@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+audit-event = { path = "../audit-event" }
 key-core = { path = "../key-core" }
 msgs = { path = "../msgs" }
 wg-core = { path = "../wg-core" }

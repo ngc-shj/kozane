@@ -161,3 +161,14 @@ fn irqs_match_layout() {
     assert_eq!(irqs_of("eth_in"), [(ETH_IN_IRQ, eth_in::CH_DEVICE)]);
     assert_eq!(irqs_of("timer"), [(TIMER_IRQ, timer::CH_DEVICE)]);
 }
+
+#[test]
+fn data_stack_size_matches_layout() {
+    let text = system_text();
+    let doc = roxmltree::Document::parse(&text).expect("parse .system");
+    let pd = doc
+        .descendants()
+        .find(|n| n.has_tag_name("protection_domain") && n.attribute("name") == Some("data"))
+        .expect("data pd");
+    assert_eq!(parse_num(pd.attribute("stack_size").expect("stack_size")), DATA_STACK_SIZE);
+}

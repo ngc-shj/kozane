@@ -261,13 +261,11 @@ fn small_install_buffer_is_reported_and_left_zeroed() {
 
 #[test]
 fn feistel_is_a_bijection_at_8_bit_halves_with_the_real_round_function() {
-    let key = Key32::from_bytes([9; 32]);
+    let indices = index::Indices::new(&Key32::from_bytes([9; 32])).unwrap();
+    let key = indices.key_for_test();
     let mut seen = std::vec![false; 1 << 16];
     for x in 0..(1u32 << 16) {
-        let y = index::feistel(x, 8, &mut |r, h| {
-            let d = crypto::hash(&[key.as_bytes(), &[r], &h.to_le_bytes()]).unwrap();
-            u16::from_le_bytes([d[0], d[1]])
-        });
+        let y = index::feistel(x, 8, &mut |r, h| index::Indices::round(key, r, h).unwrap());
         assert!(y < (1 << 16));
         assert!(!seen[y as usize], "collision at {x}");
         seen[y as usize] = true;
@@ -324,4 +322,57 @@ fn key_client_dh_matches_the_peer_side_computation() {
     let shared = KeyClient::new(&mut d).dh(&peer_pub()).unwrap();
     let expected = crypto::dh(&clamped(PEER_PRIVATE), &gw_pub()).unwrap();
     assert_eq!(shared.as_bytes(), expected.as_bytes());
+}
+
+#[test]
+fn rejected_initiations_do_not_use_up_indices() {
+    let r = region();
+    let mut d = direct(&r, 1000);
+    let mut h = handshaker();
+    let peers = [peer_pub()];
+    // Replays of one accepted initiation: authentic but refused.
+    let (_, msg) = Initiator::initiation(ts(5));
+    let accept = |h: &mut Handshaker<4>, d: &mut Direct<'_>, now: u64| {
+        let mut install = [0u8; 128];
+        let out = h.handle(&input(&msg), now, &mut KeyClient::new(d), &mut entropy(), &Peers(&peers), &mut install, &mut [0; 128]);
+        (out, install)
+    };
+    let (first, install) = accept(&mut h, &mut d, 0);
+    let Outcome::Accepted { install_len, .. } = first else { panic!("{first:?}") };
+    let first_index = msgs::Install::decode(&install[..install_len]).unwrap().local_index;
+    for i in 1..20u64 {
+        assert_eq!(accept(&mut h, &mut d, i * 1_000_000_000).0, Outcome::Rejected(Reject::Replay));
+    }
+    // The next accepted handshake gets the second index of the permutation.
+    let mut expected = index::Indices::new(&Key32::from_bytes([0x5e; 32])).unwrap();
+    assert_eq!(expected.next_index(), Some(first_index));
+    let second = expected.next_index().unwrap();
+    let (_, msg2) = Initiator::initiation(ts(6));
+    let mut install = [0u8; 128];
+    let out = h.handle(&input(&msg2), 30_000_000_000, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&peers), &mut install, &mut [0; 128]);
+    let Outcome::Accepted { install_len, .. } = out else { panic!("{out:?}") };
+    assert_eq!(msgs::Install::decode(&install[..install_len]).unwrap().local_index, second);
+}
+
+#[test]
+fn key_budget_exhaustion_is_audited_distinctly() {
+    use audit_event::Event;
+    assert_eq!(reject_event(Reject::Key(KeyError), key_core::ERR_RATE_LIMITED), Event::HandshakeKeyRateLimited);
+    assert_eq!(reject_event(Reject::Key(KeyError), key_core::ERR_ZERO_DH), Event::HandshakeKeyRefused);
+    assert_eq!(reject_event(Reject::UnknownPeer, key_core::OK), Event::HandshakeUnknownPeer);
+}
+
+#[test]
+fn exhausted_key_budget_reaches_the_audit_mapping() {
+    let r = region();
+    let mut d = direct(&r, 0);
+    let (_, msg) = Initiator::initiation(ts(1));
+    let mut client = KeyClient::new(&mut d);
+    let peers = [peer_pub()];
+    let Outcome::Rejected(rej) =
+        handshaker().handle(&input(&msg), 0, &mut client, &mut entropy(), &Peers(&peers), &mut [0; 128], &mut [0; 128])
+    else {
+        panic!("not rejected")
+    };
+    assert_eq!(reject_event(rej, client.last_error), audit_event::Event::HandshakeKeyRateLimited);
 }

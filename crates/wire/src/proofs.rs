@@ -38,6 +38,8 @@ fn parse_is_total_and_all_outcomes_reachable() {
             DropReason::NotUdp => kani::cover!(true),
             DropReason::UdpBadLength => kani::cover!(true),
             DropReason::UdpBadChecksum => kani::cover!(true),
+            // Produced by `forward_ipv4`, never by the parser.
+            DropReason::TtlExpired => {}
         }
     }
 }
@@ -80,4 +82,35 @@ fn parse_ip_is_total_and_round_trips() {
     kani::cover!(matches!(r, Ok(Frame { body: Body::Arp(_), .. })));
     kani::cover!(r == Err(DropReason::Ipv4BadChecksum));
     assert!(!matches!(r, Ok(Frame { body: Body::Udp4(_), .. })));
+}
+
+/// Forwarding keeps the datagram parseable, lowers TTL by exactly one,
+/// changes nothing else but the checksum, and refuses TTL <= 1.
+#[kani::proof]
+#[kani::unwind(50)]
+fn forward_decrements_ttl_and_keeps_the_datagram_valid() {
+    let buf: [u8; 48] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= buf.len());
+    let input = buf.get(..len).unwrap_or(&[]);
+    let mut out = [0u8; 48];
+    match forward_ipv4(input, &mut out) {
+        Ok(n) => {
+            let before = parse_ipv4_packet(input).ok().map(|p| p.packet);
+            let after = out.get(..n).unwrap_or(&[]);
+            assert!(parse_ipv4_packet(after).is_ok());
+            if let Some(b) = before {
+                assert!(b.len() == n && b[8] > 1 && after[8] == b[8] - 1);
+                for i in 0..n {
+                    if i != 8 && i != 10 && i != 11 {
+                        assert!(after[i] == b[i]);
+                    }
+                }
+            }
+            kani::cover!(true);
+        }
+        Err(e) => {
+            kani::cover!(e == DropReason::TtlExpired);
+        }
+    }
 }

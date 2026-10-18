@@ -47,14 +47,51 @@ fn arp(op: ArpOp, sha: Mac, eth_src: Mac, spa: Ipv4, tpa: Ipv4) -> Vec<u8> {
     })
 }
 
-fn from(frame: &[u8]) -> FromLan<'_> {
+fn from(frame: &[u8]) -> FromLan {
     from_lan(&CFG, frame, &mut [0u8; MAX_FRAME])
 }
 
+/// `p` with its TTL lowered by one and the header checksum recomputed.
+fn hopped(p: &[u8]) -> Vec<u8> {
+    let mut h = p.to_vec();
+    set_ttl(&mut h, p[8] - 1);
+    h
+}
+
+fn set_ttl(p: &mut [u8], ttl: u8) {
+    // Recompute the checksum so the parser accepts it: only TTL is under test.
+    p[8] = ttl;
+    p[10..12].copy_from_slice(&[0, 0]);
+    let mut sum: u32 = p[..20].chunks(2).map(|c| u32::from(u16::from_be_bytes([c[0], c[1]]))).sum();
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    p[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+}
+
 #[test]
-fn neighbor_traffic_is_forwarded_verbatim() {
+fn neighbor_traffic_is_forwarded_with_ttl_decremented() {
     let b = lan_frame(HOST_MAC, GW_MAC, HOST_IP, PEER_IP);
-    assert_eq!(from(&b), FromLan::Forward(&b[wire::ETH_HDR..]));
+    let mut out = [0u8; MAX_FRAME];
+    let FromLan::Forward(n) = from_lan(&CFG, &b, &mut out) else { panic!("not forwarded") };
+    assert_eq!(&out[..n], &hopped(&b[wire::ETH_HDR..])[..]);
+    assert_eq!(out[8], b[wire::ETH_HDR + 8] - 1);
+}
+
+#[test]
+fn lan_datagram_with_ttl_one_is_dropped() {
+    let mut b = lan_frame(HOST_MAC, GW_MAC, HOST_IP, PEER_IP);
+    set_ttl(&mut b[wire::ETH_HDR..], 1);
+    assert_eq!(from(&b), FromLan::Dropped(DropReason::TtlExpired));
+    set_ttl(&mut b[wire::ETH_HDR..], 2);
+    assert!(matches!(from(&b), FromLan::Forward(_)));
+}
+
+#[test]
+fn tunnel_datagram_with_ttl_one_is_dropped() {
+    let mut p = datagram(PEER_IP, HOST_IP);
+    set_ttl(&mut p, 1);
+    assert_eq!(to_lan(&CFG, &p, &mut [0u8; MAX_FRAME]), ToLan::Dropped(DropReason::TtlExpired));
 }
 
 #[test]
@@ -122,7 +159,7 @@ fn decrypted_packet_for_neighbor_is_framed_to_its_mac() {
     let ToLan::Emitted(n) = to_lan(&CFG, &p, &mut out) else { panic!("not emitted") };
     assert_eq!(&out[..6], &HOST_MAC);
     assert_eq!(&out[6..12], &GW_MAC);
-    assert_eq!(&out[wire::ETH_HDR..n], &p[..]);
+    assert_eq!(&out[wire::ETH_HDR..n], &hopped(&p)[..]);
 }
 
 #[test]

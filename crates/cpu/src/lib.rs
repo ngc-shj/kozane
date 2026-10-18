@@ -66,3 +66,30 @@ pub fn fill_random(out: &mut [u8]) -> bool {
     }
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ticks_to_ns_is_exact_at_one_gigahertz() {
+        assert_eq!(ticks_to_ns(123_456_789, 1_000_000_000), 123_456_789);
+    }
+
+    #[test]
+    fn ticks_to_ns_scales_the_qemu_counter() {
+        // QEMU virt: 62.5 MHz, 16 ns per tick.
+        assert_eq!(ticks_to_ns(62_500_000, 62_500_000), 1_000_000_000);
+        assert_eq!(ticks_to_ns(1, 62_500_000), 16);
+    }
+
+    #[test]
+    fn ticks_to_ns_without_a_frequency_is_zero() {
+        assert_eq!(ticks_to_ns(42, 0), 0);
+    }
+
+    #[test]
+    fn ticks_to_ns_saturates_instead_of_wrapping() {
+        assert_eq!(ticks_to_ns(u64::MAX, 1), u64::MAX);
+    }
+}

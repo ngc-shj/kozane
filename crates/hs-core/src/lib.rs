@@ -183,10 +183,8 @@ impl<const MAX_PEERS: usize> Handshaker<MAX_PEERS> {
         let Ok(init) = msgs::Initiation::decode(input) else {
             return Outcome::BadInput;
         };
-        let Some(local_index) = self.indices.next_index() else {
-            return Outcome::Rejected(Reject::Entropy);
-        };
-        let accepted = match self.responder.consume_initiation(init.msg, now_ns, local_index, key, entropy, peers) {
+        let indices = &mut self.indices;
+        let accepted = match self.responder.consume_initiation(init.msg, now_ns, || indices.next_index(), key, entropy, peers) {
             Ok(a) => a,
             Err(r) => return Outcome::Rejected(r),
         };
@@ -194,7 +192,6 @@ impl<const MAX_PEERS: usize> Handshaker<MAX_PEERS> {
             peer: accepted.peer.0,
             local_index: accepted.responder_index,
             remote_index: accepted.initiator_index,
-            created_ns: now_ns,
             send: accepted.keys.send.as_bytes(),
             recv: accepted.keys.recv.as_bytes(),
         }
@@ -209,6 +206,28 @@ impl<const MAX_PEERS: usize> Handshaker<MAX_PEERS> {
                 Outcome::NoBuffer
             }
         }
+    }
+}
+
+/// The audit event for a rejected handshake. `key_error` is
+/// `KeyClient::last_error`, which tells key-budget exhaustion apart from
+/// other refusals (C10: exhaustion is audited).
+pub fn reject_event(r: Reject, key_error: u64) -> audit_event::Event {
+    use audit_event::Event;
+    match r {
+        Reject::UnknownPeer => Event::HandshakeUnknownPeer,
+        Reject::Decrypt => Event::HandshakeDecrypt,
+        Reject::Replay => Event::HandshakeReplay,
+        Reject::Flood => Event::HandshakeFlood,
+        Reject::Key(_) if key_error == key_core::ERR_RATE_LIMITED => Event::HandshakeKeyRateLimited,
+        Reject::Key(_) => Event::HandshakeKeyRefused,
+        Reject::Malformed(_)
+        | Reject::BadMac1
+        | Reject::ZeroDh
+        | Reject::PeerOutOfRange
+        | Reject::Entropy
+        | Reject::IndexExhausted
+        | Reject::Crypto(_) => Event::HandshakeOther,
     }
 }
 

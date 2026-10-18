@@ -71,7 +71,7 @@ fn install_at(d: &mut D, peer: u16, local_index: u32, created_ns: u64) -> (Insta
     let send = [seed; 32];
     let recv = [seed ^ 0x80; 32];
     let remote_index = local_index + 1000;
-    let o = d.install(&Install { peer, local_index, remote_index, created_ns, send: &send, recv: &recv });
+    let o = d.install(&Install { peer, local_index, remote_index, send: &send, recv: &recv }, created_ns);
     let keys = SessionKeys { send: Key32::from_bytes(recv), recv: Key32::from_bytes(send) };
     (o, Client { s: Session::new(keys, remote_index, local_index, created_ns), to: local_index })
 }
@@ -244,6 +244,71 @@ fn endpoint_update_only_on_a_new_highest_counter() {
     assert_eq!(endpoint(recv(&mut d, EP2, &msgs[0], &mut out)), None);
     assert_eq!(recv(&mut d, EP2, &msgs[1], &mut out), InboundOutcome::Rejected(SessionError::Replay));
     assert_eq!(endpoint(recv(&mut d, EP2, &msgs[2], &mut out)), Some(EP2));
+}
+
+fn endpoint_of(o: InboundOutcome<'_>) -> Option<Endpoint> {
+    match o {
+        InboundOutcome::Authenticated { endpoint, .. } => endpoint,
+        o => panic!("{o:?}"),
+    }
+}
+
+#[test]
+fn delivered_endpoint_is_not_repeated_for_later_packets() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    let mut out = [0u8; 16];
+    assert_eq!(endpoint_of(recv(&mut d, EP1, &a.packet(&[]), &mut out)), Some(EP1));
+    d.endpoint_delivered(0, EP1);
+    for _ in 0..100 {
+        assert_eq!(endpoint_of(recv(&mut d, EP1, &a.packet(&[]), &mut out)), None);
+    }
+}
+
+#[test]
+fn undelivered_endpoint_is_asked_for_again() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    let mut out = [0u8; 16];
+    assert_eq!(endpoint_of(recv(&mut d, EP1, &a.packet(&[]), &mut out)), Some(EP1));
+    // The send failed, so nothing was recorded: the next packet asks again.
+    assert_eq!(endpoint_of(recv(&mut d, EP1, &a.packet(&[]), &mut out)), Some(EP1));
+}
+
+#[test]
+fn roaming_after_delivery_updates_once() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    let mut out = [0u8; 16];
+    recv(&mut d, EP1, &a.packet(&[]), &mut out);
+    d.endpoint_delivered(0, EP1);
+    assert_eq!(endpoint_of(recv(&mut d, EP2, &a.packet(&[]), &mut out)), Some(EP2));
+    d.endpoint_delivered(0, EP2);
+    assert_eq!(endpoint_of(recv(&mut d, EP2, &a.packet(&[]), &mut out)), None);
+}
+
+#[test]
+fn roaming_to_a_delivered_endpoint_on_an_old_counter_does_not_update() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    let old = a.packet(&[]);
+    let new = a.packet(&[]);
+    let mut out = [0u8; 16];
+    recv(&mut d, EP1, &new, &mut out);
+    d.endpoint_delivered(0, EP1);
+    assert_eq!(endpoint_of(recv(&mut d, EP2, &old, &mut out)), None);
+}
+
+#[test]
+fn session_clock_starts_when_data_installs_it() {
+    let mut d = D::new();
+    // `install`'s clock argument is data's own CNTPCT reading; the install
+    // message carries no time at all. Boundary: expired at exactly
+    // REJECT_AFTER_TIME after install, alive one nanosecond before.
+    let (o, _) = install_at(&mut d, 0, 1, 1_000);
+    assert_eq!(o, InstallOutcome::Installed);
+    assert_eq!(d.tick(1_000 + wg_core::REJECT_AFTER_TIME_NS - 1), 0);
+    assert_eq!(d.tick(1_000 + wg_core::REJECT_AFTER_TIME_NS), 1);
 }
 
 #[test]

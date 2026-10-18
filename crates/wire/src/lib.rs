@@ -119,6 +119,8 @@ drop_reasons! {
     NotUdp = 13,
     UdpBadLength = 14,
     UdpBadChecksum = 15,
+    // Forwarding only: TTL would reach zero (never from the parsers).
+    TtlExpired = 16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -297,6 +299,28 @@ fn parse_ipv4_udp(b: &[u8]) -> Result<Udp4<'_>, DropReason> {
     }
     let payload = udp.get(UDP_HDR..).ok_or(DropReason::UdpBadLength)?;
     Ok(Udp4 { src, dst, sport, dport, payload })
+}
+
+/// Copies a datagram accepted by `parse_ipv4_packet` into `out` with its
+/// TTL decremented and the header checksum recomputed, as a router must
+/// before forwarding (RFC 1812 section 5.3.1). TTL 0 or 1 is refused, so a
+/// routing loop through the gateway dies out. Returns the length written.
+pub fn forward_ipv4(packet: &[u8], out: &mut [u8]) -> Result<usize, DropReason> {
+    let p = parse_ipv4_packet(packet)?;
+    let len = p.packet.len();
+    let dst = out.get_mut(..len).ok_or(DropReason::TooLong)?;
+    dst.copy_from_slice(p.packet);
+    let ttl = dst.get_mut(8).ok_or(DropReason::TooShort)?;
+    if *ttl <= 1 {
+        return Err(DropReason::TtlExpired);
+    }
+    *ttl = ttl.saturating_sub(1);
+    let csum = dst.get_mut(10..12).ok_or(DropReason::TooShort)?;
+    csum.copy_from_slice(&[0, 0]);
+    let hdr = dst.get(..IPV4_HDR).ok_or(DropReason::TooShort)?;
+    let c = csum_fold(csum_add(0, hdr));
+    dst.get_mut(10..12).ok_or(DropReason::TooShort)?.copy_from_slice(&c.to_be_bytes());
+    Ok(len)
 }
 
 /// Writes `f` into `out` and returns the frame length. Checksums are computed.

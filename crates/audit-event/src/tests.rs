@@ -148,11 +148,13 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::NoSession
         | Event::UnknownNeighbor
         | Event::SessionPromoted
-        | Event::SessionExpired => true,
+        | Event::SessionExpired
+        | Event::HandshakeKeyRateLimited
+        | Event::TransportUnknownIndex => true,
         Event::FrameDropped { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
-    assert_eq!(Event::FIXED.len(), 29);
+    assert_eq!(Event::FIXED.len(), 31);
 }
 
 #[test]

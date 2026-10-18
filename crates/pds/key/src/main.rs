@@ -76,8 +76,11 @@ impl Handler for Key {
         let mut reply = [0u64; MAX_WORDS];
         let (label, n) =
             self.oracle.handle(&mut self.bucket, cpu::now_ns(), msg_info.label(), req.get(..count).unwrap_or(&[]), &mut reply);
-        // Overwrite every register the request or reply may have used, so
-        // no stale secret survives in the IPC buffer past this reply.
+        // Overwrite every register beyond this reply, so no part of an
+        // earlier, longer reply is handed back to `hs`. The reply words
+        // themselves stay in `key`'s own IPC buffer until the next call; only
+        // `key` can read that buffer, and it holds the static secrets anyway.
+        // `hs` zeroes its copy after use.
         with_msg_regs_mut(|mrs| {
             for (i, dst) in mrs.iter_mut().take(MAX_WORDS).enumerate() {
                 *dst = if i < n { reply.get(i).copied().unwrap_or(0) } else { 0 };

@@ -42,9 +42,16 @@ fn classify_forwards_only_well_formed_messages() {
     let payload: [u8; INITIATION_LEN + 1] = kani::any();
     let len: usize = kani::any();
     kani::assume(len <= payload.len());
+    // An already exhausted bucket for this source makes RateLimited reachable.
     let mut buckets = Buckets::<2>::default();
     let src = Endpoint { ip: kani::any(), port: kani::any() };
-    let o = classify(&AnyMac1, &mut buckets, kani::any(), src, payload.get(..len).unwrap_or(&[]));
+    let now: u64 = kani::any();
+    if kani::any() {
+        for _ in 0..BURST {
+            buckets.allow(src.ip, now);
+        }
+    }
+    let o = classify(&AnyMac1, &mut buckets, now, src, payload.get(..len).unwrap_or(&[]));
     match o {
         Outcome::Initiation { msg, .. } => assert!(len == INITIATION_LEN && msg[0] == MSG_INITIATION),
         Outcome::Transport { msg, .. } => assert!(msg.len() >= TRANSPORT_MIN_LEN && msg[0] == MSG_TRANSPORT),
@@ -53,10 +60,11 @@ fn classify_forwards_only_well_formed_messages() {
     kani::cover!(matches!(o, Outcome::Initiation { .. }));
     kani::cover!(matches!(o, Outcome::Transport { .. }));
     kani::cover!(o == Outcome::BadMac1);
+    kani::cover!(o == Outcome::RateLimited);
 }
 
-/// A source never gets more than BURST initiations at one instant, and the
-/// table never panics, for any interleaving of three sources over two slots.
+/// A fresh source gets exactly BURST initiations at one instant, and a
+/// further source arriving at any time on the full table does not panic.
 #[kani::proof]
 #[kani::unwind(10)]
 fn bucket_never_exceeds_burst() {

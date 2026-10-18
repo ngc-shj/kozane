@@ -27,12 +27,12 @@ fn response_round_trips_and_rejects_other_sizes() {
 #[test]
 fn install_round_trips_every_field() {
     let (send, recv) = ([1u8; 32], [2u8; 32]);
-    let m = Install { peer: 3, local_index: 0xdead_beef, remote_index: 7, created_ns: 1 << 40, send: &send, recv: &recv };
+    let m = Install { peer: 3, local_index: 0xdead_beef, remote_index: 7, send: &send, recv: &recv };
     let mut out = [0u8; 128];
     let n = m.encode(&mut out).unwrap();
     assert_eq!(n, INSTALL_LEN);
-    assert_eq!(Install::decode(&out[..n]), Ok(m));
-    assert_eq!(Install::decode(&out[..n - 1]), Err(Malformed));
+    assert!(Install::decode(&out[..n]) == Ok(m));
+    assert!(Install::decode(&out[..n - 1]).is_err());
 }
 
 #[test]

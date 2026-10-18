@@ -35,12 +35,10 @@ impl Indices {
         Ok(Self { key, counter: 0, exhausted: false })
     }
 
-    fn round(key: &Key32, round: u8, half: u16) -> u16 {
-        let mut out = [0u8; 2];
-        if let Ok(h) = crypto::hash(&[key.as_bytes(), &[round], &half.to_le_bytes()]) {
-            out.copy_from_slice(h.get(..2).unwrap_or(&[0, 0]));
-        }
-        u16::from_le_bytes(out)
+    /// The round function: the first 16 bits of BLAKE2s(k_idx ‖ round ‖ half).
+    pub(crate) fn round(key: &Key32, round: u8, half: u16) -> Option<u16> {
+        let h = crypto::hash(&[key.as_bytes(), &[round], &half.to_le_bytes()]).ok()?;
+        Some(u16::from_le_bytes([*h.first()?, *h.get(1)?]))
     }
 
     /// The next unused index, or None once all 2^32 have been issued.
@@ -54,12 +52,25 @@ impl Indices {
             None => self.exhausted = true,
         }
         let key = &self.key;
-        Some(feistel(n, 16, &mut |round, half| Self::round(key, round, half)))
+        // A hash failure (impossible for these tiny inputs) refuses the
+        // index rather than silently using a zero round output.
+        let mut failed = false;
+        let index = feistel(n, 16, &mut |round, half| {
+            Self::round(key, round, half).unwrap_or_else(|| {
+                failed = true;
+                0
+            })
+        });
+        (!failed).then_some(index)
     }
 }
 
 #[cfg(test)]
 impl Indices {
+    pub(crate) fn key_for_test(&self) -> &Key32 {
+        &self.key
+    }
+
     pub(crate) fn set_counter_for_test(&mut self, n: u32) {
         self.counter = n;
     }

@@ -238,6 +238,11 @@ mod link_tests {
     #[test]
     fn scrubbing_sender_zeroes_returned_buffers() {
         let s = shm();
+        // Shared pages are not guaranteed to start zeroed on the target.
+        // Seed boot-time residue and require the scrubbing constructor to
+        // establish the link's clean baseline before its first send.
+        // SAFETY: `data` is a leaked allocation of M * BUF bytes.
+        unsafe { core::slice::from_raw_parts_mut(s.data, M * BUF) }.fill(0xa5);
         // SAFETY: as in `link`.
         let (mut tx, mut rx): (Tx, Rx) = unsafe {
             (
@@ -245,6 +250,7 @@ mod link_tests {
                 Receiver::new(ShmRing::consumer(s.used), ShmRing::producer(s.free), Region::new(s.data, M * BUF)),
             )
         };
+        assert!(region_bytes(&s).iter().all(|b| *b == 0));
         assert_eq!(send(&mut tx, b"secret key bytes"), Ok(true));
         assert!(region_bytes(&s).windows(6).any(|w| w == b"secret"));
         let mut out = [0u8; BUF];

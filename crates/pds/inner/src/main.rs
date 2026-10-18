@@ -13,7 +13,8 @@ use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, debug_println, mem
 
 const ETH_IN: Channel = Channel::new(ch::CH_ETH_IN);
 const DATA: Channel = Channel::new(ch::CH_DATA);
-const MAX_NEIGHBORS: usize = 64;
+const MAX_NEIGHBORS: usize = config::MAX_NEIGHBORS;
+const _: () = assert!(config::NEIGHBORS.len() <= MAX_NEIGHBORS);
 
 struct Inner {
     from_driver: Rx,
@@ -69,7 +70,7 @@ fn init() -> Inner {
         from_data,
         audit,
         neighbors,
-        neighbor_count: config::NEIGHBORS.len().min(MAX_NEIGHBORS),
+        neighbor_count: config::NEIGHBORS.len(),
         buf: [0; layout::NET_BUF_SIZE],
         reply: [0; layout::NET_BUF_SIZE],
         scratch: [0; layout::NET_BUF_SIZE],
@@ -82,21 +83,18 @@ struct Wake {
     data: bool,
 }
 
+fn lan_config(neighbors: &[([u8; 4], [u8; 6])]) -> Config<'_> {
+    Config { mac: config::INSIDE_MAC, ipv4: config::INSIDE_IP, neighbors }
+}
+
 impl Inner {
-    fn config(&self) -> Config<'_> {
-        Config {
-            mac: config::INSIDE_MAC,
-            ipv4: config::INSIDE_IP,
-            neighbors: self.neighbors.get(..self.neighbor_count).unwrap_or(&[]),
-        }
-    }
 
     fn from_lan(&mut self, wake: &mut Wake) {
         while let Some(n) = pdkit::recv(&mut self.from_driver, &mut self.buf, &mut self.audit) {
             wake.driver = true;
-            let mut reply = self.reply;
-            let cfg = self.config();
-            let outcome = from_lan(&cfg, self.buf.get(..n).unwrap_or(&[]), &mut reply);
+            let cfg = lan_config(self.neighbors.get(..self.neighbor_count).unwrap_or(&[]));
+            let reply = &mut self.reply;
+            let outcome = from_lan(&cfg, self.buf.get(..n).unwrap_or(&[]), reply);
             match outcome {
                 FromLan::ArpReplied(len) => {
                     let r = reply.get(..len).unwrap_or(&[]);
@@ -104,12 +102,9 @@ impl Inner {
                         self.audit.record(Event::ArpReplied);
                     }
                 }
-                FromLan::Forward(packet) => {
-                    let mut copy = [0u8; layout::NET_BUF_SIZE];
-                    let Some(dst) = copy.get_mut(..packet.len()) else { continue };
-                    dst.copy_from_slice(packet);
-                    let len = packet.len();
-                    wake.data |= pdkit::send(&mut self.to_data, &mut self.scratch, copy.get(..len).unwrap_or(&[]), &mut self.audit);
+                FromLan::Forward(len) => {
+                    let p = reply.get(..len).unwrap_or(&[]);
+                    wake.data |= pdkit::send(&mut self.to_data, &mut self.scratch, p, &mut self.audit);
                 }
                 FromLan::Dropped(reason) => self.audit.record(Event::FrameDropped { reason: reason as u16 }),
                 FromLan::NotForUs => self.audit.record(Event::NotForUs),
@@ -122,9 +117,9 @@ impl Inner {
     fn from_tunnel(&mut self, wake: &mut Wake) {
         while let Some(n) = pdkit::recv(&mut self.from_data, &mut self.buf, &mut self.audit) {
             wake.data = true;
-            let mut frame = self.reply;
-            let cfg = self.config();
-            match to_lan(&cfg, self.buf.get(..n).unwrap_or(&[]), &mut frame) {
+            let cfg = lan_config(self.neighbors.get(..self.neighbor_count).unwrap_or(&[]));
+            let frame = &mut self.reply;
+            match to_lan(&cfg, self.buf.get(..n).unwrap_or(&[]), frame) {
                 ToLan::Emitted(len) => {
                     let f = frame.get(..len).unwrap_or(&[]);
                     wake.driver |= pdkit::send(&mut self.to_driver, &mut self.scratch, f, &mut self.audit);

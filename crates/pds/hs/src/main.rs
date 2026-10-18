@@ -14,12 +14,14 @@ use sel4_microkit::{
     Channel, ChannelSet, Handler, Infallible, MessageInfo, debug_println, memory_region_symbol, protection_domain,
     with_msg_regs, with_msg_regs_mut,
 };
-use wg_core::noise::Reject;
 
 const KEY: Channel = Channel::new(ch::CH_KEY);
 const INGRESS: Channel = Channel::new(ch::CH_INGRESS);
 const DATA: Channel = Channel::new(ch::CH_DATA);
-const MAX_PEERS: usize = 61;
+const MAX_PEERS: usize = config::MAX_PEERS;
+// The configuration was validated against this bound at build time; the
+// assertion keeps the PD's tables from silently diverging from it.
+const _: () = assert!(config::PEERS.len() <= MAX_PEERS);
 
 /// `key` over PPC. Request and reply registers are zeroed after each call.
 struct Ppc;
@@ -119,22 +121,11 @@ fn init() -> Hs {
         entropy: HedgedEntropy::new(seed, Hw),
         handshaker,
         peers,
-        peer_count: config::PEERS.len().min(MAX_PEERS),
+        peer_count: config::PEERS.len(),
         input: [0; layout::NET_BUF_SIZE],
         install: [0; layout::NET_BUF_SIZE],
         response: [0; layout::NET_BUF_SIZE],
         scratch: [0; layout::NET_BUF_SIZE],
-    }
-}
-
-fn reject_event(r: Reject) -> Event {
-    match r {
-        Reject::UnknownPeer => Event::HandshakeUnknownPeer,
-        Reject::Decrypt => Event::HandshakeDecrypt,
-        Reject::Replay => Event::HandshakeReplay,
-        Reject::Flood => Event::HandshakeFlood,
-        Reject::Key(_) => Event::HandshakeKeyRefused,
-        _ => Event::HandshakeOther,
     }
 }
 
@@ -180,7 +171,7 @@ impl Hs {
                         }
                     }
                 }
-                Outcome::Rejected(r) => self.audit.record(reject_event(r)),
+                Outcome::Rejected(r) => self.audit.record(hs_core::reject_event(r, self.key.last_error)),
                 Outcome::BadInput | Outcome::NoBuffer => self.audit.record(Event::HandshakeOther),
             }
         }
@@ -192,8 +183,13 @@ impl Handler for Hs {
     type Error = Infallible;
 
     fn notified(&mut self, _channels: ChannelSet) -> Result<(), Self::Error> {
-        // Timer ticks need no work here yet: per-peer handshake state ages
-        // by timestamp comparison inside wg-core.
+        // Scrub returned install buffers now, not at the next handshake:
+        // `data` notifies as soon as it has copied an install out, so the
+        // transport keys leave the shared `hd` region within one wakeup
+        // (law L12). The 1 Hz timer tick retries if that notify was missed.
+        if let Err(e) = self.to_data.reclaim() {
+            self.audit.link_error(e);
+        }
         let (_, to_ingress, consumed) = self.poll();
         if to_ingress || consumed {
             INGRESS.notify();

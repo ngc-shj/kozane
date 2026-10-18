@@ -16,7 +16,10 @@ const INGRESS: Channel = Channel::new(ch::CH_INGRESS);
 const HS: Channel = Channel::new(ch::CH_HS);
 const INNER: Channel = Channel::new(ch::CH_INNER);
 const TIMER: Channel = Channel::new(ch::CH_TIMER);
-const MAX_PEERS: usize = 8;
+const MAX_PEERS: usize = config::MAX_PEERS;
+// The configuration was validated against this bound at build time; the
+// assertion keeps the PD's tables from silently diverging from it.
+const _: () = assert!(config::PEERS.len() <= MAX_PEERS);
 
 /// Allowed IPs from the compiled configuration (law L6).
 struct Config;
@@ -26,6 +29,10 @@ impl AllowedIps for Config {
         config::PEERS.get(peer).is_some_and(|p| p.allowed.iter().any(|a| a.contains(ip)))
     }
 }
+
+// The handler state lives on the stack (returned by value from `init`);
+// half the stack stays free for per-call buffers and the crypto.
+const _: () = assert!(core::mem::size_of::<DataPd>() <= layout::DATA_STACK_SIZE / 2, "data state needs a bigger stack");
 
 struct DataPd {
     from_hs: Rx,
@@ -43,10 +50,6 @@ struct DataPd {
 
 #[protection_domain]
 fn init() -> DataPd {
-    if config::PEERS.len() > MAX_PEERS {
-        debug_println!("data: more peers configured than MAX_PEERS");
-        panic!("data: halted");
-    }
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout`; receive data regions are read-only here.
     let (from_hs, from_ingress, to_ingress, from_inner, to_inner, audit) = unsafe {
@@ -115,7 +118,7 @@ impl DataPd {
         while let Some(n) = pdkit::recv(&mut self.from_hs, &mut self.buf, &mut self.audit) {
             wake.hs = true;
             let ev = match msgs::Install::decode(self.buf.get(..n).unwrap_or(&[])) {
-                Ok(m) => match self.data.install(&m) {
+                Ok(m) => match self.data.install(&m, cpu::now_ns()) {
                     InstallOutcome::Installed => Event::SessionInstalled,
                     InstallOutcome::IndexCollision => Event::SessionCollision,
                     InstallOutcome::PeerOutOfRange => Event::HandshakeOther,
@@ -143,8 +146,12 @@ impl DataPd {
                         audit.record(Event::SessionPromoted);
                     }
                     if let Some(endpoint) = endpoint {
-                        wake.ingress |=
-                            send_to_ingress(to_ingress, scratch, audit, ToIngress::EndpointUpdate { peer, endpoint });
+                        let m = ToIngress::EndpointUpdate { peer, endpoint };
+                        if send_to_ingress(to_ingress, scratch, audit, m) {
+                            wake.ingress = true;
+                            // Only now: a failed send is retried on the next packet.
+                            data.endpoint_delivered(peer, endpoint);
+                        }
                     }
                     match payload {
                         Payload::Keepalive => {}
@@ -161,9 +168,8 @@ impl DataPd {
                         Payload::Invalid(r) => audit.record(Event::FrameDropped { reason: r as u16 }),
                     }
                 }
-                InboundOutcome::Malformed(_) | InboundOutcome::UnknownIndex | InboundOutcome::Rejected(_) => {
-                    audit.record(Event::TransportRejected)
-                }
+                InboundOutcome::UnknownIndex => audit.record(Event::TransportUnknownIndex),
+                InboundOutcome::Malformed(_) | InboundOutcome::Rejected(_) => audit.record(Event::TransportRejected),
             }
             self.out.fill(0);
         }

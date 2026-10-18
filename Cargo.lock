@@ -201,6 +201,7 @@ dependencies = [
 name = "config"
 version = "0.1.0"
 dependencies = [
+ "secret-blob",
  "serde",
  "toml",
 ]
@@ -422,6 +423,7 @@ dependencies = [
 name = "hs-core"
 version = "0.1.0"
 dependencies = [
+ "audit-event",
  "key-core",
  "msgs",
  "secret-blob",
@@ -1705,6 +1707,9 @@ dependencies = [
 [[package]]
 name = "wg-wire"
 version = "0.1.0"
+dependencies = [
+ "bolero",
+]
 
 [[package]]
 name = "windows-link"

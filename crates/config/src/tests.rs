@@ -101,3 +101,115 @@ fn compiled_config_routes_by_allowed_ips() {
     assert_eq!(crate::peer_for(first.addr), Some(0));
     assert_eq!(crate::peer_for([192, 0, 2, 1]), None);
 }
+
+#[test]
+fn peer_count_bound_is_the_deployable_limit() {
+    let many = |n: usize| -> String {
+        (0..n)
+            .map(|i| {
+                let k = base64_key(i as u8 + 1);
+                peer(&k, &std::format!("\"10.200.{i}.0/24\""))
+            })
+            .collect()
+    };
+    assert!(validate::check(&cfg(&many(validate::MAX_PEERS)), validate::MAX_PEERS).is_ok());
+    let e = validate::check(&cfg(&many(validate::MAX_PEERS + 1)), validate::MAX_PEERS).err().unwrap();
+    assert!(e.contains("need 1..=8 peers"), "{e}");
+}
+
+/// The 32-byte key [b; 32] in base64.
+fn base64_key(b: u8) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let bytes = [b; 32];
+    let mut s = String::new();
+    for c in bytes.chunks(3) {
+        let n = (u32::from(c[0]) << 16) | (u32::from(*c.get(1).unwrap_or(&0)) << 8) | u32::from(*c.get(2).unwrap_or(&0));
+        for i in 0..4 {
+            s.push(if i <= c.len() { char::from(A[(n >> (18 - 6 * i) & 63) as usize]) } else { '=' });
+        }
+    }
+    s
+}
+
+fn with_neighbors(n: usize) -> String {
+    let mut c = cfg(&peer(K1, "\"10.200.0.2/32\""));
+    for i in 0..n {
+        c += &std::format!("\n[[neighbors]]\nip = \"10.98.{}.{}\"\nmac = \"02:00:00:00:{:02x}:{:02x}\"\n", i / 250, i % 250 + 1, i / 256, i % 256 + 1);
+    }
+    c
+}
+
+#[test]
+fn neighbor_count_is_bounded() {
+    // `cfg` already declares one neighbor.
+    assert!(validate::check(&with_neighbors(validate::MAX_NEIGHBORS - 1), 4).is_ok());
+    assert!(err(&with_neighbors(validate::MAX_NEIGHBORS)).contains("at most 64 neighbors"));
+}
+
+#[test]
+fn neighbor_on_a_gateway_address_is_rejected() {
+    let c = cfg(&peer(K1, "\"10.200.0.2/32\"")) + "\n[[neighbors]]\nip = \"10.99.0.1\"\nmac = \"02:00:00:00:99:09\"\n";
+    assert!(err(&c).contains("uses a gateway address"));
+}
+
+#[test]
+fn allowed_ips_covering_a_neighbor_are_rejected() {
+    assert!(err(&cfg(&peer(K1, "\"10.99.0.0/24\""))).contains("cover"));
+    assert!(err(&cfg(&peer(K1, "\"0.0.0.0/0\""))).contains("cover"));
+    assert!(err(&cfg(&peer(K1, "\"10.99.0.2/32\""))).contains("cover neighbor 10.99.0.2"));
+}
+
+#[test]
+fn allowed_ips_covering_the_outside_address_are_rejected() {
+    assert!(err(&cfg(&peer(K1, "\"10.0.2.15/32\""))).contains("cover a gateway address"));
+}
+
+#[test]
+fn allowed_ips_next_to_the_inside_network_are_accepted() {
+    assert!(validate::check(&cfg(&peer(K1, "\"10.98.0.0/24\"")), 4).is_ok());
+}
+
+#[test]
+fn zero_peers_are_rejected() {
+    // Without any [[peers]] table deserialization refuses the missing field.
+    assert!(err(&cfg("")).contains("missing field `peers`"));
+}
+
+#[test]
+fn peer_without_allowed_ips_is_rejected() {
+    assert!(err(&cfg(&peer(K1, ""))).contains("has no allowed IPs"));
+}
+
+#[test]
+fn duplicate_neighbor_is_rejected() {
+    let c = cfg(&peer(K1, "\"10.200.0.2/32\"")) + "\n[[neighbors]]\nip = \"10.99.0.2\"\nmac = \"02:00:00:00:99:03\"\n";
+    assert!(err(&c).contains("duplicate neighbor 10.99.0.2"));
+}
+
+#[test]
+fn zero_listen_port_is_rejected() {
+    let c = cfg(&peer(K1, "\"10.200.0.2/32\"")).replace("listen_port = 51820", "listen_port = 0");
+    assert!(err(&c).contains("listen_port must be non-zero"));
+}
+
+#[test]
+fn prefix_length_over_32_is_rejected() {
+    assert!(err(&cfg(&peer(K1, "\"10.200.0.2/33\""))).contains("bad prefix length"));
+}
+
+#[test]
+fn malformed_ipv4_is_rejected() {
+    assert!(err(&cfg(&peer(K1, "\"10.200.0.256/32\""))).contains("bad IPv4 address"));
+}
+
+#[test]
+fn malformed_mac_is_rejected() {
+    let c = cfg(&peer(K1, "\"10.200.0.2/32\"")).replace("52:54:00:12:34:57", "52:54:00:12:34");
+    assert!(err(&c).contains("bad MAC"));
+}
+
+#[test]
+fn key_of_the_wrong_length_is_rejected() {
+    let short = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
+    assert!(err(&cfg(&peer(short, "\"10.200.0.2/32\""))).contains("expected 44 base64 characters"));
+}

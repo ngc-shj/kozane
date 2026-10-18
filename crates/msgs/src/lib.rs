@@ -120,20 +120,22 @@ impl<'a> Response<'a> {
 }
 
 /// hs → data: a freshly negotiated session. Carries transport keys, so the
-/// receiving buffer must be zeroed once copied out (plan, secrets residue).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// receiving buffer must be zeroed once copied out (plan, secrets residue);
+/// not `Debug`/`Clone`/`Copy` for the same reason (C9). No timestamp: `data`
+/// starts the session clock itself, so a compromised `hs` cannot extend
+/// a session past REJECT_AFTER_TIME.
+#[derive(PartialEq, Eq)]
 pub struct Install<'a> {
     pub peer: u16,
     /// Our index (the receiver index of inbound transport packets).
     pub local_index: u32,
     /// The initiator's index (the receiver index of our outbound packets).
     pub remote_index: u32,
-    pub created_ns: u64,
     pub send: &'a [u8; 32],
     pub recv: &'a [u8; 32],
 }
 
-pub const INSTALL_LEN: usize = 2 + 4 + 4 + 8 + 32 + 32;
+pub const INSTALL_LEN: usize = 2 + 4 + 4 + 32 + 32;
 
 impl<'a> Install<'a> {
     pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
@@ -141,7 +143,6 @@ impl<'a> Install<'a> {
         put(out, &mut at, &self.peer.to_le_bytes())?;
         put(out, &mut at, &self.local_index.to_le_bytes())?;
         put(out, &mut at, &self.remote_index.to_le_bytes())?;
-        put(out, &mut at, &self.created_ns.to_le_bytes())?;
         put(out, &mut at, self.send)?;
         put(out, &mut at, self.recv)?;
         Some(at)
@@ -152,11 +153,10 @@ impl<'a> Install<'a> {
         let peer = u16::from_le_bytes(*take::<2>(b, &mut at)?);
         let local_index = u32::from_le_bytes(*take::<4>(b, &mut at)?);
         let remote_index = u32::from_le_bytes(*take::<4>(b, &mut at)?);
-        let created_ns = u64::from_le_bytes(*take::<8>(b, &mut at)?);
         let send = take::<32>(b, &mut at)?;
         let recv = take::<32>(b, &mut at)?;
         exact(b, at)?;
-        Ok(Self { peer, local_index, remote_index, created_ns, send, recv })
+        Ok(Self { peer, local_index, remote_index, send, recv })
     }
 }
 
@@ -243,9 +243,12 @@ mod proofs {
         let b = buf.get(..len).unwrap_or(&[]);
         let mut out = [0u8; 16];
         if let Ok(m) = ToIngress::decode(b) {
+            kani::cover!(matches!(m, ToIngress::Outbound { .. }));
+            kani::cover!(matches!(m, ToIngress::EndpointUpdate { .. }));
             assert!(m.encode(&mut out) == Some(len) && out.get(..len) == Some(b));
         }
         if let Ok(m) = Transport::decode(b) {
+            kani::cover!(!m.msg.is_empty());
             assert!(m.encode(&mut out) == Some(len) && out.get(..len) == Some(b));
         }
     }

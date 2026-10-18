@@ -56,9 +56,9 @@ CASES_FOR_GATE = {
     "lint": {"lint"},
     "unit": {"unit"},
     "kani": {"kani", "kani-cache"},
-    "bolero": {"bolero"},
+    "bolero": {"bolero", "bolero-wg-wire"},
     "laws": {"laws"},
-    "test": {"integration"},
+    "test": {"integration", "integration-count"},
     "manifest": {"manifest"},
 }
 
@@ -106,6 +106,10 @@ CASES = {
                                           "for_each(|bytes: &[u8]| if bytes.len() >= 20 { std::eprintln!(\"selftest-bolero-injected\"); panic!() })"),
                # bolero hides the panic message, so the injection prints its own.
                "selftest-bolero-injected"),
+    "bolero-wg-wire": (["bolero"], lambda t: edit(t, "crates/wg-wire/src/tests.rs",
+                                                  "bolero::check!().for_each(fuzz_one);",
+                                                  "bolero::check!().for_each(|b: &[u8]| if b.len() >= 20 { std::eprintln!(\"selftest-bolero-wg-injected\"); panic!() });"),
+                       "selftest-bolero-wg-injected"),
     # Editing a path dependency (wire) must re-prove ingress-core rather than
     # serve the cached pass copied in from the real tree.
     "kani-cache": (["kani", "kani_crates=ingress-core"],
@@ -121,8 +125,12 @@ CASES = {
     "laws": (["laws"], lambda t: edit(t, "system/secureos.system", "</system>", "    <selftest_unknown />\n</system>"), "L4"),
     "pins": (["pins"], lambda t: edit(t, "Makefile", "\trm -rf $(BUILD)", "\t-rm -rf $(BUILD)"), "P5"),
     "integration": (["test"], lambda t: edit(t, "tests/integration/run.py",
-                                              "        if handshake(bad):",
-                                              "        if not handshake(bad):"), "response opened with a wrong PSK"),
+                                              "        if bad.consume_response(resp):",
+                                              "        if not bad.consume_response(resp):"), "response opened with a wrong PSK"),
+    # A case that stops counting must fail the manifest, not just print fewer PASS lines.
+    "integration-count": (["test", "manifest"], lambda t: edit(t, "tests/integration/run.py",
+                                                               '        passed.append("unknown peer")\n', ""),
+                          "INTEGRATION-CASES: 7 < manifest 8"),
     # Until cookies (SC13) only debug kernels may be packaged, judged from
     # the kernel's gen_config.h (M2 plan F10/T13). Refused before any
     # secrets are read, so the paths need not exist.

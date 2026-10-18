@@ -165,7 +165,7 @@ fn valid_initiation(ts: [u8; 12]) -> (Initiator, [u8; INITIATION_LEN]) {
 }
 
 fn consume(r: &mut Responder<4>, msg: &[u8; INITIATION_LEN], now: u64, key: &mut TestKey) -> Result<Accepted, Reject> {
-    r.consume_initiation(msg, now, 0xaabb_ccdd, key, &mut CountingEntropy(0), &Peers)
+    r.consume_initiation(msg, now, || Some(0xaabb_ccdd), key, &mut CountingEntropy(0), &Peers)
 }
 
 #[test]
@@ -203,10 +203,10 @@ fn full_handshake_and_transport_in_both_directions() {
 fn responder_ephemeral_comes_from_entropy() {
     let (_, msg) = valid_initiation(tai64n(100, 0));
     let a = responder()
-        .consume_initiation(&msg, T0, 1, &mut TestKey::new(), &mut CountingEntropy(0), &Peers)
+        .consume_initiation(&msg, T0, || Some(1), &mut TestKey::new(), &mut CountingEntropy(0), &Peers)
         .unwrap();
     let b = responder()
-        .consume_initiation(&msg, T0, 1, &mut TestKey::new(), &mut CountingEntropy(7), &Peers)
+        .consume_initiation(&msg, T0, || Some(1), &mut TestKey::new(), &mut CountingEntropy(7), &Peers)
         .unwrap();
     let ea = MessageResponse::parse(&a.response).unwrap().ephemeral;
     let eb = MessageResponse::parse(&b.response).unwrap().ephemeral;
@@ -325,7 +325,7 @@ fn low_order_ephemeral_refused_by_key_holder_is_rejected() {
 fn entropy_failure_refuses_the_handshake() {
     let mut r = responder();
     let (_, msg) = valid_initiation(tai64n(100, 0));
-    let res = r.consume_initiation(&msg, T0, 1, &mut TestKey::new(), &mut NoEntropy, &Peers);
+    let res = r.consume_initiation(&msg, T0, || Some(1), &mut TestKey::new(), &mut NoEntropy, &Peers);
     assert_eq!(res.err(), Some(Reject::Entropy));
 }
 
@@ -340,7 +340,7 @@ fn peer_id_beyond_capacity_is_rejected_before_ss() {
     let mut r = responder();
     let mut key = TestKey::new();
     let (_, msg) = valid_initiation(tai64n(100, 0));
-    let res = r.consume_initiation(&msg, T0, 1, &mut key, &mut CountingEntropy(0), &FarPeers);
+    let res = r.consume_initiation(&msg, T0, || Some(1), &mut key, &mut CountingEntropy(0), &FarPeers);
     assert_eq!(res.err(), Some(Reject::PeerOutOfRange));
     assert_eq!(key.dh_calls, 1);
 }
@@ -368,4 +368,50 @@ fn transport_from_wrong_session_does_not_open() {
     let mut ct = [0u8; 32];
     let (c, n) = client.seal(b"x", &mut ct, T0).unwrap();
     assert_eq!(gw.open(c, &ct[..n], &mut [0u8; 32], T0), Err(SessionError::Auth));
+}
+
+/// One handshake initiation captured from wireguard-go (Debian package, in
+/// an unprivileged netns): initiator private key [0x42; 32] (`PEER_PRIV`),
+/// responder public key derived from [0x41; 32] (`GW_PRIV`), PSK [0x50; 32].
+/// The only fixture produced by an independent implementation, so a shared
+/// misreading of the whitepaper by this crate and its test initiator cannot
+/// pass it (code review T3).
+const WG_GO_INITIATION: &str = "01000000ffe5f42220cf3e9ad5c074b52f168acdef0bb3bd295b492d4e574fbdaf0a0a41\
+36893e2776567209857f129f163dd0dd353e85e93c15e7e2fa925b116ae4136602ab70248b56f970048d6c1aeda6d3acf3cbe\
+a5cab885a4f89b15e9cd1b0c8f76f8dbc4db699674ccda40c5f1a284a35de20bce1537a0456c34f1eecdb2c8ca50000000000\
+0000000000000000000000";
+
+fn wg_go_initiation() -> [u8; INITIATION_LEN] {
+    let mut msg = [0u8; INITIATION_LEN];
+    assert_eq!(WG_GO_INITIATION.len(), 2 * INITIATION_LEN);
+    for (i, b) in msg.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&WG_GO_INITIATION[2 * i..2 * i + 2], 16).unwrap();
+    }
+    msg
+}
+
+#[test]
+fn captured_wireguard_go_initiation_is_accepted() {
+    let msg = wg_go_initiation();
+    let acc = consume(&mut responder(), &msg, T0, &mut TestKey::new()).expect("wireguard-go initiation");
+    // The encrypted static decrypted to the configured peer's key.
+    assert_eq!(acc.peer, PeerId(1));
+    assert_eq!(acc.initiator_index, u32::from_le_bytes(msg[4..8].try_into().unwrap()));
+}
+
+#[test]
+fn captured_initiation_with_a_tampered_static_fails_to_decrypt() {
+    let mut msg = wg_go_initiation();
+    msg[40] ^= 1; // inside enc_static
+    // Re-MAC so the tamper reaches the AEAD instead of the mac1 check.
+    let key = crypto::hash(&[LABEL_MAC1, &gw_pub()]).unwrap();
+    let mac1 = crypto::mac(&key, &[&msg[..INITIATION_MAC1_OFFSET]]).unwrap();
+    msg[INITIATION_MAC1_OFFSET..INITIATION_MAC1_OFFSET + 16].copy_from_slice(&mac1);
+    assert!(matches!(consume(&mut responder(), &msg, T0, &mut TestKey::new()), Err(Reject::Decrypt)));
+}
+
+#[test]
+fn captured_initiation_for_another_responder_fails_mac1() {
+    let mut r: Responder<4> = Responder::new(&crypto::public_key(&Key32::from_bytes(STRANGER_PRIV))).unwrap();
+    assert!(matches!(consume(&mut r, &wg_go_initiation(), T0, &mut TestKey::new()), Err(Reject::BadMac1)));
 }

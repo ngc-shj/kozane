@@ -1,7 +1,8 @@
 //! `inner` decision logic (plan C13): the gateway's inside-LAN face. It
 //! answers ARP for the inside address, forwards IPv4 from static neighbors
 //! (source IP and MAC must both match one) towards the tunnel, and frames
-//! decrypted packets for a static neighbor. No ARP cache: every address
+//! decrypted packets for a static neighbor. Both directions are routed hops:
+//! TTL is decremented and TTL <= 1 is dropped (`wire::forward_ipv4`). No ARP cache: every address
 //! comes from the compiled configuration (law L6). Pure and total, so it
 //! is unit-tested and proved on the host; the PD only moves bytes.
 
@@ -37,11 +38,12 @@ impl Config<'_> {
 
 /// Result of a frame received on the inside NIC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FromLan<'a> {
+pub enum FromLan {
     /// ARP reply of this many bytes was written to `out`.
     ArpReplied(usize),
-    /// IPv4 datagram to send through the tunnel, verbatim.
-    Forward(&'a [u8]),
+    /// IPv4 datagram of this many bytes, written to `out` with its TTL
+    /// decremented, to send through the tunnel.
+    Forward(usize),
     Dropped(DropReason),
     NotForUs,
     /// Addressed to the gateway itself; nothing listens on the inside.
@@ -64,20 +66,20 @@ pub enum ToLan {
 
 const BROADCAST: Mac = [0xff; 6];
 
-pub fn from_lan<'a>(cfg: &Config<'_>, frame: &'a [u8], out: &mut [u8]) -> FromLan<'a> {
+pub fn from_lan(cfg: &Config<'_>, frame: &[u8], out: &mut [u8]) -> FromLan {
     let f = match wire::parse_frame_ip(frame) {
         Ok(f) => f,
         Err(r) => return FromLan::Dropped(r),
     };
     match f.body {
         Body::Arp(a) => arp(cfg, &f.eth, &a, out),
-        Body::Ipv4(p) => ipv4(cfg, &f.eth, &p),
+        Body::Ipv4(p) => ipv4(cfg, &f.eth, &p, out),
         // `parse_frame_ip` never yields it.
         Body::Udp4(_) => FromLan::NoService,
     }
 }
 
-fn arp<'a>(cfg: &Config<'_>, eth: &EthAddrs, a: &ArpPacket, out: &mut [u8]) -> FromLan<'a> {
+fn arp(cfg: &Config<'_>, eth: &EthAddrs, a: &ArpPacket, out: &mut [u8]) -> FromLan {
     if (eth.dst != cfg.mac && eth.dst != BROADCAST) || a.tpa != cfg.ipv4 {
         return FromLan::NotForUs;
     }
@@ -97,7 +99,7 @@ fn arp<'a>(cfg: &Config<'_>, eth: &EthAddrs, a: &ArpPacket, out: &mut [u8]) -> F
     }
 }
 
-fn ipv4<'a>(cfg: &Config<'_>, eth: &EthAddrs, p: &Ip4Packet<'a>) -> FromLan<'a> {
+fn ipv4(cfg: &Config<'_>, eth: &EthAddrs, p: &Ip4Packet<'_>, out: &mut [u8]) -> FromLan {
     if eth.dst != cfg.mac {
         return FromLan::NotForUs;
     }
@@ -107,12 +109,19 @@ fn ipv4<'a>(cfg: &Config<'_>, eth: &EthAddrs, p: &Ip4Packet<'a>) -> FromLan<'a> 
     if p.dst == cfg.ipv4 {
         return FromLan::NoService;
     }
-    FromLan::Forward(p.packet)
+    match wire::forward_ipv4(p.packet, out) {
+        Ok(n) => FromLan::Forward(n),
+        Err(r) => FromLan::Dropped(r),
+    }
 }
 
 pub fn to_lan(cfg: &Config<'_>, packet: &[u8], out: &mut [u8]) -> ToLan {
-    let p = match wire::parse_ipv4_packet(packet) {
-        Ok(p) => p,
+    let mut hop = [0u8; wire::MAX_FRAME];
+    let p = match wire::forward_ipv4(packet, &mut hop) {
+        Ok(n) => match wire::parse_ipv4_packet(hop.get(..n).unwrap_or(&[])) {
+            Ok(p) => p,
+            Err(r) => return ToLan::Dropped(r),
+        },
         Err(r) => return ToLan::Dropped(r),
     };
     let Some(dst) = cfg.neighbor_mac(&p.dst) else {
@@ -149,9 +158,10 @@ mod proofs {
         if let FromLan::ArpReplied(n) = o {
             assert!(n <= out.len());
         }
-        if let FromLan::Forward(p) = o {
+        if let FromLan::Forward(n) = o {
+            assert!(n <= out.len());
             let src_mac = frame.get(6..12);
-            let src_ip = p.get(12..16);
+            let src_ip = out.get(12..16);
             assert!(src_mac == Some(&CFG.neighbors[0].1[..]) && src_ip == Some(&CFG.neighbors[0].0[..]));
         }
         kani::cover!(matches!(o, FromLan::ArpReplied(_)));

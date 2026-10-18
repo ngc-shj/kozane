@@ -52,10 +52,21 @@ where
         Self { used: Producer::new(used), free: Consumer::new(free), pool: Pool::new(true), region, dead: false, scrub: false }
     }
 
-    /// A sender that zeroes every returned buffer in the shared region, so
-    /// a message carrying key material does not outlive its delivery.
+    /// A sender that zeroes the whole shared region at construction and
+    /// every returned buffer thereafter, so neither boot-time residue nor a
+    /// message carrying key material outlives sender ownership/delivery.
     pub fn new_scrubbing(used: U, free: F, region: Region) -> Self {
-        Self { scrub: true, ..Self::new(used, free, region) }
+        let mut sender = Self { scrub: true, ..Self::new(used, free, region) };
+        let zero = [0u8; BUF];
+        for idx in 0..M {
+            if sender.region.write_from(buf_offset::<BUF>(idx), &zero).is_err() {
+                // The unsafe constructor contract says the region holds all
+                // M buffers. Fail closed if a caller violated that contract.
+                sender.dead = true;
+                break;
+            }
+        }
+        sender
     }
 
     /// Takes back buffers the receiver has returned. Stops at the first bad

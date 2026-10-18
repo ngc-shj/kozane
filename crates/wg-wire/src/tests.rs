@@ -1,5 +1,7 @@
 #![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::arithmetic_side_effects, clippy::panic)]
 
+extern crate std;
+
 use super::replay::ReplayWindow;
 use super::*;
 
@@ -195,4 +197,44 @@ fn replay_window_is_exactly_bits_minus_one_wide() {
     assert!(c.check_and_update(100));
     assert!(c.check_and_update(100 - 63));
     assert!(!c.check_and_update(100 - 64));
+}
+
+/// Every parser is total and whatever parses re-emits to the same bytes; the
+/// replay window agrees with a set-based model of its specification (exact
+/// window of BITS - 1 below the highest accepted counter). Beyond Kani's
+/// 152-byte bound: transport messages of any length (code review T2).
+fn fuzz_one(bytes: &[u8]) {
+    let mut out = [0u8; 2048];
+    if let Ok(m) = MessageInitiation::parse(bytes) {
+        let n = m.emit(&mut out).unwrap();
+        assert_eq!(&out[..n], bytes);
+    }
+    if let Ok(m) = MessageResponse::parse(bytes) {
+        let n = m.emit(&mut out).unwrap();
+        assert_eq!(&out[..n], bytes);
+    }
+    if let Ok(t) = Transport::parse(bytes) {
+        let n = emit_transport_header(t.receiver, t.counter, &mut out).unwrap();
+        assert_eq!(&out[..n], &bytes[..n]);
+        assert_eq!(t.ciphertext, &bytes[n..]);
+    }
+    // Replay window vs model, counters from consecutive byte pairs so they
+    // fall inside and outside the window often.
+    let mut w = ReplayWindow::<64>::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut max: Option<u64> = None;
+    for pair in bytes.as_chunks::<2>().0 {
+        let c = u64::from(u16::from_le_bytes(*pair));
+        let expect = !seen.contains(&c) && max.is_none_or(|m| c + ReplayWindow::<64>::WINDOW >= m);
+        assert_eq!(w.check_and_update(c), expect, "counter {c}, max {max:?}");
+        if expect {
+            seen.insert(c);
+            max = Some(max.map_or(c, |m| m.max(c)));
+        }
+    }
+}
+
+#[test]
+fn fuzz_parsers_never_panic_and_round_trip() {
+    bolero::check!().for_each(fuzz_one);
 }

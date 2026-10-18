@@ -84,6 +84,8 @@ pub enum Reject {
     /// Less than `INITIATION_MIN_INTERVAL_NS` since this peer's last accepted initiation.
     Flood,
     Entropy,
+    /// No receiver index left to issue (after 2^32 accepted handshakes).
+    IndexExhausted,
     Crypto(CryptoError),
 }
 
@@ -136,12 +138,15 @@ impl<const MAX_PEERS: usize> Responder<MAX_PEERS> {
     /// Verifies and consumes a handshake initiation and builds the response.
     ///
     /// mac1 is checked before any DH; an unknown static key is rejected
-    /// after the first DH (`es`) and before the second (`ss`).
+    /// after the first DH (`es`) and before the second (`ss`). `local_index`
+    /// is asked for our receiver index only once the initiation has
+    /// authenticated and passed the replay and flood checks, so rejected
+    /// initiations cannot use up the index space.
     pub fn consume_initiation(
         &mut self,
         msg: &[u8; wg_wire::INITIATION_LEN],
         now_ns: u64,
-        local_index: u32,
+        local_index: impl FnOnce() -> Option<u32>,
         key: &mut impl StaticKey,
         entropy: &mut impl Entropy,
         peers: &impl PeerTable,
@@ -191,6 +196,7 @@ impl<const MAX_PEERS: usize> Responder<MAX_PEERS> {
         // so a later failure cannot let the same initiation be replayed.
         state.last_timestamp = timestamp;
         state.last_accept_ns = Some(now_ns);
+        let local_index = local_index().ok_or(Reject::IndexExhausted)?;
 
         // e (ours)
         let mut e_priv = Key32::zero();

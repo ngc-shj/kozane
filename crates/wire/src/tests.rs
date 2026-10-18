@@ -269,7 +269,7 @@ fn udp_bad_checksum() {
 
 /// One frame per reason. The exhaustive match makes a new `DropReason`
 /// a compile error here until it has a triggering frame.
-fn frame_for(r: DropReason) -> Vec<u8> {
+fn frame_for(r: DropReason) -> Option<Vec<u8>> {
     let mut b = udp_frame(b"abcd");
     match r {
         DropReason::TooShort => b.truncate(13),
@@ -299,15 +299,53 @@ fn frame_for(r: DropReason) -> Vec<u8> {
         }
         DropReason::UdpBadLength => b[ETH_HDR + IPV4_HDR + 5] -= 1,
         DropReason::UdpBadChecksum => *b.last_mut().unwrap() ^= 1,
+        // Forwarding only; see `forward_*` tests below.
+        DropReason::TtlExpired => return None,
     }
-    b
+    Some(b)
 }
 
 #[test]
-fn every_drop_reason_is_produced_by_its_frame() {
+fn every_parser_drop_reason_is_produced_by_its_frame() {
     for &r in DropReason::ALL {
-        assert_eq!(reason(&frame_for(r)), r);
+        if let Some(f) = frame_for(r) {
+            assert_eq!(reason(&f), r);
+        }
     }
+}
+
+fn ip_with_ttl(ttl: u8) -> Vec<u8> {
+    let mut b = udp_frame(b"abcd");
+    b[ETH_HDR + 8] = ttl;
+    fix_ip_csum(&mut b);
+    b[ETH_HDR..].to_vec()
+}
+
+#[test]
+fn forward_decrements_ttl_and_fixes_the_checksum() {
+    let p = ip_with_ttl(64);
+    let mut out = [0u8; MAX_FRAME];
+    let n = forward_ipv4(&p, &mut out).unwrap();
+    assert_eq!(n, p.len());
+    assert_eq!(out[8], 63);
+    assert_eq!(csum_fold(csum_add(0, &out[..IPV4_HDR])), 0);
+    assert_eq!(&out[IPV4_HDR..n], &p[IPV4_HDR..]);
+    assert!(parse_ipv4_packet(&out[..n]).is_ok());
+}
+
+#[test]
+fn forward_boundary_is_ttl_two() {
+    let mut out = [0u8; MAX_FRAME];
+    assert_eq!(forward_ipv4(&ip_with_ttl(2), &mut out).map(|_| out[8]), Ok(1));
+    assert_eq!(forward_ipv4(&ip_with_ttl(1), &mut out), Err(DropReason::TtlExpired));
+    assert_eq!(forward_ipv4(&ip_with_ttl(0), &mut out), Err(DropReason::TtlExpired));
+}
+
+#[test]
+fn forward_refuses_what_the_parser_refuses() {
+    let mut p = ip_with_ttl(64);
+    p[10] ^= 1;
+    assert_eq!(forward_ipv4(&p, &mut [0u8; MAX_FRAME]), Err(DropReason::Ipv4BadChecksum));
 }
 
 #[test]

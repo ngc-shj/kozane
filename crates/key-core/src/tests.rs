@@ -83,8 +83,21 @@ fn boot_error_messages_are_distinct() {
         BootError::GatewayKeyMismatch,
         BootError::PeerMismatch,
         BootError::Blob(BlobError::BadMagic),
+        BootError::Blob(BlobError::BadVersion),
+        BootError::Blob(BlobError::BadPeerCount),
         BootError::Blob(BlobError::BadChecksum),
+        BootError::Blob(BlobError::NonZeroPadding),
+        BootError::Blob(BlobError::TooSmall),
     ];
+    // Exhaustive: a new BlobError variant fails to compile until listed above.
+    let _listed = |e: BlobError| match e {
+        BlobError::BadMagic
+        | BlobError::BadVersion
+        | BlobError::BadPeerCount
+        | BlobError::BadChecksum
+        | BlobError::NonZeroPadding
+        | BlobError::TooSmall => (),
+    };
     for (i, a) in all.iter().enumerate() {
         for b in &all[i + 1..] {
             assert_ne!(a.message(), b.message());

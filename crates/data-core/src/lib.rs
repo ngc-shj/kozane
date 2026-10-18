@@ -115,6 +115,9 @@ struct Peer {
     next: Option<Session>,
     current: Option<Session>,
     previous: Option<Session>,
+    /// Last endpoint `ingress` is known to have been told (see
+    /// `endpoint_delivered`); suppresses repeated identical updates.
+    endpoint: Option<Endpoint>,
 }
 
 impl Peer {
@@ -160,7 +163,8 @@ impl<const MAX_PEERS: usize> Data<MAX_PEERS> {
 
     /// Replaces `peer`'s `next` (an older unconfirmed `next` is dropped). The
     /// keys are copied out of `msg`; the caller zeroes its install buffer.
-    pub fn install(&mut self, msg: &Install<'_>) -> InstallOutcome {
+    /// The session clock starts at `now_ns`, taken by `data` itself.
+    pub fn install(&mut self, msg: &Install<'_>, now_ns: u64) -> InstallOutcome {
         if self.find(msg.local_index).is_some() {
             return InstallOutcome::IndexCollision;
         }
@@ -168,7 +172,7 @@ impl<const MAX_PEERS: usize> Data<MAX_PEERS> {
             return InstallOutcome::PeerOutOfRange;
         };
         let keys = SessionKeys { send: Key32::from_bytes(*msg.send), recv: Key32::from_bytes(*msg.recv) };
-        p.next = Some(Session::new(keys, msg.local_index, msg.remote_index, msg.created_ns));
+        p.next = Some(Session::new(keys, msg.local_index, msg.remote_index, now_ns));
         InstallOutcome::Installed
     }
 
@@ -201,8 +205,10 @@ impl<const MAX_PEERS: usize> Data<MAX_PEERS> {
             Ok(n) => n,
             Err(e) => return InboundOutcome::Rejected(e),
         };
-        // `None < Some(_)`: the first accepted counter is a new maximum.
-        let endpoint = (before < Some(t.counter)).then_some(src);
+        // `None < Some(_)`: the first accepted counter is a new maximum. An
+        // update is due only when the source differs from what `ingress`
+        // last accepted: one per roam, not one per packet.
+        let endpoint = (before < Some(t.counter) && p.endpoint != Some(src)).then_some(src);
         let promoted = slot == Slot::Next;
         if promoted {
             p.promote();
@@ -211,6 +217,15 @@ impl<const MAX_PEERS: usize> Data<MAX_PEERS> {
         // `find` only yields peers below MAX_PEERS, which fit in u16.
         let peer = u16::try_from(peer).unwrap_or(u16::MAX);
         InboundOutcome::Authenticated { peer, endpoint, promoted, payload }
+    }
+
+    /// Records that `ingress` accepted an `EndpointUpdate` for `peer`. Call
+    /// only after the update was actually sent: until then every new
+    /// highest counter from that source asks for it again.
+    pub fn endpoint_delivered(&mut self, peer: u16, endpoint: Endpoint) {
+        if let Some(p) = self.peers.get_mut(usize::from(peer)) {
+            p.endpoint = Some(endpoint);
+        }
     }
 
     /// Seals an IPv4 datagram from `inner` for the peer whose allowed IPs

@@ -21,7 +21,7 @@ loader := $(BUILD)/loader.img
 counts := $(BUILD)/counts
 
 pds := eth-out eth-in ingress audit timer key hs inner data
-host_crates := wire ring audit-event ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core
+host_crates := wire ring audit-event ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu
 kani_crates := wire ring ingress-core inner-core wg-wire msgs
 
 .PHONY: clean-counts
@@ -84,13 +84,21 @@ package: image
 		--search-path $(BUILD) --board $(MICROKIT_BOARD) --config $(MICROKIT_CONFIG) \
 		--microkit $(MICROKIT_SDK)/bin/microkit
 
-run: image
+# Boots an image interactively with both NICs as the integration test does
+# (outside on user-net with 51820 forwarded to RUN_PORT, inside on a dgram
+# socket). The default image holds the zero placeholder, so `key` halts;
+# boot a packaged one with LOADER=<dir>/loader.img.
+LOADER ?= $(loader)
+RUN_PORT ?= 51820
+run:
 	qemu-system-aarch64 \
-		-machine virt,virtualization=on -cpu cortex-a53 -m size=2G \
+		-machine virt,virtualization=on -cpu neoverse-n2 -m size=2G \
 		-serial mon:stdio -nographic \
-		-device loader,file=$(loader),addr=0x70000000,cpu-num=0 \
-		-device virtio-net-device,netdev=n0,mac=52:54:00:12:34:56 \
-		-netdev user,id=n0,hostfwd=udp:127.0.0.1:7777-:7
+		-device loader,file=$(LOADER),addr=0x70000000,cpu-num=0 \
+		-device virtio-net-device,netdev=n0,mac=52:54:00:12:34:56,bus=virtio-mmio-bus.31 \
+		-netdev user,id=n0,hostfwd=udp:127.0.0.1:$(RUN_PORT)-:51820 \
+		-device virtio-net-device,netdev=n1,mac=52:54:00:12:34:57,bus=virtio-mmio-bus.23 \
+		-netdev dgram,id=n1,local.type=inet,local.host=127.0.0.1,local.port=45001,remote.type=inet,remote.host=127.0.0.1,remote.port=45002
 
 # The crate-level clippy denies (indexing, unwrap, arithmetic) only bite here.
 lint: | $(counts)
@@ -116,26 +124,41 @@ unit: | $(counts)
 
 kani: | $(counts)
 	rm -f $(counts)/kani.log
-	$(foreach c,$(kani_crates),tools/kani-gate.sh -p $(c) $(kani_args_$(c)) >> $(counts)/kani.log \
+	$(foreach c,$(kani_crates),echo "KANI-CRATE $(c)" >> $(counts)/kani.log; \
+		tools/kani-gate.sh -p $(c) $(kani_args_$(c)) >> $(counts)/kani.log \
 		|| { cat $(counts)/kani.log; exit 1; };)
-	awk '/^KANI-HARNESSES/ { n += $$2 } END { print "KANI-HARNESSES", n }' $(counts)/kani.log > $(counts)/kani
+	# Per-crate counts too (M2 plan T12), keyed KANI-<CRATE>.
+	awk '/^KANI-CRATE / { c = toupper($$2) } /^KANI-HARNESSES/ { n += $$2; per[c] += $$2 } \
+		END { print "KANI-HARNESSES", n; for (k in per) print "KANI-" k, per[k] }' \
+		$(counts)/kani.log > $(counts)/kani
 
-bolero_target := -p wire tests::fuzz_parse_never_panics_and_round_trips
+bolero_targets := wire/tests::fuzz_parse_never_panics_and_round_trips \
+	wg-wire/tests::fuzz_parsers_never_panic_and_round_trip
 
-# Requires > 0 fuzz iterations, so a target that silently stops running fails.
+# Each target must load its committed seed corpus and complete > 0 runs, so
+# a target that silently stops running fails (BOLERO-TARGETS).
 bolero: | $(counts)
 	cargo metadata --locked --format-version 1 > /dev/null
-	cargo bolero test $(bolero_target) -T 30s > $(counts)/bolero.log 2>&1 \
-		|| { awk '{ l[NR] = $$0 } /panicked|deadly signal/ && !p { for (i = (NR > 60 ? NR - 60 : 1); i <= NR; i++) print l[i]; p = 1 }' \
-			$(counts)/bolero.log; tail -20 $(counts)/bolero.log; exit 1; }
-	# The committed seed corpus must have been loaded, and the target must have run.
-	grep -qE 'INFO: +[1-9][0-9]* files found in .*/corpus' $(counts)/bolero.log \
-		|| { echo "bolero: seed corpus not loaded"; exit 1; }
-	awk '/^Done [0-9]+ runs/ && $$2 > 0 { n++ } END { print "BOLERO-TARGETS", n + 0 }' $(counts)/bolero.log > $(counts)/bolero
+	rm -f $(counts)/bolero.log
+	$(foreach t,$(bolero_targets),$(call bolero_one,$(word 1,$(subst /, ,$(t))),$(word 2,$(subst /, ,$(t)))))
+	awk '/^BOLERO-TARGET-OK/ { n++ } END { print "BOLERO-TARGETS", n + 0 }' $(counts)/bolero.log > $(counts)/bolero
+
+define bolero_one
+	cargo bolero test -p $(1) $(2) -T 30s > $(counts)/bolero-$(1).log 2>&1 \
+		|| { awk '{ l[NR] = $$$$0 } /panicked|deadly signal/ && !p { for (i = (NR > 60 ? NR - 60 : 1); i <= NR; i++) print l[i]; p = 1 }' \
+			$(counts)/bolero-$(1).log; tail -20 $(counts)/bolero-$(1).log; exit 1; }
+	grep -qE 'INFO: +[1-9][0-9]* files found in .*/corpus' $(counts)/bolero-$(1).log \
+		|| { echo "bolero: seed corpus not loaded for $(1)"; exit 1; }
+	grep -qE '^Done [1-9][0-9]* runs' $(counts)/bolero-$(1).log \
+		|| { echo "bolero: $(1) completed no runs"; exit 1; }
+	cat $(counts)/bolero-$(1).log >> $(counts)/bolero.log
+	echo "BOLERO-TARGET-OK $(1)" >> $(counts)/bolero.log
+
+endef
 
 fuzz-long:
 	cargo metadata --locked --format-version 1 > /dev/null
-	cargo bolero test $(bolero_target) -T 600s
+	$(foreach t,$(bolero_targets),cargo bolero test -p $(word 1,$(subst /, ,$(t))) $(word 2,$(subst /, ,$(t))) -T 600s;)
 
 laws: | $(counts)
 	cargo run --locked -q -p laws -- check --system $(system) --policy $(policy) --search-path $(BUILD) --no-elf-check
@@ -146,9 +169,10 @@ pins: | $(counts)
 	python3 tests/tools/test_check_pins.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_check_selftest.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_package.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	python3 tests/tools/test_config_build.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	docker/make-seccomp.py --check >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_seccomp.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES)' $(counts)/pins.log > $(counts)/pins
+	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES)' $(counts)/pins.log > $(counts)/pins
 
 # Builds its own deployment (fresh keys, generated config, package); see run.py.
 test: | $(counts)

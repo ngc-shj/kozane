@@ -50,6 +50,11 @@ impl Prefix {
         let lo = a & mask;
         (lo, lo | !mask)
     }
+
+    fn contains(&self, ip: [u8; 4]) -> bool {
+        let (lo, hi) = self.range();
+        (lo..=hi).contains(&u32::from_be_bytes(ip))
+    }
 }
 
 #[derive(Debug)]
@@ -118,7 +123,15 @@ pub fn parse_prefix(s: &str) -> Result<Prefix, String> {
     Ok(p)
 }
 
-/// Validates a configuration; `max_peers` comes from the secrets format.
+/// Most peers an image can serve: `data` keeps three sessions per peer and
+/// its replay windows dominate its memory (deviation log). Rendered into the
+/// config crate as `MAX_PEERS`, so every PD sizes its tables from this one
+/// value; build.rs asserts it fits the secrets region (secret_blob::MAX_PEERS).
+pub const MAX_PEERS: usize = 8;
+/// Most static inside neighbors (`inner`'s table), rendered as `MAX_NEIGHBORS`.
+pub const MAX_NEIGHBORS: usize = 64;
+
+/// Validates a configuration. `max_peers` is `MAX_PEERS` except in tests.
 pub fn check(text: &str, max_peers: usize) -> Result<Checked, String> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| format!("config: {e}"))?;
     let g = &raw.gateway;
@@ -152,13 +165,34 @@ pub fn check(text: &str, max_peers: usize) -> Result<Checked, String> {
     if peers.iter().any(|(k, _)| *k == gateway_public) {
         return Err("config: a peer uses the gateway's own key".into());
     }
+    let outside_ip = parse_ip(&g.outside_ip)?;
+    let inside_ip = parse_ip(&g.inside_ip)?;
+    if raw.neighbors.len() > MAX_NEIGHBORS {
+        return Err(format!("config: at most {MAX_NEIGHBORS} neighbors, got {}", raw.neighbors.len()));
+    }
     let mut neighbors = Vec::new();
     for n in &raw.neighbors {
         let ip = parse_ip(&n.ip)?;
         if neighbors.iter().any(|(i, _)| *i == ip) {
             return Err(format!("config: duplicate neighbor {}", n.ip));
         }
+        if ip == inside_ip || ip == outside_ip {
+            return Err(format!("config: neighbor {} uses a gateway address", n.ip));
+        }
         neighbors.push((ip, parse_mac(&n.mac)?));
+    }
+    // A tunnel source inside a peer's allowed IPs passes `data`'s spoofing
+    // check, so no allowed IP may stand for a gateway or inside-host address
+    // (otherwise a peer could speak as that host on the inside LAN).
+    for (i, (_, ps)) in peers.iter().enumerate() {
+        for p in ps {
+            if p.contains(inside_ip) || p.contains(outside_ip) {
+                return Err(format!("config: allowed IPs of peer {i} cover a gateway address"));
+            }
+            if let Some((ip, _)) = neighbors.iter().find(|(ip, _)| p.contains(*ip)) {
+                return Err(format!("config: allowed IPs of peer {i} cover neighbor {}", std::net::Ipv4Addr::from(*ip)));
+            }
+        }
     }
     if g.listen_port == 0 {
         return Err("config: listen_port must be non-zero".into());
@@ -166,10 +200,10 @@ pub fn check(text: &str, max_peers: usize) -> Result<Checked, String> {
     Ok(Checked {
         gateway_public,
         listen_port: g.listen_port,
-        outside_ip: parse_ip(&g.outside_ip)?,
+        outside_ip,
         outside_mac: parse_mac(&g.outside_mac)?,
         outside_router_mac: parse_mac(&g.outside_router_mac)?,
-        inside_ip: parse_ip(&g.inside_ip)?,
+        inside_ip,
         inside_mac: parse_mac(&g.inside_mac)?,
         neighbors,
         peers,
@@ -178,6 +212,8 @@ pub fn check(text: &str, max_peers: usize) -> Result<Checked, String> {
 
 pub fn render(c: &Checked) -> String {
     let mut s = String::new();
+    s += &format!("pub const MAX_PEERS: usize = {MAX_PEERS};\n");
+    s += &format!("pub const MAX_NEIGHBORS: usize = {MAX_NEIGHBORS};\n");
     s += &format!("pub const GATEWAY_PUBLIC: [u8; 32] = {:?};\n", c.gateway_public);
     s += &format!("pub const LISTEN_PORT: u16 = {};\n", c.listen_port);
     s += &format!("pub const OUTSIDE_IP: [u8; 4] = {:?};\n", c.outside_ip);

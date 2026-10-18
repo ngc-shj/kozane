@@ -79,16 +79,22 @@ fn check_out_dir(out: &Path, forbidden: &[PathBuf]) -> Result<PathBuf, String> {
     Ok(resolved)
 }
 
-fn forbidden_roots() -> Vec<PathBuf> {
+/// The repository (which contains `build/`) and the toolchain caches. The
+/// repository must resolve: a binary run where its source tree is absent
+/// would otherwise silently drop the most important root. Caches that do
+/// not exist are skipped (nothing can be written under them).
+fn forbidden_roots() -> Result<Vec<PathBuf>, String> {
+    let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut roots = vec![repo.canonicalize().map_err(|e| format!("cannot resolve the repository {}: {e}", repo.display()))?];
     let home = std::env::var_os("HOME").map(PathBuf::from);
-    let candidates = [
-        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")),
+    let caches = [
         std::env::var_os("CARGO_HOME").map(PathBuf::from),
         std::env::var_os("RUSTUP_HOME").map(PathBuf::from),
         home.as_ref().map(|h| h.join(".cargo")),
         home.as_ref().map(|h| h.join(".rustup")),
     ];
-    candidates.into_iter().flatten().filter_map(|p| p.canonicalize().ok()).collect()
+    roots.extend(caches.into_iter().flatten().filter_map(|p| p.canonicalize().ok()));
+    Ok(roots)
 }
 
 struct Deployment {
@@ -103,8 +109,8 @@ fn peer_ip(i: usize) -> String {
 
 /// Builds every output in memory; nothing touches the disk here.
 fn generate(template: &str, peers: usize, endpoint: &str) -> Result<Deployment, String> {
-    if peers == 0 || peers > secret_blob::MAX_PEERS.min(250) {
-        return Err(format!("--peers must be 1..={}", secret_blob::MAX_PEERS.min(250)));
+    if peers == 0 || peers > validate::MAX_PEERS {
+        return Err(format!("--peers must be 1..={}", validate::MAX_PEERS));
     }
     let raw: validate::RawConfig = toml::from_str(template).map_err(|e| format!("template: {e}"))?;
     let g = &raw.gateway;
@@ -134,7 +140,7 @@ fn generate(template: &str, peers: usize, endpoint: &str) -> Result<Deployment, 
             peer_ip(i)
         ));
     }
-    validate::check(&config, secret_blob::MAX_PEERS).map_err(|e| format!("generated config invalid: {e}"))?;
+    validate::check(&config, validate::MAX_PEERS).map_err(|e| format!("generated config invalid: {e}"))?;
 
     let mut blob = Box::new([0u8; secret_blob::REGION_SIZE]);
     let blob_peers: Vec<([u8; 32], [u8; 32])> = peer_keys.iter().map(|(kp, psk)| (kp.public, *psk)).collect();
@@ -192,7 +198,7 @@ fn run(args: &[String]) -> Result<(), String> {
     let (Some(template), Some(peers), Some(out)) = (template, peers, out) else {
         return Err("usage: mksecrets --template FILE --peers N --out DIR [--endpoint HOST:PORT]".into());
     };
-    let dir = check_out_dir(&out, &forbidden_roots())?;
+    let dir = check_out_dir(&out, &forbidden_roots()?)?;
     let text = std::fs::read_to_string(&template).map_err(|e| format!("{template}: {e}"))?;
     let d = generate(&text, peers, &endpoint)?;
 

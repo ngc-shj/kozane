@@ -19,7 +19,10 @@ use wg_core::wire::{INITIATION_LEN, INITIATION_MAC1_OFFSET};
 const ETH_OUT: Channel = Channel::new(ch::CH_ETH_OUT);
 const HS: Channel = Channel::new(ch::CH_HS);
 const DATA: Channel = Channel::new(ch::CH_DATA);
-const MAX_PEERS: usize = 61;
+const MAX_PEERS: usize = config::MAX_PEERS;
+// The configuration was validated against this bound at build time; the
+// assertion keeps the PD's tables from silently diverging from it.
+const _: () = assert!(config::PEERS.len() <= MAX_PEERS);
 const BUCKETS: usize = 64;
 
 const CONFIG: Config = Config {

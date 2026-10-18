@@ -90,6 +90,10 @@ pub enum Event {
     SessionPromoted,
     /// A session reached REJECT_AFTER_TIME and was zeroized.
     SessionExpired,
+    /// `key` refused a request because `hs`'s call budget was exhausted.
+    HandshakeKeyRateLimited,
+    /// Transport packet for a receiver index with no live session.
+    TransportUnknownIndex,
 }
 
 impl Event {
@@ -124,6 +128,8 @@ impl Event {
             Event::UnknownNeighbor => 0x002f,
             Event::SessionPromoted => 0x0030,
             Event::SessionExpired => 0x0031,
+            Event::HandshakeKeyRateLimited => 0x0032,
+            Event::TransportUnknownIndex => 0x0033,
             Event::FrameDropped { reason } => {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
             }
@@ -131,7 +137,7 @@ impl Event {
     }
 
     /// Every variant except the parameterised `FrameDropped`.
-    pub const FIXED: [Event; 29] = [
+    pub const FIXED: [Event; 31] = [
         Event::ArpReplied,
         Event::UdpEchoed,
         Event::RingCorrupt,
@@ -161,6 +167,8 @@ impl Event {
         Event::UnknownNeighbor,
         Event::SessionPromoted,
         Event::SessionExpired,
+        Event::HandshakeKeyRateLimited,
+        Event::TransportUnknownIndex,
     ];
 
     /// Display name; exhaustive, so a new variant fails to compile here.
@@ -195,6 +203,8 @@ impl Event {
             Event::UnknownNeighbor => "UnknownNeighbor",
             Event::SessionPromoted => "SessionPromoted",
             Event::SessionExpired => "SessionExpired",
+            Event::HandshakeKeyRateLimited => "HandshakeKeyRateLimited",
+            Event::TransportUnknownIndex => "TransportUnknownIndex",
             Event::FrameDropped { .. } => "FrameDropped",
         }
     }
@@ -236,6 +246,8 @@ impl Event {
             Event::UnknownNeighbor => 26,
             Event::SessionPromoted => 27,
             Event::SessionExpired => 28,
+            Event::HandshakeKeyRateLimited => 29,
+            Event::TransportUnknownIndex => 30,
             Event::FrameDropped { reason } => {
                 // FIXED_SLOTS..FIXED_SLOTS+64, clamped like `code`.
                 let r = if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason };
@@ -245,7 +257,7 @@ impl Event {
     }
 }
 
-const FIXED_SLOTS: usize = 29;
+const FIXED_SLOTS: usize = 31;
 const SLOTS: usize = FIXED_SLOTS + MAX_DROP_REASON as usize + 1;
 
 /// Per-producer coalescing state.

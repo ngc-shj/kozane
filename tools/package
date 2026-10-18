@@ -11,8 +11,11 @@ The result is accepted only if, against the placeholder build:
   - the loader images have equal length, differ somewhere, and every
     differing byte lies inside the one place the blob appears in the new
     image, where the placeholder image held zeros;
-  - the blob is a full, non-zero region with the right magic, read from a
-    path outside the repository.
+  - the blob is a full, non-zero region with the right magic.
+Both the blob and OUT must resolve outside the repository (and so `build/`)
+and the toolchain caches. OUT must not exist yet: the image is built in a
+fresh 0700 staging directory beside it under umask 077, renamed into place
+only after every check passed, and removed on every failure path.
 Until cookies land (SC13, architecture R6) only `debug` kernels may be
 packaged, read from the kernel's own gen_config.h rather than a make
 variable.
@@ -21,8 +24,10 @@ variable.
 import argparse
 import os
 import pathlib
+import shutil
 import subprocess
 import sys
+import tempfile
 import xml.etree.ElementTree as ET
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -49,11 +54,41 @@ def check_blob(blob: bytes) -> list:
     return errors
 
 
-def check_secrets_path(path: pathlib.Path, repo: pathlib.Path) -> list:
-    resolved = path.resolve()
-    if resolved.is_relative_to(repo.resolve()):
-        return [f"package: secrets path {resolved} is inside the repository"]
+def forbidden_roots(repo: pathlib.Path) -> list:
+    """The repository (which contains `build/`) and the toolchain caches,
+    resolved. The repo must resolve; a cache that does not exist is skipped
+    (nothing can be written under it)."""
+    roots = [repo.resolve(strict=True)]
+    home = os.environ.get("HOME")
+    for p in (os.environ.get("CARGO_HOME"), os.environ.get("RUSTUP_HOME"),
+              home and os.path.join(home, ".cargo"), home and os.path.join(home, ".rustup")):
+        if p and os.path.exists(p):
+            roots.append(pathlib.Path(p).resolve(strict=True))
+    return roots
+
+
+def check_location(what: str, path: pathlib.Path, roots: list) -> list:
+    """`path` itself need not exist; its parent must. Symlinks are resolved
+    before the comparison, so a link into a forbidden root is refused."""
+    parent = path.parent.resolve(strict=True)
+    resolved = parent / path.name
+    if resolved.exists() or resolved.is_symlink():
+        resolved = resolved.resolve()
+    for root in roots:
+        if resolved == root or resolved.is_relative_to(root):
+            return [f"package: {what} {resolved} is inside {root}"]
     return []
+
+
+def check_secrets_path(path: pathlib.Path, repo: pathlib.Path) -> list:
+    return check_location("secrets path", path, forbidden_roots(repo))
+
+
+def check_out_path(path: pathlib.Path, repo: pathlib.Path) -> list:
+    errors = check_location("output directory", path, forbidden_roots(repo))
+    if not errors and (path.exists() or path.is_symlink()):
+        errors.append(f"package: output directory {path} already exists")
+    return errors
 
 
 def _diff_elements(a: ET.Element, b: ET.Element, where: str, errors: list):
@@ -123,8 +158,16 @@ def main() -> int:
     a = ap.parse_args()
 
     secrets = pathlib.Path(a.secrets)
+    out = pathlib.Path(a.out)
     errors = require_debug(pathlib.Path(a.gen_config).read_text())
-    errors += check_secrets_path(secrets, ROOT)
+    if errors:
+        print("\n".join(errors))
+        return 1
+    try:
+        errors = check_secrets_path(secrets, ROOT) + check_out_path(out, ROOT)
+    except OSError as e:
+        print(f"package: cannot resolve a path to check: {e}")
+        return 1
     if errors:
         print("\n".join(errors))
         return 1
@@ -134,8 +177,19 @@ def main() -> int:
         print("\n".join(errors))
         return 1
 
-    out = pathlib.Path(a.out)
-    out.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.umask(0o077)
+    staging = pathlib.Path(tempfile.mkdtemp(prefix=f".{out.name}.", dir=out.parent))
+    try:
+        if build(a, secrets, blob, staging) != 0:
+            return 1
+        os.rename(staging, out)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    print(f"package: wrote {out / 'loader.img'}")
+    return 0
+
+
+def build(a, secrets: pathlib.Path, blob: bytes, out: pathlib.Path) -> int:
     placeholder_system = pathlib.Path(a.system).read_text()
     system = out / "secureos.system"
     system.write_text(with_prefill(placeholder_system, str(secrets.resolve())))
@@ -149,11 +203,8 @@ def main() -> int:
     errors = check_systems(placeholder_system, system.read_text())
     errors += check_images(pathlib.Path(a.image).read_bytes(), loader.read_bytes(), blob)
     if errors:
-        loader.unlink()
         print("\n".join(errors))
         return 1
-    os.chmod(loader, 0o600)
-    print(f"package: wrote {loader}")
     return 0
 
 

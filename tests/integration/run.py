@@ -21,6 +21,7 @@ Missing prerequisites fail the run; nothing is skipped.
 """
 
 import base64
+import json
 import os
 import re
 import secrets
@@ -150,6 +151,8 @@ DROP_REASONS = [
     "ArpBadSender", "Ipv4Version", "Ipv4Options", "Ipv4Fragment", "Ipv4BadLength",
     "Ipv4BadChecksum", "Ipv4BadSrc", "NotUdp", "UdpBadLength", "UdpBadChecksum",
 ]
+# Produced by forwarding (wire::forward_ipv4), not by any outside frame.
+FORWARD_ONLY = ["TtlExpired"]
 
 
 def check_reason_list_matches_rust():
@@ -157,11 +160,14 @@ def check_reason_list_matches_rust():
     block = src[src.index("drop_reasons! {"):]
     block = block[: block.index("}")]
     rust = re.findall(r"^\s+(\w+) = \d+,", block, re.M)
-    if rust != DROP_REASONS:
+    if rust != DROP_REASONS + FORWARD_ONLY:
         raise Fail(f"DROP_REASONS out of sync with wire: {rust}")
 
 
 # ---------------------------------------------------------------- harness
+
+
+READY_LINE = re.compile(r"(eth_out|eth_in|ingress|inner|data|hs|audit): ready\r?\n")
 
 
 class Console:
@@ -193,12 +199,19 @@ class Console:
         with self.lock:
             return len(self.text)
 
-    def wait_for(self, pattern: str, since: int = 0, timeout: float = LINE_TIMEOUT_S) -> re.Match:
+    def wait_for(self, pattern: str, since: int = 0, timeout: float = LINE_TIMEOUT_S,
+                 strip_ready: bool = False) -> re.Match:
+        """`strip_ready` removes other PDs' "<pd>: ready" lines first: during
+        boot a PD that exhausts its budget mid-line is preempted, and another
+        PD's line lands inside it (characters are printed one by one)."""
         rx = re.compile(pattern)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             with self.lock:
-                m = rx.search(self.text, since)
+                text = self.text[since:]
+            if strip_ready:
+                text = READY_LINE.sub("", text)
+            m = rx.search(text)
             if m:
                 return m
             if not self.alive:
@@ -211,15 +224,23 @@ class Console:
             return re.findall(pattern, self.text[since:])
 
 
+_handed_out = set()
+
+
 def free_udp_port() -> int:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    """A currently free port never handed out before in this run (a port
+    released by bind/close can be offered again by the next call)."""
+    while True:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        if port not in _handed_out:
+            _handed_out.add(port)
+            return port
 
 
-def boot(loader: str, outside: str, inside: str) -> tuple:
+def boot(loader: str, outside: str, inside: str, monitor: str = "") -> tuple:
     cmd = [
         "-machine", "virt,virtualization=on", "-cpu", "neoverse-n2", "-m", "size=2G",
         "-serial", "mon:stdio", "-nographic",
@@ -229,6 +250,8 @@ def boot(loader: str, outside: str, inside: str) -> tuple:
         "-device", f"virtio-net-device,netdev=n1,mac={INSIDE_MAC.hex(':')},bus=virtio-mmio-bus.23",
         "-netdev", inside,
     ]
+    if monitor:
+        cmd += ["-monitor", f"unix:{monitor},server,nowait"]
     # pexpect makes the child a session leader, so kill() takes the group.
     child = pexpect.spawn("qemu-system-aarch64", cmd, encoding="utf-8", timeout=BOOT_TIMEOUT_S)
     return child, Console(child)
@@ -240,6 +263,76 @@ def kill(child: pexpect.spawn):
     except ProcessLookupError:
         pass
     child.close(force=True)
+
+
+class Monitor:
+    """QEMU human monitor over a unix socket (physical memory reads)."""
+
+    def __init__(self, path: str):
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.connect(path)
+                break
+            except OSError:
+                if time.monotonic() > deadline:
+                    raise Fail("QEMU monitor socket did not appear")
+                time.sleep(0.05)
+        self.sock.settimeout(LINE_TIMEOUT_S)
+        self._read_until(b"(qemu) ")
+
+    def _read_until(self, marker: bytes) -> bytes:
+        buf = b""
+        while not buf.endswith(marker):
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise Fail("QEMU monitor closed")
+            buf += chunk
+        return buf
+
+    def pmem(self, addr: int, size: int, path: str) -> bytes:
+        # HMP parses an unquoted absolute path as part of the preceding
+        # integer expression (`/tmp/...` starts with division). JSON string
+        # quoting is accepted by HMP and also handles unusual path bytes.
+        self.sock.sendall(f"pmemsave {addr:#x} {size:#x} {json.dumps(path)}\n".encode())
+        reply = self._read_until(b"(qemu) ")
+        if not os.path.exists(path):
+            detail = reply.decode(errors="replace").strip()
+            raise Fail(f"pmemsave did not create {path}: {detail}")
+        with open(path, "rb") as f:
+            data = f.read()
+        if len(data) != size:
+            raise Fail(f"pmemsave returned {len(data)} of {size} bytes")
+        return data
+
+
+# Guest RAM holding every kernel object. The current package report reaches
+# past 0x60c0_0000, so cover the first 16 MiB rather than only the loader's
+# first 2 MiB; scanned whole, so no individual-MR address is assumed.
+OBJECT_RAM = (0x6000_0000, 0x0100_0000)
+
+
+def wait_absent(mon: Monitor, needle: bytes, scratch: str, timeout: float = 5.0):
+    """Polls until `needle` occurs nowhere in OBJECT_RAM (bounded: the 1 Hz
+    timer retries the reclaim if a wakeup was missed)."""
+    base, size = OBJECT_RAM
+    deadline = time.monotonic() + timeout
+    while True:
+        ram = mon.pmem(base, size, scratch)
+        at = ram.find(needle)
+        if at < 0:
+            return
+        if time.monotonic() > deadline:
+            raise Fail(f"install message still in guest RAM at {base + at:#x}")
+        time.sleep(0.2)
+
+
+def install_bytes(peer: int, i) -> bytes:
+    """The `msgs::Install` hs sent for initiator `i`'s session: our index is
+    the receiver of its transport packets, its sender index is our remote,
+    and our send/recv keys are its recv/send keys."""
+    return struct.pack("<HII", peer, i.receiver, i.sender) + i.recv_key + i.send_key
 
 
 def dgram(name: str, local: int, remote: int) -> str:
@@ -405,6 +498,14 @@ class WgGo:
         self.dev = dev = f"wgt{os.getpid() % 100000}"
         self.proc = subprocess.Popen(["wireguard-go", "-f", dev], stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL, env={**os.environ, "LOG_LEVEL": "error"})
+        try:
+            self._configure(conf, address)
+        except BaseException:
+            self.close()
+            raise
+
+    def _configure(self, conf: str, address: str):
+        dev = self.dev
         deadline = time.monotonic() + 10
         while subprocess.run(["ip", "link", "show", dev], capture_output=True).returncode:
             if time.monotonic() > deadline or self.proc.poll() is not None:
@@ -437,15 +538,18 @@ def ping(tries: int) -> None:
     raise Fail("no ping reply through the tunnel")
 
 
-def test_wireguard(loader: str, deploy: str):
+def test_wireguard(loader: str, deploy: str, passed: list):
     hostfwd = free_udp_port()
     inside = Wire()
     host = InsideHost(inside)
+    monitor = os.path.join(deploy, "monitor.sock")
     child, con = boot(loader, f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT}",
-                      inside.netdev("n1"))
+                      inside.netdev("n1"), monitor)
     wg = None
     try:
         host.start()
+        mon = Monitor(monitor)
+        scratch = os.path.join(deploy, "pmem.bin")
         cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
         gw_pub = b64(cfg["gateway"]["public_key"])
         peer0 = open(os.path.join(deploy, "peer-0.conf")).read()
@@ -464,6 +568,12 @@ def test_wireguard(loader: str, deploy: str):
             raise Fail("wg show reports no handshake")
         con.wait_for(r"audit: src=hs HandshakeOk total=1 ")
         con.wait_for(r"audit: src=data SessionPromoted total=1 ")
+        # A routed hop: wireguard-go's echo request (TTL 64) reaches the
+        # inside host with TTL 63.
+        requests = [ip for ip in host.received if ip[9] == 1 and ip[20] == 8]
+        if not requests or any(ip[8] != 63 for ip in requests):
+            raise Fail(f"echo requests arrived with TTLs {[ip[8] for ip in requests]}, want 63")
+        passed.append("wireguard-go handshake and ping")
         print("\nPASS [wireguard-go handshake and ping]")
 
         def initiator(conf: str, psk=None, static=None):
@@ -482,13 +592,22 @@ def test_wireguard(loader: str, deploy: str):
         # Case 2: peer 0's own key with a wrong PSK and a newer timestamp.
         mark = con.mark()
         bad = initiator(peer0, psk=b"\x42" * 32)
-        if handshake(bad):
+        out.sendto(bad.initiation(ts_offset_s=30), ("127.0.0.1", hostfwd))
+        resp, _ = out.recvfrom(2048)
+        # Allow side first: the same response opens with peer 0's real PSK,
+        # so the failure below is the PSK, not a broken response.
+        probe = initiator(peer0)
+        probe.c, probe.h, probe.e, probe.sender = bad.c, bad.h, bad.e, bad.sender
+        if not probe.consume_response(resp):
+            raise Fail("response does not open even with the right PSK")
+        if bad.consume_response(resp):
             raise Fail("response opened with a wrong PSK")
         out.sendto(bad.transport(b""), ("127.0.0.1", hostfwd))
         con.wait_for(r"audit: src=data TransportRejected total=1 ", since=mark)
         ping(tries=3)
         if wg.latest_handshake() != first:
             raise Fail("wireguard-go had to re-handshake: the unconfirmed session displaced current")
+        passed.append("wrong PSK")
         print("\nPASS [wrong PSK: response unusable, transport rejected, current kept]")
 
         # Case 3: unknown static key.
@@ -496,6 +615,7 @@ def test_wireguard(loader: str, deploy: str):
         out.sendto(initiator(peer1, static=secrets.token_bytes(32)).initiation(), ("127.0.0.1", hostfwd))
         con.wait_for(r"audit: src=hs HandshakeUnknownPeer total=1 ", since=mark)
         ping(tries=3)
+        passed.append("unknown peer")
         print("\nPASS [unknown peer rejected]")
 
         # Case 4: valid peer 1 sends a datagram with a source outside its
@@ -510,6 +630,25 @@ def test_wireguard(loader: str, deploy: str):
         ping(tries=3)
         if any(ip[12:16] == bytes([10, 200, 0, 99]) for ip in host.received):
             raise Fail("spoofed datagram reached the inside host")
+        # The install for peer 1 carried transport keys through the shared
+        # `hd` region; once delivered, no copy of it may remain anywhere in
+        # guest memory (L12), without waiting for another handshake.
+        wait_absent(mon, install_bytes(1, good), scratch)
+        passed.append("spoofed inner source, install scrubbed")
+
+        # Case 5: an inside datagram with TTL 1 must not be forwarded into
+        # the tunnel; TTL 2 still is (the boundary).
+        mark = con.mark()
+        for ttl in (1, 2):
+            pkt = bytearray(icmp_echo(HOST_IP, bytes([10, 200, 0, 2]), 8, 7, ttl, b"ttl"))
+            pkt[8] = ttl
+            pkt[10:12] = b"\0\0"
+            pkt[10:12] = struct.pack("!H", csum(bytes(pkt[:20])))
+            inside.send(eth(INSIDE_MAC, HOST_MAC, 0x0800, bytes(pkt)))
+        con.wait_for(r"audit: src=inner FrameDropped\(TtlExpired\) total=1 ", since=mark)
+        ping(tries=3)
+        passed.append("ttl expiry")
+        print("\nPASS [TTL 1 dropped at the inside hop]")
         print("\nPASS [spoofed inner source dropped]")
     finally:
         host.stop = True
@@ -525,8 +664,10 @@ def test_mismatched_blob(loader: str):
     child, con = boot(loader, dgram("n0", free_udp_port(), free_udp_port()),
                       dgram("n1", free_udp_port(), free_udp_port()))
     try:
-        con.wait_for(r"key: secrets: gateway key does not match the configuration", timeout=BOOT_TIMEOUT_S)
+        con.wait_for(r"key: secrets: gateway key does not match the configuration", timeout=BOOT_TIMEOUT_S,
+                     strip_ready=True)
         con.wait_for(r"key: halted", timeout=LINE_TIMEOUT_S)
+        con.wait_for(r"MON\|ERROR: faulting PD: key", timeout=LINE_TIMEOUT_S)
     finally:
         kill(child)
 
@@ -544,8 +685,11 @@ def preflight():
     # The seccomp profile allows exactly CLONE_NEWUSER|CLONE_NEWNET (M2 review T14).
     if subprocess.run(["unshare", "-rn", "true"], capture_output=True).returncode != 0:
         raise Fail("unshare -rn refused (seccomp profile not applied?)")
-    if subprocess.run(["unshare", "-rm", "true"], capture_output=True).returncode == 0:
-        raise Fail("unshare -rm allowed: seccomp filter is wider than the plan permits")
+    # CLONE_NEWUTS needs no mount step, so a refusal here is the unshare
+    # syscall itself being filtered, not a later mount(2) failing.
+    r = subprocess.run(["unshare", "-r", "--uts", "true"], capture_output=True, text=True)
+    if r.returncode == 0 or "unshare failed" not in r.stderr:
+        raise Fail(f"unshare(NEWUSER|NEWUTS) not refused by the filter: rc={r.returncode} {r.stderr.strip()}")
 
 
 def make(*args, env=None):
@@ -570,10 +714,20 @@ def build(tmp: str) -> tuple:
 
 def in_netns(good: str, mismatched: str, deploy: str) -> int:
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
-    cases = [("reason list in sync", check_reason_list_matches_rust),
-             ("raw frames", lambda: test_raw(good)),
-             ("wireguard", lambda: test_wireguard(good, deploy)),
-             ("mismatched blob halts key", lambda: test_mismatched_blob(mismatched))]
+    # Each case appends to `passed` only once its assertions held; the
+    # count printed is what ran, not a constant (code review T1).
+    passed = []
+
+    def single(name, fn):
+        def run():
+            fn()
+            passed.append(name)
+        return run
+
+    cases = [("reason list in sync", single("reason list", check_reason_list_matches_rust)),
+             ("raw frames", single("raw frames", lambda: test_raw(good))),
+             ("wireguard", lambda: test_wireguard(good, deploy, passed)),
+             ("mismatched blob halts key", single("mismatched blob", lambda: test_mismatched_blob(mismatched)))]
     for name, fn in cases:
         try:
             fn()
@@ -581,12 +735,19 @@ def in_netns(good: str, mismatched: str, deploy: str) -> int:
             print(f"\nFAIL [{name}]: {type(e).__name__}: {e}", file=sys.stderr)
             return 1
         print(f"\nPASS [{name}]")
-    # Cases: reason list, raw frames, 4 WireGuard cases, mismatched blob.
-    print("INTEGRATION-CASES 7")
+    print(f"INTEGRATION-CASES {len(passed)}")
     return 0
 
 
+def exit_on_signal(signum, _frame):
+    # Turn SIGTERM/SIGHUP into SystemExit so `finally` blocks run: the temp
+    # dir holds private keys and must go on every exit path.
+    raise SystemExit(128 + signum)
+
+
 def main() -> int:
+    signal.signal(signal.SIGTERM, exit_on_signal)
+    signal.signal(signal.SIGHUP, exit_on_signal)
     if sys.argv[1:2] == ["--netns"]:
         return in_netns(*sys.argv[2:5])
     tmp = tempfile.mkdtemp(prefix="secureos-it-")

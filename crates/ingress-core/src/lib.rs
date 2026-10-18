@@ -125,8 +125,11 @@ fn udp<'a, M: Mac1, const N: usize>(
 }
 
 /// WireGuard-level checks on a datagram addressed to the listen port. The
-/// rate budget is spent only after a valid mac1, so forged initiations
-/// cannot drain a real peer's budget without the gateway's public key.
+/// rate budget is spent only after a valid mac1. mac1 is no authentication:
+/// it needs only the gateway's public key, which is compiled into the image
+/// (law L6), so anyone holding the image can pass it with spoofed sources
+/// and spend `key`'s shared budget. Cookies (SC13) close that; until then
+/// M2 images are dev-only (architecture R6).
 pub fn classify<'a, M: Mac1, const N: usize>(
     mac1: &M,
     buckets: &mut Buckets<N>,

@@ -25,6 +25,10 @@ pub const ETH_IN_DMA_SIZE: usize = 0x200_000;
 pub const ETH_IN_MMIO_OFFSET: usize = 0xe00;
 pub const ETH_IN_IRQ: usize = 71;
 
+/// `data`'s stack_size: its handler state, returned by value from init,
+/// lives there (crates/pds/data asserts it fits).
+pub const DATA_STACK_SIZE: usize = 0x20_000;
+
 /// sp804 on QEMU virt (coliasgroup patch): 1 MHz input clock, SPI 11.
 pub const TIMER_IRQ: usize = 43;
 pub const TIMER_FREQ_HZ: u32 = 1_000_000;

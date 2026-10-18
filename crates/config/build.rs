@@ -6,8 +6,8 @@ mod validate {
     include!("src/validate.rs");
 }
 
-// Mirrors secret_blob::MAX_PEERS (the secrets region holds this many peers).
-const MAX_PEERS: usize = 61;
+// The secrets region must hold every peer an image can serve.
+const _: () = assert!(validate::MAX_PEERS <= secret_blob::MAX_PEERS);
 
 fn main() {
     let path = std::env::var("SECUREOS_CONFIG")
@@ -16,7 +16,7 @@ fn main() {
     println!("cargo:rerun-if-changed={path}");
     println!("cargo:rerun-if-changed=src/validate.rs");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));
-    let checked = validate::check(&text, MAX_PEERS).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let checked = validate::check(&text, validate::MAX_PEERS).unwrap_or_else(|e| panic!("{path}: {e}"));
     let out = std::path::Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("config.rs");
     std::fs::write(out, validate::render(&checked)).expect("write config.rs");
 }
