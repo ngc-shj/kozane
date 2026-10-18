@@ -248,3 +248,30 @@ R43 F1 · others OK
 R49 F1/F2 · R43/RS3 previous fixes verified · others OK
 ### Testing expert
 RT7 T17/T18 · others OK
+
+---
+
+# Round 6
+Date: 2026-10-18
+
+## Changes from Previous Round
+Reviewed `abfe229..8f94195`. Round 5 fixes confirmed (Func F1 make-style directive join; test_check_selftest executed-case count; prefix-rule fixtures). All new findings Minor.
+
+| ID | Expert | Sev | Finding | Resolution |
+|---|---|---|---|---|
+| Sec S1 | Sec | Minor | check-propagation injected only into pins; a mask conditioned on MAKECMDGOALS/MAKELEVEL (variable-built `MAKEFLAGS += -i` when the goal is `manifest`) hid later gates under `make check` (reproduced with GNU make) | check-propagation now runs the real `make check` once per gate of the derived `check` list, with every gate's recipe overridden to a no-op except that one, which fails with a marker; 9/9 gates propagate. Mutations on a copy: the MAKECMDGOALS mask (P5 silent) → `check-propagation[manifest]` FAILS; a `-` on the gate line → rejected by check_gates (and P5). check-pins docstring now names this case as the adjudicating control |
+| Func F1 / T19 | Func+Test | Minor (R29/RT7) | old check-propagation comment overstated what the pins injection caught | comment replaced with the per-gate design's docstring |
+
+## Observed during verification
+One integration-selftest boot stalled right after `LDR|INFO|CPU0: jumping to kernel` (60 s boot timeout) during the full selftest run. Not reproduced: the case passed on two immediate re-runs, `make test` passed, and 20 back-to-back boots of the same image reached all ready lines (≈0.1 s each). Recorded as an unexplained one-off (1 in 23 boots observed); no retry was added, so a recurrence will fail loudly. To revisit if it recurs, and on real hardware (M7).
+
+### Round 6 verification
+`make check` green; `tools/check-selftest` all layers pass on re-run (check-propagation now 9 sub-cases); integration case re-run 2/2 ok.
+
+## Recurring Issue Check
+### Functionality expert
+R29 F1 · others OK
+### Security expert
+RS-class control overclaim S1 · others OK
+### Testing expert
+RT7 T19 · others OK

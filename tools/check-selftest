@@ -105,11 +105,9 @@ CASES = {
     "kani-cache": (["kani", "kani_crates=ingress-core"],
                    lambda t: append(t, "crates/wire/src/lib.rs", "\n// selftest: cache key input\n"),
                    "Checking harness"),
-    # End to end through the real `check` rule: a failing gate must fail
-    # `make check` however the rule is spelled (an error-ignore prefix or a
-    # .IGNORE built from a variable would make this case fail). pins runs
-    # first after clean-counts, so this stops early.
-    "check-propagation": (["check"], lambda t: edit(t, "Makefile", "\trm -rf $(BUILD)", "\t-rm -rf $(BUILD)"), "P5"),
+    # End to end through the real `check` rule, once per gate: see
+    # run_propagation(). The tuple is only a placeholder for the case table.
+    "check-propagation": ([], lambda t: None, ""),
     # A count file that is not regenerated must be reported missing.
     "stale-counts": (["clean-counts", "manifest"], lambda t: None, "missing (gate did not run)"),
     "lint": (["lint"], lambda t: append(t, "crates/wire/src/lib.rs",
@@ -140,7 +138,37 @@ EXPECT_SUCCESS = {"kani-cache"}
 ABSENT = {"kani-cache": "cached pass"}
 
 
+def run_propagation(gates: list) -> bool:
+    """For each gate of the `check` rule, override every gate's recipe with a
+    no-op except that one, which fails with a marker, and run the real
+    `make check`. Catches any mask that hides a gate's failure under `check`
+    (an error-ignore prefix, .IGNORE or MAKEFLAGS -i, including ones built
+    from variables or conditioned on MAKECMDGOALS/MAKELEVEL), without running
+    the expensive gates themselves."""
+    ok = True
+    for target in gates:
+        with tempfile.TemporaryDirectory(prefix=f"selftest-propagation-{target}-") as d:
+            tree = pathlib.Path(d)
+            copy_repo(tree)
+            overrides = "\n# selftest: gate recipes replaced (make warns about overriding)\n"
+            for g in gates:
+                body = f"@echo selftest-gate-{g}; exit 1" if g == target else "@true"
+                overrides += f"{g}:\n\t{body}\n"
+            (tree / "Makefile").write_text((tree / "Makefile").read_text() + overrides)
+            out = subprocess.run(["make", "-C", str(tree), "check"], capture_output=True, text=True)
+            text = out.stdout + out.stderr
+        needle = f"selftest-gate-{target}"
+        this_ok = out.returncode != 0 and needle in text
+        ok &= this_ok
+        print(f"{'ok  ' if this_ok else 'FAIL'} check-propagation[{target}]: exit={out.returncode} needle={needle!r}")
+        if not this_ok:
+            print(text[-2000:])
+    return ok
+
+
 def run_case(name: str) -> bool:
+    if name == "check-propagation":
+        return run_propagation(check_gates())
     targets, inject, needle = CASES[name]
     with tempfile.TemporaryDirectory(prefix=f"selftest-{name}-") as d:
         tree = pathlib.Path(d)

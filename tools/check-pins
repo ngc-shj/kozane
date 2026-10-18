@@ -21,9 +21,10 @@ Control class: P1-P4 are fail-closed checks over the files they read. P5 is
 a best-effort tripwire: make and bash decide what a recipe does, and a
 pattern list cannot enumerate every spelling. Known bypasses it does not
 catch: an error-ignore prefix supplied through a variable (`$(D)cmd` with
-D := -) and masks built from variables or functions. The enforceable control
-for "a failing gate fails `make check`" is tools/check-selftest, which runs
-make and proves each gate's failure propagates.
+D := -) and masks built from variables or functions. The adjudicating
+control for "a failing gate fails `make check`" is tools/check-selftest's
+check-propagation case, which runs the real `make check` once per gate with
+that gate made to fail.
 """
 
 import argparse
