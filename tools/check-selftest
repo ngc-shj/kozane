@@ -57,17 +57,26 @@ CASES_FOR_GATE = {
 }
 
 
+class GateParseError(Exception):
+    pass
+
+
 def check_gates() -> list:
-    """Targets run by the `check` recipe, in order."""
+    """Targets run by the `check` rule (prerequisites, then `$(MAKE)` recipe
+    lines), in order. Any other recipe line is an unaccounted gate."""
     lines = (ROOT / "Makefile").read_text().splitlines()
-    start = lines.index("check:")
-    gates = []
+    heads = [i for i, l in enumerate(lines) if l.split(":", 1)[0] == "check" and ":" in l and not l.startswith("\t")]
+    if len(heads) != 1:
+        raise GateParseError(f"expected one `check:` rule, found {len(heads)}")
+    start = heads[0]
+    gates = lines[start].split(":", 1)[1].split()
     for line in lines[start + 1:]:
         if not line.startswith("\t"):
             break
-        words = line.split()
-        if words[:1] == ["$(MAKE)"]:
-            gates += words[1:]
+        words = line.lstrip("\t@+- ").split()
+        if words[:1] != ["$(MAKE)"]:
+            raise GateParseError(f"`check` recipe line is not a $(MAKE) call: {line.strip()!r}")
+        gates += words[1:]
     return gates
 
 # layer -> (make targets, injection, text that must appear in the output)
@@ -135,9 +144,11 @@ def run_case(name: str) -> bool:
             # Allow side first: the uninjected copy must hit the cache, or
             # the injected run below would prove nothing about the key.
             pre = subprocess.run(["make", "-C", str(tree), *targets], capture_output=True, text=True)
-            pre_log = (tree / "build/counts/kani.log").read_text(errors="replace")
+            pre_path = tree / "build/counts/kani.log"
+            pre_log = pre_path.read_text(errors="replace") if pre_path.exists() else ""
             if pre.returncode != 0 or "cached pass" not in pre_log:
                 print(f"FAIL {name}: uninjected copy did not hit the proof cache")
+                print((pre.stdout + pre.stderr)[-2000:])
                 return False
         inject(tree)
         out = subprocess.run(["make", "-C", str(tree), *targets], capture_output=True, text=True)
@@ -156,7 +167,11 @@ def run_case(name: str) -> bool:
 
 
 def main() -> int:
-    gates = check_gates()
+    try:
+        gates = check_gates()
+    except GateParseError as e:
+        print(f"selftest: {e}")
+        return 1
     unknown = [g for g in gates if g not in CASES_FOR_GATE]
     expected = set().union(*(CASES_FOR_GATE[g] for g in gates if g in CASES_FOR_GATE))
     if unknown or set(CASES) != expected:

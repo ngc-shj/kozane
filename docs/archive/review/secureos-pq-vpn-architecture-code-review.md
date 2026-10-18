@@ -156,3 +156,32 @@ R47 T1 · R57 T9 · RT1 T8/T8b · RT7 T4/T6 · RT8 T2 · R44/R50 T3 · others OK
 
 ### Round 2 verification (2026-10-18)
 `make check` green (CHECK-PINS-FIXTURES 22, UNIT-TESTS 185, KANI-HARNESSES 13, INTEGRATION-CASES 3, others unchanged); manifest floors raised. `tools/check-selftest`: all 10 layers pass, gate list derived from the Makefile, clean-counts ordering asserted, kani-cache allow side checked before injection.
+
+---
+
+# Round 3
+Date: 2026-10-18
+
+## Changes from Previous Round
+Reviewed `f4e7e81..cea39df`. All Round 2 findings confirmed resolved (S5–S7, N1–N4, T1–T10; T2 mutation evidence reproduced independently). All new findings are Minor; none Critical/Major.
+
+| ID | Expert | Sev | Finding | Resolution |
+|---|---|---|---|---|
+| N-S8 | Sec | Minor (R43, fix-induced) | continuation exemption used `rstrip().endswith("\\")`; trailing space or even backslashes hid a real `-` prefix (reproduced with GNU make 4.4.1) | lines grouped into logical lines with make's rule (odd count of trailing backslashes, nothing after); prefix checked on the first physical line only; fixtures for both bypasses plus a true-continuation allow case |
+| N-S9 | Sec | Minor | masked-exit check per physical line (`\|\| \` + `true`); `\|\| exit 0` missing | checked on joined logical lines; `exit 0` added; fixtures |
+| N5 | Func | Minor | bounded rx loop + RING_EVENT_IDX: a non-delivering batch could strand completions without an interrupt | `service` loops while `pump_rx` reports it stopped at the bound, notifying ingress per batch |
+| T11 | Test | Minor | `check_gates` read only `$(MAKE)` lines | reads `check:` prerequisites; any non-`$(MAKE)` recipe line is an error |
+| T12 | Test | Minor | burst_echo not shown to exercise backpressure | mutation on a throwaway copy (`/tmp/txm`): dropping frames when no tx buffer is idle makes the raw-frames case FAIL ("no reply") |
+| T13 | Test | Minor | continuation exemption had no allow fixture | covered by the N-S8 allow case |
+| T14 | Test | Minor | kani-cache pre-check crashed if the log was absent | guarded; prints make output on failure |
+
+### Round 3 verification
+`make check` green (CHECK-PINS-FIXTURES 27, UNIT-TESTS 185, KANI-HARNESSES 13, INTEGRATION-CASES 3); manifest floor raised. `tools/check-selftest`: 10/10 layers.
+
+## Recurring Issue Check
+### Functionality expert
+R29 N5 · others OK
+### Security expert
+R43 N-S8 · RS3 N-S9 · others OK
+### Testing expert
+R47 T13 · RT7 T11/T12 · RT3 T14 · others OK

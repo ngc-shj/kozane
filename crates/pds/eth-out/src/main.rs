@@ -171,34 +171,35 @@ impl Driver {
         }
     }
 
-    /// Device → ingress. Returns whether anything was delivered.
-    fn pump_rx(&mut self) -> bool {
+    /// Device → ingress, one queue's worth at most. Returns (delivered
+    /// anything, stopped at the bound with completions possibly pending).
+    fn pump_rx(&mut self) -> (bool, bool) {
         let mut delivered = false;
         if let Err(e) = self.to_ingress.reclaim() {
             self.audit_link_error(e);
         }
-        // At most one queue's worth per call, so a steady stream cannot keep
-        // this loop running and delay the ingress notification indefinitely.
+        // At most one queue's worth per call, so ingress is notified per
+        // batch instead of after an arbitrarily long stream.
         for _ in 0..QUEUE_SIZE {
             if self.device_dead {
-                break;
+                return (delivered, false);
             }
-            let Some(token) = self.dev.poll_receive() else { break };
+            let Some(token) = self.dev.poll_receive() else { return (delivered, false) };
             let Some(i) = self.rx_inflight.get_mut(usize::from(token)).and_then(Option::take) else {
                 self.device_broke();
-                break;
+                return (delivered, false);
             };
-            let Some(buf) = self.rx_bufs.get_mut(i) else { break };
+            let Some(buf) = self.rx_bufs.get_mut(i) else { return (delivered, false) };
             // SAFETY: `buf` is the buffer submitted with this token.
             let Ok((hdr, len)) = (unsafe { self.dev.receive_complete(token, buf) }) else {
                 self.device_broke();
-                break;
+                return (delivered, false);
             };
             // A used length beyond the buffer is a protocol violation, not a
             // frame to drop quietly.
             let Some(packet) = buf.get(hdr..hdr.saturating_add(len)) else {
                 self.device_broke();
-                break;
+                return (delivered, false);
             };
             if packet.len() > NET_BUF_SIZE {
                 self.audit(Event::FrameTooLong);
@@ -215,7 +216,7 @@ impl Driver {
             }
             self.post_rx(i);
         }
-        delivered
+        (delivered, true)
     }
 
     /// Reaps finished transmissions, freeing their buffers.
@@ -286,12 +287,22 @@ impl Driver {
     }
 
     fn service(&mut self) {
-        self.pump_tx();
-        if self.pump_rx() {
-            INGRESS.notify();
-        }
-        if core::mem::take(&mut self.audit_pending) {
-            AUDIT.notify();
+        // virtio-drivers negotiates RING_EVENT_IDX: the device interrupts
+        // only once the driver has caught up with the used ring, so stopping
+        // at the batch bound must not end the handler while completions
+        // remain, or rx would wait for an unrelated event.
+        loop {
+            self.pump_tx();
+            let (delivered, more) = self.pump_rx();
+            if delivered {
+                INGRESS.notify();
+            }
+            if core::mem::take(&mut self.audit_pending) {
+                AUDIT.notify();
+            }
+            if !more {
+                break;
+            }
         }
     }
 }
