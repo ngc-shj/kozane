@@ -45,15 +45,30 @@ CASES = [
 ]
 
 
+def threads_started_only_through_the_helper() -> list:
+    """A thread started any other way would bring back F-R5-1 silently: its
+    signal mask lets a stop signal through mid-teardown."""
+    import re
+    src = (ROOT / "tests/integration/run.py").read_text()
+    starts = [m.start() for m in re.finditer(r"\.start\(\)", src)]
+    helper = src.index("def start_without_stop_signals")
+    helper_end = src.index("\n\n\n", helper)
+    stray = [src.count("\n", 0, i) + 1 for i in starts if not helper <= i < helper_end]
+    return [f"run.py line {n}: thread started outside start_without_stop_signals" for n in stray]
+
+
 def main() -> int:
     failures = 0
+    errors = threads_started_only_through_the_helper()
+    print(f"{'ok  ' if not errors else 'FAIL'} threads start only through start_without_stop_signals: {errors or 'ok'}")
+    failures += bool(errors)
     for name, want in CASES:
         r = subprocess.run([sys.executable, "-c", CHILD, str(ROOT / "tests/integration/run.py")],
                            capture_output=True, text=True, timeout=60)
         ok = r.returncode == 0 and want in r.stdout
         failures += not ok
         print(f"{'ok  ' if ok else 'FAIL'} {name}: rc={r.returncode} {r.stdout.strip()!r} {r.stderr.strip()[-200:]!r}")
-    print(f"HARNESS-SIGNAL-FIXTURES {len(CASES)}")
+    print(f"HARNESS-SIGNAL-FIXTURES {len(CASES) + 1}")
     return 1 if failures else 0
 
 

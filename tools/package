@@ -226,12 +226,17 @@ def main() -> int:
                 status = 0
     finally:
         # The final teardown: no stop signal may cut it short or skip its
-        # leftover report (one statement before this remains inherent to
-        # Python's asynchronous signal handling).
-        for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        # leftover report. Blocking all three in one call first leaves only
+        # that statement exposed (inherent to Python's signal handling);
+        # ignoring them afterwards discards whatever was blocked.
+        stop = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
+        mask = signal.pthread_sigmask(signal.SIG_BLOCK, stop)
+        for s in stop:
             signal.signal(s, signal.SIG_IGN)
         if staging.exists() and not remove_staging(staging):
             status = 1
+        # Anything blocked meanwhile is discarded on unblock (ignored).
+        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
     if status == 0:
         print(f"package: wrote {out / 'loader.img'}")
     return status

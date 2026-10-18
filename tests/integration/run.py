@@ -177,7 +177,7 @@ def start_without_stop_signals(thread: threading.Thread):
     """Starts a helper thread with the stop signals blocked; it inherits the
     mask, so process-directed signals reach only the main thread, where
     `signals_held` can hold them during a teardown."""
-    old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
     try:
         thread.start()
     finally:
@@ -791,8 +791,9 @@ def build(tmp: str) -> tuple:
 
 
 def check_harness_matches_config(deploy: str):
-    """Every address the harness plays or expects comes from the template;
-    fail by name before any boot if the template moves one."""
+    """Every address the harness plays or expects comes from the generated
+    config (template plus mksecrets' peer addresses); fail by name before
+    any boot if one moves."""
     cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
     g = cfg["gateway"]
     ip = lambda b: ".".join(map(str, b))  # noqa: E731
@@ -807,6 +808,8 @@ def check_harness_matches_config(deploy: str):
         "neighbors[0].ip": (cfg["neighbors"][0]["ip"], ip(HOST_IP)),
         "neighbors[0].mac": (cfg["neighbors"][0]["mac"], mac(HOST_MAC)),
         "peers[0].allowed_ips": (cfg["peers"][0]["allowed_ips"], ["10.200.0.2/32"]),
+        # Case 4 sends from 10.200.0.99 as peer 1, which must not own it.
+        "peers[1].allowed_ips": (cfg["peers"][1]["allowed_ips"], ["10.200.0.3/32"]),
     }
     wrong = [f"{k}={got!r} (harness uses {want!r})" for k, (got, want) in expected.items() if got != want]
     if wrong:
@@ -871,7 +874,9 @@ STOP_SIGNALS = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
 
 
 def ignore_signals():
-    """Once the run is ending: no further signal may cut the teardown short."""
+    """Once the run is ending: no further signal may cut the teardown short.
+    Blocked in one call first, so the per-signal loop has no window."""
+    signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
     for s in STOP_SIGNALS:
         signal.signal(s, signal.SIG_IGN)
 

@@ -149,8 +149,9 @@ def run_main(build_result):
                 pkg.shutil.rmtree = second_signal
             real_remove = pkg.remove_staging
             if build_result == "early-second-signal":
-                # The second signal lands before the removal blocks signals:
-                # only the handlers' own ignoring protects this window.
+                # The second signal lands after the first ended the build and
+                # before the removal: the teardown's own ignoring covers it
+                # (exit_on_signal's ignoring is pinned by its own fixture).
                 def remove_after_signal(staging):
                     os.kill(os.getpid(), signal.SIGTERM)
                     return real_remove(staging)
@@ -306,6 +307,25 @@ def signal_during_removal_does_not_cut_it_short():
         shutil.rmtree(d)
 
 
+def handler_ignores_further_signals():
+    """exit_on_signal must stop listening before it raises: the unwinding
+    up to the teardown's `finally` is otherwise exposed to a second signal."""
+    stop = (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)
+    saved = {s: signal.getsignal(s) for s in stop}
+    try:
+        try:
+            pkg.exit_on_signal(signal.SIGTERM, None)
+            return ["exit_on_signal returned instead of raising SystemExit"]
+        except SystemExit as e:
+            if e.code != 128 + signal.SIGTERM:
+                return [f"exit code {e.code}"]
+        still = [signal.Signals(s).name for s in stop if signal.getsignal(s) != signal.SIG_IGN]
+        return [f"still handled after the first signal: {still}"] if still else []
+    finally:
+        for s, h in saved.items():
+            signal.signal(s, h)
+
+
 def existing_out(d):
     (d / "pkg").mkdir()
     return d / "pkg"
@@ -350,6 +370,7 @@ CASES = [
     ("SIGTERM during the build leaves no OUT and no staging", None, run_main("sigterm")),
     ("a second SIGTERM during cleanup does not cut it short", None, run_main("two-signals")),
     ("a second SIGTERM before the removal is ignored", None, run_main("early-second-signal")),
+    ("the signal handler ignores further signals before raising", None, handler_ignores_further_signals),
     ("SIGINT during the build leaves no OUT and no staging", None, run_main("sigint")),
     ("main() reports a staging dir it could not remove", None, run_main("removal-fails")),
     ("a signal during a failing removal does not hide the report", None, run_main("signal-and-removal-fails")),

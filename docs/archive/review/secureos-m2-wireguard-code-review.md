@@ -231,3 +231,29 @@ Functionality: R49/R50 (F-R5-1: a single-threaded red-proof taken for the thread
 - T5-5: fixtures for SIGINT during the build (exit 130) and a second SIGTERM before the removal blocks signals; red-proved by removing SIGINT handling and the teardown ignoring.
 - F-R5-3: `check_harness_matches_config` compares every address, MAC and port the harness plays with the generated config before any boot.
 - F-R5-4: comment narrowed (QEMU's pexpect fork still runs a little Python; accepted). F-R5-5 / T5-4: saved handlers restored. T5-2: exact needle "UNIT-AUDIT-EVENT: 13 < manifest 14". T5-7: exact allowed-IP message asserted.
+
+# Round 6
+Date: 2026-10-19 — incremental review of `25ecdca..2185ba2`. No Critical or Major findings from any expert; R43: no widening. All Round-5 findings resolved (T5-5/T5-6 partly, see T6-1/T6-3).
+
+## Findings (all Minor)
+| ID | Finding |
+|---|---|
+| S6-1 | Final teardowns silenced the stop signals one at a time; residual window wider than the documented one statement |
+| S6-2 / T6-3 | Nothing stopped a future thread start from bypassing `start_without_stop_signals` |
+| F-R6-1 | The helper-thread mask repeated the signal set instead of `STOP_SIGNALS` |
+| F-R6-2 | An unlisted zero count got unsatisfiable "add it" advice |
+| F-R6-3 | Harness/config check omitted peer 1 (case 4); docstring credited mksecrets values to the template |
+| T6-1 | early-second-signal fixture did not pin exit_on_signal's own ignoring; comment false |
+| T6-2 | "zero refused" could not fail for the `v == 0` clause |
+| T6-4 | check-manifest resolved duplicate keys across counts files silently |
+
+## Recurring Issue Check (Round 6)
+Functionality: R2 (F-R6-1), R29/R49 (F-R6-3), R52 (F-R6-2) violated; R3, R12, R16, R43, R44, R50 checked. Security: RS1/RS4 (S6-1), RS2 (S6-2); others resolved or N/A. Testing: RT3 (T6-1, T6-2, T6-3), RT6 (T6-4); RT4 deterministic (30/30), RT5, RT9 (8/8 anchors), RT10, RT11 checked.
+
+## Resolution Status (Round 6)
+- S6-1: tools/package's final teardown and run.py's `ignore_signals` block all three stop signals in one `pthread_sigmask` call before ignoring them; package restores its mask afterwards (anything blocked meanwhile is discarded).
+- S6-2 / T6-3: test_harness_signals.py also checks statically that run.py starts threads only inside `start_without_stop_signals`; red-proved with a stray `Thread(...).start()`.
+- F-R6-1: `STOP_SIGNALS` used for the helper mask. F-R6-2: an unlisted zero count says the gate counted nothing (fixture). F-R6-3: peers[1].allowed_ips checked; docstring corrected.
+- T6-1: fixture calls `exit_on_signal` and requires all three stop signals ignored before SystemExit 143; red-proved by removing its loop; the early-second-signal comment corrected.
+- T6-2: a manifest line of 0 with a count of 0 is refused (fixture), red-proved by removing `v == 0`.
+- T6-4: a key reported by two counts files is refused naming both (fixture), red-proved.

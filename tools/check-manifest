@@ -22,14 +22,17 @@ def main() -> int:
         if line:
             key, n = line.split()
             want[key] = int(n)
-    got = {}
-    for f in counts_dir.iterdir():
+    got, source = {}, {}
+    bad = []
+    for f in sorted(counts_dir.iterdir()):
         if f.is_file() and f.suffix != ".log":
             for line in f.read_text().splitlines():
                 parts = line.split()
                 if len(parts) == 2 and parts[1].isdigit():
+                    if parts[0] in source and source[parts[0]] != f.name:
+                        bad.append(f"{parts[0]}: reported by both {source[parts[0]]} and {f.name}")
                     got[parts[0]] = int(parts[1])
-    bad = []
+                    source.setdefault(parts[0], f.name)
     for key, n in want.items():
         v = got.get(key)
         if v is None:
@@ -39,7 +42,10 @@ def main() -> int:
         elif v > n:
             bad.append(f"{key}: {v} > manifest {n} (raise the manifest to {v})")
     for key in sorted(set(got) - set(want)):
-        bad.append(f"{key}: {got[key]} not in the manifest (add it)")
+        if got[key] == 0:
+            bad.append(f"{key}: 0, the gate counted nothing (add tests or drop it from the gate)")
+        else:
+            bad.append(f"{key}: {got[key]} not in the manifest (add it)")
     for b in bad:
         print(f"check-manifest: {b}")
     return 1 if bad else 0
