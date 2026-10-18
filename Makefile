@@ -176,9 +176,11 @@ pins: | $(counts)
 	python3 tests/tools/test_check_selftest.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_package.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_config_build.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	python3 tests/tools/test_check_manifest.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	python3 tests/tools/test_harness_signals.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	docker/make-seccomp.py --check >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_seccomp.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES)' $(counts)/pins.log > $(counts)/pins
+	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES)' $(counts)/pins.log > $(counts)/pins
 
 # Builds its own deployment (fresh keys, generated config, package); see run.py.
 test: | $(counts)

@@ -203,3 +203,31 @@ Functionality: R2/R3 (F-R4-3, F-R4-6), R29/R49 (F-R4-1, F-R4-2, F-R4-5) violated
 - F-R4-6: test_wireguard fails by name if the template's neighbor or peer-0 addresses differ from the harness constants.
 - R4-T3 / R4-T6: the fixture asserts the "staging directory" message and three root lookups, and restores umask and the saved handlers. R4-T4: main() variant whose cleanup cannot remove staging must print the warning and fail; red-proved with a silent cleanup.
 - R4-T8: accepted residual. Both deny branches were exercised by hand (empty index → "no committed seed-*"); a selftest case would need a git-less tree, which the bolero cases already show fails loudly with git's own error.
+
+# Round 5
+Date: 2026-10-19 — incremental review of `670d8c7..25ecdca`. No Critical findings; R43: no widening.
+
+## Findings
+| ID | Sev | Finding |
+|---|---|---|
+| F-R5-1 / S5-1 / T5-6 | Major | `signals_held` masked only the main thread; with the Console/InsideHost threads alive a process-directed signal still cut the teardown short (reproduced) |
+| T5-1 | Major | The new "count above the manifest" branch had no test |
+| F-R5-2 / S5-2 | Minor | Package: a signal re-delivered on unmask skipped the leftover warning |
+| F-R5-3 | Minor | Harness constant check partial (MACs, GW_IP, port unchecked) and late |
+| F-R5-4 | Minor | setpriv comment overstated the QEMU case |
+| F-R5-5 / T5-4 | Minor | A fixture reset SIGINT/SIGHUP to SIG_DFL |
+| T5-2 | Minor | Selftest `manifest` needle also matched the new "above" message |
+| T5-3 | Minor | Counts without a manifest line were never checked |
+| T5-5 | Minor | SIGINT handling and early second signal not red-provable |
+| T5-7 | Minor | "config: allowed IP:" label unpinned |
+
+## Recurring Issue Check (Round 5)
+Functionality: R49/R50 (F-R5-1: a single-threaded red-proof taken for the threaded harness; F-R5-4), R2 (F-R5-3), R3 (F-R5-5) violated; R12, R16, R29, R40, R43, R44, R52 checked. Security: R43 none; RS1 (S5-2); RS2 (S5-1); RS4 accepted windows; others resolved/N/A. Testing: RT1 (T5-2, T5-7), RT3 (T5-1, T5-5, T5-6), RT5 (T5-4), RT6 (T5-3 guard), RT7 (T5-7).
+
+## Resolution Status (Round 5)
+- F-R5-1 / S5-1 / T5-6: helper threads start with the stop signals blocked (`start_without_stop_signals`), so process-directed signals reach only the main thread, where `signals_held` holds them. tests/tools/test_harness_signals.py (pins gate) runs the harness's own code with a live helper thread and requires the teardown to finish before exit 143; it refuses to pass single-threaded. Red-proved: with threads started unblocked it reports steps=0.
+- T5-1 / T5-3: check-manifest also fails on counts with no manifest line; tests/tools/test_check_manifest.py covers equal / fewer / more / missing / zero / unlisted, each red-proved for the two new branches; wired into pins (CHECK-MANIFEST-FIXTURES).
+- F-R5-2 / S5-2: the package's final teardown ignores stop signals as its first statement; fixture "a signal during a failing removal does not hide the report", red-proved. The one statement before it is an accepted residual of Python's asynchronous signal handling.
+- T5-5: fixtures for SIGINT during the build (exit 130) and a second SIGTERM before the removal blocks signals; red-proved by removing SIGINT handling and the teardown ignoring.
+- F-R5-3: `check_harness_matches_config` compares every address, MAC and port the harness plays with the generated config before any boot.
+- F-R5-4: comment narrowed (QEMU's pexpect fork still runs a little Python; accepted). F-R5-5 / T5-4: saved handlers restored. T5-2: exact needle "UNIT-AUDIT-EVENT: 13 < manifest 14". T5-7: exact allowed-IP message asserted.

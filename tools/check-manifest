@@ -2,10 +2,12 @@
 """Compares gate counts in a counts directory with the committed manifest.
 
 Usage: check-manifest <manifest.txt> <counts-dir>
-Each manifest line is "<KEY> <minimum>". Every key must appear in some
-counts file with a value >= its minimum and > 0. A value above its minimum
-also fails ("raise the manifest"): a minimum left below the real count is a
-test that can be deleted without any gate noticing. Exit 1 otherwise.
+Each manifest line is "<KEY> <count>". Every key must appear in some counts
+file with exactly that value, and > 0. Fewer means a gate ran less than it
+should; more fails too ("raise the manifest"), since a number left below the
+real count is a test that can be deleted without any gate noticing; and a
+count with no manifest line fails ("add it"), so a new gate or crate cannot
+go unpinned. Exit 1 otherwise.
 """
 
 import pathlib
@@ -36,6 +38,8 @@ def main() -> int:
             bad.append(f"{key}: {v} < manifest {n}")
         elif v > n:
             bad.append(f"{key}: {v} > manifest {n} (raise the manifest to {v})")
+    for key in sorted(set(got) - set(want)):
+        bad.append(f"{key}: {got[key]} not in the manifest (add it)")
     for b in bad:
         print(f"check-manifest: {b}")
     return 1 if bad else 0

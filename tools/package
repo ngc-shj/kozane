@@ -153,7 +153,7 @@ def with_prefill(system: str, blob_path: str) -> str:
 
 
 def exit_on_signal(signum, _frame):
-    # SIGTERM/SIGHUP must run the `finally` that removes the staging dir:
+    # SIGTERM/SIGHUP/SIGINT must run the `finally` that removes the staging dir:
     # after microkit it holds an image with the secrets embedded. Later
     # signals are ignored so they cannot interrupt that removal.
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
@@ -225,6 +225,11 @@ def main() -> int:
                 os.rename(staging, out)
                 status = 0
     finally:
+        # The final teardown: no stop signal may cut it short or skip its
+        # leftover report (one statement before this remains inherent to
+        # Python's asynchronous signal handling).
+        for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(s, signal.SIG_IGN)
         if staging.exists() and not remove_staging(staging):
             status = 1
     if status == 0:

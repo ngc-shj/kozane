@@ -148,7 +148,7 @@ CASES = {
     # Deleting a test keeps `unit` green; only the manifest comparison notices.
     "manifest": (["unit", "manifest"], lambda t: edit(t, "crates/audit-event/src/tests.rs",
                                                      "#[test]\nfn first_occurrence_emits()",
-                                                     "#[allow(dead_code)]\nfn first_occurrence_emits()"), "UNIT-TESTS"),
+                                                     "#[allow(dead_code)]\nfn first_occurrence_emits()"), "UNIT-AUDIT-EVENT: 13 < manifest 14"),
 }
 
 

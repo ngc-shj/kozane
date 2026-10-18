@@ -173,6 +173,17 @@ def check_reason_list_matches_rust():
 READY_LINE = re.compile(r"(eth_out|eth_in|ingress|inner|data|hs|audit): ready\r*\n")
 
 
+def start_without_stop_signals(thread: threading.Thread):
+    """Starts a helper thread with the stop signals blocked; it inherits the
+    mask, so process-directed signals reach only the main thread, where
+    `signals_held` can hold them during a teardown."""
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+    try:
+        thread.start()
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+
 class Console:
     """QEMU serial output, drained by a thread so QEMU never blocks on a
     full pty. Waits search the text after a cursor."""
@@ -182,7 +193,7 @@ class Console:
         self.text = ""
         self.lock = threading.Lock()
         self.alive = True
-        threading.Thread(target=self._drain, daemon=True).start()
+        start_without_stop_signals(threading.Thread(target=self._drain, daemon=True))
 
     def _drain(self):
         while self.alive:
@@ -596,14 +607,10 @@ def test_wireguard(loader: str, deploy: str, passed: list):
                       inside.netdev("n1"), monitor)
     wg = None
     try:
-        host.start()
+        start_without_stop_signals(host)
         mon = Monitor(monitor)
         scratch = os.path.join(deploy, "pmem.bin")
         cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
-        # The harness plays these addresses; fail by name if the template moves them.
-        if (cfg["neighbors"][0]["ip"] != ".".join(map(str, HOST_IP))
-                or cfg["peers"][0]["allowed_ips"] != ["10.200.0.2/32"]):
-            raise Fail("config/gateway.toml no longer matches the harness addresses (HOST_IP, peer 0)")
         gw_pub = b64(cfg["gateway"]["public_key"])
         peer0 = open(os.path.join(deploy, "peer-0.conf")).read()
         peer1 = open(os.path.join(deploy, "peer-1.conf")).read()
@@ -783,8 +790,36 @@ def build(tmp: str) -> tuple:
     return f"{tmp}/a/pkg/loader.img", f"{tmp}/b/pkg/loader.img"
 
 
+def check_harness_matches_config(deploy: str):
+    """Every address the harness plays or expects comes from the template;
+    fail by name before any boot if the template moves one."""
+    cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
+    g = cfg["gateway"]
+    ip = lambda b: ".".join(map(str, b))  # noqa: E731
+    mac = lambda b: b.hex(":")  # noqa: E731
+    expected = {
+        "gateway.outside_ip": (g["outside_ip"], ip(GW_IP)),
+        "gateway.outside_mac": (g["outside_mac"], mac(GW_MAC)),
+        "gateway.outside_router_mac": (g["outside_router_mac"], mac(PEER_MAC)),
+        "gateway.listen_port": (g["listen_port"], WG_PORT),
+        "gateway.inside_ip": (g["inside_ip"], ip(INSIDE_IP)),
+        "gateway.inside_mac": (g["inside_mac"], mac(INSIDE_MAC)),
+        "neighbors[0].ip": (cfg["neighbors"][0]["ip"], ip(HOST_IP)),
+        "neighbors[0].mac": (cfg["neighbors"][0]["mac"], mac(HOST_MAC)),
+        "peers[0].allowed_ips": (cfg["peers"][0]["allowed_ips"], ["10.200.0.2/32"]),
+    }
+    wrong = [f"{k}={got!r} (harness uses {want!r})" for k, (got, want) in expected.items() if got != want]
+    if wrong:
+        raise Fail("config/gateway.toml no longer matches the harness: " + "; ".join(wrong))
+
+
 def in_netns(good: str, mismatched: str, deploy: str) -> int:
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
+    try:
+        check_harness_matches_config(deploy)
+    except Fail as e:
+        print(f"\nFAIL [setup]: {e}", file=sys.stderr)
+        return 1
     # Each case appends to `passed` only once its assertions held; the
     # count printed is what ran, not a constant (code review T1).
     passed = []
@@ -817,7 +852,9 @@ PR_SET_PDEATHSIG = 1
 
 
 # Children of the (multi-threaded) netns harness get PR_SET_PDEATHSIG from
-# setpriv rather than a preexec_fn, which is unsafe once threads exist.
+# setpriv rather than a preexec_fn, which is unsafe once threads exist. For
+# wireguard-go (subprocess) that removes Python code from the fork child; for
+# QEMU, pexpect still runs a little Python between fork and exec (accepted).
 DIE_WITH_PARENT = ["setpriv", "--pdeathsig", "KILL", "--"]
 
 

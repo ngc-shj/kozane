@@ -68,7 +68,8 @@ fn malformed_key_is_rejected() {
 
 #[test]
 fn host_bits_in_prefix_are_rejected() {
-    assert!(err(&cfg(&peer(K1, "\"10.200.0.2/24\""))).contains("host bits"));
+    let e = err(&cfg(&peer(K1, "\"10.200.0.2/24\"")));
+    assert_eq!(e, "config: allowed IP: prefix \"10.200.0.2/24\" has host bits set");
 }
 
 #[test]
