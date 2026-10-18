@@ -114,14 +114,14 @@ pub fn parse_mac(s: &str) -> Result<[u8; 6], String> {
 }
 
 pub fn parse_prefix(s: &str) -> Result<Prefix, String> {
-    let (ip, len) = s.split_once('/').ok_or_else(|| format!("allowed IP {s:?} needs /len"))?;
+    let (ip, len) = s.split_once('/').ok_or_else(|| format!("prefix {s:?} needs /len"))?;
     let len: u8 = len.parse().map_err(|_| format!("bad prefix length in {s:?}"))?;
     if len > 32 {
         return Err(format!("bad prefix length in {s:?}"));
     }
     let p = Prefix { addr: parse_ip(ip)?, len };
     if p.range().0 != u32::from_be_bytes(p.addr) {
-        return Err(format!("allowed IP {s:?} has host bits set"));
+        return Err(format!("prefix {s:?} has host bits set"));
     }
     Ok(p)
 }
@@ -150,7 +150,11 @@ pub fn check(text: &str, max_peers: usize) -> Result<Checked, String> {
         if p.allowed_ips.is_empty() {
             return Err(format!("config: peer {} has no allowed IPs", p.public_key));
         }
-        let prefixes = p.allowed_ips.iter().map(|s| parse_prefix(s)).collect::<Result<Vec<_>, _>>()?;
+        let prefixes = p
+            .allowed_ips
+            .iter()
+            .map(|s| parse_prefix(s).map_err(|e| format!("config: allowed IP: {e}")))
+            .collect::<Result<Vec<_>, _>>()?;
         peers.push((key, prefixes));
     }
     // Cryptokey routing needs an unambiguous owner for every address.

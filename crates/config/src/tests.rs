@@ -250,7 +250,9 @@ fn outside_address_next_to_the_inside_network_is_accepted() {
 #[test]
 fn malformed_inside_prefix_is_named_in_the_error() {
     let c = cfg(&peer(K1, "\"10.200.0.2/32\"")).replace("inside_prefix = \"10.99.0.0/24\"", "inside_prefix = \"10.99.0.1/24\"");
-    assert!(err(&c).contains("inside_prefix: "));
+    let e = err(&c);
+    assert!(e.contains("inside_prefix: prefix \"10.99.0.1/24\" has host bits set"), "{e}");
+    assert!(!e.contains("allowed IP"), "{e}");
 }
 
 #[test]
@@ -259,4 +261,15 @@ fn overlap_boundaries_of_the_inside_network_are_both_refused() {
     assert!(err(&cfg(&peer(K1, "\"10.99.0.0/32\""))).contains("overlap inside_prefix"));
     assert!(err(&cfg(&peer(K1, "\"10.99.0.255/32\""))).contains("overlap inside_prefix"));
     assert!(validate::check(&cfg(&peer(K1, "\"10.100.0.0/32\"")), 4).is_ok());
+}
+
+#[test]
+fn addresses_adjacent_to_the_inside_network_are_accepted() {
+    // One past each end of 10.99.0.0/24: the overlap test is inclusive, not wider.
+    assert!(validate::check(&cfg(&peer(K1, "\"10.99.1.0/32\"")), 4).is_ok());
+    assert!(validate::check(&cfg(&peer(K1, "\"10.98.255.255/32\"")), 4).is_ok());
+    for outside in ["10.99.1.0", "10.98.255.255"] {
+        let c = cfg(&peer(K1, "\"10.200.0.2/32\"")).replace("outside_ip = \"10.0.2.15\"", &std::format!("outside_ip = \"{outside}\""));
+        assert!(validate::check(&c, 4).is_ok(), "{outside}");
+    }
 }

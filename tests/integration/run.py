@@ -21,6 +21,7 @@ Missing prerequisites fail the run; nothing is skipped.
 """
 
 import base64
+import contextlib
 import ctypes
 import json
 import os
@@ -256,8 +257,8 @@ def boot(loader: str, outside: str, inside: str, monitor: str = "") -> tuple:
     if monitor:
         cmd += ["-monitor", f"unix:{monitor},server,nowait"]
     # pexpect makes the child a session leader, so kill() takes the group.
-    child = pexpect.spawn("qemu-system-aarch64", cmd, encoding="utf-8", timeout=BOOT_TIMEOUT_S,
-                          preexec_fn=die_with_parent)
+    child = pexpect.spawn(DIE_WITH_PARENT[0], DIE_WITH_PARENT[1:] + ["qemu-system-aarch64"] + cmd,
+                          encoding="utf-8", timeout=BOOT_TIMEOUT_S)
     return child, Console(child)
 
 
@@ -544,9 +545,8 @@ class WgGo:
     def __init__(self, conf: str, address: str, inside_prefix: str):
         self.inside_prefix = inside_prefix
         self.dev = dev = f"wgt{os.getpid() % 100000}"
-        self.proc = subprocess.Popen(["wireguard-go", "-f", dev], stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL, env={**os.environ, "LOG_LEVEL": "error"},
-                                     preexec_fn=die_with_parent)
+        self.proc = subprocess.Popen(DIE_WITH_PARENT + ["wireguard-go", "-f", dev], stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL, env={**os.environ, "LOG_LEVEL": "error"})
         try:
             self._configure(conf, address)
         except BaseException:
@@ -600,6 +600,10 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         mon = Monitor(monitor)
         scratch = os.path.join(deploy, "pmem.bin")
         cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
+        # The harness plays these addresses; fail by name if the template moves them.
+        if (cfg["neighbors"][0]["ip"] != ".".join(map(str, HOST_IP))
+                or cfg["peers"][0]["allowed_ips"] != ["10.200.0.2/32"]):
+            raise Fail("config/gateway.toml no longer matches the harness addresses (HOST_IP, peer 0)")
         gw_pub = b64(cfg["gateway"]["public_key"])
         peer0 = open(os.path.join(deploy, "peer-0.conf")).read()
         peer1 = open(os.path.join(deploy, "peer-1.conf")).read()
@@ -716,10 +720,11 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         passed.append("ttl expiry")
         print("\nPASS [TTL 1 dropped, TTL 2 forwarded at the inside hop]")
     finally:
-        host.stop = True
-        if wg:
-            wg.close()
-        kill(child)
+        with signals_held():
+            host.stop = True
+            if wg:
+                wg.close()
+            kill(child)
 
 
 # ---------------------------------------------------------------- boot 3
@@ -741,7 +746,8 @@ def test_mismatched_blob(loader: str):
 
 
 def preflight():
-    missing = [t for t in ("unshare", "wireguard-go", "wg", "ip", "ping", "qemu-system-aarch64") if not shutil.which(t)]
+    missing = [t for t in ("unshare", "setpriv", "wireguard-go", "wg", "ip", "ping", "qemu-system-aarch64")
+               if not shutil.which(t)]
     if missing:
         raise Fail(f"missing tools: {missing}")
     if not os.path.exists("/dev/net/tun"):
@@ -810,20 +816,44 @@ _LIBC = ctypes.CDLL(None, use_errno=True)
 PR_SET_PDEATHSIG = 1
 
 
+# Children of the (multi-threaded) netns harness get PR_SET_PDEATHSIG from
+# setpriv rather than a preexec_fn, which is unsafe once threads exist.
+DIE_WITH_PARENT = ["setpriv", "--pdeathsig", "KILL", "--"]
+
+
 def die_with_parent():
-    """SIGKILL this process when its parent dies (PR_SET_PDEATHSIG). Applied
-    at every level: outer harness -> netns harness -> QEMU / wireguard-go,
-    so killing any level outright orphans nothing below it."""
+    """SIGKILL this process when its parent dies (PR_SET_PDEATHSIG): used by
+    the netns harness on itself right after exec. Together with setpriv for
+    QEMU and wireguard-go this closes the orphan race at the harness level
+    (each child still has a fork-to-prctl window)."""
     if _LIBC.prctl(PR_SET_PDEATHSIG, signal.SIGKILL) != 0:
         raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG)")
 
 
+STOP_SIGNALS = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
+
+
+def ignore_signals():
+    """Once the run is ending: no further signal may cut the teardown short."""
+    for s in STOP_SIGNALS:
+        signal.signal(s, signal.SIG_IGN)
+
+
+@contextlib.contextmanager
+def signals_held():
+    """Blocks stop signals for a teardown in the middle of the run; one that
+    arrives meanwhile is delivered when the teardown has finished."""
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    try:
+        yield
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+
+
 def exit_on_signal(signum, _frame):
     # Turn SIGTERM/SIGHUP/SIGINT into SystemExit so `finally` blocks run: the
-    # temp dir holds private keys and must go on every exit path. Further
-    # signals are ignored from here on, so they cannot cut the teardown short.
-    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
-        signal.signal(s, signal.SIG_IGN)
+    # temp dir holds private keys and must go on every exit path.
+    ignore_signals()
     raise SystemExit(128 + signum)
 
 
@@ -834,7 +864,10 @@ def main() -> int:
         # Re-armed after exec (PDEATHSIG survives unshare's exec, but checking
         # the parent closes the race where it died before this point).
         die_with_parent()
-        if os.getppid() == 1:
+        # Compare with the outer harness's own pid: under a subreaper an
+        # orphan is not reparented to 1.
+        if str(os.getppid()) != os.environ.get("SECUREOS_IT_PARENT"):
+            print("\nFAIL [setup]: outer harness already gone", file=sys.stderr)
             return 1
         return in_netns(*sys.argv[2:5])
     tmp = tempfile.mkdtemp(prefix="secureos-it-")
@@ -843,8 +876,10 @@ def main() -> int:
         preflight()
         good, mismatched = build(tmp)
         # `unshare` execs the child, so the Popen pid is the netns harness.
+        # The outer harness has no threads, so preexec_fn is safe here.
         child = subprocess.Popen(["unshare", "-rn", sys.executable, os.path.abspath(__file__), "--netns",
-                                  good, mismatched, os.path.join(tmp, "a")], preexec_fn=die_with_parent)
+                                  good, mismatched, os.path.join(tmp, "a")], preexec_fn=die_with_parent,
+                                 env={**os.environ, "SECUREOS_IT_PARENT": str(os.getpid())})
         try:
             status = child.wait()
         except BaseException:
@@ -863,6 +898,7 @@ def main() -> int:
     except Fail as e:
         print(f"\nFAIL [setup]: {e}", file=sys.stderr)
     finally:
+        ignore_signals()
         left = []
         shutil.rmtree(tmp, onexc=lambda _f, p, e: left.append(f"{p}: {e}"))
         if left or os.path.exists(tmp):

@@ -170,3 +170,36 @@ Testing: regression (T1); RT1 (T2, T4); RT3 (T3); RT5 (T9); RT6 (T8); RT7 (T2, T
 - F-R3-4: wireguard-go routes `inside_prefix` from the generated config. F-R3-A1: comment corrected. T8: minimums raised. T11: see the manual proof recorded below.
 - T11 manual proof (2026-10-19, dev container): `run.py` started in the background; once "PASS [wireguard-go handshake" was logged, SIGTERM to the outer harness. Outer exit 143; afterwards no `qemu-system-aarch64`, no harness `wireguard-go` (`wgt*`), no `wgt*` UAPI socket and no `/tmp/secureos-it-*` directory remained.
 - Verification of this round: `make check` green; `tools/check-selftest integration-residue bolero bolero-wg-wire` → all three ok (`integration-residue`: with the reclaim removed, `make test` fails with "install message still in guest RAM").
+
+# Round 4
+Date: 2026-10-19 — incremental review of `4e72286..670d8c7`. No Critical findings; one Major; R43: no widening. All Round-3 security findings resolved.
+
+## Findings
+| ID | Sev | Finding |
+|---|---|---|
+| R4-T1 | Major | Manifest minimums lagged again (UNIT-MSGS 6 < 7, UNIT-TESTS 379 < 384): the golden-vector test was deletable green |
+| S1 / F-R4-3 | Minor | tools/package did not handle SIGINT; a signal during normal-path teardown could cut it short |
+| S2 / F-R4-5 | Minor | `--netns` parent check assumed reparenting to PID 1 (subreapers) and exited silently |
+| F-R4-1 / R4-T7 | Minor | inside_prefix errors still said "allowed IP" |
+| F-R4-2 / R4-T2 | Minor | Accept-side boundary tests not at the true neighbours of the inside network |
+| F-R4-4 | Minor | preexec_fn used in the multi-threaded netns harness |
+| F-R4-6 | Minor | Harness addresses duplicated the config template without a check |
+| R4-T3 | Minor | staging_in_forbidden_root could pass on an earlier refusal |
+| R4-T4 | Minor | main()'s loud staging removal untested (only the helper) |
+| R4-T5 | Minor | Ignoring later signals during teardown untested |
+| R4-T6 | Minor | A fixture leaked umask 077 and reset handlers to SIG_DFL |
+| R4-T8 | Minor | Seed-check deny branches proven by hand only |
+
+## Recurring Issue Check (Round 4)
+Functionality: R2/R3 (F-R4-3, F-R4-6), R29/R49 (F-R4-1, F-R4-2, F-R4-5) violated; R12, R40, R44, R50 resolved; others checked. Security: R43 none; RS1 (S1); RS4 (S2); others resolved or N/A. Testing: RT1 (R4-T3), RT3 (R4-T4, R4-T5), RT5 (R4-T6), RT6 recurring (R4-T1), RT7 (R4-T3, R4-T7), RT8 (R4-T2), RT10 (R4-T4), RT11 (R4-T8).
+
+## Resolution Status (Round 4)
+- R4-T1: manifest raised to the actual counts, and `tools/check-manifest` now fails when a count exceeds its minimum ("raise the manifest to N"), so a minimum can no longer lag the tests it protects; the selftest `manifest` case keeps the decrease side proven.
+- S1 / F-R4-3 / R4-T5: tools/package handles SIGINT; staging removal blocks stop signals (pthread_sigmask) so a signal waits until removal finished; run.py blocks them around mid-run teardown (`signals_held`) and ignores them in the final one. Fixtures: second SIGTERM during cleanup, signal during removal; red-proved by removing both protections.
+- S2 / F-R4-5: the outer harness passes its pid (`SECUREOS_IT_PARENT`); the netns harness compares getppid() with it and prints a FAIL line. Docstring restated.
+- F-R4-4: QEMU and wireguard-go get PR_SET_PDEATHSIG through `setpriv --pdeathsig KILL` (preflight requires setpriv); preexec_fn remains only in the single-threaded outer harness. Integration re-run green.
+- F-R4-1 / R4-T7: `parse_prefix` messages are neutral; callers label them (`allowed IP:`, `inside_prefix:`); the test asserts the full message and the absence of "allowed IP".
+- F-R4-2 / R4-T2: 10.99.1.0/32 and 10.98.255.255/32 accepted as allowed IPs and as outside_ip.
+- F-R4-6: test_wireguard fails by name if the template's neighbor or peer-0 addresses differ from the harness constants.
+- R4-T3 / R4-T6: the fixture asserts the "staging directory" message and three root lookups, and restores umask and the saved handlers. R4-T4: main() variant whose cleanup cannot remove staging must print the warning and fail; red-proved with a silent cleanup.
+- R4-T8: accepted residual. Both deny branches were exercised by hand (empty index → "no committed seed-*"); a selftest case would need a git-less tree, which the bolero cases already show fails loudly with git's own error.

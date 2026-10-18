@@ -5,7 +5,9 @@ Usage: python3 tests/tools/test_package.py
 Prints "PACKAGE-FIXTURES <n>" and exits non-zero on any mismatch.
 """
 
+import contextlib
 import importlib.machinery
+import io
 import importlib.util
 import os
 import pathlib
@@ -118,7 +120,7 @@ def run_main(build_result):
                 if build_result == "out-appears":
                     out.mkdir()
                     return 0
-                if build_result == "sigterm":
+                if build_result in ("sigterm", "two-signals"):
                     os.kill(os.getpid(), signal.SIGTERM)
                 return build_result
 
@@ -126,14 +128,30 @@ def run_main(build_result):
             sys.argv = ["package", "--secrets", str(blob), "--out", str(out), "--system", "x", "--policy", "x",
                         "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
                         "--config", "x", "--microkit", "x"]
-            real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
+            real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+            real_rmtree = pkg.shutil.rmtree
+            if build_result == "removal-fails":
+                # main()'s cleanup cannot remove the staging dir: it must say so.
+                def cannot_remove(path, onexc=None, **_):
+                    if onexc:
+                        onexc(None, str(path), PermissionError("denied"))
+                pkg.shutil.rmtree = cannot_remove
+            if build_result == "two-signals":
+                # A second signal arrives while the staging dir is being removed.
+                def second_signal(path, **kw):
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    real_rmtree(path, **kw)
+                pkg.shutil.rmtree = second_signal
+            captured = io.StringIO()
             try:
-                status = pkg.main()
+                with contextlib.redirect_stdout(captured):
+                    status = pkg.main()
             except RuntimeError:
                 status = "raised"
             except SystemExit as e:
                 status = f"exit {e.code}"
             finally:
+                pkg.shutil.rmtree = real_rmtree
                 for s, h in real_handlers.items():
                     signal.signal(s, h)
             errors = []
@@ -154,7 +172,16 @@ def run_main(build_result):
             expected = {1: 1, "raise": "raised", "out-appears": 1, 0: 0}.get(build_result)
             if expected is not None and status != expected:
                 errors.append(f"status {status}, want {expected}")
-            if build_result == "sigterm" and status != f"exit {128 + signal.SIGTERM}":
+            if build_result == "removal-fails":
+                if status != 1 or "could not remove staging directory" not in captured.getvalue():
+                    errors.append(f"failed removal not reported (status {status})")
+                # This variant deliberately leaves staging behind; clear the
+                # expected leftover error and remove it here.
+                errors = [e for e in errors if e != "staging directory left behind"]
+                for p in d.iterdir():
+                    if p.name.startswith(".pkg."):
+                        shutil.rmtree(p)
+            if build_result in ("sigterm", "two-signals") and status != f"exit {128 + signal.SIGTERM}":
                 errors.append(f"SIGTERM did not end the run through SystemExit (status {status})")
             return errors
         finally:
@@ -169,6 +196,9 @@ def staging_in_forbidden_root():
     swapped after the check): main() must refuse before building."""
     d = tmp_tree()
     real_roots, real_build, real_argv = pkg.forbidden_roots, pkg.build, sys.argv
+    real_umask = os.umask(0o022)
+    os.umask(real_umask)
+    real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
     built = []
     try:
         blob = d / "secrets.bin"
@@ -188,15 +218,21 @@ def staging_in_forbidden_root():
         sys.argv = ["package", "--secrets", str(blob), "--out", str(d / "pkg"), "--system", "x", "--policy", "x",
                     "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
                     "--config", "x", "--microkit", "x"]
-        status = pkg.main()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            status = pkg.main()
         errors = []
         if status != 1 or built or (d / "pkg").exists() or [p for p in d.iterdir() if p.name.startswith(".pkg.")]:
             errors.append(f"staging in a forbidden root was not refused cleanly (status {status}, built {built})")
+        # Refused by the staging re-check itself, not by an earlier check.
+        if "staging directory" not in out.getvalue() or len(calls) != 3:
+            errors.append(f"refused by another check: {out.getvalue().strip()!r}, {len(calls)} root lookups")
         return errors
     finally:
         pkg.forbidden_roots, pkg.build, sys.argv = real_roots, real_build, real_argv
-        for s in (signal.SIGTERM, signal.SIGHUP):
-            signal.signal(s, signal.SIG_DFL)
+        os.umask(real_umask)
+        for s, h in real_handlers.items():
+            signal.signal(s, h)
         shutil.rmtree(d)
 
 
@@ -215,6 +251,41 @@ def failed_staging_removal_is_reported():
         return [] if ok is False else ["a failed removal was reported as success"]
     finally:
         pkg.shutil.rmtree = real_rmtree
+        shutil.rmtree(d)
+
+
+def signal_during_removal_does_not_cut_it_short():
+    """A SIGTERM delivered while the staging dir is being removed must wait
+    until the removal has finished (then end the run)."""
+    d = tmp_tree()
+    real_rmtree = pkg.shutil.rmtree
+    old = signal.signal(signal.SIGTERM, pkg.exit_on_signal)
+    try:
+        staging = d / ".pkg.x"
+        (staging / "sub").mkdir(parents=True)
+        (staging / "sub" / "loader.img").write_bytes(b"secret image")
+
+        def interrupted(path, onexc=None):
+            os.kill(os.getpid(), signal.SIGTERM)
+            real_rmtree(path, onexc=onexc)
+
+        pkg.shutil.rmtree = interrupted
+        try:
+            pkg.remove_staging(staging)
+            ended = False
+        except SystemExit:
+            ended = True
+        errors = []
+        if staging.exists():
+            errors.append("staging survived a signal during its removal")
+        if not ended:
+            errors.append("the signal was lost instead of ending the run after the removal")
+        return errors
+    finally:
+        pkg.shutil.rmtree = real_rmtree
+        for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+            signal.signal(s, signal.SIG_DFL)
+        signal.signal(signal.SIGTERM, old)
         shutil.rmtree(d)
 
 
@@ -260,8 +331,11 @@ CASES = [
     ("crashing build leaves no OUT and no staging", None, run_main("raise")),
     ("OUT appearing during the build is refused, staging removed", None, run_main("out-appears")),
     ("SIGTERM during the build leaves no OUT and no staging", None, run_main("sigterm")),
+    ("a second SIGTERM during cleanup does not cut it short", None, run_main("two-signals")),
+    ("main() reports a staging dir it could not remove", None, run_main("removal-fails")),
     ("staging that resolves into a forbidden root is refused", None, staging_in_forbidden_root),
     ("a failed staging removal fails loudly", None, failed_staging_removal_is_reported),
+    ("a signal during the staging removal waits for it", None, signal_during_removal_does_not_cut_it_short),
     ("output inside build/", "inside", lambda: pkg.check_out_path(ROOT / "build/pkg", ROOT)),
     ("output inside the repo", "inside", lambda: pkg.check_out_path(ROOT / "pkg-out", ROOT)),
     ("output through a symlink into the repo", "inside", out_case(link_into_repo)),

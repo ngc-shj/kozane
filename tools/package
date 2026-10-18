@@ -156,15 +156,20 @@ def exit_on_signal(signum, _frame):
     # SIGTERM/SIGHUP must run the `finally` that removes the staging dir:
     # after microkit it holds an image with the secrets embedded. Later
     # signals are ignored so they cannot interrupt that removal.
-    for s in (signal.SIGTERM, signal.SIGHUP):
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(s, signal.SIG_IGN)
     raise SystemExit(128 + signum)
 
 
 def remove_staging(staging: pathlib.Path) -> bool:
-    """Removes the staging dir; reports (never swallows) what could not go."""
+    """Removes the staging dir; reports (never swallows) what could not go.
+    Stop signals are blocked meanwhile, so none can cut the removal short."""
     left = []
-    shutil.rmtree(staging, onexc=lambda _f, p, e: left.append(f"{p}: {e}"))
+    old = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM, signal.SIGHUP, signal.SIGINT})
+    try:
+        shutil.rmtree(staging, onexc=lambda _f, p, e: left.append(f"{p}: {e}"))
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, old)
     if left or staging.exists():
         print("package: could not remove staging directory (may hold secrets): " + "; ".join(left or [str(staging)]))
         return False
@@ -172,8 +177,8 @@ def remove_staging(staging: pathlib.Path) -> bool:
 
 
 def main() -> int:
-    signal.signal(signal.SIGTERM, exit_on_signal)
-    signal.signal(signal.SIGHUP, exit_on_signal)
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, exit_on_signal)
     ap = argparse.ArgumentParser()
     for opt in ("secrets", "out", "system", "policy", "image", "gen-config", "search-path", "board", "config", "microkit"):
         ap.add_argument(f"--{opt}", required=True)
