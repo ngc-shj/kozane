@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Packages a deployment image: the `make image` system with only the
+secrets region's `prefill_path` pointed at a real blob (plan C16).
+
+Usage: package --secrets FILE --out DIR --system FILE --policy FILE
+               --image LOADER --gen-config gen_config.h --search-path DIR
+               --board BOARD --config CONFIG --microkit BIN
+
+The result is accepted only if, against the placeholder build:
+  - the .system differs in nothing but that one attribute;
+  - the loader images have equal length, differ somewhere, and every
+    differing byte lies inside the one place the blob appears in the new
+    image, where the placeholder image held zeros;
+  - the blob is a full, non-zero region with the right magic, read from a
+    path outside the repository.
+Until cookies land (SC13, architecture R6) only `debug` kernels may be
+packaged, read from the kernel's own gen_config.h rather than a make
+variable.
+"""
+
+import argparse
+import os
+import pathlib
+import subprocess
+import sys
+import xml.etree.ElementTree as ET
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SECRETS_MR = "secrets"
+REGION_SIZE = 4096
+MAGIC = b"SOSSECR1"
+DEBUG_LINE = "#define CONFIG_DEBUG_BUILD  1"
+
+
+def require_debug(gen_config: str) -> list:
+    if DEBUG_LINE in gen_config.splitlines():
+        return []
+    return ["package: kernel config is not debug; M2 images are dev-only until cookies (SC13)"]
+
+
+def check_blob(blob: bytes) -> list:
+    errors = []
+    if len(blob) != REGION_SIZE:
+        errors.append(f"package: blob is {len(blob)} bytes, expected {REGION_SIZE}")
+    if not any(blob):
+        errors.append("package: blob is all zero")
+    elif blob[: len(MAGIC)] != MAGIC:
+        errors.append("package: blob has no secrets magic")
+    return errors
+
+
+def check_secrets_path(path: pathlib.Path, repo: pathlib.Path) -> list:
+    resolved = path.resolve()
+    if resolved.is_relative_to(repo.resolve()):
+        return [f"package: secrets path {resolved} is inside the repository"]
+    return []
+
+
+def _diff_elements(a: ET.Element, b: ET.Element, where: str, errors: list):
+    if a.tag != b.tag:
+        errors.append(f"package: {where}: element <{a.tag}> became <{b.tag}>")
+        return
+    attrs_a, attrs_b = dict(a.attrib), dict(b.attrib)
+    if a.tag == "memory_region" and a.get("name") == SECRETS_MR and b.get("name") == SECRETS_MR:
+        attrs_a.pop("prefill_path", None)
+        attrs_b.pop("prefill_path", None)
+    if attrs_a != attrs_b:
+        errors.append(f"package: {where}: attributes of <{a.tag}> changed")
+    if (a.text or "").strip() != (b.text or "").strip():
+        errors.append(f"package: {where}: text of <{a.tag}> changed")
+    ca, cb = list(a), list(b)
+    if len(ca) != len(cb):
+        errors.append(f"package: {where}: <{a.tag}> has {len(ca)} children, now {len(cb)}")
+        return
+    for i, (x, y) in enumerate(zip(ca, cb)):
+        _diff_elements(x, y, f"{where}/{x.tag}[{i}]", errors)
+
+
+def check_systems(placeholder: str, package: str) -> list:
+    """The package .system must equal the placeholder one except for the
+    secrets mr's prefill_path, which must be set in both."""
+    a, b = ET.fromstring(placeholder), ET.fromstring(package)
+    errors = []
+    _diff_elements(a, b, a.tag, errors)
+    for name, root in (("placeholder", a), ("package", b)):
+        mrs = [m for m in root.iter("memory_region") if m.get("name") == SECRETS_MR]
+        if len(mrs) != 1 or not mrs[0].get("prefill_path"):
+            errors.append(f"package: {name} system needs one '{SECRETS_MR}' mr with a prefill_path")
+    return errors
+
+
+def check_images(placeholder: bytes, package: bytes, blob: bytes) -> list:
+    if len(placeholder) != len(package):
+        return ["package: image length changed"]
+    diffs = [i for i, (x, y) in enumerate(zip(placeholder, package)) if x != y]
+    if not diffs:
+        return ["package: image is identical to the placeholder build"]
+    at = package.find(blob)
+    if at < 0 or package.find(blob, at + 1) >= 0:
+        return ["package: blob does not appear exactly once in the image"]
+    end = at + len(blob)
+    errors = []
+    if any(placeholder[at:end]):
+        errors.append("package: placeholder image is not zero where the blob lands")
+    if diffs[0] < at or diffs[-1] >= end:
+        errors.append(f"package: image differs outside the blob ({diffs[0]:#x}..{diffs[-1]:#x} vs {at:#x}..{end:#x})")
+    return errors
+
+
+def with_prefill(system: str, blob_path: str) -> str:
+    root = ET.fromstring(system)
+    mrs = [m for m in root.iter("memory_region") if m.get("name") == SECRETS_MR]
+    if len(mrs) != 1:
+        raise SystemExit(f"package: system needs exactly one '{SECRETS_MR}' mr")
+    mrs[0].set("prefill_path", blob_path)
+    return ET.tostring(root, encoding="unicode")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    for opt in ("secrets", "out", "system", "policy", "image", "gen-config", "search-path", "board", "config", "microkit"):
+        ap.add_argument(f"--{opt}", required=True)
+    a = ap.parse_args()
+
+    secrets = pathlib.Path(a.secrets)
+    errors = require_debug(pathlib.Path(a.gen_config).read_text())
+    errors += check_secrets_path(secrets, ROOT)
+    if errors:
+        print("\n".join(errors))
+        return 1
+    blob = secrets.read_bytes()
+    errors = check_blob(blob)
+    if errors:
+        print("\n".join(errors))
+        return 1
+
+    out = pathlib.Path(a.out)
+    out.mkdir(mode=0o700, parents=True, exist_ok=True)
+    placeholder_system = pathlib.Path(a.system).read_text()
+    system = out / "secureos.system"
+    system.write_text(with_prefill(placeholder_system, str(secrets.resolve())))
+    loader = out / "loader.img"
+
+    subprocess.run(["cargo", "run", "--locked", "-q", "-p", "laws", "--", "check", "--system", str(system),
+                    "--policy", a.policy, "--search-path", a.search_path], check=True)
+    subprocess.run([a.microkit, str(system), "--search-path", a.search_path, "--board", a.board,
+                    "--config", a.config, "-r", str(out / "report.txt"), "-o", str(loader)], check=True)
+
+    errors = check_systems(placeholder_system, system.read_text())
+    errors += check_images(pathlib.Path(a.image).read_bytes(), loader.read_bytes(), blob)
+    if errors:
+        loader.unlink()
+        print("\n".join(errors))
+        return 1
+    os.chmod(loader, 0o600)
+    print(f"package: wrote {loader}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -54,6 +54,42 @@ pub enum Event {
     DeviceFault,
     /// The NIC delivered a frame longer than a ring buffer.
     FrameTooLong,
+    /// A handshake completed; a session was handed to `data`.
+    HandshakeOk,
+    /// Initiation from a static key not in the configuration.
+    HandshakeUnknownPeer,
+    /// Initiation's encrypted static or timestamp failed to authenticate.
+    HandshakeDecrypt,
+    /// Initiation's TAI64N was not newer than the peer's last one.
+    HandshakeReplay,
+    /// Initiation within 1/50 s of the peer's last accepted one.
+    HandshakeFlood,
+    /// `key` refused a request (rate limit or invalid point).
+    HandshakeKeyRefused,
+    /// Any other handshake rejection (malformed, zero DH, entropy).
+    HandshakeOther,
+    /// WireGuard type/length a responder does not accept.
+    WgBadMessage,
+    /// Initiation with an invalid mac1.
+    WgBadMac1,
+    /// Initiation over its source's rate budget.
+    WgRateLimited,
+    /// `data` installed a session as `next`.
+    SessionInstalled,
+    /// Install whose index collides with a live session.
+    SessionCollision,
+    /// Transport packet with an unknown index, bad tag, replayed or expired.
+    TransportRejected,
+    /// Decrypted packet whose source is outside the peer's allowed IPs.
+    SpoofedSource,
+    /// Outbound packet with no peer or no current session.
+    NoSession,
+    /// Decrypted packet for a host that is not a static neighbor.
+    UnknownNeighbor,
+    /// First authenticated packet confirmed a `next` session.
+    SessionPromoted,
+    /// A session reached REJECT_AFTER_TIME and was zeroized.
+    SessionExpired,
 }
 
 impl Event {
@@ -70,6 +106,24 @@ impl Event {
             Event::Spoofed => 0x0016,
             Event::DeviceFault => 0x0017,
             Event::FrameTooLong => 0x0018,
+            Event::HandshakeOk => 0x0020,
+            Event::HandshakeUnknownPeer => 0x0021,
+            Event::HandshakeDecrypt => 0x0022,
+            Event::HandshakeReplay => 0x0023,
+            Event::HandshakeFlood => 0x0024,
+            Event::HandshakeKeyRefused => 0x0025,
+            Event::HandshakeOther => 0x0026,
+            Event::WgBadMessage => 0x0027,
+            Event::WgBadMac1 => 0x0028,
+            Event::WgRateLimited => 0x0029,
+            Event::SessionInstalled => 0x002a,
+            Event::SessionCollision => 0x002b,
+            Event::TransportRejected => 0x002c,
+            Event::SpoofedSource => 0x002d,
+            Event::NoSession => 0x002e,
+            Event::UnknownNeighbor => 0x002f,
+            Event::SessionPromoted => 0x0030,
+            Event::SessionExpired => 0x0031,
             Event::FrameDropped { reason } => {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
             }
@@ -77,7 +131,7 @@ impl Event {
     }
 
     /// Every variant except the parameterised `FrameDropped`.
-    pub const FIXED: [Event; 11] = [
+    pub const FIXED: [Event; 29] = [
         Event::ArpReplied,
         Event::UdpEchoed,
         Event::RingCorrupt,
@@ -89,6 +143,24 @@ impl Event {
         Event::Spoofed,
         Event::DeviceFault,
         Event::FrameTooLong,
+        Event::HandshakeOk,
+        Event::HandshakeUnknownPeer,
+        Event::HandshakeDecrypt,
+        Event::HandshakeReplay,
+        Event::HandshakeFlood,
+        Event::HandshakeKeyRefused,
+        Event::HandshakeOther,
+        Event::WgBadMessage,
+        Event::WgBadMac1,
+        Event::WgRateLimited,
+        Event::SessionInstalled,
+        Event::SessionCollision,
+        Event::TransportRejected,
+        Event::SpoofedSource,
+        Event::NoSession,
+        Event::UnknownNeighbor,
+        Event::SessionPromoted,
+        Event::SessionExpired,
     ];
 
     /// Display name; exhaustive, so a new variant fails to compile here.
@@ -105,6 +177,24 @@ impl Event {
             Event::Spoofed => "Spoofed",
             Event::DeviceFault => "DeviceFault",
             Event::FrameTooLong => "FrameTooLong",
+            Event::HandshakeOk => "HandshakeOk",
+            Event::HandshakeUnknownPeer => "HandshakeUnknownPeer",
+            Event::HandshakeDecrypt => "HandshakeDecrypt",
+            Event::HandshakeReplay => "HandshakeReplay",
+            Event::HandshakeFlood => "HandshakeFlood",
+            Event::HandshakeKeyRefused => "HandshakeKeyRefused",
+            Event::HandshakeOther => "HandshakeOther",
+            Event::WgBadMessage => "WgBadMessage",
+            Event::WgBadMac1 => "WgBadMac1",
+            Event::WgRateLimited => "WgRateLimited",
+            Event::SessionInstalled => "SessionInstalled",
+            Event::SessionCollision => "SessionCollision",
+            Event::TransportRejected => "TransportRejected",
+            Event::SpoofedSource => "SpoofedSource",
+            Event::NoSession => "NoSession",
+            Event::UnknownNeighbor => "UnknownNeighbor",
+            Event::SessionPromoted => "SessionPromoted",
+            Event::SessionExpired => "SessionExpired",
             Event::FrameDropped { .. } => "FrameDropped",
         }
     }
@@ -128,6 +218,24 @@ impl Event {
             Event::Spoofed => 8,
             Event::DeviceFault => 9,
             Event::FrameTooLong => 10,
+            Event::HandshakeOk => 11,
+            Event::HandshakeUnknownPeer => 12,
+            Event::HandshakeDecrypt => 13,
+            Event::HandshakeReplay => 14,
+            Event::HandshakeFlood => 15,
+            Event::HandshakeKeyRefused => 16,
+            Event::HandshakeOther => 17,
+            Event::WgBadMessage => 18,
+            Event::WgBadMac1 => 19,
+            Event::WgRateLimited => 20,
+            Event::SessionInstalled => 21,
+            Event::SessionCollision => 22,
+            Event::TransportRejected => 23,
+            Event::SpoofedSource => 24,
+            Event::NoSession => 25,
+            Event::UnknownNeighbor => 26,
+            Event::SessionPromoted => 27,
+            Event::SessionExpired => 28,
             Event::FrameDropped { reason } => {
                 // FIXED_SLOTS..FIXED_SLOTS+64, clamped like `code`.
                 let r = if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason };
@@ -137,7 +245,7 @@ impl Event {
     }
 }
 
-const FIXED_SLOTS: usize = 11;
+const FIXED_SLOTS: usize = 29;
 const SLOTS: usize = FIXED_SLOTS + MAX_DROP_REASON as usize + 1;
 
 /// Per-producer coalescing state.

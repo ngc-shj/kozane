@@ -102,7 +102,9 @@ ARG UID=1000
 ARG GID=1000
 RUN set -eux; \
     getent group "$GID" || groupadd --gid "$GID" dev; \
-    useradd --uid "$UID" --gid "$GID" --create-home dev
+    useradd --uid "$UID" --gid "$GID" --create-home dev; \
+    # wireguard-go's UAPI socket directory, for the unprivileged test netns.
+    install -d -o "$UID" -g "$GID" -m 0700 /var/run/wireguard
 USER dev
 
 # The toolchain itself is selected by rust-toolchain.toml in the repo.

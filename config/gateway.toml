@@ -1,0 +1,20 @@
+# Gateway configuration compiled into the image (law L6). Public values only.
+# The keys below are placeholders for builds without a deployment config;
+# integration tests generate their own config and secrets (tools/mksecrets).
+
+[gateway]
+public_key = "78wdDVL8XdPitWIiZQ7OBEnnlJfytmjgXqe3dz2gyGA="
+listen_port = 51820
+outside_ip = "10.0.2.15"
+outside_mac = "52:54:00:12:34:56"
+outside_router_mac = "52:55:0a:00:02:02"
+inside_ip = "10.99.0.1"
+inside_mac = "52:54:00:12:34:57"
+
+[[neighbors]]
+ip = "10.99.0.2"
+mac = "02:00:00:00:99:02"
+
+[[peers]]
+public_key = "YBS8Ds6hLNV9RKN63rn+Z7o/7hO6Iwmh1xhxEHInuGg="
+allowed_ips = ["10.200.0.2/32"]

@@ -19,21 +19,75 @@ pub const ETH_OUT_MMIO_OFFSET: usize = 0xe00;
 /// GIC interrupt of QEMU virt virtio-mmio slot 31 (SPI 47).
 pub const ETH_OUT_IRQ: usize = 79;
 
+/// Inside NIC: virtio-mmio slot 23 (0xa002e00, own page), placed with QEMU
+/// `bus=virtio-mmio-bus.23`; GIC interrupt 48 + 23.
+pub const ETH_IN_DMA_SIZE: usize = 0x200_000;
+pub const ETH_IN_MMIO_OFFSET: usize = 0xe00;
+pub const ETH_IN_IRQ: usize = 71;
+
+/// sp804 on QEMU virt (coliasgroup patch): 1 MHz input clock, SPI 11.
+pub const TIMER_IRQ: usize = 43;
+pub const TIMER_FREQ_HZ: u32 = 1_000_000;
+
 pub mod eth_out {
     pub const CH_DEVICE: usize = 0;
     pub const CH_INGRESS: usize = 1;
     pub const CH_AUDIT: usize = 2;
 }
 
+pub mod eth_in {
+    pub const CH_DEVICE: usize = 0;
+    pub const CH_INNER: usize = 1;
+    pub const CH_AUDIT: usize = 2;
+}
+
 pub mod ingress {
     pub const CH_ETH_OUT: usize = 1;
     pub const CH_AUDIT: usize = 2;
+    pub const CH_HS: usize = 3;
+    pub const CH_DATA: usize = 4;
 }
 
 pub mod audit {
     pub const CH_INGRESS: usize = 1;
     pub const CH_ETH_OUT: usize = 2;
+    pub const CH_ETH_IN: usize = 3;
+    pub const CH_INNER: usize = 4;
+    pub const CH_HS: usize = 5;
+    pub const CH_DATA: usize = 6;
 }
 
 #[cfg(test)]
 mod tests;
+
+pub mod timer {
+    pub const CH_DEVICE: usize = 0;
+    pub const CH_DATA: usize = 1;
+    pub const CH_HS: usize = 2;
+}
+
+pub mod key {
+    pub const CH_HS: usize = 1;
+}
+
+pub mod hs {
+    pub const CH_KEY: usize = 1;
+    pub const CH_INGRESS: usize = 2;
+    pub const CH_DATA: usize = 3;
+    pub const CH_TIMER: usize = 4;
+    pub const CH_AUDIT: usize = 5;
+}
+
+pub mod data {
+    pub const CH_INGRESS: usize = 1;
+    pub const CH_HS: usize = 2;
+    pub const CH_INNER: usize = 3;
+    pub const CH_TIMER: usize = 4;
+    pub const CH_AUDIT: usize = 5;
+}
+
+pub mod inner {
+    pub const CH_ETH_IN: usize = 1;
+    pub const CH_DATA: usize = 2;
+    pub const CH_AUDIT: usize = 3;
+}

@@ -1,0 +1,465 @@
+#![allow(clippy::indexing_slicing, clippy::unwrap_used, clippy::arithmetic_side_effects, clippy::panic)]
+
+extern crate std;
+
+use std::vec::Vec;
+
+use static_assertions::assert_not_impl_any;
+use wg_core::REJECT_AFTER_TIME_NS;
+use wire::{Body, EthAddrs, Frame, Udp4};
+
+use super::*;
+
+assert_not_impl_any!(Data<2>: Clone, Copy, core::fmt::Debug);
+assert_not_impl_any!(Peer: Clone, Copy, core::fmt::Debug);
+
+const T0: u64 = 1_000_000_000_000;
+const PEER0_IP: Ipv4 = [10, 200, 0, 2];
+const PEER1_IP: Ipv4 = [10, 201, 0, 5];
+const HOST_IP: Ipv4 = [10, 99, 0, 2];
+const EP1: Endpoint = Endpoint { ip: [192, 0, 2, 1], port: 1111 };
+const EP2: Endpoint = Endpoint { ip: [198, 51, 100, 7], port: 2222 };
+
+/// Peer 0 owns 10.200.0.2/32, peer 1 owns 10.201.0.0/24.
+struct Allowed;
+
+impl AllowedIps for Allowed {
+    fn contains(&self, peer: usize, ip: Ipv4) -> bool {
+        match peer {
+            0 => ip == PEER0_IP,
+            1 => ip[..3] == PEER1_IP[..3],
+            _ => false,
+        }
+    }
+}
+
+type D = Data<2>;
+
+/// The initiator's half of a session installed in `data`: its send key is
+/// our receive key and vice versa, so packets go through real AEAD.
+struct Client {
+    s: Session,
+    /// Our local index (the receiver index on its packets).
+    to: u32,
+}
+
+impl Client {
+    fn packet(&mut self, plaintext: &[u8]) -> Vec<u8> {
+        let mut ct = std::vec![0u8; plaintext.len() + TAG_LEN];
+        let (c, n) = self.s.seal(plaintext, &mut ct, T0).unwrap();
+        let mut msg = std::vec![0u8; TRANSPORT_HEADER_LEN];
+        wg_wire::emit_transport_header(self.to, c, &mut msg).unwrap();
+        msg.extend_from_slice(&ct[..n]);
+        msg
+    }
+
+    /// Opens a message `outbound` produced; `None` if it is not for us.
+    fn open(&mut self, msg: &[u8]) -> Option<Vec<u8>> {
+        let t = Transport::parse(msg).ok()?;
+        if t.receiver != self.s.recv_index {
+            return None;
+        }
+        let mut pt = std::vec![0u8; t.ciphertext.len() - TAG_LEN];
+        let n = self.s.open(t.counter, t.ciphertext, &mut pt, T0).ok()?;
+        pt.truncate(n);
+        Some(pt)
+    }
+}
+
+fn install_at(d: &mut D, peer: u16, local_index: u32, created_ns: u64) -> (InstallOutcome, Client) {
+    let seed = local_index as u8;
+    let send = [seed; 32];
+    let recv = [seed ^ 0x80; 32];
+    let remote_index = local_index + 1000;
+    let o = d.install(&Install { peer, local_index, remote_index, created_ns, send: &send, recv: &recv });
+    let keys = SessionKeys { send: Key32::from_bytes(recv), recv: Key32::from_bytes(send) };
+    (o, Client { s: Session::new(keys, remote_index, local_index, created_ns), to: local_index })
+}
+
+fn install(d: &mut D, peer: u16, local_index: u32) -> Client {
+    let (o, c) = install_at(d, peer, local_index, T0);
+    assert_eq!(o, InstallOutcome::Installed);
+    c
+}
+
+fn recv<'o>(d: &mut D, src: Endpoint, msg: &[u8], out: &'o mut [u8]) -> InboundOutcome<'o> {
+    d.inbound(&Allowed, src, msg, T0, out)
+}
+
+fn confirm(d: &mut D, c: &mut Client) {
+    let mut buf = [0u8; 64];
+    let o = recv(d, EP1, &c.packet(&[]), &mut buf);
+    assert!(matches!(o, InboundOutcome::Authenticated { promoted: true, .. }), "{o:?}");
+}
+
+fn datagram_with(src: Ipv4, dst: Ipv4, payload: &[u8]) -> Vec<u8> {
+    let f = Frame {
+        eth: EthAddrs { src: [2; 6], dst: [4; 6] },
+        body: Body::Udp4(Udp4 { src, dst, sport: 1, dport: 2, payload }),
+    };
+    let mut out = [0u8; wire::MAX_FRAME];
+    let n = wire::emit(&f, &mut out).unwrap();
+    out[wire::ETH_HDR..n].to_vec()
+}
+
+fn datagram(src: Ipv4, dst: Ipv4) -> Vec<u8> {
+    datagram_with(src, dst, b"ping")
+}
+
+fn send(d: &mut D, packet: &[u8]) -> (OutboundOutcome, Vec<u8>) {
+    let mut out = [0u8; MAX_TRANSPORT];
+    let o = d.outbound(&Allowed, packet, T0, &mut out);
+    let len = if let OutboundOutcome::Sealed { len, .. } = o { len } else { 0 };
+    (o, out[..len].to_vec())
+}
+
+// --- install ---
+
+#[test]
+fn install_replaces_next_and_drops_the_old_one() {
+    let mut d = D::new();
+    let mut old = install(&mut d, 0, 1);
+    let mut new = install(&mut d, 0, 2);
+    assert_eq!(d.has(0, Slot::Next), Some(2));
+    assert_eq!(recv(&mut d, EP1, &old.packet(&[]), &mut [0u8; 16]), InboundOutcome::UnknownIndex);
+    assert!(matches!(recv(&mut d, EP1, &new.packet(&[]), &mut [0u8; 16]), InboundOutcome::Authenticated { .. }));
+}
+
+#[test]
+fn install_rejects_an_index_live_in_any_peer_and_slot() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 7);
+    assert_eq!(install_at(&mut d, 1, 7, T0).0, InstallOutcome::IndexCollision);
+    assert_eq!(d.has(1, Slot::Next), None);
+    // Also once confirmed into `current`, and for the same peer.
+    confirm(&mut d, &mut a);
+    assert_eq!(install_at(&mut d, 0, 7, T0).0, InstallOutcome::IndexCollision);
+    assert_eq!(d.has(0, Slot::Current), Some(7));
+    assert_eq!(d.has(0, Slot::Next), None);
+}
+
+#[test]
+fn install_rejects_a_peer_out_of_range() {
+    let mut d = D::new();
+    assert_eq!(install_at(&mut d, 2, 1, T0).0, InstallOutcome::PeerOutOfRange);
+    assert_eq!(install_at(&mut d, u16::MAX, 1, T0).0, InstallOutcome::PeerOutOfRange);
+}
+
+// --- promotion ---
+
+#[test]
+fn first_keepalive_on_next_promotes_it() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    let mut buf = [0u8; 16];
+    let o = recv(&mut d, EP1, &a.packet(&[]), &mut buf);
+    assert_eq!(
+        o,
+        InboundOutcome::Authenticated { peer: 0, endpoint: Some(EP1), promoted: true, payload: Payload::Keepalive }
+    );
+    assert_eq!((d.has(0, Slot::Next), d.has(0, Slot::Current)), (None, Some(1)));
+}
+
+#[test]
+fn first_data_packet_on_next_promotes_it_and_current_becomes_previous() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    confirm(&mut d, &mut a);
+    let mut b = install(&mut d, 0, 2);
+    let mut out = [0u8; 64];
+    let o = recv(&mut d, EP1, &b.packet(&datagram(PEER0_IP, HOST_IP)), &mut out);
+    assert!(matches!(o, InboundOutcome::Authenticated { promoted: true, payload: Payload::Forward(_), .. }));
+    assert_eq!((d.has(0, Slot::Current), d.has(0, Slot::Previous)), (Some(2), Some(1)));
+}
+
+#[test]
+fn unconfirmed_next_never_displaces_current_for_sending() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    confirm(&mut d, &mut a);
+    let mut b = install(&mut d, 0, 2);
+    let (o, msg) = send(&mut d, &datagram(HOST_IP, PEER0_IP));
+    assert!(matches!(o, OutboundOutcome::Sealed { peer: 0, .. }));
+    assert_eq!(b.open(&msg), None);
+    assert_eq!(a.open(&msg).unwrap()[..32], datagram(HOST_IP, PEER0_IP)[..]);
+}
+
+#[test]
+fn previous_is_still_accepted_for_receiving() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    confirm(&mut d, &mut a);
+    let mut b = install(&mut d, 0, 2);
+    confirm(&mut d, &mut b);
+    let pkt = datagram(PEER0_IP, HOST_IP);
+    let mut out = [0u8; 64];
+    let o = recv(&mut d, EP1, &a.packet(&pkt), &mut out);
+    assert!(
+        matches!(o, InboundOutcome::Authenticated { promoted: false, payload: Payload::Forward(p), .. } if p == pkt)
+    );
+    assert_eq!((d.has(0, Slot::Current), d.has(0, Slot::Previous)), (Some(2), Some(1)));
+}
+
+#[test]
+fn promotion_drops_the_old_previous() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    confirm(&mut d, &mut a);
+    let mut b = install(&mut d, 0, 2);
+    confirm(&mut d, &mut b);
+    let mut c = install(&mut d, 0, 3);
+    confirm(&mut d, &mut c);
+    assert_eq!((d.has(0, Slot::Current), d.has(0, Slot::Previous)), (Some(3), Some(2)));
+    assert_eq!(recv(&mut d, EP1, &a.packet(&[]), &mut [0u8; 16]), InboundOutcome::UnknownIndex);
+    // Its index is free again.
+    assert_eq!(install_at(&mut d, 1, 1, T0).0, InstallOutcome::Installed);
+}
+
+#[test]
+fn packets_on_current_do_not_promote() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    confirm(&mut d, &mut a);
+    let _b = install(&mut d, 0, 2);
+    let mut buf = [0u8; 16];
+    let o = recv(&mut d, EP1, &a.packet(&[]), &mut buf);
+    assert!(matches!(o, InboundOutcome::Authenticated { promoted: false, .. }));
+    assert_eq!((d.has(0, Slot::Next), d.has(0, Slot::Current)), (Some(2), Some(1)));
+}
+
+// --- roaming ---
+
+#[test]
+fn endpoint_update_only_on_a_new_highest_counter() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    let msgs: Vec<_> = (0..3).map(|_| a.packet(&[])).collect();
+    let mut out = [0u8; 16];
+    let endpoint = |o: InboundOutcome<'_>| match o {
+        InboundOutcome::Authenticated { endpoint, .. } => endpoint,
+        o => panic!("{o:?}"),
+    };
+    assert_eq!(endpoint(recv(&mut d, EP1, &msgs[1], &mut out)), Some(EP1));
+    // Older but in the window: authentic, accepted, yet no roaming.
+    assert_eq!(endpoint(recv(&mut d, EP2, &msgs[0], &mut out)), None);
+    assert_eq!(recv(&mut d, EP2, &msgs[1], &mut out), InboundOutcome::Rejected(SessionError::Replay));
+    assert_eq!(endpoint(recv(&mut d, EP2, &msgs[2], &mut out)), Some(EP2));
+}
+
+#[test]
+fn each_session_tracks_its_own_highest_counter() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    for _ in 0..5 {
+        recv(&mut d, EP1, &a.packet(&[]), &mut [0u8; 16]);
+    }
+    let mut b = install(&mut d, 0, 2);
+    let mut buf = [0u8; 16];
+    let o = recv(&mut d, EP2, &b.packet(&[]), &mut buf);
+    assert!(matches!(o, InboundOutcome::Authenticated { endpoint: Some(EP2), .. }));
+}
+
+// --- inner packet checks ---
+
+#[test]
+fn forwards_exactly_the_datagram_without_padding() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    let pkt = datagram_with(PEER0_IP, HOST_IP, b"hello"); // 33 bytes
+    let mut padded = pkt.clone();
+    padded.resize(48, 0);
+    let mut out = [0u8; 64];
+    let o = recv(&mut d, EP1, &a.packet(&padded), &mut out);
+    assert!(matches!(o, InboundOutcome::Authenticated { payload: Payload::Forward(p), .. } if p == pkt));
+}
+
+#[test]
+fn spoofed_inner_source_is_dropped_and_wiped() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    let mut out = [0u8; 64];
+    let o = recv(&mut d, EP1, &a.packet(&datagram(PEER1_IP, HOST_IP)), &mut out);
+    assert!(matches!(o, InboundOutcome::Authenticated { peer: 0, payload: Payload::SpoofedSource, .. }));
+    assert_eq!(out, [0; 64]);
+}
+
+#[test]
+fn source_in_the_peers_own_range_is_forwarded() {
+    let mut d = D::new();
+    let mut b = install(&mut d, 1, 1);
+    let mut out = [0u8; 64];
+    let o = recv(&mut d, EP1, &b.packet(&datagram([10, 201, 0, 99], HOST_IP)), &mut out);
+    assert!(matches!(o, InboundOutcome::Authenticated { peer: 1, payload: Payload::Forward(_), .. }));
+}
+
+#[test]
+fn non_ipv4_plaintext_is_dropped_and_wiped() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    let mut out = [0u8; 64];
+    let o = recv(&mut d, EP1, &a.packet(&[0x60; 40]), &mut out);
+    assert!(matches!(o, InboundOutcome::Authenticated { payload: Payload::Invalid(DropReason::Ipv4Version), .. }));
+    assert_eq!(out, [0; 64]);
+}
+
+// --- refused packets ---
+
+#[test]
+fn malformed_and_unknown_index_are_distinct() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    let mut msg = a.packet(&[]);
+    assert_eq!(recv(&mut d, EP1, &msg[..31], &mut [0u8; 16]), InboundOutcome::Malformed(WireError::TooShort));
+    msg[4] = 9;
+    assert_eq!(recv(&mut d, EP1, &msg, &mut [0u8; 16]), InboundOutcome::UnknownIndex);
+}
+
+#[test]
+fn failed_open_leaves_slots_and_endpoint_untouched() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    let good = a.packet(&[]);
+    let mut forged = good.clone();
+    forged[TRANSPORT_HEADER_LEN] ^= 1;
+    assert_eq!(recv(&mut d, EP2, &forged, &mut [0u8; 16]), InboundOutcome::Rejected(SessionError::Auth));
+    assert_eq!((d.has(0, Slot::Next), d.has(0, Slot::Current)), (Some(1), None));
+    // The forgery neither consumed the counter nor set a maximum.
+    let mut buf = [0u8; 16];
+    let o = recv(&mut d, EP1, &good, &mut buf);
+    assert!(matches!(o, InboundOutcome::Authenticated { endpoint: Some(EP1), promoted: true, .. }));
+    // A replay neither demotes nor moves anything.
+    let mut b = install(&mut d, 0, 2);
+    let b0 = b.packet(&[]);
+    assert_eq!(recv(&mut d, EP2, &good, &mut [0u8; 16]), InboundOutcome::Rejected(SessionError::Replay));
+    assert_eq!((d.has(0, Slot::Next), d.has(0, Slot::Current)), (Some(2), Some(1)));
+    let mut buf = [0u8; 16];
+    let o = recv(&mut d, EP2, &b0, &mut buf);
+    assert!(matches!(o, InboundOutcome::Authenticated { endpoint: Some(EP2), promoted: true, .. }));
+}
+
+#[test]
+fn expired_session_refuses_packets_until_tick_drops_it() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    let msg = a.packet(&[]);
+    let late = T0 + REJECT_AFTER_TIME_NS;
+    let mut buf = [0u8; 16];
+    let o = d.inbound(&Allowed, EP1, &msg, late, &mut buf);
+    assert_eq!(o, InboundOutcome::Rejected(SessionError::Expired));
+    assert_eq!(d.has(0, Slot::Next), Some(1));
+}
+
+// --- expiry ---
+
+#[test]
+fn tick_drops_every_slot_including_next_at_reject_after_time() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    confirm(&mut d, &mut a);
+    let mut b = install(&mut d, 0, 2);
+    confirm(&mut d, &mut b);
+    install(&mut d, 0, 3);
+    let (_, _late) = install_at(&mut d, 1, 4, T0 + 1);
+    assert_eq!(d.tick(T0 + REJECT_AFTER_TIME_NS - 1), 0);
+    assert_eq!(d.tick(T0 + REJECT_AFTER_TIME_NS), 3);
+    for slot in [Slot::Next, Slot::Current, Slot::Previous] {
+        assert_eq!(d.has(0, slot), None);
+    }
+    assert_eq!(d.has(1, Slot::Next), Some(4));
+    assert_eq!(d.tick(T0 + REJECT_AFTER_TIME_NS + 1), 1);
+    assert_eq!(d.has(1, Slot::Next), None);
+}
+
+// --- outbound ---
+
+#[test]
+fn outbound_needs_a_peer_and_a_current_session() {
+    let mut d = D::new();
+    assert_eq!(send(&mut d, &datagram(HOST_IP, [10, 9, 9, 9])).0, OutboundOutcome::NoPeer);
+    let mut a = install(&mut d, 0, 1);
+    assert_eq!(send(&mut d, &datagram(HOST_IP, PEER0_IP)).0, OutboundOutcome::NoSession);
+    confirm(&mut d, &mut a);
+    // Peer 1 has nothing even though peer 0 does.
+    assert_eq!(send(&mut d, &datagram(HOST_IP, PEER1_IP)).0, OutboundOutcome::NoSession);
+}
+
+#[test]
+fn outbound_routes_by_destination_and_uses_the_remote_index() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    confirm(&mut d, &mut a);
+    let mut b = install(&mut d, 1, 2);
+    confirm(&mut d, &mut b);
+    let (o, msg) = send(&mut d, &datagram(HOST_IP, PEER1_IP));
+    assert!(matches!(o, OutboundOutcome::Sealed { peer: 1, .. }));
+    assert_eq!(Transport::parse(&msg).unwrap().receiver, 1002);
+    assert!(b.open(&msg).is_some());
+}
+
+#[test]
+fn outbound_does_not_use_previous() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    confirm(&mut d, &mut a);
+    let mut b = install(&mut d, 0, 2);
+    confirm(&mut d, &mut b);
+    let (_, msg) = send(&mut d, &datagram(HOST_IP, PEER0_IP));
+    assert_eq!(a.open(&msg), None);
+    assert!(b.open(&msg).is_some());
+}
+
+#[test]
+fn outbound_pads_plaintext_to_a_multiple_of_16() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    confirm(&mut d, &mut a);
+    let pkt = datagram_with(HOST_IP, PEER0_IP, b"hello"); // 33 bytes
+    // Trailing bytes past the IPv4 total length are not sent.
+    let mut trailing = pkt.clone();
+    trailing.extend_from_slice(&[0xee; 7]);
+    let (o, msg) = send(&mut d, &trailing);
+    assert_eq!(o, OutboundOutcome::Sealed { peer: 0, len: TRANSPORT_MIN_LEN + 48 });
+    let pt = a.open(&msg).unwrap();
+    assert_eq!(pt[..33], pkt[..]);
+    assert_eq!(pt[33..], [0; 15]);
+}
+
+#[test]
+fn outbound_padding_is_bounded_by_the_mtu() {
+    assert_eq!(MTU % 16, 0);
+    assert_eq!((padded_len(0), padded_len(16), padded_len(17)), (Some(0), Some(16), Some(32)));
+    assert_eq!((padded_len(MTU), padded_len(MTU + 1)), (Some(MTU), None));
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    confirm(&mut d, &mut a);
+    let full = datagram_with(HOST_IP, PEER0_IP, &[7; MTU - 28]);
+    let (o, msg) = send(&mut d, &full);
+    assert_eq!(o, OutboundOutcome::Sealed { peer: 0, len: MAX_TRANSPORT });
+    assert_eq!(a.open(&msg).unwrap(), full);
+    let over = datagram_with(HOST_IP, PEER0_IP, &[7; MTU - 27]);
+    assert_eq!(send(&mut d, &over).0, OutboundOutcome::TooLarge);
+}
+
+#[test]
+fn outbound_rejects_invalid_packets_and_short_buffers() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    confirm(&mut d, &mut a);
+    assert_eq!(send(&mut d, &[0x45; 10]).0, OutboundOutcome::Dropped(DropReason::TooShort));
+    let mut out = [0u8; TRANSPORT_MIN_LEN + 31];
+    let o = d.outbound(&Allowed, &datagram(HOST_IP, PEER0_IP), T0, &mut out);
+    assert_eq!(o, OutboundOutcome::Rejected(SessionError::Buffer));
+    // The failed seal did not consume a counter.
+    let (_, msg) = send(&mut d, &datagram(HOST_IP, PEER0_IP));
+    assert_eq!(Transport::parse(&msg).unwrap().counter, 0);
+}
+
+#[test]
+fn outbound_refuses_an_expired_current() {
+    let mut d = D::new();
+    let mut a = install(&mut d, 0, 1);
+    confirm(&mut d, &mut a);
+    let mut out = [0u8; MAX_TRANSPORT];
+    let o = d.outbound(&Allowed, &datagram(HOST_IP, PEER0_IP), T0 + REJECT_AFTER_TIME_NS, &mut out);
+    assert_eq!(o, OutboundOutcome::Rejected(SessionError::Expired));
+}

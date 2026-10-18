@@ -130,11 +130,29 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::NoService
         | Event::Spoofed
         | Event::DeviceFault
-        | Event::FrameTooLong => true,
+        | Event::FrameTooLong
+        | Event::HandshakeOk
+        | Event::HandshakeUnknownPeer
+        | Event::HandshakeDecrypt
+        | Event::HandshakeReplay
+        | Event::HandshakeFlood
+        | Event::HandshakeKeyRefused
+        | Event::HandshakeOther
+        | Event::WgBadMessage
+        | Event::WgBadMac1
+        | Event::WgRateLimited
+        | Event::SessionInstalled
+        | Event::SessionCollision
+        | Event::TransportRejected
+        | Event::SpoofedSource
+        | Event::NoSession
+        | Event::UnknownNeighbor
+        | Event::SessionPromoted
+        | Event::SessionExpired => true,
         Event::FrameDropped { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
-    assert_eq!(Event::FIXED.len(), 11);
+    assert_eq!(Event::FIXED.len(), 29);
 }
 
 #[test]

@@ -20,13 +20,12 @@ policy := policy/laws.toml
 loader := $(BUILD)/loader.img
 counts := $(BUILD)/counts
 
-pds := eth-out ingress audit
-host_crates := wire ring audit-event ingress-core layout laws
-kani_crates := wire ring ingress-core
-kani_args_ingress-core := --features echo
+pds := eth-out eth-in ingress audit timer key hs inner data
+host_crates := wire ring audit-event ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core
+kani_crates := wire ring ingress-core inner-core wg-wire msgs
 
 .PHONY: clean-counts
-.PHONY: all image run test check check-selftest lint unit kani bolero fuzz-long laws pins manifest kernel-config clean
+.PHONY: all image package run test check check-selftest lint unit kani bolero fuzz-long laws pins manifest kernel-config clean
 all: image
 
 $(counts):
@@ -37,9 +36,6 @@ $(counts):
 .PHONY: pds
 pds:
 	$(foreach pd,$(pds),$(call build_pd,$(pd));)
-
-# M1 images run the ingress echo test service (C6); M2 drops it.
-features_ingress := echo
 
 define build_pd
 SEL4_INCLUDE_DIRS=$(abspath $(sdk_config_dir)/include) \
@@ -59,8 +55,14 @@ kernel-config:
 	grep -q '^#define CONFIG_MAX_NUM_NODES  1$$' $(sdk_config_dir)/include/kernel/gen_config.h
 	grep -q '^#define CONFIG_KERNEL_MCS  1$$' $(sdk_config_dir)/include/kernel/gen_config.h
 
+# Zero blob for the secrets region: `make image` is never deployable (`key`
+# halts on it); `make package` swaps in a real one (plan C16).
+$(BUILD)/secrets-placeholder.bin:
+	mkdir -p $(BUILD)
+	head -c 4096 /dev/zero > $@
+
 # The laws checker runs on the exact file handed to the Microkit tool.
-image: pds kernel-config
+image: pds kernel-config $(BUILD)/secrets-placeholder.bin
 	cargo run --locked -q -p laws -- check --system $(system) --policy $(policy) --search-path $(BUILD)
 	$(MICROKIT_SDK)/bin/microkit $(system) \
 		--search-path $(BUILD) \
@@ -68,6 +70,19 @@ image: pds kernel-config
 		--config $(MICROKIT_CONFIG) \
 		-r $(BUILD)/report.txt \
 		-o $(loader)
+
+# Same system with only the secrets prefill_path changed; tools/package
+# refuses anything else, and refuses non-debug kernels until SC13.
+ifneq ($(filter package,$(MAKECMDGOALS)),)
+ifeq ($(and $(SECRETS),$(OUT)),)
+$(error package: set SECRETS=<blob> OUT=<dir>)
+endif
+endif
+package: image
+	tools/package --secrets $(SECRETS) --out $(OUT) --system $(system) --policy $(policy) \
+		--image $(loader) --gen-config $(sdk_config_dir)/include/kernel/gen_config.h \
+		--search-path $(BUILD) --board $(MICROKIT_BOARD) --config $(MICROKIT_CONFIG) \
+		--microkit $(MICROKIT_SDK)/bin/microkit
 
 run: image
 	qemu-system-aarch64 \
@@ -81,9 +96,6 @@ run: image
 lint: | $(counts)
 	cargo clippy --locked $(foreach c,$(host_crates),-p $(c)) --all-targets -- -D warnings \
 		> $(counts)/lint.log 2>&1 || { cat $(counts)/lint.log; exit 1; }
-	# The M1 image ships the echo build of ingress-core; lint it too.
-	cargo clippy --locked -p ingress-core --features echo --all-targets -- -D warnings \
-		>> $(counts)/lint.log 2>&1 || { cat $(counts)/lint.log; exit 1; }
 	# Count the workspace crates clippy actually covered (fresh ones included).
 	cargo clippy --locked $(foreach c,$(host_crates),-p $(c)) --all-targets --message-format=json -- -D warnings \
 		| python3 -c 'import json, sys; ws = set(sys.argv[1:]); \
@@ -94,9 +106,13 @@ lint: | $(counts)
 unit: | $(counts)
 	cargo test --locked $(foreach c,$(host_crates),-p $(c)) > $(counts)/unit.log 2>&1 \
 		|| { cat $(counts)/unit.log; exit 1; }
-	cargo test --locked -p ingress-core --features echo >> $(counts)/unit.log 2>&1 \
-		|| { cat $(counts)/unit.log; exit 1; }
-	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-TESTS", n }' $(counts)/unit.log > $(counts)/unit
+	# Per-crate counts too (M2 plan T12): a crate whose tests stop running
+	# fails the manifest even if the total still clears its minimum.
+	awk '/^ *Running / { c = $$NF; sub(/\)$$/, "", c); sub(/.*\//, "", c); sub(/-[0-9a-f]+$$/, "", c) } \
+		/Doc-tests / { c = $$2 } \
+		/^test result: ok\./ { n += $$4; per[c] += $$4 } \
+		END { print "UNIT-TESTS", n; for (k in per) { u = toupper(k); gsub(/_/, "-", u); print "UNIT-" u, per[k] } }' \
+		$(counts)/unit.log > $(counts)/unit
 
 kani: | $(counts)
 	rm -f $(counts)/kani.log
@@ -129,10 +145,14 @@ pins: | $(counts)
 	tools/check-pins > $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_check_pins.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_check_selftest.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)' $(counts)/pins.log > $(counts)/pins
+	python3 tests/tools/test_package.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	docker/make-seccomp.py --check >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	python3 tests/tools/test_seccomp.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES)' $(counts)/pins.log > $(counts)/pins
 
-test: image | $(counts)
-	python3 tests/integration/run.py $(loader) > $(counts)/test.log 2>&1 \
+# Builds its own deployment (fresh keys, generated config, package); see run.py.
+test: | $(counts)
+	python3 tests/integration/run.py > $(counts)/test.log 2>&1 \
 		|| { tail -40 $(counts)/test.log; exit 1; }
 	grep '^INTEGRATION-CASES' $(counts)/test.log > $(counts)/test
 

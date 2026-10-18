@@ -51,7 +51,8 @@ KANI_HARNESS = (
 # fails the selftest.
 CASES_FOR_GATE = {
     "clean-counts": {"stale-counts", "check-propagation"},
-    "pins": {"pins"},
+    # pins runs the package checker fixtures; package-release drives the real target.
+    "pins": {"pins", "package-release"},
     "lint": {"lint"},
     "unit": {"unit"},
     "kani": {"kani", "kani-cache"},
@@ -120,8 +121,13 @@ CASES = {
     "laws": (["laws"], lambda t: edit(t, "system/secureos.system", "</system>", "    <selftest_unknown />\n</system>"), "L4"),
     "pins": (["pins"], lambda t: edit(t, "Makefile", "\trm -rf $(BUILD)", "\t-rm -rf $(BUILD)"), "P5"),
     "integration": (["test"], lambda t: edit(t, "tests/integration/run.py",
-                                              "if r[42:42 + len(nonce)] != nonce",
-                                              "if r[42:42 + len(nonce)] == nonce"), "bad echo"),
+                                              "        if handshake(bad):",
+                                              "        if not handshake(bad):"), "response opened with a wrong PSK"),
+    # Until cookies (SC13) only debug kernels may be packaged, judged from
+    # the kernel's gen_config.h (M2 plan F10/T13). Refused before any
+    # secrets are read, so the paths need not exist.
+    "package-release": (["package", "MICROKIT_CONFIG=release", "SECRETS=/nonexistent/s.bin", "OUT=/nonexistent/pkg"],
+                        lambda t: None, "kernel config is not debug"),
     # Deleting a test keeps `unit` green; only the manifest comparison notices.
     "manifest": (["unit", "manifest"], lambda t: edit(t, "crates/audit-event/src/tests.rs",
                                                      "#[test]\nfn first_occurrence_emits()",

@@ -30,19 +30,27 @@ fn mr_sizes() -> HashMap<String, usize> {
         .collect()
 }
 
+/// Every link (pdkit / ring::link): used ring, free ring, data region.
+const LINKS: [&str; 11] = ["net_rx", "net_tx", "inner_rx", "inner_tx", "ih", "hi", "hd", "id", "di", "dn", "nd"];
+const AUDITS: [&str; 6] = ["audit_ingress", "audit_eth_out", "audit_eth_in", "audit_inner", "audit_hs", "audit_data"];
+
 #[test]
-fn net_data_regions_match_net_region_size() {
+fn link_data_regions_match_net_region_size() {
     let m = mr_sizes();
-    assert_eq!(m["net_rx_data"], NET_REGION_SIZE);
-    assert_eq!(m["net_tx_data"], NET_REGION_SIZE);
+    for l in LINKS {
+        assert_eq!(m[&std::format!("{l}_data")], NET_REGION_SIZE, "{l}");
+    }
 }
 
 #[test]
-fn net_rings_fit_their_regions() {
+fn link_rings_fit_their_regions() {
     let m = mr_sizes();
     let need = ring::shmem::ring_bytes::<ring::Desc, NET_RING_SLOTS>();
-    for mr in ["net_rx_used", "net_rx_free", "net_tx_used", "net_tx_free"] {
-        assert!(m[mr] >= need, "{mr}: {} < {need}", m[mr]);
+    for l in LINKS {
+        for side in ["used", "free"] {
+            let mr = std::format!("{l}_{side}");
+            assert!(m[&mr] >= need, "{mr}: {} < {need}", m[&mr]);
+        }
     }
 }
 
@@ -50,14 +58,35 @@ fn net_rings_fit_their_regions() {
 fn audit_rings_fit_their_regions() {
     let m = mr_sizes();
     let need = ring::shmem::ring_bytes::<audit_event::Record, AUDIT_RING_SLOTS>();
-    for mr in ["audit_ingress", "audit_eth_out"] {
+    for mr in AUDITS {
         assert!(m[mr] >= need, "{mr}: {} < {need}", m[mr]);
     }
 }
 
 #[test]
-fn eth_out_dma_matches() {
+fn dma_regions_match() {
     assert_eq!(mr_sizes()["eth_out_dma"], ETH_OUT_DMA_SIZE);
+    assert_eq!(mr_sizes()["eth_in_dma"], ETH_IN_DMA_SIZE);
+}
+
+#[test]
+fn every_region_is_a_link_an_audit_ring_or_a_named_singleton() {
+    let mut expected: std::vec::Vec<String> = LINKS
+        .iter()
+        .flat_map(|l| ["used", "free", "data"].map(|s| std::format!("{l}_{s}")))
+        .chain(AUDITS.iter().map(|a| String::from(*a)))
+        .chain(["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "secrets"].map(String::from))
+        .collect();
+    expected.sort();
+    let mut actual: std::vec::Vec<String> = mr_sizes().into_keys().collect();
+    actual.sort();
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn secrets_region_holds_one_blob() {
+    // Mirrors secret_blob::REGION_SIZE (key maps it whole).
+    assert_eq!(mr_sizes()["secrets"], 4096);
 }
 
 // NET_RING_SLOTS >= NET_BUFFERS is a compile-time assert in ring::link.
@@ -88,24 +117,47 @@ fn has_channel(a: (&str, usize), b: (&str, usize)) -> bool {
 
 #[test]
 fn channel_ids_match_layout() {
-    assert!(has_channel(("eth_out", eth_out::CH_INGRESS), ("ingress", ingress::CH_ETH_OUT)));
-    assert!(has_channel(("eth_out", eth_out::CH_AUDIT), ("audit", audit::CH_ETH_OUT)));
-    assert!(has_channel(("ingress", ingress::CH_AUDIT), ("audit", audit::CH_INGRESS)));
-    assert_eq!(channel_ids().len(), 3, "a channel not described by layout");
+    let expected = [
+        (("eth_out", eth_out::CH_INGRESS), ("ingress", ingress::CH_ETH_OUT)),
+        (("eth_out", eth_out::CH_AUDIT), ("audit", audit::CH_ETH_OUT)),
+        (("ingress", ingress::CH_AUDIT), ("audit", audit::CH_INGRESS)),
+        (("eth_in", eth_in::CH_INNER), ("inner", inner::CH_ETH_IN)),
+        (("eth_in", eth_in::CH_AUDIT), ("audit", audit::CH_ETH_IN)),
+        (("inner", inner::CH_AUDIT), ("audit", audit::CH_INNER)),
+        (("hs", hs::CH_AUDIT), ("audit", audit::CH_HS)),
+        (("data", data::CH_AUDIT), ("audit", audit::CH_DATA)),
+        (("ingress", ingress::CH_HS), ("hs", hs::CH_INGRESS)),
+        (("ingress", ingress::CH_DATA), ("data", data::CH_INGRESS)),
+        (("hs", hs::CH_DATA), ("data", data::CH_HS)),
+        (("data", data::CH_INNER), ("inner", inner::CH_DATA)),
+        (("hs", hs::CH_KEY), ("key", key::CH_HS)),
+        (("timer", timer::CH_DATA), ("data", data::CH_TIMER)),
+        (("timer", timer::CH_HS), ("hs", hs::CH_TIMER)),
+    ];
+    for (a, b) in expected {
+        assert!(has_channel(a, b), "{a:?} <-> {b:?}");
+    }
+    assert_eq!(channel_ids().len(), expected.len(), "a channel not described by layout");
 }
 
-#[test]
-fn eth_out_irq_matches_layout() {
+fn irqs_of(name: &str) -> std::vec::Vec<(usize, usize)> {
     let text = system_text();
     let doc = roxmltree::Document::parse(&text).expect("parse .system");
     let pd = doc
         .descendants()
-        .find(|n| n.has_tag_name("protection_domain") && n.attribute("name") == Some("eth_out"))
-        .expect("eth_out pd");
+        .find(|n| n.has_tag_name("protection_domain") && n.attribute("name") == Some(name))
+        .expect("pd");
     let irqs: std::vec::Vec<(usize, usize)> = pd
         .children()
         .filter(|n| n.has_tag_name("irq"))
         .map(|n| (parse_num(n.attribute("irq").expect("irq")), parse_num(n.attribute("id").expect("id"))))
         .collect();
-    assert_eq!(irqs, [(ETH_OUT_IRQ, eth_out::CH_DEVICE)]);
+    irqs
+}
+
+#[test]
+fn irqs_match_layout() {
+    assert_eq!(irqs_of("eth_out"), [(ETH_OUT_IRQ, eth_out::CH_DEVICE)]);
+    assert_eq!(irqs_of("eth_in"), [(ETH_IN_IRQ, eth_in::CH_DEVICE)]);
+    assert_eq!(irqs_of("timer"), [(TIMER_IRQ, timer::CH_DEVICE)]);
 }

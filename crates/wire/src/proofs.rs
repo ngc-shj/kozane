@@ -65,3 +65,19 @@ fn accepted_frames_round_trip() {
         kani::cover!(matches!(f.body, Body::Udp4(u) if !u.payload.is_empty()));
     }
 }
+
+/// Inside-NIC parser: total, and accepted frames (any IPv4 protocol,
+/// forwarded verbatim) re-emit to an equal frame.
+#[kani::proof]
+#[kani::unwind(66)]
+fn parse_ip_is_total_and_round_trips() {
+    let buf: [u8; MAX_LEN] = kani::any();
+    let bytes = any_frame_bytes(&buf);
+    let mut out = [0u8; MAX_LEN];
+    let r = check_ip_into(bytes, &mut out);
+    kani::cover!(matches!(r, Ok(Frame { body: Body::Ipv4(p), .. }) if p.proto != 17));
+    kani::cover!(matches!(r, Ok(Frame { body: Body::Ipv4(p), .. }) if p.packet.len() > IPV4_HDR));
+    kani::cover!(matches!(r, Ok(Frame { body: Body::Arp(_), .. })));
+    kani::cover!(r == Err(DropReason::Ipv4BadChecksum));
+    assert!(!matches!(r, Ok(Frame { body: Body::Udp4(_), .. })));
+}

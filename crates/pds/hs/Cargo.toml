@@ -1,0 +1,16 @@
+[package]
+name = "pd-hs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+audit-event = { path = "../../audit-event" }
+config = { path = "../../config" }
+cpu = { path = "../../cpu" }
+hs-core = { path = "../../hs-core" }
+key-core = { path = "../../key-core" }
+layout = { path = "../../layout" }
+pdkit = { path = "../../pdkit" }
+sel4-microkit = { workspace = true }
+wg-core = { path = "../../wg-core" }

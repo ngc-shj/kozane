@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <memory_region name="nic_mr" size="0x1000" phys_addr="0x9000000" />
+    <memory_region name="timer_mr" size="0x1000" phys_addr="0x90d0000" />
+
+    <protection_domain name="driver" priority="1" budget="1_000" period="10_000">
+        <program_image path="driver.elf" />
+        <map mr="nic_mr" vaddr="0x1_000_000" perms="rw" />
+    </protection_domain>
+
+    <protection_domain name="timer" priority="2" budget="1_000" period="10_000">
+        <program_image path="timer.elf" />
+        <map mr="timer_mr" vaddr="0x2_000_000" perms="rw" cached="false" />
+        <irq irq="43" id="0" />
+    </protection_domain>
+
+    <channel>
+        <end pd="timer" id="1" pp="true" />
+        <end pd="driver" id="1" notify="false" />
+    </channel>
+</system>

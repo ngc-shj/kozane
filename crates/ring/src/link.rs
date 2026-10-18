@@ -36,6 +36,8 @@ pub struct Sender<U, F, const N: usize, const M: usize, const BUF: usize> {
     region: Region,
     /// Set once any ring operation fails; the link is never used again.
     dead: bool,
+    /// Zero each buffer as it comes back, for links carrying secrets.
+    scrub: bool,
 }
 
 impl<U, F, const N: usize, const M: usize, const BUF: usize> Sender<U, F, N, M, BUF>
@@ -47,7 +49,13 @@ where
 
     pub fn new(used: U, free: F, region: Region) -> Self {
         let () = Self::RING_HOLDS_ALL_BUFFERS;
-        Self { used: Producer::new(used), free: Consumer::new(free), pool: Pool::new(true), region, dead: false }
+        Self { used: Producer::new(used), free: Consumer::new(free), pool: Pool::new(true), region, dead: false, scrub: false }
+    }
+
+    /// A sender that zeroes every returned buffer in the shared region, so
+    /// a message carrying key material does not outlive its delivery.
+    pub fn new_scrubbing(used: U, free: F, region: Region) -> Self {
+        Self { scrub: true, ..Self::new(used, free, region) }
     }
 
     /// Takes back buffers the receiver has returned. Stops at the first bad
@@ -57,7 +65,11 @@ where
             return Err(LinkError::Corrupt);
         }
         while let Some(d) = self.free.pop().inspect_err(|_| self.dead = true)? {
-            self.pool.accept(d).map_err(LinkError::BadDesc)?;
+            let idx = self.pool.accept(d).map_err(LinkError::BadDesc)?;
+            if self.scrub {
+                // The buffer is ours again; nothing reads it until it is refilled.
+                let _ = self.region.write_from(buf_offset::<BUF>(idx), &[0u8; BUF]);
+            }
         }
         Ok(())
     }

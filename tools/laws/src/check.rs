@@ -44,10 +44,10 @@ fn check_default_deny(system: &System, policy: &Policy, findings: &mut Vec<Findi
             findings.push(Finding::new(LawId::L4, format!("pd '{}' is not described by policy", pd.name)));
             continue;
         }
-        if !pd.irqs.is_empty() && policy.role(&pd.name) != Some(Role::Driver) {
+        if !pd.irqs.is_empty() && !policy.role(&pd.name).is_some_and(Role::owns_hardware) {
             findings.push(Finding::new(
                 LawId::L4,
-                format!("pd '{}' declares <irq> but is not a driver", pd.name),
+                format!("pd '{}' declares <irq> but is not a driver or timer", pd.name),
             ));
         }
         for irq in &pd.irqs {
@@ -145,7 +145,8 @@ fn check_default_deny(system: &System, policy: &Policy, findings: &mut Vec<Findi
 }
 
 /// Pds tainted per L1: seeded by mapping a device mr, propagated over
-/// channels and shared mrs, with the `key` exemption.
+/// channels and shared mrs, with the `key` and `timer` exemptions. A
+/// `timer`'s own device page (not a NIC) does not seed taint.
 fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) -> BTreeSet<String> {
     let mut adjacency: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut add_edge = |from: &str, to: &str| {
@@ -170,15 +171,23 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
         }
     }
 
-    // Channel edges, with the `key` exemption evaluated directly (and
-    // reported as an L1 finding when it fails) below.
+    // Channel edges, with the `key` and `timer` exemptions evaluated
+    // directly (and reported as an L1 finding when they fail) below.
     for channel in &system.channels {
         let [a, b] = &channel.ends;
         let a_role = policy.role(&a.pd);
         let b_role = policy.role(&b.pd);
 
-        let a_exempt = a_role == Some(Role::Key) && channel_is_exempt(system, policy, a, b, findings);
-        let b_exempt = b_role == Some(Role::Key) && channel_is_exempt(system, policy, b, a, findings);
+        let a_exempt = match a_role {
+            Some(Role::Key) => channel_is_exempt(system, policy, a, b, findings),
+            Some(Role::Timer) => timer_channel_is_exempt(system, policy, a, b, findings),
+            _ => false,
+        };
+        let b_exempt = match b_role {
+            Some(Role::Key) => channel_is_exempt(system, policy, b, a, findings),
+            Some(Role::Timer) => timer_channel_is_exempt(system, policy, b, a, findings),
+            _ => false,
+        };
 
         if !a_exempt {
             add_edge(&b.pd, &a.pd);
@@ -206,6 +215,7 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
     let seeds: Vec<&str> = system
         .pds
         .iter()
+        .filter(|pd| policy.role(&pd.name) != Some(Role::Timer))
         .filter(|pd| mrs_mapped_by(pd).any(|m| matches!(policy.mrs.get(m.mr.as_str()), Some(MrPolicy::Device { .. }))))
         .map(|pd| pd.name.as_str())
         .collect();
@@ -219,6 +229,14 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
                     queue.push_back(n.clone());
                 }
             }
+        }
+    }
+    // A `timer` is trusted by later laws (L8, L13); one reached by taint
+    // through any edge (e.g. a shared mr) is an L1 violation, not just a
+    // tainted pd.
+    for pd in &system.pds {
+        if policy.role(&pd.name) == Some(Role::Timer) && tainted.contains(&pd.name) {
+            findings.push(Finding::new(LawId::L1, format!("timer pd '{}' is tainted", pd.name)));
         }
     }
     tainted
@@ -247,6 +265,36 @@ fn channel_is_exempt(
                 "channel between key pd '{}' and '{}' does not meet the key exemption \
                  (peer pp=true, key pp=false, peer notify=false, key maps only the secrets mr)",
                 key_end.pd, peer.pd
+            ),
+        ));
+    }
+    ok
+}
+
+/// Whether the channel between `timer_end` (a `timer`-role pd) and `peer`
+/// satisfies L1's notify-only exemption: `pp == false` on both ends (a
+/// PPC reply would carry data chosen by the callee into the timer),
+/// `peer.notify == false`, and the timer maps only its own device mrs (so
+/// it shares no memory). A failure is reported as L1 directly.
+fn timer_channel_is_exempt(
+    system: &System,
+    policy: &Policy,
+    timer_end: &crate::sdf::ChannelEnd,
+    peer: &crate::sdf::ChannelEnd,
+    findings: &mut Vec<Finding>,
+) -> bool {
+    let maps_only_own_device = pd_by_name(system, &timer_end.pd)
+        .into_iter()
+        .flat_map(mrs_mapped_by)
+        .all(|m| matches!(policy.mrs.get(m.mr.as_str()), Some(MrPolicy::Device { owner, .. }) if owner == &timer_end.pd));
+    let ok = !peer.pp && !timer_end.pp && !peer.notify && maps_only_own_device;
+    if !ok {
+        findings.push(Finding::new(
+            LawId::L1,
+            format!(
+                "channel between timer pd '{}' and '{}' does not meet the timer exemption \
+                 (pp=false on both ends, peer notify=false, timer maps only its own device mr)",
+                timer_end.pd, peer.pd
             ),
         ));
     }

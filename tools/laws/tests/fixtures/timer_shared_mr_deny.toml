@@ -1,0 +1,34 @@
+[pds.driver]
+role = "driver"
+
+[pds.timer]
+role = "timer"
+irqs = [43]
+
+[mrs.nic_mr]
+kind = "device"
+owner = "driver"
+phys_addr = 0x9000000
+size = 0x1000
+
+[mrs.timer_mr]
+kind = "device"
+owner = "timer"
+phys_addr = 0x90d0000
+size = 0x1000
+
+[mrs.shared_mr]
+kind = "plain"
+shares = { driver = "rw", timer = "r" }
+
+[[channels]]
+between = ["timer", "driver"]
+pp = { timer = false, driver = false }
+notify = { timer = true, driver = false }
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

@@ -10,13 +10,18 @@
 # Schema:
 #
 #   [pds.<name>]
-#   role = "driver" | "untrusted_input" | "key" | "data" | "service"
+#   role = "driver" | "untrusted_input" | "key" | "data" | "service" | "timer"
 #   irqs = [<n>, ...]
 #     Every pd in the `.system` must have an entry here. `driver` pds may
 #     own device/dma mrs (L5) and claim the hardware IRQ numbers listed in
 #     `irqs` (L4: an undeclared irq, or any irq on a non-driver, is a
 #     violation; L5: the same irq number claimed by two pds); `irqs` is
-#     rejected on any other role. `key` is the sole secrets holder and
+#     rejected on any other role except `timer`. `timer` may own device
+#     mrs and irqs like a driver, but its device does not seed taint; it
+#     is exempt from taint only while it maps nothing but its own device
+#     mrs and every channel to it has pp=false on both ends and
+#     notify=false on the peer end (L1); a tainted timer is itself an L1
+#     violation. `key` is the sole secrets holder and
 #     taint exemption (L1, L2) — at most one pd may hold it, and the
 #     secrets mr may be mapped by at most one pd (L2); `untrusted_input`,
 #     `data` and `service` carry no extra mr privileges of their own but
@@ -28,7 +33,7 @@
 #
 #   [mrs.<name>]
 #   kind = "device" | "dma" | "secrets" | "data" | "plain"
-#     device: owner = "<driver pd>", phys_addr = <addr>, size = <bytes>
+#     device: owner = "<driver or timer pd>", phys_addr = <addr>, size = <bytes>
 #       MMIO owned by exactly that driver, page-granular (L5): only the
 #       owner may map it, its `.system` `phys_addr`/`size` must match the
 #       pinned values here exactly (L5), its range must not overlap
@@ -89,27 +94,48 @@
 #
 # Design notes (decisions not spelled out by C7 itself, so recorded here):
 #   - "Maps a NIC device" (L1's taint seed) is generalised to "maps any
-#     policy-declared device-kind mr": M0/M1 only has NIC devices, so this
-#     is equivalent for now and keeps the rule simple.
+#     device-kind mr owned by a non-timer pd": every such device is a NIC
+#     today, so this is equivalent and keeps the rule simple.
 #   - "x permission on shared maps" is enforced for any mr mapped by more
 #     than one distinct pd in the `.system`, regardless of kind.
 #   - DOCTYPE, entities and duplicate attributes are rejected by the XML
 #     parser itself (exit 2, a parse error), not reported as a law
 #     violation — see tools/laws/src/sdf.rs.
 #
-# Current system (M1 bring-up: `eth_out` driver, `ingress`, `audit`):
-#   `eth_out` owns the one virtio-net device and its DMA buffer (L5).
-#   `ingress` parses attacker-controlled frames relayed through `eth_out`
-#   (untrusted_input). `audit` drains both pds' event rings. All three are
-#   tainted: `eth_out` seeds taint by mapping the NIC, and it propagates to
-#   `ingress` and `audit` over the shared rx/tx and audit rings (L1). There
-#   is no `key` pd yet, so `priority.below` is empty.
+# Current system (M2: WireGuard responder; see system/secureos.system):
+#   `eth_out` and `eth_in` own one virtio-net device each (L5) and seed
+#   taint. `ingress` (outside) and `inner` (inside) parse attacker-
+#   controlled frames; `hs` parses initiations relayed by `ingress`; `data`
+#   holds transport keys and is, with `inner`, the only reader of tunnelled
+#   plaintext (L3: the `dn`/`nd` data regions). All of these and `audit` are
+#   tainted. `key` is the taint-exempt secrets holder (passive, PPC from `hs`
+#   only, maps only `secrets`). `timer` is exempt as notify-only (L1).
 
 [pds.eth_out]
 role = "driver"
 irqs = [79]
 
+[pds.eth_in]
+role = "driver"
+irqs = [71]
+
+[pds.timer]
+role = "timer"
+irqs = [43]
+
+[pds.key]
+role = "key"
+
+[pds.hs]
+role = "untrusted_input"
+
 [pds.ingress]
+role = "untrusted_input"
+
+[pds.data]
+role = "data"
+
+[pds.inner]
 role = "untrusted_input"
 
 [pds.audit]
@@ -125,6 +151,26 @@ size = 0x1000
 kind = "dma"
 owner = "eth_out"
 
+[mrs.eth_in_mmio]
+kind = "device"
+owner = "eth_in"
+phys_addr = 0xa002000
+size = 0x1000
+
+[mrs.eth_in_dma]
+kind = "dma"
+owner = "eth_in"
+
+[mrs.timer_mmio]
+kind = "device"
+owner = "timer"
+phys_addr = 0x90d0000
+size = 0x1000
+
+[mrs.secrets]
+kind = "secrets"
+
+# net_rx: eth_out -> ingress, outside frames in
 [mrs.net_rx_used]
 kind = "plain"
 shares = { eth_out = "rw", ingress = "rw" }
@@ -138,18 +184,145 @@ kind = "data"
 producer = "eth_out"
 consumers = ["ingress"]
 
+# net_tx: ingress -> eth_out, outside frames out
 [mrs.net_tx_used]
 kind = "plain"
-shares = { eth_out = "rw", ingress = "rw" }
+shares = { ingress = "rw", eth_out = "rw" }
 
 [mrs.net_tx_free]
 kind = "plain"
-shares = { eth_out = "rw", ingress = "rw" }
+shares = { ingress = "rw", eth_out = "rw" }
 
 [mrs.net_tx_data]
 kind = "data"
 producer = "ingress"
 consumers = ["eth_out"]
+
+# inner_rx: eth_in -> inner, inside frames in
+[mrs.inner_rx_used]
+kind = "plain"
+shares = { eth_in = "rw", inner = "rw" }
+
+[mrs.inner_rx_free]
+kind = "plain"
+shares = { eth_in = "rw", inner = "rw" }
+
+[mrs.inner_rx_data]
+kind = "data"
+producer = "eth_in"
+consumers = ["inner"]
+
+# inner_tx: inner -> eth_in, inside frames out
+[mrs.inner_tx_used]
+kind = "plain"
+shares = { inner = "rw", eth_in = "rw" }
+
+[mrs.inner_tx_free]
+kind = "plain"
+shares = { inner = "rw", eth_in = "rw" }
+
+[mrs.inner_tx_data]
+kind = "data"
+producer = "inner"
+consumers = ["eth_in"]
+
+# ih: ingress -> hs, initiations
+[mrs.ih_used]
+kind = "plain"
+shares = { ingress = "rw", hs = "rw" }
+
+[mrs.ih_free]
+kind = "plain"
+shares = { ingress = "rw", hs = "rw" }
+
+[mrs.ih_data]
+kind = "data"
+producer = "ingress"
+consumers = ["hs"]
+
+# hi: hs -> ingress, responses
+[mrs.hi_used]
+kind = "plain"
+shares = { hs = "rw", ingress = "rw" }
+
+[mrs.hi_free]
+kind = "plain"
+shares = { hs = "rw", ingress = "rw" }
+
+[mrs.hi_data]
+kind = "data"
+producer = "hs"
+consumers = ["ingress"]
+
+# hd: hs -> data, session installs (keys; sender scrubs)
+[mrs.hd_used]
+kind = "plain"
+shares = { hs = "rw", data = "rw" }
+
+[mrs.hd_free]
+kind = "plain"
+shares = { hs = "rw", data = "rw" }
+
+[mrs.hd_data]
+kind = "data"
+producer = "hs"
+consumers = ["data"]
+
+# id: ingress -> data, inbound transport
+[mrs.id_used]
+kind = "plain"
+shares = { ingress = "rw", data = "rw" }
+
+[mrs.id_free]
+kind = "plain"
+shares = { ingress = "rw", data = "rw" }
+
+[mrs.id_data]
+kind = "data"
+producer = "ingress"
+consumers = ["data"]
+
+# di: data -> ingress, outbound transport, endpoint updates
+[mrs.di_used]
+kind = "plain"
+shares = { data = "rw", ingress = "rw" }
+
+[mrs.di_free]
+kind = "plain"
+shares = { data = "rw", ingress = "rw" }
+
+[mrs.di_data]
+kind = "data"
+producer = "data"
+consumers = ["ingress"]
+
+# dn: data -> inner, decrypted IPv4 (plaintext)
+[mrs.dn_used]
+kind = "plain"
+shares = { data = "rw", inner = "rw" }
+
+[mrs.dn_free]
+kind = "plain"
+shares = { data = "rw", inner = "rw" }
+
+[mrs.dn_data]
+kind = "data"
+producer = "data"
+consumers = ["inner"]
+
+# nd: inner -> data, IPv4 to encrypt (plaintext)
+[mrs.nd_used]
+kind = "plain"
+shares = { inner = "rw", data = "rw" }
+
+[mrs.nd_free]
+kind = "plain"
+shares = { inner = "rw", data = "rw" }
+
+[mrs.nd_data]
+kind = "data"
+producer = "inner"
+consumers = ["data"]
 
 [mrs.audit_ingress]
 kind = "plain"
@@ -159,10 +332,24 @@ shares = { ingress = "rw", audit = "rw" }
 kind = "plain"
 shares = { eth_out = "rw", audit = "rw" }
 
+[mrs.audit_eth_in]
+kind = "plain"
+shares = { eth_in = "rw", audit = "rw" }
+
+[mrs.audit_inner]
+kind = "plain"
+shares = { inner = "rw", audit = "rw" }
+
+[mrs.audit_hs]
+kind = "plain"
+shares = { hs = "rw", audit = "rw" }
+
+[mrs.audit_data]
+kind = "plain"
+shares = { data = "rw", audit = "rw" }
+
 [[channels]]
 between = ["eth_out", "ingress"]
-# Both ends send plain notifications, no pp calls, matching
-# system/secureos.system's attribute-free <end>s (Microkit defaults).
 pp = { eth_out = false, ingress = false }
 notify = { eth_out = true, ingress = true }
 
@@ -176,12 +363,82 @@ between = ["ingress", "audit"]
 pp = { ingress = false, audit = false }
 notify = { ingress = true, audit = true }
 
+[[channels]]
+between = ["eth_in", "inner"]
+pp = { eth_in = false, inner = false }
+notify = { eth_in = true, inner = true }
+
+[[channels]]
+between = ["eth_in", "audit"]
+pp = { eth_in = false, audit = false }
+notify = { eth_in = true, audit = true }
+
+[[channels]]
+between = ["inner", "audit"]
+pp = { inner = false, audit = false }
+notify = { inner = true, audit = true }
+
+[[channels]]
+between = ["hs", "audit"]
+pp = { hs = false, audit = false }
+notify = { hs = true, audit = true }
+
+[[channels]]
+between = ["data", "audit"]
+pp = { data = false, audit = false }
+notify = { data = true, audit = true }
+
+[[channels]]
+between = ["ingress", "hs"]
+pp = { ingress = false, hs = false }
+notify = { ingress = true, hs = true }
+
+[[channels]]
+between = ["ingress", "data"]
+pp = { ingress = false, data = false }
+notify = { ingress = true, data = true }
+
+[[channels]]
+between = ["hs", "data"]
+pp = { hs = false, data = false }
+notify = { hs = true, data = true }
+
+[[channels]]
+between = ["data", "inner"]
+pp = { data = false, inner = false }
+notify = { data = true, inner = true }
+
+[[channels]]
+between = ["hs", "key"]
+pp = { hs = true, key = false }
+notify = { hs = false, key = true }
+
+[[channels]]
+between = ["timer", "data"]
+pp = { timer = false, data = false }
+notify = { timer = true, data = false }
+
+[[channels]]
+between = ["timer", "hs"]
+pp = { timer = false, hs = false }
+notify = { timer = true, hs = false }
+
+[priority]
+# L13: untrusted-input and tunnel PDs run strictly below `key` and `timer`.
+below = [
+    ["untrusted_input", "key"],
+    ["untrusted_input", "timer"],
+    ["data", "key"],
+    ["data", "timer"],
+    ["service", "key"],
+    ["service", "timer"],
+]
+
 [budgets]
-# eth_out and ingress each run at ratio 0.2 (2_000/10_000), audit at 0.1
-# (1_000/10_000); sum 0.5. Caps leave headroom for one more similarly-sized
-# tainted pd before M1 is done, without being toothless.
+# Tainted ratios: drivers, ingress and inner 0.1 each, hs and data 0.2 (crypto),
+# audit 0.05; sum 0.85.
 ratio_cap = 0.25
-ratio_sum_cap = 0.6
+ratio_sum_cap = 0.9
 
 [board]
 # qemu_virt_aarch64: 2 GiB RAM starting at 0x4000_0000 (`-m 2G`).

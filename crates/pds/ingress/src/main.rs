@@ -1,160 +1,271 @@
-//! `ingress` v1: every frame is copied in from the driver's region and
-//! decided by `ingress_core::respond`. Holds no secret (law L1).
+//! `ingress` v2 (plan C14): the outside NIC's only consumer. Answers ARP,
+//! hands vetted initiations to `hs` and transport messages to `data`, and
+//! frames their replies to the peers' endpoints, which it alone tracks.
+//! Holds no secret (law L1).
 
 #![no_std]
 #![no_main]
 
-use core::ptr::NonNull;
-
-use audit_event::{Coalescer, Event, Record};
-use ingress_core::{Config, Outcome, respond};
-use layout::{AUDIT_RING_SLOTS, NET_BUF_SIZE, NET_BUFFERS, NET_REGION_SIZE, NET_RING_SLOTS, ingress as ch};
-use ring::Producer;
-use ring::link::{LinkError, Receiver, Sender};
-use ring::shmem::{Region, ShmRing};
+use audit_event::Event;
+use ingress_core::{Buckets, Config, Endpoint, Mac1, Outcome, emit_udp, respond};
+use layout::ingress as ch;
+use msgs::ToIngress;
+use pdkit::{Audit, Buf, Rx, Tx};
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, debug_println, memory_region_symbol, protection_domain};
+use wg_core::crypto;
+use wg_core::noise::LABEL_MAC1;
+use wg_core::wire::{INITIATION_LEN, INITIATION_MAC1_OFFSET};
 
 const ETH_OUT: Channel = Channel::new(ch::CH_ETH_OUT);
-const AUDIT: Channel = Channel::new(ch::CH_AUDIT);
+const HS: Channel = Channel::new(ch::CH_HS);
+const DATA: Channel = Channel::new(ch::CH_DATA);
+const MAX_PEERS: usize = 61;
+const BUCKETS: usize = 64;
 
-/// QEMU's default MAC for the first NIC and the user-net guest address.
-const CONFIG: Config = Config { mac: [0x52, 0x54, 0x00, 0x12, 0x34, 0x56], ipv4: [10, 0, 2, 15], echo_port: 7 };
+const CONFIG: Config = Config {
+    mac: config::OUTSIDE_MAC,
+    ipv4: config::OUTSIDE_IP,
+    router_mac: config::OUTSIDE_ROUTER_MAC,
+    port: config::LISTEN_PORT,
+};
 
-type NetRing = ShmRing<ring::Desc, NET_RING_SLOTS>;
-type AuditRing = ShmRing<Record, AUDIT_RING_SLOTS>;
-
-struct Ingress {
-    from_driver: Receiver<NetRing, NetRing, NET_RING_SLOTS, NET_BUFFERS, NET_BUF_SIZE>,
-    to_driver: Sender<NetRing, NetRing, NET_RING_SLOTS, NET_BUFFERS, NET_BUF_SIZE>,
-    audit: Producer<AuditRing, Record, AUDIT_RING_SLOTS>,
-    coalescer: Coalescer,
-    frame: [u8; NET_BUF_SIZE],
-    reply: [u8; NET_BUF_SIZE],
-    scratch: [u8; NET_BUF_SIZE],
-    audit_pending: bool,
+/// mac1 = MAC(HASH(LABEL_MAC1 ‖ S_pub), msg[..116]).
+struct GatewayMac1 {
+    key: [u8; 32],
 }
 
-fn region_ptr(p: NonNull<u8>) -> *mut u8 {
-    p.as_ptr()
+impl Mac1 for GatewayMac1 {
+    fn verify(&self, msg: &[u8; INITIATION_LEN]) -> bool {
+        let (covered, rest) = msg.split_at(INITIATION_MAC1_OFFSET);
+        match (crypto::mac(&self.key, &[covered]), rest.get(..16)) {
+            (Ok(m), Some(got)) => crypto::ct_eq(&m, got),
+            _ => false,
+        }
+    }
+}
+
+struct Ingress {
+    from_driver: Rx,
+    to_driver: Tx,
+    to_hs: Tx,
+    from_hs: Rx,
+    to_data: Tx,
+    from_data: Rx,
+    audit: Audit,
+    mac1: GatewayMac1,
+    buckets: Buckets<BUCKETS>,
+    endpoints: [Option<Endpoint>; MAX_PEERS],
+    frame: Buf,
+    reply: Buf,
+    msg: Buf,
+    scratch: Buf,
 }
 
 #[protection_domain]
 fn init() -> Ingress {
-    // SAFETY: the .system maps each region into this PD and `eth_out` only,
-    // sized as in `layout`; the rx data region is mapped read-only here.
-    let (from_driver, to_driver, audit) = unsafe {
+    // SAFETY: each link's regions are mapped into this PD and its one peer
+    // only, sized as in `layout`; receive data regions are read-only here.
+    let (from_driver, to_driver, to_hs, from_hs, to_data, from_data, audit) = unsafe {
         (
-            Receiver::new(
-                NetRing::consumer(region_ptr(memory_region_symbol!(net_rx_used: *mut u8))),
-                NetRing::producer(region_ptr(memory_region_symbol!(net_rx_free: *mut u8))),
-                Region::new(region_ptr(memory_region_symbol!(net_rx_data: *mut u8)), NET_REGION_SIZE),
+            pdkit::rx(
+                memory_region_symbol!(net_rx_used: *mut u8),
+                memory_region_symbol!(net_rx_free: *mut u8),
+                memory_region_symbol!(net_rx_data: *mut u8),
             ),
-            Sender::new(
-                NetRing::producer(region_ptr(memory_region_symbol!(net_tx_used: *mut u8))),
-                NetRing::consumer(region_ptr(memory_region_symbol!(net_tx_free: *mut u8))),
-                Region::new(region_ptr(memory_region_symbol!(net_tx_data: *mut u8)), NET_REGION_SIZE),
+            pdkit::tx(
+                memory_region_symbol!(net_tx_used: *mut u8),
+                memory_region_symbol!(net_tx_free: *mut u8),
+                memory_region_symbol!(net_tx_data: *mut u8),
             ),
-            Producer::new(AuditRing::producer(region_ptr(memory_region_symbol!(audit_ingress: *mut u8)))),
+            pdkit::tx(
+                memory_region_symbol!(ih_used: *mut u8),
+                memory_region_symbol!(ih_free: *mut u8),
+                memory_region_symbol!(ih_data: *mut u8),
+            ),
+            pdkit::rx(
+                memory_region_symbol!(hi_used: *mut u8),
+                memory_region_symbol!(hi_free: *mut u8),
+                memory_region_symbol!(hi_data: *mut u8),
+            ),
+            pdkit::tx(
+                memory_region_symbol!(id_used: *mut u8),
+                memory_region_symbol!(id_free: *mut u8),
+                memory_region_symbol!(id_data: *mut u8),
+            ),
+            pdkit::rx(
+                memory_region_symbol!(di_used: *mut u8),
+                memory_region_symbol!(di_free: *mut u8),
+                memory_region_symbol!(di_data: *mut u8),
+            ),
+            Audit::new(memory_region_symbol!(audit_ingress: *mut u8), Channel::new(ch::CH_AUDIT)),
         )
     };
+    let key = crypto::hash(&[LABEL_MAC1, &config::GATEWAY_PUBLIC]).unwrap_or_else(|_| panic!("ingress: mac1 key"));
     debug_println!("ingress: ready");
     Ingress {
         from_driver,
         to_driver,
+        to_hs,
+        from_hs,
+        to_data,
+        from_data,
         audit,
-        coalescer: Coalescer::new(),
-        frame: [0; NET_BUF_SIZE],
-        reply: [0; NET_BUF_SIZE],
-        scratch: [0; NET_BUF_SIZE],
-        audit_pending: false,
+        mac1: GatewayMac1 { key },
+        buckets: Buckets::default(),
+        endpoints: [None; MAX_PEERS],
+        frame: [0; layout::NET_BUF_SIZE],
+        reply: [0; layout::NET_BUF_SIZE],
+        msg: [0; layout::NET_BUF_SIZE],
+        scratch: [0; layout::NET_BUF_SIZE],
     }
 }
 
+/// Which peers to notify after a pass.
+#[derive(Default)]
+struct Wake {
+    driver: bool,
+    hs: bool,
+    data: bool,
+}
+
 impl Ingress {
-    fn audit(&mut self, ev: Event) {
-        let audit = &mut self.audit;
-        // Notify on every offer, including a full ring (see Coalescer::record).
-        self.audit_pending |= self.coalescer.record(ev, |r| audit.push(r).is_ok());
-    }
-
-    fn audit_link_error(&mut self, e: LinkError) {
-        self.audit(match e {
-            LinkError::Corrupt => Event::RingCorrupt,
-            LinkError::BadDesc(_) => Event::BadDescriptor,
-            LinkError::NoBuffer => Event::TxNoBuffer,
-        });
-    }
-
-    fn send_reply(&mut self, n: usize) -> bool {
-        if let Err(e) = self.to_driver.reclaim() {
-            self.audit_link_error(e);
+    fn to_peer(&mut self, dst: Endpoint, payload: &[u8], wake: &mut Wake) {
+        match emit_udp(&CONFIG, dst, payload, &mut self.reply) {
+            Ok(n) => {
+                let frame = self.reply.get(..n).unwrap_or(&[]);
+                wake.driver |= pdkit::send(&mut self.to_driver, &mut self.scratch, frame, &mut self.audit);
+            }
+            Err(_) => self.audit.record(Event::TxNoBuffer),
         }
-        let reply = &self.reply;
-        let r = self.to_driver.send_with(&mut self.scratch, |s| {
-            s.get_mut(..n)?.copy_from_slice(reply.get(..n)?);
-            Some(n)
-        });
-        match r {
-            Ok(sent) => sent,
-            Err(e) => {
-                self.audit_link_error(e);
-                false
+    }
+
+    fn from_outside(&mut self, wake: &mut Wake) {
+        while let Some(n) = pdkit::recv(&mut self.from_driver, &mut self.frame, &mut self.audit) {
+            wake.driver = true;
+            let frame = self.frame.get(..n).unwrap_or(&[]);
+            let mut msg_len = None;
+            let target = match respond(&CONFIG, &self.mac1, &mut self.buckets, cpu::now_ns(), frame, &mut self.reply) {
+                Outcome::ArpReplied(len) => {
+                    let reply = self.reply.get(..len).unwrap_or(&[]);
+                    if pdkit::send(&mut self.to_driver, &mut self.scratch, reply, &mut self.audit) {
+                        self.audit.record(Event::ArpReplied);
+                    }
+                    continue;
+                }
+                Outcome::Initiation { src, msg } => {
+                    msg_len = msgs::Initiation { src: ep(src), msg }.encode(&mut self.msg);
+                    Some(true)
+                }
+                Outcome::Transport { src, msg } => {
+                    msg_len = msgs::Transport { src: ep(src), msg }.encode(&mut self.msg);
+                    Some(false)
+                }
+                Outcome::Dropped(reason) => {
+                    self.audit.record(Event::FrameDropped { reason: reason as u16 });
+                    None
+                }
+                Outcome::NotForUs => {
+                    self.audit.record(Event::NotForUs);
+                    None
+                }
+                Outcome::NoService => {
+                    self.audit.record(Event::NoService);
+                    None
+                }
+                Outcome::Spoofed => {
+                    self.audit.record(Event::Spoofed);
+                    None
+                }
+                Outcome::BadMessage => {
+                    self.audit.record(Event::WgBadMessage);
+                    None
+                }
+                Outcome::BadMac1 => {
+                    self.audit.record(Event::WgBadMac1);
+                    None
+                }
+                Outcome::RateLimited => {
+                    self.audit.record(Event::WgRateLimited);
+                    None
+                }
+            };
+            let (Some(to_hs), Some(len)) = (target, msg_len) else { continue };
+            let msg = self.msg.get(..len).unwrap_or(&[]);
+            if to_hs {
+                wake.hs |= pdkit::send(&mut self.to_hs, &mut self.scratch, msg, &mut self.audit);
+            } else {
+                wake.data |= pdkit::send(&mut self.to_data, &mut self.scratch, msg, &mut self.audit);
             }
         }
     }
 
-    /// Handles every queued frame. Returns (sent a reply, returned a buffer).
-    fn poll(&mut self) -> (bool, bool) {
-        let (mut sent, mut returned) = (false, false);
-        loop {
-            let n = match self.from_driver.recv_into(&mut self.frame) {
-                Ok(Some(n)) => n,
-                Ok(None) => break,
-                Err(LinkError::Corrupt) => {
-                    self.audit(Event::RingCorrupt);
-                    break;
+    fn from_hs(&mut self, wake: &mut Wake) {
+        while let Some(n) = pdkit::recv(&mut self.from_hs, &mut self.msg, &mut self.audit) {
+            wake.hs = true;
+            let Ok(r) = msgs::Response::decode(self.msg.get(..n).unwrap_or(&[])) else {
+                self.audit.record(Event::BadDescriptor);
+                continue;
+            };
+            let (dst, payload) = (Endpoint { ip: r.dst.ip, port: r.dst.port }, *r.msg);
+            self.to_peer(dst, &payload, wake);
+        }
+    }
+
+    fn from_data(&mut self, wake: &mut Wake) {
+        while let Some(n) = pdkit::recv(&mut self.from_data, &mut self.msg, &mut self.audit) {
+            wake.data = true;
+            let len = n.min(self.msg.len());
+            let mut payload = [0u8; layout::NET_BUF_SIZE];
+            let (dst, plen) = match ToIngress::decode(self.msg.get(..len).unwrap_or(&[])) {
+                Ok(ToIngress::Outbound { peer, msg }) => {
+                    let Some(dst) = self.endpoints.get(usize::from(peer)).copied().flatten() else {
+                        self.audit.record(Event::NoSession);
+                        continue;
+                    };
+                    let Some(p) = payload.get_mut(..msg.len()) else { continue };
+                    p.copy_from_slice(msg);
+                    (dst, msg.len())
                 }
-                Err(e) => {
-                    self.audit_link_error(e);
+                Ok(ToIngress::EndpointUpdate { peer, endpoint }) => {
+                    if usize::from(peer) < config::PEERS.len()
+                        && let Some(slot) = self.endpoints.get_mut(usize::from(peer))
+                    {
+                        *slot = Some(Endpoint { ip: endpoint.ip, port: endpoint.port });
+                    }
+                    continue;
+                }
+                Err(_) => {
+                    self.audit.record(Event::BadDescriptor);
                     continue;
                 }
             };
-            returned = true;
-            let frame = self.frame.get(..n).unwrap_or(&[]);
-            match respond(&CONFIG, frame, &mut self.reply) {
-                Outcome::ArpReplied(len) => {
-                    if self.send_reply(len) {
-                        sent = true;
-                        self.audit(Event::ArpReplied);
-                    }
-                }
-                Outcome::UdpEchoed(len) => {
-                    if self.send_reply(len) {
-                        sent = true;
-                        self.audit(Event::UdpEchoed);
-                    }
-                }
-                Outcome::Dropped(reason) => self.audit(Event::FrameDropped { reason: reason as u16 }),
-                Outcome::NotForUs => self.audit(Event::NotForUs),
-                Outcome::NoService => self.audit(Event::NoService),
-                Outcome::Spoofed => self.audit(Event::Spoofed),
-            }
+            self.to_peer(dst, payload.get(..plen).unwrap_or(&[]), wake);
         }
-        (sent, returned)
     }
+}
+
+fn ep(e: Endpoint) -> msgs::Endpoint {
+    msgs::Endpoint { ip: e.ip, port: e.port }
 }
 
 impl Handler for Ingress {
     type Error = Infallible;
 
     fn notified(&mut self, _channels: ChannelSet) -> Result<(), Self::Error> {
-        let (sent, returned) = self.poll();
-        if sent || returned {
+        let mut wake = Wake::default();
+        self.from_hs(&mut wake);
+        self.from_data(&mut wake);
+        self.from_outside(&mut wake);
+        if wake.driver {
             ETH_OUT.notify();
         }
-        if core::mem::take(&mut self.audit_pending) {
-            AUDIT.notify();
+        if wake.hs {
+            HS.notify();
         }
+        if wake.data {
+            DATA.notify();
+        }
+        self.audit.flush();
         Ok(())
     }
 }

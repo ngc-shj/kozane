@@ -1,53 +1,198 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  M1 layout. Sizes must match crates/layout. Laws are checked by tools/laws
-  against policy/laws.toml before the Microkit tool runs.
+  M2 layout (WireGuard responder). Sizes and channel ids must match
+  crates/layout (checked by its tests); laws are checked by tools/laws
+  against policy/laws.toml before the Microkit tool runs. Each link is a
+  used ring, a free ring and a data region (crates/ring::link).
 -->
 <system>
-    <!-- Outside NIC: QEMU virt virtio-mmio slot 31 (0xa003e00), SPI 47. -->
+    <!-- Outside NIC: virtio-mmio slot 31 (0xa003e00), SPI 47. -->
     <memory_region name="eth_out_mmio" size="0x1000" phys_addr="0xa003000" />
     <memory_region name="eth_out_dma" size="0x200_000" page_size="0x200_000" />
+    <!-- Inside NIC: virtio-mmio slot 23 (0xa002e00), SPI 39. -->
+    <memory_region name="eth_in_mmio" size="0x1000" phys_addr="0xa002000" />
+    <memory_region name="eth_in_dma" size="0x200_000" page_size="0x200_000" />
+    <!-- sp804 timer (patched QEMU virt), SPI 11. -->
+    <memory_region name="timer_mmio" size="0x1000" phys_addr="0x90d0000" />
+    <!-- Static secrets (law L2): zero placeholder here; `make package` swaps
+         only this prefill_path for a real blob. -->
+    <memory_region name="secrets" size="0x1000" prefill_path="secrets-placeholder.bin" />
 
+    <!-- net_rx: eth_out -> ingress, outside frames in -->
     <memory_region name="net_rx_used" size="0x1000" />
     <memory_region name="net_rx_free" size="0x1000" />
     <memory_region name="net_rx_data" size="0x20_000" />
+    <!-- net_tx: ingress -> eth_out, outside frames out -->
     <memory_region name="net_tx_used" size="0x1000" />
     <memory_region name="net_tx_free" size="0x1000" />
     <memory_region name="net_tx_data" size="0x20_000" />
+    <!-- inner_rx: eth_in -> inner, inside frames in -->
+    <memory_region name="inner_rx_used" size="0x1000" />
+    <memory_region name="inner_rx_free" size="0x1000" />
+    <memory_region name="inner_rx_data" size="0x20_000" />
+    <!-- inner_tx: inner -> eth_in, inside frames out -->
+    <memory_region name="inner_tx_used" size="0x1000" />
+    <memory_region name="inner_tx_free" size="0x1000" />
+    <memory_region name="inner_tx_data" size="0x20_000" />
+    <!-- ih: ingress -> hs, initiations -->
+    <memory_region name="ih_used" size="0x1000" />
+    <memory_region name="ih_free" size="0x1000" />
+    <memory_region name="ih_data" size="0x20_000" />
+    <!-- hi: hs -> ingress, responses -->
+    <memory_region name="hi_used" size="0x1000" />
+    <memory_region name="hi_free" size="0x1000" />
+    <memory_region name="hi_data" size="0x20_000" />
+    <!-- hd: hs -> data, session installs (keys; sender scrubs) -->
+    <memory_region name="hd_used" size="0x1000" />
+    <memory_region name="hd_free" size="0x1000" />
+    <memory_region name="hd_data" size="0x20_000" />
+    <!-- id: ingress -> data, inbound transport -->
+    <memory_region name="id_used" size="0x1000" />
+    <memory_region name="id_free" size="0x1000" />
+    <memory_region name="id_data" size="0x20_000" />
+    <!-- di: data -> ingress, outbound transport, endpoint updates -->
+    <memory_region name="di_used" size="0x1000" />
+    <memory_region name="di_free" size="0x1000" />
+    <memory_region name="di_data" size="0x20_000" />
+    <!-- dn: data -> inner, decrypted IPv4 (plaintext) -->
+    <memory_region name="dn_used" size="0x1000" />
+    <memory_region name="dn_free" size="0x1000" />
+    <memory_region name="dn_data" size="0x20_000" />
+    <!-- nd: inner -> data, IPv4 to encrypt (plaintext) -->
+    <memory_region name="nd_used" size="0x1000" />
+    <memory_region name="nd_free" size="0x1000" />
+    <memory_region name="nd_data" size="0x20_000" />
 
     <memory_region name="audit_ingress" size="0x1000" />
     <memory_region name="audit_eth_out" size="0x1000" />
+    <memory_region name="audit_eth_in" size="0x1000" />
+    <memory_region name="audit_inner" size="0x1000" />
+    <memory_region name="audit_hs" size="0x1000" />
+    <memory_region name="audit_data" size="0x1000" />
 
-    <protection_domain name="eth_out" priority="150" budget="2_000" period="10_000" stack_size="0x10_000">
+    <protection_domain name="eth_out" priority="150" budget="1_000" period="10_000" stack_size="0x10_000">
         <program_image path="pd-eth-out.elf" />
         <map mr="eth_out_mmio" vaddr="0x2_000_000" perms="rw" cached="false" setvar_vaddr="eth_out_mmio_vaddr" />
         <map mr="eth_out_dma" vaddr="0x4_000_000" perms="rw" setvar_vaddr="eth_out_dma_vaddr" />
         <setvar symbol="eth_out_dma_paddr" region_paddr="eth_out_dma" />
         <map mr="net_rx_used" vaddr="0x6_000_000" perms="rw" setvar_vaddr="net_rx_used" />
         <map mr="net_rx_free" vaddr="0x6_001_000" perms="rw" setvar_vaddr="net_rx_free" />
-        <map mr="net_rx_data" vaddr="0x6_100_000" perms="rw" setvar_vaddr="net_rx_data" />
         <map mr="net_tx_used" vaddr="0x6_002_000" perms="rw" setvar_vaddr="net_tx_used" />
         <map mr="net_tx_free" vaddr="0x6_003_000" perms="rw" setvar_vaddr="net_tx_free" />
-        <map mr="net_tx_data" vaddr="0x6_200_000" perms="r" setvar_vaddr="net_tx_data" />
+        <map mr="net_rx_data" vaddr="0x10_000_000" perms="rw" setvar_vaddr="net_rx_data" />
+        <map mr="net_tx_data" vaddr="0x10_100_000" perms="r" setvar_vaddr="net_tx_data" />
         <map mr="audit_eth_out" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_eth_out" />
         <irq irq="79" id="0" />
     </protection_domain>
 
-    <protection_domain name="ingress" priority="100" budget="2_000" period="10_000" stack_size="0x10_000">
+    <protection_domain name="eth_in" priority="150" budget="1_000" period="10_000" stack_size="0x10_000">
+        <program_image path="pd-eth-in.elf" />
+        <map mr="eth_in_mmio" vaddr="0x2_000_000" perms="rw" cached="false" setvar_vaddr="eth_in_mmio_vaddr" />
+        <map mr="eth_in_dma" vaddr="0x4_000_000" perms="rw" setvar_vaddr="eth_in_dma_vaddr" />
+        <setvar symbol="eth_in_dma_paddr" region_paddr="eth_in_dma" />
+        <map mr="inner_rx_used" vaddr="0x6_000_000" perms="rw" setvar_vaddr="inner_rx_used" />
+        <map mr="inner_rx_free" vaddr="0x6_001_000" perms="rw" setvar_vaddr="inner_rx_free" />
+        <map mr="inner_tx_used" vaddr="0x6_002_000" perms="rw" setvar_vaddr="inner_tx_used" />
+        <map mr="inner_tx_free" vaddr="0x6_003_000" perms="rw" setvar_vaddr="inner_tx_free" />
+        <map mr="inner_rx_data" vaddr="0x10_000_000" perms="rw" setvar_vaddr="inner_rx_data" />
+        <map mr="inner_tx_data" vaddr="0x10_100_000" perms="r" setvar_vaddr="inner_tx_data" />
+        <map mr="audit_eth_in" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_eth_in" />
+        <irq irq="71" id="0" />
+    </protection_domain>
+
+    <protection_domain name="timer" priority="150" budget="100" period="10_000" stack_size="0x10_000">
+        <program_image path="pd-timer.elf" />
+        <map mr="timer_mmio" vaddr="0x2_000_000" perms="rw" cached="false" setvar_vaddr="timer_mmio_vaddr" />
+        <irq irq="43" id="0" />
+    </protection_domain>
+
+    <protection_domain name="key" priority="140" budget="2_000" period="10_000" passive="true" stack_size="0x20_000">
+        <program_image path="pd-key.elf" />
+        <map mr="secrets" vaddr="0x2_000_000" perms="r" setvar_vaddr="secrets" />
+    </protection_domain>
+
+    <protection_domain name="hs" priority="110" budget="2_000" period="10_000" stack_size="0x20_000">
+        <program_image path="pd-hs.elf" />
+        <map mr="ih_used" vaddr="0x6_000_000" perms="rw" setvar_vaddr="ih_used" />
+        <map mr="ih_free" vaddr="0x6_001_000" perms="rw" setvar_vaddr="ih_free" />
+        <map mr="hi_used" vaddr="0x6_002_000" perms="rw" setvar_vaddr="hi_used" />
+        <map mr="hi_free" vaddr="0x6_003_000" perms="rw" setvar_vaddr="hi_free" />
+        <map mr="hd_used" vaddr="0x6_004_000" perms="rw" setvar_vaddr="hd_used" />
+        <map mr="hd_free" vaddr="0x6_005_000" perms="rw" setvar_vaddr="hd_free" />
+        <map mr="ih_data" vaddr="0x10_000_000" perms="r" setvar_vaddr="ih_data" />
+        <map mr="hi_data" vaddr="0x10_100_000" perms="rw" setvar_vaddr="hi_data" />
+        <map mr="hd_data" vaddr="0x10_200_000" perms="rw" setvar_vaddr="hd_data" />
+        <map mr="audit_hs" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_hs" />
+    </protection_domain>
+
+    <protection_domain name="ingress" priority="100" budget="1_000" period="10_000" stack_size="0x10_000">
         <program_image path="pd-ingress.elf" />
         <map mr="net_rx_used" vaddr="0x6_000_000" perms="rw" setvar_vaddr="net_rx_used" />
         <map mr="net_rx_free" vaddr="0x6_001_000" perms="rw" setvar_vaddr="net_rx_free" />
-        <map mr="net_rx_data" vaddr="0x6_100_000" perms="r" setvar_vaddr="net_rx_data" />
         <map mr="net_tx_used" vaddr="0x6_002_000" perms="rw" setvar_vaddr="net_tx_used" />
         <map mr="net_tx_free" vaddr="0x6_003_000" perms="rw" setvar_vaddr="net_tx_free" />
-        <map mr="net_tx_data" vaddr="0x6_200_000" perms="rw" setvar_vaddr="net_tx_data" />
+        <map mr="ih_used" vaddr="0x6_004_000" perms="rw" setvar_vaddr="ih_used" />
+        <map mr="ih_free" vaddr="0x6_005_000" perms="rw" setvar_vaddr="ih_free" />
+        <map mr="hi_used" vaddr="0x6_006_000" perms="rw" setvar_vaddr="hi_used" />
+        <map mr="hi_free" vaddr="0x6_007_000" perms="rw" setvar_vaddr="hi_free" />
+        <map mr="id_used" vaddr="0x6_008_000" perms="rw" setvar_vaddr="id_used" />
+        <map mr="id_free" vaddr="0x6_009_000" perms="rw" setvar_vaddr="id_free" />
+        <map mr="di_used" vaddr="0x6_00a_000" perms="rw" setvar_vaddr="di_used" />
+        <map mr="di_free" vaddr="0x6_00b_000" perms="rw" setvar_vaddr="di_free" />
+        <map mr="net_rx_data" vaddr="0x10_000_000" perms="r" setvar_vaddr="net_rx_data" />
+        <map mr="net_tx_data" vaddr="0x10_100_000" perms="rw" setvar_vaddr="net_tx_data" />
+        <map mr="ih_data" vaddr="0x10_200_000" perms="rw" setvar_vaddr="ih_data" />
+        <map mr="hi_data" vaddr="0x10_300_000" perms="r" setvar_vaddr="hi_data" />
+        <map mr="id_data" vaddr="0x10_400_000" perms="rw" setvar_vaddr="id_data" />
+        <map mr="di_data" vaddr="0x10_500_000" perms="r" setvar_vaddr="di_data" />
         <map mr="audit_ingress" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_ingress" />
     </protection_domain>
 
-    <protection_domain name="audit" priority="50" budget="1_000" period="10_000" stack_size="0x10_000">
+    <protection_domain name="data" priority="100" budget="2_000" period="10_000" stack_size="0x20_000">
+        <program_image path="pd-data.elf" />
+        <map mr="hd_used" vaddr="0x6_000_000" perms="rw" setvar_vaddr="hd_used" />
+        <map mr="hd_free" vaddr="0x6_001_000" perms="rw" setvar_vaddr="hd_free" />
+        <map mr="id_used" vaddr="0x6_002_000" perms="rw" setvar_vaddr="id_used" />
+        <map mr="id_free" vaddr="0x6_003_000" perms="rw" setvar_vaddr="id_free" />
+        <map mr="di_used" vaddr="0x6_004_000" perms="rw" setvar_vaddr="di_used" />
+        <map mr="di_free" vaddr="0x6_005_000" perms="rw" setvar_vaddr="di_free" />
+        <map mr="dn_used" vaddr="0x6_006_000" perms="rw" setvar_vaddr="dn_used" />
+        <map mr="dn_free" vaddr="0x6_007_000" perms="rw" setvar_vaddr="dn_free" />
+        <map mr="nd_used" vaddr="0x6_008_000" perms="rw" setvar_vaddr="nd_used" />
+        <map mr="nd_free" vaddr="0x6_009_000" perms="rw" setvar_vaddr="nd_free" />
+        <map mr="hd_data" vaddr="0x10_000_000" perms="r" setvar_vaddr="hd_data" />
+        <map mr="id_data" vaddr="0x10_100_000" perms="r" setvar_vaddr="id_data" />
+        <map mr="di_data" vaddr="0x10_200_000" perms="rw" setvar_vaddr="di_data" />
+        <map mr="dn_data" vaddr="0x10_300_000" perms="rw" setvar_vaddr="dn_data" />
+        <map mr="nd_data" vaddr="0x10_400_000" perms="r" setvar_vaddr="nd_data" />
+        <map mr="audit_data" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_data" />
+    </protection_domain>
+
+    <protection_domain name="inner" priority="100" budget="1_000" period="10_000" stack_size="0x10_000">
+        <program_image path="pd-inner.elf" />
+        <map mr="inner_rx_used" vaddr="0x6_000_000" perms="rw" setvar_vaddr="inner_rx_used" />
+        <map mr="inner_rx_free" vaddr="0x6_001_000" perms="rw" setvar_vaddr="inner_rx_free" />
+        <map mr="inner_tx_used" vaddr="0x6_002_000" perms="rw" setvar_vaddr="inner_tx_used" />
+        <map mr="inner_tx_free" vaddr="0x6_003_000" perms="rw" setvar_vaddr="inner_tx_free" />
+        <map mr="dn_used" vaddr="0x6_004_000" perms="rw" setvar_vaddr="dn_used" />
+        <map mr="dn_free" vaddr="0x6_005_000" perms="rw" setvar_vaddr="dn_free" />
+        <map mr="nd_used" vaddr="0x6_006_000" perms="rw" setvar_vaddr="nd_used" />
+        <map mr="nd_free" vaddr="0x6_007_000" perms="rw" setvar_vaddr="nd_free" />
+        <map mr="inner_rx_data" vaddr="0x10_000_000" perms="r" setvar_vaddr="inner_rx_data" />
+        <map mr="inner_tx_data" vaddr="0x10_100_000" perms="rw" setvar_vaddr="inner_tx_data" />
+        <map mr="dn_data" vaddr="0x10_200_000" perms="r" setvar_vaddr="dn_data" />
+        <map mr="nd_data" vaddr="0x10_300_000" perms="rw" setvar_vaddr="nd_data" />
+        <map mr="audit_inner" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_inner" />
+    </protection_domain>
+
+    <protection_domain name="audit" priority="50" budget="500" period="10_000" stack_size="0x10_000">
         <program_image path="pd-audit.elf" />
         <map mr="audit_ingress" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_ingress" />
         <map mr="audit_eth_out" vaddr="0x7_001_000" perms="rw" setvar_vaddr="audit_eth_out" />
+        <map mr="audit_eth_in" vaddr="0x7_002_000" perms="rw" setvar_vaddr="audit_eth_in" />
+        <map mr="audit_inner" vaddr="0x7_003_000" perms="rw" setvar_vaddr="audit_inner" />
+        <map mr="audit_hs" vaddr="0x7_004_000" perms="rw" setvar_vaddr="audit_hs" />
+        <map mr="audit_data" vaddr="0x7_005_000" perms="rw" setvar_vaddr="audit_data" />
     </protection_domain>
 
     <channel>
@@ -61,5 +206,53 @@
     <channel>
         <end pd="ingress" id="2" />
         <end pd="audit" id="1" />
+    </channel>
+    <channel>
+        <end pd="eth_in" id="1" />
+        <end pd="inner" id="1" />
+    </channel>
+    <channel>
+        <end pd="eth_in" id="2" />
+        <end pd="audit" id="3" />
+    </channel>
+    <channel>
+        <end pd="inner" id="3" />
+        <end pd="audit" id="4" />
+    </channel>
+    <channel>
+        <end pd="hs" id="5" />
+        <end pd="audit" id="5" />
+    </channel>
+    <channel>
+        <end pd="data" id="5" />
+        <end pd="audit" id="6" />
+    </channel>
+    <channel>
+        <end pd="ingress" id="3" />
+        <end pd="hs" id="2" />
+    </channel>
+    <channel>
+        <end pd="ingress" id="4" />
+        <end pd="data" id="1" />
+    </channel>
+    <channel>
+        <end pd="hs" id="3" />
+        <end pd="data" id="2" />
+    </channel>
+    <channel>
+        <end pd="data" id="3" />
+        <end pd="inner" id="2" />
+    </channel>
+    <channel>
+        <end pd="hs" id="1" pp="true" notify="false" />
+        <end pd="key" id="1" pp="false" />
+    </channel>
+    <channel>
+        <end pd="timer" id="1" />
+        <end pd="data" id="4" notify="false" />
+    </channel>
+    <channel>
+        <end pd="timer" id="2" />
+        <end pd="hs" id="4" notify="false" />
     </channel>
 </system>

@@ -33,6 +33,7 @@ pub enum Role {
     Key,
     Data,
     Service,
+    Timer,
 }
 
 impl Role {
@@ -43,10 +44,16 @@ impl Role {
             "key" => Ok(Role::Key),
             "data" => Ok(Role::Data),
             "service" => Ok(Role::Service),
+            "timer" => Ok(Role::Timer),
             other => Err(err(format!(
-                "unknown role '{other}' (expected driver, untrusted_input, key, data or service)"
+                "unknown role '{other}' (expected driver, untrusted_input, key, data, service or timer)"
             ))),
         }
+    }
+
+    /// Roles that may own device mrs and claim hardware IRQs (L4/L5).
+    pub fn owns_hardware(self) -> bool {
+        matches!(self, Role::Driver | Role::Timer)
     }
 }
 
@@ -221,8 +228,8 @@ impl Policy {
                     return Err(err(format!("duplicate irq {n} declared for pd '{name}'")));
                 }
             }
-            if !irqs.is_empty() && role != Role::Driver {
-                return Err(err(format!("pd '{name}' declares irqs but its role is not 'driver'")));
+            if !irqs.is_empty() && !role.owns_hardware() {
+                return Err(err(format!("pd '{name}' declares irqs but its role is not 'driver' or 'timer'")));
             }
             if pds.insert(name.clone(), PdPolicy { role, irqs }).is_some() {
                 return Err(err(format!("duplicate pd '{name}' in policy")));
@@ -250,7 +257,10 @@ impl Policy {
         for (name, mr) in raw.mrs {
             let policy_mr = match mr {
                 RawMr::Device { owner, phys_addr, size } => {
-                    require_role(&pds, &owner, Role::Driver)?;
+                    require_pd(&pds, &owner)?;
+                    if !pds.get(&owner).is_some_and(|p| p.role.owns_hardware()) {
+                        return Err(err(format!("device mr '{name}' owner '{owner}' must have role 'driver' or 'timer'")));
+                    }
                     if size == 0 {
                         return Err(err(format!("device mr '{name}' must have a nonzero size")));
                     }

@@ -190,6 +190,69 @@ fn not_udp() {
     assert_eq!(reason(&b), DropReason::NotUdp);
 }
 
+fn tcp_frame() -> Vec<u8> {
+    let mut b = udp_frame(b"tcp-ish payload");
+    b[ETH_HDR + 9] = 6;
+    b[ETH_HDR + 8] = 17; // TTL a re-encoder would overwrite
+    b[ETH_HDR + 4] = 0xab; // identification likewise
+    fix_ip_csum(&mut b);
+    b
+}
+
+#[test]
+fn inside_parser_accepts_any_protocol_verbatim() {
+    let b = tcp_frame();
+    let f = parse_frame_ip(&b).unwrap();
+    let Body::Ipv4(p) = f.body else { panic!("not ipv4") };
+    assert_eq!((p.src, p.dst, p.proto), (HOST_IP, GW_IP, 6));
+    assert_eq!(p.packet, &b[ETH_HDR..]);
+}
+
+#[test]
+fn inside_parser_drops_ethernet_padding() {
+    let mut b = tcp_frame();
+    let n = b.len() - ETH_HDR;
+    b.extend_from_slice(&[0xee; 7]);
+    let Body::Ipv4(p) = parse_frame_ip(&b).unwrap().body else { panic!("not ipv4") };
+    assert_eq!(p.packet.len(), n);
+}
+
+#[test]
+fn inside_parser_keeps_ipv4_header_rules() {
+    let mut b = tcp_frame();
+    b[ETH_HDR + 6] = 0x20; // MF
+    fix_ip_csum(&mut b);
+    assert_eq!(parse_frame_ip(&b).unwrap_err(), DropReason::Ipv4Fragment);
+    let mut b = tcp_frame();
+    b[ETH_HDR + 10] ^= 1;
+    assert_eq!(parse_frame_ip(&b).unwrap_err(), DropReason::Ipv4BadChecksum);
+}
+
+#[test]
+fn ipv4_body_re_emits_byte_identical() {
+    let b = tcp_frame();
+    let f = parse_frame_ip(&b).unwrap();
+    let mut out = [0u8; MAX_FRAME];
+    let n = emit(&f, &mut out).unwrap();
+    assert_eq!(&out[..n], &b[..]);
+}
+
+#[test]
+fn emit_refuses_an_ipv4_body_that_does_not_parse_to_itself() {
+    let b = tcp_frame();
+    let Body::Ipv4(p) = parse_frame_ip(&b).unwrap().body else { panic!("not ipv4") };
+    let lie = Frame {
+        eth: EthAddrs { src: GW_MAC, dst: HOST_MAC },
+        body: Body::Ipv4(Ip4Packet { src: GW_IP, ..p }),
+    };
+    assert_eq!(emit(&lie, &mut [0u8; MAX_FRAME]), Err(EmitError::Invalid));
+}
+
+#[test]
+fn outside_parser_still_rejects_non_udp() {
+    assert_eq!(reason(&tcp_frame()), DropReason::NotUdp);
+}
+
 #[test]
 fn udp_bad_length() {
     let mut b = udp_frame(b"abcd");

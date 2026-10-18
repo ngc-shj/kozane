@@ -230,6 +230,38 @@ mod link_tests {
         }
     }
 
+    fn region_bytes(s: &Shm) -> std::vec::Vec<u8> {
+        // SAFETY: `data` is a leaked allocation of M * BUF bytes.
+        unsafe { core::slice::from_raw_parts(s.data, M * BUF) }.to_vec()
+    }
+
+    #[test]
+    fn scrubbing_sender_zeroes_returned_buffers() {
+        let s = shm();
+        // SAFETY: as in `link`.
+        let (mut tx, mut rx): (Tx, Rx) = unsafe {
+            (
+                Sender::new_scrubbing(ShmRing::producer(s.used), ShmRing::consumer(s.free), Region::new(s.data, M * BUF)),
+                Receiver::new(ShmRing::consumer(s.used), ShmRing::producer(s.free), Region::new(s.data, M * BUF)),
+            )
+        };
+        assert_eq!(send(&mut tx, b"secret key bytes"), Ok(true));
+        assert!(region_bytes(&s).windows(6).any(|w| w == b"secret"));
+        let mut out = [0u8; BUF];
+        assert_eq!(rx.recv_into(&mut out), Ok(Some(16)));
+        tx.reclaim().unwrap();
+        assert!(region_bytes(&s).iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn plain_sender_leaves_returned_buffers_alone() {
+        let (mut tx, mut rx, s) = link();
+        assert_eq!(send(&mut tx, b"payload"), Ok(true));
+        rx.recv_into(&mut [0u8; BUF]).unwrap();
+        tx.reclaim().unwrap();
+        assert!(region_bytes(&s).windows(7).any(|w| w == b"payload"));
+    }
+
     #[test]
     fn sender_runs_out_of_buffers_until_receiver_returns_them() {
         let (mut tx, mut rx, _s) = link();

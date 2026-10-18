@@ -24,41 +24,28 @@ struct Source {
 }
 
 struct Audit {
-    sources: [Source; 2],
+    sources: [Source; 6],
     unknown: UnknownCodes,
 }
 
-fn region_ptr(p: NonNull<u8>) -> *mut u8 {
-    p.as_ptr()
+fn source(name: &'static str, channel: usize, region: NonNull<u8>) -> Source {
+    // SAFETY: each ring is mapped into this PD and exactly one producer.
+    let ring = unsafe { AuditRing::consumer(region.as_ptr()) };
+    Source { name, channel: Channel::new(channel), ring: Consumer::new(ring), reported_corrupt: false }
 }
 
 #[protection_domain]
 fn init() -> Audit {
-    // SAFETY: each ring is mapped into this PD and exactly one producer.
-    let (ingress, eth_out) = unsafe {
-        (
-            AuditRing::consumer(region_ptr(memory_region_symbol!(audit_ingress: *mut u8))),
-            AuditRing::consumer(region_ptr(memory_region_symbol!(audit_eth_out: *mut u8))),
-        )
-    };
+    let sources = [
+        source("ingress", ch::CH_INGRESS, memory_region_symbol!(audit_ingress: *mut u8)),
+        source("eth_out", ch::CH_ETH_OUT, memory_region_symbol!(audit_eth_out: *mut u8)),
+        source("eth_in", ch::CH_ETH_IN, memory_region_symbol!(audit_eth_in: *mut u8)),
+        source("inner", ch::CH_INNER, memory_region_symbol!(audit_inner: *mut u8)),
+        source("hs", ch::CH_HS, memory_region_symbol!(audit_hs: *mut u8)),
+        source("data", ch::CH_DATA, memory_region_symbol!(audit_data: *mut u8)),
+    ];
     debug_println!("audit: ready");
-    Audit {
-        sources: [
-            Source {
-                name: "ingress",
-                channel: Channel::new(ch::CH_INGRESS),
-                ring: Consumer::new(ingress),
-                reported_corrupt: false,
-            },
-            Source {
-                name: "eth_out",
-                channel: Channel::new(ch::CH_ETH_OUT),
-                ring: Consumer::new(eth_out),
-                reported_corrupt: false,
-            },
-        ],
-        unknown: UnknownCodes::new(),
-    }
+    Audit { sources, unknown: UnknownCodes::new() }
 }
 
 fn drop_reason(r: u16) -> Option<DropReason> {

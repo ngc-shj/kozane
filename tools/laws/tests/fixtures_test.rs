@@ -227,6 +227,31 @@ fn key_channel_meeting_the_exemption_is_allowed() {
     assert_allow("key_exemption_correct_allow");
 }
 
+#[test]
+fn notify_only_timer_with_own_device_page_is_allowed() {
+    assert_allow("timer_exemption_allow");
+}
+
+#[test]
+fn timer_channel_where_peer_can_notify_is_l1() {
+    assert_deny("timer_peer_notify_deny", &["L1"]);
+}
+
+#[test]
+fn timer_channel_with_pp_on_timer_end_is_l1() {
+    assert_deny("timer_end_pp_deny", &["L1"]);
+}
+
+#[test]
+fn timer_channel_with_pp_on_peer_end_is_l1() {
+    assert_deny("timer_peer_pp_deny", &["L1"]);
+}
+
+#[test]
+fn timer_sharing_an_mr_with_a_tainted_pd_is_l1() {
+    assert_deny("timer_shared_mr_deny", &["L1"]);
+}
+
 /// Regression test against the real files (not a frozen fixture): keeps
 /// `policy/laws.toml` honest as `system/secureos.system` grows, since C2
 /// wires `laws check` into `make image` against exactly these two paths.

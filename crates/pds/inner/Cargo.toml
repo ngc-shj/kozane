@@ -1,0 +1,13 @@
+[package]
+name = "pd-inner"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+audit-event = { path = "../../audit-event" }
+config = { path = "../../config" }
+inner-core = { path = "../../inner-core" }
+layout = { path = "../../layout" }
+pdkit = { path = "../../pdkit" }
+sel4-microkit.workspace = true

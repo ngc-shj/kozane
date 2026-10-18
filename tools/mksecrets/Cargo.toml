@@ -1,0 +1,16 @@
+[package]
+name = "mksecrets"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+secret-blob = { path = "../../crates/secret-blob" }
+libcrux-curve25519 = { version = "=0.0.9", default-features = false }
+serde = { version = "=1.0.229", features = ["derive"] }
+toml = "=0.9.8"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
