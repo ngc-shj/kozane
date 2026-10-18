@@ -10,6 +10,7 @@ Usage: check-selftest [layer ...]
 """
 
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -138,27 +139,64 @@ EXPECT_SUCCESS = {"kani-cache"}
 ABSENT = {"kani-cache": "cached pass"}
 
 
+def rule_prerequisites(text: str) -> dict:
+    """target -> plain-word prerequisites (normal and order-only) from the
+    Makefile's rule heads. Variable references are skipped."""
+    deps = {}
+    for line in text.splitlines():
+        m = re.match(r"^([A-Za-z0-9_.-]+)\s*:(?!=)\s*([^=#;]*)", line)
+        if not m or line.startswith("\t"):
+            continue
+        words = [w for w in m.group(2).replace("|", " ").split() if not w.startswith("$")]
+        deps.setdefault(m.group(1), []).extend(words)
+    return deps
+
+
+def closure(gates: list, deps: dict) -> list:
+    """The gates plus everything they depend on, transitively."""
+    seen, todo = [], list(gates)
+    while todo:
+        t = todo.pop()
+        if t not in seen:
+            seen.append(t)
+            todo += deps.get(t, [])
+    return seen
+
+
 def run_propagation(gates: list) -> bool:
-    """For each gate of the `check` rule, override every gate's recipe with a
-    no-op except that one, which fails with a marker, and run the real
-    `make check`. Catches any mask that hides a gate's failure under `check`
-    (an error-ignore prefix, .IGNORE or MAKEFLAGS -i, including ones built
-    from variables or conditioned on MAKECMDGOALS/MAKELEVEL), without running
-    the expensive gates themselves."""
+    """For each gate of the `check` rule, replace the recipes of every gate
+    and its prerequisites with no-ops except that gate, which fails with a
+    marker, and run the real `make check`. This proves the check rule passes
+    a gate's failure through masks applied around recipes: an error-ignore
+    prefix, .IGNORE or MAKEFLAGS -i, including ones built from variables or
+    conditioned on MAKECMDGOALS, MAKELEVEL or files under build/counts (the
+    real counts and logs are copied in). It does not run real recipes in the
+    `check` context, so a mask written inside a recipe and keyed on that
+    context is not caught (accepted, see the code review, Round 7 S2).
+    """
     ok = True
     for target in gates:
         with tempfile.TemporaryDirectory(prefix=f"selftest-propagation-{target}-") as d:
             tree = pathlib.Path(d)
             copy_repo(tree)
-            overrides = "\n# selftest: gate recipes replaced (make warns about overriding)\n"
-            for g in gates:
+            if (ROOT / "build/counts").is_dir():
+                shutil.copytree(ROOT / "build/counts", tree / "build/counts")
+            # make accumulates prerequisites across rules, so a gate's own
+            # prerequisites (e.g. test: image) still run unless they are
+            # replaced too; replace the whole closure.
+            makefile = (tree / "Makefile").read_text()
+            overrides = "\n# selftest: recipes replaced (make warns about overriding)\n"
+            for g in closure(gates, rule_prerequisites(makefile)):
                 body = f"@echo selftest-gate-{g}; exit 1" if g == target else "@true"
                 overrides += f"{g}:\n\t{body}\n"
-            (tree / "Makefile").write_text((tree / "Makefile").read_text() + overrides)
+            (tree / "Makefile").write_text(makefile + overrides)
             out = subprocess.run(["make", "-C", str(tree), "check"], capture_output=True, text=True)
             text = out.stdout + out.stderr
         needle = f"selftest-gate-{target}"
-        this_ok = out.returncode != 0 and needle in text
+        # make's own failure line names the rule that failed, so the
+        # non-zero exit is attributable to the target gate.
+        failed_rule = re.search(rf"\[[^\]]*: {re.escape(target)}\] Error 1", text)
+        this_ok = out.returncode != 0 and needle in text and failed_rule is not None
         ok &= this_ok
         print(f"{'ok  ' if this_ok else 'FAIL'} check-propagation[{target}]: exit={out.returncode} needle={needle!r}")
         if not this_ok:

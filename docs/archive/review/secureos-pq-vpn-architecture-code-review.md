@@ -275,3 +275,34 @@ R29 F1 · others OK
 RS-class control overclaim S1 · others OK
 ### Testing expert
 RT7 T19 · others OK
+
+---
+
+# Round 7
+Date: 2026-10-18
+
+## Changes from Previous Round
+Reviewed `8f94195..cf52857`. Security S1 (per-gate propagation) confirmed closed; the boot-stall handling (recorded, no retry) judged acceptable practice.
+
+| ID | Expert | Sev | Finding | Resolution |
+|---|---|---|---|---|
+| F1 / T1 | Func+Test | Major / Minor | make accumulates prerequisites across rules, so the overridden `test` still built `image` (pds, kernel-config) cold, and an unrelated build failure could satisfy a sub-case | the override replaces the whole prerequisite closure, derived from the Makefile's rule heads; each sub-case also requires make's own `[...: <gate>] Error 1` line; check-propagation now takes ≈0.4 s |
+| S2 | Sec | Minor (low realism) | masks keyed on the `check` context evade both the stubs and the top-level per-gate cases: (B) inside a recipe on MAKELEVEL, (C) on an exported variable set when the goal is `check`, (D) on a file only real gates create | (D) fixed: the real build/counts (logs included) is copied into each propagation tree; mutation with a `$(wildcard $(counts)/pins.log)`-keyed `MAKEFLAGS += -i` now FAILS check-propagation. (B)/(C) accepted below; docstring narrowed to what is tested |
+
+### S2 (B, C) [Minor] context-keyed masks inside recipes — Accepted
+- **Anti-Deferral check**: acceptable risk.
+- **Justification**: catching them needs every real gate recipe run inside `make check` (including the ≈10–40 min Kani and the image build) per injection. The gate guards against accidental masking in a repository the user controls; these masks have to be written deliberately to tell the selftest apart from `make check`, which is a code-review matter, not something a gate can settle.
+- **Worst case**: a deliberately obfuscated Makefile change lets one failing gate pass `make check`.
+- **Likelihood**: very low in this project (single maintainer, every Makefile change reviewed; P5 and check_gates flag the common spellings).
+- **Cost to fix**: a full real `make check` per gate per selftest run (hours); revisit when CI exists (SC9), where a periodic full-context run is affordable.
+
+### Round 7 verification
+`make check` green; `tools/check-selftest` all layers pass (check-propagation 9/9 with failure-line attribution).
+
+## Recurring Issue Check
+### Functionality expert
+F1 (test/doc mismatch) · others OK
+### Security expert
+S1 closed · S2 control-overclaim (docstring narrowed) · others OK
+### Testing expert
+RT1 T1 · others OK
