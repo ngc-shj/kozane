@@ -9,6 +9,7 @@ injected item. Run inside the dev container.
 Usage: check-selftest [layer ...]
 """
 
+import os
 import pathlib
 import re
 import shutil
@@ -17,6 +18,9 @@ import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+# make's messages ("Error 1") are matched below; GNU make translates them
+# (e.g. "エラー 1" under ja_JP), so run it in the C locale.
+MAKE_ENV = {**os.environ, "LC_ALL": "C"}
 # "crashes": old local crash files must not make the bolero case pass.
 SKIP = {"build", "target", ".git", "crashes"}
 
@@ -169,28 +173,36 @@ def run_propagation(gates: list) -> bool:
     marker, and run the real `make check`. This proves the check rule passes
     a gate's failure through masks applied around recipes: an error-ignore
     prefix, .IGNORE or MAKEFLAGS -i, including ones built from variables or
-    conditioned on MAKECMDGOALS, MAKELEVEL or files under build/counts (the
-    real counts and logs are copied in). It does not run real recipes in the
-    `check` context, so a mask written inside a recipe and keyed on that
-    context is not caught (accepted, see the code review, Round 7 S2).
+    conditioned on MAKECMDGOALS, MAKELEVEL or the state of build/counts: the
+    counts and logs of the last real run are copied in, and clean-counts
+    keeps its real recipe (unless it is the gate under test), so the file
+    state the gates see matches a real `make check`. It does not run real
+    gate recipes in the `check` context, so a mask written inside a recipe
+    and keyed on that context is not caught (accepted, code review Round 7
+    S2).
     """
     ok = True
     for target in gates:
         with tempfile.TemporaryDirectory(prefix=f"selftest-propagation-{target}-") as d:
             tree = pathlib.Path(d)
             copy_repo(tree)
-            if (ROOT / "build/counts").is_dir():
-                shutil.copytree(ROOT / "build/counts", tree / "build/counts")
+            if not (ROOT / "build/counts").is_dir():
+                print("FAIL check-propagation: build/counts missing; run `make check` first")
+                return False
+            shutil.copytree(ROOT / "build/counts", tree / "build/counts")
             # make accumulates prerequisites across rules, so a gate's own
             # prerequisites (e.g. test: image) still run unless they are
             # replaced too; replace the whole closure.
             makefile = (tree / "Makefile").read_text()
             overrides = "\n# selftest: recipes replaced (make warns about overriding)\n"
             for g in closure(gates, rule_prerequisites(makefile)):
+                # clean-counts is cheap and its effect on file state matters.
+                if g == "clean-counts" and g != target:
+                    continue
                 body = f"@echo selftest-gate-{g}; exit 1" if g == target else "@true"
                 overrides += f"{g}:\n\t{body}\n"
             (tree / "Makefile").write_text(makefile + overrides)
-            out = subprocess.run(["make", "-C", str(tree), "check"], capture_output=True, text=True)
+            out = subprocess.run(["make", "-C", str(tree), "check"], capture_output=True, text=True, env=MAKE_ENV)
             text = out.stdout + out.stderr
         needle = f"selftest-gate-{target}"
         # make's own failure line names the rule that failed, so the
@@ -222,7 +234,7 @@ def run_case(name: str) -> bool:
         if name == "kani-cache":
             # Allow side first: the uninjected copy must hit the cache, or
             # the injected run below would prove nothing about the key.
-            pre = subprocess.run(["make", "-C", str(tree), *targets], capture_output=True, text=True)
+            pre = subprocess.run(["make", "-C", str(tree), *targets], capture_output=True, text=True, env=MAKE_ENV)
             pre_path = tree / "build/counts/kani.log"
             pre_log = pre_path.read_text(errors="replace") if pre_path.exists() else ""
             if pre.returncode != 0 or "cached pass" not in pre_log:
@@ -230,7 +242,7 @@ def run_case(name: str) -> bool:
                 print((pre.stdout + pre.stderr)[-2000:])
                 return False
         inject(tree)
-        out = subprocess.run(["make", "-C", str(tree), *targets], capture_output=True, text=True)
+        out = subprocess.run(["make", "-C", str(tree), *targets], capture_output=True, text=True, env=MAKE_ENV)
         text = out.stdout + out.stderr
         # Gates write their tool output to build/counts/*.log.
         for log in sorted((tree / "build/counts").glob("*.log")):

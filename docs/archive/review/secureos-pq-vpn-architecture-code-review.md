@@ -306,3 +306,27 @@ F1 (test/doc mismatch) · others OK
 S1 closed · S2 control-overclaim (docstring narrowed) · others OK
 ### Testing expert
 RT1 T1 · others OK
+
+---
+
+# Round 8
+Date: 2026-10-18
+
+## Changes from Previous Round
+Reviewed `cf52857..1e1cb0e`. Round 7 fixes confirmed (closure override, failure-line attribution — shown to reject a failure from the wrong rule; S2 acceptance judged justified). Testing: No findings.
+
+| ID | Expert | Sev | Finding | Resolution |
+|---|---|---|---|---|
+| F1 | Func | **Major** (R11) | the failure-line regex matched the English `Error 1`; GNU make prints `エラー 1` under the maintainer's `ja_JP.UTF-8`, so every propagation sub-case failed on the host shell | check-selftest runs make with `LC_ALL=C` (all three call sites); verified on the host with `LANG=ja_JP.UTF-8`: 9/9 |
+| S3 | Sec | Minor | counts copy did not reproduce clean-counts' deletions (absence-keyed masks evaded) and was skipped silently when build/counts was missing | clean-counts keeps its real recipe unless it is the gate under test; a missing build/counts fails the case; docstring states the file state matches a real `make check`. Mutation with an absence-keyed `MAKEFLAGS += -i` now FAILS check-propagation |
+
+### Round 8 verification
+`make check` green; `tools/check-selftest` all layers pass.
+
+## Recurring Issue Check
+### Functionality expert
+R11 F1 · others OK
+### Security expert
+control-overclaim S3 · R43 none · others OK
+### Testing expert
+No findings · RT1 T1 closed
