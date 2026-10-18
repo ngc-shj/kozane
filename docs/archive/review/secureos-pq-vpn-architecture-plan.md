@@ -52,7 +52,7 @@ Consequence of compromise per PD (what the design does and does not give) [S1, S
 
 Reboot (stateless image) ends persistence but not exploitability: the same input re-exploits until a fixed image ships.
 
-Residual risks (accepted, revisited each milestone): R1 MCS kernel proofs pending (VE1); R2 no DMA isolation on aarch64 (VE3); R3 microarchitectural timing channels between PDs (seL4 time protection unverified); R4 `debug` kernel lets any PD print via `seL4_DebugPutChar`, so L10 holds only on `release` images [S12].
+Residual risks (accepted, revisited each milestone): R1 MCS kernel proofs pending (VE1); R2 no DMA isolation on aarch64 (VE3); R3 microarchitectural timing channels between PDs (seL4 time protection unverified); R4 `debug` kernel lets any PD print via `seL4_DebugPutChar`, so L10 holds only on `release` images [S12]; R5 the dev container allows `unshare(CLONE_NEWUSER|CLONE_NEWNET)` for test namespaces, so a malicious crate's build code can reach NET_ADMIN-gated kernel surface in an empty namespace (M2 plan VE7); R6 L13 waived for M2 images — no WireGuard cookies until M2.5 (SC13); `make package` refuses every kernel config other than `debug` (read from the built `gen_config.h`) until then [F10].
 
 ## Architecture-wide security laws
 
@@ -60,8 +60,8 @@ C7 checks L1–L5, L11 and L13 mechanically against the exact `.system` file pas
 
 | ID | Law | Enforcement |
 |---|---|---|
-| L1 | **Taint**: a PD is tainted if it maps a NIC device or is connected (shared memory region or channel) to a tainted PD. The sole exception is the `key` role, and only while: every channel to `key` has `pp="true"` on the peer end and `pp="false"` on the `key` end, `notify="false"` on the peer end, and `key` maps no MR except the secrets MR (so it shares **no** memory with any PD). Message sizes per oracle label are a code property checked in the M2 `key` contract. Tainted PDs map no secret MR [F2, S2, S16] | C7 taint propagation |
-| L2 | Static secrets exist only in one MR mapped only into `key`. `key` has no device and exposes a closed oracle enum (static-DH, static-KEM decapsulation) that rejects invalid inputs and all-zero DH output, uses constant-time libcrux code, and enforces a count-based per-caller query quota | C7 + closed IPC enum + `key` contract (M2) |
+| L1 | **Taint**: a PD is tainted if it maps a NIC device or is connected (shared memory region or channel) to a tainted PD. A `timer`-role PD is also exempt while it maps no memory region except its own device page, and every channel to it has `pp="false"` on **both** ends and `notify="false"` on the peer end (it can only send notifications) [M2, S14]. The sole other exception is the `key` role, and only while: every channel to `key` has `pp="true"` on the peer end and `pp="false"` on the `key` end, `notify="false"` on the peer end, and `key` maps no MR except the secrets MR (so it shares **no** memory with any PD). Message sizes per oracle label are a code property checked in the M2 `key` contract. Tainted PDs map no secret MR [F2, S2, S16] | C7 taint propagation |
+| L2 | Static secrets exist only in one MR mapped only into `key`. `key` has no device and exposes a closed oracle enum (static-DH, PskMix, BootSeed (per-boot derived value only) [M2]; static-KEM decapsulation [M3]) that rejects invalid inputs and all-zero DH output, uses constant-time libcrux code, and enforces a rate-based (CNTPCT token bucket) per-caller quota | C7 + closed IPC enum + `key` contract (M2) |
 | L3 | Tunnelled plaintext is reachable only by `data` and the inside path | C7 |
 | L4 | Default deny: every PD, channel, map, IRQ and attribute in the `.system` must be described by `policy/laws.toml` | C7, fail-closed |
 | L5 | Only driver PDs map device MMIO; device ownership is keyed by **physical page**, one driver per page; a DMA MR (any `region_paddr` target) is mapped only into its owning driver and is never a C3 data region [F6, S18, S21] | C7 |

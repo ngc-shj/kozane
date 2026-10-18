@@ -39,6 +39,11 @@ RUN apt-get update -q && apt-get install -y --no-install-recommends \
     python3-pexpect \
     iproute2 \
     netcat-openbsd \
+    # M2 interop: official userspace WireGuard as the test client
+    wireguard-go \
+    wireguard-tools \
+    iputils-ping \
+    python3-cryptography \
     && rm -rf /var/lib/apt/lists/*
 
 ARG ARM_GNU_URL=https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-aarch64-aarch64-none-elf.tar.xz
