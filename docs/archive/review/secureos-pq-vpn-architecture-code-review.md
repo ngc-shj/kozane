@@ -330,3 +330,13 @@ R11 F1 · others OK
 control-overclaim S3 · R43 none · others OK
 ### Testing expert
 No findings · RT1 T1 closed
+
+---
+
+# Round 9
+Date: 2026-10-18
+
+Reviewed `1e1cb0e..ae3ddd1`. Functionality: No findings. Security: No findings (S3 verified). Testing: No findings (absence-keyed mask and missing-counts behaviour reproduced independently).
+
+## Termination
+All three experts returned "No findings" in Round 9. Code review complete after 9 rounds. Accepted residuals (Anti-Deferral entries above): Round 4 T16 (N5 event-idx race not reproducible under QEMU), Round 7 S2 (B)/(C) (recipe-internal masks keyed on the `check` context). Plan-level residual risks R1–R4 unchanged.

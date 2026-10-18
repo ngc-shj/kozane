@@ -25,7 +25,7 @@ PQ-hybrid HTTPS reverse proxy on the same base.
 | | Deliverable | Status |
 |---|---|---|
 | M0 | Docker dev env, Microkit 2.3.1 + rust-sel4, hello PD boots in QEMU | done |
-| M1 | virtio-net driver, `ingress` (ARP + UDP echo), `audit`, laws checker, proofs for `ring`/`wire`/driver copy | in progress |
+| M1 | virtio-net driver, `ingress` (ARP + UDP echo), `audit`, laws checker, proofs for `ring`/`wire`/driver copy | done |
 | M2 | WireGuard responder (`hs`, `key`, `data`), `rng`, second NIC, dev secrets packaging, fault policy | |
 | M3 | Rosenpass (`pq`), PQ-mandatory gate | |
 | M4 | Verus/Vest re-proofs | |
