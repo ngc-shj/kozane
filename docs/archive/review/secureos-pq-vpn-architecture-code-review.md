@@ -116,3 +116,43 @@ R44/R50 T3,T5 · R47 T1 · R57 boundaries T2 · RT1 T8 · RT7 T4 · RT8 T2 · RT
 - `tools/check-selftest`: all 10 layers detect their injection (unit, kani, kani-cache, bolero, stale-counts, lint, laws, pins, integration, manifest). Allow side of kani-cache: the unmodified tree reports `cached pass`.
 - Side fix: the round-trip harness called `parse_frame` twice after adding covers and CBMC itself failed (not a property violation); restructured to parse once and emit into a 64-byte buffer — wire proofs now 10 min instead of 40.
 - Integration with the non-blocking driver: flood totals exactly 65..641, lost 0.
+
+---
+
+# Round 2
+Date: 2026-10-18
+
+## Changes from Previous Round
+Reviewed `fe17f4f..f4e7e81`. All Round 1 findings confirmed resolved by their originating experts (Func F1–F10, Sec F1–F4; Testing T1/T2 continuing, rest resolved or narrowed). No Critical or Major from Functionality or Security; Testing kept two Majors open (T1, T2).
+
+| ID | Expert | Sev | Status | Finding | Resolution |
+|---|---|---|---|---|---|
+| S5 | Sec | Minor | new | `[board] ram = []` disables the RAM-overlap check | empty list is a policy error; unit test |
+| S6 / N2 | Sec+Func | Minor | new | oversize device rx length dropped silently | used length beyond the buffer → `device_broke()`; frame > NET_BUF_SIZE → `FrameTooLong` audit |
+| S7 | Sec | Minor | new | own MAC as eth.src not Spoofed | `eth.src == our MAC` → Spoofed in ARP and UDP; test |
+| N1 | Func | Minor | new | unbounded rx loop delays ingress notification | ≤ QUEUE_SIZE completions per call |
+| N3 | Func | Minor | new | dead device reported as RingCorrupt | new `DeviceFault` event |
+| N4 | Func | Minor | new | echo build not linted | `make lint` also runs clippy with `--features echo` |
+| T1 | Test | Major | continuing | P5 misses whitespace before `@-` and `(cmd \|\| true)` | `^\t[\s@+]*-` (not on continuation lines), `\|\|\s*(true\|:)(?![\w-])`; fixtures for both |
+| T2 | Test | Major | continuing | bundled fixtures hide single check sites | one fixture per site (`<system>`, `<memory_region>`, `<channel>`, `<end>` unknown attrs; `cspace`, `virtual_machine`, `smc`); each shown red by removing its site on a throwaway copy (`/tmp/lm`): all 7 FAILED under mutation |
+| T3 | Test | Minor | continuing | `check` could drop clean-counts unnoticed | selftest asserts `check` runs clean-counts first |
+| T4 | Test | Minor | continuing | kani-cache could pass vacuously | selftest requires the uninjected copy to hit the cache first |
+| T6 | Test | Minor | continuing | layer list compared with itself | selftest derives gates from the Makefile `check` recipe |
+| T7 | Test | Minor | continuing | echo checksum/length; boot retry hides crashes | IPv4 checksum + UDP length asserted; retry only on port-in-use |
+| T8 | Test | Minor | continuing | pool proof frame condition | other buffers unchanged on Ok, all unchanged on Err |
+| T8b | Test | Minor | new | round-trip harness diverged from `check` | shared `check_into` used by bolero and Kani |
+| T9 | Test | Minor | continuing | decode boundaries | upper FrameDropped edge and first code after fixed range tested |
+| T10 | Test | Minor | new (Adjacent) | tx backpressure never exercised | integration `burst_echo`: 40 back-to-back echoes (> 16 tx buffers), all replies required |
+
+Side fix during Round 2: the tightened P5 prefix regex initially flagged backslash-continued recipe lines (`\t\t-Z ...`); make honours `-` only at the start of a logical line, so continuation lines are exempt. (Caught by running check-pins on the real tree; an earlier `| tail -1` had hidden the failure — gates are now read by exit status.)
+
+## Recurring Issue Check
+### Functionality expert
+R57 N2 · all others OK or N/A
+### Security expert
+R43 checked (no widening; namespaced attributes ignored identically by laws and the Microkit tool) · RS3 S5 · R29 S6 · others OK or N/A
+### Testing expert
+R47 T1 · R57 T9 · RT1 T8/T8b · RT7 T4/T6 · RT8 T2 · R44/R50 T3 · others OK or N/A
+
+### Round 2 verification (2026-10-18)
+`make check` green (CHECK-PINS-FIXTURES 22, UNIT-TESTS 185, KANI-HARNESSES 13, INTEGRATION-CASES 3, others unchanged); manifest floors raised. `tools/check-selftest`: all 10 layers pass, gate list derived from the Makefile, clean-counts ordering asserted, kani-cache allow side checked before injection.

@@ -158,8 +158,12 @@ def spawn_ready(loader: str, netdev_fn, attempts: int = 3) -> pexpect.spawn:
             wait_ready(child)
             return child
         except pexpect.EOF:
+            out = child.before or ""
             kill(child)
-    raise Fail("QEMU did not boot")
+            # Only a lost port race is retried; any other early exit is a failure.
+            if "in use" not in out and "bind" not in out:
+                raise Fail(f"QEMU exited during boot: {out[-500:]}")
+    raise Fail("QEMU did not boot (port in use on every attempt)")
 
 
 def spawn(loader: str, netdev: str) -> pexpect.spawn:
@@ -263,6 +267,7 @@ def test_raw(loader: str):
             w.send(frame_for(reason))
             expect_line(child, rf"audit: src=ingress FrameDropped\({reason}\) total=1 lost=0")
 
+        burst_echo(w, child, n=40)
         flood(w, child, "Ipv4BadChecksum", k=640)
         echo(w, child)  # liveness after the flood
         echo(w, child)
@@ -275,14 +280,30 @@ def echo(w: Wire, child):
     w.send(ipv4_udp(PEER_IP, GW_IP, 40000, ECHO_PORT, nonce))
     r = w.recv_matching(lambda d: d[12:14] == b"\x08\x00" and d[23] == 17, child)
     sport, dport = struct.unpack("!HH", r[34:38])
+    (udp_len,) = struct.unpack("!H", r[38:40])
     headers_ok = (r[:6] == PEER_MAC and r[6:12] == GW_MAC
                   and r[26:30] == GW_IP and r[30:34] == PEER_IP
-                  and (sport, dport) == (ECHO_PORT, 40000))
+                  and (sport, dport) == (ECHO_PORT, 40000)
+                  and csum(r[14:34]) == 0
+                  and udp_len == 8 + len(nonce))
     if r[42:42 + len(nonce)] != nonce or not headers_ok:
         raise Fail(f"bad echo {r.hex()}")
 
 
 FLOOD_BATCH = 32
+
+
+def burst_echo(w: Wire, child, n: int):
+    """n echo requests back to back, more than eth_out's 16 tx buffers and
+    fewer than the 64 ring buffers: replies queue behind in-flight
+    transmissions (driver backpressure) and every one must still arrive."""
+    nonces = [secrets.token_bytes(16) for _ in range(n)]
+    for nonce in nonces:
+        w.send(ipv4_udp(PEER_IP, GW_IP, 40000, ECHO_PORT, nonce))
+    pending = set(nonces)
+    while pending:
+        r = w.recv_matching(lambda d: d[12:14] == b"\x08\x00" and d[23] == 17, child)
+        pending.discard(r[42:58])
 
 
 def flood(w: Wire, child, reason: str, k: int):

@@ -55,15 +55,13 @@ fn oversized_frame_is_dropped() {
 fn accepted_frames_round_trip() {
     let buf: [u8; MAX_LEN] = kani::any();
     let bytes = any_frame_bytes(&buf);
-    // Same property as `check`, with the parse done once so the covers do
-    // not double the problem size (a second parse made CBMC fail).
-    if let Ok(f) = parse_frame(bytes) {
+    // Same property bolero checks (`check_into`), parsing once so the covers
+    // do not double the problem size (a second parse made CBMC fail). A
+    // frame parsed from <= 64 bytes re-emits in <= 64 bytes.
+    let mut out = [0u8; MAX_LEN];
+    if let Ok(f) = check_into(bytes, &mut out) {
         // Without these the harness would pass vacuously if nothing were accepted.
         kani::cover!(matches!(f.body, Body::Arp(_)));
         kani::cover!(matches!(f.body, Body::Udp4(u) if !u.payload.is_empty()));
-        let mut out = [0u8; MAX_LEN];
-        let n = emit(&f, &mut out).unwrap_or(usize::MAX);
-        assert!(n <= MAX_LEN, "accepted frame must be emittable");
-        assert!(out.get(..n).map(parse_frame) == Some(Ok(f)));
     }
 }

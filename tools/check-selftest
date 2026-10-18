@@ -41,9 +41,34 @@ KANI_HARNESS = (
     "    let x: u8 = kani::any();\n    kani::cover!(x > 1 && x < 1);\n}\n"
 )
 
-# Every gate in `make check` must have a case; removing one fails the selftest.
-EXPECTED_LAYERS = {"unit", "kani", "kani-cache", "bolero", "lint", "laws", "pins", "integration",
-                   "manifest", "stale-counts"}
+# Selftest case(s) required for each target the Makefile `check` recipe
+# runs. The recipe is read from the Makefile, so a new gate without a case
+# fails the selftest.
+CASES_FOR_GATE = {
+    "clean-counts": {"stale-counts"},
+    "pins": {"pins"},
+    "lint": {"lint"},
+    "unit": {"unit"},
+    "kani": {"kani", "kani-cache"},
+    "bolero": {"bolero"},
+    "laws": {"laws"},
+    "test": {"integration"},
+    "manifest": {"manifest"},
+}
+
+
+def check_gates() -> list:
+    """Targets run by the `check` recipe, in order."""
+    lines = (ROOT / "Makefile").read_text().splitlines()
+    start = lines.index("check:")
+    gates = []
+    for line in lines[start + 1:]:
+        if not line.startswith("\t"):
+            break
+        words = line.split()
+        if words[:1] == ["$(MAKE)"]:
+            gates += words[1:]
+    return gates
 
 # layer -> (make targets, injection, text that must appear in the output)
 # A case passes when make FAILS and prints the needle, unless listed in
@@ -106,6 +131,14 @@ def run_case(name: str) -> bool:
         # if it changes the cache key.
         if "kani" in targets and (ROOT / "build/kani-cache").is_dir():
             shutil.copytree(ROOT / "build/kani-cache", tree / "build/kani-cache")
+        if name == "kani-cache":
+            # Allow side first: the uninjected copy must hit the cache, or
+            # the injected run below would prove nothing about the key.
+            pre = subprocess.run(["make", "-C", str(tree), *targets], capture_output=True, text=True)
+            pre_log = (tree / "build/counts/kani.log").read_text(errors="replace")
+            if pre.returncode != 0 or "cached pass" not in pre_log:
+                print(f"FAIL {name}: uninjected copy did not hit the proof cache")
+                return False
         inject(tree)
         out = subprocess.run(["make", "-C", str(tree), *targets], capture_output=True, text=True)
         text = out.stdout + out.stderr
@@ -123,8 +156,15 @@ def run_case(name: str) -> bool:
 
 
 def main() -> int:
-    if set(CASES) != EXPECTED_LAYERS:
-        print(f"selftest: layers {sorted(set(CASES) ^ EXPECTED_LAYERS)} missing or unexpected")
+    gates = check_gates()
+    unknown = [g for g in gates if g not in CASES_FOR_GATE]
+    expected = set().union(*(CASES_FOR_GATE[g] for g in gates if g in CASES_FOR_GATE))
+    if unknown or set(CASES) != expected:
+        print(f"selftest: gates without a case {unknown}; case mismatch {sorted(set(CASES) ^ expected)}")
+        return 1
+    # Stale counts are only harmless if `check` clears them before any gate.
+    if gates[:1] != ["clean-counts"]:
+        print(f"selftest: `check` must run clean-counts first, runs {gates}")
         return 1
     names = sys.argv[1:] or list(CASES)
     results = [run_case(n) for n in names]

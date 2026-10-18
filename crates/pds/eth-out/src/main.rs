@@ -153,7 +153,7 @@ impl Driver {
     fn device_broke(&mut self) {
         if !self.device_dead {
             self.device_dead = true;
-            self.audit(Event::RingCorrupt);
+            self.audit(Event::DeviceFault);
         }
     }
 
@@ -177,7 +177,12 @@ impl Driver {
         if let Err(e) = self.to_ingress.reclaim() {
             self.audit_link_error(e);
         }
-        while !self.device_dead {
+        // At most one queue's worth per call, so a steady stream cannot keep
+        // this loop running and delay the ingress notification indefinitely.
+        for _ in 0..QUEUE_SIZE {
+            if self.device_dead {
+                break;
+            }
             let Some(token) = self.dev.poll_receive() else { break };
             let Some(i) = self.rx_inflight.get_mut(usize::from(token)).and_then(Option::take) else {
                 self.device_broke();
@@ -189,9 +194,18 @@ impl Driver {
                 self.device_broke();
                 break;
             };
-            let packet = buf.get(hdr..hdr.saturating_add(len));
+            // A used length beyond the buffer is a protocol violation, not a
+            // frame to drop quietly.
+            let Some(packet) = buf.get(hdr..hdr.saturating_add(len)) else {
+                self.device_broke();
+                break;
+            };
+            if packet.len() > NET_BUF_SIZE {
+                self.audit(Event::FrameTooLong);
+                self.post_rx(i);
+                continue;
+            }
             let r = self.to_ingress.send_with(&mut self.scratch, |s| {
-                let packet = packet?;
                 s.get_mut(..packet.len())?.copy_from_slice(packet);
                 Some(packet.len())
             });

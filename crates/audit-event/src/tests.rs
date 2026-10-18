@@ -128,11 +128,13 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::BadDescriptor
         | Event::NotForUs
         | Event::NoService
-        | Event::Spoofed => true,
+        | Event::Spoofed
+        | Event::DeviceFault
+        | Event::FrameTooLong => true,
         Event::FrameDropped { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
-    assert_eq!(Event::FIXED.len(), 9);
+    assert_eq!(Event::FIXED.len(), 11);
 }
 
 #[test]
@@ -141,6 +143,10 @@ fn decode_classifies_fixed_dropped_and_unknown_codes() {
     assert_eq!(decode(FRAME_DROPPED_BASE | 11), Decoded::FrameDropped(11));
     assert_eq!(decode(0x7777), Decoded::Unknown);
     assert_eq!(decode(FRAME_DROPPED_BASE + 0x40), Decoded::Unknown);
+    // Upper edge of the FrameDropped range, and the first code after the
+    // fixed range.
+    assert_eq!(decode(FRAME_DROPPED_BASE + 0x3f), Decoded::FrameDropped(0x3f));
+    assert_eq!(decode(0x0019), Decoded::Unknown);
 }
 
 #[test]

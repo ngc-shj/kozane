@@ -341,6 +341,10 @@ impl Policy {
             return Err(err("budgets.ratio_sum_cap must be in (0, 1]"));
         }
 
+        // An empty list would silently disable the board-RAM overlap check.
+        if raw.board.ram.is_empty() {
+            return Err(err("board.ram must list at least one RAM region"));
+        }
         let mut ram = Vec::new();
         for r in raw.board.ram {
             if r.size == 0 {
@@ -442,6 +446,22 @@ mod tests {
         "#
         );
         assert!(Policy::load(&text).is_err());
+    }
+
+    #[test]
+    fn empty_board_ram_is_rejected() {
+        let text = r#"
+            [pds.hello]
+            role = "service"
+
+            [budgets]
+            ratio_cap = 0.2
+            ratio_sum_cap = 0.5
+
+            [board]
+            ram = []
+        "#;
+        assert!(Policy::load(text).is_err());
     }
 
     #[test]

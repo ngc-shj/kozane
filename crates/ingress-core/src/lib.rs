@@ -50,7 +50,7 @@ fn arp(cfg: &Config, eth: &EthAddrs, a: &ArpPacket, out: &mut [u8]) -> Outcome {
     if (eth.dst != cfg.mac && eth.dst != BROADCAST) || a.tpa != cfg.ipv4 {
         return Outcome::NotForUs;
     }
-    if a.sha != eth.src || a.spa == cfg.ipv4 {
+    if a.sha != eth.src || eth.src == cfg.mac || a.spa == cfg.ipv4 {
         return Outcome::Spoofed;
     }
     if a.op != ArpOp::Request {
@@ -73,7 +73,7 @@ fn udp(cfg: &Config, eth: &EthAddrs, u: &Udp4<'_>, out: &mut [u8]) -> Outcome {
     if eth.dst != cfg.mac || u.dst != cfg.ipv4 {
         return Outcome::NotForUs;
     }
-    if u.src == cfg.ipv4 {
+    if u.src == cfg.ipv4 || eth.src == cfg.mac {
         return Outcome::Spoofed;
     }
     // Two echo services pointed at each other (one via a spoofed source)

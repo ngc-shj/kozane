@@ -136,6 +136,20 @@ fn arp_claiming_our_own_ip_is_spoofed() {
 }
 
 #[test]
+fn frames_from_our_own_mac_are_spoofed() {
+    let udp = build(&Frame {
+        eth: EthAddrs { src: CFG.mac, dst: CFG.mac },
+        body: Body::Udp4(Udp4 { src: PEER_IP, dst: CFG.ipv4, sport: 40000, dport: 7, payload: b"x" }),
+    });
+    assert_eq!(run(&udp).0, Outcome::Spoofed);
+    let arp = build(&Frame {
+        eth: EthAddrs { src: CFG.mac, dst: [0xff; 6] },
+        body: Body::Arp(ArpPacket { op: ArpOp::Request, sha: CFG.mac, spa: PEER_IP, tha: [0; 6], tpa: CFG.ipv4 }),
+    });
+    assert_eq!(run(&arp).0, Outcome::Spoofed);
+}
+
+#[test]
 fn malformed_frame_reports_parser_reason() {
     assert_eq!(run(&[0u8; 10]).0, Outcome::Dropped(DropReason::TooShort));
 }

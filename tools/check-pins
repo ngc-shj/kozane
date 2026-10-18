@@ -86,14 +86,20 @@ def check_makefile(text: str, rel: str, out: list):
         out.append(f"P5 {rel}: SHELL is not bash")
     if not re.search(r"^\.SHELLFLAGS\s*:?=\s*-euo pipefail -c\s*$", text, re.M):
         out.append(f"P5 {rel}: .SHELLFLAGS is not '-euo pipefail -c'")
+    prev = ""
     for n, line in enumerate(text.splitlines(), 1):
+        # A line after a trailing backslash continues the same command;
+        # make only honours the @/+/- prefix at the start of a logical line.
+        continued = prev.rstrip().endswith("\\")
+        prev = line
         if re.match(r"^\.IGNORE\b", line):
             out.append(f"P5 {rel}:{n}: .IGNORE")
         if re.match(r"^MAKEFLAGS\b.*(\s|^|=)-[a-zA-Z]*[ik]", line):
             out.append(f"P5 {rel}:{n}: MAKEFLAGS ignores errors")
-        if re.match(r"^\t[@+]*-", line):
+        # make skips whitespace before the @/+/- prefix characters.
+        if not continued and re.match(r"^\t[\s@+]*-", line):
             out.append(f"P5 {rel}:{n}: recipe error-ignore prefix")
-        if re.search(r"\|\|\s*(true|:)(\s|;|$)|;\s*true\b|\bset \+e\b", line):
+        if re.search(r"\|\|\s*(true|:)(?![\w-])|;\s*true\b|\bset \+e\b", line):
             out.append(f"P5 {rel}:{n}: masked exit status")
 
 

@@ -363,15 +363,24 @@ impl Writer<'_> {
 /// Property shared by the Kani harness and the bolero target: parsing never
 /// panics, and anything accepted re-emits to an equal frame.
 #[cfg(any(test, kani))]
-#[allow(clippy::panic)]
 pub fn check(bytes: &[u8]) {
-    if let Ok(f) = parse_frame(bytes) {
-        let mut out = [0u8; MAX_FRAME];
-        match emit(&f, &mut out) {
+    let mut out = [0u8; MAX_FRAME];
+    let _ = check_into(bytes, &mut out);
+}
+
+/// `check` with a caller-supplied output buffer (the Kani harness uses a
+/// small one to keep the problem tractable). Returns the parse result.
+#[cfg(any(test, kani))]
+#[allow(clippy::panic)]
+pub fn check_into<'a>(bytes: &'a [u8], out: &mut [u8]) -> Result<Frame<'a>, DropReason> {
+    let r = parse_frame(bytes);
+    if let Ok(f) = r {
+        match emit(&f, out) {
             Ok(n) => assert!(out.get(..n).map(parse_frame) == Some(Ok(f))),
-            Err(_) => unreachable!("accepted frames must be emittable"),
+            Err(_) => panic!("accepted frames must be emittable"),
         }
     }
+    r
 }
 
 #[cfg(kani)]

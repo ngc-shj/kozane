@@ -128,6 +128,14 @@ fn pool_accept_stays_in_region() {
         assert!(start + u64::from(d.len) <= Pool::<4, 2048>::region_len() as u64);
         assert!(u64::from(d.offset) == start);
         assert!(pool.mine[i]);
+        // No other buffer's ownership changes.
+        for j in 0..4 {
+            if j != i {
+                assert!(pool.mine[j] == before[j]);
+            }
+        }
+    } else {
+        assert!(pool.mine == before);
     }
     kani::cover!(r.is_ok());
     kani::cover!(r == Err(DescError::NotWithPeer));

@@ -470,3 +470,40 @@ fn ratio_exactly_at_the_cap_is_allowed() {
 fn budget_equal_to_period_is_l13() {
     assert_deny("budget_equals_period_deny", &["L13"]);
 }
+
+// One fixture per check site: the bundled fixtures above report a
+// deduplicated law set, so they cannot show that each site works alone.
+#[test]
+fn unknown_attr_on_system_alone_is_l4() {
+    assert_deny("unknown_attr_system_deny", &["L4"]);
+}
+
+#[test]
+fn unknown_attr_on_memory_region_alone_is_l4() {
+    assert_deny("unknown_attr_mr_deny", &["L4"]);
+}
+
+#[test]
+fn unknown_attr_on_channel_alone_is_l4() {
+    assert_deny("unknown_attr_channel_deny", &["L4"]);
+}
+
+#[test]
+fn unknown_attr_on_end_alone_is_l4() {
+    assert_deny("unknown_attr_end_deny", &["L4"]);
+}
+
+#[test]
+fn cspace_alone_is_l4() {
+    assert_deny("cspace_deny", &["L4"]);
+}
+
+#[test]
+fn virtual_machine_alone_is_l4() {
+    assert_deny("virtual_machine_deny", &["L4"]);
+}
+
+#[test]
+fn smc_alone_is_l4() {
+    assert_deny("smc_deny", &["L4"]);
+}

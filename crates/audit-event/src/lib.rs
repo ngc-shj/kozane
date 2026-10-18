@@ -50,6 +50,10 @@ pub enum Event {
     NoService,
     /// Frame forging our address or an inconsistent ARP sender.
     Spoofed,
+    /// The NIC broke the virtqueue protocol; the driver stopped using it.
+    DeviceFault,
+    /// The NIC delivered a frame longer than a ring buffer.
+    FrameTooLong,
 }
 
 impl Event {
@@ -64,6 +68,8 @@ impl Event {
             Event::NotForUs => 0x0014,
             Event::NoService => 0x0015,
             Event::Spoofed => 0x0016,
+            Event::DeviceFault => 0x0017,
+            Event::FrameTooLong => 0x0018,
             Event::FrameDropped { reason } => {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
             }
@@ -71,7 +77,7 @@ impl Event {
     }
 
     /// Every variant except the parameterised `FrameDropped`.
-    pub const FIXED: [Event; 9] = [
+    pub const FIXED: [Event; 11] = [
         Event::ArpReplied,
         Event::UdpEchoed,
         Event::RingCorrupt,
@@ -81,6 +87,8 @@ impl Event {
         Event::NotForUs,
         Event::NoService,
         Event::Spoofed,
+        Event::DeviceFault,
+        Event::FrameTooLong,
     ];
 
     /// Display name; exhaustive, so a new variant fails to compile here.
@@ -95,6 +103,8 @@ impl Event {
             Event::NotForUs => "NotForUs",
             Event::NoService => "NoService",
             Event::Spoofed => "Spoofed",
+            Event::DeviceFault => "DeviceFault",
+            Event::FrameTooLong => "FrameTooLong",
             Event::FrameDropped { .. } => "FrameDropped",
         }
     }
@@ -116,6 +126,8 @@ impl Event {
             Event::NotForUs => 6,
             Event::NoService => 7,
             Event::Spoofed => 8,
+            Event::DeviceFault => 9,
+            Event::FrameTooLong => 10,
             Event::FrameDropped { reason } => {
                 // FIXED_SLOTS..FIXED_SLOTS+64, clamped like `code`.
                 let r = if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason };
@@ -125,7 +137,7 @@ impl Event {
     }
 }
 
-const FIXED_SLOTS: usize = 9;
+const FIXED_SLOTS: usize = 11;
 const SLOTS: usize = FIXED_SLOTS + MAX_DROP_REASON as usize + 1;
 
 /// Per-producer coalescing state.

@@ -81,6 +81,9 @@ run: image
 lint: | $(counts)
 	cargo clippy --locked $(foreach c,$(host_crates),-p $(c)) --all-targets -- -D warnings \
 		> $(counts)/lint.log 2>&1 || { cat $(counts)/lint.log; exit 1; }
+	# The M1 image ships the echo build of ingress-core; lint it too.
+	cargo clippy --locked -p ingress-core --features echo --all-targets -- -D warnings \
+		>> $(counts)/lint.log 2>&1 || { cat $(counts)/lint.log; exit 1; }
 	# Count the workspace crates clippy actually covered (fresh ones included).
 	cargo clippy --locked $(foreach c,$(host_crates),-p $(c)) --all-targets --message-format=json -- -D warnings \
 		| python3 -c 'import json, sys; ws = set(sys.argv[1:]); \
