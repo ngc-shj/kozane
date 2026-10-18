@@ -21,6 +21,7 @@ outside_ip = "10.0.2.15"
 outside_mac = "52:54:00:12:34:56"
 outside_router_mac = "52:55:0a:00:02:02"
 inside_ip = "10.99.0.1"
+inside_prefix = "10.99.0.0/24"
 inside_mac = "52:54:00:12:34:57"
 
 [[neighbors]]
@@ -134,7 +135,7 @@ fn base64_key(b: u8) -> String {
 fn with_neighbors(n: usize) -> String {
     let mut c = cfg(&peer(K1, "\"10.200.0.2/32\""));
     for i in 0..n {
-        c += &std::format!("\n[[neighbors]]\nip = \"10.98.{}.{}\"\nmac = \"02:00:00:00:{:02x}:{:02x}\"\n", i / 250, i % 250 + 1, i / 256, i % 256 + 1);
+        c += &std::format!("\n[[neighbors]]\nip = \"10.99.0.{}\"\nmac = \"02:00:00:00:00:{:02x}\"\n", i + 3, i + 3);
     }
     c
 }
@@ -212,4 +213,23 @@ fn malformed_mac_is_rejected() {
 fn key_of_the_wrong_length_is_rejected() {
     let short = "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE=";
     assert!(err(&cfg(&peer(short, "\"10.200.0.2/32\""))).contains("expected 44 base64 characters"));
+}
+
+#[test]
+fn allowed_ips_overlapping_the_inside_network_are_rejected_without_a_listed_neighbor() {
+    // 10.99.0.128/25 covers no listed neighbor and not the gateway, but an
+    // unlisted inside host could be impersonated from it.
+    assert!(err(&cfg(&peer(K1, "\"10.99.0.128/25\""))).contains("overlap inside_prefix"));
+}
+
+#[test]
+fn neighbor_outside_the_inside_network_is_rejected() {
+    let c = cfg(&peer(K1, "\"10.200.0.2/32\"")) + "\n[[neighbors]]\nip = \"10.98.0.5\"\nmac = \"02:00:00:00:98:05\"\n";
+    assert!(err(&c).contains("outside inside_prefix"));
+}
+
+#[test]
+fn inside_address_outside_its_prefix_is_rejected() {
+    let c = cfg(&peer(K1, "\"10.200.0.2/32\"")).replace("inside_prefix = \"10.99.0.0/24\"", "inside_prefix = \"10.98.0.0/24\"");
+    assert!(err(&c).contains("is outside inside_prefix"));
 }

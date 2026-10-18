@@ -50,6 +50,11 @@ struct DataPd {
 
 #[protection_domain]
 fn init() -> DataPd {
+    if cpu::checked_frequency(cpu::cntfrq()).is_none() {
+        // Without a counter frequency no session would ever expire (L12).
+        debug_println!("data: CNTFRQ is 0; refusing to run without a clock");
+        panic!("data: halted");
+    }
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout`; receive data regions are read-only here.
     let (from_hs, from_ingress, to_ingress, from_inner, to_inner, audit) = unsafe {

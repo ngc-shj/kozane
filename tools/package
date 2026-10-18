@@ -25,6 +25,7 @@ import argparse
 import os
 import pathlib
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -151,7 +152,25 @@ def with_prefill(system: str, blob_path: str) -> str:
     return ET.tostring(root, encoding="unicode")
 
 
+def exit_on_signal(signum, _frame):
+    # SIGTERM/SIGHUP must run the `finally` that removes the staging dir:
+    # after microkit it holds an image with the secrets embedded.
+    raise SystemExit(128 + signum)
+
+
+def remove_staging(staging: pathlib.Path) -> bool:
+    """Removes the staging dir; reports (never swallows) what could not go."""
+    left = []
+    shutil.rmtree(staging, onexc=lambda _f, p, e: left.append(f"{p}: {e}"))
+    if left or staging.exists():
+        print("package: could not remove staging directory (may hold secrets): " + "; ".join(left or [str(staging)]))
+        return False
+    return True
+
+
 def main() -> int:
+    signal.signal(signal.SIGTERM, exit_on_signal)
+    signal.signal(signal.SIGHUP, exit_on_signal)
     ap = argparse.ArgumentParser()
     for opt in ("secrets", "out", "system", "policy", "image", "gen-config", "search-path", "board", "config", "microkit"):
         ap.add_argument(f"--{opt}", required=True)
@@ -177,16 +196,31 @@ def main() -> int:
         print("\n".join(errors))
         return 1
 
+    # Everything below uses the parent as resolved for the check, so a path
+    # component swapped afterwards cannot move the output elsewhere.
+    parent = out.parent.resolve(strict=True)
+    out = parent / out.name
     os.umask(0o077)
-    staging = pathlib.Path(tempfile.mkdtemp(prefix=f".{out.name}.", dir=out.parent))
+    staging = pathlib.Path(tempfile.mkdtemp(prefix=f".{out.name}.", dir=parent))
+    status = 1
     try:
-        if build(a, secrets, blob, staging) != 0:
-            return 1
-        os.rename(staging, out)
+        errors = check_location("staging directory", staging, forbidden_roots(ROOT))
+        if errors:
+            print("\n".join(errors))
+        elif build(a, secrets, blob, staging) == 0:
+            # rename(2) would silently replace an empty directory created
+            # since the check; refuse instead.
+            if out.exists() or out.is_symlink():
+                print(f"package: output directory {out} appeared during the build")
+            else:
+                os.rename(staging, out)
+                status = 0
     finally:
-        shutil.rmtree(staging, ignore_errors=True)
-    print(f"package: wrote {out / 'loader.img'}")
-    return 0
+        if staging.exists() and not remove_staging(staging):
+            status = 1
+    if status == 0:
+        print(f"package: wrote {out / 'loader.img'}")
+    return status
 
 
 def build(a, secrets: pathlib.Path, blob: bytes, out: pathlib.Path) -> int:

@@ -70,7 +70,7 @@ Phase 1 constraints (VE6–VE8: RNDR needs neoverse-n2, integration in `unshare 
 - Action: one `MAX_PEERS` (8, the deployable bound) and `MAX_NEIGHBORS` (64) in validate.rs, rendered into `config`; build.rs asserts it fits secret_blob; mksecrets, hs, ingress, data and inner use it with compile-time assertions; data's runtime halt removed. End-to-end fixture: 9 peers fail the build.
 - Modified: crates/config/{build.rs,src/validate.rs,Cargo.toml}, tools/mksecrets/src/main.rs, crates/pds/{hs,ingress,data,inner}/src/main.rs
 ### S1 / F4 / external #1 [Major] Install residue
-- Action: the scrubbing sender clears the whole link at construction (shared pages are not assumed zero), and `hs` reclaims it on every notification (errors audited). Integration (PD path, closes S10): after peer 1's handshake the harness rebuilds the 74-byte `msgs::Install` hs must have sent (indices and keys known to the Python initiator) and scans the first 32 MiB of guest RAM (every kernel object) through the QEMU monitor until no copy remains. The Microkit report's frame addresses were found not to match runtime placement (they held page-table entries), so no address is assumed. Red-proved: with the reclaim removed the install is found at 0x6053f000 and the case fails.
+- Action: the scrubbing sender clears the whole link at construction (shared pages are not assumed zero), and `hs` reclaims it on every notification (errors audited). Integration (PD path, closes S10): after peer 1's handshake (the only session whose keys the harness knows; wireguard-go's are not exposed) the harness rebuilds the 74-byte `msgs::Install` hs sent (length tied to `msgs::INSTALL_LEN`) and polls the guest RAM window `OBJECT_RAM` in tests/integration/run.py through the QEMU monitor until no copy remains, while requiring in the same snapshot a positive control (the session key `data` must hold), so a window that misses PD memory fails instead of passing. The Microkit report's frame addresses were found not to match runtime placement (they held page-table entries), so no address is assumed. Red-proved: with the reclaim removed the install is found at 0x6053f000 and the case fails.
 - Modified: crates/ring/src/link.rs, crates/ring/src/tests.rs, crates/pds/hs/src/main.rs, tests/integration/run.py
 ### S2 / external #2 [Major] Package output protection
 - Action: shared forbidden-root predicate for blob and OUT (repo incl. build/, cargo/rustup homes; repo must resolve), OUT must not exist, 0700 staging dir under umask 077, rename on success, staging removed on every failure path. Fixtures: OUT in build/, in repo, through a symlink, existing; blob in cargo home; allow cases.
@@ -92,3 +92,40 @@ Phase 1 constraints (VE6–VE8: RNDR needs neoverse-n2, integration in `unshare 
 - Action: `WgGo` tears itself down if configuration fails; SIGTERM/SIGHUP raise SystemExit in parent and netns child so `finally` removes the key-bearing temp dir.
 ### Minor findings
 - F3 `make run` mirrors the integration QEMU arguments, `LOADER=` boots a package. F5/S9/T21 `HandshakeKeyRateLimited`, mapping moved to `hs_core::reject_event` with tests. F6 `Install` no longer Debug/Clone/Copy. F7/S6 neighbor bound and alias checks with tests. F8 `size_of::<DataPd>()` asserted against `layout::DATA_STACK_SIZE` (layout test ties it to the .system). F9 no per-frame copies. S3 comment corrected, residue recorded. S4 index issued after authentication (test red-proved). S5 `created_ns` removed; data stamps install time (boundary test). S7 comment and R6 corrected. S8 unresolvable repo root is an error. S11 `TransportUnknownIndex`. T8 per-crate Kani keys. T9 covers per Ok variant. T10 `unshare -r --uts` probe requiring "unshare failed". T11 monitor fault line asserted. T12 tests per validator branch. T13 self-cleaning scratch dirs, deny asserts match "is inside". T14 `cpu` linted and tested (ticks_to_ns; RNDR not executed on the host, which lacks FEAT_RNG). T15 all boot errors compared, exhaustive. T16 allow side: the same response opens with the right PSK. T17 ports never reused within a run. T18 test calls `Indices::round`. T19 doc corrected, RateLimited cover. T22 a round hash failure refuses the index.
+
+# Round 2
+Date: 2026-10-19 — incremental review of `5c4e486..e234ed7` by the same three experts. Round-1 findings all resolved except where noted below; no Critical findings; R43 (fix-induced widening): none found by any expert.
+
+## Findings
+| ID | Sev | Finding |
+|---|---|---|
+| F-R2-1 / M8 | Major | Docs overstated the residue test (each handshake / all zero / 32 MiB) |
+| M1 | Major | SIGTERM to the harness SIGKILLed the netns child, orphaning QEMU and wireguard-go |
+| M2 / R2-S1 | Major | RAM residue scan had no positive control; vacuous if layout or window drifted |
+| M3 | Major | Secrets-path symlink resolution in tools/package untested (red-proved removable) |
+| M4 | Major | Package staging lifecycle (0700, rename, cleanup on failure) untested |
+| R2-S2 | Minor | Package staging leaked on SIGTERM/SIGHUP; rmtree errors swallowed |
+| R2-S3 / F-R2-4 | Minor | Package check/rename via an unresolved parent; rename replaces an empty OUT |
+| R2-S4 | Minor | CNTFRQ == 0 freezes time, so sessions never expire |
+| R2-S5 | Minor | Allowed IPs could cover unlisted inside hosts (no inside prefix) |
+| F-R2-2 | Minor | `make run` lost its image prerequisite |
+| F-R2-3 / M7 | Minor | Integration TTL case did not assert the TTL-2 allow side; PASS order |
+| M5 | Minor | LINT-CRATES minimum not raised for `cpu` |
+| M6 | Minor | hostfwd port chosen before Wire bound its port |
+| M9 | Minor | Bolero corpus check satisfied by untracked generated inputs |
+| M10 | Minor | Boot-error exhaustive match not tied to the compared list |
+
+## Recurring Issue Check (Round 2)
+Functionality: R2 resolved; R3, R4, R12, R32, R38, R40, R41, R44, R48 checked; R16 violated (F-R2-2); R29/R49 violated (F-R2-1); R43 checked, no widening.
+Security: R43 none; RS1 OK; RS2 accepted (R6); RS3 gap R2-S5; RS4 OK; RS5 violated (R2-S4); RS6 N/A.
+Testing: R29 (M7, M8); R49 (M1, M2); RT6 (M5); RT7 (M2, M3); RT10 (M4, M7); RT11 (M1, M6); others checked.
+
+## Resolution Status (Round 2)
+- F-R2-1 / M8: deviation log and Round-1 S1 entry restated to the actual mechanism (peer 1's install needle, `OBJECT_RAM`, positive control); both cite the constant instead of a size.
+- M2 / R2-S1: the same snapshot must contain `data`'s live session key (control) and must not contain the install; needle length checked against `msgs::INSTALL_LEN` parsed from the Rust source; scratch file unlinked before each read; window 32 MiB.
+- M1: the parent forwards SIGTERM to the netns child and waits 15 s (then kills, loudly); QEMU and wireguard-go get PR_SET_PDEATHSIG so a killed harness cannot orphan them.
+- M3: fixtures for a secrets symlink into the repo (deny) and outside (allow). M4: fixtures run `main()` with `build` replaced: success → OUT 0700 with a 0600 image and no staging; failure and exception → no OUT, no staging. Red-proved: removing the cleanup fails both failure fixtures; removing the umask fails the success fixture.
+- R2-S2: SIGTERM/SIGHUP raise SystemExit in tools/package; staging removal reports leftovers and fails the run. R2-S3 / F-R2-4: parent resolved once and used for mkdtemp and rename; the staging dir is re-checked against the forbidden roots; OUT existing just before the rename refuses (residual window between that check and rename(2) accepted: it needs write access to the operator's own directory).
+- R2-S4: `cpu::checked_frequency` refuses 0; `data` and `hs` halt at init without a clock (host test 0 / 62.5 MHz).
+- R2-S5: required `inside_prefix`; inside_ip and every neighbor must lie in it, outside_ip must not, and no allowed IP may overlap it (unit tests and a build-failure fixture).
+- F-R2-2: `run` depends on `image` when the default LOADER is used. F-R2-3 / M7: the TTL case requires an echo reply to seq 2 and none to seq 1; `to_lan` TTL-2 unit test; PASS lines in order. M5: LINT-CRATES 17. M6: Wire records its held port; hostfwd chosen after it. M9: each bolero target requires committed `seed-*` files. M10: the compared list is built from the exhaustive match and its length asserted.

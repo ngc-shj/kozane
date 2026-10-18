@@ -203,7 +203,8 @@ class Console:
                  strip_ready: bool = False) -> re.Match:
         """`strip_ready` removes other PDs' "<pd>: ready" lines first: during
         boot a PD that exhausts its budget mid-line is preempted, and another
-        PD's line lands inside it (characters are printed one by one)."""
+        PD's line lands inside it (characters are printed one by one). The
+        match's offsets index the searched copy, not `self.text`."""
         rx = re.compile(pattern)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -253,7 +254,8 @@ def boot(loader: str, outside: str, inside: str, monitor: str = "") -> tuple:
     if monitor:
         cmd += ["-monitor", f"unix:{monitor},server,nowait"]
     # pexpect makes the child a session leader, so kill() takes the group.
-    child = pexpect.spawn("qemu-system-aarch64", cmd, encoding="utf-8", timeout=BOOT_TIMEOUT_S)
+    child = pexpect.spawn("qemu-system-aarch64", cmd, encoding="utf-8", timeout=BOOT_TIMEOUT_S,
+                          preexec_fn=die_with_parent)
     return child, Console(child)
 
 
@@ -295,6 +297,11 @@ class Monitor:
         # HMP parses an unquoted absolute path as part of the preceding
         # integer expression (`/tmp/...` starts with division). JSON string
         # quoting is accepted by HMP and also handles unusual path bytes.
+        # A stale snapshot from an earlier call must never be read back.
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
         self.sock.sendall(f"pmemsave {addr:#x} {size:#x} {json.dumps(path)}\n".encode())
         reply = self._read_until(b"(qemu) ")
         if not os.path.exists(path):
@@ -307,19 +314,23 @@ class Monitor:
         return data
 
 
-# Guest RAM holding every kernel object. The current package report reaches
-# past 0x60c0_0000, so cover the first 16 MiB rather than only the loader's
-# first 2 MiB; scanned whole, so no individual-MR address is assumed.
-OBJECT_RAM = (0x6000_0000, 0x0100_0000)
+# Guest RAM scanned for residue. Which frames back which region at run time
+# is not knowable from the Microkit report, so the whole window is read and
+# a positive control (a value `data` must hold) proves it covers PD memory.
+OBJECT_RAM = (0x6000_0000, 0x0200_0000)
 
 
-def wait_absent(mon: Monitor, needle: bytes, scratch: str, timeout: float = 5.0):
-    """Polls until `needle` occurs nowhere in OBJECT_RAM (bounded: the 1 Hz
-    timer retries the reclaim if a wakeup was missed)."""
+def wait_absent(mon: Monitor, needle: bytes, control: bytes, scratch: str, timeout: float = 5.0):
+    """Polls until `needle` occurs nowhere in OBJECT_RAM while `control`
+    does, in the same snapshot (bounded: the 1 Hz timer retries the reclaim
+    if a wakeup was missed). A missing control fails: the scan would prove
+    nothing."""
     base, size = OBJECT_RAM
     deadline = time.monotonic() + timeout
     while True:
         ram = mon.pmem(base, size, scratch)
+        if ram.find(control) < 0:
+            raise Fail("scan window does not cover PD memory: live session key not found")
         at = ram.find(needle)
         if at < 0:
             return
@@ -328,11 +339,22 @@ def wait_absent(mon: Monitor, needle: bytes, scratch: str, timeout: float = 5.0)
         time.sleep(0.2)
 
 
+def install_len_from_rust() -> int:
+    src = open(os.path.join(ROOT, "crates/msgs/src/lib.rs")).read()
+    m = re.search(r"pub const INSTALL_LEN: usize = ([0-9 +]+);", src)
+    if not m:
+        raise Fail("INSTALL_LEN not found in crates/msgs/src/lib.rs")
+    return sum(int(x) for x in m.group(1).split("+"))
+
+
 def install_bytes(peer: int, i) -> bytes:
     """The `msgs::Install` hs sent for initiator `i`'s session: our index is
     the receiver of its transport packets, its sender index is our remote,
     and our send/recv keys are its recv/send keys."""
-    return struct.pack("<HII", peer, i.receiver, i.sender) + i.recv_key + i.send_key
+    b = struct.pack("<HII", peer, i.receiver, i.sender) + i.recv_key + i.send_key
+    if len(b) != install_len_from_rust():
+        raise Fail(f"install layout drifted: {len(b)} bytes vs msgs::INSTALL_LEN")
+    return b
 
 
 def dgram(name: str, local: int, remote: int) -> str:
@@ -347,6 +369,7 @@ class Wire:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("127.0.0.1", 0))
         self.port = self.sock.getsockname()[1]
+        _handed_out.add(self.port)  # held open; never offered to QEMU
         self.qemu_port = free_udp_port()
         self.sock.settimeout(REPLY_TIMEOUT_S)
 
@@ -497,7 +520,8 @@ class WgGo:
     def __init__(self, conf: str, address: str):
         self.dev = dev = f"wgt{os.getpid() % 100000}"
         self.proc = subprocess.Popen(["wireguard-go", "-f", dev], stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL, env={**os.environ, "LOG_LEVEL": "error"})
+                                     stderr=subprocess.DEVNULL, env={**os.environ, "LOG_LEVEL": "error"},
+                                     preexec_fn=die_with_parent)
         try:
             self._configure(conf, address)
         except BaseException:
@@ -539,8 +563,8 @@ def ping(tries: int) -> None:
 
 
 def test_wireguard(loader: str, deploy: str, passed: list):
-    hostfwd = free_udp_port()
     inside = Wire()
+    hostfwd = free_udp_port()
     host = InsideHost(inside)
     monitor = os.path.join(deploy, "monitor.sock")
     child, con = boot(loader, f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT}",
@@ -633,8 +657,10 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         # The install for peer 1 carried transport keys through the shared
         # `hd` region; once delivered, no copy of it may remain anywhere in
         # guest memory (L12), without waiting for another handshake.
-        wait_absent(mon, install_bytes(1, good), scratch)
+        # Control: data's live session for peer 1 holds this key.
+        wait_absent(mon, install_bytes(1, good), good.recv_key, scratch)
         passed.append("spoofed inner source, install scrubbed")
+        print("\nPASS [spoofed inner source dropped, install scrubbed]")
 
         # Case 5: an inside datagram with TTL 1 must not be forwarded into
         # the tunnel; TTL 2 still is (the boundary).
@@ -646,10 +672,20 @@ def test_wireguard(loader: str, deploy: str, passed: list):
             pkt[10:12] = struct.pack("!H", csum(bytes(pkt[:20])))
             inside.send(eth(INSIDE_MAC, HOST_MAC, 0x0800, bytes(pkt)))
         con.wait_for(r"audit: src=inner FrameDropped\(TtlExpired\) total=1 ", since=mark)
+        # Allow side: the TTL 2 request crossed the tunnel and wireguard-go's
+        # host answered it; the TTL 1 one never got an answer.
+        deadline = time.monotonic() + REPLY_TIMEOUT_S
+
+        def replies(seq):
+            return [ip for ip in list(host.received) if ip[9] == 1 and ip[20] == 0
+                    and ip[12:16] == bytes([10, 200, 0, 2]) and ip[24:28] == struct.pack("!HH", 7, seq)]
+        while not replies(2) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if not replies(2) or replies(1):
+            raise Fail(f"TTL boundary: replies to seq 2 {len(replies(2))}, to seq 1 {len(replies(1))}")
         ping(tries=3)
         passed.append("ttl expiry")
-        print("\nPASS [TTL 1 dropped at the inside hop]")
-        print("\nPASS [spoofed inner source dropped]")
+        print("\nPASS [TTL 1 dropped, TTL 2 forwarded at the inside hop]")
     finally:
         host.stop = True
         if wg:
@@ -739,6 +775,14 @@ def in_netns(good: str, mismatched: str, deploy: str) -> int:
     return 0
 
 
+def die_with_parent():
+    """preexec_fn: SIGKILL this process if the harness dies, so a harness
+    killed outright cannot orphan QEMU or wireguard-go (PR_SET_PDEATHSIG)."""
+    import ctypes
+    if ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL) != 0:
+        raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG)")
+
+
 def exit_on_signal(signum, _frame):
     # Turn SIGTERM/SIGHUP into SystemExit so `finally` blocks run: the temp
     # dir holds private keys and must go on every exit path.
@@ -754,8 +798,22 @@ def main() -> int:
     try:
         preflight()
         good, mismatched = build(tmp)
-        return subprocess.run(["unshare", "-rn", sys.executable, os.path.abspath(__file__), "--netns",
-                               good, mismatched, os.path.join(tmp, "a")]).returncode
+        # `unshare` execs the child, so the Popen pid is the netns harness.
+        child = subprocess.Popen(["unshare", "-rn", sys.executable, os.path.abspath(__file__), "--netns",
+                                  good, mismatched, os.path.join(tmp, "a")])
+        try:
+            return child.wait()
+        except BaseException:
+            # Let the child run its own teardown (QEMU, wireguard-go, UAPI
+            # socket) before the temp dir goes; kill only if it hangs.
+            child.send_signal(signal.SIGTERM)
+            try:
+                child.wait(timeout=15)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+                print("\nFAIL [teardown]: netns harness ignored SIGTERM; killed", file=sys.stderr)
+            raise
     except Fail as e:
         print(f"\nFAIL [setup]: {e}", file=sys.stderr)
         return 1

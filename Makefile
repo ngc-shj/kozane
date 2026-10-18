@@ -90,7 +90,8 @@ package: image
 # boot a packaged one with LOADER=<dir>/loader.img.
 LOADER ?= $(loader)
 RUN_PORT ?= 51820
-run:
+# Build the default image; a packaged LOADER= is booted as is.
+run: $(if $(filter $(loader),$(LOADER)),image)
 	qemu-system-aarch64 \
 		-machine virt,virtualization=on -cpu neoverse-n2 -m size=2G \
 		-serial mon:stdio -nographic \
@@ -145,10 +146,13 @@ bolero: | $(counts)
 
 define bolero_one
 	cargo bolero test -p $(1) $(2) -T 30s > $(counts)/bolero-$(1).log 2>&1 \
-		|| { awk '{ l[NR] = $$$$0 } /panicked|deadly signal/ && !p { for (i = (NR > 60 ? NR - 60 : 1); i <= NR; i++) print l[i]; p = 1 }' \
+		|| { awk '{ l[NR] = $$0 } /panicked|deadly signal/ && !p { for (i = (NR > 60 ? NR - 60 : 1); i <= NR; i++) print l[i]; p = 1 }' \
 			$(counts)/bolero-$(1).log; tail -20 $(counts)/bolero-$(1).log; exit 1; }
 	grep -qE 'INFO: +[1-9][0-9]* files found in .*/corpus' $(counts)/bolero-$(1).log \
 		|| { echo "bolero: seed corpus not loaded for $(1)"; exit 1; }
+	# Generated inputs accumulate locally; the committed seeds must exist.
+	test "$$(git ls-files 'crates/$(1)/src/__fuzz__/*/corpus/seed-*' | wc -l)" -ge 1 \
+		|| { echo "bolero: no committed seed-* corpus for $(1)"; exit 1; }
 	grep -qE '^Done [1-9][0-9]* runs' $(counts)/bolero-$(1).log \
 		|| { echo "bolero: $(1) completed no runs"; exit 1; }
 	cat $(counts)/bolero-$(1).log >> $(counts)/bolero.log

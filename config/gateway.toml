@@ -9,6 +9,7 @@ outside_ip = "10.0.2.15"
 outside_mac = "52:54:00:12:34:56"
 outside_router_mac = "52:55:0a:00:02:02"
 inside_ip = "10.99.0.1"
+inside_prefix = "10.99.0.0/24"
 inside_mac = "52:54:00:12:34:57"
 
 [[neighbors]]

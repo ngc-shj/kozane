@@ -88,6 +88,16 @@ fn lan_datagram_with_ttl_one_is_dropped() {
 }
 
 #[test]
+fn tunnel_datagram_with_ttl_two_is_delivered_with_ttl_one() {
+    let mut p = datagram(PEER_IP, HOST_IP);
+    set_ttl(&mut p, 2);
+    let mut out = [0u8; MAX_FRAME];
+    let ToLan::Emitted(n) = to_lan(&CFG, &p, &mut out) else { panic!("not emitted") };
+    assert_eq!(out[wire::ETH_HDR + 8], 1);
+    assert_eq!(&out[wire::ETH_HDR..n], &hopped(&p)[..]);
+}
+
+#[test]
 fn tunnel_datagram_with_ttl_one_is_dropped() {
     let mut p = datagram(PEER_IP, HOST_IP);
     set_ttl(&mut p, 1);

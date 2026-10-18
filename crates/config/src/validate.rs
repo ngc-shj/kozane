@@ -20,6 +20,9 @@ pub struct RawGateway {
     pub outside_mac: String,
     pub outside_router_mac: String,
     pub inside_ip: String,
+    /// The inside network (with prefix length): the gateway and every
+    /// neighbor lie in it, and no peer's allowed IPs may overlap it.
+    pub inside_prefix: String,
     pub inside_mac: String,
 }
 
@@ -167,6 +170,13 @@ pub fn check(text: &str, max_peers: usize) -> Result<Checked, String> {
     }
     let outside_ip = parse_ip(&g.outside_ip)?;
     let inside_ip = parse_ip(&g.inside_ip)?;
+    let inside_prefix = parse_prefix(&g.inside_prefix)?;
+    if !inside_prefix.contains(inside_ip) {
+        return Err(format!("config: inside_ip {} is outside inside_prefix {}", g.inside_ip, g.inside_prefix));
+    }
+    if inside_prefix.contains(outside_ip) {
+        return Err("config: outside_ip lies inside inside_prefix".into());
+    }
     if raw.neighbors.len() > MAX_NEIGHBORS {
         return Err(format!("config: at most {MAX_NEIGHBORS} neighbors, got {}", raw.neighbors.len()));
     }
@@ -178,6 +188,9 @@ pub fn check(text: &str, max_peers: usize) -> Result<Checked, String> {
         }
         if ip == inside_ip || ip == outside_ip {
             return Err(format!("config: neighbor {} uses a gateway address", n.ip));
+        }
+        if !inside_prefix.contains(ip) {
+            return Err(format!("config: neighbor {} is outside inside_prefix", n.ip));
         }
         neighbors.push((ip, parse_mac(&n.mac)?));
     }
@@ -191,6 +204,12 @@ pub fn check(text: &str, max_peers: usize) -> Result<Checked, String> {
             }
             if let Some((ip, _)) = neighbors.iter().find(|(ip, _)| p.contains(*ip)) {
                 return Err(format!("config: allowed IPs of peer {i} cover neighbor {}", std::net::Ipv4Addr::from(*ip)));
+            }
+            // Any overlap with the inside network would let the peer speak
+            // as an inside host, listed as a neighbor or not.
+            let ((a0, a1), (b0, b1)) = (p.range(), inside_prefix.range());
+            if a0 <= b1 && b0 <= a1 {
+                return Err(format!("config: allowed IPs of peer {i} overlap inside_prefix"));
             }
         }
     }

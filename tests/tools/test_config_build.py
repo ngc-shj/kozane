@@ -30,6 +30,8 @@ CASES = [
     ("committed config builds", None, BASE),
     ("overlapping allowed IPs fail the build", "overlap", BASE + peer(7).replace("10.200.7.0/24", "10.200.0.0/16")),
     ("allowed IPs covering a neighbor fail the build", "cover neighbor", BASE.replace("10.200.0.2/32", "10.99.0.2/32")),
+    ("allowed IPs overlapping the inside network fail the build", "overlap inside_prefix",
+     BASE.replace("10.200.0.2/32", "10.99.0.128/25")),
     ("one peer over the deployable limit fails the build", "need 1..=8 peers",
      BASE.replace(PEER, "") + "".join(peer(i) for i in range(1, 10))),
     ("unknown field fails the build", "unknown field", BASE.replace("[gateway]", "[gateway]\nmtu = 1400")),

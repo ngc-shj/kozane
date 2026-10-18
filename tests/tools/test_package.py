@@ -79,6 +79,66 @@ def secrets_in_cargo_home():
         shutil.rmtree(d)
 
 
+def secrets_symlink(target_in_repo: bool):
+    def run():
+        d = tmp_tree()
+        try:
+            target = ROOT / "build" / "secrets.bin" if target_in_repo else d / "real.bin"
+            (d / "s.bin").symlink_to(target)
+            return pkg.check_secrets_path(d / "s.bin", ROOT)
+        finally:
+            shutil.rmtree(d)
+    return run
+
+
+def run_main(build_result):
+    """Runs `main()` past every check with `build` replaced: returns errors
+    about OUT and leftover staging dirs (empty list when the outcome is the
+    expected one for `build_result`)."""
+    def run():
+        d = tmp_tree()
+        real_build, real_argv = pkg.build, sys.argv
+        real_umask = os.umask(0o022)
+        os.umask(real_umask)
+        try:
+            blob = d / "secrets.bin"
+            blob.write_bytes(BLOB)
+            gen = d / "gen_config.h"
+            gen.write_text(GEN_DEBUG)
+            out = d / "pkg"
+
+            def fake_build(a, secrets, blob_bytes, staging):
+                (staging / "loader.img").write_bytes(b"image")
+                if build_result == "raise":
+                    raise RuntimeError("microkit failed")
+                return build_result
+
+            pkg.build = fake_build
+            sys.argv = ["package", "--secrets", str(blob), "--out", str(out), "--system", "x", "--policy", "x",
+                        "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
+                        "--config", "x", "--microkit", "x"]
+            try:
+                status = pkg.main()
+            except RuntimeError:
+                status = "raised"
+            errors = []
+            if [p for p in d.iterdir() if p.name.startswith(".pkg.")]:
+                errors.append("staging directory left behind")
+            if build_result == 0:
+                if status != 0 or not (out / "loader.img").exists():
+                    errors.append(f"success did not produce OUT (status {status})")
+                elif oct(out.stat().st_mode & 0o777) != "0o700" or oct((out / "loader.img").stat().st_mode & 0o777) != "0o600":
+                    errors.append("OUT or loader.img not owner-only")
+            elif out.exists():
+                errors.append(f"OUT exists after a failed build (status {status})")
+            return errors
+        finally:
+            pkg.build, sys.argv = real_build, real_argv
+            os.umask(real_umask)
+            shutil.rmtree(d)
+    return run
+
+
 def existing_out(d):
     (d / "pkg").mkdir()
     return d / "pkg"
@@ -114,6 +174,11 @@ CASES = [
     ("secrets path inside the repo", "inside", lambda: pkg.check_secrets_path(ROOT / "build/secrets.bin", ROOT)),
     ("secrets path outside the repo", None, lambda: pkg.check_secrets_path(pathlib.Path("/tmp/s.bin"), ROOT)),
     ("secrets path inside the cargo home", "inside", secrets_in_cargo_home),
+    ("secrets path through a symlink into the repo", "inside", secrets_symlink(True)),
+    ("secrets path through a symlink outside the repo", None, secrets_symlink(False)),
+    ("successful build is renamed into place owner-only", None, run_main(0)),
+    ("failed build leaves no OUT and no staging", None, run_main(1)),
+    ("crashing build leaves no OUT and no staging", None, run_main("raise")),
     ("output inside build/", "inside", lambda: pkg.check_out_path(ROOT / "build/pkg", ROOT)),
     ("output inside the repo", "inside", lambda: pkg.check_out_path(ROOT / "pkg-out", ROOT)),
     ("output through a symlink into the repo", "inside", out_case(link_into_repo)),

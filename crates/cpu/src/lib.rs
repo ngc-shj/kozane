@@ -31,6 +31,12 @@ pub fn ticks_to_ns(ticks: u64, freq: u64) -> u64 {
     u64::try_from(ns).unwrap_or(u64::MAX)
 }
 
+/// The counter frequency, or None if firmware left it unset: with 0 every
+/// timestamp reads 0 and nothing would ever expire, so callers halt.
+pub fn checked_frequency(freq: u64) -> Option<u64> {
+    (freq != 0).then_some(freq)
+}
+
 pub fn now_ns() -> u64 {
     ticks_to_ns(cntpct(), cntfrq())
 }
@@ -86,6 +92,12 @@ mod tests {
     #[test]
     fn ticks_to_ns_without_a_frequency_is_zero() {
         assert_eq!(ticks_to_ns(42, 0), 0);
+    }
+
+    #[test]
+    fn unset_frequency_is_refused_and_qemus_accepted() {
+        assert_eq!(checked_frequency(0), None);
+        assert_eq!(checked_frequency(62_500_000), Some(62_500_000));
     }
 
     #[test]

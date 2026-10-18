@@ -79,25 +79,36 @@ fn peer_count_mismatch_and_bad_format_report_the_blob_error() {
 
 #[test]
 fn boot_error_messages_are_distinct() {
-    let all = [
-        BootError::GatewayKeyMismatch,
-        BootError::PeerMismatch,
-        BootError::Blob(BlobError::BadMagic),
-        BootError::Blob(BlobError::BadVersion),
-        BootError::Blob(BlobError::BadPeerCount),
-        BootError::Blob(BlobError::BadChecksum),
-        BootError::Blob(BlobError::NonZeroPadding),
-        BootError::Blob(BlobError::TooSmall),
-    ];
-    // Exhaustive: a new BlobError variant fails to compile until listed above.
-    let _listed = |e: BlobError| match e {
-        BlobError::BadMagic
-        | BlobError::BadVersion
-        | BlobError::BadPeerCount
-        | BlobError::BadChecksum
-        | BlobError::NonZeroPadding
-        | BlobError::TooSmall => (),
+    // Built from an exhaustive match: a new BlobError variant fails to
+    // compile here until it is listed, and then it is compared.
+    let blob = |i: usize| -> Option<BlobError> {
+        let e = [
+            BlobError::BadMagic,
+            BlobError::BadVersion,
+            BlobError::BadPeerCount,
+            BlobError::BadChecksum,
+            BlobError::NonZeroPadding,
+            BlobError::TooSmall,
+        ]
+        .get(i)
+        .copied()?;
+        match e {
+            BlobError::BadMagic
+            | BlobError::BadVersion
+            | BlobError::BadPeerCount
+            | BlobError::BadChecksum
+            | BlobError::NonZeroPadding
+            | BlobError::TooSmall => Some(e),
+        }
     };
+    let mut all = [BootError::GatewayKeyMismatch; 8];
+    all[1] = BootError::PeerMismatch;
+    let mut n = 2;
+    while let Some(e) = blob(n - 2) {
+        all[n] = BootError::Blob(e);
+        n += 1;
+    }
+    assert_eq!(n, all.len(), "every BlobError compared");
     for (i, a) in all.iter().enumerate() {
         for b in &all[i + 1..] {
             assert_ne!(a.message(), b.message());

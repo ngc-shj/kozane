@@ -104,6 +104,9 @@ fn init() -> Hs {
             Audit::new(memory_region_symbol!(audit_hs: *mut u8), Channel::new(ch::CH_AUDIT)),
         )
     };
+    if cpu::checked_frequency(cpu::cntfrq()).is_none() {
+        halt("CNTFRQ is 0; refusing to run without a clock");
+    }
     let mut key = KeyClient::new(Ppc);
     let seed = key.boot_seed().unwrap_or_else(|_| halt("no boot seed from key"));
     let handshaker = Handshaker::new(&config::GATEWAY_PUBLIC, &seed).unwrap_or_else(|_| halt("init failed"));
