@@ -127,11 +127,20 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::TxNoBuffer
         | Event::BadDescriptor
         | Event::NotForUs
-        | Event::NoService => true,
+        | Event::NoService
+        | Event::Spoofed => true,
         Event::FrameDropped { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
-    assert_eq!(Event::FIXED.len(), 8);
+    assert_eq!(Event::FIXED.len(), 9);
+}
+
+#[test]
+fn decode_classifies_fixed_dropped_and_unknown_codes() {
+    assert_eq!(decode(Event::NoService.code()), Decoded::Fixed(Event::NoService));
+    assert_eq!(decode(FRAME_DROPPED_BASE | 11), Decoded::FrameDropped(11));
+    assert_eq!(decode(0x7777), Decoded::Unknown);
+    assert_eq!(decode(FRAME_DROPPED_BASE + 0x40), Decoded::Unknown);
 }
 
 #[test]

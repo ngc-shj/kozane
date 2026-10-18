@@ -1,0 +1,13 @@
+[pds.a]
+role = "service"
+
+[mrs.ring_mr]
+kind = "plain"
+shares = { a = "r" }
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

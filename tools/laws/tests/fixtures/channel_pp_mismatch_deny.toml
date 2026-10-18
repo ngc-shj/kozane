@@ -1,0 +1,17 @@
+[pds.a]
+role = "service"
+
+[pds.b]
+role = "service"
+
+[[channels]]
+between = ["a", "b"]
+pp = { a = true, b = true }
+notify = { a = false, b = false }
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

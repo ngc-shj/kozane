@@ -263,3 +263,210 @@ fn misspelled_policy_section_is_a_parse_error() {
     // Ignoring it would silently drop the priority law.
     assert_parse_error("policy_typo_deny");
 }
+
+#[test]
+fn duplicate_attribute_allow_neighbour_is_allowed() {
+    assert_allow("duplicate_attr_allow");
+}
+
+#[test]
+fn misspelled_policy_section_allow_neighbour_is_allowed() {
+    assert_allow("policy_typo_allow");
+}
+
+// --- finding 1: channel pp/notify and driver irqs (L4), duplicate irq (L5) ---
+
+#[test]
+fn channel_with_declared_pp_notify_is_allowed() {
+    assert_allow("channel_attrs_allow");
+}
+
+#[test]
+fn channel_end_pp_mismatch_is_l4() {
+    assert_deny("channel_pp_mismatch_deny", &["L4"]);
+}
+
+#[test]
+fn channel_end_notify_mismatch_is_l4() {
+    assert_deny("channel_notify_mismatch_deny", &["L4"]);
+}
+
+#[test]
+fn channel_declared_between_two_pds_is_allowed() {
+    assert_allow("channel_declared_allow");
+}
+
+#[test]
+fn undeclared_channel_is_l4() {
+    assert_deny("channel_undeclared_deny", &["L4"]);
+}
+
+#[test]
+fn driver_irq_matching_policy_is_allowed() {
+    assert_allow("irq_driver_allow");
+}
+
+#[test]
+fn driver_irq_not_listed_in_policy_is_l4() {
+    assert_deny("irq_wrong_number_deny", &["L4"]);
+}
+
+#[test]
+fn irq_on_a_non_driver_pd_is_l4() {
+    assert_deny("irq_non_driver_deny", &["L4"]);
+}
+
+#[test]
+fn two_drivers_with_distinct_irqs_is_allowed() {
+    assert_allow("irq_two_drivers_allow");
+}
+
+#[test]
+fn same_irq_claimed_by_two_pds_is_l5() {
+    assert_deny("irq_duplicate_deny", &["L5"]);
+}
+
+// --- finding 2/3: device mr phys_addr/size pinning and board-ram overlap (L5) ---
+
+#[test]
+fn device_mr_physical_range_inside_board_ram_is_l5() {
+    assert_deny("device_in_ram_deny", &["L5"]);
+}
+
+#[test]
+fn device_mr_physical_range_mismatching_policy_is_l5() {
+    assert_deny("device_range_mismatch_deny", &["L5"]);
+}
+
+#[test]
+fn two_devices_with_non_overlapping_ranges_is_allowed() {
+    assert_allow("device_overlap_allow");
+}
+
+#[test]
+fn two_devices_with_overlapping_ranges_is_l5() {
+    assert_deny("device_overlap_deny", &["L5"]);
+}
+
+// --- finding 4: NaN ratio caps ---
+
+#[test]
+fn ratio_cap_nan_allow_neighbour_is_allowed() {
+    assert_allow("ratio_cap_nan_allow");
+}
+
+#[test]
+fn ratio_cap_of_nan_is_a_policy_error() {
+    assert_parse_error("ratio_cap_nan_deny");
+}
+
+// --- finding 5: unknown attributes on memory_region/channel/end/system (L4) ---
+
+#[test]
+fn baseline_without_unknown_attrs_is_allowed() {
+    assert_allow("unknown_attrs_allow");
+}
+
+#[test]
+fn unknown_attrs_on_system_mr_channel_end_are_l4() {
+    assert_deny("unknown_attrs_deny", &["L4"]);
+}
+
+// --- finding 7: more than one key pd (L2) ---
+
+#[test]
+fn two_key_pds_is_l2() {
+    assert_deny("two_key_pds_deny", &["L2"]);
+}
+
+// --- finding 8: full coverage sweep ---
+
+#[test]
+fn producer_rw_consumer_r_data_mr_is_allowed() {
+    assert_allow("data_rw_r_allow");
+}
+
+#[test]
+fn consumer_maps_data_mr_rw_is_l3() {
+    assert_deny("data_consumer_rw_deny", &["L3"]);
+}
+
+#[test]
+fn undeclared_pd_maps_data_mr_is_l3() {
+    assert_deny("data_undeclared_pd_deny", &["L3"]);
+}
+
+#[test]
+fn untrusted_input_strictly_below_key_is_allowed() {
+    assert_allow("priority_below_key_allow");
+}
+
+#[test]
+fn untrusted_input_priority_not_below_key_is_l13() {
+    assert_deny("priority_not_below_key_deny", &["L13"]);
+}
+
+#[test]
+fn shared_mr_within_x_allowance_is_allowed() {
+    assert_allow("shared_exec_allow");
+}
+
+#[test]
+fn executable_perms_on_shared_mr_is_l4() {
+    assert_deny("shared_exec_deny", &["L4"]);
+}
+
+#[test]
+fn perms_within_policy_allowance_is_allowed() {
+    assert_allow("plain_perms_allow");
+}
+
+#[test]
+fn perms_beyond_policy_allowance_is_l4() {
+    assert_deny("plain_perms_beyond_deny", &["L4"]);
+}
+
+#[test]
+fn key_mapping_a_non_secrets_mr_is_l1() {
+    assert_deny("key_maps_non_secrets_deny", &["L1"]);
+}
+
+#[test]
+fn baseline_without_prefill_path_is_allowed() {
+    assert_allow("prefill_non_secrets_allow");
+}
+
+#[test]
+fn prefill_path_on_a_non_secrets_mr_is_l2() {
+    assert_deny("prefill_non_secrets_deny", &["L2"]);
+}
+
+#[test]
+fn baseline_without_phys_addr_is_allowed() {
+    assert_allow("phys_addr_non_device_allow");
+}
+
+#[test]
+fn phys_addr_on_a_non_device_mr_is_l5() {
+    assert_deny("phys_addr_non_device_deny", &["L5"]);
+}
+
+#[test]
+fn cspace_virtual_machine_and_smc_are_l4() {
+    assert_deny("cspace_vm_smc_deny", &["L4"]);
+}
+
+#[test]
+fn baseline_without_cspace_virtual_machine_or_smc_is_allowed() {
+    assert_allow("cspace_vm_smc_allow");
+}
+
+#[test]
+fn ratio_exactly_at_the_cap_is_allowed() {
+    assert_allow("ratio_cap_exact_allow");
+}
+
+#[test]
+fn budget_equal_to_period_is_l13() {
+    assert_deny("budget_equals_period_deny", &["L13"]);
+}

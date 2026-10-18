@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <protection_domain name="untrusted" priority="1">
+        <program_image path="untrusted.elf" />
+    </protection_domain>
+    <protection_domain name="key" priority="2" passive="true">
+        <program_image path="key.elf" />
+    </protection_domain>
+</system>

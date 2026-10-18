@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <protection_domain name="svc" priority="1">
+        <program_image path="svc.elf" />
+        <irq irq="33" id="0" />
+    </protection_domain>
+</system>

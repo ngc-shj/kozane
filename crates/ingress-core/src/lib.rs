@@ -29,6 +29,8 @@ pub enum Outcome {
     Dropped(DropReason),
     NotForUs,
     NoService,
+    /// Source claims to be us, or ARP sender differs from the Ethernet source.
+    Spoofed,
 }
 
 const BROADCAST: Mac = [0xff; 6];
@@ -48,11 +50,16 @@ fn arp(cfg: &Config, eth: &EthAddrs, a: &ArpPacket, out: &mut [u8]) -> Outcome {
     if (eth.dst != cfg.mac && eth.dst != BROADCAST) || a.tpa != cfg.ipv4 {
         return Outcome::NotForUs;
     }
+    if a.sha != eth.src || a.spa == cfg.ipv4 {
+        return Outcome::Spoofed;
+    }
     if a.op != ArpOp::Request {
         return Outcome::NoService;
     }
+    // Reply to the frame's sender (equal to sha, checked above), so a
+    // forged sha cannot aim the reply at a third party.
     let reply = Frame {
-        eth: EthAddrs { src: cfg.mac, dst: a.sha },
+        eth: EthAddrs { src: cfg.mac, dst: eth.src },
         body: Body::Arp(ArpPacket { op: ArpOp::Reply, sha: cfg.mac, spa: cfg.ipv4, tha: a.sha, tpa: a.spa }),
     };
     match wire::emit(&reply, out) {
@@ -66,7 +73,12 @@ fn udp(cfg: &Config, eth: &EthAddrs, u: &Udp4<'_>, out: &mut [u8]) -> Outcome {
     if eth.dst != cfg.mac || u.dst != cfg.ipv4 {
         return Outcome::NotForUs;
     }
-    if u.dport != cfg.echo_port {
+    if u.src == cfg.ipv4 {
+        return Outcome::Spoofed;
+    }
+    // Two echo services pointed at each other (one via a spoofed source)
+    // would bounce forever; never answer a datagram from an echo port.
+    if !cfg!(feature = "echo") || u.dport != cfg.echo_port || u.sport == cfg.echo_port {
         return Outcome::NoService;
     }
     let reply = Frame {
@@ -97,9 +109,11 @@ mod proofs {
             assert!(n <= out.len());
         }
         kani::cover!(matches!(o, Outcome::ArpReplied(_)));
+        #[cfg(feature = "echo")]
         kani::cover!(matches!(o, Outcome::UdpEchoed(_)));
         kani::cover!(o == Outcome::NotForUs);
         kani::cover!(o == Outcome::NoService);
+        kani::cover!(o == Outcome::Spoofed);
     }
 }
 

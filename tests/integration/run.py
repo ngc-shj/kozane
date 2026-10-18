@@ -149,6 +149,19 @@ def free_udp_port() -> int:
     return port
 
 
+def spawn_ready(loader: str, netdev_fn, attempts: int = 3) -> pexpect.spawn:
+    """Boots and waits for the ready lines. Retries when QEMU exits early,
+    e.g. because a port picked by free_udp_port was taken in the meantime."""
+    for _ in range(attempts):
+        child = spawn(loader, netdev_fn())
+        try:
+            wait_ready(child)
+            return child
+        except pexpect.EOF:
+            kill(child)
+    raise Fail("QEMU did not boot")
+
+
 def spawn(loader: str, netdev: str) -> pexpect.spawn:
     cmd = [
         "-machine", "virt,virtualization=on", "-cpu", "cortex-a53", "-m", "size=2G",
@@ -225,9 +238,13 @@ class Wire:
 
 def test_raw(loader: str):
     w = Wire()
-    child = spawn(loader, w.netdev())
+
+    def netdev():
+        w.qemu_port = free_udp_port()
+        return w.netdev()
+
+    child = spawn_ready(loader, netdev)
     try:
-        wait_ready(child)
 
         # ARP request for our IP -> exact reply.
         w.send(arp(1, PEER_MAC, PEER_IP, b"\0" * 6, GW_IP))
@@ -248,6 +265,7 @@ def test_raw(loader: str):
 
         flood(w, child, "Ipv4BadChecksum", k=640)
         echo(w, child)  # liveness after the flood
+        echo(w, child)
     finally:
         kill(child)
 
@@ -257,16 +275,27 @@ def echo(w: Wire, child):
     w.send(ipv4_udp(PEER_IP, GW_IP, 40000, ECHO_PORT, nonce))
     r = w.recv_matching(lambda d: d[12:14] == b"\x08\x00" and d[23] == 17, child)
     sport, dport = struct.unpack("!HH", r[34:38])
-    if r[42:42 + len(nonce)] != nonce or (sport, dport) != (ECHO_PORT, 40000) or r[:6] != PEER_MAC:
+    headers_ok = (r[:6] == PEER_MAC and r[6:12] == GW_MAC
+                  and r[26:30] == GW_IP and r[30:34] == PEER_IP
+                  and (sport, dport) == (ECHO_PORT, 40000))
+    if r[42:42 + len(nonce)] != nonce or not headers_ok:
         raise Fail(f"bad echo {r.hex()}")
 
 
+FLOOD_BATCH = 32
+
+
 def flood(w: Wire, child, reason: str, k: int):
-    """After k more frames of one reason (total k+1 incl. the earlier one):
-    >= 1 and <= k/64 + 2 lines, last total == 1 mod 64, total + lost <= k + 1."""
+    """Sends k more frames of one reason (k+1 in total with the earlier one)
+    in batches, with an echo round trip after each: rings are FIFO, so the
+    echo returning proves the batch was consumed and nothing is dropped for
+    lack of buffers. Then exactly ceil((k+1)/64) lines, the last with
+    total == k+1 and lost == 0."""
     frame = frame_for(reason)
-    for _ in range(k):
-        w.send(frame)
+    for start in range(0, k, FLOOD_BATCH):
+        for _ in range(min(FLOOD_BATCH, k - start)):
+            w.send(frame)
+        echo(w, child)
     totals, lost = [], 0
     pat = re.compile(rf"audit: src=ingress FrameDropped\({reason}\) total=(\d+) lost=(\d+)")
     while True:
@@ -275,22 +304,25 @@ def flood(w: Wire, child, reason: str, k: int):
             break
         totals.append(int(child.match.group(1)))
         lost = int(child.match.group(2))
-    if not totals:
-        raise Fail("flood produced no audit line")
-    if len(totals) > k // 64 + 2:
-        raise Fail(f"flood produced {len(totals)} lines")
-    if totals[-1] % 64 != 1 or totals[-1] + lost > k + 1:
-        raise Fail(f"flood totals inconsistent: {totals} lost={lost}")
+    # The first occurrence (total=1) was asserted before the flood.
+    want = list(range(65, k + 2, 64))
+    if totals != want or lost != 0:
+        raise Fail(f"flood totals {totals} lost={lost}, want {want} lost=0")
 
 
 # ---------------------------------------------------------------- boot 2
 
 
 def test_hostfwd(loader: str):
-    port = free_udp_port()
-    child = spawn(loader, f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{port}-:{ECHO_PORT}")
+    ports = []
+
+    def netdev():
+        ports.append(free_udp_port())
+        return f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{ports[-1]}-:{ECHO_PORT}"
+
+    child = spawn_ready(loader, netdev)
+    port = ports[-1]
     try:
-        wait_ready(child)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(1)
         nonce = secrets.token_bytes(8)

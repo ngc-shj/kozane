@@ -20,6 +20,7 @@ pub fn check(system: &System, policy: &Policy) -> Vec<Finding> {
     check_secrets_and_taint(system, policy, &tainted, &mut findings);
     check_device_and_dma(system, policy, &mut findings);
     check_dma_setvar_present(system, policy, &mut findings);
+    check_irq_duplicates(system, &mut findings);
     check_data_confinement(system, policy, &mut findings);
     check_availability(system, policy, &tainted, &mut findings);
 
@@ -43,11 +44,19 @@ fn check_default_deny(system: &System, policy: &Policy, findings: &mut Vec<Findi
             findings.push(Finding::new(LawId::L4, format!("pd '{}' is not described by policy", pd.name)));
             continue;
         }
-        if pd.has_irq && policy.role(&pd.name) != Some(Role::Driver) {
+        if !pd.irqs.is_empty() && policy.role(&pd.name) != Some(Role::Driver) {
             findings.push(Finding::new(
                 LawId::L4,
                 format!("pd '{}' declares <irq> but is not a driver", pd.name),
             ));
+        }
+        for irq in &pd.irqs {
+            if !policy.irqs(&pd.name).is_some_and(|declared| declared.contains(irq)) {
+                findings.push(Finding::new(
+                    LawId::L4,
+                    format!("pd '{}' claims irq {irq}, which is not listed in its policy irqs", pd.name),
+                ));
+            }
         }
     }
 
@@ -57,14 +66,41 @@ fn check_default_deny(system: &System, policy: &Policy, findings: &mut Vec<Findi
         }
     }
 
+    // Channel pair presence, then each end's effective (default-applied)
+    // pp/notify against what the policy declares for that end (finding 1).
     for channel in &system.channels {
         let [a, b] = &channel.ends;
-        let pair = if a.pd < b.pd { (a.pd.clone(), b.pd.clone()) } else { (b.pd.clone(), a.pd.clone()) };
-        if !policy.channels.contains(&pair) {
-            findings.push(Finding::new(
+        match policy.channel(&a.pd, &b.pd) {
+            None => findings.push(Finding::new(
                 LawId::L4,
-                format!("channel between '{}' and '{}' is not described by policy", pair.0, pair.1),
-            ));
+                format!("channel between '{}' and '{}' is not described by policy", a.pd, b.pd),
+            )),
+            Some(cp) => {
+                for end in [a, b] {
+                    if end.pp != cp.expected_pp(&end.pd) {
+                        findings.push(Finding::new(
+                            LawId::L4,
+                            format!(
+                                "channel end for pd '{}' has pp={}, policy declares pp={}",
+                                end.pd,
+                                end.pp,
+                                cp.expected_pp(&end.pd)
+                            ),
+                        ));
+                    }
+                    if end.notify != cp.expected_notify(&end.pd) {
+                        findings.push(Finding::new(
+                            LawId::L4,
+                            format!(
+                                "channel end for pd '{}' has notify={}, policy declares notify={}",
+                                end.pd,
+                                end.notify,
+                                cp.expected_notify(&end.pd)
+                            ),
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -255,15 +291,39 @@ fn check_secrets_and_taint(
             ));
         }
     }
+
+    // L2: at most one pd may hold the `key` role, and the secrets mr (if
+    // any) may be mapped by at most one pd — either violation defeats "one
+    // MR for static secrets, mapped only into key".
+    let key_pds: Vec<&str> =
+        system.pds.iter().filter(|pd| policy.role(&pd.name) == Some(Role::Key)).map(|pd| pd.name.as_str()).collect();
+    if key_pds.len() > 1 {
+        findings.push(Finding::new(LawId::L2, format!("more than one pd has role 'key': {}", key_pds.join(", "))));
+    }
+
+    if let Some(secrets_mr) = secrets_mr {
+        let mappers: Vec<&str> = system
+            .pds
+            .iter()
+            .filter(|pd| mrs_mapped_by(pd).any(|m| m.mr == secrets_mr))
+            .map(|pd| pd.name.as_str())
+            .collect();
+        if mappers.len() > 1 {
+            findings.push(Finding::new(
+                LawId::L2,
+                format!("secrets mr '{secrets_mr}' is mapped into more than one pd: {}", mappers.join(", ")),
+            ));
+        }
+    }
 }
 
-/// L5: device/DMA ownership, page-granular overlap, and `setvar
-/// region_paddr`.
+/// L5: device/DMA ownership, page-granular overlap, physical-range pinning
+/// against the policy, board-RAM overlap, and `setvar region_paddr`.
 fn check_device_and_dma(system: &System, policy: &Policy, findings: &mut Vec<Finding>) {
     // Device mr ownership and page-granular overlap across different owners.
     let mut device_ranges: Vec<(&str, &str, u64, u64)> = Vec::new(); // (mr, owner, start, end)
     for mr in &system.mrs {
-        let Some(MrPolicy::Device { owner }) = policy.mrs.get(mr.name.as_str()) else { continue };
+        let Some(MrPolicy::Device { owner, .. }) = policy.mrs.get(mr.name.as_str()) else { continue };
         if let Some(phys_addr) = mr.phys_addr {
             let size = mr.size.unwrap_or(mr.page_size);
             device_ranges.push((mr.name.as_str(), owner.as_str(), phys_addr, phys_addr.saturating_add(size)));
@@ -295,10 +355,48 @@ fn check_device_and_dma(system: &System, policy: &Policy, findings: &mut Vec<Fin
         }
     }
 
+    // The `.system`'s phys_addr/size for a device mr must match the pinned
+    // value the policy declares (finding 3): a mismatch is otherwise
+    // invisible to every other check here, which all trust the policy's
+    // numbers rather than the `.system`'s.
+    for mr in &system.mrs {
+        if let Some(MrPolicy::Device { phys_addr, size, .. }) = policy.mrs.get(mr.name.as_str())
+            && (mr.phys_addr != Some(*phys_addr) || mr.size != Some(*size))
+        {
+            findings.push(Finding::new(
+                LawId::L5,
+                format!(
+                    "device mr '{}' has phys_addr={:?}/size={:?}, policy pins phys_addr={phys_addr:#x}/size={size:#x}",
+                    mr.name, mr.phys_addr, mr.size
+                ),
+            ));
+        }
+    }
+
+    // A device mr's pinned physical range must not intersect board RAM
+    // (C7: phys_addr is only allowed on device mrs "with no overlap with
+    // board RAM"). Checked against the policy's own pinned range rather
+    // than the `.system`'s, since a mismatch between the two is already
+    // reported above.
+    for (name, mp) in &policy.mrs {
+        let MrPolicy::Device { phys_addr, size, .. } = mp else { continue };
+        let end = phys_addr.saturating_add(*size);
+        for (ram_start, ram_end) in &policy.ram {
+            if phys_addr < ram_end && ram_start < &end {
+                findings.push(Finding::new(
+                    LawId::L5,
+                    format!(
+                        "device mr '{name}' [{phys_addr:#x}, {end:#x}) overlaps board ram [{ram_start:#x}, {ram_end:#x})"
+                    ),
+                ));
+            }
+        }
+    }
+
     for pd in &system.pds {
         for m in mrs_mapped_by(pd) {
             match policy.mrs.get(m.mr.as_str()) {
-                Some(MrPolicy::Device { owner }) if owner != &pd.name => {
+                Some(MrPolicy::Device { owner, .. }) if owner != &pd.name => {
                     findings.push(Finding::new(
                         LawId::L5,
                         format!("device mr '{}' (owner '{owner}') is also mapped into pd '{}'", m.mr, pd.name),
@@ -325,6 +423,25 @@ fn check_device_and_dma(system: &System, policy: &Policy, findings: &mut Vec<Fin
                     ),
                 )),
             }
+        }
+    }
+}
+
+/// L5: the same hardware IRQ number claimed by more than one pd's `<irq>`.
+/// Independent of whether either claim is itself policy-declared (L4
+/// already covers that); two pds racing to ack the same line is a
+/// device-ownership violation in its own right.
+fn check_irq_duplicates(system: &System, findings: &mut Vec<Finding>) {
+    let mut claimants: BTreeMap<u64, BTreeSet<&str>> = BTreeMap::new();
+    for pd in &system.pds {
+        for irq in &pd.irqs {
+            claimants.entry(*irq).or_default().insert(pd.name.as_str());
+        }
+    }
+    for (irq, pds) in claimants {
+        if pds.len() > 1 {
+            let names: Vec<&str> = pds.into_iter().collect();
+            findings.push(Finding::new(LawId::L5, format!("irq {irq} is claimed by more than one pd: {}", names.join(", "))));
         }
     }
 }

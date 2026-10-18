@@ -1,9 +1,11 @@
 //! Parses a Microkit System Description File (SDF) into a [`System`],
 //! applying the same defaults the `microkit` tool applies (Microkit 2.3.1
 //! manual, section 7), and collecting [`Finding`]s for anything the SDF
-//! grammar allows but this checker's supported subset does not (unknown
-//! elements/attributes, `cspace`, child `protection_domain`,
-//! `virtual_machine`, `smc`, `ioport`, `domains` — all L4, default deny).
+//! grammar allows but this checker's supported subset does not: unknown
+//! elements, unknown attributes on any element (`<system>`,
+//! `<memory_region>`, `<channel>`/`<end>` included, same as `<map>`/
+//! `<protection_domain>`), `cspace`, child `protection_domain`,
+//! `virtual_machine`, `smc`, `ioport`, `domains` — all L4, default deny.
 //!
 //! A document that is not even valid XML, or that violates the SDF grammar
 //! itself (a required attribute missing, a malformed number, an invalid
@@ -91,7 +93,9 @@ pub struct Pd {
     pub path_for_symbols: Option<String>,
     pub maps: Vec<Map>,
     pub setvars: Vec<Setvar>,
-    pub has_irq: bool,
+    /// Hardware interrupt numbers from this pd's `<irq irq="...">` elements
+    /// (manual §7.1); empty if it declares none.
+    pub irqs: Vec<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,8 +126,33 @@ pub struct System {
     pub channels: Vec<Channel>,
 }
 
-const DEFAULT_PAGE_SIZE: u64 = 0x1000;
 const DEFAULT_BUDGET_US: u64 = 1000;
+
+/// Microkit channel `<end>` defaults (manual §7.6): `pp` defaults to
+/// `false`, `notify` to `true`. Shared with `policy.rs`, which compares
+/// these same effective values against its own per-end declarations (L4).
+pub const DEFAULT_PP: bool = false;
+pub const DEFAULT_NOTIFY: bool = true;
+
+/// Page sizes Microkit supports on every architecture this checker covers
+/// (manual §7.5.1), largest first.
+const PAGE_SIZES: [u64; 2] = [0x200_000, 0x1000];
+
+/// Mirrors the Microkit tool's own `page_size` default (manual §7.2): when
+/// `page_size` is omitted, use the largest supported page size the region
+/// is aligned to (both `size` and, if given, `phys_addr` must be a
+/// multiple of the candidate). A `prefill_path`-only mr (`size` not yet
+/// known here) defaults to the smallest page size, the conservative choice
+/// available before the prefill file's length is known.
+fn default_page_size(size: Option<u64>, phys_addr: Option<u64>) -> u64 {
+    let Some(size) = size else { return 0x1000 };
+    for p in PAGE_SIZES {
+        if size % p == 0 && phys_addr.is_none_or(|a| a % p == 0) {
+            return p;
+        }
+    }
+    0x1000
+}
 
 /// Parses `xml` and returns the structural model plus any L4 (default-deny)
 /// findings for SDF constructs outside this checker's supported subset.
@@ -141,6 +170,11 @@ pub fn parse(xml: &str) -> Result<(System, Vec<Finding>), SdfError> {
     let mut system = System::default();
     let mut findings = Vec::new();
 
+    // <system> itself supports no attributes (manual §7); any present are a
+    // default-deny finding (L4) like unknown attributes elsewhere, not a
+    // parse error.
+    check_unknown_attrs(root, &[], &mut findings);
+
     for child in root.children().filter(Node::is_element) {
         check_no_duplicate_attrs(child)?;
         match child.tag_name().name() {
@@ -148,8 +182,8 @@ pub fn parse(xml: &str) -> Result<(System, Vec<Finding>), SdfError> {
                 let pd = parse_pd(child, &mut findings)?;
                 system.pds.push(pd);
             }
-            "memory_region" => system.mrs.push(parse_mr(child)?),
-            "channel" => system.channels.push(parse_channel(child)?),
+            "memory_region" => system.mrs.push(parse_mr(child, &mut findings)?),
+            "channel" => system.channels.push(parse_channel(child, &mut findings)?),
             other => findings.push(Finding::new(
                 LawId::L4,
                 format!("unsupported element <{other}> under <system>"),
@@ -243,7 +277,7 @@ fn parse_pd(node: Node, findings: &mut Vec<Finding>) -> Result<Pd, SdfError> {
     let mut path_for_symbols = None;
     let mut maps = Vec::new();
     let mut setvars = Vec::new();
-    let mut has_irq = false;
+    let mut irqs = Vec::new();
 
     for child in node.children().filter(Node::is_element) {
         check_no_duplicate_attrs(child)?;
@@ -281,12 +315,12 @@ fn parse_pd(node: Node, findings: &mut Vec<Finding>) -> Result<Pd, SdfError> {
             }
             "irq" => {
                 check_unknown_attrs(child, &["irq", "id", "trigger", "setvar_id"], findings);
-                required_attr(child, "irq")?;
+                let irq = parse_u64(required_attr(child, "irq")?).map_err(|e| err(e.to_string()))?;
                 let id = parse_u64(required_attr(child, "id")?).map_err(|e| err(e.to_string()))?;
                 if id >= 63 {
                     return Err(err(format!("irq id {id} out of range (0-62) on pd '{name}'")));
                 }
-                has_irq = true;
+                irqs.push(irq);
             }
             other => findings.push(Finding::new(
                 LawId::L4,
@@ -310,22 +344,16 @@ fn parse_pd(node: Node, findings: &mut Vec<Finding>) -> Result<Pd, SdfError> {
         path_for_symbols,
         maps,
         setvars,
-        has_irq,
+        irqs,
     })
 }
 
-fn parse_mr(node: Node) -> Result<MemoryRegion, SdfError> {
+fn parse_mr(node: Node, findings: &mut Vec<Finding>) -> Result<MemoryRegion, SdfError> {
     const ALLOWED: &[&str] = &["name", "size", "page_size", "phys_addr", "prefill_path", "prefill_bootinfo"];
-    // Soft (L4) findings on memory_region attributes are rare enough in
-    // practice that they are folded into the caller's findings list by name
-    // resolution in `check`, so unknown attributes here are hard errors: an
-    // mr with a typo'd attribute name is unlikely to be an intentional
-    // "undescribed but valid" construct.
-    for a in node.attributes() {
-        if !ALLOWED.contains(&a.name()) {
-            return Err(err(format!("unsupported attribute '{}' on <memory_region>", a.name())));
-        }
-    }
+    // Unknown attributes are a default-deny (L4) finding, same as on <map>
+    // and <protection_domain>: an undescribed-but-structurally-valid
+    // attribute is exactly what L4 exists to catch, not a parse error.
+    check_unknown_attrs(node, ALLOWED, findings);
 
     let name = required_attr(node, "name")?.to_string();
     let prefill_path = node.attribute("prefill_path").map(str::to_string);
@@ -340,14 +368,14 @@ fn parse_mr(node: Node) -> Result<MemoryRegion, SdfError> {
         }
     };
 
-    let page_size = match node.attribute("page_size") {
-        Some(v) => parse_u64(v).map_err(|e| err(e.to_string()))?,
-        None => DEFAULT_PAGE_SIZE,
-    };
-
     let phys_addr = match node.attribute("phys_addr") {
         Some(v) => Some(parse_u64(v).map_err(|e| err(e.to_string()))?),
         None => None,
+    };
+
+    let page_size = match node.attribute("page_size") {
+        Some(v) => parse_u64(v).map_err(|e| err(e.to_string()))?,
+        None => default_page_size(size, phys_addr),
     };
 
     if node.attribute("prefill_bootinfo").is_some() {
@@ -358,21 +386,17 @@ fn parse_mr(node: Node) -> Result<MemoryRegion, SdfError> {
     Ok(MemoryRegion { name, size, page_size, phys_addr, prefill_path })
 }
 
-fn parse_channel(node: Node) -> Result<Channel, SdfError> {
-    if node.attributes().next().is_some() {
-        return Err(err("<channel> takes no attributes"));
-    }
+fn parse_channel(node: Node, findings: &mut Vec<Finding>) -> Result<Channel, SdfError> {
+    // <channel> itself takes no attributes (manual §7.6); any present are
+    // an L4 finding, not a parse error.
+    check_unknown_attrs(node, &[], findings);
     let mut ends = Vec::new();
     for child in node.children().filter(Node::is_element) {
         check_no_duplicate_attrs(child)?;
         if child.tag_name().name() != "end" {
             return Err(err(format!("<channel> may only contain <end>, found <{}>", child.tag_name().name())));
         }
-        for a in child.attributes() {
-            if !["pd", "id", "pp", "notify", "setvar_id"].contains(&a.name()) {
-                return Err(err(format!("unsupported attribute '{}' on <end>", a.name())));
-            }
-        }
+        check_unknown_attrs(child, &["pd", "id", "pp", "notify", "setvar_id"], findings);
         let pd = required_attr(child, "pd")?.to_string();
         let id = parse_u64(required_attr(child, "id")?).map_err(|e| err(e.to_string()))?;
         if id >= 63 {
@@ -380,11 +404,11 @@ fn parse_channel(node: Node) -> Result<Channel, SdfError> {
         }
         let pp = match child.attribute("pp") {
             Some(v) => parse_bool(v).map_err(|e| err(e.to_string()))?,
-            None => false,
+            None => DEFAULT_PP,
         };
         let notify = match child.attribute("notify") {
             Some(v) => parse_bool(v).map_err(|e| err(e.to_string()))?,
-            None => true,
+            None => DEFAULT_NOTIFY,
         };
         ends.push(ChannelEnd { pd, pp, notify });
     }

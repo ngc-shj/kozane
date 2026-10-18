@@ -91,9 +91,9 @@ def check_makefile(text: str, rel: str, out: list):
             out.append(f"P5 {rel}:{n}: .IGNORE")
         if re.match(r"^MAKEFLAGS\b.*(\s|^|=)-[a-zA-Z]*[ik]", line):
             out.append(f"P5 {rel}:{n}: MAKEFLAGS ignores errors")
-        if re.match(r"^\t@?-", line):
+        if re.match(r"^\t[@+]*-", line):
             out.append(f"P5 {rel}:{n}: recipe error-ignore prefix")
-        if re.search(r"\|\|\s*(true|:)\b|;\s*true\b|\bset \+e\b", line):
+        if re.search(r"\|\|\s*(true|:)(\s|;|$)|;\s*true\b|\bset \+e\b", line):
             out.append(f"P5 {rel}:{n}: masked exit status")
 
 

@@ -1,10 +1,10 @@
 # Minimum executed counts per gate (plan C2). `make check` fails if a gate
 # reports zero or fewer than listed. Raise a number when you add tests;
 # never lower it to make a failure go away.
-UNIT-TESTS 110
+UNIT-TESTS 175
 KANI-HARNESSES 13
 CHECK-PINS-RULES 5
-CHECK-PINS-FIXTURES 16
+CHECK-PINS-FIXTURES 20
 LAWS-SYSTEMS 1
 INTEGRATION-CASES 3
 BOLERO-TARGETS 1

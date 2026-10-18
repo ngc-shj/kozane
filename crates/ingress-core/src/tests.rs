@@ -40,6 +40,13 @@ fn run(frame: &[u8]) -> (Outcome, Vec<u8>) {
     (o, out[..n].to_vec())
 }
 
+#[cfg(not(feature = "echo"))]
+#[test]
+fn without_echo_feature_udp_to_echo_port_is_no_service() {
+    assert_eq!(run(&udp_to(CFG.mac, CFG.ipv4, 7, b"nonce-42")).0, Outcome::NoService);
+}
+
+#[cfg(feature = "echo")]
 #[test]
 fn echoes_udp_with_swapped_addresses_and_same_payload() {
     let (o, reply) = run(&udp_to(CFG.mac, CFG.ipv4, 7, b"nonce-42"));
@@ -90,6 +97,42 @@ fn udp_to_other_mac_or_ip_is_not_for_us() {
 #[test]
 fn udp_to_other_port_is_no_service() {
     assert_eq!(run(&udp_to(CFG.mac, CFG.ipv4, 8, b"x")).0, Outcome::NoService);
+}
+
+#[test]
+fn udp_from_echo_port_is_not_answered() {
+    let f = build(&Frame {
+        eth: EthAddrs { src: PEER_MAC, dst: CFG.mac },
+        body: Body::Udp4(Udp4 { src: PEER_IP, dst: CFG.ipv4, sport: 7, dport: 7, payload: b"x" }),
+    });
+    assert_eq!(run(&f).0, Outcome::NoService);
+}
+
+#[test]
+fn udp_claiming_our_own_source_ip_is_spoofed() {
+    let f = build(&Frame {
+        eth: EthAddrs { src: PEER_MAC, dst: CFG.mac },
+        body: Body::Udp4(Udp4 { src: CFG.ipv4, dst: CFG.ipv4, sport: 40000, dport: 7, payload: b"x" }),
+    });
+    assert_eq!(run(&f).0, Outcome::Spoofed);
+}
+
+#[test]
+fn arp_with_sender_mac_differing_from_ethernet_source_is_spoofed() {
+    let f = build(&Frame {
+        eth: EthAddrs { src: PEER_MAC, dst: [0xff; 6] },
+        body: Body::Arp(ArpPacket { op: ArpOp::Request, sha: [0x52, 0x55, 1, 2, 3, 4], spa: PEER_IP, tha: [0; 6], tpa: CFG.ipv4 }),
+    });
+    assert_eq!(run(&f).0, Outcome::Spoofed);
+}
+
+#[test]
+fn arp_claiming_our_own_ip_is_spoofed() {
+    let f = build(&Frame {
+        eth: EthAddrs { src: PEER_MAC, dst: [0xff; 6] },
+        body: Body::Arp(ArpPacket { op: ArpOp::Request, sha: PEER_MAC, spa: CFG.ipv4, tha: [0; 6], tpa: CFG.ipv4 }),
+    });
+    assert_eq!(run(&f).0, Outcome::Spoofed);
 }
 
 #[test]

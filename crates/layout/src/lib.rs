@@ -16,6 +16,8 @@ pub const AUDIT_RING_SLOTS: usize = 128;
 pub const ETH_OUT_DMA_SIZE: usize = 0x200_000;
 /// Offset of the virtio-mmio transport within the `eth_out_mmio` page.
 pub const ETH_OUT_MMIO_OFFSET: usize = 0xe00;
+/// GIC interrupt of QEMU virt virtio-mmio slot 31 (SPI 47).
+pub const ETH_OUT_IRQ: usize = 79;
 
 pub mod eth_out {
     pub const CH_DEVICE: usize = 0;

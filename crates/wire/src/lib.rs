@@ -121,7 +121,8 @@ fn mac_is_valid_src(m: &Mac) -> bool {
 }
 
 fn ipv4_is_valid_src(a: &Ipv4) -> bool {
-    *a != [0; 4] && *a != [255; 4] && (a[0] & 0xf0) != 0xe0
+    // Not unspecified, broadcast, multicast (224/4) or loopback (127/8).
+    *a != [0; 4] && *a != [255; 4] && (a[0] & 0xf0) != 0xe0 && a[0] != 127
 }
 
 fn get<const N: usize>(b: &[u8], at: usize) -> Option<[u8; N]> {

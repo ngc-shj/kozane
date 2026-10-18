@@ -174,7 +174,7 @@ fn ipv4_bad_checksum() {
 
 #[test]
 fn ipv4_bad_src_broadcast_multicast_zero() {
-    for src in [[255u8; 4], [224, 0, 0, 1], [0; 4]] {
+    for src in [[255u8; 4], [224, 0, 0, 1], [0; 4], [127, 0, 0, 1]] {
         let mut b = udp_frame(b"");
         b[ETH_HDR + 12..ETH_HDR + 16].copy_from_slice(&src);
         fix_ip_csum(&mut b);

@@ -7,13 +7,19 @@ role = "key"
 [mrs.device_mr]
 kind = "device"
 owner = "driver"
+phys_addr = 0x9000000
+size = 0x1000
 
 [mrs.secrets_mr]
 kind = "secrets"
 
 [[channels]]
 between = ["driver", "key"]
+pp = { key = true }
 
 [budgets]
 ratio_cap = 0.5
 ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

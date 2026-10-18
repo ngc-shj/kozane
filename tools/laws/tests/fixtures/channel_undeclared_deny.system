@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <protection_domain name="a" priority="1">
+        <program_image path="a.elf" />
+    </protection_domain>
+    <protection_domain name="b" priority="1">
+        <program_image path="b.elf" />
+    </protection_domain>
+    <channel>
+        <end pd="a" id="0" />
+        <end pd="b" id="0" />
+    </channel>
+</system>

@@ -23,7 +23,9 @@ counts := $(BUILD)/counts
 pds := eth-out ingress audit
 host_crates := wire ring audit-event ingress-core layout laws
 kani_crates := wire ring ingress-core
+kani_args_ingress-core := --features echo
 
+.PHONY: clean-counts
 .PHONY: all image run test check check-selftest lint unit kani bolero fuzz-long laws pins manifest kernel-config clean
 all: image
 
@@ -36,6 +38,9 @@ $(counts):
 pds:
 	$(foreach pd,$(pds),$(call build_pd,$(pd));)
 
+# M1 images run the ingress echo test service (C6); M2 drops it.
+features_ingress := echo
+
 define build_pd
 SEL4_INCLUDE_DIRS=$(abspath $(sdk_config_dir)/include) \
 	RUSTFLAGS=-Zunstable-options \
@@ -46,7 +51,7 @@ SEL4_INCLUDE_DIRS=$(abspath $(sdk_config_dir)/include) \
 		--release \
 		--target-dir $(BUILD)/target \
 		--artifact-dir $(BUILD) -Z unstable-options \
-		-p pd-$(1)
+		-p pd-$(1) $(if $(features_$(1)),--features $(features_$(1)))
 endef
 
 # L11: single core, MCS as shipped by Microkit.
@@ -86,11 +91,14 @@ lint: | $(counts)
 unit: | $(counts)
 	cargo test --locked $(foreach c,$(host_crates),-p $(c)) > $(counts)/unit.log 2>&1 \
 		|| { cat $(counts)/unit.log; exit 1; }
+	cargo test --locked -p ingress-core --features echo >> $(counts)/unit.log 2>&1 \
+		|| { cat $(counts)/unit.log; exit 1; }
 	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-TESTS", n }' $(counts)/unit.log > $(counts)/unit
 
 kani: | $(counts)
 	rm -f $(counts)/kani.log
-	$(foreach c,$(kani_crates),tools/kani-gate.sh -p $(c) >> $(counts)/kani.log;)
+	$(foreach c,$(kani_crates),tools/kani-gate.sh -p $(c) $(kani_args_$(c)) >> $(counts)/kani.log \
+		|| { cat $(counts)/kani.log; exit 1; };)
 	awk '/^KANI-HARNESSES/ { n += $$2 } END { print "KANI-HARNESSES", n }' $(counts)/kani.log > $(counts)/kani
 
 bolero_target := -p wire tests::fuzz_parse_never_panics_and_round_trips
@@ -101,6 +109,9 @@ bolero: | $(counts)
 	cargo bolero test $(bolero_target) -T 30s > $(counts)/bolero.log 2>&1 \
 		|| { awk '{ l[NR] = $$0 } /panicked|deadly signal/ && !p { for (i = (NR > 60 ? NR - 60 : 1); i <= NR; i++) print l[i]; p = 1 }' \
 			$(counts)/bolero.log; tail -20 $(counts)/bolero.log; exit 1; }
+	# The committed seed corpus must have been loaded, and the target must have run.
+	grep -qE 'INFO: +[1-9][0-9]* files found in .*/corpus' $(counts)/bolero.log \
+		|| { echo "bolero: seed corpus not loaded"; exit 1; }
 	awk '/^Done [0-9]+ runs/ && $$2 > 0 { n++ } END { print "BOLERO-TARGETS", n + 0 }' $(counts)/bolero.log > $(counts)/bolero
 
 fuzz-long:
@@ -124,7 +135,15 @@ test: image | $(counts)
 manifest:
 	tools/check-manifest tests/manifest.txt $(counts)
 
-check: pins lint unit kani bolero laws test
+# Count files from earlier runs are removed first, so a gate that does not
+# run this time is reported missing instead of passing on a stale count.
+clean-counts:
+	mkdir -p $(counts)
+	find $(counts) -maxdepth 1 -type f ! -name '*.log' -delete
+
+check:
+	$(MAKE) clean-counts
+	$(MAKE) pins lint unit kani bolero laws test
 	$(MAKE) manifest
 
 # Requires a prior `make check` (the manifest case reuses build/counts).

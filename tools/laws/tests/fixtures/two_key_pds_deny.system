@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <protection_domain name="key1" priority="1" passive="true">
+        <program_image path="key1.elf" />
+    </protection_domain>
+    <protection_domain name="key2" priority="1" passive="true">
+        <program_image path="key2.elf" />
+    </protection_domain>
+</system>

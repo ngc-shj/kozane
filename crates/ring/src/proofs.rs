@@ -113,14 +113,24 @@ fn producer_n256() {
 /// buffer index whose byte range lies inside the region.
 #[kani::proof]
 fn pool_accept_stays_in_region() {
-    let mut pool: Pool<4, 2048> = Pool::new(kani::any());
+    let mut pool: Pool<4, 2048> = Pool::new(false);
+    // Arbitrary ownership per buffer, not one shared state.
+    pool.mine = kani::any();
+    let before = pool.mine;
     let d = Desc { offset: kani::any(), len: kani::any() };
-    if let Ok(idx) = pool.accept(d) {
-        let start = (idx as u64) * 2048;
+    let r = pool.accept(d);
+    let in_range = d.offset % 2048 == 0 && (d.offset / 2048) < 4 && d.len <= 2048;
+    let idx = (d.offset / 2048) as usize;
+    // Accepted exactly when well-formed and currently with the peer.
+    assert!(r.is_ok() == (in_range && !before[idx.min(3)]));
+    if let Ok(i) = r {
+        let start = (i as u64) * 2048;
         assert!(start + u64::from(d.len) <= Pool::<4, 2048>::region_len() as u64);
         assert!(u64::from(d.offset) == start);
-        kani::cover!(true);
+        assert!(pool.mine[i]);
     }
+    kani::cover!(r.is_ok());
+    kani::cover!(r == Err(DescError::NotWithPeer));
 }
 
 mod link_proofs {
@@ -150,6 +160,8 @@ mod link_proofs {
         if let Ok(Some(n)) = r {
             assert!(n <= BUF);
         }
+        // Read-once also holds through the link layer.
+        assert!(used.index_loads.get() <= 1 && free.index_loads.get() <= 1);
         kani::cover!(matches!(r, Ok(Some(_))));
         kani::cover!(matches!(r, Err(LinkError::BadDesc(_))));
         kani::cover!(matches!(r, Err(LinkError::Corrupt)));
@@ -172,6 +184,7 @@ mod link_proofs {
         if r == Ok(true) {
             assert!(len <= BUF);
         }
+        assert!(used.index_loads.get() <= 1 && free.index_loads.get() == 0);
         kani::cover!(r == Ok(true));
         kani::cover!(matches!(r, Err(LinkError::BadDesc(_))));
     }

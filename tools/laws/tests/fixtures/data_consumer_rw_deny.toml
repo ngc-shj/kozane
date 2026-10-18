@@ -1,0 +1,17 @@
+[pds.prod]
+role = "service"
+
+[pds.cons]
+role = "service"
+
+[mrs.data_mr]
+kind = "data"
+producer = "prod"
+consumers = ["cons"]
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

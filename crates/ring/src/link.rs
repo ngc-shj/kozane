@@ -34,6 +34,8 @@ pub struct Sender<U, F, const N: usize, const M: usize, const BUF: usize> {
     free: Consumer<F, Desc, N>,
     pool: Pool<M, BUF>,
     region: Region,
+    /// Set once any ring operation fails; the link is never used again.
+    dead: bool,
 }
 
 impl<U, F, const N: usize, const M: usize, const BUF: usize> Sender<U, F, N, M, BUF>
@@ -45,13 +47,16 @@ where
 
     pub fn new(used: U, free: F, region: Region) -> Self {
         let () = Self::RING_HOLDS_ALL_BUFFERS;
-        Self { used: Producer::new(used), free: Consumer::new(free), pool: Pool::new(true), region }
+        Self { used: Producer::new(used), free: Consumer::new(free), pool: Pool::new(true), region, dead: false }
     }
 
     /// Takes back buffers the receiver has returned. Stops at the first bad
     /// descriptor and reports it.
     pub fn reclaim(&mut self) -> Result<(), LinkError> {
-        while let Some(d) = self.free.pop()? {
+        if self.dead {
+            return Err(LinkError::Corrupt);
+        }
+        while let Some(d) = self.free.pop().inspect_err(|_| self.dead = true)? {
             self.pool.accept(d).map_err(LinkError::BadDesc)?;
         }
         Ok(())
@@ -65,7 +70,7 @@ where
         scratch: &mut [u8; BUF],
         fill: impl FnOnce(&mut [u8; BUF]) -> Option<usize>,
     ) -> Result<bool, LinkError> {
-        if self.used.is_corrupt() || self.free.is_corrupt() {
+        if self.dead {
             return Err(LinkError::Corrupt);
         }
         let idx = self.pool.first_mine().ok_or(LinkError::NoBuffer)?;
@@ -77,7 +82,9 @@ where
             .write_from(buf_offset::<BUF>(idx), data)
             .map_err(|_| LinkError::BadDesc(DescError::OutOfRange))?;
         let d = self.pool.give(idx, len).ok_or(LinkError::NoBuffer)?;
-        self.used.push(d)?;
+        // A full ring here means the peer broke the protocol (N >= M); the
+        // buffer just given away is lost, so the link must not be reused.
+        self.used.push(d).inspect_err(|_| self.dead = true)?;
         Ok(true)
     }
 }
@@ -87,6 +94,8 @@ pub struct Receiver<U, F, const N: usize, const M: usize, const BUF: usize> {
     free: Producer<F, Desc, N>,
     pool: Pool<M, BUF>,
     region: Region,
+    /// Set once any ring operation fails; the link is never used again.
+    dead: bool,
 }
 
 impl<U, F, const N: usize, const M: usize, const BUF: usize> Receiver<U, F, N, M, BUF>
@@ -98,13 +107,16 @@ where
 
     pub fn new(used: U, free: F, region: Region) -> Self {
         let () = Self::RING_HOLDS_ALL_BUFFERS;
-        Self { used: Consumer::new(used), free: Producer::new(free), pool: Pool::new(false), region }
+        Self { used: Consumer::new(used), free: Producer::new(free), pool: Pool::new(false), region, dead: false }
     }
 
     /// Copies the next payload into `out` and returns the buffer to the
     /// sender before returning its length. `Ok(None)` when nothing is queued.
     pub fn recv_into(&mut self, out: &mut [u8; BUF]) -> Result<Option<usize>, LinkError> {
-        let Some(d) = self.used.pop()? else {
+        if self.dead {
+            return Err(LinkError::Corrupt);
+        }
+        let Some(d) = self.used.pop().inspect_err(|_| self.dead = true)? else {
             return Ok(None);
         };
         let idx = self.pool.accept(d).map_err(LinkError::BadDesc)?;
@@ -113,7 +125,7 @@ where
         let dst = out.get_mut(..len).ok_or(LinkError::BadDesc(DescError::TooLong))?;
         let copied = self.region.read_into(buf_offset::<BUF>(idx), dst);
         let back = self.pool.give(idx, 0).ok_or(LinkError::NoBuffer)?;
-        self.free.push(back)?;
+        self.free.push(back).inspect_err(|_| self.dead = true)?;
         copied.map_err(|_| LinkError::BadDesc(DescError::OutOfRange))?;
         Ok(Some(len))
     }

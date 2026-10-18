@@ -41,7 +41,13 @@ KANI_HARNESS = (
     "    let x: u8 = kani::any();\n    kani::cover!(x > 1 && x < 1);\n}\n"
 )
 
+# Every gate in `make check` must have a case; removing one fails the selftest.
+EXPECTED_LAYERS = {"unit", "kani", "kani-cache", "bolero", "lint", "laws", "pins", "integration",
+                   "manifest", "stale-counts"}
+
 # layer -> (make targets, injection, text that must appear in the output)
+# A case passes when make FAILS and prints the needle, unless listed in
+# EXPECT_SUCCESS, where make must SUCCEED, print the needle and not ABSENT.
 CASES = {
     "unit": (["unit"], lambda t: append(t, "crates/wire/src/tests.rs", UNIT_TEST), "selftest_injected_failure"),
     # Only ring: the injection invalidates every proof cache entry, and
@@ -52,6 +58,13 @@ CASES = {
                                           "for_each(|bytes: &[u8]| if bytes.len() >= 20 { std::eprintln!(\"selftest-bolero-injected\"); panic!() })"),
                # bolero hides the panic message, so the injection prints its own.
                "selftest-bolero-injected"),
+    # Editing a path dependency (wire) must re-prove ingress-core rather than
+    # serve the cached pass copied in from the real tree.
+    "kani-cache": (["kani", "kani_crates=ingress-core"],
+                   lambda t: append(t, "crates/wire/src/lib.rs", "\n// selftest: cache key input\n"),
+                   "Checking harness"),
+    # A count file that is not regenerated must be reported missing.
+    "stale-counts": (["clean-counts", "manifest"], lambda t: None, "missing (gate did not run)"),
     "lint": (["lint"], lambda t: append(t, "crates/wire/src/lib.rs",
                                         "\npub fn selftest_lint(b: &[u8]) -> u8 {\n    b[0]\n}\n"), "indexing"),
     "laws": (["laws"], lambda t: edit(t, "system/secureos.system", "</system>", "    <selftest_unknown />\n</system>"), "L4"),
@@ -76,6 +89,10 @@ def copy_repo(dst: pathlib.Path):
             shutil.copy2(item, dst / item.name)
 
 
+EXPECT_SUCCESS = {"kani-cache"}
+ABSENT = {"kani-cache": "cached pass"}
+
+
 def run_case(name: str) -> bool:
     targets, inject, needle = CASES[name]
     with tempfile.TemporaryDirectory(prefix=f"selftest-{name}-") as d:
@@ -85,10 +102,20 @@ def run_case(name: str) -> bool:
         # layer under test, so only the injected layer can fail.
         if "manifest" in targets:
             shutil.copytree(ROOT / "build/counts", tree / "build/counts")
+        # Start from the real proof cache, so an injection is detected only
+        # if it changes the cache key.
+        if "kani" in targets and (ROOT / "build/kani-cache").is_dir():
+            shutil.copytree(ROOT / "build/kani-cache", tree / "build/kani-cache")
         inject(tree)
         out = subprocess.run(["make", "-C", str(tree), *targets], capture_output=True, text=True)
         text = out.stdout + out.stderr
-    ok = out.returncode != 0 and needle in text
+        # Gates write their tool output to build/counts/*.log.
+        for log in sorted((tree / "build/counts").glob("*.log")):
+            text += log.read_text(errors="replace")
+    if name in EXPECT_SUCCESS:
+        ok = out.returncode == 0 and needle in text and ABSENT[name] not in text
+    else:
+        ok = out.returncode != 0 and needle in text
     print(f"{'ok  ' if ok else 'FAIL'} {name}: exit={out.returncode} needle={needle!r} found={needle in text}")
     if not ok:
         print(text[-3000:])
@@ -96,6 +123,9 @@ def run_case(name: str) -> bool:
 
 
 def main() -> int:
+    if set(CASES) != EXPECTED_LAYERS:
+        print(f"selftest: layers {sorted(set(CASES) ^ EXPECTED_LAYERS)} missing or unexpected")
+        return 1
     names = sys.argv[1:] or list(CASES)
     results = [run_case(n) for n in names]
     print(f"SELFTEST-LAYERS {sum(results)}")

@@ -1,0 +1,15 @@
+[pds.driver]
+role = "driver"
+
+[mrs.device_mr]
+kind = "device"
+owner = "driver"
+phys_addr = 0x4000_1000
+size = 0x1000
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

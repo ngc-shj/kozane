@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <memory_region name="data_mr" size="0x1000" />
+    <protection_domain name="prod" priority="1" budget="1_000" period="10_000">
+        <program_image path="prod.elf" />
+        <map mr="data_mr" vaddr="0x1_000_000" perms="rw" />
+    </protection_domain>
+    <protection_domain name="cons" priority="1" budget="1_000" period="10_000">
+        <program_image path="cons.elf" />
+        <map mr="data_mr" vaddr="0x1_000_000" perms="r" />
+    </protection_domain>
+</system>

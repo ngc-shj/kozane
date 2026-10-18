@@ -258,6 +258,24 @@ mod link_tests {
     }
 
     #[test]
+    fn link_is_dead_after_peer_stalls_its_read_index() {
+        // A receiver that returns buffers but never advances its read index
+        // makes the used ring look full; the sender must stop for good
+        // instead of leaking a buffer per call.
+        let (mut tx, _rx, s) = link();
+        let mut stall: Producer<ShmRing<Desc, N>, Desc, N> =
+            Producer::new(unsafe { ShmRing::producer(s.free) });
+        for i in 0..M {
+            send(&mut tx, b"x").unwrap();
+            stall.push(Desc { offset: (i * BUF) as u32, len: 0 }).unwrap();
+        }
+        tx.reclaim().unwrap();
+        assert_eq!(send(&mut tx, b"x"), Err(LinkError::Corrupt));
+        assert_eq!(send(&mut tx, b"x"), Err(LinkError::Corrupt));
+        assert_eq!(tx.reclaim(), Err(LinkError::Corrupt));
+    }
+
+    #[test]
     fn sender_rejects_forged_return() {
         let (mut tx, _rx, s) = link();
         let mut forger: Producer<ShmRing<Desc, N>, Desc, N> =

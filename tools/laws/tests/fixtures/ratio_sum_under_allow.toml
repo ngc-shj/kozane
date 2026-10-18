@@ -7,11 +7,18 @@ role = "driver"
 [mrs.device_mr_a]
 kind = "device"
 owner = "driver_a"
+phys_addr = 0x9000000
+size = 0x1000
 
 [mrs.device_mr_b]
 kind = "device"
 owner = "driver_b"
+phys_addr = 0x9002000
+size = 0x1000
 
 [budgets]
 ratio_cap = 0.5
 ratio_sum_cap = 0.85
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

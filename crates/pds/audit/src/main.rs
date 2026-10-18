@@ -7,7 +7,7 @@
 
 use core::ptr::NonNull;
 
-use audit_event::{Event, FRAME_DROPPED_BASE, Record, UnknownCodes};
+use audit_event::{Decoded, Record, UnknownCodes, decode};
 use layout::{AUDIT_RING_SLOTS, audit as ch};
 use ring::shmem::ShmRing;
 use ring::{Consumer, RingError};
@@ -61,18 +61,27 @@ fn init() -> Audit {
     }
 }
 
-fn drop_reason(code: u16) -> Option<DropReason> {
-    let r = code.checked_sub(FRAME_DROPPED_BASE)?;
+fn drop_reason(r: u16) -> Option<DropReason> {
     DropReason::ALL.iter().copied().find(|d| *d as u16 == r)
 }
 
 impl Audit {
     fn print(&mut self, src: &'static str, r: Record) {
-        if let Some(ev) = Event::from_fixed_code(r.code) {
-            debug_println!("audit: src={} {} total={} lost={}", src, ev.name(), r.a, r.b);
-        } else if let Some(d) = drop_reason(r.code) {
-            debug_println!("audit: src={} FrameDropped({:?}) total={} lost={}", src, d, r.a, r.b);
-        } else if let Some(total) = self.unknown.record() {
+        let named = match decode(r.code) {
+            Decoded::Fixed(ev) => {
+                debug_println!("audit: src={} {} total={} lost={}", src, ev.name(), r.a, r.b);
+                true
+            }
+            Decoded::FrameDropped(reason) => match drop_reason(reason) {
+                Some(d) => {
+                    debug_println!("audit: src={} FrameDropped({:?}) total={} lost={}", src, d, r.a, r.b);
+                    true
+                }
+                None => false,
+            },
+            Decoded::Unknown => false,
+        };
+        if !named && let Some(total) = self.unknown.record() {
             debug_println!("audit: src={} unknown code={:#06x} unknown_total={}", src, r.code, total);
         }
     }

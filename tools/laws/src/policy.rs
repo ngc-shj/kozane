@@ -11,6 +11,8 @@ use std::fmt;
 
 use serde::Deserialize;
 
+use crate::sdf::{DEFAULT_NOTIFY, DEFAULT_PP};
+
 #[derive(Debug)]
 pub struct PolicyError(String);
 
@@ -80,8 +82,11 @@ impl SharePerms {
 
 #[derive(Debug, Clone)]
 pub enum MrPolicy {
-    /// MMIO owned by exactly one driver, page-granular (L5).
-    Device { owner: String },
+    /// MMIO owned by exactly one driver, page-granular (L5). `phys_addr`
+    /// and `size` pin the physical range the `.system` must match exactly
+    /// (finding 3) and are what the board-RAM overlap check (finding 2)
+    /// uses.
+    Device { owner: String, phys_addr: u64, size: u64 },
     /// DMA buffer owned by exactly one driver, never shared (L5).
     Dma { owner: String },
     /// The one MR holding static secrets, mapped only into `key` (L2).
@@ -92,14 +97,43 @@ pub enum MrPolicy {
     Plain { shares: BTreeMap<String, SharePerms> },
 }
 
+/// Per-pd policy: its role plus, for `driver`-role pds, the hardware IRQ
+/// numbers it is allowed to claim (L4/L5).
+#[derive(Debug, Clone)]
+pub struct PdPolicy {
+    pub role: Role,
+    pub irqs: BTreeSet<u64>,
+}
+
+/// Per-end `pp`/`notify` the `.system` must match exactly (L4). A pd name
+/// absent from either map falls back to the Microkit default for that
+/// attribute, same as an absent attribute in the `.system` itself.
+#[derive(Debug, Clone, Default)]
+pub struct ChannelPolicy {
+    pp: BTreeMap<String, bool>,
+    notify: BTreeMap<String, bool>,
+}
+
+impl ChannelPolicy {
+    pub fn expected_pp(&self, pd: &str) -> bool {
+        self.pp.get(pd).copied().unwrap_or(DEFAULT_PP)
+    }
+
+    pub fn expected_notify(&self, pd: &str) -> bool {
+        self.notify.get(pd).copied().unwrap_or(DEFAULT_NOTIFY)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Policy {
-    pub pds: BTreeMap<String, Role>,
+    pds: BTreeMap<String, PdPolicy>,
     pub mrs: BTreeMap<String, MrPolicy>,
-    pub channels: BTreeSet<(String, String)>,
+    pub channels: BTreeMap<(String, String), ChannelPolicy>,
     pub priority_below: Vec<(Role, Role)>,
     pub ratio_cap: f64,
     pub ratio_sum_cap: f64,
+    /// Board RAM ranges (half-open `[start, end)`), from `[board] ram`.
+    pub ram: Vec<(u64, u64)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -113,18 +147,21 @@ struct RawPolicy {
     #[serde(default)]
     priority: RawPriority,
     budgets: RawBudgets,
+    board: RawBoard,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawPd {
     role: String,
+    #[serde(default)]
+    irqs: Vec<u64>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RawMr {
-    Device { owner: String },
+    Device { owner: String, phys_addr: u64, size: u64 },
     Dma { owner: String },
     Secrets,
     Data { producer: String, consumers: Vec<String> },
@@ -135,6 +172,10 @@ enum RawMr {
 #[serde(deny_unknown_fields)]
 struct RawChannel {
     between: Vec<String>,
+    #[serde(default)]
+    pp: BTreeMap<String, bool>,
+    #[serde(default)]
+    notify: BTreeMap<String, bool>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -151,6 +192,19 @@ struct RawBudgets {
     ratio_sum_cap: f64,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawBoard {
+    ram: Vec<RawRamRegion>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRamRegion {
+    start: u64,
+    size: u64,
+}
+
 impl Policy {
     pub fn load(text: &str) -> Result<Policy, PolicyError> {
         let raw: RawPolicy = toml::from_str(text).map_err(|e| err(e.to_string()))?;
@@ -161,21 +215,30 @@ impl Policy {
         let mut pds = BTreeMap::new();
         for (name, pd) in raw.pds {
             let role = Role::parse(&pd.role)?;
-            if pds.insert(name.clone(), role).is_some() {
+            let mut irqs = BTreeSet::new();
+            for n in pd.irqs {
+                if !irqs.insert(n) {
+                    return Err(err(format!("duplicate irq {n} declared for pd '{name}'")));
+                }
+            }
+            if !irqs.is_empty() && role != Role::Driver {
+                return Err(err(format!("pd '{name}' declares irqs but its role is not 'driver'")));
+            }
+            if pds.insert(name.clone(), PdPolicy { role, irqs }).is_some() {
                 return Err(err(format!("duplicate pd '{name}' in policy")));
             }
         }
 
-        let require_pd = |pds: &BTreeMap<String, Role>, name: &str| -> Result<(), PolicyError> {
+        let require_pd = |pds: &BTreeMap<String, PdPolicy>, name: &str| -> Result<(), PolicyError> {
             if pds.contains_key(name) {
                 Ok(())
             } else {
                 Err(err(format!("policy references undeclared pd '{name}'")))
             }
         };
-        let require_role = |pds: &BTreeMap<String, Role>, name: &str, want: Role| -> Result<(), PolicyError> {
+        let require_role = |pds: &BTreeMap<String, PdPolicy>, name: &str, want: Role| -> Result<(), PolicyError> {
             require_pd(pds, name)?;
-            if pds.get(name) == Some(&want) {
+            if pds.get(name).map(|p| p.role) == Some(want) {
                 Ok(())
             } else {
                 Err(err(format!("pd '{name}' must have role matching its mr ownership")))
@@ -186,9 +249,15 @@ impl Policy {
         let mut secrets_count = 0usize;
         for (name, mr) in raw.mrs {
             let policy_mr = match mr {
-                RawMr::Device { owner } => {
+                RawMr::Device { owner, phys_addr, size } => {
                     require_role(&pds, &owner, Role::Driver)?;
-                    MrPolicy::Device { owner }
+                    if size == 0 {
+                        return Err(err(format!("device mr '{name}' must have a nonzero size")));
+                    }
+                    if phys_addr.checked_add(size).is_none() {
+                        return Err(err(format!("device mr '{name}' phys_addr + size overflows a 64-bit address")));
+                    }
+                    MrPolicy::Device { owner, phys_addr, size }
                 }
                 RawMr::Dma { owner } => {
                     require_role(&pds, &owner, Role::Driver)?;
@@ -231,7 +300,7 @@ impl Policy {
             return Err(err("at most one mr may have kind = \"secrets\" (L2: one MR for static secrets)"));
         }
 
-        let mut channels = BTreeSet::new();
+        let mut channels = BTreeMap::new();
         for c in raw.channels {
             let [a, b]: [String; 2] = c
                 .between
@@ -242,8 +311,17 @@ impl Policy {
             if a == b {
                 return Err(err(format!("channel 'between' names the same pd twice ('{a}')")));
             }
-            let pair = if a < b { (a, b) } else { (b, a) };
-            channels.insert(pair);
+            for pd_name in c.pp.keys().chain(c.notify.keys()) {
+                if pd_name != &a && pd_name != &b {
+                    return Err(err(format!(
+                        "channel between '{a}' and '{b}' has a pp/notify override for '{pd_name}', which is neither end"
+                    )));
+                }
+            }
+            let pair = if a < b { (a.clone(), b.clone()) } else { (b.clone(), a.clone()) };
+            if channels.insert(pair, ChannelPolicy { pp: c.pp, notify: c.notify }).is_some() {
+                return Err(err(format!("duplicate channel between '{a}' and '{b}' in policy")));
+            }
         }
 
         let mut priority_below = Vec::new();
@@ -253,11 +331,23 @@ impl Policy {
             priority_below.push((Role::parse(&lo)?, Role::parse(&hi)?));
         }
 
-        if raw.budgets.ratio_cap <= 0.0 || raw.budgets.ratio_cap > 1.0 {
+        // `!(x > 0.0 && x <= 1.0)` rather than `x <= 0.0 || x > 1.0`: the
+        // latter lets NaN through (every comparison against NaN is false),
+        // silently disabling both ratio caps.
+        if !(raw.budgets.ratio_cap > 0.0 && raw.budgets.ratio_cap <= 1.0) {
             return Err(err("budgets.ratio_cap must be in (0, 1]"));
         }
-        if raw.budgets.ratio_sum_cap <= 0.0 || raw.budgets.ratio_sum_cap > 1.0 {
+        if !(raw.budgets.ratio_sum_cap > 0.0 && raw.budgets.ratio_sum_cap <= 1.0) {
             return Err(err("budgets.ratio_sum_cap must be in (0, 1]"));
+        }
+
+        let mut ram = Vec::new();
+        for r in raw.board.ram {
+            if r.size == 0 {
+                return Err(err("board.ram region must have a nonzero size"));
+            }
+            let end = r.start.checked_add(r.size).ok_or_else(|| err("board.ram region start + size overflows a 64-bit address"))?;
+            ram.push((r.start, end));
         }
 
         Ok(Policy {
@@ -267,11 +357,24 @@ impl Policy {
             priority_below,
             ratio_cap: raw.budgets.ratio_cap,
             ratio_sum_cap: raw.budgets.ratio_sum_cap,
+            ram,
         })
     }
 
     pub fn role(&self, pd: &str) -> Option<Role> {
-        self.pds.get(pd).copied()
+        self.pds.get(pd).map(|p| p.role)
+    }
+
+    /// The driver irqs declared for `pd`, or `None` if `pd` is undeclared.
+    pub fn irqs(&self, pd: &str) -> Option<&BTreeSet<u64>> {
+        self.pds.get(pd).map(|p| &p.irqs)
+    }
+
+    /// The declared policy for the channel between `a` and `b` (order
+    /// doesn't matter), if any.
+    pub fn channel(&self, a: &str, b: &str) -> Option<&ChannelPolicy> {
+        let pair = if a < b { (a.to_string(), b.to_string()) } else { (b.to_string(), a.to_string()) };
+        self.channels.get(&pair)
     }
 }
 
@@ -281,36 +384,48 @@ mod tests {
 
     use super::*;
 
+    const BOARD: &str = r#"
+        [board]
+        ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]
+    "#;
+
     #[test]
     fn minimal_policy_loads() {
-        let text = r#"
+        let text = format!(
+            r#"
             [pds.hello]
             role = "service"
 
             [budgets]
             ratio_cap = 0.2
             ratio_sum_cap = 0.5
-        "#;
-        let p = Policy::load(text).unwrap();
+            {BOARD}
+        "#
+        );
+        let p = Policy::load(&text).unwrap();
         assert_eq!(p.role("hello"), Some(Role::Service));
     }
 
     #[test]
     fn unknown_role_is_rejected() {
-        let text = r#"
+        let text = format!(
+            r#"
             [pds.hello]
             role = "bogus"
 
             [budgets]
             ratio_cap = 0.2
             ratio_sum_cap = 0.5
-        "#;
-        assert!(Policy::load(text).is_err());
+            {BOARD}
+        "#
+        );
+        assert!(Policy::load(&text).is_err());
     }
 
     #[test]
     fn duplicate_secrets_mr_is_rejected() {
-        let text = r#"
+        let text = format!(
+            r#"
             [pds.key]
             role = "key"
 
@@ -323,7 +438,71 @@ mod tests {
             [budgets]
             ratio_cap = 0.2
             ratio_sum_cap = 0.5
+            {BOARD}
+        "#
+        );
+        assert!(Policy::load(&text).is_err());
+    }
+
+    #[test]
+    fn missing_board_is_rejected() {
+        let text = r#"
+            [pds.hello]
+            role = "service"
+
+            [budgets]
+            ratio_cap = 0.2
+            ratio_sum_cap = 0.5
         "#;
         assert!(Policy::load(text).is_err());
+    }
+
+    #[test]
+    fn nan_ratio_cap_is_rejected() {
+        let text = format!(
+            r#"
+            [pds.hello]
+            role = "service"
+
+            [budgets]
+            ratio_cap = nan
+            ratio_sum_cap = 0.5
+            {BOARD}
+        "#
+        );
+        assert!(Policy::load(&text).is_err());
+    }
+
+    #[test]
+    fn ratio_cap_of_exactly_one_is_accepted() {
+        let text = format!(
+            r#"
+            [pds.hello]
+            role = "service"
+
+            [budgets]
+            ratio_cap = 1.0
+            ratio_sum_cap = 1.0
+            {BOARD}
+        "#
+        );
+        assert!(Policy::load(&text).is_ok());
+    }
+
+    #[test]
+    fn irqs_on_a_non_driver_pd_are_rejected() {
+        let text = format!(
+            r#"
+            [pds.hello]
+            role = "service"
+            irqs = [1]
+
+            [budgets]
+            ratio_cap = 0.2
+            ratio_sum_cap = 0.5
+            {BOARD}
+        "#
+        );
+        assert!(Policy::load(&text).is_err());
     }
 }

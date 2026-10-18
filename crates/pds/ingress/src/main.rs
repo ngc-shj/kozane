@@ -137,6 +137,7 @@ impl Ingress {
                 Outcome::Dropped(reason) => self.audit(Event::FrameDropped { reason: reason as u16 }),
                 Outcome::NotForUs => self.audit(Event::NotForUs),
                 Outcome::NoService => self.audit(Event::NoService),
+                Outcome::Spoofed => self.audit(Event::Spoofed),
             }
         }
         (sent, returned)
