@@ -60,3 +60,22 @@ fn encode_reports_a_small_buffer() {
     let msg = [0u8; INITIATION_LEN];
     assert_eq!(Initiation { src: EP, msg: &msg }.encode(&mut [0u8; 100]), None);
 }
+
+/// Byte layout of `Install`, fixed. tests/integration/run.py reads this
+/// constant to check its own packing (the residue scan's needle) against
+/// the Rust encoder, so a field-order change cannot make that scan vacuous.
+pub const INSTALL_GOLDEN_HEX: &str = "0201060504030a09080711111111111111111111111111111111111111111111111111111111111111112222222222222222222222222222222222222222222222222222222222222222";
+
+#[test]
+fn install_encoding_matches_the_golden_vector() {
+    let (send, recv) = ([0x11u8; 32], [0x22u8; 32]);
+    let m = Install { peer: 0x0102, local_index: 0x0304_0506, remote_index: 0x0708_090a, send: &send, recv: &recv };
+    let mut out = [0u8; INSTALL_LEN];
+    assert_eq!(m.encode(&mut out), Some(INSTALL_LEN));
+    let golden = INSTALL_GOLDEN_HEX.as_bytes();
+    assert_eq!(golden.len(), 2 * INSTALL_LEN);
+    for (i, b) in out.iter().enumerate() {
+        let pair = core::str::from_utf8(&golden[2 * i..2 * i + 2]).unwrap();
+        assert_eq!(*b, u8::from_str_radix(pair, 16).unwrap(), "byte {i}");
+    }
+}

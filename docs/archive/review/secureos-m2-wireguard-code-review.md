@@ -129,3 +129,44 @@ Testing: R29 (M7, M8); R49 (M1, M2); RT6 (M5); RT7 (M2, M3); RT10 (M4, M7); RT11
 - R2-S4: `cpu::checked_frequency` refuses 0; `data` and `hs` halt at init without a clock (host test 0 / 62.5 MHz).
 - R2-S5: required `inside_prefix`; inside_ip and every neighbor must lie in it, outside_ip must not, and no allowed IP may overlap it (unit tests and a build-failure fixture).
 - F-R2-2: `run` depends on `image` when the default LOADER is used. F-R2-3 / M7: the TTL case requires an echo reply to seq 2 and none to seq 1; `to_lan` TTL-2 unit test; PASS lines in order. M5: LINT-CRATES 17. M6: Wire records its held port; hostfwd chosen after it. M9: each bolero target requires committed `seed-*` files. M10: the compared list is built from the exhaustive match and its length asserted.
+
+# Round 3
+Date: 2026-10-19 — incremental review of `e234ed7..4e72286`. No Critical findings; R43: no widening.
+
+## Findings
+| ID | Sev | Finding |
+|---|---|---|
+| R3-S1 / T6 | Major | Positive control satisfiable by hs/data stack residue; coverage of `hd` itself unproven |
+| T1 | Major | Bolero seed check (git) broke check-selftest: its copies have no .git |
+| T2 / R3-S2 | Major | inside_ip test passed on a neighbor error (substring collision); outside_ip branch untested |
+| T3 / R3-S3 / F-R3-A2 | Major | Package main() fixtures ignored exit status; new branches (OUT appeared, staging re-check, loud removal, signals) deletable green |
+| T4 / F-R3-3 | Major | BlobError list tie still skippable by an arm-only addition (red-proved) |
+| T5 | Major | Residue needle tied to msgs::Install by length only |
+| R3-S4 / F-R3-1 / F-R3-2 | Minor | Second signal interrupted teardown; netns harness had no PDEATHSIG |
+| R3-S5 | Minor | RAM dump kept until teardown; temp-dir removal errors swallowed |
+| F-R3-4 | Minor | wireguard-go route hard-coded instead of inside_prefix |
+| F-R3-5 | Minor | inside_prefix parse errors labelled "allowed IP" |
+| F-R3-A1 | Minor | Package comment claimed a single parent resolution |
+| T7 | Minor | inside_prefix overlap boundaries unpinned |
+| T8 | Minor | Manifest minimums lagged the counts |
+| T9 | Minor | run_main left signal handlers installed |
+| T10 | Minor | Seed check misattributed git failures; per crate, not per target |
+| T11 | Minor | SIGTERM forwarding had no recorded proof |
+
+## Recurring Issue Check (Round 3)
+Functionality: R2 (F-R3-4), R3 (F-R3-1/2), R12 (F-R3-3), R29/R49 (F-R3-3 comment, package comment) violated; R4, R16, R38, R40, R41, R43, R44, R48, R50, R52 checked.
+Security: R43 none; RS1 (R3-S5); RS2 accepted residual undermined the control (R3-S1); RS3 (R3-S2); RS4 accepted windows only; RS5 resolved; RS6 N/A.
+Testing: regression (T1); RT1 (T2, T4); RT3 (T3); RT5 (T9); RT6 (T8); RT7 (T2, T3, T7); RT8 (T7); RT9 (T4); RT10 partial (T3); RT11 partial (T6, T10).
+
+## Resolution Status (Round 3)
+- R3-S1 / T6: comments and docs restated to what the control proves (PD memory, not `hd`); check-selftest case `integration-residue` removes the reclaim and requires `make test` to fail with "install message still in guest RAM", so the scan's power to catch `hd` residue is re-proven mechanically. (Pinning `hd_data`'s physical address was rejected: C7 allows `phys_addr` only on device regions.)
+- T5: golden vector `INSTALL_GOLDEN_HEX` in crates/msgs/src/tests.rs pins the encoder; run.py checks its packing against it before scanning.
+- T1 / T10: check-selftest runs make with `GIT_DIR` of the real repository; the seed check is per target directory and reports a git failure as such. Deny side checked with an empty index ("no committed seed-*").
+- T2 / R3-S2: inside_ip moved alone with the exact message asserted; outside_ip deny and adjacent allow tests. T7: /32 at both ends of the inside network refused, a neighboring /32 accepted. F-R3-5: inside_prefix errors carry their own label.
+- T3 / R3-S3 / F-R3-A2 / T9: fixtures assert exit status and that the build ran; new fixtures for OUT appearing during the build, SIGTERM during the build, staging resolving into a forbidden root, and a failed staging removal; handlers, umask, argv and `build` restored. Red-proved: removing the staging re-check, the OUT-appeared refusal, the loud removal, or the signal handler each fails its fixture.
+- T4 / F-R3-3: successor-walk over BlobError plus `variant_count` assertions for BlobError and BootError.
+- R3-S4 / F-R3-1 / F-R3-2: signal handlers ignore further signals during teardown (run.py, tools/package); SIGTERM forwarded only to a live child; the netns harness gets PR_SET_PDEATHSIG (preexec and re-armed after exec, exiting if the parent is already gone); ctypes resolved at import.
+- R3-S5: each RAM dump is unlinked right after reading; temp-dir removal reports leftovers and fails the run.
+- F-R3-4: wireguard-go routes `inside_prefix` from the generated config. F-R3-A1: comment corrected. T8: minimums raised. T11: see the manual proof recorded below.
+- T11 manual proof (2026-10-19, dev container): `run.py` started in the background; once "PASS [wireguard-go handshake" was logged, SIGTERM to the outer harness. Outer exit 143; afterwards no `qemu-system-aarch64`, no harness `wireguard-go` (`wgt*`), no `wgt*` UAPI socket and no `/tmp/secureos-it-*` directory remained.
+- Verification of this round: `make check` green; `tools/check-selftest integration-residue bolero bolero-wg-wire` → all three ok (`integration-residue`: with the reclaim removed, `make test` fails with "install message still in guest RAM").

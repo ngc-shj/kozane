@@ -20,7 +20,9 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 # make's messages ("Error 1") are matched below; GNU make translates them
 # (e.g. "エラー 1" under ja_JP), so run it in the C locale.
-MAKE_ENV = {**os.environ, "LC_ALL": "C"}
+# The copies have no .git; git queries (the bolero seed check) read the real
+# repository's index instead.
+MAKE_ENV = {**os.environ, "LC_ALL": "C", "GIT_DIR": str(ROOT / ".git")}
 # "crashes": old local crash files must not make the bolero case pass.
 SKIP = {"build", "target", ".git", "crashes"}
 
@@ -58,7 +60,7 @@ CASES_FOR_GATE = {
     "kani": {"kani", "kani-cache"},
     "bolero": {"bolero", "bolero-wg-wire"},
     "laws": {"laws"},
-    "test": {"integration", "integration-count"},
+    "test": {"integration", "integration-count", "integration-residue"},
     "manifest": {"manifest"},
 }
 
@@ -127,6 +129,13 @@ CASES = {
     "integration": (["test"], lambda t: edit(t, "tests/integration/run.py",
                                               "        if bad.consume_response(resp):",
                                               "        if not bad.consume_response(resp):"), "response opened with a wrong PSK"),
+    # The residue scan must catch keys left in the hs->data link: without the
+    # reclaim on wakeup the install stays in guest RAM (the scan's red-proof,
+    # re-run here so it cannot silently go vacuous).
+    "integration-residue": (["test"], lambda t: edit(t, "crates/pds/hs/src/main.rs",
+                                                     "        if let Err(e) = self.to_data.reclaim() {\n",
+                                                     "        if let Err(e) = Ok::<(), _>(()) {\n"),
+                            "install message still in guest RAM"),
     # A case that stops counting must fail the manifest, not just print fewer PASS lines.
     "integration-count": (["test", "manifest"], lambda t: edit(t, "tests/integration/run.py",
                                                                '        passed.append("unknown peer")\n', ""),

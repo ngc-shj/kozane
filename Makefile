@@ -150,9 +150,11 @@ define bolero_one
 			$(counts)/bolero-$(1).log; tail -20 $(counts)/bolero-$(1).log; exit 1; }
 	grep -qE 'INFO: +[1-9][0-9]* files found in .*/corpus' $(counts)/bolero-$(1).log \
 		|| { echo "bolero: seed corpus not loaded for $(1)"; exit 1; }
-	# Generated inputs accumulate locally; the committed seeds must exist.
-	test "$$(git ls-files 'crates/$(1)/src/__fuzz__/*/corpus/seed-*' | wc -l)" -ge 1 \
-		|| { echo "bolero: no committed seed-* corpus for $(1)"; exit 1; }
+	# Generated inputs accumulate locally; this target's committed seeds must
+	# exist (git failing is reported as such, not as "no seeds").
+	seeds=$$(git ls-files -- 'crates/$(1)/src/__fuzz__/$(subst ::,__,$(subst fuzz_,,$(2)))/corpus/seed-*') \
+		|| { echo "bolero: git ls-files failed for $(1)"; exit 1; }; \
+		test -n "$$seeds" || { echo "bolero: no committed seed-* corpus for $(1)"; exit 1; }
 	grep -qE '^Done [1-9][0-9]* runs' $(counts)/bolero-$(1).log \
 		|| { echo "bolero: $(1) completed no runs"; exit 1; }
 	cat $(counts)/bolero-$(1).log >> $(counts)/bolero.log

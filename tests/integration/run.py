@@ -21,6 +21,7 @@ Missing prerequisites fail the run; nothing is skipped.
 """
 
 import base64
+import ctypes
 import json
 import os
 import re
@@ -167,7 +168,8 @@ def check_reason_list_matches_rust():
 # ---------------------------------------------------------------- harness
 
 
-READY_LINE = re.compile(r"(eth_out|eth_in|ingress|inner|data|hs|audit): ready\r?\n")
+# QEMU's serial console ends lines with "\r\r\n".
+READY_LINE = re.compile(r"(eth_out|eth_in|ingress|inner|data|hs|audit): ready\r*\n")
 
 
 class Console:
@@ -307,8 +309,12 @@ class Monitor:
         if not os.path.exists(path):
             detail = reply.decode(errors="replace").strip()
             raise Fail(f"pmemsave did not create {path}: {detail}")
-        with open(path, "rb") as f:
-            data = f.read()
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        finally:
+            # The dump holds guest RAM, secrets region included.
+            os.unlink(path)
         if len(data) != size:
             raise Fail(f"pmemsave returned {len(data)} of {size} bytes")
         return data
@@ -316,7 +322,8 @@ class Monitor:
 
 # Guest RAM scanned for residue. Which frames back which region at run time
 # is not knowable from the Microkit report, so the whole window is read and
-# a positive control (a value `data` must hold) proves it covers PD memory.
+# a positive control (a session key that data or hs memory must hold) proves
+# it covers PD memory.
 OBJECT_RAM = (0x6000_0000, 0x0200_0000)
 
 
@@ -347,11 +354,28 @@ def install_len_from_rust() -> int:
     return sum(int(x) for x in m.group(1).split("+"))
 
 
+def pack_install(peer: int, local: int, remote: int, send: bytes, recv: bytes) -> bytes:
+    return struct.pack("<HII", peer, local, remote) + send + recv
+
+
+def check_install_layout_matches_rust():
+    """The needle's packing must equal msgs::Install::encode on the golden
+    inputs of crates/msgs/src/tests.rs, not merely have its length."""
+    src = open(os.path.join(ROOT, "crates/msgs/src/tests.rs")).read()
+    m = re.search(r'INSTALL_GOLDEN_HEX: &str = "([0-9a-f]+)"', src)
+    if not m:
+        raise Fail("INSTALL_GOLDEN_HEX not found in crates/msgs/src/tests.rs")
+    mine = pack_install(0x0102, 0x03040506, 0x0708090A, b"\x11" * 32, b"\x22" * 32)
+    if mine.hex() != m.group(1):
+        raise Fail("install layout in run.py differs from msgs::Install::encode")
+
+
 def install_bytes(peer: int, i) -> bytes:
     """The `msgs::Install` hs sent for initiator `i`'s session: our index is
     the receiver of its transport packets, its sender index is our remote,
     and our send/recv keys are its recv/send keys."""
-    b = struct.pack("<HII", peer, i.receiver, i.sender) + i.recv_key + i.send_key
+    check_install_layout_matches_rust()
+    b = pack_install(peer, i.receiver, i.sender, i.recv_key, i.send_key)
     if len(b) != install_len_from_rust():
         raise Fail(f"install layout drifted: {len(b)} bytes vs msgs::INSTALL_LEN")
     return b
@@ -517,7 +541,8 @@ class WgGo:
     """wireguard-go in the test netns. Its UAPI socket directory is shared
     by every netns in the container, so the interface name is per run."""
 
-    def __init__(self, conf: str, address: str):
+    def __init__(self, conf: str, address: str, inside_prefix: str):
+        self.inside_prefix = inside_prefix
         self.dev = dev = f"wgt{os.getpid() % 100000}"
         self.proc = subprocess.Popen(["wireguard-go", "-f", dev], stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL, env={**os.environ, "LOG_LEVEL": "error"},
@@ -538,7 +563,7 @@ class WgGo:
         sh("wg", "setconf", dev, conf)
         sh("ip", "addr", "add", address, "dev", dev)
         sh("ip", "link", "set", dev, "up")
-        sh("ip", "route", "add", "10.99.0.0/24", "dev", dev)
+        sh("ip", "route", "add", self.inside_prefix, "dev", dev)
 
     def latest_handshake(self) -> int:
         out = sh("wg", "show", self.dev, "latest-handshakes").stdout.split()
@@ -585,7 +610,7 @@ def test_wireguard(loader: str, deploy: str, passed: list):
 
         # Case 1: wireguard-go handshakes (first ping triggers it; it
         # retries every 5 s while the image is still booting).
-        wg = WgGo(conf0, "10.200.0.2/32")
+        wg = WgGo(conf0, "10.200.0.2/32", cfg["gateway"]["inside_prefix"])
         ping(tries=30)
         first = wg.latest_handshake()
         if not first:
@@ -657,7 +682,11 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         # The install for peer 1 carried transport keys through the shared
         # `hd` region; once delivered, no copy of it may remain anywhere in
         # guest memory (L12), without waiting for another handshake.
-        # Control: data's live session for peer 1 holds this key.
+        # Control: this key must be somewhere in the window (data's session,
+        # or hs/data stack residue), proving the window covers PD memory; it
+        # does not prove the window covers `hd` itself. That is pinned by the
+        # check-selftest case `integration-residue`, which removes the
+        # reclaim and requires this check to fail.
         wait_absent(mon, install_bytes(1, good), good.recv_key, scratch)
         passed.append("spoofed inner source, install scrubbed")
         print("\nPASS [spoofed inner source dropped, install scrubbed]")
@@ -702,7 +731,7 @@ def test_mismatched_blob(loader: str):
     try:
         con.wait_for(r"key: secrets: gateway key does not match the configuration", timeout=BOOT_TIMEOUT_S,
                      strip_ready=True)
-        con.wait_for(r"key: halted", timeout=LINE_TIMEOUT_S)
+        con.wait_for(r"key: halted", timeout=LINE_TIMEOUT_S, strip_ready=True)
         con.wait_for(r"MON\|ERROR: faulting PD: key", timeout=LINE_TIMEOUT_S)
     finally:
         kill(child)
@@ -775,38 +804,55 @@ def in_netns(good: str, mismatched: str, deploy: str) -> int:
     return 0
 
 
+# Resolved at import: preexec_fn runs between fork and exec, where importing
+# (and its lock) is unsafe once other threads exist.
+_LIBC = ctypes.CDLL(None, use_errno=True)
+PR_SET_PDEATHSIG = 1
+
+
 def die_with_parent():
-    """preexec_fn: SIGKILL this process if the harness dies, so a harness
-    killed outright cannot orphan QEMU or wireguard-go (PR_SET_PDEATHSIG)."""
-    import ctypes
-    if ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGKILL) != 0:
+    """SIGKILL this process when its parent dies (PR_SET_PDEATHSIG). Applied
+    at every level: outer harness -> netns harness -> QEMU / wireguard-go,
+    so killing any level outright orphans nothing below it."""
+    if _LIBC.prctl(PR_SET_PDEATHSIG, signal.SIGKILL) != 0:
         raise OSError(ctypes.get_errno(), "prctl(PR_SET_PDEATHSIG)")
 
 
 def exit_on_signal(signum, _frame):
-    # Turn SIGTERM/SIGHUP into SystemExit so `finally` blocks run: the temp
-    # dir holds private keys and must go on every exit path.
+    # Turn SIGTERM/SIGHUP/SIGINT into SystemExit so `finally` blocks run: the
+    # temp dir holds private keys and must go on every exit path. Further
+    # signals are ignored from here on, so they cannot cut the teardown short.
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, signal.SIG_IGN)
     raise SystemExit(128 + signum)
 
 
 def main() -> int:
-    signal.signal(signal.SIGTERM, exit_on_signal)
-    signal.signal(signal.SIGHUP, exit_on_signal)
+    for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+        signal.signal(s, exit_on_signal)
     if sys.argv[1:2] == ["--netns"]:
+        # Re-armed after exec (PDEATHSIG survives unshare's exec, but checking
+        # the parent closes the race where it died before this point).
+        die_with_parent()
+        if os.getppid() == 1:
+            return 1
         return in_netns(*sys.argv[2:5])
     tmp = tempfile.mkdtemp(prefix="secureos-it-")
+    status = 1
     try:
         preflight()
         good, mismatched = build(tmp)
         # `unshare` execs the child, so the Popen pid is the netns harness.
         child = subprocess.Popen(["unshare", "-rn", sys.executable, os.path.abspath(__file__), "--netns",
-                                  good, mismatched, os.path.join(tmp, "a")])
+                                  good, mismatched, os.path.join(tmp, "a")], preexec_fn=die_with_parent)
         try:
-            return child.wait()
+            status = child.wait()
         except BaseException:
             # Let the child run its own teardown (QEMU, wireguard-go, UAPI
-            # socket) before the temp dir goes; kill only if it hangs.
-            child.send_signal(signal.SIGTERM)
+            # socket) before the temp dir goes; kill only if it hangs. The
+            # child ignores repeated signals, so forwarding cannot interrupt it.
+            if child.poll() is None:
+                child.send_signal(signal.SIGTERM)
             try:
                 child.wait(timeout=15)
             except subprocess.TimeoutExpired:
@@ -816,10 +862,14 @@ def main() -> int:
             raise
     except Fail as e:
         print(f"\nFAIL [setup]: {e}", file=sys.stderr)
-        return 1
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
-
+        left = []
+        shutil.rmtree(tmp, onexc=lambda _f, p, e: left.append(f"{p}: {e}"))
+        if left or os.path.exists(tmp):
+            # A key-bearing leftover must fail the run.
+            print(f"\nFAIL [teardown]: could not remove {tmp} (holds keys): {left}", file=sys.stderr)
+            status = 1
+    return status
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wg as wg_mod  # noqa: E402

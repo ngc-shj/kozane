@@ -15,6 +15,7 @@
 //! little-endian `u64`s, as in seL4 message registers.
 
 #![no_std]
+#![cfg_attr(test, feature(variant_count))]
 #![deny(
     unsafe_code,
     clippy::indexing_slicing,

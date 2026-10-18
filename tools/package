@@ -154,7 +154,10 @@ def with_prefill(system: str, blob_path: str) -> str:
 
 def exit_on_signal(signum, _frame):
     # SIGTERM/SIGHUP must run the `finally` that removes the staging dir:
-    # after microkit it holds an image with the secrets embedded.
+    # after microkit it holds an image with the secrets embedded. Later
+    # signals are ignored so they cannot interrupt that removal.
+    for s in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(s, signal.SIG_IGN)
     raise SystemExit(128 + signum)
 
 
@@ -196,8 +199,9 @@ def main() -> int:
         print("\n".join(errors))
         return 1
 
-    # Everything below uses the parent as resolved for the check, so a path
-    # component swapped afterwards cannot move the output elsewhere.
+    # The parent is resolved again here (check_out_path resolved it too); a
+    # path component swapped in between is caught by re-checking the staging
+    # dir against the forbidden roots below, and OUT again before rename.
     parent = out.parent.resolve(strict=True)
     out = parent / out.name
     os.umask(0o077)

@@ -29,8 +29,15 @@ from it. Each entry: what changed, why, and what it costs.
   returned buffer in `reclaim()`, which `hs` runs on every notification;
   `data` notifies right after copying an install out, and the 1 Hz timer
   retries. Both PDs zero their private copies. The integration test checks
-  this on the PD path: after peer 1's handshake (the only session whose keys the harness knows; wireguard-go's are not exposed) the harness rebuilds the 74-byte `msgs::Install` hs sent (length tied to `msgs::INSTALL_LEN`) and polls the guest RAM window `OBJECT_RAM` in tests/integration/run.py through the QEMU monitor until no copy remains, while requiring in the same snapshot a positive control (the session key `data` must hold), so a window that misses PD memory fails instead of passing. The Microkit report's frame addresses
-  do not match runtime placement, so no address is assumed.
+  this on the PD path: after peer 1's handshake (the only session whose keys
+  the harness knows) it rebuilds the install hs sent (packing checked against
+  a golden vector of `msgs::Install::encode`) and polls the guest RAM window
+  `OBJECT_RAM` in tests/integration/run.py through the QEMU monitor until no
+  copy remains. A positive control in the same snapshot (the session key,
+  held by `data` or as hs/data stack residue) proves the window covers PD
+  memory, not that it covers `hd` itself; that the scan catches residue in
+  `hd` is pinned by the check-selftest case `integration-residue`, which
+  removes the reclaim and requires the scan to fail.
 - **`key`'s own IPC buffer** keeps its last reply until the next call. Only
   `key` can read it and it holds the static secrets anyway; registers beyond
   each reply are zeroed so no earlier, longer reply reaches `hs`.

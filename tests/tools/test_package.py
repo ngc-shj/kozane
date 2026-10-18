@@ -10,6 +10,7 @@ import importlib.util
 import os
 import pathlib
 import shutil
+import signal
 import sys
 import tempfile
 
@@ -107,36 +108,114 @@ def run_main(build_result):
             gen.write_text(GEN_DEBUG)
             out = d / "pkg"
 
+            built = []
+
             def fake_build(a, secrets, blob_bytes, staging):
+                built.append(1)
                 (staging / "loader.img").write_bytes(b"image")
                 if build_result == "raise":
                     raise RuntimeError("microkit failed")
+                if build_result == "out-appears":
+                    out.mkdir()
+                    return 0
+                if build_result == "sigterm":
+                    os.kill(os.getpid(), signal.SIGTERM)
                 return build_result
 
             pkg.build = fake_build
             sys.argv = ["package", "--secrets", str(blob), "--out", str(out), "--system", "x", "--policy", "x",
                         "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
                         "--config", "x", "--microkit", "x"]
+            real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP)}
             try:
                 status = pkg.main()
             except RuntimeError:
                 status = "raised"
+            except SystemExit as e:
+                status = f"exit {e.code}"
+            finally:
+                for s, h in real_handlers.items():
+                    signal.signal(s, h)
             errors = []
             if [p for p in d.iterdir() if p.name.startswith(".pkg.")]:
                 errors.append("staging directory left behind")
-            if build_result == 0:
+            if build_result == "out-appears":
+                if status != 1 or list(out.iterdir()):
+                    errors.append(f"OUT appearing during the build was not refused (status {status})")
+            elif build_result == 0:
                 if status != 0 or not (out / "loader.img").exists():
                     errors.append(f"success did not produce OUT (status {status})")
                 elif oct(out.stat().st_mode & 0o777) != "0o700" or oct((out / "loader.img").stat().st_mode & 0o777) != "0o600":
                     errors.append("OUT or loader.img not owner-only")
             elif out.exists():
                 errors.append(f"OUT exists after a failed build (status {status})")
+            if not built:
+                errors.append("main() returned before building")
+            expected = {1: 1, "raise": "raised", "out-appears": 1, 0: 0}.get(build_result)
+            if expected is not None and status != expected:
+                errors.append(f"status {status}, want {expected}")
+            if build_result == "sigterm" and status != f"exit {128 + signal.SIGTERM}":
+                errors.append(f"SIGTERM did not end the run through SystemExit (status {status})")
             return errors
         finally:
             pkg.build, sys.argv = real_build, real_argv
             os.umask(real_umask)
             shutil.rmtree(d)
     return run
+
+
+def staging_in_forbidden_root():
+    """A forbidden root covering the parent (as if a path component had been
+    swapped after the check): main() must refuse before building."""
+    d = tmp_tree()
+    real_roots, real_build, real_argv = pkg.forbidden_roots, pkg.build, sys.argv
+    built = []
+    try:
+        blob = d / "secrets.bin"
+        blob.write_bytes(BLOB)
+        gen = d / "gen_config.h"
+        gen.write_text(GEN_DEBUG)
+        calls = []
+
+        def roots(repo):
+            calls.append(1)
+            # The first two calls are the blob and OUT checks; the third is
+            # the staging re-check, which now sees `d` as forbidden.
+            return real_roots(repo) + ([d.resolve()] if len(calls) > 2 else [])
+
+        pkg.forbidden_roots = roots
+        pkg.build = lambda *a: built.append(1) or 0
+        sys.argv = ["package", "--secrets", str(blob), "--out", str(d / "pkg"), "--system", "x", "--policy", "x",
+                    "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
+                    "--config", "x", "--microkit", "x"]
+        status = pkg.main()
+        errors = []
+        if status != 1 or built or (d / "pkg").exists() or [p for p in d.iterdir() if p.name.startswith(".pkg.")]:
+            errors.append(f"staging in a forbidden root was not refused cleanly (status {status}, built {built})")
+        return errors
+    finally:
+        pkg.forbidden_roots, pkg.build, sys.argv = real_roots, real_build, real_argv
+        for s in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(s, signal.SIG_DFL)
+        shutil.rmtree(d)
+
+
+def failed_staging_removal_is_reported():
+    d = tmp_tree()
+    real_rmtree = pkg.shutil.rmtree
+    try:
+        staging = d / ".pkg.x"
+        staging.mkdir()
+
+        def broken(path, onexc=None):
+            onexc(None, str(path), PermissionError("denied"))
+
+        pkg.shutil.rmtree = broken
+        ok = pkg.remove_staging(staging)
+        return [] if ok is False else ["a failed removal was reported as success"]
+    finally:
+        pkg.shutil.rmtree = real_rmtree
+        shutil.rmtree(d)
 
 
 def existing_out(d):
@@ -179,6 +258,10 @@ CASES = [
     ("successful build is renamed into place owner-only", None, run_main(0)),
     ("failed build leaves no OUT and no staging", None, run_main(1)),
     ("crashing build leaves no OUT and no staging", None, run_main("raise")),
+    ("OUT appearing during the build is refused, staging removed", None, run_main("out-appears")),
+    ("SIGTERM during the build leaves no OUT and no staging", None, run_main("sigterm")),
+    ("staging that resolves into a forbidden root is refused", None, staging_in_forbidden_root),
+    ("a failed staging removal fails loudly", None, failed_staging_removal_is_reported),
     ("output inside build/", "inside", lambda: pkg.check_out_path(ROOT / "build/pkg", ROOT)),
     ("output inside the repo", "inside", lambda: pkg.check_out_path(ROOT / "pkg-out", ROOT)),
     ("output through a symlink into the repo", "inside", out_case(link_into_repo)),

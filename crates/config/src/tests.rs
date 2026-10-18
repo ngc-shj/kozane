@@ -230,6 +230,33 @@ fn neighbor_outside_the_inside_network_is_rejected() {
 
 #[test]
 fn inside_address_outside_its_prefix_is_rejected() {
-    let c = cfg(&peer(K1, "\"10.200.0.2/32\"")).replace("inside_prefix = \"10.99.0.0/24\"", "inside_prefix = \"10.98.0.0/24\"");
-    assert!(err(&c).contains("is outside inside_prefix"));
+    // Only inside_ip moves, so it is the sole violation.
+    let c = cfg(&peer(K1, "\"10.200.0.2/32\"")).replace("inside_ip = \"10.99.0.1\"", "inside_ip = \"10.98.0.1\"");
+    assert!(err(&c).contains("inside_ip 10.98.0.1 is outside inside_prefix"));
+}
+
+#[test]
+fn outside_address_inside_the_inside_network_is_rejected() {
+    let c = cfg(&peer(K1, "\"10.200.0.2/32\"")).replace("outside_ip = \"10.0.2.15\"", "outside_ip = \"10.99.0.200\"");
+    assert!(err(&c).contains("outside_ip lies inside inside_prefix"));
+}
+
+#[test]
+fn outside_address_next_to_the_inside_network_is_accepted() {
+    let c = cfg(&peer(K1, "\"10.200.0.2/32\"")).replace("outside_ip = \"10.0.2.15\"", "outside_ip = \"10.99.1.1\"");
+    assert!(validate::check(&c, 4).is_ok());
+}
+
+#[test]
+fn malformed_inside_prefix_is_named_in_the_error() {
+    let c = cfg(&peer(K1, "\"10.200.0.2/32\"")).replace("inside_prefix = \"10.99.0.0/24\"", "inside_prefix = \"10.99.0.1/24\"");
+    assert!(err(&c).contains("inside_prefix: "));
+}
+
+#[test]
+fn overlap_boundaries_of_the_inside_network_are_both_refused() {
+    // Inclusive at both ends: the network's first and last address.
+    assert!(err(&cfg(&peer(K1, "\"10.99.0.0/32\""))).contains("overlap inside_prefix"));
+    assert!(err(&cfg(&peer(K1, "\"10.99.0.255/32\""))).contains("overlap inside_prefix"));
+    assert!(validate::check(&cfg(&peer(K1, "\"10.100.0.0/32\"")), 4).is_ok());
 }

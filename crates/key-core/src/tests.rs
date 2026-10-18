@@ -79,36 +79,32 @@ fn peer_count_mismatch_and_bad_format_report_the_blob_error() {
 
 #[test]
 fn boot_error_messages_are_distinct() {
-    // Built from an exhaustive match: a new BlobError variant fails to
-    // compile here until it is listed, and then it is compared.
-    let blob = |i: usize| -> Option<BlobError> {
-        let e = [
-            BlobError::BadMagic,
-            BlobError::BadVersion,
-            BlobError::BadPeerCount,
-            BlobError::BadChecksum,
-            BlobError::NonZeroPadding,
-            BlobError::TooSmall,
-        ]
-        .get(i)
-        .copied()?;
-        match e {
-            BlobError::BadMagic
-            | BlobError::BadVersion
-            | BlobError::BadPeerCount
-            | BlobError::BadChecksum
-            | BlobError::NonZeroPadding
-            | BlobError::TooSmall => Some(e),
-        }
+    // Every BlobError, walked through an exhaustive successor match: a new
+    // variant fails to compile until it gets an arm, and its arm must name
+    // a successor (or end the walk), so leaving it out of the comparison
+    // takes a deliberately wrong arm rather than a forgotten line.
+    let next = |e: BlobError| match e {
+        BlobError::BadMagic => Some(BlobError::BadVersion),
+        BlobError::BadVersion => Some(BlobError::BadPeerCount),
+        BlobError::BadPeerCount => Some(BlobError::BadChecksum),
+        BlobError::BadChecksum => Some(BlobError::NonZeroPadding),
+        BlobError::NonZeroPadding => Some(BlobError::TooSmall),
+        BlobError::TooSmall => None,
     };
     let mut all = [BootError::GatewayKeyMismatch; 8];
     all[1] = BootError::PeerMismatch;
     let mut n = 2;
-    while let Some(e) = blob(n - 2) {
-        all[n] = BootError::Blob(e);
+    let mut e = Some(BlobError::BadMagic);
+    while let Some(v) = e {
+        all[n] = BootError::Blob(v);
         n += 1;
+        e = next(v);
     }
     assert_eq!(n, all.len(), "every BlobError compared");
+    // The walk visits every variant, and BootError has exactly the three
+    // kinds listed: a variant missing from either fails here.
+    assert_eq!(n - 2, core::mem::variant_count::<BlobError>());
+    assert_eq!(core::mem::variant_count::<BootError>(), 3);
     for (i, a) in all.iter().enumerate() {
         for b in &all[i + 1..] {
             assert_ne!(a.message(), b.message());

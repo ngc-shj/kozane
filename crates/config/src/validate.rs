@@ -170,7 +170,7 @@ pub fn check(text: &str, max_peers: usize) -> Result<Checked, String> {
     }
     let outside_ip = parse_ip(&g.outside_ip)?;
     let inside_ip = parse_ip(&g.inside_ip)?;
-    let inside_prefix = parse_prefix(&g.inside_prefix)?;
+    let inside_prefix = parse_prefix(&g.inside_prefix).map_err(|e| format!("config: inside_prefix: {e}"))?;
     if !inside_prefix.contains(inside_ip) {
         return Err(format!("config: inside_ip {} is outside inside_prefix {}", g.inside_ip, g.inside_prefix));
     }
