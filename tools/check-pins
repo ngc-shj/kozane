@@ -12,9 +12,18 @@ Rules:
   P3 every git dependency in a Cargo.toml has rev = "<40 hex>" and no
      branch/tag
   P4 docker/Dockerfile PD_TOOLCHAIN equals the channel in rust-toolchain.toml
-  P5 Makefile: SHELL is bash with -euo pipefail; no .IGNORE, no -i/-k in
-     MAKEFLAGS, no '-' or '@-' recipe prefix, no `|| true`, `|| :`,
-     `; true`, `set +e`
+  P5 Makefile: SHELL is bash with -euo pipefail; no .IGNORE, no
+     .RECIPEPREFIX, no -i/-k in MAKEFLAGS, no '-' recipe prefix (incl. after
+     @/+, and on inline `target: ; -cmd` recipes), no `|| true`, `|| :`,
+     `|| exit 0`, `; true`, `set +e`
+
+Control class: P1-P4 are fail-closed checks over the files they read. P5 is
+a best-effort tripwire: make and bash decide what a recipe does, and a
+pattern list cannot enumerate every spelling. Known bypasses it does not
+catch: an error-ignore prefix supplied through a variable (`$(D)cmd` with
+D := -) and masks built from variables or functions. The enforceable control
+for "a failing gate fails `make check`" is tools/check-selftest, which runs
+make and proves each gate's failure propagates.
 """
 
 import argparse
@@ -100,17 +109,27 @@ def check_makefile(text: str, rel: str, out: list):
         continues = trailing % 2 == 1
     for n, lines in logical:
         first = lines[0]
-        # bash sees the continuation joined; check masks on the joined text.
-        joined = " ".join(l[:-1] if i < len(lines) - 1 else l for i, l in enumerate(lines))
+        # What bash receives: make keeps `\<newline>` but strips the recipe
+        # tab from each continuation line, and bash then deletes
+        # `\<newline>`, so tokens split across lines run joined.
+        joined = lines[0][:-1] if len(lines) > 1 else lines[0]
+        for i, l in enumerate(lines[1:], 1):
+            l = l.removeprefix("\t")
+            joined += l[:-1] if i < len(lines) - 1 else l
         if re.match(r"^\.IGNORE\b", first):
             out.append(f"P5 {rel}:{n}: .IGNORE")
-        if re.match(r"^MAKEFLAGS\b.*(\s|^|=)-[a-zA-Z]*[ik]", first):
+        if re.match(r"^\.RECIPEPREFIX\b", first):
+            out.append(f"P5 {rel}:{n}: .RECIPEPREFIX changes what a recipe line is")
+        # Inline recipe: `target: prereqs ; -cmd`.
+        if not first.startswith("\t") and re.match(r"^[^#=]*:[^=]*;\s*[@+]*-", first):
+            out.append(f"P5 {rel}:{n}: inline recipe error-ignore prefix")
+        if re.match(r"^MAKEFLAGS\b.*(\s|^|=)-[a-zA-Z]*[ik]", joined):
             out.append(f"P5 {rel}:{n}: MAKEFLAGS ignores errors")
         # make honours @/+/- (after optional whitespace) at the start of a
         # logical recipe line only.
         if re.match(r"^\t[\s@+]*-", first):
             out.append(f"P5 {rel}:{n}: recipe error-ignore prefix")
-        if re.search(r"\|\|\s*(true|:|exit\s+0)(?![\w-])|;\s*true\b|\bset \+e\b", joined):
+        if re.search(r"\|\|\s*(true|:|exit\s+0+)(?![\w-])|;\s*true\b|\bset \+e\b", joined):
             out.append(f"P5 {rel}:{n}: masked exit status")
 
 def main() -> int:

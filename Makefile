@@ -128,7 +128,8 @@ laws: | $(counts)
 pins: | $(counts)
 	tools/check-pins > $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_check_pins.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^CHECK-PINS-(RULES|FIXTURES)' $(counts)/pins.log > $(counts)/pins
+	python3 tests/tools/test_check_selftest.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	grep -E '^CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)' $(counts)/pins.log > $(counts)/pins
 
 test: image | $(counts)
 	python3 tests/integration/run.py $(loader) > $(counts)/test.log 2>&1 \

@@ -268,6 +268,7 @@ def test_raw(loader: str):
             expect_line(child, rf"audit: src=ingress FrameDropped\({reason}\) total=1 lost=0")
 
         burst_echo(w, child, n=40)
+        oversize_then_echo(w, child, n=20)
         flood(w, child, "Ipv4BadChecksum", k=640)
         echo(w, child)  # liveness after the flood
         echo(w, child)
@@ -291,6 +292,19 @@ def echo(w: Wire, child):
 
 
 FLOOD_BATCH = 32
+
+
+def oversize_then_echo(w: Wire, child, n: int):
+    """n frames longer than a ring buffer (2048) but short enough for the
+    virtio rx buffer, then an echo. Each is dropped as FrameTooLong without
+    reaching ingress; with more than QUEUE_SIZE (16) of them, eth_out must
+    keep draining past its per-batch bound, or under virtio event-idx the
+    echo behind them never raises an interrupt and gets no reply."""
+    big = eth(GW_MAC, PEER_MAC, 0x0800, b"\0" * 2050)
+    for _ in range(n):
+        w.send(big)
+    echo(w, child)
+    expect_line(child, r"audit: src=eth_out FrameTooLong total=1 lost=0")
 
 
 def burst_echo(w: Wire, child, n: int):

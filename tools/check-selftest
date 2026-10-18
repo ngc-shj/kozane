@@ -61,16 +61,19 @@ class GateParseError(Exception):
     pass
 
 
-def check_gates() -> list:
+def check_gates(text: str = "") -> list:
     """Targets run by the `check` rule (prerequisites, then `$(MAKE)` recipe
     lines), in order. Any other recipe line is an unaccounted gate."""
-    lines = (ROOT / "Makefile").read_text().splitlines()
+    lines = (text or (ROOT / "Makefile").read_text()).splitlines()
     heads = [i for i, l in enumerate(lines) if l.split(":", 1)[0] == "check" and ":" in l and not l.startswith("\t")]
     if len(heads) != 1:
         raise GateParseError(f"expected one `check:` rule, found {len(heads)}")
     start = heads[0]
     gates = lines[start].split(":", 1)[1].split()
     for line in lines[start + 1:]:
+        # make keeps reading a recipe across blank and column-0 comment lines.
+        if not line.strip() or line.startswith("#"):
+            continue
         if not line.startswith("\t"):
             break
         words = line.lstrip("\t@+- ").split()

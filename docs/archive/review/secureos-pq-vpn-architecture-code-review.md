@@ -185,3 +185,39 @@ R29 N5 · others OK
 R43 N-S8 · RS3 N-S9 · others OK
 ### Testing expert
 R47 T13 · RT7 T11/T12 · RT3 T14 · others OK
+
+---
+
+# Round 4
+Date: 2026-10-18
+
+## Changes from Previous Round
+Reviewed `cea39df..70f2122`. All Round 3 findings confirmed resolved (N5, N-S8, N-S9, T11–T14; the T13 allow case shown non-decorative by a one-step tightening). All new findings Minor.
+
+| ID | Expert | Sev | Finding | Resolution |
+|---|---|---|---|---|
+| F1 | Func | Minor | MAKEFLAGS check used the first physical line | checked on the joined logical line; fixture |
+| F2 / T15 | Func+Test | Minor | check_gates stopped at blank/comment lines inside the recipe | blank and column-0 `#` lines skipped; `tests/tools/test_check_selftest.py` (7 cases incl. raw command after a blank line) wired into `make pins` |
+| N-S10 | Sec | Minor (R43) | continuation join differed from bash (`\|`+`\| true`, `tr`+`ue`) | join exactly as bash receives it (strip `\`, strip the recipe tab, concatenate); fixtures for both splits |
+| N-S11 | Sec | Minor | `\|\| exit 00` not caught | `exit\s+0+`; fixture |
+| — | Sec (record) | — | variable-supplied prefix, inline `; -cmd`, `.RECIPEPREFIX` not caught | `.RECIPEPREFIX` and inline `; -cmd` now P5; variable-supplied prefixes documented as a known bypass. P5 is reclassified as a **best-effort tripwire** in the tool's docstring; the enforceable control for "a failing gate fails `make check`" is `tools/check-selftest`, which executes make. |
+| T16 | Test | Minor | N5 loop not shown to be test-detectable | Added `oversize_then_echo` (20 frames > NET_BUF_SIZE, then an echo; asserts the FrameTooLong audit line). Mutation (single-pass `service`) on `/tmp/n5m`: still PASSES — see Anti-Deferral entry below. |
+
+### T16 [Minor] N5 not test-detectable — Accepted
+- **Anti-Deferral check**: acceptable risk.
+- **Justification**: Under QEMU, virtio-net refills each re-posted rx buffer immediately and the driver updates `used_event` on every pop, so the "completions pending at the batch bound with no further interrupt" state is a timing race that QEMU TCG does not produce deterministically; the mutation passes. Reproducing it needs a fake `VirtIONetRaw` transport, which virtio-drivers 0.13 does not provide.
+- **Worst case**: under real hardware timing, rx stalls until the next unrelated event (tx completion, ingress notification) — availability only, no isolation impact.
+- **Likelihood**: low (needs ≥ 16 completions arriving while the driver lags, all non-delivering).
+- **Cost to fix**: building a fake virtio transport + host harness for the PD (days); revisit at M7 (real hardware) where timing differs.
+- The fix itself rests on the vendored virtio-drivers source (`pop_used` sets `used_event = last_used_idx`), verified by the Functionality expert.
+
+### Round 4 verification
+`make check` green (CHECK-PINS-FIXTURES 34, CHECK-SELFTEST-FIXTURES 7, UNIT-TESTS 185, KANI-HARNESSES 13, INTEGRATION-CASES 3); `tools/check-selftest` 10/10.
+
+## Recurring Issue Check
+### Functionality expert
+R43 F1 · R57 F2 · others OK
+### Security expert
+R43 N-S10 · RS3 N-S10/N-S11 · others OK
+### Testing expert
+RT7 T15/T16 · others OK
