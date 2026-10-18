@@ -110,7 +110,7 @@ laws checker, proofs for `ring`, `wire` and the driver copy path.
 **C2 — Build, run and gate harness** [S9, T6, T8, T9]
 - Interface: `make image`, `make run`, `make test`, `make check` (= unit + kani + bolero 30 s + laws + test), `make fuzz-long`, `make check-selftest`.
 - Invariants:
-  - `SHELL := bash`, `.SHELLFLAGS := -euo pipefail -c`; no `.IGNORE`, no `-i`/`-k` in `MAKEFLAGS`, no `-`/`@-` recipe prefix, no `|| true`, `|| :`, `; true`, `set +e` (checked by `tools/check-pins`).
+  - `SHELL := bash`, `.SHELLFLAGS := -euo pipefail -c`; no `.IGNORE`, no `-i`/`-k` in `MAKEFLAGS`, no `-`/`@-` recipe prefix, no `|| true`, `|| :`, `; true`, `set +e`. `tools/check-pins` P5 flags known spellings as a **best-effort tripwire** (make and bash interpret the Makefile; a pattern list cannot enumerate every spelling). The **adjudicating** control for failure propagation is `tools/check-selftest`, which executes make: per-gate cases, plus `check-propagation`, which injects a failing gate and requires the real `make check` to fail [code review R4–R5].
   - `make image` runs C7 on the exact `.system` it then passes to `microkit`, and checks L11 from `gen_config.h`.
   - `make check` compares executed counts with a committed manifest — unit tests, Kani harnesses, integration cases, laws fixtures, `check-pins` fixtures, bolero targets (each with > 0 iterations); zero or fewer than recorded fails.
   - Kani runs with `--fail-uncoverable` (with `-Z unstable-options` if the pinned Kani requires it; checked against the pinned binary at image build), else a wrapper that fails on any cover status other than SATISFIED [T14, N2].
@@ -185,7 +185,7 @@ laws checker, proofs for `ring`, `wire` and the driver copy path.
 | Unit | `cargo test --locked` on host | verifiable-local |
 | Proof | Kani (C3, C4, C5) — pinned in the image | verifiable-local |
 | Fuzz | bolero, seed corpus; 30 s in `make check`, long run in `make fuzz-long` | verifiable-local |
-| Layout | laws checker + exact-ID fixtures (C7); `tools/check-pins` fixtures (C1, C2) | verifiable-local |
+| Layout | laws checker + exact-ID fixtures (C7); `tools/check-pins` fixtures (C1 checks; C2 P5 as a tripwire) | verifiable-local |
 | Integration | pexpect boots QEMU; waits for readiness lines (no sleeps); raw frames over `-netdev dgram`; nonce echo; bounded retries; QEMU process group killed in `finally`; free port per run | verifiable-local |
 | Gate self-test | `make check-selftest` | verifiable-local |
 | Hardware, root of trust, DMA isolation | — | blocked-deferred (VE1, VE2, VE3, VE5) — needs a verified board + TPM; owners M5/M7; DMA isolation needs a platform change (SC10) |

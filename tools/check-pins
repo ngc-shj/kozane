@@ -109,21 +109,28 @@ def check_makefile(text: str, rel: str, out: list):
         continues = trailing % 2 == 1
     for n, lines in logical:
         first = lines[0]
-        # What bash receives: make keeps `\<newline>` but strips the recipe
-        # tab from each continuation line, and bash then deletes
-        # `\<newline>`, so tokens split across lines run joined.
+        # What bash receives from a recipe line: make keeps `\<newline>` but
+        # strips the recipe tab from each continuation line, and bash then
+        # deletes `\<newline>`, so tokens split across lines run joined.
         joined = lines[0][:-1] if len(lines) > 1 else lines[0]
         for i, l in enumerate(lines[1:], 1):
             l = l.removeprefix("\t")
             joined += l[:-1] if i < len(lines) - 1 else l
-        if re.match(r"^\.IGNORE\b", first):
+        # Outside recipes make replaces `\<newline>` and surrounding
+        # whitespace with a single space.
+        make_joined = " ".join(l.removesuffix("\\").strip() for l in lines)
+        if not first.startswith("\t"):
+            directive = make_joined
+        else:
+            directive = first
+        if re.match(r"^\.IGNORE\b", directive):
             out.append(f"P5 {rel}:{n}: .IGNORE")
-        if re.match(r"^\.RECIPEPREFIX\b", first):
+        if re.match(r"^\.RECIPEPREFIX\b", directive):
             out.append(f"P5 {rel}:{n}: .RECIPEPREFIX changes what a recipe line is")
         # Inline recipe: `target: prereqs ; -cmd`.
         if not first.startswith("\t") and re.match(r"^[^#=]*:[^=]*;\s*[@+]*-", first):
             out.append(f"P5 {rel}:{n}: inline recipe error-ignore prefix")
-        if re.match(r"^MAKEFLAGS\b.*(\s|^|=)-[a-zA-Z]*[ik]", joined):
+        if re.match(r"^MAKEFLAGS\b.*(\s|^|=)-[a-zA-Z]*[ik]", directive):
             out.append(f"P5 {rel}:{n}: MAKEFLAGS ignores errors")
         # make honours @/+/- (after optional whitespace) at the start of a
         # logical recipe line only.

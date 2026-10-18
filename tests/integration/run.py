@@ -296,10 +296,10 @@ FLOOD_BATCH = 32
 
 def oversize_then_echo(w: Wire, child, n: int):
     """n frames longer than a ring buffer (2048) but short enough for the
-    virtio rx buffer, then an echo. Each is dropped as FrameTooLong without
-    reaching ingress; with more than QUEUE_SIZE (16) of them, eth_out must
-    keep draining past its per-batch bound, or under virtio event-idx the
-    echo behind them never raises an interrupt and gets no reply."""
+    virtio rx buffer, then an echo: covers the FrameTooLong drop path and
+    that rx continues past more than QUEUE_SIZE (16) dropped frames. It does
+    not reproduce the event-idx stall the batch loop in eth_out guards
+    against; under QEMU that race is not deterministic (code review T16)."""
     big = eth(GW_MAC, PEER_MAC, 0x0800, b"\0" * 2050)
     for _ in range(n):
         w.send(big)

@@ -221,3 +221,30 @@ R43 F1 · R57 F2 · others OK
 R43 N-S10 · RS3 N-S10/N-S11 · others OK
 ### Testing expert
 RT7 T15/T16 · others OK
+
+---
+
+# Round 5
+Date: 2026-10-18
+
+## Changes from Previous Round
+Reviewed `70f2122..abfe229`. Round 4 fixes confirmed (F1, F2/T15, N-S10, N-S11; T16 acceptance judged properly justified). One Major (Security F1, R49).
+
+| ID | Expert | Sev | Finding | Resolution |
+|---|---|---|---|---|
+| Sec F1 | Sec | **Major** (R49) | After reclassifying P5 as a tripwire, nothing executed `make check` itself: `\t-$(MAKE) …` in the check recipe was accepted by check_gates, and `I := .IGNORE` + `$(I): check` was caught by nothing (both reproduced with GNU make 4.4.1) | new selftest layer `check-propagation` runs the real `make check` with a failing gate injected and requires failure; check_gates rejects `-` in a gate line's prefix (fixtures). Mutation on `/tmp/prop` with the variable-built `.IGNORE`: P5 silent, `check-propagation` FAILS (exit 0 where failure was required) |
+| Sec F2 | Sec | Minor (R49) | plan C2 still described P5 as part of a fail-closed gate | plan C2 now names P5 a best-effort tripwire and check-selftest (incl. check-propagation) as the adjudicating control |
+| Func F1 | Func | Minor (R43) | bash-style join used for MAKEFLAGS; make joins non-recipe continuations with a space (`-s\`+`-k` missed) | directives (.IGNORE, .RECIPEPREFIX, MAKEFLAGS) checked on a make-style join; recipes keep the bash-style join; fixture |
+| T17 | Test | Minor (RT7) | CHECK-SELFTEST-FIXTURES was a hardcoded number | counts executed cases |
+| T18 | Test | Minor (RT7) | oversize_then_echo docstring claimed N5 detection | docstring states what it covers and that it does not reproduce the T16 race |
+
+### Round 5 verification
+`make check` green (CHECK-PINS-FIXTURES 35, CHECK-SELFTEST-FIXTURES 10, UNIT-TESTS 185, KANI-HARNESSES 13, INTEGRATION-CASES 3); `tools/check-selftest` 11/11 layers (new: check-propagation).
+
+## Recurring Issue Check
+### Functionality expert
+R43 F1 · others OK
+### Security expert
+R49 F1/F2 · R43/RS3 previous fixes verified · others OK
+### Testing expert
+RT7 T17/T18 · others OK

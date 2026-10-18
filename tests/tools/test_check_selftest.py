@@ -20,9 +20,11 @@ def main() -> int:
     g = load()
     gates, err = g["check_gates"], g["GateParseError"]
     failures = 0
+    ran = 0
 
     def expect(name, text, want):
-        nonlocal failures
+        nonlocal failures, ran
+        ran += 1
         try:
             got = gates(text)
         except err:
@@ -38,7 +40,10 @@ def main() -> int:
     expect("raw command", "check:\n\ttools/foo\n", "error")
     expect("recipe ends at the next rule", "check:\n\t$(MAKE) a\nother:\n\ttools/foo\n", ["a"])
     expect("no check rule", "all:\n\t$(MAKE) a\n", "error")
-    print("CHECK-SELFTEST-FIXTURES 7")
+    expect("error-ignore prefix on a gate line", "check:\n\t-$(MAKE) a\n", "error")
+    expect("error-ignore after @", "check:\n\t@-$(MAKE) a\n", "error")
+    expect("allowed @ prefix", "check:\n\t@$(MAKE) a\n", ["a"])
+    print(f"CHECK-SELFTEST-FIXTURES {ran}")
     return 1 if failures else 0
 
 

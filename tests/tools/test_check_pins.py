@@ -99,6 +99,8 @@ CASES = [
     ("P5 .RECIPEPREFIX", {"P5"}, lambda t: edit(t / "Makefile", "BUILD ?= build", ".RECIPEPREFIX = >\nBUILD ?= build")),
     ("P5 inline recipe '; -cmd'", {"P5"}, lambda t: edit(t / "Makefile", "clean:\n", "x: ; -false\nclean:\n")),
     ("allow inline recipe without prefix", set(), lambda t: edit(t / "Makefile", "clean:\n", "x: ; echo ok\nclean:\n")),
+    ("P5 MAKEFLAGS -k after a backslash with no space", {"P5"},
+     lambda t: edit(t / "Makefile", "BUILD ?= build", "MAKEFLAGS += -s\\\n-k\nBUILD ?= build")),
     ("P5 '|| exit 0'", {"P5"},
      lambda t: edit(t / "Makefile", "\trm -rf $(BUILD)", "\trm -rf $(BUILD) || exit 0")),
     ("allow '|| exit 1' and ':' in a URL", set(),

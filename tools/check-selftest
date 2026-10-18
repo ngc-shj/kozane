@@ -45,7 +45,7 @@ KANI_HARNESS = (
 # runs. The recipe is read from the Makefile, so a new gate without a case
 # fails the selftest.
 CASES_FOR_GATE = {
-    "clean-counts": {"stale-counts"},
+    "clean-counts": {"stale-counts", "check-propagation"},
     "pins": {"pins"},
     "lint": {"lint"},
     "unit": {"unit"},
@@ -76,7 +76,12 @@ def check_gates(text: str = "") -> list:
             continue
         if not line.startswith("\t"):
             break
-        words = line.lstrip("\t@+- ").split()
+        body = line.lstrip("\t ")
+        command = body.lstrip("@+- ")
+        # `-` in the prefix makes make ignore a failing gate; only @ and + are allowed.
+        if "-" in body[: len(body) - len(command)]:
+            raise GateParseError(f"`check` recipe line ignores errors: {line.strip()!r}")
+        words = command.split()
         if words[:1] != ["$(MAKE)"]:
             raise GateParseError(f"`check` recipe line is not a $(MAKE) call: {line.strip()!r}")
         gates += words[1:]
@@ -100,6 +105,11 @@ CASES = {
     "kani-cache": (["kani", "kani_crates=ingress-core"],
                    lambda t: append(t, "crates/wire/src/lib.rs", "\n// selftest: cache key input\n"),
                    "Checking harness"),
+    # End to end through the real `check` rule: a failing gate must fail
+    # `make check` however the rule is spelled (an error-ignore prefix or a
+    # .IGNORE built from a variable would make this case fail). pins runs
+    # first after clean-counts, so this stops early.
+    "check-propagation": (["check"], lambda t: edit(t, "Makefile", "\trm -rf $(BUILD)", "\t-rm -rf $(BUILD)"), "P5"),
     # A count file that is not regenerated must be reported missing.
     "stale-counts": (["clean-counts", "manifest"], lambda t: None, "missing (gate did not run)"),
     "lint": (["lint"], lambda t: append(t, "crates/wire/src/lib.rs",
