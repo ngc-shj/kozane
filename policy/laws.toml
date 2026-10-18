@@ -1,0 +1,151 @@
+# policy/laws.toml — C7 laws-checker policy (tools/laws).
+#
+# Describes the architecture-wide allowlist that `tools/laws check` enforces
+# against a Microkit `.system` file. See
+# docs/archive/review/secureos-pq-vpn-architecture-plan.md, "Architecture-wide
+# security laws" (L1-L13) and contract C7, for the laws themselves.
+# Anything in the `.system` not described here is a violation of L4
+# (default deny).
+#
+# Schema:
+#
+#   [pds.<name>]
+#   role = "driver" | "untrusted_input" | "key" | "data" | "service"
+#     Every pd in the `.system` must have an entry here. `driver` pds may
+#     own device/dma mrs (L5); `key` is the sole secrets holder and taint
+#     exemption (L1, L2); `untrusted_input`, `data` and `service` carry no
+#     extra mr privileges of their own but matter for taint reporting and
+#     priority ordering (below). Any role, including `driver`, may be the
+#     producer of a `data`-kind mr (below) — producing a shared region is a
+#     structural (C3) property, not tied to the `data` role tag, which
+#     names the dedicated transport-key-holding pd of later milestones.
+#
+#   [mrs.<name>]
+#   kind = "device" | "dma" | "secrets" | "data" | "plain"
+#     device: owner = "<driver pd>"
+#       MMIO owned by exactly that driver, page-granular (L5): its
+#       `phys_addr`/`size` range in the `.system` must not overlap another
+#       driver's device mr, and only the owner may map it.
+#     dma: owner = "<driver pd>"
+#       A DMA buffer, mapped only into its owning driver (L5) and never
+#       shared as a `data` region. `setvar region_paddr` may only name a
+#       driver's own dma mr, from within that driver (L5).
+#     secrets: (no extra fields)
+#       The one mr holding static secrets (L2); at most one may exist.
+#       Mapped only into a `key`-role pd; `prefill_path` is only valid on
+#       this mr.
+#     data: producer = "<pd>", consumers = ["<pd>", ...]
+#       Tunnelled-plaintext-shaped sharing (L3): the producer may map with
+#       any perms, every consumer must map it read-only, and no other pd
+#       may map it at all.
+#     plain: shares = { "<pd>" = "<perms>", ... }
+#       Any other mr shared between pds (e.g. a ring's free/used metadata,
+#       which both sides mutate): each listed pd's actual `.system` map
+#       perms must be within what is listed here.
+#
+#   [[channels]]
+#   between = ["<pd>", "<pd>"]
+#     Every channel in the `.system` must name a pair declared here
+#     (unordered; L4 default deny otherwise).
+#
+#   [priority]
+#   below = [["<role>", "<role>"]]
+#     Every pd of the first role must have a strictly lower `priority`
+#     value than every pd of the second role (L13; e.g.
+#     `["untrusted_input", "key"]`). May be empty/omitted; empty is
+#     vacuously satisfied while no `key`/`timer`-equivalent pd exists yet.
+#
+#   [budgets]
+#   ratio_cap = <0 < x <= 1>
+#   ratio_sum_cap = <0 < x <= 1>
+#     L13 availability caps applied to every tainted pd (L1): each tainted
+#     pd's budget/period ratio must be <= ratio_cap, and the sum of those
+#     ratios over all tainted pds must be <= ratio_sum_cap. A tainted pd
+#     also needs an *explicit* `budget` and `period` attribute with
+#     budget < period (relying on the Microkit default is itself a
+#     violation).
+#
+# Design notes (decisions not spelled out by C7 itself, so recorded here):
+#   - "Maps a NIC device" (L1's taint seed) is generalised to "maps any
+#     policy-declared device-kind mr": M0/M1 only has NIC devices, so this
+#     is equivalent for now and keeps the rule simple.
+#   - "x permission on shared maps" is enforced for any mr mapped by more
+#     than one distinct pd in the `.system`, regardless of kind.
+#   - DOCTYPE, entities and duplicate attributes are rejected by the XML
+#     parser itself (exit 2, a parse error), not reported as a law
+#     violation — see tools/laws/src/sdf.rs.
+#
+# Current system (M1 bring-up: `eth_out` driver, `ingress`, `audit`):
+#   `eth_out` owns the one virtio-net device and its DMA buffer (L5).
+#   `ingress` parses attacker-controlled frames relayed through `eth_out`
+#   (untrusted_input). `audit` drains both pds' event rings. All three are
+#   tainted: `eth_out` seeds taint by mapping the NIC, and it propagates to
+#   `ingress` and `audit` over the shared rx/tx and audit rings (L1). There
+#   is no `key` pd yet, so `priority.below` is empty.
+
+[pds.eth_out]
+role = "driver"
+
+[pds.ingress]
+role = "untrusted_input"
+
+[pds.audit]
+role = "service"
+
+[mrs.eth_out_mmio]
+kind = "device"
+owner = "eth_out"
+
+[mrs.eth_out_dma]
+kind = "dma"
+owner = "eth_out"
+
+[mrs.net_rx_used]
+kind = "plain"
+shares = { eth_out = "rw", ingress = "rw" }
+
+[mrs.net_rx_free]
+kind = "plain"
+shares = { eth_out = "rw", ingress = "rw" }
+
+[mrs.net_rx_data]
+kind = "data"
+producer = "eth_out"
+consumers = ["ingress"]
+
+[mrs.net_tx_used]
+kind = "plain"
+shares = { eth_out = "rw", ingress = "rw" }
+
+[mrs.net_tx_free]
+kind = "plain"
+shares = { eth_out = "rw", ingress = "rw" }
+
+[mrs.net_tx_data]
+kind = "data"
+producer = "ingress"
+consumers = ["eth_out"]
+
+[mrs.audit_ingress]
+kind = "plain"
+shares = { ingress = "rw", audit = "rw" }
+
+[mrs.audit_eth_out]
+kind = "plain"
+shares = { eth_out = "rw", audit = "rw" }
+
+[[channels]]
+between = ["eth_out", "ingress"]
+
+[[channels]]
+between = ["eth_out", "audit"]
+
+[[channels]]
+between = ["ingress", "audit"]
+
+[budgets]
+# eth_out and ingress each run at ratio 0.2 (2_000/10_000), audit at 0.1
+# (1_000/10_000); sum 0.5. Caps leave headroom for one more similarly-sized
+# tainted pd before M1 is done, without being toothless.
+ratio_cap = 0.25
+ratio_sum_cap = 0.6

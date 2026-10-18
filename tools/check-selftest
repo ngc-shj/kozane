@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+"""Proves every gate in `make check` can fail (plan C2, T8, T15).
+
+For each layer: copy the repo to a scratch dir, inject one deliberate
+failure (a failed anchor match is a hard error), run ONLY that layer's make
+target there, and require (a) a non-zero exit and (b) output naming the
+injected item. Run inside the dev container.
+
+Usage: check-selftest [layer ...]
+"""
+
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+# "crashes": old local crash files must not make the bolero case pass.
+SKIP = {"build", "target", ".git", "crashes"}
+
+
+def edit(tree: pathlib.Path, rel: str, old: str, new: str):
+    p = tree / rel
+    text = p.read_text()
+    if text.count(old) != 1:
+        raise SystemExit(f"selftest: injection anchor in {rel} matched {text.count(old)} times: {old!r}")
+    p.write_text(text.replace(old, new))
+
+
+def append(tree: pathlib.Path, rel: str, text: str):
+    p = tree / rel
+    if not p.exists():
+        raise SystemExit(f"selftest: {rel} missing")
+    p.write_text(p.read_text() + text)
+
+
+UNIT_TEST = "\n#[test]\nfn selftest_injected_failure() {\n    assert_eq!(1, 2);\n}\n"
+KANI_HARNESS = (
+    "\n#[kani::proof]\nfn selftest_unsatisfiable_cover() {\n"
+    "    let x: u8 = kani::any();\n    kani::cover!(x > 1 && x < 1);\n}\n"
+)
+
+# layer -> (make targets, injection, text that must appear in the output)
+CASES = {
+    "unit": (["unit"], lambda t: append(t, "crates/wire/src/tests.rs", UNIT_TEST), "selftest_injected_failure"),
+    # Only ring: the injection invalidates every proof cache entry, and
+    # re-proving wire takes ~40 minutes.
+    "kani": (["kani", "kani_crates=ring"], lambda t: append(t, "crates/ring/src/proofs.rs", KANI_HARNESS), "selftest_unsatisfiable_cover"),
+    "bolero": (["bolero"], lambda t: edit(t, "crates/wire/src/tests.rs",
+                                          "for_each(|bytes: &[u8]| check(bytes))",
+                                          "for_each(|bytes: &[u8]| if bytes.len() >= 20 { std::eprintln!(\"selftest-bolero-injected\"); panic!() })"),
+               # bolero hides the panic message, so the injection prints its own.
+               "selftest-bolero-injected"),
+    "lint": (["lint"], lambda t: append(t, "crates/wire/src/lib.rs",
+                                        "\npub fn selftest_lint(b: &[u8]) -> u8 {\n    b[0]\n}\n"), "indexing"),
+    "laws": (["laws"], lambda t: edit(t, "system/secureos.system", "</system>", "    <selftest_unknown />\n</system>"), "L4"),
+    "pins": (["pins"], lambda t: edit(t, "Makefile", "\trm -rf $(BUILD)", "\t-rm -rf $(BUILD)"), "P5"),
+    "integration": (["test"], lambda t: edit(t, "tests/integration/run.py",
+                                              "if r[42:42 + len(nonce)] != nonce",
+                                              "if r[42:42 + len(nonce)] == nonce"), "bad echo"),
+    # Deleting a test keeps `unit` green; only the manifest comparison notices.
+    "manifest": (["unit", "manifest"], lambda t: edit(t, "crates/audit-event/src/tests.rs",
+                                                     "#[test]\nfn first_occurrence_emits()",
+                                                     "#[allow(dead_code)]\nfn first_occurrence_emits()"), "UNIT-TESTS"),
+}
+
+
+def copy_repo(dst: pathlib.Path):
+    for item in ROOT.iterdir():
+        if item.name in SKIP:
+            continue
+        if item.is_dir():
+            shutil.copytree(item, dst / item.name, ignore=shutil.ignore_patterns(*SKIP))
+        else:
+            shutil.copy2(item, dst / item.name)
+
+
+def run_case(name: str) -> bool:
+    targets, inject, needle = CASES[name]
+    with tempfile.TemporaryDirectory(prefix=f"selftest-{name}-") as d:
+        tree = pathlib.Path(d)
+        copy_repo(tree)
+        # Populate counts the manifest needs from the real tree, except the
+        # layer under test, so only the injected layer can fail.
+        if "manifest" in targets:
+            shutil.copytree(ROOT / "build/counts", tree / "build/counts")
+        inject(tree)
+        out = subprocess.run(["make", "-C", str(tree), *targets], capture_output=True, text=True)
+        text = out.stdout + out.stderr
+    ok = out.returncode != 0 and needle in text
+    print(f"{'ok  ' if ok else 'FAIL'} {name}: exit={out.returncode} needle={needle!r} found={needle in text}")
+    if not ok:
+        print(text[-3000:])
+    return ok
+
+
+def main() -> int:
+    names = sys.argv[1:] or list(CASES)
+    results = [run_case(n) for n in names]
+    print(f"SELFTEST-LAYERS {sum(results)}")
+    return 0 if all(results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

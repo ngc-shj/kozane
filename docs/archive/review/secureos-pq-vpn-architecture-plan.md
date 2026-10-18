@@ -225,3 +225,21 @@ laws checker, proofs for `ring`, `wire` and the driver copy path.
 | C6 | `ingress` v1 | locked |
 | C7 | Laws checker | locked |
 | C8 | `audit` PD and event schema | locked |
+
+## Implementation Checklist (iteration 1)
+
+Greenfield: no existing shared utilities to reuse; rust-sel4 `sel4-shared-ring-buffer` deliberately not reused (C3, F11). No CI config exists yet (SC9), so `make check` is the full gate set.
+
+| Contract | Files |
+|---|---|
+| C1 | `docker/Dockerfile`, `docker/Makefile`, `docker/keys/microkit-release.asc`, `rust-toolchain.toml`, `Cargo.lock`, `tools/check-pins`, `tests/tools/test_check_pins.py` |
+| C2 | `Makefile`, `tools/kani-gate.sh`, `tools/check-manifest`, `tools/check-selftest`, `tests/manifest.txt`, `tests/integration/run.py` |
+| C3 | `crates/ring/src/{lib,shmem,link,tests,proofs}.rs` |
+| C4 | `crates/wire/src/{lib,tests,proofs}.rs`, `crates/wire/src/__fuzz__/*/corpus/seed-*` |
+| C5 | `crates/pds/eth-out/`, `ring::link` proofs |
+| C6 | `crates/ingress-core/`, `crates/pds/ingress/` |
+| C7 | `tools/laws/`, `policy/laws.toml` |
+| C8 | `crates/audit-event/`, `crates/pds/audit/` |
+| shared | `crates/layout/`, `system/secureos.system`, `support/targets/aarch64-sel4-microkit.json`, `.cargo/config.toml` |
+
+Patterns applied at every site: copy-in before parse; `checked_*`/`saturating_*` arithmetic under `clippy::arithmetic_side_effects`; `unsafe` only in `ring::shmem` and the PD `init` functions mapping Microkit regions; no `unwrap`/`expect`/`panic` outside PD init and tests.

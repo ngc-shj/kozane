@@ -1,0 +1,19 @@
+[pds.driver]
+role = "driver"
+
+[pds.key]
+role = "key"
+
+[mrs.device_mr]
+kind = "device"
+owner = "driver"
+
+[mrs.secrets_mr]
+kind = "secrets"
+
+[[channels]]
+between = ["driver", "key"]
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9

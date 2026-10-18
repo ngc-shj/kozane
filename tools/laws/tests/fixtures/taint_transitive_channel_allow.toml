@@ -1,0 +1,22 @@
+[pds.driver]
+role = "driver"
+
+[pds.mid]
+role = "service"
+
+[pds.far]
+role = "service"
+
+[mrs.device_mr]
+kind = "device"
+owner = "driver"
+
+[[channels]]
+between = ["driver", "mid"]
+
+[[channels]]
+between = ["mid", "far"]
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9

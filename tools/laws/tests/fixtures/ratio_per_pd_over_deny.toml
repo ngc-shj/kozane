@@ -1,0 +1,10 @@
+[pds.driver]
+role = "driver"
+
+[mrs.device_mr]
+kind = "device"
+owner = "driver"
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.95

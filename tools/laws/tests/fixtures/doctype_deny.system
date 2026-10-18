@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE system [<!ENTITY xxe "boom">]>
+<system>
+    <protection_domain name="hello" priority="1">
+        <program_image path="hello.elf" />
+    </protection_domain>
+</system>

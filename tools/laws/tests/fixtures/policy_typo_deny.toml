@@ -1,0 +1,9 @@
+[pds.hello]
+role = "service"
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[priorty]
+below = [["untrusted_input", "key"]]

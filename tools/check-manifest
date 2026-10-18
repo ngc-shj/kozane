@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Compares gate counts in a counts directory with the committed manifest.
+
+Usage: check-manifest <manifest.txt> <counts-dir>
+Each manifest line is "<KEY> <minimum>". Every key must appear in some
+counts file with a value >= its minimum and > 0. Exit 1 otherwise.
+"""
+
+import pathlib
+import sys
+
+
+def main() -> int:
+    manifest, counts_dir = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+    want = {}
+    for line in manifest.read_text().splitlines():
+        line = line.split("#", 1)[0].strip()
+        if line:
+            key, n = line.split()
+            want[key] = int(n)
+    got = {}
+    for f in counts_dir.iterdir():
+        if f.is_file() and f.suffix != ".log":
+            for line in f.read_text().splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    got[parts[0]] = int(parts[1])
+    bad = []
+    for key, n in want.items():
+        v = got.get(key)
+        if v is None:
+            bad.append(f"{key}: missing (gate did not run)")
+        elif v == 0 or v < n:
+            bad.append(f"{key}: {v} < manifest {n}")
+    for b in bad:
+        print(f"check-manifest: {b}")
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

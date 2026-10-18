@@ -1,0 +1,5 @@
+# Pinned to the toolchain rust-sel4 is tested with (rust-sel4 rev in Cargo.toml).
+[toolchain]
+channel = "nightly-2026-08-21"
+profile = "minimal"
+components = ["rust-src", "rustfmt", "clippy"]

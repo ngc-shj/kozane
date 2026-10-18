@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Positive pin rules for the dev environment and gates (plan C1, C2).
+
+Usage: check-pins [--root DIR]
+Exit 0 when every rule holds; 1 with one line per violation; prints
+"CHECK-PINS-RULES <n>" for the count manifest.
+
+Rules:
+  P1 every curl/wget download in docker/Dockerfile is followed, within the
+     same RUN, by `sha256sum -c`
+  P2 no download is piped into a shell
+  P3 every git dependency in a Cargo.toml has rev = "<40 hex>" and no
+     branch/tag
+  P4 docker/Dockerfile PD_TOOLCHAIN equals the channel in rust-toolchain.toml
+  P5 Makefile: SHELL is bash with -euo pipefail; no .IGNORE, no -i/-k in
+     MAKEFLAGS, no '-' or '@-' recipe prefix, no `|| true`, `|| :`,
+     `; true`, `set +e`
+"""
+
+import argparse
+import pathlib
+import re
+import sys
+
+RULES = ["P1", "P2", "P3", "P4", "P5"]
+
+
+def run_blocks(dockerfile: str):
+    """Yields (start_line, text) for each RUN instruction incl. continuations."""
+    lines = dockerfile.splitlines()
+    i = 0
+    while i < len(lines):
+        if lines[i].lstrip().startswith("RUN "):
+            start, buf = i + 1, [lines[i]]
+            while lines[i].rstrip().endswith("\\") and i + 1 < len(lines):
+                i += 1
+                buf.append(lines[i])
+            yield start, "\n".join(buf)
+        i += 1
+
+
+def check_dockerfile(text: str, out: list):
+    for n, line in enumerate(text.splitlines(), 1):
+        if re.match(r"\s*ADD\s+(\S+\s+)*https?://", line):
+            out.append(f"P1 docker/Dockerfile:{n}: ADD from a URL is not hash-checked")
+    for start, block in run_blocks(text):
+        for m in re.finditer(r"\bgit\s+clone\b[^\n]*", block):
+            out.append(f"P1 docker/Dockerfile:{start}: git clone is not hash-pinned; download a release archive")
+        # A command, not a package name in an apt list ("curl \\").
+        for m in re.finditer(r"\b(curl|wget)\s+(?!\\)\S[^\n]*", block):
+            line = m.group(0)
+            if re.search(r"\|\s*(ba|z|da)?sh\b", line):
+                out.append(f"P2 docker/Dockerfile:{start}: download piped into a shell")
+                continue
+            # The hash check must name the downloaded file itself, not just
+            # appear somewhere later in the block.
+            target = re.search(r"(?:-o|-O|--output)\s+(\S+)", line)
+            if not target:
+                out.append(f"P1 docker/Dockerfile:{start}: download without -o <file> to hash-check")
+                continue
+            name = target.group(1).strip('"')
+            checked = any(name in l and "sha256sum -c" in l for l in block[m.end():].splitlines())
+            if not checked:
+                out.append(f"P1 docker/Dockerfile:{start}: {name} downloaded without its own sha256sum -c")
+
+
+def check_cargo(path: pathlib.Path, rel: str, out: list):
+    for n, line in enumerate(path.read_text().splitlines(), 1):
+        if "git" not in line or "=" not in line or not re.search(r"\bgit\s*=", line):
+            continue
+        if re.search(r"\b(branch|tag)\s*=", line):
+            out.append(f"P3 {rel}:{n}: git dependency uses branch/tag")
+        if not re.search(r'\brev\s*=\s*"[0-9a-f]{40}"', line):
+            out.append(f"P3 {rel}:{n}: git dependency without a 40-hex rev")
+
+
+def check_toolchain(docker: str, toolchain: str, out: list):
+    d = re.search(r"^ARG PD_TOOLCHAIN=(\S+)", docker, re.M)
+    t = re.search(r'^channel\s*=\s*"([^"]+)"', toolchain, re.M)
+    if not d or not t or d.group(1) != t.group(1):
+        out.append(f"P4 PD_TOOLCHAIN ({d and d.group(1)}) != rust-toolchain.toml ({t and t.group(1)})")
+
+
+def check_makefile(text: str, rel: str, out: list):
+    if not re.search(r"^SHELL\s*:?=\s*bash\b", text, re.M):
+        out.append(f"P5 {rel}: SHELL is not bash")
+    if not re.search(r"^\.SHELLFLAGS\s*:?=\s*-euo pipefail -c\s*$", text, re.M):
+        out.append(f"P5 {rel}: .SHELLFLAGS is not '-euo pipefail -c'")
+    for n, line in enumerate(text.splitlines(), 1):
+        if re.match(r"^\.IGNORE\b", line):
+            out.append(f"P5 {rel}:{n}: .IGNORE")
+        if re.match(r"^MAKEFLAGS\b.*(\s|^|=)-[a-zA-Z]*[ik]", line):
+            out.append(f"P5 {rel}:{n}: MAKEFLAGS ignores errors")
+        if re.match(r"^\t@?-", line):
+            out.append(f"P5 {rel}:{n}: recipe error-ignore prefix")
+        if re.search(r"\|\|\s*(true|:)\b|;\s*true\b|\bset \+e\b", line):
+            out.append(f"P5 {rel}:{n}: masked exit status")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default=".")
+    root = pathlib.Path(ap.parse_args().root)
+    out: list = []
+    docker = (root / "docker/Dockerfile").read_text()
+    check_dockerfile(docker, out)
+    for p in sorted(root.glob("**/Cargo.toml")):
+        if any(part in ("target", "build") for part in p.parts):
+            continue
+        check_cargo(p, str(p.relative_to(root)), out)
+    check_toolchain(docker, (root / "rust-toolchain.toml").read_text(), out)
+    check_makefile((root / "Makefile").read_text(), "Makefile", out)
+    for line in out:
+        print(line)
+    print(f"CHECK-PINS-RULES {len(RULES)}")
+    return 1 if out else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,65 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  M1 layout. Sizes must match crates/layout. Laws are checked by tools/laws
+  against policy/laws.toml before the Microkit tool runs.
+-->
+<system>
+    <!-- Outside NIC: QEMU virt virtio-mmio slot 31 (0xa003e00), SPI 47. -->
+    <memory_region name="eth_out_mmio" size="0x1000" phys_addr="0xa003000" />
+    <memory_region name="eth_out_dma" size="0x200_000" page_size="0x200_000" />
+
+    <memory_region name="net_rx_used" size="0x1000" />
+    <memory_region name="net_rx_free" size="0x1000" />
+    <memory_region name="net_rx_data" size="0x20_000" />
+    <memory_region name="net_tx_used" size="0x1000" />
+    <memory_region name="net_tx_free" size="0x1000" />
+    <memory_region name="net_tx_data" size="0x20_000" />
+
+    <memory_region name="audit_ingress" size="0x1000" />
+    <memory_region name="audit_eth_out" size="0x1000" />
+
+    <protection_domain name="eth_out" priority="150" budget="2_000" period="10_000" stack_size="0x10_000">
+        <program_image path="pd-eth-out.elf" />
+        <map mr="eth_out_mmio" vaddr="0x2_000_000" perms="rw" cached="false" setvar_vaddr="eth_out_mmio_vaddr" />
+        <map mr="eth_out_dma" vaddr="0x4_000_000" perms="rw" setvar_vaddr="eth_out_dma_vaddr" />
+        <setvar symbol="eth_out_dma_paddr" region_paddr="eth_out_dma" />
+        <map mr="net_rx_used" vaddr="0x6_000_000" perms="rw" setvar_vaddr="net_rx_used" />
+        <map mr="net_rx_free" vaddr="0x6_001_000" perms="rw" setvar_vaddr="net_rx_free" />
+        <map mr="net_rx_data" vaddr="0x6_100_000" perms="rw" setvar_vaddr="net_rx_data" />
+        <map mr="net_tx_used" vaddr="0x6_002_000" perms="rw" setvar_vaddr="net_tx_used" />
+        <map mr="net_tx_free" vaddr="0x6_003_000" perms="rw" setvar_vaddr="net_tx_free" />
+        <map mr="net_tx_data" vaddr="0x6_200_000" perms="r" setvar_vaddr="net_tx_data" />
+        <map mr="audit_eth_out" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_eth_out" />
+        <irq irq="79" id="0" />
+    </protection_domain>
+
+    <protection_domain name="ingress" priority="100" budget="2_000" period="10_000" stack_size="0x10_000">
+        <program_image path="pd-ingress.elf" />
+        <map mr="net_rx_used" vaddr="0x6_000_000" perms="rw" setvar_vaddr="net_rx_used" />
+        <map mr="net_rx_free" vaddr="0x6_001_000" perms="rw" setvar_vaddr="net_rx_free" />
+        <map mr="net_rx_data" vaddr="0x6_100_000" perms="r" setvar_vaddr="net_rx_data" />
+        <map mr="net_tx_used" vaddr="0x6_002_000" perms="rw" setvar_vaddr="net_tx_used" />
+        <map mr="net_tx_free" vaddr="0x6_003_000" perms="rw" setvar_vaddr="net_tx_free" />
+        <map mr="net_tx_data" vaddr="0x6_200_000" perms="rw" setvar_vaddr="net_tx_data" />
+        <map mr="audit_ingress" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_ingress" />
+    </protection_domain>
+
+    <protection_domain name="audit" priority="50" budget="1_000" period="10_000" stack_size="0x10_000">
+        <program_image path="pd-audit.elf" />
+        <map mr="audit_ingress" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_ingress" />
+        <map mr="audit_eth_out" vaddr="0x7_001_000" perms="rw" setvar_vaddr="audit_eth_out" />
+    </protection_domain>
+
+    <channel>
+        <end pd="eth_out" id="1" />
+        <end pd="ingress" id="1" />
+    </channel>
+    <channel>
+        <end pd="eth_out" id="2" />
+        <end pd="audit" id="2" />
+    </channel>
+    <channel>
+        <end pd="ingress" id="2" />
+        <end pd="audit" id="1" />
+    </channel>
+</system>

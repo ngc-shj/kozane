@@ -1,0 +1,24 @@
+[pds.driver]
+role = "driver"
+
+[pds.mid]
+role = "service"
+
+[pds.far]
+role = "service"
+
+[mrs.device_mr]
+kind = "device"
+owner = "driver"
+
+[mrs.link_1]
+kind = "plain"
+shares = { driver = "rw", mid = "rw" }
+
+[mrs.link_2]
+kind = "plain"
+shares = { mid = "rw", far = "rw" }
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9

@@ -1,0 +1,380 @@
+//! Ethernet / ARP / IPv4 / UDP parsing and emission for untrusted frames.
+//!
+//! `parse_frame` is total: every input yields either a `Frame` or a
+//! `DropReason`, and it never panics (proved by the Kani harnesses in
+//! `proofs`). It accepts only the narrow subset `ingress` needs: no VLANs,
+//! no IPv4 options, no fragments.
+
+#![no_std]
+#![deny(
+    unsafe_code,
+    clippy::indexing_slicing,
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::arithmetic_side_effects
+)]
+
+pub type Mac = [u8; 6];
+pub type Ipv4 = [u8; 4];
+
+pub const ETH_HDR: usize = 14;
+pub const ARP_LEN: usize = 28;
+pub const IPV4_HDR: usize = 20;
+pub const UDP_HDR: usize = 8;
+/// Largest frame we emit or accept (no jumbo frames, no FCS).
+pub const MAX_FRAME: usize = 1514;
+pub const MAX_UDP_PAYLOAD: usize = MAX_FRAME - ETH_HDR - IPV4_HDR - UDP_HDR;
+
+const ETHERTYPE_IPV4: u16 = 0x0800;
+const ETHERTYPE_ARP: u16 = 0x0806;
+const IPPROTO_UDP: u8 = 17;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EthAddrs {
+    pub src: Mac,
+    pub dst: Mac,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArpOp {
+    Request,
+    Reply,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArpPacket {
+    pub op: ArpOp,
+    pub sha: Mac,
+    pub spa: Ipv4,
+    pub tha: Mac,
+    pub tpa: Ipv4,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Udp4<'a> {
+    pub src: Ipv4,
+    pub dst: Ipv4,
+    pub sport: u16,
+    pub dport: u16,
+    pub payload: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Body<'a> {
+    Arp(ArpPacket),
+    Udp4(Udp4<'a>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Frame<'a> {
+    pub eth: EthAddrs,
+    pub body: Body<'a>,
+}
+
+/// Declares `DropReason` and `DropReason::ALL` from one list, so a variant
+/// cannot be added without also being in `ALL`.
+macro_rules! drop_reasons {
+    ($($name:ident = $code:literal,)+) => {
+        /// Why a frame was dropped. Values are stable: they appear in audit events.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(u16)]
+        pub enum DropReason {
+            $($name = $code,)+
+        }
+
+        impl DropReason {
+            pub const ALL: &'static [DropReason] = &[$(DropReason::$name,)+];
+        }
+    };
+}
+
+drop_reasons! {
+    TooShort = 1,
+    TooLong = 2,
+    EthBadSrc = 3,
+    UnknownEtherType = 4,
+    ArpMalformed = 5,
+    ArpBadSender = 6,
+    Ipv4Version = 7,
+    Ipv4Options = 8,
+    Ipv4Fragment = 9,
+    Ipv4BadLength = 10,
+    Ipv4BadChecksum = 11,
+    Ipv4BadSrc = 12,
+    NotUdp = 13,
+    UdpBadLength = 14,
+    UdpBadChecksum = 15,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmitError {
+    TooSmall,
+    /// The frame would not be accepted by `parse_frame` (bad source address,
+    /// oversized payload), so it is refused rather than emitted.
+    Invalid,
+}
+
+fn mac_is_valid_src(m: &Mac) -> bool {
+    // Group bit set means multicast/broadcast; all-zero is unassigned.
+    m[0] & 1 == 0 && *m != [0; 6]
+}
+
+fn ipv4_is_valid_src(a: &Ipv4) -> bool {
+    *a != [0; 4] && *a != [255; 4] && (a[0] & 0xf0) != 0xe0
+}
+
+fn get<const N: usize>(b: &[u8], at: usize) -> Option<[u8; N]> {
+    let end = at.checked_add(N)?;
+    b.get(at..end)?.try_into().ok()
+}
+
+fn be16(b: &[u8], at: usize) -> Option<u16> {
+    get::<2>(b, at).map(u16::from_be_bytes)
+}
+
+/// One's-complement sum folded to 16 bits, over `data` plus an initial sum.
+fn csum_add(mut sum: u32, data: &[u8]) -> u32 {
+    let (pairs, rest) = data.as_chunks::<2>();
+    for pair in pairs {
+        sum = sum.wrapping_add(u32::from(u16::from_be_bytes(*pair)));
+    }
+    if let [last] = rest {
+        sum = sum.wrapping_add(u32::from(*last) << 8);
+    }
+    sum
+}
+
+fn csum_fold(mut sum: u32) -> u16 {
+    while sum >> 16 != 0 {
+        sum = (sum & 0xffff).wrapping_add(sum >> 16);
+    }
+    !(sum as u16)
+}
+
+fn udp_pseudo_sum(src: &Ipv4, dst: &Ipv4, udp_len: u16) -> u32 {
+    let mut sum = csum_add(0, src);
+    sum = csum_add(sum, dst);
+    sum = sum.wrapping_add(u32::from(IPPROTO_UDP));
+    sum.wrapping_add(u32::from(udp_len))
+}
+
+pub fn parse_frame(b: &[u8]) -> Result<Frame<'_>, DropReason> {
+    if b.len() > MAX_FRAME {
+        return Err(DropReason::TooLong);
+    }
+    let (Some(dst), Some(src), Some(ethertype)) = (get::<6>(b, 0), get::<6>(b, 6), be16(b, 12))
+    else {
+        return Err(DropReason::TooShort);
+    };
+    if !mac_is_valid_src(&src) {
+        return Err(DropReason::EthBadSrc);
+    }
+    let eth = EthAddrs { src, dst };
+    let rest = b.get(ETH_HDR..).ok_or(DropReason::TooShort)?;
+    let body = match ethertype {
+        ETHERTYPE_ARP => Body::Arp(parse_arp(rest)?),
+        ETHERTYPE_IPV4 => Body::Udp4(parse_ipv4_udp(rest)?),
+        _ => return Err(DropReason::UnknownEtherType),
+    };
+    Ok(Frame { eth, body })
+}
+
+fn parse_arp(b: &[u8]) -> Result<ArpPacket, DropReason> {
+    if b.len() < ARP_LEN {
+        return Err(DropReason::TooShort);
+    }
+    let (Some(htype), Some(ptype), Some([hlen, plen]), Some(op)) =
+        (be16(b, 0), be16(b, 2), get::<2>(b, 4), be16(b, 6))
+    else {
+        return Err(DropReason::TooShort);
+    };
+    let op = match op {
+        1 => ArpOp::Request,
+        2 => ArpOp::Reply,
+        _ => return Err(DropReason::ArpMalformed),
+    };
+    if htype != 1 || ptype != ETHERTYPE_IPV4 || hlen != 6 || plen != 4 {
+        return Err(DropReason::ArpMalformed);
+    }
+    let (Some(sha), Some(spa), Some(tha), Some(tpa)) =
+        (get::<6>(b, 8), get::<4>(b, 14), get::<6>(b, 18), get::<4>(b, 24))
+    else {
+        return Err(DropReason::TooShort);
+    };
+    if !mac_is_valid_src(&sha) || !ipv4_is_valid_src(&spa) {
+        return Err(DropReason::ArpBadSender);
+    }
+    Ok(ArpPacket { op, sha, spa, tha, tpa })
+}
+
+fn parse_ipv4_udp(b: &[u8]) -> Result<Udp4<'_>, DropReason> {
+    let hdr = b.get(..IPV4_HDR).ok_or(DropReason::TooShort)?;
+    let (Some([ver_ihl, _tos]), Some(total_len), Some(frag), Some([_ttl, proto])) =
+        (get::<2>(hdr, 0), be16(hdr, 2), be16(hdr, 6), get::<2>(hdr, 8))
+    else {
+        return Err(DropReason::TooShort);
+    };
+    if ver_ihl >> 4 != 4 {
+        return Err(DropReason::Ipv4Version);
+    }
+    if ver_ihl & 0x0f != 5 {
+        return Err(DropReason::Ipv4Options);
+    }
+    // Reserved bit, MF, and fragment offset must all be zero; DF is allowed.
+    if frag & 0xbfff != 0 {
+        return Err(DropReason::Ipv4Fragment);
+    }
+    let total_len = usize::from(total_len);
+    // Trailing bytes beyond total_len are Ethernet padding and are ignored.
+    if total_len < IPV4_HDR || total_len > b.len() {
+        return Err(DropReason::Ipv4BadLength);
+    }
+    if csum_fold(csum_add(0, hdr)) != 0 {
+        return Err(DropReason::Ipv4BadChecksum);
+    }
+    let (Some(src), Some(dst)) = (get::<4>(hdr, 12), get::<4>(hdr, 16)) else {
+        return Err(DropReason::TooShort);
+    };
+    if !ipv4_is_valid_src(&src) {
+        return Err(DropReason::Ipv4BadSrc);
+    }
+    if proto != IPPROTO_UDP {
+        return Err(DropReason::NotUdp);
+    }
+    let udp = b.get(IPV4_HDR..total_len).ok_or(DropReason::Ipv4BadLength)?;
+    let (Some(sport), Some(dport), Some(udp_len), Some(udp_csum)) =
+        (be16(udp, 0), be16(udp, 2), be16(udp, 4), be16(udp, 6))
+    else {
+        return Err(DropReason::UdpBadLength);
+    };
+    if usize::from(udp_len) != udp.len() || udp.len() < UDP_HDR {
+        return Err(DropReason::UdpBadLength);
+    }
+    // A zero checksum means "not computed" in IPv4.
+    if udp_csum != 0 && csum_fold(csum_add(udp_pseudo_sum(&src, &dst, udp_len), udp)) != 0 {
+        return Err(DropReason::UdpBadChecksum);
+    }
+    let payload = udp.get(UDP_HDR..).ok_or(DropReason::UdpBadLength)?;
+    Ok(Udp4 { src, dst, sport, dport, payload })
+}
+
+/// Writes `f` into `out` and returns the frame length. Checksums are computed.
+pub fn emit(f: &Frame<'_>, out: &mut [u8]) -> Result<usize, EmitError> {
+    if !mac_is_valid_src(&f.eth.src) {
+        return Err(EmitError::Invalid);
+    }
+    let len = match &f.body {
+        Body::Arp(a) => {
+            if !mac_is_valid_src(&a.sha) || !ipv4_is_valid_src(&a.spa) {
+                return Err(EmitError::Invalid);
+            }
+            ETH_HDR + ARP_LEN
+        }
+        Body::Udp4(u) => {
+            if !ipv4_is_valid_src(&u.src) || u.payload.len() > MAX_UDP_PAYLOAD {
+                return Err(EmitError::Invalid);
+            }
+            (ETH_HDR + IPV4_HDR + UDP_HDR).saturating_add(u.payload.len())
+        }
+    };
+    let out = out.get_mut(..len).ok_or(EmitError::TooSmall)?;
+    let mut w = Writer { buf: out, at: 0 };
+    w.put(&f.eth.dst);
+    w.put(&f.eth.src);
+    match &f.body {
+        Body::Arp(a) => {
+            w.put(&ETHERTYPE_ARP.to_be_bytes());
+            w.put(&[0, 1, 0x08, 0x00, 6, 4]);
+            let op: u16 = match a.op {
+                ArpOp::Request => 1,
+                ArpOp::Reply => 2,
+            };
+            w.put(&op.to_be_bytes());
+            w.put(&a.sha);
+            w.put(&a.spa);
+            w.put(&a.tha);
+            w.put(&a.tpa);
+        }
+        Body::Udp4(u) => {
+            // Payload is bounded by MAX_UDP_PAYLOAD above, so these fit in u16.
+            let udp_len = u16::try_from(UDP_HDR.saturating_add(u.payload.len()))
+                .map_err(|_| EmitError::Invalid)?;
+            let total_len = u16::try_from((IPV4_HDR + UDP_HDR).saturating_add(u.payload.len()))
+                .map_err(|_| EmitError::Invalid)?;
+            w.put(&ETHERTYPE_IPV4.to_be_bytes());
+            let ip_start = w.at;
+            w.put(&[0x45, 0]);
+            w.put(&total_len.to_be_bytes());
+            w.put(&[0, 0, 0x40, 0, 64, IPPROTO_UDP, 0, 0]);
+            w.put(&u.src);
+            w.put(&u.dst);
+            let udp_start = w.at;
+            w.put(&u.sport.to_be_bytes());
+            w.put(&u.dport.to_be_bytes());
+            w.put(&udp_len.to_be_bytes());
+            w.put(&[0, 0]);
+            w.put(u.payload);
+            let ip_csum = csum_fold(csum_add(0, w.slice(ip_start, IPV4_HDR)));
+            w.patch(ip_start.saturating_add(10), ip_csum);
+            let mut udp_csum = csum_fold(csum_add(
+                udp_pseudo_sum(&u.src, &u.dst, udp_len),
+                w.slice(udp_start, usize::from(udp_len)),
+            ));
+            // An all-zero result is transmitted as 0xffff (RFC 768).
+            if udp_csum == 0 {
+                udp_csum = 0xffff;
+            }
+            w.patch(udp_start.saturating_add(6), udp_csum);
+        }
+    }
+    Ok(len)
+}
+
+/// Sequential writer over a buffer whose size was checked by the caller;
+/// out-of-range writes are silently ignored rather than panicking, and the
+/// round-trip proof would catch any resulting corruption.
+struct Writer<'a> {
+    buf: &'a mut [u8],
+    at: usize,
+}
+
+impl Writer<'_> {
+    fn put(&mut self, data: &[u8]) {
+        let end = self.at.saturating_add(data.len());
+        if let Some(dst) = self.buf.get_mut(self.at..end) {
+            dst.copy_from_slice(data);
+        }
+        self.at = end;
+    }
+
+    fn slice(&self, start: usize, len: usize) -> &[u8] {
+        self.buf.get(start..start.saturating_add(len)).unwrap_or(&[])
+    }
+
+    fn patch(&mut self, at: usize, v: u16) {
+        if let Some(dst) = self.buf.get_mut(at..at.saturating_add(2)) {
+            dst.copy_from_slice(&v.to_be_bytes());
+        }
+    }
+}
+
+/// Property shared by the Kani harness and the bolero target: parsing never
+/// panics, and anything accepted re-emits to an equal frame.
+#[cfg(any(test, kani))]
+#[allow(clippy::panic)]
+pub fn check(bytes: &[u8]) {
+    if let Ok(f) = parse_frame(bytes) {
+        let mut out = [0u8; MAX_FRAME];
+        match emit(&f, &mut out) {
+            Ok(n) => assert!(out.get(..n).map(parse_frame) == Some(Ok(f))),
+            Err(_) => unreachable!("accepted frames must be emittable"),
+        }
+    }
+}
+
+#[cfg(kani)]
+mod proofs;
+
+#[cfg(test)]
+mod tests;

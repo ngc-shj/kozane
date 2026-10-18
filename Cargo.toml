@@ -1,0 +1,26 @@
+[workspace]
+resolver = "3"
+members = ["crates/audit-event", "crates/ingress-core", "crates/layout", "crates/pds/audit", "crates/pds/eth-out", "crates/pds/hello", "crates/pds/ingress", "crates/ring", "crates/wire", "tools/laws"]
+
+[workspace.package]
+edition = "2024"
+license = "BSD-2-Clause"
+
+[workspace.dependencies]
+# Pinned rev: seL4 16.0.0 + Microkit 2.3.0 compatible, toolchain nightly-2026-08-21.
+sel4-microkit = { git = "https://github.com/seL4/rust-sel4", rev = "86a0dbf4f53e6766734331c5df61851489ed38a1", default-features = false }
+sel4-virtio-hal-impl = { git = "https://github.com/seL4/rust-sel4", rev = "86a0dbf4f53e6766734331c5df61851489ed38a1" }
+virtio-drivers = { version = "=0.13.0", default-features = false, features = ["alloc"] }
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+debug = 0
+overflow-checks = true
+
+# Used by `cargo bolero test` (libFuzzer engine).
+[profile.fuzz]
+inherits = "dev"
+opt-level = 3
+incremental = false
+codegen-units = 1

@@ -1,0 +1,7 @@
+/build/
+/target/
+# bolero: keep hand-written seeds only; generated corpus and crash dirs stay local.
+/crates/*/src/__fuzz__/*/corpus/*
+!/crates/*/src/__fuzz__/*/corpus/seed-*
+/crates/*/src/__fuzz__/*/crashes/
+__pycache__/

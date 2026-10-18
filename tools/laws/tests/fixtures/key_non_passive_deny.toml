@@ -1,0 +1,9 @@
+[pds.key]
+role = "key"
+
+[mrs.secrets_mr]
+kind = "secrets"
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9

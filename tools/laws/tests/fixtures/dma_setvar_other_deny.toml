@@ -1,0 +1,13 @@
+[pds.driver]
+role = "driver"
+
+[pds.ingress]
+role = "untrusted_input"
+
+[mrs.dma_mr]
+kind = "dma"
+owner = "driver"
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9

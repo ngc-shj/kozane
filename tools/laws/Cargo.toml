@@ -1,0 +1,16 @@
+[package]
+name = "laws"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+roxmltree = "=0.19.0"
+toml = "=0.9.8"
+serde = { version = "=1.0.229", features = ["derive"] }
+sha2 = "=0.10.9"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
