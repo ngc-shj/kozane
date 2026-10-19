@@ -349,3 +349,30 @@ Functionality: sibling parity (F-R10-1), consumers of changed outputs (F-R10-2);
 
 ## Termination
 The 10-round limit is reached. Every finding through Round 10 is fixed, each with a red-proven fixture or proof and `make check` green; the Round-10 fixes themselves have not had an eleventh review round. Decision recorded with the user (see below).
+
+The user chose "secure": a scoped security spot-check of the Round-10 fixes
+(`f1c4fb0..578a329`: tools/package, tests/integration/run.py and their
+fixtures) before completion, instead of completing as is.
+
+### Spot-check (after Round 10)
+No Critical or Major findings: no secret leaves the staging dir on any exit
+path, publish failures are fail-closed, and no failing run exits 0.
+
+- **S11-1 [Minor] signals_held skips its teardown when the handler runs on
+  entry.** A pending handler can run in contextlib's `__enter__`, before the
+  generator's `try`, so S10-1's hold did not cover it. Each call site now
+  wraps it in `try: ... except SystemExit:` repeating the idempotent
+  teardown. Fixture: every `with signals_held()` in run.py must be the body
+  of a try, and each real call site is executed with SIGTERM injected at
+  `__enter__` (`exit 143` and the kill recorded). Red before the fix
+  (`done=[]`) and when one retry is removed.
+- **S11-2 [Minor] check_systems validated the rewritten .system, not the one
+  microkit consumed (R43).** The consumed file is now checked before the
+  rewrite, and the rewritten one after. Fixture: a .system changed during the
+  microkit run is refused. Red before the fix.
+- **F-R11-1 [Minor] Doubled publish error message.** `publish` raises a
+  one-argument OSError, so its message is printed once. The publish-fails
+  fixture now drives the real `publish` and requires exactly one
+  `package: cannot publish` and no `[Errno`. Red before the fix.
+
+Phase 3 is complete with these fixed and `make check` green.

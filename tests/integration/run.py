@@ -489,8 +489,12 @@ def test_raw(loader: str):
         flood(w, con, "Ipv4BadChecksum", k=640)
         arp_roundtrip(w)
     finally:
-        with signals_held():
+        try:
+            with signals_held():
+                kill(child)
+        except SystemExit:
             kill(child)
+            raise
 
 
 def flood(w: Wire, con: Console, reason: str, k: int):
@@ -743,11 +747,18 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         passed.append("ttl expiry")
         print("\nPASS [TTL 1 dropped, TTL 2 forwarded at the inside hop]")
     finally:
-        with signals_held():
+        try:
+            with signals_held():
+                host.stop = True
+                if wg:
+                    wg.close()
+                kill(child)
+        except SystemExit:
             host.stop = True
             if wg:
                 wg.close()
             kill(child)
+            raise
 
 
 # ---------------------------------------------------------------- boot 3
@@ -762,8 +773,12 @@ def test_mismatched_blob(loader: str):
         con.wait_for(r"key: halted", timeout=LINE_TIMEOUT_S, strip_ready=True)
         con.wait_for(r"MON\|ERROR: faulting PD: key", timeout=LINE_TIMEOUT_S)
     finally:
-        with signals_held():
+        try:
+            with signals_held():
+                kill(child)
+        except SystemExit:
             kill(child)
+            raise
 
 
 # ---------------------------------------------------------------- driver
@@ -902,7 +917,11 @@ def ignore_signals():
 @contextlib.contextmanager
 def signals_held():
     """Blocks stop signals for a teardown in the middle of the run; one that
-    arrives meanwhile is delivered when the teardown has finished."""
+    arrives meanwhile is delivered when the teardown has finished.
+
+    A handler already pending can also run while this is being entered,
+    before its own try: callers wrap it in `try: ... except SystemExit:`
+    repeating the (idempotent) teardown, as final_teardown's caller does."""
     held = None
     try:
         old = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)

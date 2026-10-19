@@ -272,7 +272,8 @@ def publish(src: pathlib.Path, dst: pathlib.Path):
         raise OSError("package: renameat2 unavailable; cannot publish without replacing")
     if libc.renameat2(AT_FDCWD, os.fsencode(src), AT_FDCWD, os.fsencode(dst), RENAME_NOREPLACE) != 0:
         err = ctypes.get_errno()
-        raise OSError(err, f"package: cannot publish {dst}: {os.strerror(err)}")
+        # One argument: str() of the errno form would prefix "[Errno N]".
+        raise OSError(f"package: cannot publish {dst}: {os.strerror(err)}")
 
 
 def build(a, blob: bytes, out: pathlib.Path) -> int:
@@ -291,12 +292,14 @@ def build(a, blob: bytes, out: pathlib.Path) -> int:
     subprocess.run([a.microkit, str(system), "--search-path", a.search_path, "--board", a.board,
                     "--config", a.config, "-r", str(out / "report.txt"), "-o", str(loader)], check=True)
 
-    # The blob now lives only inside the image; drop the private copy, and
-    # make the packaged .system name the operator's blob again (a name only:
-    # nothing here follows it), so it can rebuild the image from that file.
+    # The blob now lives only inside the image; drop the private copy. The
+    # .system microkit consumed is checked before it is replaced by one that
+    # names the operator's blob again (a name only: nothing here follows it),
+    # so the operator can rebuild the image from that file; both are checked.
     blob_copy.unlink()
-    system.write_text(with_prefill(placeholder_system, os.path.abspath(a.secrets)))
     errors = check_systems(placeholder_system, system.read_text())
+    system.write_text(with_prefill(placeholder_system, os.path.abspath(a.secrets)))
+    errors += check_systems(placeholder_system, system.read_text())
     errors += check_images(pathlib.Path(a.image).read_bytes(), loader.read_bytes(), blob)
     if errors:
         print("\n".join(errors))

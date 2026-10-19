@@ -189,7 +189,9 @@ def run_main(build_result):
             real_publish = pkg.publish
 
             def failing_publish(src, dst):
-                raise OSError(22, "Invalid argument")
+                # The real publish, failing (no such parent): its own error
+                # text must reach the operator once, not wrapped again.
+                real_publish(src, dst.parent / "missing" / dst.name)
             if build_result == "early-second-signal":
                 # The second signal lands after the first ended the build and
                 # before the removal: the teardown's own ignoring covers it
@@ -235,8 +237,9 @@ def run_main(build_result):
                 errors.append(f"main() left signals blocked: {sorted(left_blocked - real_sigmask)}")
             expected = {1: 1, "raise": "raised", "out-appears": 1, 0: 0, "signal-in-ignore-loop": 1,
                         "publish-fails": 1}.get(build_result)
-            if build_result == "publish-fails" and "package: cannot publish" not in captured.getvalue():
-                errors.append("a failed publish was not reported as a package: message")
+            if build_result == "publish-fails" and (captured.getvalue().count("package: cannot publish") != 1
+                                                    or "[Errno" in captured.getvalue()):
+                errors.append(f"a failed publish was not reported as one package: message: {captured.getvalue()!r}")
             if expected is not None and status != expected:
                 errors.append(f"status {status}, want {expected}")
             if build_result in ("removal-fails", "signal-and-removal-fails"):
@@ -378,10 +381,16 @@ def handler_ignores_further_signals():
             signal.signal(s, h)
 
 
-def build_uses_the_checked_bytes():
+def build_uses_the_checked_bytes(tamper: bool = False):
     """The image must be built from a private copy of the checked bytes, not
     by following the caller's path again (TOCTOU), and the copy must not be
-    left beside the image."""
+    left beside the image. With `tamper`, the .system microkit consumed
+    differs from the generated one: the build must refuse it, although the
+    packaged .system is rewritten afterwards (S11-2)."""
+    return lambda: _build_case(tamper)
+
+
+def _build_case(tamper: bool):
     d = tmp_tree()
     real_run = pkg.subprocess.run
     seen = {}
@@ -399,6 +408,8 @@ def build_uses_the_checked_bytes():
                        if m.get("name") == pkg.SECRETS_MR][0]
             seen["prefill"] = prefill
             seen["bytes"] = pathlib.Path(prefill).read_bytes()
+            if tamper:
+                system.write_text(system.read_text().replace('priority="140"', 'priority="141"'))
             pathlib.Path(cmd[cmd.index("-o") + 1]).write_bytes(PACKAGE_IMG)
 
         pkg.subprocess.run = fake_run
@@ -408,7 +419,13 @@ def build_uses_the_checked_bytes():
                 str(d / "system.xml"), str(d / "placeholder.img"), "p", "s", "b", "c", "microkit")
             secrets = str(d / "operator" / "secrets.bin")
 
-        status = pkg.build(A, BLOB, staging)
+        captured = io.StringIO()
+        with contextlib.redirect_stdout(captured):
+            status = pkg.build(A, BLOB, staging)
+        if tamper:
+            if status != 1 or "attributes of <protection_domain>" not in captured.getvalue():
+                return [f"a changed consumed .system was accepted (status {status})"]
+            return []
         errors = []
         if status != 0:
             errors.append(f"build failed ({status})")
@@ -502,7 +519,8 @@ CASES = [
     ("staging that resolves into a forbidden root is refused", None, staging_in_forbidden_root),
     ("a failed staging removal fails loudly", None, failed_staging_removal_is_reported),
     ("a signal during the staging removal waits for it", None, signal_during_removal_does_not_cut_it_short),
-    ("the image is built from a private copy of the checked blob", None, build_uses_the_checked_bytes),
+    ("the image is built from a private copy of the checked blob", None, build_uses_the_checked_bytes()),
+    ("a consumed .system that differs from the generated one is refused", None, build_uses_the_checked_bytes(tamper=True)),
     ("publishing refuses to replace an OUT that appeared", None, publish_never_replaces(True)),
     ("publishing to a free OUT succeeds", None, publish_never_replaces(False)),
     ("a failed publish is reported and leaves no OUT or staging", None, run_main("publish-fails")),

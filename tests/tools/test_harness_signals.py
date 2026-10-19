@@ -219,6 +219,62 @@ def signals_held_runs_the_teardown_first() -> list:
     return []
 
 
+CALL_SITE_CHILD = r"""
+import _thread, contextlib, importlib.util, signal, sys, types
+spec = importlib.util.spec_from_file_location("run", sys.argv[1])
+run = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(run)
+for s in run.STOP_SIGNALS:
+    signal.signal(s, run.exit_on_signal)
+done = []
+env = dict(vars(run), kill=lambda child: done.append("kill"), child=None, host=types.SimpleNamespace(stop=False),
+           wg=types.SimpleNamespace(close=lambda: done.append("wg")))
+
+def trace(frame, event, arg):
+    # The pending handler runs on the way into the context manager, before
+    # signals_held's own try can catch its exit.
+    if event == "call" and frame.f_code.co_name == "__enter__" and frame.f_code.co_filename == contextlib.__file__:
+        sys.settrace(None)
+        _thread.interrupt_main(signal.SIGTERM)
+
+sys.settrace(trace)
+try:
+    exec(sys.argv[2], env)
+    print(f"no exit, done={done}")
+except SystemExit as e:
+    print(f"exit {e.code}, done={done}")
+"""
+
+
+def held_teardowns_survive_an_exit_on_entry() -> list:
+    """Every `with signals_held()` in run.py sits in a try that runs its
+    teardown again on SystemExit: a handler that runs while entering the
+    context manager must not skip the kill (S11-1). Each real call site is
+    executed with the teardown recorded."""
+    import ast
+    import textwrap
+    src = (ROOT / "tests/integration/run.py").read_text()
+    tree = ast.parse(src)
+    parents = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+    sites = [n for n in ast.walk(tree) if isinstance(n, ast.With)
+             and any(isinstance(i.context_expr, ast.Call) and getattr(i.context_expr.func, "id", None) == "signals_held"
+                     for i in n.items)]
+    if not sites:
+        return ["no signals_held call sites found"]
+    errors = []
+    for site in sites:
+        enclosing = parents.get(site)
+        if not isinstance(enclosing, ast.Try) or site not in enclosing.body:
+            errors.append(f"line {site.lineno}: signals_held is not the body of a try")
+            continue
+        code = textwrap.dedent(ast.get_source_segment(src, enclosing, padded=True))
+        r = subprocess.run([sys.executable, "-c", CALL_SITE_CHILD, str(ROOT / "tests/integration/run.py"), code],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0 or "exit 143" not in r.stdout or "'kill'" not in r.stdout:
+            errors.append(f"line {site.lineno}: teardown skipped: rc={r.returncode} {r.stdout.strip()!r} {r.stderr[-200:]!r}")
+    return errors
+
+
 def netns_harness_installs_the_guard() -> list:
     """The guard only protects runs that install it: in_netns must do so
     before anything else."""
@@ -251,6 +307,7 @@ CHECKS = [
     ("the final teardown holds an exit until removal", lambda: final_teardown_holds_an_exit()),
     ("ignore_signals blocks before ignoring", lambda: ignore_signals_has_no_window()),
     ("signals_held runs its teardown even if entering it raises", lambda: signals_held_runs_the_teardown_first()),
+    ("every held teardown runs even if the handler fires on entry", lambda: held_teardowns_survive_an_exit_on_entry()),
     ("main returns the failure status when no signal arrives", main_holds_and_reraises("plain", "returned 1, gone=True")),
     ("main re-raises an exit held on entry to its teardown", main_holds_and_reraises("entry", "exit 143, gone=True")),
 ]
