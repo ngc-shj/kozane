@@ -1,14 +1,15 @@
 //! Key oracle PD (plan C10, laws L1/L2): passive, device-less, and the only
 //! PD that maps the secrets region. Validates it against the compiled
 //! configuration at boot and halts on any mismatch; afterwards answers the
-//! fixed-size requests defined in `key-core`, from `hs` only.
+//! fixed-size requests defined in `key-core`, each caller limited to its row
+//! of the caller → label table (`hs` is the only caller).
 
 #![no_std]
 #![no_main]
 
 use core::ptr::NonNull;
 
-use key_core::{Bucket, ERR_BAD_REQUEST, KEY_BURST, KEY_INTERVAL_NS, MAX_WORDS, Oracle};
+use key_core::{Bucket, Caller, ERR_BAD_REQUEST, KEY_BURST, KEY_INTERVAL_NS, MAX_WORDS, Oracle};
 use layout::key as ch;
 use sel4_microkit::{
     Channel, Handler, Infallible, MessageInfo, debug_println, memory_region_symbol, protection_domain,
@@ -17,6 +18,10 @@ use sel4_microkit::{
 use wg_core::crypto::{self, Key32};
 
 const HS: Channel = Channel::new(ch::CH_HS);
+
+fn caller(channel: Channel) -> Option<Caller> {
+    (channel == HS).then_some(Caller::Hs)
+}
 
 /// RNDR samples mixed into the boot seed.
 const SEED_SAMPLES: usize = 4;
@@ -60,7 +65,7 @@ impl Handler for Key {
     fn protected(&mut self, channel: Channel, msg_info: MessageInfo) -> Result<MessageInfo, Self::Error> {
         let mut req = [0u64; MAX_WORDS];
         let count = msg_info.count();
-        if channel != HS || count > MAX_WORDS {
+        if count > MAX_WORDS {
             return Ok(MessageInfo::new(ERR_BAD_REQUEST, 0));
         }
         with_msg_regs(|mrs| {
@@ -69,8 +74,14 @@ impl Handler for Key {
             }
         });
         let mut reply = [0u64; MAX_WORDS];
-        let (label, n) =
-            self.oracle.handle(&mut self.bucket, cpu::now_ns(), msg_info.label(), req.get(..count).unwrap_or(&[]), &mut reply);
+        let (label, n) = self.oracle.handle(
+            caller(channel),
+            &mut self.bucket,
+            cpu::now_ns(),
+            msg_info.label(),
+            req.get(..count).unwrap_or(&[]),
+            &mut reply,
+        );
         // Overwrite every register beyond this reply, so no part of an
         // earlier, longer reply is handed back to `hs`. The reply words
         // themselves stay in `key`'s own IPC buffer until the next call; only

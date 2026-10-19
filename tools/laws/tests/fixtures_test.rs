@@ -87,6 +87,14 @@ fn assert_parse_error(name: &str) {
     );
 }
 
+/// Like [`assert_parse_error`], and the error names `needle`, so the
+/// fixture cannot pass on some other policy error.
+fn assert_parse_error_naming(name: &str, needle: &str) {
+    assert_parse_error(name);
+    let err = stderr(&run(name));
+    assert!(err.contains(needle), "fixture '{name}' failed for another reason (want '{needle}'):\n{err}");
+}
+
 #[test]
 fn secrets_mr_into_untrusted_pd_is_l1_l2() {
     assert_deny("secrets_deny", &["L1", "L2"]);
@@ -397,11 +405,70 @@ fn unknown_attrs_on_system_mr_channel_end_are_l4() {
     assert_deny("unknown_attrs_deny", &["L4"]);
 }
 
-// --- finding 7: more than one key pd (L2) ---
+// --- L2 amendment (M3 plan, Law amendments; contract C2 "Laws fixtures") ---
 
 #[test]
-fn two_key_pds_is_l2() {
-    assert_deny("two_key_pds_deny", &["L2"]);
+fn two_key_pds_with_disjoint_secrets_and_callers_are_allowed() {
+    assert_allow("two_key_disjoint_allow");
+}
+
+#[test]
+fn key_pds_mapping_none_of_their_own_secrets_is_l2() {
+    // Replaces the M2 "more than one key pd" deny: two key pds are now
+    // legal, but each must map exactly the secrets mr it owns.
+    assert_deny("two_key_pds_without_own_secrets_deny", &["L2"]);
+}
+
+#[test]
+fn secrets_mr_shared_by_two_key_pds_is_l2() {
+    assert_deny("two_key_shared_secrets_deny", &["L2"]);
+}
+
+#[test]
+fn caller_with_pp_channels_to_both_key_pds_is_l2() {
+    assert_deny("two_key_caller_of_both_deny", &["L2"]);
+}
+
+#[test]
+fn key_pds_mapping_each_others_secrets_is_l2() {
+    assert_deny("two_key_swapped_owners_deny", &["L2"]);
+}
+
+#[test]
+fn second_key_pd_mapping_a_non_secrets_mr_is_l1_l2() {
+    assert_deny("two_key_maps_non_secrets_deny", &["L1", "L2"]);
+}
+
+#[test]
+fn prefill_path_on_a_non_secrets_mr_beside_two_key_pds_is_l2() {
+    assert_deny("two_key_prefill_non_secrets_deny", &["L2"]);
+}
+
+#[test]
+fn secrets_mr_without_owner_is_a_policy_error() {
+    assert_parse_error_naming("two_key_ownerless_secrets_deny", "secrets mr 'third_secrets' has no owner");
+}
+
+// --- ratio_sum_cap at the 0.95 ceiling (M3 plan, Budgets) ---
+
+#[test]
+fn ratio_sum_exactly_at_the_ceiling_cap_is_allowed() {
+    assert_allow("ratio_sum_at_ceiling_allow");
+}
+
+#[test]
+fn ratio_sum_over_the_ceiling_cap_is_l13() {
+    assert_deny("ratio_sum_over_ceiling_cap_deny", &["L13"]);
+}
+
+#[test]
+fn ratio_sum_cap_one_ulp_above_the_ceiling_is_a_policy_error() {
+    assert_parse_error_naming("ratio_sum_cap_above_ceiling_deny", "budgets.ratio_sum_cap must be in (0, 0.95]");
+}
+
+#[test]
+fn ratio_sum_cap_one_ulp_below_the_ceiling_is_allowed() {
+    assert_allow("ratio_sum_cap_below_ceiling_allow");
 }
 
 // --- finding 8: full coverage sweep ---
@@ -452,8 +519,8 @@ fn perms_beyond_policy_allowance_is_l4() {
 }
 
 #[test]
-fn key_mapping_a_non_secrets_mr_is_l1() {
-    assert_deny("key_maps_non_secrets_deny", &["L1"]);
+fn key_mapping_a_non_secrets_mr_is_l1_l2() {
+    assert_deny("key_maps_non_secrets_deny", &["L1", "L2"]);
 }
 
 #[test]

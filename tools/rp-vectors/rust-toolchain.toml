@@ -1,0 +1,5 @@
+# Upstream rosenpass 9e72f1eb pins this toolchain; docker/Dockerfile's VE9
+# oracle stage builds with the same one (RP_TOOLCHAIN).
+[toolchain]
+channel = "1.93.1"
+profile = "minimal"

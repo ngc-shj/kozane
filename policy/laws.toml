@@ -21,9 +21,11 @@
 #     is exempt from taint only while it maps nothing but its own device
 #     mrs and every channel to it has pp=false on both ends and
 #     notify=false on the peer end (L1); a tainted timer is itself an L1
-#     violation. `key` is the sole secrets holder and
-#     taint exemption (L1, L2) — at most one pd may hold it, and the
-#     secrets mr may be mapped by at most one pd (L2); `untrusted_input`,
+#     violation. `key` pds hold the static secrets and get the
+#     taint exemption (L1, L2); there may be several, each mapping
+#     exactly its own secrets mr and nothing else, and no pd may hold
+#     pp=true channels to two of them (L2: disjoint secrets and disjoint
+#     callers, M3 plan Law amendments); `untrusted_input`,
 #     `data` and `service` carry no extra mr privileges of their own but
 #     matter for taint reporting and priority ordering (below). Any role,
 #     including `driver`, may be the producer of a `data`-kind mr (below)
@@ -44,10 +46,11 @@
 #       A DMA buffer, mapped only into its owning driver (L5) and never
 #       shared as a `data` region. `setvar region_paddr` may only name a
 #       driver's own dma mr, from within that driver (L5).
-#     secrets: (no extra fields)
-#       The one mr holding static secrets (L2); at most one may exist.
-#       Mapped only into a `key`-role pd; `prefill_path` is only valid on
-#       this mr.
+#     secrets: owner = "<key pd>"
+#       An mr holding static secrets (L2). The owner is required (a
+#       secrets mr without one is a policy error) and must have role
+#       `key`; each key pd owns at most one. Mapped only into its owner;
+#       `prefill_path` is valid on every secrets mr and on nothing else.
 #     data: producer = "<pd>", consumers = ["<pd>", ...]
 #       Tunnelled-plaintext-shaped sharing (L3): the producer may map with
 #       any perms, every consumer must map it read-only, and no other pd
@@ -77,7 +80,9 @@
 #
 #   [budgets]
 #   ratio_cap = <0 < x <= 1>
-#   ratio_sum_cap = <0 < x <= 1>
+#   ratio_sum_cap = <0 < x <= 0.95>
+#     The 0.95 ceiling is hard (M3 plan, Budgets): a policy above it is a
+#     policy error, and needing more means re-planning, not an amendment.
 #     L13 availability caps applied to every tainted pd (L1): each tainted
 #     pd's budget/period ratio must be <= ratio_cap, and the sum of those
 #     ratios over all tainted pds must be <= ratio_sum_cap. A tainted pd
@@ -173,6 +178,7 @@ size = 0x1000
 
 [mrs.secrets]
 kind = "secrets"
+owner = "key"
 
 # net_rx: eth_out -> ingress, outside frames in
 [mrs.net_rx_used]

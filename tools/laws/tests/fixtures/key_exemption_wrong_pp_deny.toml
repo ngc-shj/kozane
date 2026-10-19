@@ -12,6 +12,7 @@ size = 0x1000
 
 [mrs.secrets_mr]
 kind = "secrets"
+owner = "key"
 
 [[channels]]
 between = ["driver", "key"]

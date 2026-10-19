@@ -16,6 +16,12 @@ pub struct RawConfig {
 pub struct RawGateway {
     pub public_key: String,
     pub listen_port: u16,
+    /// Rosenpass arrives on its own port (M3 plan F20).
+    pub rp_port: u16,
+    /// The gateway's McEliece public key file (`spkm`), relative to this
+    /// file, and its BLAKE2s-256 in hex.
+    pub rp_pub_path: String,
+    pub rp_hash: String,
     pub outside_ip: String,
     pub outside_mac: String,
     pub outside_router_mac: String,
@@ -36,7 +42,12 @@ pub struct RawNeighbor {
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawPeer {
-    pub public_key: String,
+    /// WireGuard static public key.
+    pub wg_pub: String,
+    /// The peer's McEliece public key file (`spkt`), relative to this file,
+    /// and its BLAKE2s-256 in hex: one record binds both keys (M3 plan S8).
+    pub rp_pub_path: String,
+    pub rp_hash: String,
     pub allowed_ips: Vec<String>,
 }
 
@@ -60,17 +71,33 @@ impl Prefix {
     }
 }
 
+/// A McEliece public key read from its file and checked against its hash.
+#[derive(Debug)]
+pub struct RpKey {
+    pub hash: [u8; 32],
+    pub public: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct CheckedPeer {
+    pub public: [u8; 32],
+    pub allowed: Vec<Prefix>,
+    pub rp: RpKey,
+}
+
 #[derive(Debug)]
 pub struct Checked {
     pub gateway_public: [u8; 32],
     pub listen_port: u16,
+    pub rp_port: u16,
+    pub gateway_rp: RpKey,
     pub outside_ip: [u8; 4],
     pub outside_mac: [u8; 6],
     pub outside_router_mac: [u8; 6],
     pub inside_ip: [u8; 4],
     pub inside_mac: [u8; 6],
     pub neighbors: Vec<([u8; 4], [u8; 6])>,
-    pub peers: Vec<([u8; 32], Vec<Prefix>)>,
+    pub peers: Vec<CheckedPeer>,
 }
 
 pub fn decode_key(s: &str) -> Result<[u8; 32], String> {
@@ -91,6 +118,43 @@ pub fn decode_key(s: &str) -> Result<[u8; 32], String> {
         }
     }
     out.try_into().map_err(|_| format!("key {s:?}: does not decode to 32 bytes"))
+}
+
+/// A 32-byte hash written as 64 hex digits.
+pub fn decode_hash(s: &str) -> Result<[u8; 32], String> {
+    let bad = || format!("hash {s:?}: expected 64 hex digits");
+    if s.len() != 64 || !s.is_ascii() {
+        return Err(bad());
+    }
+    let mut out = [0u8; 32];
+    for (o, i) in out.iter_mut().zip((0..64).step_by(2)) {
+        *o = u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| bad())?;
+    }
+    Ok(out)
+}
+
+pub fn encode_hash(h: &[u8; 32]) -> String {
+    h.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Size of a Classic McEliece 460896 public key, rendered as `RP_PUBLIC_KEY_LEN`.
+pub const RP_PUBLIC_KEY_LEN: usize = secret_blob::pq::PK_LEN;
+
+/// Reads a McEliece public key through `load` and checks its size and hash.
+fn load_rp(path: &str, hash: &str, load: &dyn Fn(&str) -> Result<Vec<u8>, String>) -> Result<RpKey, String> {
+    let public = load(path)?;
+    if public.len() != RP_PUBLIC_KEY_LEN {
+        return Err(format!(
+            "config: McEliece public key {path}: {} bytes, expected {RP_PUBLIC_KEY_LEN}",
+            public.len()
+        ));
+    }
+    let want = decode_hash(hash).map_err(|e| format!("config: rp_hash of {path}: {e}"))?;
+    let hash = secret_blob::blake2s(&[&public]);
+    if hash != want {
+        return Err(format!("config: McEliece public key {path} does not match its rp_hash"));
+    }
+    Ok(RpKey { hash, public })
 }
 
 pub fn parse_ip(s: &str) -> Result<[u8; 4], String> {
@@ -135,30 +199,37 @@ pub const MAX_PEERS: usize = 8;
 pub const MAX_NEIGHBORS: usize = 64;
 
 /// Validates a configuration. `max_peers` is `MAX_PEERS` except in tests.
-pub fn check(text: &str, max_peers: usize) -> Result<Checked, String> {
+/// `load` reads a key file named in the configuration (build.rs resolves it
+/// against the file's directory; tests and mksecrets serve it from memory).
+pub fn check(text: &str, max_peers: usize, load: &dyn Fn(&str) -> Result<Vec<u8>, String>) -> Result<Checked, String> {
     let raw: RawConfig = toml::from_str(text).map_err(|e| format!("config: {e}"))?;
     let g = &raw.gateway;
     if raw.peers.is_empty() || raw.peers.len() > max_peers {
         return Err(format!("config: need 1..={max_peers} peers, got {}", raw.peers.len()));
     }
-    let mut peers = Vec::new();
+    let gateway_rp = load_rp(&g.rp_pub_path, &g.rp_hash, load)?;
+    let mut peers: Vec<CheckedPeer> = Vec::new();
     for p in &raw.peers {
-        let key = decode_key(&p.public_key)?;
-        if peers.iter().any(|(k, _)| *k == key) {
-            return Err(format!("config: duplicate peer {}", p.public_key));
+        let key = decode_key(&p.wg_pub)?;
+        if peers.iter().any(|q| q.public == key) {
+            return Err(format!("config: duplicate peer {}", p.wg_pub));
         }
         if p.allowed_ips.is_empty() {
-            return Err(format!("config: peer {} has no allowed IPs", p.public_key));
+            return Err(format!("config: peer {} has no allowed IPs", p.wg_pub));
         }
-        let prefixes = p
+        let allowed = p
             .allowed_ips
             .iter()
             .map(|s| parse_prefix(s).map_err(|e| format!("config: allowed IP: {e}")))
             .collect::<Result<Vec<_>, _>>()?;
-        peers.push((key, prefixes));
+        let rp = load_rp(&p.rp_pub_path, &p.rp_hash, load)?;
+        if rp.hash == gateway_rp.hash || peers.iter().any(|q| q.rp.hash == rp.hash) {
+            return Err(format!("config: duplicate rp_pub {} (peer {})", p.rp_pub_path, p.wg_pub));
+        }
+        peers.push(CheckedPeer { public: key, allowed, rp });
     }
     // Cryptokey routing needs an unambiguous owner for every address.
-    let all: Vec<(usize, &Prefix)> = peers.iter().enumerate().flat_map(|(i, (_, ps))| ps.iter().map(move |p| (i, p))).collect();
+    let all: Vec<(usize, &Prefix)> = peers.iter().enumerate().flat_map(|(i, q)| q.allowed.iter().map(move |p| (i, p))).collect();
     for (i, (pi, a)) in all.iter().enumerate() {
         for (pj, b) in &all[i + 1..] {
             let (a0, a1) = a.range();
@@ -169,7 +240,7 @@ pub fn check(text: &str, max_peers: usize) -> Result<Checked, String> {
         }
     }
     let gateway_public = decode_key(&g.public_key)?;
-    if peers.iter().any(|(k, _)| *k == gateway_public) {
+    if peers.iter().any(|q| q.public == gateway_public) {
         return Err("config: a peer uses the gateway's own key".into());
     }
     let outside_ip = parse_ip(&g.outside_ip)?;
@@ -201,8 +272,8 @@ pub fn check(text: &str, max_peers: usize) -> Result<Checked, String> {
     // A tunnel source inside a peer's allowed IPs passes `data`'s spoofing
     // check, so no allowed IP may stand for a gateway or inside-host address
     // (otherwise a peer could speak as that host on the inside LAN).
-    for (i, (_, ps)) in peers.iter().enumerate() {
-        for p in ps {
+    for (i, q) in peers.iter().enumerate() {
+        for p in &q.allowed {
             if p.contains(inside_ip) || p.contains(outside_ip) {
                 return Err(format!("config: allowed IPs of peer {i} cover a gateway address"));
             }
@@ -220,9 +291,17 @@ pub fn check(text: &str, max_peers: usize) -> Result<Checked, String> {
     if g.listen_port == 0 {
         return Err("config: listen_port must be non-zero".into());
     }
+    if g.rp_port == 0 {
+        return Err("config: rp_port must be non-zero".into());
+    }
+    if g.rp_port == g.listen_port {
+        return Err("config: rp_port must differ from listen_port".into());
+    }
     Ok(Checked {
         gateway_public,
         listen_port: g.listen_port,
+        rp_port: g.rp_port,
+        gateway_rp,
         outside_ip,
         outside_mac: parse_mac(&g.outside_mac)?,
         outside_router_mac: parse_mac(&g.outside_router_mac)?,
@@ -233,12 +312,19 @@ pub fn check(text: &str, max_peers: usize) -> Result<Checked, String> {
     })
 }
 
-pub fn render(c: &Checked) -> String {
+/// Renders the compiled configuration. `gateway_rp_file` and `peer_rp_files`
+/// are the absolute paths of the McEliece public keys copied to OUT_DIR:
+/// the generated macros embed them only in the crate that expands them
+/// (`pq`, M3 plan F9/L6), never in `config` itself.
+pub fn render(c: &Checked, gateway_rp_file: &str, peer_rp_files: &[String]) -> String {
     let mut s = String::new();
     s += &format!("pub const MAX_PEERS: usize = {MAX_PEERS};\n");
     s += &format!("pub const MAX_NEIGHBORS: usize = {MAX_NEIGHBORS};\n");
     s += &format!("pub const GATEWAY_PUBLIC: [u8; 32] = {:?};\n", c.gateway_public);
     s += &format!("pub const LISTEN_PORT: u16 = {};\n", c.listen_port);
+    s += &format!("pub const RP_PORT: u16 = {};\n", c.rp_port);
+    s += &format!("pub const RP_PUBLIC_KEY_LEN: usize = {RP_PUBLIC_KEY_LEN};\n");
+    s += &format!("pub const GATEWAY_RP_HASH: [u8; 32] = {:?};\n", c.gateway_rp.hash);
     s += &format!("pub const OUTSIDE_IP: [u8; 4] = {:?};\n", c.outside_ip);
     s += &format!("pub const OUTSIDE_MAC: [u8; 6] = {:?};\n", c.outside_mac);
     s += &format!("pub const OUTSIDE_ROUTER_MAC: [u8; 6] = {:?};\n", c.outside_router_mac);
@@ -249,13 +335,21 @@ pub fn render(c: &Checked) -> String {
         s += &format!("    Neighbor {{ ip: {ip:?}, mac: {mac:?} }},\n");
     }
     s += "];\npub const PEERS: &[Peer] = &[\n";
-    for (key, ps) in &c.peers {
-        s += &format!("    Peer {{ public: {key:?}, allowed: &[");
-        for p in ps {
+    for q in &c.peers {
+        s += &format!("    Peer {{ public: {:?}, rp_hash: {:?}, allowed: &[", q.public, q.rp.hash);
+        for p in &q.allowed {
             s += &format!("Prefix {{ addr: {:?}, len: {} }}, ", p.addr, p.len);
         }
         s += "] },\n";
     }
     s += "];\n";
+    s += "/// The gateway's McEliece public key (`spkm`) as `&'static [u8; RP_PUBLIC_KEY_LEN]`.\n";
+    s += &format!("#[macro_export]\nmacro_rules! gateway_rp_public {{\n    () => {{ include_bytes!({gateway_rp_file:?}) }};\n}}\n");
+    s += "/// Each peer's McEliece public key (`spkt`), in `PEERS` order.\n";
+    s += "#[macro_export]\nmacro_rules! peer_rp_publics {\n    () => { [";
+    for f in peer_rp_files {
+        s += &format!("include_bytes!({f:?}), ");
+    }
+    s += "] };\n}\n";
     s
 }

@@ -197,13 +197,14 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
         }
     }
 
-    // `key` maps no mr except the secrets mr (L1), independent of taint.
+    // `key` maps no mr except a secrets mr (L1), independent of taint;
+    // which one is L2's business.
     for pd in &system.pds {
         if policy.role(&pd.name) != Some(Role::Key) {
             continue;
         }
         for m in mrs_mapped_by(pd) {
-            if !matches!(policy.mrs.get(m.mr.as_str()), Some(MrPolicy::Secrets)) {
+            if !matches!(policy.mrs.get(m.mr.as_str()), Some(MrPolicy::Secrets { .. })) {
                 findings.push(Finding::new(
                     LawId::L1,
                     format!("key pd '{}' maps mr '{}', not just the secrets mr", pd.name, m.mr),
@@ -256,7 +257,7 @@ fn channel_is_exempt(
     let key_maps_only_secrets = pd_by_name(system, &key_end.pd)
         .into_iter()
         .flat_map(mrs_mapped_by)
-        .all(|m| matches!(policy.mrs.get(m.mr.as_str()), Some(MrPolicy::Secrets)));
+        .all(|m| matches!(policy.mrs.get(m.mr.as_str()), Some(MrPolicy::Secrets { .. })));
     let ok = peer.pp && !key_end.pp && !peer.notify && key_maps_only_secrets;
     if !ok {
         findings.push(Finding::new(
@@ -301,65 +302,82 @@ fn timer_channel_is_exempt(
     ok
 }
 
-/// L1 (tainted pds map no secret mr) and L2 (the secrets mr is mapped only
-/// into `key`, and `prefill_path` appears only on the secrets mr).
+/// L1 (tainted pds map no secret mr) and L2 (M3 plan amendment): every
+/// secrets mr is mapped only by its policy owner, each `key`-role pd maps
+/// exactly its own secrets mr and nothing else, `prefill_path` appears
+/// only on secrets mrs, and no pd holds `pp` channels to two key pds.
 fn check_secrets_and_taint(
     system: &System,
     policy: &Policy,
     tainted: &BTreeSet<String>,
     findings: &mut Vec<Finding>,
 ) {
-    let secrets_mr: Option<&str> =
-        policy.mrs.iter().find(|(_, mr)| matches!(mr, MrPolicy::Secrets)).map(|(name, _)| name.as_str());
-
     for pd in &system.pds {
         for m in mrs_mapped_by(pd) {
-            if matches!(policy.mrs.get(m.mr.as_str()), Some(MrPolicy::Secrets)) {
+            if let Some(MrPolicy::Secrets { owner }) = policy.mrs.get(m.mr.as_str()) {
                 if tainted.contains(&pd.name) {
                     findings.push(Finding::new(
                         LawId::L1,
                         format!("tainted pd '{}' maps secrets mr '{}'", pd.name, m.mr),
                     ));
                 }
-                if policy.role(&pd.name) != Some(Role::Key) {
+                if owner != &pd.name {
                     findings.push(Finding::new(
                         LawId::L2,
-                        format!("secrets mr '{}' is mapped into non-key pd '{}'", m.mr, pd.name),
+                        format!("secrets mr '{}' (owner '{owner}') is mapped into pd '{}'", m.mr, pd.name),
                     ));
                 }
             }
         }
     }
 
-    for mr in &system.mrs {
-        if mr.prefill_path.is_some() && Some(mr.name.as_str()) != secrets_mr {
+    for pd in system.pds.iter().filter(|pd| policy.role(&pd.name) == Some(Role::Key)) {
+        let own: Vec<&str> = mrs_mapped_by(pd)
+            .filter(|m| matches!(policy.mrs.get(m.mr.as_str()), Some(MrPolicy::Secrets { owner }) if owner == &pd.name))
+            .map(|m| m.mr.as_str())
+            .collect();
+        if own.len() != 1 {
             findings.push(Finding::new(
                 LawId::L2,
-                format!("prefill_path is only allowed on the secrets mr, not '{}'", mr.name),
+                format!("key pd '{}' maps {} of its own secrets mrs, expected exactly one", pd.name, own.len()),
+            ));
+        }
+        for m in mrs_mapped_by(pd) {
+            if !own.contains(&m.mr.as_str()) {
+                findings.push(Finding::new(
+                    LawId::L2,
+                    format!("key pd '{}' maps mr '{}', which is not its own secrets mr", pd.name, m.mr),
+                ));
+            }
+        }
+    }
+
+    for mr in &system.mrs {
+        if mr.prefill_path.is_some() && !matches!(policy.mrs.get(mr.name.as_str()), Some(MrPolicy::Secrets { .. })) {
+            findings.push(Finding::new(
+                LawId::L2,
+                format!("prefill_path is only allowed on secrets mrs, not '{}'", mr.name),
             ));
         }
     }
 
-    // L2: at most one pd may hold the `key` role, and the secrets mr (if
-    // any) may be mapped by at most one pd — either violation defeats "one
-    // MR for static secrets, mapped only into key".
-    let key_pds: Vec<&str> =
-        system.pds.iter().filter(|pd| policy.role(&pd.name) == Some(Role::Key)).map(|pd| pd.name.as_str()).collect();
-    if key_pds.len() > 1 {
-        findings.push(Finding::new(LawId::L2, format!("more than one pd has role 'key': {}", key_pds.join(", "))));
+    // Disjoint caller sets: a pd able to call two key pds could combine
+    // their label tables, which neither table was reviewed for.
+    let mut callees: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for channel in &system.channels {
+        let [a, b] = &channel.ends;
+        for (caller, callee) in [(a, b), (b, a)] {
+            if caller.pp && policy.role(&callee.pd) == Some(Role::Key) {
+                callees.entry(caller.pd.as_str()).or_default().insert(callee.pd.as_str());
+            }
+        }
     }
-
-    if let Some(secrets_mr) = secrets_mr {
-        let mappers: Vec<&str> = system
-            .pds
-            .iter()
-            .filter(|pd| mrs_mapped_by(pd).any(|m| m.mr == secrets_mr))
-            .map(|pd| pd.name.as_str())
-            .collect();
-        if mappers.len() > 1 {
+    for (caller, keys) in callees {
+        if keys.len() > 1 {
+            let names: Vec<&str> = keys.into_iter().collect();
             findings.push(Finding::new(
                 LawId::L2,
-                format!("secrets mr '{secrets_mr}' is mapped into more than one pd: {}", mappers.join(", ")),
+                format!("pd '{caller}' has pp channels to more than one key pd: {}", names.join(", ")),
             ));
         }
     }

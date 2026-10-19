@@ -96,8 +96,9 @@ pub enum MrPolicy {
     Device { owner: String, phys_addr: u64, size: u64 },
     /// DMA buffer owned by exactly one driver, never shared (L5).
     Dma { owner: String },
-    /// The one MR holding static secrets, mapped only into `key` (L2).
-    Secrets,
+    /// An MR holding static secrets, mapped only into its `key`-role owner
+    /// (L2). Each key pd owns at most one.
+    Secrets { owner: String },
     /// Producer writes, declared consumers read only (L3).
     Data { producer: String, consumers: BTreeSet<String> },
     /// Any other shared buffer (e.g. a ring region): explicit per-pd perms.
@@ -130,6 +131,10 @@ impl ChannelPolicy {
         self.notify.get(pd).copied().unwrap_or(DEFAULT_NOTIFY)
     }
 }
+
+/// Hard ceiling on `budgets.ratio_sum_cap` (M3 plan, Budgets): what is left
+/// covers the untainted `timer` reservation and the passive pds' init.
+pub const RATIO_SUM_CEILING: f64 = 0.95;
 
 #[derive(Debug, Clone)]
 pub struct Policy {
@@ -170,7 +175,9 @@ struct RawPd {
 enum RawMr {
     Device { owner: String, phys_addr: u64, size: u64 },
     Dma { owner: String },
-    Secrets,
+    // `Option` so a missing owner gets an L2-specific policy error rather
+    // than serde's generic "missing field".
+    Secrets { owner: Option<String> },
     Data { producer: String, consumers: Vec<String> },
     Plain { shares: BTreeMap<String, String> },
 }
@@ -253,7 +260,7 @@ impl Policy {
         };
 
         let mut mrs = BTreeMap::new();
-        let mut secrets_count = 0usize;
+        let mut secrets_owners: BTreeMap<String, String> = BTreeMap::new();
         for (name, mr) in raw.mrs {
             let policy_mr = match mr {
                 RawMr::Device { owner, phys_addr, size } => {
@@ -273,9 +280,17 @@ impl Policy {
                     require_role(&pds, &owner, Role::Driver)?;
                     MrPolicy::Dma { owner }
                 }
-                RawMr::Secrets => {
-                    secrets_count += 1;
-                    MrPolicy::Secrets
+                RawMr::Secrets { owner } => {
+                    let owner = owner.ok_or_else(|| {
+                        err(format!("secrets mr '{name}' has no owner (L2: every secrets mr names its key pd)"))
+                    })?;
+                    require_role(&pds, &owner, Role::Key)?;
+                    if let Some(other) = secrets_owners.insert(owner.clone(), name.clone()) {
+                        return Err(err(format!(
+                            "key pd '{owner}' owns both secrets mrs '{other}' and '{name}' (L2: one each)"
+                        )));
+                    }
+                    MrPolicy::Secrets { owner }
                 }
                 RawMr::Data { producer, consumers } => {
                     // The producer's own role (e.g. `driver`) is unrestricted: a
@@ -306,10 +321,6 @@ impl Policy {
                 return Err(err(format!("duplicate mr '{name}' in policy")));
             }
         }
-        if secrets_count > 1 {
-            return Err(err("at most one mr may have kind = \"secrets\" (L2: one MR for static secrets)"));
-        }
-
         let mut channels = BTreeMap::new();
         for c in raw.channels {
             let [a, b]: [String; 2] = c
@@ -347,8 +358,10 @@ impl Policy {
         if !(raw.budgets.ratio_cap > 0.0 && raw.budgets.ratio_cap <= 1.0) {
             return Err(err("budgets.ratio_cap must be in (0, 1]"));
         }
-        if !(raw.budgets.ratio_sum_cap > 0.0 && raw.budgets.ratio_sum_cap <= 1.0) {
-            return Err(err("budgets.ratio_sum_cap must be in (0, 1]"));
+        if !(raw.budgets.ratio_sum_cap > 0.0 && raw.budgets.ratio_sum_cap <= RATIO_SUM_CEILING) {
+            return Err(err(format!(
+                "budgets.ratio_sum_cap must be in (0, {RATIO_SUM_CEILING}]: raising it past the ceiling means re-planning, not an amendment"
+            )));
         }
 
         // An empty list would silently disable the board-RAM overlap check.
@@ -436,24 +449,79 @@ mod tests {
         assert!(Policy::load(&text).is_err());
     }
 
-    #[test]
-    fn duplicate_secrets_mr_is_rejected() {
-        let text = format!(
+    fn secrets_policy(mrs: &str) -> String {
+        format!(
             r#"
             [pds.key]
             role = "key"
 
-            [mrs.secrets_a]
-            kind = "secrets"
+            [pds.pqkey]
+            role = "key"
 
-            [mrs.secrets_b]
-            kind = "secrets"
+            [pds.hs]
+            role = "service"
+            {mrs}
 
             [budgets]
             ratio_cap = 0.2
             ratio_sum_cap = 0.5
             {BOARD}
         "#
+        )
+    }
+
+    #[test]
+    fn two_secrets_mrs_owned_by_one_key_pd_are_rejected() {
+        let text = secrets_policy(
+            r#"
+            [mrs.secrets_a]
+            kind = "secrets"
+            owner = "key"
+
+            [mrs.secrets_b]
+            kind = "secrets"
+            owner = "key"
+        "#,
+        );
+        assert!(Policy::load(&text).is_err());
+    }
+
+    #[test]
+    fn one_secrets_mr_per_key_pd_loads() {
+        let text = secrets_policy(
+            r#"
+            [mrs.secrets_a]
+            kind = "secrets"
+            owner = "key"
+
+            [mrs.secrets_b]
+            kind = "secrets"
+            owner = "pqkey"
+        "#,
+        );
+        assert!(Policy::load(&text).is_ok());
+    }
+
+    #[test]
+    fn secrets_mr_without_owner_is_rejected() {
+        let text = secrets_policy(
+            r#"
+            [mrs.secrets_a]
+            kind = "secrets"
+        "#,
+        );
+        let e = Policy::load(&text).unwrap_err().to_string();
+        assert!(e.contains("has no owner"), "{e}");
+    }
+
+    #[test]
+    fn secrets_mr_owned_by_a_non_key_pd_is_rejected() {
+        let text = secrets_policy(
+            r#"
+            [mrs.secrets_a]
+            kind = "secrets"
+            owner = "hs"
+        "#,
         );
         assert!(Policy::load(&text).is_err());
     }
@@ -512,11 +580,27 @@ mod tests {
 
             [budgets]
             ratio_cap = 1.0
-            ratio_sum_cap = 1.0
+            ratio_sum_cap = 0.5
             {BOARD}
         "#
         );
         assert!(Policy::load(&text).is_ok());
+    }
+
+    #[test]
+    fn ratio_sum_cap_of_one_is_above_the_ceiling() {
+        let text = format!(
+            r#"
+            [pds.hello]
+            role = "service"
+
+            [budgets]
+            ratio_cap = 0.2
+            ratio_sum_cap = 1.0
+            {BOARD}
+        "#
+        );
+        assert!(Policy::load(&text).is_err());
     }
 
     #[test]

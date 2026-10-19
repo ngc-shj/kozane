@@ -1,10 +1,14 @@
 # Gateway configuration compiled into the image (law L6). Public values only.
 # The keys below are placeholders for builds without a deployment config;
 # integration tests generate their own config and secrets (tools/mksecrets).
+# Key files are relative to this file; rp_hash is BLAKE2s-256 of the file.
 
 [gateway]
 public_key = "78wdDVL8XdPitWIiZQ7OBEnnlJfytmjgXqe3dz2gyGA="
 listen_port = 51820
+rp_port = 51819
+rp_pub_path = "keys/gateway.rp.pk"
+rp_hash = "21f9f2594f944af3571a8de5748b6dc23f57182326d117764b553155af0d3cbc"
 outside_ip = "10.0.2.15"
 outside_mac = "52:54:00:12:34:56"
 outside_router_mac = "52:55:0a:00:02:02"
@@ -17,5 +21,7 @@ ip = "10.99.0.2"
 mac = "02:00:00:00:99:02"
 
 [[peers]]
-public_key = "YBS8Ds6hLNV9RKN63rn+Z7o/7hO6Iwmh1xhxEHInuGg="
+wg_pub = "YBS8Ds6hLNV9RKN63rn+Z7o/7hO6Iwmh1xhxEHInuGg="
+rp_pub_path = "keys/peer-0.rp.pk"
+rp_hash = "dca15eb47af3a4a3022bc1baa044231b27bdd6c98f1abd8b1294b8c971f37fb3"
 allowed_ips = ["10.200.0.2/32"]

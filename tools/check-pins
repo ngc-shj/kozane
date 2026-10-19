@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Positive pin rules for the dev environment and gates (plan C1, C2).
 
-Usage: check-pins [--root DIR]
+Usage: check-pins [--root DIR] [--enforce-pending]
 Exit 0 when every rule holds; 1 with one line per violation; prints
-"CHECK-PINS-RULES <n>" for the count manifest.
+"CHECK-PINS-RULES <n>" (enforced rules) for the count manifest.
 
 Rules:
   P1 every curl/wget download in docker/Dockerfile is followed, within the
@@ -16,6 +16,20 @@ Rules:
      .RECIPEPREFIX, no -i/-k in MAKEFLAGS, no '-' recipe prefix (incl. after
      @/+, and on inline `target: ; -cmd` recipes), no `|| true`, `|| :`,
      `|| exit 0`, `; true`, `set +e`
+  P6 policy/waivers.toml parses (tools/waivers.py), and while Cargo.lock
+     locks classic-mceliece-rust 2.0.2 it lists SC23 with status "open"
+     (M3 plan, Packaging)
+  P7 no `(?i)psk_?mix` in crates/ (*.rs, Cargo.toml): the static PSK path
+     is removed (M3 plan L8, F21)
+  P8 no `getrandom|thread_rng|OsRng` in crates/ (*.rs, Cargo.toml):
+     randomness comes only through `cpu` and the hedged source
+  P9 no derive(Clone|Copy|Debug) on a type wrapping `Secret<` in
+     rosenpass-core, pqkey-core or pds/pq (L12, M3 plan S12)
+
+Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
+fail until they are removed from PENDING; --enforce-pending makes them fail
+now (the fixtures use it). P7 is pending until wg-core, hs-core and key-core
+drop PSK_MIX in M3a; removing it from PENDING raises CHECK-PINS-RULES.
 
 Control class: P1-P4 are fail-closed checks over the files they read. P5 is
 a best-effort tripwire: make and bash decide what a recipe does, and a
@@ -31,8 +45,16 @@ import argparse
 import pathlib
 import re
 import sys
+import tomllib
 
-RULES = ["P1", "P2", "P3", "P4", "P5"]
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import waivers  # noqa: E402
+
+RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9"]
+PENDING = {"P7"}
+# Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
+SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq"]
 
 
 def run_blocks(dockerfile: str):
@@ -140,10 +162,85 @@ def check_makefile(text: str, rel: str, out: list):
         if re.search(r"\|\|\s*(true|:|exit\s+0+)(?![\w-])|;\s*true\b|\bset \+e\b", joined):
             out.append(f"P5 {rel}:{n}: masked exit status")
 
+def check_waivers(root: pathlib.Path, out: list):
+    try:
+        listed = waivers.load(root / "policy/waivers.toml")
+    except waivers.WaiverError as e:
+        out.append(f"P6 policy/waivers.toml: {e}")
+        return
+    try:
+        lock = tomllib.loads((root / "Cargo.lock").read_text())
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        out.append(f"P6 Cargo.lock: cannot read: {e}")
+        return
+    cmr = any(p.get("name") == "classic-mceliece-rust" and p.get("version") == "2.0.2" for p in lock.get("package", []))
+    sc23 = [w for w in listed if w.id == "SC23"]
+    if cmr and not (sc23 and sc23[0].status == "open"):
+        out.append("P6 Cargo.lock locks classic-mceliece-rust 2.0.2 but policy/waivers.toml "
+                   "does not list SC23 as open")
+
+
+def crate_sources(root: pathlib.Path, rel: str):
+    """Yields (relative path, text) for *.rs and Cargo.toml under root/rel."""
+    base = root / rel
+    if not base.is_dir():
+        return
+    for p in sorted(base.rglob("*")):
+        if p.is_file() and (p.suffix == ".rs" or p.name == "Cargo.toml") and \
+                not any(part in ("target", "build") for part in p.relative_to(root).parts):
+            yield str(p.relative_to(root)), p.read_text()
+
+
+def check_forbidden(root: pathlib.Path, out: list):
+    for rel, text in crate_sources(root, "crates"):
+        for n, line in enumerate(text.splitlines(), 1):
+            if re.search(r"(?i)psk_?mix", line):
+                out.append(f"P7 {rel}:{n}: psk_mix (the static PSK path is removed)")
+            if re.search(r"getrandom|thread_rng|OsRng", line):
+                out.append(f"P8 {rel}:{n}: randomness outside cpu and the hedged source")
+
+
+def item_after(text: str, pos: int) -> str:
+    """The text of the first struct/enum/union item after pos, through its
+    matching closing brace/paren or terminating ';'."""
+    m = re.compile(r"\b(struct|enum|union)\b").search(text, pos)
+    if not m:
+        return ""
+    depth = 0
+    for i in range(m.end(), len(text)):
+        c = text[i]
+        if c in "{(":
+            depth += 1
+        elif c in "})":
+            depth -= 1
+            if depth == 0 and c == "}":
+                return text[m.start():i + 1]
+        elif c == ";" and depth == 0:
+            return text[m.start():i + 1]
+    return text[m.start():]
+
+
+def check_secret_derives(root: pathlib.Path, out: list):
+    for crate in SECRET_CRATES:
+        for rel, text in crate_sources(root, crate):
+            if not rel.endswith(".rs"):
+                continue
+            code = re.sub(r"//[^\n]*", "", text)
+            for m in re.finditer(r"\bderive\(([^)]*)\)", code):
+                if not re.search(r"\b(Clone|Copy|Debug)\b", m.group(1)):
+                    continue
+                if "Secret<" in item_after(code, m.end()):
+                    n = code.count("\n", 0, m.start()) + 1
+                    out.append(f"P9 {rel}:{n}: derive({m.group(1)}) on a type wrapping Secret<")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
-    root = pathlib.Path(ap.parse_args().root)
+    ap.add_argument("--enforce-pending", action="store_true")
+    args = ap.parse_args()
+    root = pathlib.Path(args.root)
+    pending = set() if args.enforce_pending else PENDING
     out: list = []
     docker = (root / "docker/Dockerfile").read_text()
     check_dockerfile(docker, out)
@@ -153,10 +250,14 @@ def main() -> int:
         check_cargo(p, str(p.relative_to(root)), out)
     check_toolchain(docker, (root / "rust-toolchain.toml").read_text(), out)
     check_makefile((root / "Makefile").read_text(), "Makefile", out)
+    check_waivers(root, out)
+    check_forbidden(root, out)
+    check_secret_derives(root, out)
+    failing = [l for l in out if l.split()[0] not in pending]
     for line in out:
-        print(line)
-    print(f"CHECK-PINS-RULES {len(RULES)}")
-    return 1 if out else 0
+        print(line if line in failing else f"pending {line}")
+    print(f"CHECK-PINS-RULES {len([r for r in RULES if r not in pending])}")
+    return 1 if failing else 0
 
 
 if __name__ == "__main__":

@@ -1,0 +1,30 @@
+# policy/waivers.toml — open security waivers (M3 plan, Law amendments:
+# Packaging).
+#
+# `tools/package` refuses non-debug kernels while any waiver here is open,
+# naming each one; a missing or unparsable file also refuses. That is a
+# fail-closed gate which editing this file bypasses, so `tools/check-pins`
+# (P6) binds SC23 to its mechanical condition: while Cargo.lock locks
+# classic-mceliece-rust 2.0.2, SC23 must be listed with status "open".
+# SC26 has no mechanical signal and is closed by hand.
+#
+# Schema (parsed by tools/waivers.py; anything else is an error):
+#
+#   [[waivers]]
+#   id = "<id>"          unique
+#   owner = "<milestone>" which milestone closes it
+#   status = "open" | "closed"
+
+# cmr 2.0.2 is unaudited with no constant-time verification; replacing it
+# lifts the L2 constant-time waiver for `pqkey`.
+[[waivers]]
+id = "SC23"
+owner = "M4"
+status = "open"
+
+# Rosenpass cookie gate under load, its flood and latency cases, and the
+# guest-RAM OSK residue scan.
+[[waivers]]
+id = "SC26"
+owner = "M3b"
+status = "open"

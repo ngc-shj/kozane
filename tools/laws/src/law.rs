@@ -9,7 +9,8 @@ use core::fmt;
 pub enum LawId {
     /// Taint propagation and the `key` exemption.
     L1,
-    /// Static secrets live only in one MR mapped only into `key`.
+    /// Static secrets live only in secrets MRs, each mapped only into its
+    /// owning `key` pd, with disjoint caller sets.
     L2,
     /// Tunnelled plaintext is reachable only by `data` and the inside path.
     L3,

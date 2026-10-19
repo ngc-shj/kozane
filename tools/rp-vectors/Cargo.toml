@@ -1,0 +1,18 @@
+[package]
+name = "rp-vectors"
+version = "0.1.0"
+edition = "2021"
+license = "BSD-2-Clause"
+publish = false
+
+# Not a member of the secureos workspace: it builds upstream rosenpass (std,
+# liboqs via cmake) and only regenerates committed golden vectors (M3 plan C1).
+[workspace]
+
+[dependencies]
+rosenpass = { git = "https://github.com/rosenpass/rosenpass", rev = "9e72f1eb871c4c403e99e9b78262fff8dd8d7357", features = ["expose_internal_modules"] }
+assert_tv = "=0.6.9"
+oqs-sys = { version = "=0.8.0", default-features = false, features = ["classic_mceliece", "kyber"] }
+anyhow = "1"
+base64 = "0.23"
+serde_json = "1"

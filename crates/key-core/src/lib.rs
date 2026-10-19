@@ -1,18 +1,20 @@
 //! `key` oracle logic (plan C10, law L2): the only code that touches the
-//! gateway's static private key and the PSKs. The PD maps the secrets
-//! region read-only, validates it against the compiled configuration once
-//! at boot (halting on any mismatch), and then answers exactly three
-//! fixed-size PPC requests:
+//! gateway's static WireGuard private key. The PD maps the secrets region
+//! read-only, validates it against the compiled configuration once at boot
+//! (halting on any mismatch), and then answers fixed-size PPC requests:
 //!
 //! | label        | request (words)        | reply (words)        |
 //! |--------------|------------------------|----------------------|
 //! | `STATIC_DH`  | peer point (4)         | DH(S_priv, point) (4)|
-//! | `PSK_MIX`    | peer id (1), C (4)     | C', tau, kappa (12)  |
 //! | `BOOT_SEED`  | — (0)                  | per-boot seed (4)    |
 //!
-//! Anything else, a wrong size, an all-zero DH, an unknown peer or an
-//! exhausted caller budget gets an error label and no data. Words are
-//! little-endian `u64`s, as in seL4 message registers.
+//! Each caller may use only the labels in its row of a closed caller →
+//! label table (M3 plan C2): `Hs → {STATIC_DH, BOOT_SEED}`. An unknown
+//! caller, a label outside the caller's row, a wrong size, an all-zero DH
+//! or an exhausted caller budget gets an error label and no data; the first
+//! three before any budget is spent. Words are little-endian `u64`s, as in
+//! seL4 message registers. WireGuard PSKs come only from Rosenpass (L8);
+//! `key` holds none.
 
 #![no_std]
 #![cfg_attr(test, feature(variant_count))]
@@ -29,25 +31,37 @@ use secret_blob::{Blob, BlobError};
 use wg_core::crypto::{self, Key32};
 
 pub const LABEL_STATIC_DH: u64 = 1;
-pub const LABEL_PSK_MIX: u64 = 2;
 pub const LABEL_BOOT_SEED: u64 = 3;
 
 /// Reply labels.
 pub const OK: u64 = 0;
 pub const ERR_BAD_REQUEST: u64 = 1;
 pub const ERR_ZERO_DH: u64 = 2;
-pub const ERR_UNKNOWN_PEER: u64 = 3;
 pub const ERR_RATE_LIMITED: u64 = 4;
 pub const ERR_CRYPTO: u64 = 5;
 
 pub const STATIC_DH_REQ_WORDS: usize = 4;
-pub const PSK_MIX_REQ_WORDS: usize = 5;
 pub const BOOT_SEED_REQ_WORDS: usize = 0;
 pub const STATIC_DH_REPLY_WORDS: usize = 4;
-pub const PSK_MIX_REPLY_WORDS: usize = 12;
 pub const BOOT_SEED_REPLY_WORDS: usize = 4;
 /// Largest request or reply.
-pub const MAX_WORDS: usize = PSK_MIX_REPLY_WORDS;
+pub const MAX_WORDS: usize = STATIC_DH_REQ_WORDS;
+
+/// The PDs allowed to call `key`. The PD maps its channel to a caller;
+/// a channel with no caller is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Caller {
+    Hs,
+}
+
+impl Caller {
+    /// The closed caller → label table (M3 plan C2, law L2).
+    pub const fn allows(self, label: u64) -> bool {
+        match self {
+            Caller::Hs => matches!(label, LABEL_STATIC_DH | LABEL_BOOT_SEED),
+        }
+    }
+}
 
 /// `hs`'s call budget: `KEY_BURST` calls, refilled at one per
 /// `KEY_INTERVAL_NS` (2 000/s). Far beyond what `hs`'s CPU budget can drive,
@@ -91,7 +105,7 @@ pub fn validate<'a, 'p>(
         return Err(BootError::GatewayKeyMismatch);
     }
     for (i, public) in peers.enumerate() {
-        let hash = blob.peer(i).map(|(h, _)| h).ok_or(BootError::PeerMismatch)?;
+        let hash = blob.peer(i).ok_or(BootError::PeerMismatch)?;
         if !crypto::ct_eq(hash, &secret_blob::blake2s(&[public])) {
             return Err(BootError::PeerMismatch);
         }
@@ -164,11 +178,23 @@ impl<'a> Oracle<'a> {
         Self { blob, boot_seed }
     }
 
-    /// Answers one request. Returns (reply label, reply word count); on any
-    /// error the count is 0 and `reply` is zeroed, so no partial result
-    /// leaks through a reused message register.
-    pub fn handle(&self, bucket: &mut Bucket, now_ns: u64, label: u64, req: &[u64], reply: &mut [u64]) -> (u64, usize) {
-        let r = self.dispatch(bucket, now_ns, label, req, reply);
+    /// Answers one request from `caller` (None: a channel with no caller).
+    /// Returns (reply label, reply word count); on any error the count is 0
+    /// and `reply` is zeroed, so no partial result leaks through a reused
+    /// message register.
+    pub fn handle(
+        &self,
+        caller: Option<Caller>,
+        bucket: &mut Bucket,
+        now_ns: u64,
+        label: u64,
+        req: &[u64],
+        reply: &mut [u64],
+    ) -> (u64, usize) {
+        let r = match caller {
+            Some(c) if c.allows(label) => self.dispatch(bucket, now_ns, label, req, reply),
+            _ => (ERR_BAD_REQUEST, 0),
+        };
         if r.0 != OK {
             reply.fill(0);
             return (r.0, 0);
@@ -179,7 +205,6 @@ impl<'a> Oracle<'a> {
     fn dispatch(&self, bucket: &mut Bucket, now_ns: u64, label: u64, req: &[u64], reply: &mut [u64]) -> (u64, usize) {
         let expected = match label {
             LABEL_STATIC_DH => STATIC_DH_REQ_WORDS,
-            LABEL_PSK_MIX => PSK_MIX_REQ_WORDS,
             LABEL_BOOT_SEED => BOOT_SEED_REQ_WORDS,
             _ => return (ERR_BAD_REQUEST, 0),
         };
@@ -191,7 +216,6 @@ impl<'a> Oracle<'a> {
         }
         let written = match label {
             LABEL_STATIC_DH => self.static_dh(req, reply),
-            LABEL_PSK_MIX => self.psk_mix(req, reply),
             _ => put_bytes(reply, self.boot_seed.as_bytes()).ok_or(ERR_BAD_REQUEST),
         };
         match written {
@@ -208,20 +232,6 @@ impl<'a> Oracle<'a> {
             _ => ERR_CRYPTO,
         })?;
         put_bytes(reply, shared.as_bytes()).ok_or(ERR_BAD_REQUEST)
-    }
-
-    fn psk_mix(&self, req: &[u64], reply: &mut [u64]) -> Result<usize, u64> {
-        let (&[peer], c) = req.split_first_chunk::<1>().ok_or(ERR_BAD_REQUEST)?;
-        let peer = usize::try_from(peer).map_err(|_| ERR_UNKNOWN_PEER)?;
-        let (_, psk) = self.blob.peer(peer).ok_or(ERR_UNKNOWN_PEER)?;
-        let chaining = Key32::from_bytes(words_to_bytes(c).ok_or(ERR_BAD_REQUEST)?);
-        let (c2, tau, kappa) = crypto::kdf3(&chaining, psk).map_err(|_| ERR_CRYPTO)?;
-        let mut n = 0usize;
-        for k in [&c2, &tau, &kappa] {
-            let dst = reply.get_mut(n..).ok_or(ERR_BAD_REQUEST)?;
-            n = n.saturating_add(put_bytes(dst, k.as_bytes()).ok_or(ERR_BAD_REQUEST)?);
-        }
-        Ok(n)
     }
 }
 

@@ -22,6 +22,9 @@ impl Prefix {
 #[derive(Debug, Clone, Copy)]
 pub struct Peer {
     pub public: [u8; 32],
+    /// BLAKE2s-256 of the peer's McEliece public key (`pq` checks the
+    /// embedded key against it at boot, M3 plan S8).
+    pub rp_hash: [u8; 32],
     pub allowed: &'static [Prefix],
 }
 

@@ -13,11 +13,14 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools/check-pins"
-FILES = ["docker/Dockerfile", "Makefile", "rust-toolchain.toml", "Cargo.toml"]
+FILES = ["docker/Dockerfile", "Makefile", "rust-toolchain.toml", "Cargo.toml", "Cargo.lock", "policy/waivers.toml"]
+# P7 runs as a pending rule until the PSK_MIX path is removed; its cases
+# enforce it on a tree whose crates/ is replaced by a synthetic one.
+ENFORCE = ["--enforce-pending"]
 
 
-def rules_fired(tree: pathlib.Path) -> set:
-    out = subprocess.run([sys.executable, str(TOOL), "--root", str(tree)], capture_output=True, text=True)
+def rules_fired(tree: pathlib.Path, args=()) -> set:
+    out = subprocess.run([sys.executable, str(TOOL), "--root", str(tree), *args], capture_output=True, text=True)
     fired = {line.split()[0] for line in out.stdout.splitlines() if line[:1] == "P"}
     if bool(fired) != (out.returncode == 1):
         raise SystemExit(f"exit status {out.returncode} disagrees with output {fired}")
@@ -28,6 +31,38 @@ def copy_tree(dst: pathlib.Path):
     for f in FILES:
         (dst / f).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / f, dst / f)
+    # Sources only: P7-P9 read *.rs and Cargo.toml, P3 reads Cargo.toml.
+    for src in (ROOT / "crates").rglob("*"):
+        rel = src.relative_to(ROOT)
+        if src.is_file() and (src.suffix == ".rs" or src.name == "Cargo.toml") and "target" not in rel.parts:
+            (dst / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(src, dst / rel)
+
+
+def write(path: pathlib.Path, text: str):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def append(path: pathlib.Path, text: str):
+    if not path.exists():
+        raise SystemExit(f"fixture target missing: {path}")
+    path.write_text(path.read_text() + text)
+
+
+def synthetic_crates(t: pathlib.Path, lib: str = "pub fn f() {}\n"):
+    shutil.rmtree(t / "crates")
+    write(t / "crates/demo/Cargo.toml", '[package]\nname = "demo"\nversion = "0.1.0"\n')
+    write(t / "crates/demo/src/lib.rs", lib)
+
+
+def drop_cmr(t: pathlib.Path):
+    edit(t / "Cargo.lock", '[[package]]\nname = "classic-mceliece-rust"\nversion = "2.0.2"\n',
+         '[[package]]\nname = "classic-mceliece-rust-was"\nversion = "2.0.2"\n')
+
+
+SC23 = '[[waivers]]\nid = "SC23"\nowner = "M4"\nstatus = "open"\n'
+SECRET = "\npub struct Secret<const N: usize>([u8; N]);\n"
 
 
 def edit(path: pathlib.Path, old: str, new: str):
@@ -108,17 +143,74 @@ CASES = [
     ("P5 ignore prefix", {"P5"},
      lambda t: edit(t / "Makefile", "\trm -rf $(BUILD)", "\t-rm -rf $(BUILD)")),
     ("P5 .IGNORE", {"P5"}, lambda t: edit(t / "Makefile", "clean:\n", ".IGNORE:\nclean:\n")),
+    # P6: SC23 bound to cmr 2.0.2 in Cargo.lock; waivers.toml must parse.
+    ("allow cmr 2.0.2 locked and SC23 open", set(), lambda t: edit(t / "policy/waivers.toml", SC23, SC23)),
+    ("P6 cmr 2.0.2 locked and SC23 absent", {"P6"}, lambda t: edit(t / "policy/waivers.toml", SC23, "")),
+    ("P6 cmr 2.0.2 locked and SC23 closed", {"P6"},
+     lambda t: edit(t / "policy/waivers.toml", SC23, SC23.replace('"open"', '"closed"'))),
+    ("allow neither cmr 2.0.2 nor SC23", set(),
+     lambda t: (drop_cmr(t), edit(t / "policy/waivers.toml", SC23, ""))),
+    ("allow cmr at another version and SC23 absent", set(),
+     lambda t: (edit(t / "Cargo.lock", 'name = "classic-mceliece-rust"\nversion = "2.0.2"',
+                     'name = "classic-mceliece-rust"\nversion = "2.0.3"'),
+                edit(t / "policy/waivers.toml", SC23, ""))),
+    ("P6 waivers.toml missing", {"P6"}, lambda t: (t / "policy/waivers.toml").unlink()),
+    ("P6 waivers.toml unparsable", {"P6"}, lambda t: edit(t / "policy/waivers.toml", SC23, SC23 + "status = \n")),
+    ("P6 waiver status neither open nor closed", {"P6"},
+     lambda t: edit(t / "policy/waivers.toml", SC23, SC23.replace('"open"', '"waived"'))),
+    ("P6 waiver with an unknown key", {"P6"},
+     lambda t: edit(t / "policy/waivers.toml", SC23, SC23 + 'expires = "never"\n')),
+    ("P6 waiver id listed twice", {"P6"}, lambda t: edit(t / "policy/waivers.toml", SC23, SC23 + "\n" + SC23)),
+    # P7 (pending): enforced here on synthetic crates.
+    ("allow synthetic crates without psk_mix", set(), lambda t: synthetic_crates(t), ENFORCE),
+    ("P7 psk_mix identifier", {"P7"}, lambda t: synthetic_crates(t, "pub fn psk_mix() {}\n"), ENFORCE),
+    ("P7 PSK_MIX constant", {"P7"}, lambda t: synthetic_crates(t, "pub const LABEL_PSK_MIX: u64 = 2;\n"), ENFORCE),
+    ("P7 PskMix in a comment", {"P7"}, lambda t: synthetic_crates(t, "// then PskMix on accept\n"), ENFORCE),
+    ("P7 psk_mix in a Cargo.toml", {"P7"},
+     lambda t: (synthetic_crates(t), append(t / "crates/demo/Cargo.toml", "[features]\npsk-mix = []\npsk_mix = []\n")),
+     ENFORCE),
+    # P8: crate sources and manifests, never Cargo.lock.
+    ("P8 getrandom in a crate source", {"P8"},
+     lambda t: append(t / "crates/wire/src/lib.rs", "\nuse getrandom::fill;\n")),
+    ("P8 thread_rng in a crate source", {"P8"},
+     lambda t: append(t / "crates/hs-core/src/lib.rs", "\nfn r() { let _ = rand::thread_rng(); }\n")),
+    ("P8 OsRng in a crate source", {"P8"},
+     lambda t: append(t / "crates/rosenpass-core/src/lib.rs", "\nuse rand_core::OsRng;\n")),
+    ("P8 getrandom feature in a crate Cargo.toml", {"P8"},
+     lambda t: append(t / "crates/pqkey-core/Cargo.toml", '\n[features]\nstd = ["rand_core/getrandom"]\n')),
+    ("allow getrandom in Cargo.lock", set(),
+     lambda t: append(t / "Cargo.lock", '\n[[package]]\nname = "getrandom"\nversion = "0.2.15"\n')),
+    # P9: Secret<-wrapping types in rosenpass-core, pqkey-core and pds/pq.
+    ("P9 derive(Clone) on a Secret wrapper", {"P9"},
+     lambda t: append(t / "crates/rosenpass-core/src/lib.rs", SECRET + "#[derive(Clone)]\npub struct Osk(Secret<32>);\n")),
+    ("P9 derive(Debug) behind another attribute", {"P9"},
+     lambda t: append(t / "crates/pqkey-core/src/lib.rs",
+                      SECRET + "#[derive(PartialEq, Debug)]\n#[repr(C)]\npub struct Reply {\n    shk: Secret<32>,\n}\n")),
+    ("P9 cfg_attr derive(Copy) in pds/pq", {"P9"},
+     lambda t: write(t / "crates/pds/pq/src/main.rs",
+                     SECRET + "#[cfg_attr(test, derive(Copy))]\nenum Slot {\n    Live(Secret<32>),\n    Empty,\n}\n")),
+    ("P9 derive(Debug) on Secret itself", {"P9"},
+     lambda t: append(t / "crates/rosenpass-core/src/lib.rs", "\n#[derive(Debug)]\npub struct Secret<const N: usize>([u8; N]);\n")),
+    ("allow derive(Clone) on a type without a Secret", set(),
+     lambda t: append(t / "crates/rosenpass-core/src/lib.rs",
+                      SECRET + "#[derive(Clone)]\npub struct Header {\n    len: u8,\n}\npub struct Osk(Secret<32>);\n")),
+    ("allow derive(PartialEq) on a Secret wrapper", set(),
+     lambda t: append(t / "crates/rosenpass-core/src/lib.rs", SECRET + "#[derive(PartialEq)]\npub struct Osk(Secret<32>);\n")),
+    ("allow derive(Debug) on a Secret wrapper outside the secret crates", set(),
+     lambda t: append(t / "crates/wg-core/src/lib.rs", SECRET + "#[derive(Debug)]\npub struct Osk(Secret<32>);\n")),
+    ("allow derive(Clone) in a comment", set(),
+     lambda t: append(t / "crates/rosenpass-core/src/lib.rs", SECRET + "// no #[derive(Clone)]: L12\npub struct Osk(Secret<32>);\n")),
 ]
 
 
 def main() -> int:
     failures = 0
-    for name, want, mutate in CASES:
+    for name, want, mutate, *args in CASES:
         with tempfile.TemporaryDirectory() as d:
             tree = pathlib.Path(d)
             copy_tree(tree)
             mutate(tree)
-            got = rules_fired(tree)
+            got = rules_fired(tree, *args)
         ok = got == want
         failures += not ok
         print(f"{'ok  ' if ok else 'FAIL'} {name}: got {sorted(got)} want {sorted(want)}")

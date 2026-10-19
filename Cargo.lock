@@ -785,7 +785,9 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 name = "mksecrets"
 version = "0.1.0"
 dependencies = [
+ "classic-mceliece-rust",
  "libcrux-curve25519",
+ "rand_core 0.6.4",
  "secret-blob",
  "serde",
  "toml",
@@ -1070,7 +1072,7 @@ name = "pqkey-core"
 version = "0.1.0"
 dependencies = [
  "classic-mceliece-rust",
- "libcrux-blake2",
+ "secret-blob",
  "zeroize",
 ]
 
@@ -1288,6 +1290,7 @@ dependencies = [
  "libcrux-blake2",
  "libcrux-chacha20poly1305",
  "libcrux-ml-kem",
+ "rand_core 0.6.4",
  "rosenpass-wire",
  "zeroize",
 ]

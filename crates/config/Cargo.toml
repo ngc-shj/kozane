@@ -13,5 +13,6 @@ serde = { version = "=1.0.229", features = ["derive"] }
 toml = "=0.9.8"
 
 [dev-dependencies]
+secret-blob = { path = "../secret-blob" }
 serde = { version = "=1.0.229", features = ["derive"] }
 toml = "=0.9.8"

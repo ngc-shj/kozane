@@ -1,0 +1,316 @@
+//! Captures Rosenpass V02 golden vectors from upstream for rosenpass-core's
+//! unit tests (M3 plan C1, T1). See README.md for the regeneration command.
+//!
+//! One upstream initiator (`a`, the client) and one upstream responder (`b`,
+//! the gateway) run a full V02 handshake. Only the responder runs under
+//! `assert_tv::TestVectorActive` in init mode, so the recorded values (ck
+//! chain, sidr, the two encapsulations, the biscuit) are exactly the ones the
+//! secureos responder must reproduce. Everything else (domains, macs, peer
+//! ids, ICR ck values, the OSK) is computed with upstream's own functions.
+
+use std::collections::BTreeMap;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+
+use anyhow::{bail, ensure, Context};
+use assert_tv::{finalize_tv_case, initialize_tv_case_from_file, TestMode, TestVectorActive, TestVectorFileFormat};
+use base64::Engine;
+use rosenpass::hash_domains as hd;
+use rosenpass::internal::cipher_traits::primitives::{Kem, KeyedHashInstance};
+use rosenpass::internal::ciphers::{EphemeralKem, KeyedHash, StaticKem};
+use rosenpass::internal::secret_memory::policy::secret_policy_use_only_malloc_secrets;
+use rosenpass::protocol::basic_types::{MsgBuf, SPk, SSk, SessionId};
+use rosenpass::protocol::osk_domain_separator::OskDomainSeparator;
+use rosenpass::protocol::{CryptoServer, HandshakeState, PeerPtr, ProtocolVersion};
+use std::ops::DerefMut;
+
+const UPSTREAM_REV: &str = "9e72f1eb871c4c403e99e9b78262fff8dd8d7357";
+const KYBER_KAT_SEED: u64 = 0x5eed_0000_0000_4b59;
+const MCELIECE_KAT_SEED: u64 = 0x5eed_0000_0000_4d43;
+
+/// SplitMix64 as a byte stream (8 bytes LE per step). rosenpass-core's KAT
+/// test implements the same stream, so liboqs and the Rust KEMs see the same
+/// randomness whatever chunk sizes they request.
+struct SplitMix {
+    state: u64,
+    buf: [u8; 8],
+    used: usize,
+}
+
+impl SplitMix {
+    fn new(seed: u64) -> Self {
+        Self { state: seed, buf: [0; 8], used: 8 }
+    }
+
+    fn byte(&mut self) -> u8 {
+        if self.used == 8 {
+            self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = self.state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            self.buf = (z ^ (z >> 31)).to_le_bytes();
+            self.used = 0;
+        }
+        let b = self.buf[self.used];
+        self.used += 1;
+        b
+    }
+}
+
+static STREAM: Mutex<Option<SplitMix>> = Mutex::new(None);
+
+unsafe extern "C" fn stream_randombytes(buf: *mut u8, len: usize) {
+    let mut guard = STREAM.lock().expect("stream lock");
+    let s = guard.as_mut().expect("stream installed");
+    // SAFETY: liboqs passes a writable buffer of `len` bytes.
+    let out = unsafe { std::slice::from_raw_parts_mut(buf, len) };
+    for b in out {
+        *b = s.byte();
+    }
+}
+
+fn with_stream<T>(seed: u64, f: impl FnOnce() -> T) -> T {
+    *STREAM.lock().expect("stream lock") = Some(SplitMix::new(seed));
+    unsafe { oqs_sys::rand::OQS_randombytes_custom_algorithm(Some(stream_randombytes)) };
+    let r = f();
+    let system = oqs_sys::rand::OQS_RAND_alg_system.as_ptr().cast();
+    let status = unsafe { oqs_sys::rand::OQS_randombytes_switch_algorithm(system) };
+    assert_eq!(status, oqs_sys::rand::OQS_STATUS::OQS_SUCCESS);
+    *STREAM.lock().expect("stream lock") = None;
+    r
+}
+
+struct Out(BTreeMap<String, Vec<u8>>);
+
+impl Out {
+    fn put(&mut self, name: &str, v: &[u8]) -> anyhow::Result<()> {
+        if self.0.insert(name.to_owned(), v.to_vec()).is_some() {
+            bail!("duplicate vector {name}");
+        }
+        Ok(())
+    }
+}
+
+fn gen_keypair() -> anyhow::Result<(SSk, SPk)> {
+    let (mut sk, mut pk) = (SSk::zero(), SPk::zero());
+    StaticKem.keygen(sk.secret_mut(), pk.deref_mut())?;
+    Ok((sk, pk))
+}
+
+fn ck_of(hs: &HandshakeState) -> Vec<u8> {
+    hs.ck.clone().danger_into_secret().secret().to_vec()
+}
+
+/// Reads back the responder's recorded values from assert_tv's JSON file.
+///
+/// Upstream's `handle_msg` first tries an InitHello as V03 (SHAKE256); that
+/// attempt records IHR4 and IHR5 and then fails at IHR6, after which the V02
+/// attempt records the full sequence. Only the last sequence is ours. Unnamed
+/// fields (assert_tv records them with a null name) are mapped by position.
+fn recorded(path: &Path, out: &mut Out) -> anyhow::Result<()> {
+    const SEQUENCE: [(Option<&str>, &str); 19] = [
+        (Some("chaining_key_ihr IHR 4"), "ck.ihr4"),
+        (Some("chaining_key_ihr IHR 5"), "ck.ihr5"),
+        (Some("chaining_key_ihr IHR 6"), "ck.ihr6"),
+        (Some("chaining_key_ihr IHR 7"), "ck.ihr7"),
+        (Some("chaining_key_ihr IHR 8"), "ck.ihr8"),
+        (Some("session_id"), "rhr1.sidr"),
+        (Some("chaining_key_ihr RHR 3"), "ck.rhr3"),
+        (None, "rhr4.shk"),
+        (None, "rhr4.ct"),
+        (Some("chaining_key_ihr RHR 4"), "ck.rhr4"),
+        (None, "rhr5.shk"),
+        (None, "rhr5.ct"),
+        (Some("chaining_key_ihr RHR 5"), "ck.rhr5"),
+        (None, "biscuit.pt"),
+        (Some("CryptoServer::biscuit_key[r]"), "biscuit.key"),
+        (None, "biscuit.nonce_drawn"),
+        (None, "biscuit.ct"),
+        (Some("chaining_key_ihr RHR 6"), "ck.rhr6"),
+        (Some("chaining_key_ihr RHR 7"), "ck.rhr7"),
+    ];
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let entries = json["entries"].as_array().context("entries")?;
+    let first = entries
+        .iter()
+        .rposition(|e| e["name"].as_str() == Some("chaining_key_ihr IHR 4"))
+        .context("no IHR4 recorded")?;
+    let ours = &entries[first..];
+    ensure!(ours.len() == SEQUENCE.len(), "recorded {} values, expected {}", ours.len(), SEQUENCE.len());
+    for (e, (name, key)) in ours.iter().zip(SEQUENCE) {
+        ensure!(e["name"].as_str() == name, "recorded {:?} where {name:?} was expected", e["name"]);
+        let value = e["value"].as_str().context("entry value is not a string")?;
+        out.put(key, &base64::engine::general_purpose::STANDARD.decode(value)?)?;
+    }
+    ensure!(out.0["rhr4.ct"].len() == 768 && out.0["rhr5.ct"].len() == 188, "encapsulation order");
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    let repo: PathBuf = std::env::args().nth(1).context("usage: rp-vectors <secureos repo root>")?.into();
+    let vec_dir = repo.join("crates/rosenpass-core/tests/vectors");
+    let seed_dir = repo.join("crates/rosenpass-wire/src/__fuzz__/tests__parsers_never_panic_and_round_trip/corpus");
+    ensure!(vec_dir.is_dir() && seed_dir.is_dir(), "run from a secureos checkout: {repo:?}");
+
+    secret_policy_use_only_malloc_secrets();
+    let kh = KeyedHash::incorrect_hmac_blake2b();
+    let ek = EphemeralKem::Kyber512Round3;
+    let mut out = Out(BTreeMap::new());
+
+    // The keyed-hash primitive itself.
+    let kh_key: [u8; 32] = std::array::from_fn(|i| i as u8);
+    let kh_data = b"secureos rosenpass-core keyed hash KAT";
+    let mut kh_out = [0u8; 32];
+    kh.keyed_hash(&kh_key, kh_data, &mut kh_out)?;
+    out.put("kh.key", &kh_key)?;
+    out.put("kh.data", kh_data)?;
+    out.put("kh.out", &kh_out)?;
+
+    // Every hash-domain label of the V02 tree.
+    out.put("domain.protocol", &hd::protocol(kh.clone(), ek)?.into_value())?;
+    out.put("domain.mac", &hd::mac(kh.clone(), ek)?.into_value())?;
+    out.put("domain.cookie", &hd::cookie(kh.clone(), ek)?.into_value())?;
+    out.put("domain.cookie_value", &hd::cookie_value(kh.clone(), ek)?.into_value())?;
+    out.put("domain.cookie_key", &hd::cookie_key(kh.clone(), ek)?.into_value())?;
+    out.put("domain.peerid", &hd::peerid(kh.clone(), ek)?.into_value())?;
+    out.put("domain.biscuit_ad", &hd::biscuit_ad(kh.clone(), ek)?.into_value())?;
+    out.put("domain.ckinit", &hd::ckinit(kh.clone(), ek)?.into_value())?;
+    out.put("domain.ckextract", &hd::_ckextract(kh.clone(), ek)?.into_value())?;
+    out.put("domain.mix", &hd::mix(kh.clone(), ek)?)?;
+    out.put("domain.hs_enc", &hd::hs_enc(kh.clone(), ek)?)?;
+    out.put("domain.ini_enc", &hd::ini_enc(kh.clone(), ek)?)?;
+    out.put("domain.res_enc", &hd::res_enc(kh.clone(), ek)?)?;
+    out.put("domain.cke_user", &hd::cke_user(kh.clone(), ek)?.into_value())?;
+    out.put("domain.cke_user_rosenpass", &hd::cke_user_rosenpass(kh.clone(), ek)?.into_value())?;
+    out.put("domain.osk", &hd::ext_wireguard_psk_osk(kh.clone(), ek)?)?;
+    out.put("domain.osk_compressed", &OskDomainSeparator::default().compress_with(kh.clone(), ek)?)?;
+
+    let (a_sk, a_pk) = gen_keypair()?;
+    let (b_sk, b_pk) = gen_keypair()?;
+    let spkt: Vec<u8> = a_pk.to_vec();
+    let spkm: Vec<u8> = b_pk.to_vec();
+
+    out.put("mac_key.spkm", &hd::mac(kh.clone(), ek)?.mix(&spkm)?.into_value())?;
+    out.put("pid.spkm", &hd::peerid(kh.clone(), ek)?.mix(&spkm)?.into_value())?;
+    out.put("pid.spkt", &hd::peerid(kh.clone(), ek)?.mix(&spkt)?.into_value())?;
+
+    let mut a = CryptoServer::new(a_sk, a_pk.clone());
+    let mut b = CryptoServer::new(b_sk, b_pk.clone());
+    // No PSK (SC25): upstream mixes 32 zero bytes at IHR7.
+    a.add_peer(None, b_pk, ProtocolVersion::V02, OskDomainSeparator::default())?;
+    b.add_peer(None, a_pk, ProtocolVersion::V02, OskDomainSeparator::default())?;
+    let (mut abuf, mut bbuf) = (MsgBuf::zero(), MsgBuf::zero());
+
+    let raw = std::env::temp_dir().join(format!("rp-vectors-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&raw);
+    let guard = initialize_tv_case_from_file(&raw, TestVectorFileFormat::Json, TestMode::Init)?;
+
+    let n = a.initiate_handshake(PeerPtr(0), &mut abuf[..])?;
+    let ih = abuf[..n].to_vec();
+    let n = b.handle_msg_with_test_vector::<TestVectorActive>(&ih, &mut bbuf[..])?.resp.context("RespHello")?;
+    let rh = bbuf[..n].to_vec();
+    let n = a.handle_msg(&rh, &mut abuf[..])?.resp.context("InitConf")?;
+    let ic = abuf[..n].to_vec();
+
+    // ICR1-ICR4 replayed with upstream's own HandshakeState before `b`
+    // consumes the InitConf (load_biscuit only reads the server).
+    let (sidi, sidr) = (&ic[4..8], &ic[8..12]);
+    let (biscuit_ct, auth) = (&ic[12..128], &ic[128..144]);
+    let (_, biscuit_no, mut hs) = HandshakeState::load_biscuit(
+        &b,
+        biscuit_ct,
+        SessionId::from_slice(sidi),
+        SessionId::from_slice(sidr),
+        kh.clone(),
+        ek,
+    )?;
+    out.put("biscuit.no", &biscuit_no[..])?;
+    out.put("ck.icr1", &ck_of(&hs))?;
+    hs.encrypt_and_mix(&mut [0u8; 16], &[])?;
+    out.put("ck.icr2", &ck_of(&hs))?;
+    hs.mix(sidi)?.mix(sidr)?;
+    out.put("ck.icr3", &ck_of(&hs))?;
+    hs.decrypt_and_mix(&mut [0u8; 0], auth)?;
+    out.put("ck.icr4", &ck_of(&hs))?;
+
+    // Upstream casts EmptyData over its tx buffer and never writes the
+    // cookie field, so it would carry stale bytes of the previous message.
+    bbuf = MsgBuf::zero();
+    let n = b.handle_msg_with_test_vector::<TestVectorActive>(&ic, &mut bbuf[..])?.resp.context("EmptyData")?;
+    let ed = bbuf[..n].to_vec();
+    finalize_tv_case()?;
+    drop(guard);
+    ensure!(a.handle_msg(&ed, &mut abuf[..])?.resp.is_none(), "initiator answered EmptyData");
+
+    recorded(&raw, &mut out)?;
+    std::fs::remove_file(&raw)?;
+
+    let osk_a = a.osk(PeerPtr(0))?;
+    let osk_b = b.osk(PeerPtr(0))?;
+    ensure!(osk_a.secret() == osk_b.secret(), "OSK mismatch between upstream peers");
+    let session = b.peers[0].session.as_ref().context("responder session")?;
+    ensure!(session.ck.clone().danger_into_secret().secret()[..] == out.0["ck.icr4"][..], "ICR4 ck");
+    out.put("osk", osk_b.secret())?;
+
+    // IHR5's shared key, as the pqkey PD will return it.
+    let mut ihr5_shk = [0u8; 32];
+    let sctr: &[u8; 188] = ih[808..996].try_into()?;
+    StaticKem.decaps(&mut ihr5_shk, b.sskm.secret(), sctr)?;
+    out.put("ihr5.shk", &ihr5_shk)?;
+    out.put("biscuit.ad", &hd::biscuit_ad(kh.clone(), ek)?.mix(&spkm)?.mix(sidi)?.mix(sidr)?.into_value())?;
+
+    out.put("msg.init_hello", &ih)?;
+    out.put("msg.resp_hello", &rh)?;
+    out.put("msg.init_conf", &ic)?;
+    out.put("msg.empty_data", &ed)?;
+
+    // Deterministic KEM KATs (R2-T-N12): liboqs with a SplitMix64 stream.
+    let epki = &ih[8..808];
+    let mut kyber_r = [0u8; 32];
+    let mut s = SplitMix::new(KYBER_KAT_SEED);
+    kyber_r.iter_mut().for_each(|b| *b = s.byte());
+    let (mut kct, mut kss) = ([0u8; 768], [0u8; 32]);
+    with_stream(KYBER_KAT_SEED, || {
+        let st = unsafe { oqs_sys::kem::OQS_KEM_kyber_512_encaps(kct.as_mut_ptr(), kss.as_mut_ptr(), epki.as_ptr()) };
+        assert_eq!(st, oqs_sys::kem::OQS_STATUS::OQS_SUCCESS);
+    });
+    out.put("kat.kyber512.r", &kyber_r)?;
+    out.put("kat.kyber512.ct", &kct)?;
+    out.put("kat.kyber512.ss", &kss)?;
+
+    let (mut mct, mut mss) = ([0u8; 188], [0u8; 32]);
+    with_stream(MCELIECE_KAT_SEED, || {
+        let st = unsafe {
+            oqs_sys::kem::OQS_KEM_classic_mceliece_460896_encaps(mct.as_mut_ptr(), mss.as_mut_ptr(), spkt.as_ptr())
+        };
+        assert_eq!(st, oqs_sys::kem::OQS_STATUS::OQS_SUCCESS);
+    });
+    out.put("kat.mceliece460896.seed", &MCELIECE_KAT_SEED.to_le_bytes())?;
+    out.put("kat.mceliece460896.ct", &mct)?;
+    out.put("kat.mceliece460896.ss", &mss)?;
+
+    let mut text = String::new();
+    writeln!(text, "# Rosenpass V02 golden vectors for crates/rosenpass-core (M3 plan C1, T1).")?;
+    writeln!(text, "# upstream: https://github.com/rosenpass/rosenpass rev {UPSTREAM_REV}")?;
+    writeln!(
+        text,
+        "# features: expose_internal_modules; ProtocolVersion::V02; psk: none; OSK domain: default (wireguard psk)"
+    )?;
+    writeln!(text, "# roles: upstream initiator = client (spkt), upstream responder = gateway (spkm)")?;
+    writeln!(text, "# kem KATs: liboqs (oqs-sys 0.8.0) with a SplitMix64 randombytes stream")?;
+    writeln!(text, "# regenerate: see tools/rp-vectors/README.md; keys are in spkm.bin / spkt.bin")?;
+    for (k, v) in &out.0 {
+        let hex: String = v.iter().map(|b| format!("{b:02x}")).collect();
+        writeln!(text, "{k} {hex}")?;
+    }
+    std::fs::write(vec_dir.join("v02.txt"), text)?;
+    std::fs::write(vec_dir.join("spkm.bin"), &spkm)?;
+    std::fs::write(vec_dir.join("spkt.bin"), &spkt)?;
+    std::fs::write(seed_dir.join("seed-init-hello"), &ih)?;
+    std::fs::write(seed_dir.join("seed-resp-hello"), &rh)?;
+    std::fs::write(seed_dir.join("seed-init-conf"), &ic)?;
+    std::fs::write(seed_dir.join("seed-empty-data"), &ed)?;
+    println!("rp-vectors: wrote {} vectors to {}", out.0.len(), vec_dir.display());
+    Ok(())
+}

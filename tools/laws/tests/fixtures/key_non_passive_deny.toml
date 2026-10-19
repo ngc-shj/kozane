@@ -3,6 +3,7 @@ role = "key"
 
 [mrs.secrets_mr]
 kind = "secrets"
+owner = "key"
 
 [budgets]
 ratio_cap = 0.5

@@ -31,6 +31,7 @@ import bisect
 import contextlib
 import ctypes
 import errno
+import hashlib
 import json
 import math
 import os
@@ -1691,6 +1692,26 @@ def test_cookie_b(loader: str, deploy: str, passed: list):
 
 
 # ---------------------------------------------------------------- driver
+
+
+ORACLE_PINS = os.path.join(os.path.dirname(__file__), "rosenpass-oracle.sha256")
+ORACLE_BINS = {"/opt/rosenpass-master/rosenpass", "/opt/rosenpass-023/rosenpass"}
+
+
+def check_rosenpass_oracle():
+    """VE9: the upstream rosenpass binaries baked into the dev image are the
+    ones the repo pins (both builds are bit-reproducible, so a mismatch means
+    a stale image or a changed Dockerfile stage)."""
+    pins = dict(reversed(line.split()) for line in open(ORACLE_PINS) if line.strip())
+    if set(pins) != ORACLE_BINS:
+        raise Fail(f"{ORACLE_PINS} must pin exactly {sorted(ORACLE_BINS)}, has {sorted(pins)}")
+    for path, want in sorted(pins.items()):
+        try:
+            got = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        except FileNotFoundError:
+            raise Fail(f"rebuild the image: {path} is missing (VE9 oracle)") from None
+        if got != want:
+            raise Fail(f"rebuild the image: {path} has sha256 {got}, the repo pins {want}")
 
 
 def preflight():

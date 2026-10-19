@@ -4,6 +4,10 @@ role = "untrusted_input"
 [pds.key]
 role = "key"
 
+[mrs.secrets_mr]
+kind = "secrets"
+owner = "key"
+
 [priority]
 below = [["untrusted_input", "key"]]
 

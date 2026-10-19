@@ -4,7 +4,6 @@ use super::*;
 
 const GW_PRIVATE: [u8; 32] = [0x11; 32];
 const PEER_PRIVATE: [u8; 32] = [0x22; 32];
-const PSKS: [[u8; 32]; 2] = [[0xa1; 32], [0xa2; 32]];
 const SEED: [u8; 32] = [0x5e; 32];
 
 fn clamped(k: [u8; 32]) -> Key32 {
@@ -24,7 +23,7 @@ fn peer_publics() -> [[u8; 32]; 2] {
 fn region() -> [u8; secret_blob::REGION_SIZE] {
     let mut r = [0u8; secret_blob::REGION_SIZE];
     let p = peer_publics();
-    secret_blob::write(&mut r, clamped(GW_PRIVATE).as_bytes(), &[0x99; 32], &[(p[0], PSKS[0]), (p[1], PSKS[1])]).unwrap();
+    secret_blob::write(&mut r, clamped(GW_PRIVATE).as_bytes(), &[0x99; 32], &p).unwrap();
     r
 }
 
@@ -37,6 +36,8 @@ fn oracle(r: &[u8]) -> Oracle<'_> {
 fn bucket() -> Bucket {
     Bucket::new(100, 1)
 }
+
+const HS: Option<Caller> = Some(Caller::Hs);
 
 #[test]
 fn valid_region_passes_validation() {
@@ -118,7 +119,7 @@ fn static_dh_matches_the_peer_side_computation() {
     let o = oracle(&r);
     let peer_pub = peer_publics()[0];
     let mut reply = [0u64; MAX_WORDS];
-    let (label, n) = o.handle(&mut bucket(), 0, LABEL_STATIC_DH, &pack32(&peer_pub), &mut reply);
+    let (label, n) = o.handle(HS, &mut bucket(), 0, LABEL_STATIC_DH, &pack32(&peer_pub), &mut reply);
     assert_eq!((label, n), (OK, STATIC_DH_REPLY_WORDS));
     let expected = crypto::dh(&clamped(PEER_PRIVATE), &gw_public()).unwrap();
     assert_eq!(unpack32(&reply[..4]).unwrap(), *expected.as_bytes());
@@ -129,33 +130,8 @@ fn low_order_point_is_refused_and_reply_zeroed() {
     let r = region();
     let o = oracle(&r);
     let mut reply = [u64::MAX; MAX_WORDS];
-    assert_eq!(o.handle(&mut bucket(), 0, LABEL_STATIC_DH, &[0; 4], &mut reply), (ERR_ZERO_DH, 0));
+    assert_eq!(o.handle(HS, &mut bucket(), 0, LABEL_STATIC_DH, &[0; 4], &mut reply), (ERR_ZERO_DH, 0));
     assert_eq!(reply, [0; MAX_WORDS]);
-}
-
-#[test]
-fn psk_mix_is_kdf3_of_the_chaining_key_and_that_peers_psk() {
-    let r = region();
-    let o = oracle(&r);
-    let c = [0x77u8; 32];
-    let mut req = [0u64; PSK_MIX_REQ_WORDS];
-    req[0] = 1;
-    req[1..].copy_from_slice(&pack32(&c));
-    let mut reply = [0u64; MAX_WORDS];
-    assert_eq!(o.handle(&mut bucket(), 0, LABEL_PSK_MIX, &req, &mut reply), (OK, PSK_MIX_REPLY_WORDS));
-    let (c2, tau, kappa) = crypto::kdf3(&Key32::from_bytes(c), &PSKS[1]).unwrap();
-    assert_eq!(unpack32(&reply[0..4]).unwrap(), *c2.as_bytes());
-    assert_eq!(unpack32(&reply[4..8]).unwrap(), *tau.as_bytes());
-    assert_eq!(unpack32(&reply[8..12]).unwrap(), *kappa.as_bytes());
-}
-
-#[test]
-fn psk_mix_for_an_unknown_peer_is_refused() {
-    let r = region();
-    let o = oracle(&r);
-    let mut req = [0u64; PSK_MIX_REQ_WORDS];
-    req[0] = 2;
-    assert_eq!(o.handle(&mut bucket(), 0, LABEL_PSK_MIX, &req, &mut [0; MAX_WORDS]), (ERR_UNKNOWN_PEER, 0));
 }
 
 #[test]
@@ -163,7 +139,7 @@ fn boot_seed_returns_the_per_boot_value() {
     let r = region();
     let o = oracle(&r);
     let mut reply = [0u64; MAX_WORDS];
-    assert_eq!(o.handle(&mut bucket(), 0, LABEL_BOOT_SEED, &[], &mut reply), (OK, BOOT_SEED_REPLY_WORDS));
+    assert_eq!(o.handle(HS, &mut bucket(), 0, LABEL_BOOT_SEED, &[], &mut reply), (OK, BOOT_SEED_REPLY_WORDS));
     assert_eq!(unpack32(&reply[..4]).unwrap(), SEED);
 }
 
@@ -173,12 +149,11 @@ fn wrong_sizes_and_unknown_labels_are_bad_requests() {
     let o = oracle(&r);
     let mut reply = [0u64; MAX_WORDS];
     let mut b = bucket();
-    assert_eq!(o.handle(&mut b, 0, LABEL_STATIC_DH, &[0; 3], &mut reply), (ERR_BAD_REQUEST, 0));
-    assert_eq!(o.handle(&mut b, 0, LABEL_STATIC_DH, &[0; 5], &mut reply), (ERR_BAD_REQUEST, 0));
-    assert_eq!(o.handle(&mut b, 0, LABEL_PSK_MIX, &[0; 4], &mut reply), (ERR_BAD_REQUEST, 0));
-    assert_eq!(o.handle(&mut b, 0, LABEL_BOOT_SEED, &[0], &mut reply), (ERR_BAD_REQUEST, 0));
-    assert_eq!(o.handle(&mut b, 0, 0, &[], &mut reply), (ERR_BAD_REQUEST, 0));
-    assert_eq!(o.handle(&mut b, 0, 99, &[0; 4], &mut reply), (ERR_BAD_REQUEST, 0));
+    assert_eq!(o.handle(HS, &mut b, 0, LABEL_STATIC_DH, &[0; 3], &mut reply), (ERR_BAD_REQUEST, 0));
+    assert_eq!(o.handle(HS, &mut b, 0, LABEL_STATIC_DH, &[0; 5], &mut reply), (ERR_BAD_REQUEST, 0));
+    assert_eq!(o.handle(HS, &mut b, 0, LABEL_BOOT_SEED, &[0], &mut reply), (ERR_BAD_REQUEST, 0));
+    assert_eq!(o.handle(HS, &mut b, 0, 0, &[], &mut reply), (ERR_BAD_REQUEST, 0));
+    assert_eq!(o.handle(HS, &mut b, 0, 99, &[0; 4], &mut reply), (ERR_BAD_REQUEST, 0));
 }
 
 #[test]
@@ -188,12 +163,59 @@ fn exhausted_bucket_refuses_until_refilled_and_bad_requests_cost_nothing() {
     let mut b = Bucket::new(2, 1000);
     let mut reply = [0u64; MAX_WORDS];
     for _ in 0..10 {
-        assert_eq!(o.handle(&mut b, 0, 99, &[], &mut reply).0, ERR_BAD_REQUEST);
+        assert_eq!(o.handle(HS, &mut b, 0, 99, &[], &mut reply).0, ERR_BAD_REQUEST);
     }
-    assert_eq!(o.handle(&mut b, 0, LABEL_BOOT_SEED, &[], &mut reply).0, OK);
-    assert_eq!(o.handle(&mut b, 0, LABEL_BOOT_SEED, &[], &mut reply).0, OK);
-    assert_eq!(o.handle(&mut b, 0, LABEL_BOOT_SEED, &[], &mut reply), (ERR_RATE_LIMITED, 0));
-    assert_eq!(o.handle(&mut b, 1000, LABEL_BOOT_SEED, &[], &mut reply).0, OK);
+    assert_eq!(o.handle(HS, &mut b, 0, LABEL_BOOT_SEED, &[], &mut reply).0, OK);
+    assert_eq!(o.handle(HS, &mut b, 0, LABEL_BOOT_SEED, &[], &mut reply).0, OK);
+    assert_eq!(o.handle(HS, &mut b, 0, LABEL_BOOT_SEED, &[], &mut reply), (ERR_RATE_LIMITED, 0));
+    assert_eq!(o.handle(HS, &mut b, 1000, LABEL_BOOT_SEED, &[], &mut reply).0, OK);
+}
+
+/// Labels outside `Hs`'s row: either side of the table, the retired
+/// static-PSK label (2) and the largest label.
+const OUTSIDE_TABLE: [u64; 4] = [0, 2, 4, u64::MAX];
+
+#[test]
+fn hs_allowed_labels_succeed() {
+    let r = region();
+    let o = oracle(&r);
+    let mut reply = [0u64; MAX_WORDS];
+    let peer_pub = peer_publics()[0];
+    assert_eq!(o.handle(HS, &mut bucket(), 0, LABEL_STATIC_DH, &pack32(&peer_pub), &mut reply).0, OK);
+    assert_eq!(o.handle(HS, &mut bucket(), 0, LABEL_BOOT_SEED, &[], &mut reply).0, OK);
+    assert!(Caller::Hs.allows(LABEL_STATIC_DH) && Caller::Hs.allows(LABEL_BOOT_SEED));
+}
+
+#[test]
+fn labels_outside_the_hs_row_are_refused_without_spending_the_bucket() {
+    let r = region();
+    let o = oracle(&r);
+    // A one-call bucket: if any refusal spent it, the final call would be
+    // rate limited.
+    let mut b = Bucket::new(1, 1000);
+    let mut reply = [u64::MAX; MAX_WORDS];
+    for label in OUTSIDE_TABLE {
+        assert!(!Caller::Hs.allows(label), "{label}");
+        for req in [&[][..], &[0; 1], &[0; 4], &[0; 5]] {
+            assert_eq!(o.handle(HS, &mut b, 0, label, req, &mut reply), (ERR_BAD_REQUEST, 0), "{label}");
+            assert_eq!(reply, [0; MAX_WORDS]);
+        }
+    }
+    assert_eq!(o.handle(HS, &mut b, 0, LABEL_BOOT_SEED, &[], &mut reply).0, OK);
+    assert_eq!(o.handle(HS, &mut b, 0, LABEL_BOOT_SEED, &[], &mut reply).0, ERR_RATE_LIMITED);
+}
+
+#[test]
+fn unknown_caller_is_refused_for_every_label_without_spending_the_bucket() {
+    let r = region();
+    let o = oracle(&r);
+    let mut b = Bucket::new(1, 1000);
+    let mut reply = [u64::MAX; MAX_WORDS];
+    let peer_pub = peer_publics()[0];
+    assert_eq!(o.handle(None, &mut b, 0, LABEL_STATIC_DH, &pack32(&peer_pub), &mut reply), (ERR_BAD_REQUEST, 0));
+    assert_eq!(reply, [0; MAX_WORDS]);
+    assert_eq!(o.handle(None, &mut b, 0, LABEL_BOOT_SEED, &[], &mut reply), (ERR_BAD_REQUEST, 0));
+    assert_eq!(o.handle(HS, &mut b, 0, LABEL_BOOT_SEED, &[], &mut reply).0, OK);
 }
 
 #[test]

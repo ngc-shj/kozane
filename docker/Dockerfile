@@ -2,8 +2,12 @@
 # Every downloaded artifact is pinned by sha256; the Microkit SDK is also
 # checked against the release key in keys/ (fingerprint pinned below).
 
+# Shared by the oracle stage and the dev image.
+ARG RUSTUP_VERSION=1.29.1
+ARG RUSTUP_SHA256=15f6e4ce9f583b929c996c91562bad6d4454f3281de858b02cdfdef615fac433
+
 # trixie: Kani 0.68 release binaries need glibc >= 2.39.
-FROM debian:trixie@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5
+FROM debian:trixie@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5 AS base
 
 # apt resolves against a fixed snapshot so package versions do not drift.
 # Plain http is fine: apt verifies Release signatures with the archive keyring,
@@ -17,6 +21,65 @@ RUN set -eux; \
         "deb [check-valid-until=no] http://snapshot.debian.org/archive/debian-security/${DEBIAN_SNAPSHOT} trixie-security main" \
         > /etc/apt/sources.list
 
+# VE9 interop oracle: upstream rosenpass at master and 0.2.3, built in a stage
+# that sees neither /work nor any secret; only the two binaries reach the dev
+# image. Sources are GitHub archives of full commits checked by sha256; the
+# crates come from each upstream Cargo.lock (`cargo fetch --locked`; master's
+# one git dependency, rosenpass/uds, is pinned there by commit) and the build
+# itself runs with no network.
+FROM base AS rosenpass-oracle
+RUN apt-get update -q && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    curl \
+    # oqs-sys builds its vendored liboqs with cmake and bindgen
+    cmake \
+    libclang-dev \
+    # 0.2.3 only: its libsodium-sys-stable has use-pkg-config on, so it links
+    # the snapshot's libsodium dynamically and never downloads libsodium-stable
+    libsodium-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG RUSTUP_VERSION
+ARG RUSTUP_SHA256
+# master's rust-toolchain.toml; 0.2.3 pins none and builds with the same one.
+ARG RP_TOOLCHAIN=1.93.1
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN set -eux; \
+    curl -sSfL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/aarch64-unknown-linux-gnu/rustup-init"; \
+    echo "$RUSTUP_SHA256  /tmp/rustup-init" | sha256sum -c -; \
+    chmod +x /tmp/rustup-init; \
+    /tmp/rustup-init -y --no-modify-path --default-toolchain none --profile minimal; \
+    rm /tmp/rustup-init; \
+    rustup toolchain install "$RP_TOOLCHAIN" --profile minimal
+
+ARG RP_MASTER_COMMIT=9e72f1eb871c4c403e99e9b78262fff8dd8d7357
+ARG RP_MASTER_SHA256=8e58490971058e778b097147cdbcc4b0c15449ffe01f28e873993c5cd6fc0e5a
+ARG RP_023_COMMIT=512fe426be9281366d92a910d391fe8ddd72bd10
+ARG RP_023_SHA256=d634faab090db013ad6447d3dc2eec798c117408d57421e179fa8ca77daf04ec
+RUN set -eux; \
+    base=https://github.com/rosenpass/rosenpass/archive; \
+    curl -sSfL -o /tmp/rp-master.tar.gz "$base/${RP_MASTER_COMMIT}.tar.gz"; \
+    echo "$RP_MASTER_SHA256  /tmp/rp-master.tar.gz" | sha256sum -c -; \
+    curl -sSfL -o /tmp/rp-023.tar.gz "$base/${RP_023_COMMIT}.tar.gz"; \
+    echo "$RP_023_SHA256  /tmp/rp-023.tar.gz" | sha256sum -c -; \
+    for v in master 023; do \
+        mkdir -p "/src/$v"; \
+        tar -xzf "/tmp/rp-$v.tar.gz" -C "/src/$v" --strip-components=1; \
+        rm "/tmp/rp-$v.tar.gz"; \
+        (cd "/src/$v" && cargo +"$RP_TOOLCHAIN" fetch --locked); \
+    done
+
+RUN --network=none set -eux; \
+    for v in master 023; do \
+        (cd "/src/$v" && cargo +"$RP_TOOLCHAIN" build --release --locked --offline -p rosenpass --bin rosenpass); \
+        install -D -m 0755 "/src/$v/target/release/rosenpass" "/opt/rosenpass-$v/rosenpass"; \
+    done; \
+    echo "$RP_MASTER_COMMIT" > /opt/rosenpass-master/SOURCE; \
+    echo "$RP_023_COMMIT" > /opt/rosenpass-023/SOURCE
+
+FROM base
 RUN apt-get update -q && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
@@ -44,6 +107,8 @@ RUN apt-get update -q && apt-get install -y --no-install-recommends \
     wireguard-tools \
     iputils-ping \
     python3-cryptography \
+    # M3 interop: rosenpass 0.2.3 (oracle stage) links it
+    libsodium23 \
     && rm -rf /var/lib/apt/lists/*
 
 ARG ARM_GNU_URL=https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-aarch64-aarch64-none-elf.tar.xz
@@ -108,8 +173,8 @@ RUN set -eux; \
 USER dev
 
 # The toolchain itself is selected by rust-toolchain.toml in the repo.
-ARG RUSTUP_VERSION=1.29.1
-ARG RUSTUP_SHA256=15f6e4ce9f583b929c996c91562bad6d4454f3281de858b02cdfdef615fac433
+ARG RUSTUP_VERSION
+ARG RUSTUP_SHA256
 RUN set -eux; \
     curl -sSfL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/aarch64-unknown-linux-gnu/rustup-init"; \
     echo "$RUSTUP_SHA256  /tmp/rustup-init" | sha256sum -c -; \
@@ -140,5 +205,8 @@ RUN set -eux; \
     cargo +"$TOOLS_RUST" kani setup --use-local-bundle /tmp/kani.tar.gz; \
     rm /tmp/kani.tar.gz; \
     cargo +"$TOOLS_RUST" install --locked cargo-bolero --version "$CARGO_BOLERO_VERSION"
+
+COPY --from=rosenpass-oracle /opt/rosenpass-master /opt/rosenpass-master
+COPY --from=rosenpass-oracle /opt/rosenpass-023 /opt/rosenpass-023
 
 WORKDIR /work
