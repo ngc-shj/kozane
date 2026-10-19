@@ -18,13 +18,16 @@ import sys
 def main() -> int:
     manifest, counts_dir = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
     want = {}
+    dup = []
     for line in manifest.read_text().splitlines():
         line = line.split("#", 1)[0].strip()
         if line:
             key, n = line.split()
+            if key in want:
+                dup.append(f"{key}: listed twice in the manifest")
             want[key] = int(n)
     got, source = {}, {}
-    bad = []
+    bad = list(dup)
     for f in sorted(counts_dir.iterdir()):
         if f.is_file() and f.suffix != ".log":
             for line in f.read_text().splitlines():

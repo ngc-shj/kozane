@@ -114,10 +114,15 @@ def raising_once(how, mask):
 
 signal.pthread_sigmask = raising_once
 try:
-    removed, held = run.final_teardown(tmp)
-    print(f"removed={removed} gone={not os.path.exists(tmp)} held={getattr(held, 'code', None)}")
-except SystemExit as e:
-    print(f"escaped exit {e.code}, gone={not os.path.exists(tmp)}")
+    try:
+        removed, held = run.final_teardown(tmp)
+        print(f"removed={removed} gone={not os.path.exists(tmp)} held={getattr(held, 'code', None)}")
+    except SystemExit as e:
+        print(f"escaped exit {e.code}, gone={not os.path.exists(tmp)}")
+finally:
+    # The fixture's own key-bearing dir must not outlive a failing run.
+    import shutil
+    shutil.rmtree(tmp, ignore_errors=True)
 """
 
 
@@ -129,6 +134,54 @@ def final_teardown_holds_an_exit() -> list:
     if r.returncode != 0 or "removed=True gone=True held=143" not in r.stdout:
         return [f"final teardown did not hold the exit: rc={r.returncode} {r.stdout.strip()!r} {r.stderr[-200:]!r}"]
     return []
+
+
+MAIN_CHILD = r"""
+import importlib.util, os, shutil, signal, sys, tempfile
+spec = importlib.util.spec_from_file_location("run", sys.argv[1])
+run = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(run)
+mode = sys.argv[2]
+tmp = tempfile.mkdtemp(prefix="main-test-")
+open(os.path.join(tmp, "secrets.bin"), "wb").write(b"key")
+run.tempfile.mkdtemp = lambda **_: tmp
+run.preflight = lambda: None
+def failing_build(_):
+    raise run.Fail("build failed (fixture)")
+run.build = failing_build
+sys.argv = ["run.py"]
+try:
+    if mode == "entry":
+        # A signal pending when main's teardown starts: its handler runs on
+        # entry to final_teardown, before that function's own try.
+        real = run.final_teardown
+        calls = []
+        def entering(tmp_dir):
+            if not calls:
+                calls.append(1)
+                run.exit_on_signal(signal.SIGTERM, None)
+            return real(tmp_dir)
+        run.final_teardown = entering
+    try:
+        rc = run.main()
+        print(f"returned {rc}, gone={not os.path.exists(tmp)}")
+    except SystemExit as e:
+        print(f"exit {e.code}, gone={not os.path.exists(tmp)}")
+finally:
+    shutil.rmtree(tmp, ignore_errors=True)
+"""
+
+
+def main_holds_and_reraises(mode: str, want: str):
+    """main()'s teardown removes the key dir and then ends the run with the
+    held exit; without a signal it returns the failure status."""
+    def check() -> list:
+        r = subprocess.run([sys.executable, "-c", MAIN_CHILD, str(ROOT / "tests/integration/run.py"), mode],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode != 0 or want not in r.stdout:
+            return [f"want {want!r}: rc={r.returncode} {r.stdout.strip()!r} {r.stderr[-200:]!r}"]
+        return []
+    return check
 
 
 def netns_harness_installs_the_guard() -> list:
@@ -162,6 +215,8 @@ CHECKS = [
     ("the netns harness installs the guard first", lambda: netns_harness_installs_the_guard()),
     ("the final teardown holds an exit until removal", lambda: final_teardown_holds_an_exit()),
     ("ignore_signals blocks before ignoring", lambda: ignore_signals_has_no_window()),
+    ("main returns the failure status when no signal arrives", main_holds_and_reraises("plain", "returned 1, gone=True")),
+    ("main re-raises an exit held on entry to its teardown", main_holds_and_reraises("entry", "exit 143, gone=True")),
 ]
 
 

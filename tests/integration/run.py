@@ -489,7 +489,8 @@ def test_raw(loader: str):
         flood(w, con, "Ipv4BadChecksum", k=640)
         arp_roundtrip(w)
     finally:
-        kill(child)
+        with signals_held():
+            kill(child)
 
 
 def flood(w: Wire, con: Console, reason: str, k: int):
@@ -761,7 +762,8 @@ def test_mismatched_blob(loader: str):
         con.wait_for(r"key: halted", timeout=LINE_TIMEOUT_S, strip_ready=True)
         con.wait_for(r"MON\|ERROR: faulting PD: key", timeout=LINE_TIMEOUT_S)
     finally:
-        kill(child)
+        with signals_held():
+            kill(child)
 
 
 # ---------------------------------------------------------------- driver
@@ -956,7 +958,12 @@ def main() -> int:
     except Fail as e:
         print(f"\nFAIL [setup]: {e}", file=sys.stderr)
     finally:
-        removed, held = final_teardown(tmp)
+        # A handler can also run on entry to final_teardown, before its own
+        # try: hold that exit here and finish the teardown regardless.
+        try:
+            removed, held = final_teardown(tmp)
+        except SystemExit as e:
+            removed, held = final_teardown(tmp)[0], e
         if not removed:
             status = 1
         if held is not None:

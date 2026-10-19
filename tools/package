@@ -219,13 +219,13 @@ def main() -> int:
         errors = check_location("staging directory", staging, forbidden_roots(ROOT))
         if errors:
             print("\n".join(errors))
-        elif build(a, secrets, blob, staging) == 0:
-            # rename(2) would silently replace an empty directory created
-            # since the check; refuse instead.
+        elif build(a, blob, staging) == 0:
             if out.exists() or out.is_symlink():
                 print(f"package: output directory {out} appeared during the build")
             else:
-                os.rename(staging, out)
+                # Atomic and never replacing: an OUT created after the check
+                # above makes the rename fail instead of being overwritten.
+                publish(staging, out)
                 status = 0
     finally:
         # The final teardown: no stop signal may cut it short or skip its
@@ -255,10 +255,32 @@ def main() -> int:
     return status
 
 
-def build(a, secrets: pathlib.Path, blob: bytes, out: pathlib.Path) -> int:
+RENAME_NOREPLACE = 1
+AT_FDCWD = -100
+
+
+def publish(src: pathlib.Path, dst: pathlib.Path):
+    """rename(2) without replacing an existing dst (renameat2 with
+    RENAME_NOREPLACE). Refuses loudly where that is unavailable rather than
+    fall back to a rename that could replace an empty directory."""
+    import ctypes
+    libc = ctypes.CDLL(None, use_errno=True)
+    if not hasattr(libc, "renameat2"):
+        raise OSError("package: renameat2 unavailable; cannot publish without replacing")
+    if libc.renameat2(AT_FDCWD, os.fsencode(src), AT_FDCWD, os.fsencode(dst), RENAME_NOREPLACE) != 0:
+        err = ctypes.get_errno()
+        raise OSError(err, f"package: cannot publish {dst}: {os.strerror(err)}")
+
+
+def build(a, blob: bytes, out: pathlib.Path) -> int:
+    """Builds in the staging dir `out`. The image is made from a private copy
+    of the blob bytes that were checked, never from the caller's path again,
+    so swapping that path after the check cannot change what is embedded."""
+    blob_copy = out / "secrets.bin"
+    blob_copy.write_bytes(blob)
     placeholder_system = pathlib.Path(a.system).read_text()
     system = out / "secureos.system"
-    system.write_text(with_prefill(placeholder_system, str(secrets.resolve())))
+    system.write_text(with_prefill(placeholder_system, str(blob_copy)))
     loader = out / "loader.img"
 
     subprocess.run(["cargo", "run", "--locked", "-q", "-p", "laws", "--", "check", "--system", str(system),
@@ -266,6 +288,8 @@ def build(a, secrets: pathlib.Path, blob: bytes, out: pathlib.Path) -> int:
     subprocess.run([a.microkit, str(system), "--search-path", a.search_path, "--board", a.board,
                     "--config", a.config, "-r", str(out / "report.txt"), "-o", str(loader)], check=True)
 
+    # The blob now lives only inside the image; drop the private copy.
+    blob_copy.unlink()
     errors = check_systems(placeholder_system, system.read_text())
     errors += check_images(pathlib.Path(a.image).read_bytes(), loader.read_bytes(), blob)
     if errors:

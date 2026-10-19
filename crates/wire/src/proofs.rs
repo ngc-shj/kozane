@@ -113,4 +113,11 @@ fn forward_decrements_ttl_and_keeps_the_datagram_valid() {
             kani::cover!(e == DropReason::TtlExpired);
         }
     }
+    // Deny side, proved rather than covered: a datagram the parser accepts
+    // with TTL 0 or 1 is always refused as TtlExpired.
+    if let Ok(p) = parse_ipv4_packet(input) {
+        if p.packet[8] <= 1 {
+            assert!(forward_ipv4(input, &mut out) == Err(DropReason::TtlExpired));
+        }
+    }
 }

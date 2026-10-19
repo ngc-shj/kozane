@@ -14,6 +14,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools/check-manifest"
 MANIFEST = "# comment\nA-TESTS 5\nB-TESTS 2\n"
 MANIFEST_WITH_ZERO = MANIFEST + "Z-TESTS 0\n"
+MANIFEST_WITH_DUP = MANIFEST + "A-TESTS 5\n"
 
 # (name, counts file text, expected message or None for accept)
 CASES = [
@@ -28,6 +29,7 @@ CASES = [
     ("key repeated within one counts file refused", "A-TESTS 5\nB-TESTS 2\nA-TESTS 7\n",
      "A-TESTS: reported twice by gate"),
     ("duplicate key across counts files refused", "A-TESTS 5\nB-TESTS 2\n", "A-TESTS: reported by both"),
+    ("manifest key listed twice refused", "A-TESTS 5\nB-TESTS 2\n", "A-TESTS: listed twice in the manifest"),
     ("unlisted zero gets actionable advice", "A-TESTS 5\nB-TESTS 2\nC-TESTS 0\n",
      "C-TESTS: 0, the gate counted nothing"),
 ]
@@ -38,7 +40,8 @@ def main() -> int:
     for name, counts, want in CASES:
         with tempfile.TemporaryDirectory() as d:
             d = pathlib.Path(d)
-            (d / "manifest.txt").write_text(MANIFEST_WITH_ZERO if "Z-TESTS" in counts else MANIFEST)
+            text = MANIFEST_WITH_ZERO if "Z-TESTS" in counts else MANIFEST_WITH_DUP if name.startswith("manifest") else MANIFEST
+            (d / "manifest.txt").write_text(text)
             if name.startswith("duplicate"):
                 (d / "counts").mkdir()
                 (d / "counts" / "other").write_text("A-TESTS 4\n")

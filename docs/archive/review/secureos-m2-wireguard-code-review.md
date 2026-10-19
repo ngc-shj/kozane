@@ -301,3 +301,28 @@ Functionality: fixture fidelity (F-R8-1); others checked. Security: R3 (S8-2: fi
 - S8-2 / T8-3: run.py's teardown moved into `final_teardown`, which holds an exit raised by ignore_signals' blocking call until the key-bearing temp dir is removed and reported; fixture with the faithful mock; red-proved by removing the hold.
 - F-R8-2 / T8-1: an AST check requires `guard_thread_starts()` as in_netns's first statement; red-proved by deleting it.
 - T8-4: run_main saves the real pthread_sigmask before patching and restores it first in `finally`. T8-5: the harness fixture count is the number of checks that ran. T8-6: stderr included. Guard docstring states its limits (start-time check; `_thread` and targets that unblock signals themselves not covered; none exist).
+
+# Round 9
+Date: 2026-10-19 — incremental review of `d2352ff..6c8bcad`. Functionality and Security: **No findings**. Testing: one Major, two Minor. An external review supplied by the user (2026-10-19) added one conditional Major and three Minor. R43: no widening.
+
+## Findings
+| ID | Sev | Finding |
+|---|---|---|
+| T9-1 | Major | The final-teardown fixture left its key-bearing temp dir behind whenever it failed |
+| X9-1 | Major (conditional) | tools/package re-followed the blob path after checking it (TOCTOU on the bytes embedded), and `rename(2)` could still replace an empty OUT created after the existence check |
+| T9-2 | Minor | An exit raised on entry to `final_teardown` (before its own try) escaped and left the key dir |
+| T9-3 | Minor | `main`'s re-raise of the held exit was not pinned |
+| X9-2 | Minor | Raw-frame and mismatched-blob boots tore down QEMU without holding signals |
+| X9-3 | Minor | check-manifest let a key listed twice in the manifest itself win silently |
+| X9-4 | Minor | The TTL Kani harness only covered `TtlExpired`; the deny side was not asserted |
+
+## Recurring Issue Check (Round 9)
+Functionality: no findings (fixture fidelity, sibling parity, R29/R49, R2/R12, R43 checked). Security: no findings (R3, R43, RS1–RS5 checked; RS6 N/A). Testing: RT11 (T9-1), RT1/RT5 (T9-2), RT7 (T9-3); RT9 8/8 anchors; others checked. External: RS4 TOCTOU (X9-1), sibling parity (X9-2), RT6 (X9-3), proof wording (X9-4).
+
+## Resolution Status (Round 9)
+- X9-1: `build` writes the checked blob bytes to a private copy inside the 0700 staging dir and points `prefill_path` there (the caller's path is never followed again), deleting the copy once the image is built; OUT is published with `renameat2(RENAME_NOREPLACE)`, refusing loudly where unavailable. Fixtures: the image is built from the staging copy and the copy is gone; publishing refuses an existing empty OUT and succeeds on a free one. Red-proved by pointing the prefill elsewhere and by a plain rename.
+- T9-1: the teardown fixture removes its dir in a `finally` after measuring the result; no leftovers after red-proof runs.
+- T9-2 / T9-3: `main`'s `finally` holds an exit raised on entry to `final_teardown` and finishes the teardown with a second call; fixtures drive `run.main()` with a failing build: no signal → returns 1 with the dir gone; a handler on entry to the teardown → exit 143 with the dir gone. Red-proved by removing the hold and by removing the re-raise.
+- X9-2: both boots' QEMU teardown runs under `signals_held()`.
+- X9-3: a key listed twice in the manifest is refused (fixture, red-proved).
+- X9-4: the Kani harness asserts that any datagram the parser accepts with TTL 0 or 1 is refused as `TtlExpired` (proved by the kani gate in `make check`).

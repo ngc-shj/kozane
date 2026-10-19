@@ -112,7 +112,7 @@ def run_main(build_result):
 
             built = []
 
-            def fake_build(a, secrets, blob_bytes, staging):
+            def fake_build(a, blob_bytes, staging):
                 built.append(1)
                 (staging / "loader.img").write_bytes(b"image")
                 if build_result == "raise":
@@ -367,6 +367,72 @@ def handler_ignores_further_signals():
             signal.signal(s, h)
 
 
+def build_uses_the_checked_bytes():
+    """The image must be built from a private copy of the checked bytes, not
+    by following the caller's path again (TOCTOU), and the copy must not be
+    left beside the image."""
+    d = tmp_tree()
+    real_run = pkg.subprocess.run
+    seen = {}
+    try:
+        (d / "system.xml").write_text(SYSTEM)
+        (d / "placeholder.img").write_bytes(PLACEHOLDER_IMG)
+        staging = d / "staging"
+        staging.mkdir()
+
+        def fake_run(cmd, check=False, **_):
+            if cmd[0] == "cargo":
+                return
+            system = pathlib.Path(cmd[1])
+            prefill = [m.get("prefill_path") for m in pkg.ET.fromstring(system.read_text()).iter("memory_region")
+                       if m.get("name") == pkg.SECRETS_MR][0]
+            seen["prefill"] = prefill
+            seen["bytes"] = pathlib.Path(prefill).read_bytes()
+            pathlib.Path(cmd[cmd.index("-o") + 1]).write_bytes(PACKAGE_IMG)
+
+        pkg.subprocess.run = fake_run
+
+        class A:
+            system, image, policy, search_path, board, config, microkit = (
+                str(d / "system.xml"), str(d / "placeholder.img"), "p", "s", "b", "c", "microkit")
+
+        status = pkg.build(A, BLOB, staging)
+        errors = []
+        if status != 0:
+            errors.append(f"build failed ({status})")
+        if not seen.get("prefill", "").startswith(str(staging)) or seen.get("bytes") != BLOB:
+            errors.append(f"image not built from the private copy: {seen.get('prefill')}")
+        if (staging / "secrets.bin").exists():
+            errors.append("private blob copy left beside the image")
+        return errors
+    finally:
+        pkg.subprocess.run = real_run
+        shutil.rmtree(d)
+
+
+def publish_never_replaces(existing: bool):
+    def run():
+        d = tmp_tree()
+        try:
+            src = d / "staging"
+            src.mkdir()
+            (src / "loader.img").write_bytes(b"image")
+            dst = d / "pkg"
+            if existing:
+                dst.mkdir()  # an empty directory: plain rename(2) would replace it
+            try:
+                pkg.publish(src, dst)
+                published = True
+            except OSError:
+                published = False
+            if existing:
+                return [] if not published and src.exists() and not any(dst.iterdir()) else ["replaced an existing OUT"]
+            return [] if published and (dst / "loader.img").exists() else ["did not publish to a free OUT"]
+        finally:
+            shutil.rmtree(d)
+    return run
+
+
 def existing_out(d):
     (d / "pkg").mkdir()
     return d / "pkg"
@@ -420,6 +486,9 @@ CASES = [
     ("staging that resolves into a forbidden root is refused", None, staging_in_forbidden_root),
     ("a failed staging removal fails loudly", None, failed_staging_removal_is_reported),
     ("a signal during the staging removal waits for it", None, signal_during_removal_does_not_cut_it_short),
+    ("the image is built from a private copy of the checked blob", None, build_uses_the_checked_bytes),
+    ("publishing refuses to replace an OUT that appeared", None, publish_never_replaces(True)),
+    ("publishing to a free OUT succeeds", None, publish_never_replaces(False)),
     ("output inside build/", "inside", lambda: pkg.check_out_path(ROOT / "build/pkg", ROOT)),
     ("output inside the repo", "inside", lambda: pkg.check_out_path(ROOT / "pkg-out", ROOT)),
     ("output through a symlink into the repo", "inside", out_case(link_into_repo)),
