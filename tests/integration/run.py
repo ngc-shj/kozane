@@ -825,6 +825,7 @@ STEP2_WARMUP_S = 1.0           #   over capacity this long before the ping start
 PROBE_RATE = 1e6               # unpaced: the injector's own ceiling
 PROBE_S = 2.0
 PROBE_SETTLE_S = 0.3           # audit lines still printing after the drain
+DENY_SETTLE_S = 1.0            # a port-B WgMac2Accepted line must print before the count
 PROBE_SATURATION = 1.5         # the probe must offer at least this x C
 PRECONDITION_S = 4.0           # band flood measuring the below-capacity survival ratio
 FAIL_P = 1e-3                  # chance failure allowed per retry budget
@@ -1233,6 +1234,15 @@ class PyPeer:
         self.sock.close()
 
 
+def opens_for(gw_pub: bytes, reply: bytes, initiation: bytes) -> bool:
+    """Whether `reply` is a cookie reply to exactly `initiation`."""
+    try:
+        wg_mod.open_cookie_reply(gw_pub, reply, initiation)
+        return True
+    except Exception:
+        return False
+
+
 def learn_cookie(peer: PyPeer, tries: int) -> bytes:
     """Under load an initiation without mac2 must draw a cookie reply that
     opens with the public cookie key."""
@@ -1373,12 +1383,17 @@ def paired_case(con: Console, tap: Tap, peer_conf: str, gw_pub: bytes):
                 r = b.wait_kind((2, 3), COOKIE_WAIT_S)
                 if r is not None and r[0] == 2:
                     raise Fail("cookie deny: port B's initiation with port A's cookie got a handshake response")
-                if r is not None and b.open_cookie(r) is not None:
+                # Conclusive only for the reply to B's latest initiation: an
+                # earlier try that got no reply may still be in flight
+                # [code review R2-T5].
+                if r is not None and opens_for(gw_pub, r, b.sent[-1]):
                     break
             else:
                 raise Fail("cookie deny: no cookie reply at port B (positive signal missing)")
             # Allow: port A with its own cookie. Had the deny step been
-            # accepted, total=1 would already be there.
+            # accepted, total=1 would already be there; the settle lets a
+            # line `audit` prints late appear before it is counted.
+            time.sleep(DENY_SETTLE_S)
             if con.count(r"audit: src=ingress WgMac2Accepted total=\d+ "):
                 raise Fail("WgMac2Accepted appeared before the allow step: port B's initiation was accepted")
             allow = con.mark()

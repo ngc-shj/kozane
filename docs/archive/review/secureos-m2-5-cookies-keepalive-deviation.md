@@ -457,8 +457,8 @@ No committed file was mutated to prove a test.
   `PassIo`: ingress-core hs, data, tick, outside (unchanged); data-core
   installs, inbound, outbound, keepalives, with `PASS_MSGS =
   layout::NET_BUFFERS`. The data PD's inputs are `drain` steps like
-  ingress's; session expiry still runs once per timer notification, before
-  the loop.
+  ingress's. (Session expiry first stayed once per timer notification;
+  superseded by "Orchestrator follow-up … expiry every pass" below.)
   - New dependencies: ring for ingress-core, data-core, pd-ingress,
     pd-data; layout for data-core (`Cargo.lock` updated). ring has no
     dependencies, so the C5 "no cycle" note still holds.
@@ -528,3 +528,21 @@ No committed file was mutated to prove a test.
   - The unused `TIMER` constant is removed.
 - **Pinned by** the pass-order test, which now expects `expire` first in
   each pass.
+
+## Code review Round 2 fixes
+
+- **R2-F1 / S2:** the data PD's `notified` doc said expiry runs once per
+  timer notification. It now says every pass expires first. The F2 bullet
+  of the Round-1 fixes is marked as superseded.
+- **R2-T5:** the paired deny oracle had become nearly vacuous: the count,
+  the mark and the first allow send were microseconds apart. Two changes:
+  - The deny step is conclusive only for the cookie reply to port B's
+    *latest* initiation (`opens_for(gw_pub, r, b.sent[-1])`). An earlier
+    try may still be in flight.
+  - The `WgMac2Accepted` count runs only after `DENY_SETTLE_S` (1 s), so a
+    port-B line that `audit` prints late appears before the count. The
+    strict time check after port A's first send stays as defence in depth.
+
+  Not red-proved by execution: the mutant would need `audit` to print late
+  *and* B's handshake response to be lost. The change only adds a wait and
+  narrows which reply counts.

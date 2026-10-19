@@ -272,7 +272,8 @@ impl Handler for DataPd {
     type Error = Infallible;
 
     /// The bounded handler loop lives in `data_core::run_passes`, where it is
-    /// unit-tested; expiry runs once per timer notification before it.
+    /// unit-tested; every pass first expires sessions past REJECT_AFTER_TIME,
+    /// so a timer notification is just another run of it.
     fn notified(&mut self, _channels: ChannelSet) -> Result<(), Self::Error> {
         run_passes(&mut Pass { data: self, wake: Wake::default() });
         Ok(())

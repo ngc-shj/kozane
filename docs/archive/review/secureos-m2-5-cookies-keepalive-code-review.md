@@ -125,3 +125,28 @@ T8 Minor (RT7): ROTATE_AT<MAX_AGE (ingress-core lib.rs:302) and NET_BUFFERS equa
   `net-buffers-equal` red-proved.
 - **Verification:** `make check` exit 0 alone (C 943/s, step-2 measured
   survival 0.442).
+
+# Review round: 2
+Round 2 reviewed `458d791..7a86aef` with the same reviewers, as an
+incremental review.
+- **Functionality:** F1–F3 resolved. New: R2-F1 [Minor], a stale data
+  `notified` doc.
+- **Security:** S1 verified correct and complete.
+  - Every unauthenticated reply (ARP, cookie) respects the TX reserve.
+    Keeping hs responses and data outbound outside it is intended.
+  - R43: no widening. ARP suppression gives the same proportional service
+    as before, and hs/data now keep half of TX.
+  - No new DoS levers in the data loop.
+  - New: S2 [Minor], the same stale doc as R2-F1.
+- **Testing:** T1–T4 and T6–T8 resolved, and the selftest renames
+  verified. New: R2-T5 [Minor], the T5 fix was nearly vacuous.
+
+### Resolution (round 2)
+- **R2-F1 / S2:** doc reworded in `crates/pds/data/src/main.rs`, and the
+  deviation log's stale sentence marked as superseded.
+- **R2-T5:** in `tests/integration/run.py`:
+  - deny is conclusive only for the reply to B's latest initiation
+    (`opens_for`);
+  - a 1 s settle (`DENY_SETTLE_S`) runs before the `WgMac2Accepted` count;
+  - the time check is kept.
+- **Verification:** `make check` exit 0 alone.
