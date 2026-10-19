@@ -576,3 +576,11 @@ No committed file was mutated to prove a test.
     entry.
 - **Audit-trail date:** the code-review record's date is corrected to
   2026-10-19, the date of the commits.
+- **Precision notes from the follow-up external review:**
+  - "Not retried in the same pass" holds for a failed keepalive send. A
+    debt restored after a failed *outbound* send can be tried once more by
+    that pass's keepalive step. This is bounded: one attempt per peer per
+    pass.
+  - The tests pin `restore_unacked`'s state transitions. That the PD calls
+    it on every failed send is verified by review, not by a test, because
+    the PD's send paths run only on seL4.

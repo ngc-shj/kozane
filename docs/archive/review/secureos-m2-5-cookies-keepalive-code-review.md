@@ -177,3 +177,7 @@ complete after 3 rounds; every finding from Rounds 1–2 is resolved, and
 - **Record inconsistency:** the date is corrected to 2026-10-19.
 
 Details are in the deviation log ("External review after code review").
+- **Verified state:** these fixes were committed as `62e26b7`, and
+  `make check` passed alone on it (exit 0, `INTEGRATION-CASES 11`). A
+  follow-up external review of `62e26b7` found no further findings. Its two
+  precision notes are recorded in the deviation log.
