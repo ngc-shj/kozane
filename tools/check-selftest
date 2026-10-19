@@ -57,7 +57,8 @@ CASES_FOR_GATE = {
     "pins": {"pins", "package-release"},
     "lint": {"lint"},
     "unit": {"unit", "c5-forward-burst", "c5-backlog", "c5-interval", "c5-key-calls",
-             "arrival-interval-order", "arrival-burst-order", "ingress-late-notify", "ingress-unbounded-loop"},
+             "arrival-interval-order", "arrival-burst-order", "late-notify", "unbounded-drain",
+             "rotate-before-max-age", "net-buffers-equal"},
     "kani": {"kani", "kani-cache"},
     "bolero": {"bolero", "bolero-wg-wire"},
     "laws": {"laws", "laws-timer-ingress"},
@@ -142,12 +143,12 @@ CASES = {
                                                                '        passed.append("unknown peer")\n', ""),
                           "INTEGRATION-CASES: 10 < manifest 11"),
     # Under load an initiation without a valid mac2 must not reach hs (M2.5
-    # plan C6): forwarding regardless of mac2 must fail the cookie
-    # attribution (paired case at port A, or wireguard-go in the flood case).
+    # plan C6): forwarding regardless of mac2 must fail the paired case at
+    # port A, whose initiation without mac2 then draws a handshake response.
     "integration-cookie": (["test"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
                                                     "        if !self.observe_load(now_ns, backlog) {\n",
                                                     "        if !self.observe_load(now_ns, backlog) || true {\n"),
-                           "cookie attribution failed"),
+                           "cookie attribution failed: an initiation without mac2 under load got a handshake response"),
     # The key budget invariant (M2.5 plan C5): each operand of the two
     # compile-time inequalities, and the per-path count, loosened on its own.
     "c5-forward-burst": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
@@ -173,18 +174,29 @@ CASES = {
     "arrival-burst-order": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
                                                      "pub const ARRIVAL_BURST: u64 = 16;", "pub const ARRIVAL_BURST: u64 = 17;"),
                             "ARRIVAL_BURST above FORWARD_BURST"),
-    # The handler loop is unit-tested in ingress-core (TCG cannot saturate
-    # ingress behind eth_out, so the flood case cannot red these): notifying
-    # only once the loop ends, or uncapping an input, must fail the unit gate.
-    "ingress-late-notify": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
-                                                     "        io.end_pass();\n        if !pass_plan(n_hs, n_data, n_outside).continue_ {\n            return;",
-                                                     "        if !pass_plan(n_hs, n_data, n_outside).continue_ {\n            io.end_pass();\n            return;"),
-                            "each pass must serve every input, tick, then end_pass"),
+    # The handler loop that `ingress` and `data` both run is unit-tested in
+    # ring::pass (TCG cannot saturate ingress behind eth_out, so the flood
+    # case cannot red these): notifying only once the loop ends, or
+    # uncapping an input, must fail the unit gate.
+    "late-notify": (["unit"], lambda t: edit(t, "crates/ring/src/pass.rs",
+                                             "        io.end_pass();\n        if !more {\n            return;",
+                                             "        if !more {\n            io.end_pass();\n            return;"),
+                    "each pass must end with end_pass"),
     # `drain` is the loop every PD input runs, so its bound is the one the
-    # PD executes.
-    "ingress-unbounded-loop": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
-                                                        "while moved < max && step() {", "while step() {"),
-                               "drain must take exactly max and not step again"),
+    # PDs execute.
+    "unbounded-drain": (["unit"], lambda t: edit(t, "crates/ring/src/pass.rs",
+                                                 "while moved < max && step() {", "while step() {"),
+                        "drain must take exactly max and not step again"),
+    # The secret must rotate before the backstop refuses it (M2.5 plan C3).
+    "rotate-before-max-age": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                       "pub const ROTATE_AT_NS: u64 = 118_000_000_000;",
+                                                       "pub const ROTATE_AT_NS: u64 = 120_000_000_000;"),
+                              "ROTATE_AT_NS not below COOKIE_SECRET_MAX_AGE_NS"),
+    # The Gate's thresholds are fractions of the ring size it was written
+    # against; hs-core's tests assert it equals layout's.
+    "net-buffers-equal": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                   "pub const NET_BUFFERS: usize = 64;", "pub const NET_BUFFERS: usize = 65;"),
+                          "ingress-core NET_BUFFERS differs from layout"),
     # A timer that can be notified is tainted (L1): flipped in both the
     # system and the policy, so only the law can object (M2.5 plan C4).
     "laws-timer-ingress": (["laws"], lambda t: (
@@ -201,7 +213,7 @@ CASES = {
     # Deleting a test keeps `unit` green; only the manifest comparison notices.
     "manifest": (["unit", "manifest"], lambda t: edit(t, "crates/audit-event/src/tests.rs",
                                                      "#[test]\nfn first_occurrence_emits()",
-                                                     "#[allow(dead_code)]\nfn first_occurrence_emits()"), "UNIT-AUDIT-EVENT: 17 < manifest 18"),
+                                                     "#[allow(dead_code)]\nfn first_occurrence_emits()"), "UNIT-AUDIT-EVENT: 18 < manifest 19"),
 }
 
 

@@ -114,6 +114,8 @@ pub enum Event {
     CookieSecretExpired,
     /// The cookie secret could not be generated (edge; never coalesced).
     CookieSecretUnavailable,
+    /// An ARP reply was due but the TX reserve was reached.
+    ArpSuppressed,
 }
 
 impl Event {
@@ -158,6 +160,7 @@ impl Event {
             Event::WgMac2Accepted => 0x0039,
             Event::CookieSecretExpired => 0x003a,
             Event::CookieSecretUnavailable => 0x003b,
+            Event::ArpSuppressed => 0x003c,
             Event::FrameDropped { reason } => {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
             }
@@ -165,7 +168,7 @@ impl Event {
     }
 
     /// Every variant except the parameterised `FrameDropped`.
-    pub const FIXED: [Event; 39] = [
+    pub const FIXED: [Event; 40] = [
         Event::ArpReplied,
         Event::UdpEchoed,
         Event::RingCorrupt,
@@ -205,6 +208,7 @@ impl Event {
         Event::WgMac2Accepted,
         Event::CookieSecretExpired,
         Event::CookieSecretUnavailable,
+        Event::ArpSuppressed,
     ];
 
     /// Display name; exhaustive, so a new variant fails to compile here.
@@ -249,6 +253,7 @@ impl Event {
             Event::WgMac2Accepted => "WgMac2Accepted",
             Event::CookieSecretExpired => "CookieSecretExpired",
             Event::CookieSecretUnavailable => "CookieSecretUnavailable",
+            Event::ArpSuppressed => "ArpSuppressed",
             Event::FrameDropped { .. } => "FrameDropped",
         }
     }
@@ -295,7 +300,8 @@ impl Event {
             | Event::WgCookieSent
             | Event::WgCookieSuppressed
             | Event::WgCookieDropped
-            | Event::WgMac2Accepted => true,
+            | Event::WgMac2Accepted
+            | Event::ArpSuppressed => true,
         }
     }
 
@@ -346,6 +352,7 @@ impl Event {
             Event::WgMac2Accepted => 36,
             Event::CookieSecretExpired => 37,
             Event::CookieSecretUnavailable => 38,
+            Event::ArpSuppressed => 39,
             Event::FrameDropped { reason } => {
                 // FIXED_SLOTS..FIXED_SLOTS+64, clamped like `code`.
                 let r = if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason };
@@ -355,7 +362,7 @@ impl Event {
     }
 }
 
-const FIXED_SLOTS: usize = 39;
+const FIXED_SLOTS: usize = 40;
 const SLOTS: usize = FIXED_SLOTS + MAX_DROP_REASON as usize + 1;
 
 /// Per-producer coalescing state.

@@ -381,5 +381,53 @@ fn seal_into(s: &mut Session, plain: &[u8], now_ns: u64, out: &mut [u8]) -> Resu
     n.checked_add(TRANSPORT_HEADER_LEN).ok_or(SessionError::Buffer)
 }
 
+/// Messages each input may move per handler-loop pass (as `ingress`'s K).
+pub const PASS_MSGS: usize = layout::NET_BUFFERS;
+
+/// The PD's side of one handler-loop pass. Each input moves at most `max`
+/// messages, through `ring::pass::drain`, and returns how many it moved.
+pub trait PassIo {
+    /// Drops (zeroizes) the sessions past REJECT_AFTER_TIME (`Data::tick`).
+    fn expire(&mut self);
+    fn serve_installs(&mut self, max: usize) -> usize;
+    fn serve_inbound(&mut self, max: usize) -> usize;
+    fn serve_outbound(&mut self, max: usize) -> usize;
+    /// Sends every keepalive due (plan C7).
+    fn keepalives(&mut self);
+    /// Notifies every peer this pass gave work to and flushes audit.
+    fn end_pass(&mut self);
+}
+
+/// `data`'s pass order for `ring::pass`.
+struct Order<'a, T>(&'a mut T);
+
+impl<T: PassIo> ring::pass::Pass for Order<'_, T> {
+    fn serve(&mut self) -> bool {
+        // Every pass, so a flood on any input cannot hold an expired
+        // session's keys in memory (L12) [code review R1 follow-up].
+        self.0.expire();
+        // Installs first, so a session is known before its first packet
+        // (plan, Ordering).
+        let n_installs = self.0.serve_installs(PASS_MSGS);
+        let n_inbound = self.0.serve_inbound(PASS_MSGS);
+        let n_outbound = self.0.serve_outbound(PASS_MSGS);
+        // After `inner` is drained, so a reply already queued disarms first.
+        self.0.keepalives();
+        ring::pass::any_full(&[n_installs, n_inbound, n_outbound], PASS_MSGS)
+    }
+
+    fn end_pass(&mut self) {
+        self.0.end_pass();
+    }
+}
+
+/// The handler loop: every pass expires sessions, serves the three inputs,
+/// at most PASS_MSGS each, then the keepalives, and ends with `end_pass`, so a flood on one
+/// input starves neither the others, nor expiry, nor the keepalives, nor the peers
+/// waiting to be notified [code review F2].
+pub fn run_passes(io: &mut impl PassIo) {
+    ring::pass::run_passes(&mut Order(io));
+}
+
 #[cfg(test)]
 mod tests;

@@ -23,6 +23,7 @@
 )]
 
 pub mod link;
+pub mod pass;
 pub mod shmem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

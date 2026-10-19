@@ -373,3 +373,81 @@ mod link_tests {
         assert!(matches!(tx.reclaim(), Err(LinkError::BadDesc(_))));
     }
 }
+
+// ---- pass ----
+
+/// A PD stand-in: `full` passes find an input at its cap, then one does not.
+struct FakePass {
+    full: usize,
+    log: std::vec::Vec<&'static str>,
+}
+
+impl pass::Pass for FakePass {
+    fn serve(&mut self) -> bool {
+        self.log.push("serve");
+        let more = self.full > 0;
+        self.full = self.full.saturating_sub(1);
+        more
+    }
+    fn end_pass(&mut self) {
+        self.log.push("end");
+    }
+}
+
+#[test]
+fn every_pass_ends_with_end_pass_and_a_pass_below_the_cap_is_the_last() {
+    let mut io = FakePass { full: 3, log: std::vec::Vec::new() };
+    pass::run_passes(&mut io);
+    assert_eq!(io.log, ["serve", "end"].repeat(4), "each pass must end with end_pass");
+}
+
+#[test]
+fn an_idle_pass_still_ends_with_end_pass() {
+    let mut io = FakePass { full: 0, log: std::vec::Vec::new() };
+    pass::run_passes(&mut io);
+    assert_eq!(io.log, ["serve", "end"]);
+}
+
+const K: usize = 64;
+
+#[test]
+fn drain_stops_at_exactly_max_with_input_remaining() {
+    let mut waiting = K + 5;
+    let mut steps = 0;
+    let moved = pass::drain(K, || {
+        steps += 1;
+        if waiting == 0 {
+            return false;
+        }
+        waiting -= 1;
+        true
+    });
+    assert_eq!((moved, steps), (K, K), "drain must take exactly max and not step again");
+    assert_eq!(waiting, 5);
+}
+
+#[test]
+fn drain_returns_fewer_than_max_when_the_input_runs_dry() {
+    let mut waiting = 3;
+    let moved = pass::drain(K, || {
+        if waiting == 0 {
+            return false;
+        }
+        waiting -= 1;
+        true
+    });
+    assert_eq!(moved, 3);
+}
+
+#[test]
+fn any_full_continues_when_any_input_moved_the_cap() {
+    for moved in [[K, 0, 0], [0, K, 0], [0, 0, K]] {
+        assert!(pass::any_full(&moved, K), "{moved:?}");
+    }
+}
+
+#[test]
+fn any_full_breaks_when_every_input_moved_less_than_the_cap() {
+    assert!(!pass::any_full(&[K - 1, K - 1, K - 1], K));
+    assert!(!pass::any_full(&[0, 0, 0], K));
+}

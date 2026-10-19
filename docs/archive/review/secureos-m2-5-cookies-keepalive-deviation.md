@@ -247,9 +247,10 @@ Implementation decisions not spelled out by plan rev 6, or departing from it.
   - pings: `max(3, tries_for(s1))`.
   - Measured `s1`: 0.87–1.00, giving 2–6 attempts (13.7–35.0 s) and
     3–4 pings.
-- **Flood step 2:** a frame survives about C / rate, from this run's probe.
-  It is scaled by 0.5 for the gap between probe C and sustained C
-  (observed 0.6–1.0):
+- **Flood step 2:** a frame survives about C / rate. The rate is the fixed
+  `STEP2_RATE` × C, so this is the constant 1/3, not a measurement; it is
+  scaled by 0.5 for the gap between probe C and sustained C (observed
+  0.6–1.0). Step 2 measures its own survival afterwards (code review T1):
   - `s2 = 0.5 / 3 = 0.167`, so 38 tries (40 s);
   - P(fail) = 0.833^38 = 9.6e-4;
   - at the lowest measured ping survival, 0.20, it is 0.80^38 = 2.1e-4.
@@ -408,3 +409,122 @@ Implementation decisions not spelled out by plan rev 6, or departing from it.
   - this log's "open" heading for the loop mutations.
 - **R17 (functionality).** The reason `Buckets` keeps its own bucket
   arithmetic (M2 code with its own Kani proofs) is now in `Meter`'s doc.
+
+## Code review Round 1 fixes
+
+Red-proofs ran on throwaway copies of the tree in the dev container's
+`/tmp/rr1-*` (deleted after each run), or through `tools/check-selftest`.
+No committed file was mutated to prove a test.
+
+- **S1 (ARP replies bypassed the TX reserve).** `respond` passes `tx_free`
+  to the ARP path; a request is answered only while
+  `tx_free > TX_RESERVE`, otherwise `Outcome::ArpSuppressed`, which the PD
+  audits as the new coalesced `ArpSuppressed` (code 0x003c, slot 39,
+  `FIXED_SLOTS` 40). ARP replies stay.
+  - Tests: `the_tx_reserve_refuses_an_arp_reply_at_exactly_half` and
+    `an_arp_reply_is_sent_one_buffer_above_the_tx_reserve`; the existing ARP
+    tests are the allow side (`answers_broadcast_arp_request_for_our_ip`
+    now passes a full TX ring instead of 0). audit-event:
+    `arp_suppressed_is_coalesced_and_counted_apart_from_arp_replied`.
+  - Kani: `respond_is_total_and_bounded` asserts (e) for `ArpReplied` and
+    covers `ArpSuppressed`.
+  - Red-proofs: comparison removed and `<=` → `<` (the reply's `>` → `>=`)
+    each fail `the_tx_reserve_refuses_an_arp_reply_at_exactly_half` and the
+    Kani assertion `tx_free > NET_BUFFERS / 2`; `<= TX_RESERVE + 1` fails
+    the allow-side test.
+  - `arp_round_trip` (the harness's drain barrier) retries every 0.5 s, so
+    a request suppressed under saturation is followed by one answered once
+    the ring drains; the barrier's FIFO argument still holds.
+- **T1 (step 2's survival was a constant).** After step 2 the flood stops,
+  an ARP round trip proves the queues drained, and the cookie totals give
+  the measured survival `s2m` (answered / sent, upper bound), which is
+  printed. A failed ping with `s2m < s2` raises "flood step 2: measured
+  survival … below the budget's assumption …; … not judged"; otherwise the
+  regression message stands. The "Retry budgets" entry above is reworded.
+  - Red-proofs (boot b only, ping verdict forced to fail in the copy):
+    - step 2's actual rate × 10 with its band scaled, the budget's s2
+      kept: `measured survival 0.050 below the budget's assumption 0.167`;
+    - committed rate: `measured survival 0.454 (budget assumed 0.167)`, then
+      the regression message "no ping reply through the established session
+      in 38 tries over capacity".
+  - Plan's "`serve_data` moving nothing" mutant is not usable here: it
+    starves every reply to the inside, so the keepalive case, the
+    precondition ping and step 1's ping fail long before step 2.
+- **F2 (data's input loops were unbounded).** The loop moved to
+  `ring::pass` (ring is no_std, host-tested, and both PDs and both cores
+  can depend on it): `run_passes(&mut impl Pass)`, `drain(max, step)` and
+  `any_full(moved, max)`. Each core supplies its order through its own
+  `PassIo`: ingress-core hs, data, tick, outside (unchanged); data-core
+  installs, inbound, outbound, keepalives, with `PASS_MSGS =
+  layout::NET_BUFFERS`. The data PD's inputs are `drain` steps like
+  ingress's; session expiry still runs once per timer notification, before
+  the loop.
+  - New dependencies: ring for ingress-core, data-core, pd-ingress,
+    pd-data; layout for data-core (`Cargo.lock` updated). ring has no
+    dependencies, so the C5 "no cycle" note still holds.
+  - Tests: ring (end_pass every pass, idle pass, drain exact/dry,
+    `any_full` K / K−1); ingress-core and data-core each: order per pass
+    under a flood, inputs capped, K on any one input runs another pass,
+    K−1 on all is the last pass (and ingress: K from data still runs the
+    tick and outside).
+  - check-selftest: `ingress-unbounded-loop` → `unbounded-drain` and
+    `ingress-late-notify` → `late-notify`, both now editing
+    `crates/ring/src/pass.rs`; the three order tests share the needle
+    "each pass must end with end_pass", since cargo stops at the first
+    failing crate (data-core). Both red-proved.
+- **F3 (`PassActions.flush` had no consumer).** `pass_plan` and
+  `PassActions` are gone; `continue_` is `ring::pass::any_full`, tested in
+  ring and through both cores' `run_passes`. Not done: a host test that a
+  pass with no wake flags notifies nobody; `Wake` and the notify calls stay
+  in the PDs (seL4 channels), so it would need a further abstraction.
+- **F1.** wg-core `noise.rs`'s module doc: mac2 is ignored there because
+  `ingress` verifies it through `crate::cookie`; responses carry mac2 = 0
+  (SC19).
+- **T2 (integration-cookie's needle).** A run of the injected tree (HEAD
+  458d791, `observe_load(..) || true`) failed at boot a with "cookie
+  attribution failed: an initiation without mac2 under load got a
+  handshake response", the specific detector, not the generic "no cookie
+  reply". The needle is now that full message, re-red-proved: `tools/check-selftest integration-cookie` ok (exit 2,
+  needle found).
+- **T3.** Before step 1 the harness prints the highest
+  `WgCookieSuppressed` total and the blind window (63 once any line was
+  printed, else 0); a run printed "highest … 1; up to 63 suppressions in
+  step 1 would print no line". The paired case's fresh-boot `total=1`
+  check is the authoritative TX-reserve check; step 1's is auxiliary.
+- **T4.** A behavioural `Fail` in the paired case or in step 1 first checks
+  the flood's lower band over [start, now] (`check_low_band_first`); if the
+  harness under-delivered, that message is raised, chained to the original.
+- **T5.** The paired case requires the `WgMac2Accepted total=1` line to be
+  read strictly after port A's first allow send.
+- **T6.** `sender_in_flight_stays_within_pool` asserts
+  `n <= usize::from(sent == Ok(true))`. Red-proof: `in_flight` over-counting
+  by one (capped at M) fails the new assertion; the same mutant passes
+  under the old `n <= M`.
+- **T7.** The data-core test client seals and opens at its session's
+  creation time and confirms at it; `expired_current_is_disarmed_…`
+  installs peer 1 at T0 + 100 s, after peer 0's data, so no session seals
+  before its install and `data`'s clock never goes back.
+- **T8.** `ROTATE_AT_NS < COOKIE_SECRET_MAX_AGE_NS` and the ingress PD's
+  NET_BUFFERS equality carry messages (hs-core's already had the same one).
+  New unit-gate cases, both red-proved: `rotate-before-max-age`
+  (`ROTATE_AT_NS` → 120 s) and `net-buffers-equal` (ingress-core
+  `NET_BUFFERS` → 65, caught by hs-core's assertion).
+- **check-selftest `manifest`:** its needle follows audit-event's new count,
+  "UNIT-AUDIT-EVENT: 18 < manifest 19"; re-red-proved.
+- **Counts:** ingress-core loses the moved `pass_plan`/`drain` tests
+  (61 → 59); ring 24 → 30, data-core 44 → 48, audit-event 18 → 19.
+
+### Orchestrator follow-up to the Round-1 fixes: expiry every pass
+
+- **The gap:** after the F2 fix, `data` still ran `Data::tick` (session
+  expiry and zeroization) once per timer notification, before the loop. A
+  flood that kept an input full would keep the loop running, so expired
+  sessions' keys would stay in memory, against L12.
+- **The fix:**
+  - data-core's `PassIo` gains `expire()`, called first in every pass. The
+    PD implements it as `Data::tick(now)` plus `SessionExpired` audits.
+  - `notified()` no longer distinguishes the timer channel. A timer
+    notification is just another run of the loop, as in `ingress`.
+  - The unused `TIMER` constant is removed.
+- **Pinned by** the pass-order test, which now expects `expire` first in
+  each pass.

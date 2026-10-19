@@ -41,12 +41,15 @@ struct Client {
     s: Session,
     /// Our local index (the receiver index on its packets).
     to: u32,
+    /// The client's clock: its session's creation time, so it never seals
+    /// before `data` installed the session.
+    at: u64,
 }
 
 impl Client {
     fn packet(&mut self, plaintext: &[u8]) -> Vec<u8> {
         let mut ct = std::vec![0u8; plaintext.len() + TAG_LEN];
-        let (c, n) = self.s.seal(plaintext, &mut ct, T0).unwrap();
+        let (c, n) = self.s.seal(plaintext, &mut ct, self.at).unwrap();
         let mut msg = std::vec![0u8; TRANSPORT_HEADER_LEN];
         wg_wire::emit_transport_header(self.to, c, &mut msg).unwrap();
         msg.extend_from_slice(&ct[..n]);
@@ -60,7 +63,7 @@ impl Client {
             return None;
         }
         let mut pt = std::vec![0u8; t.ciphertext.len() - TAG_LEN];
-        let n = self.s.open(t.counter, t.ciphertext, &mut pt, T0).ok()?;
+        let n = self.s.open(t.counter, t.ciphertext, &mut pt, self.at).ok()?;
         pt.truncate(n);
         Some(pt)
     }
@@ -73,7 +76,7 @@ fn install_at(d: &mut D, peer: u16, local_index: u32, created_ns: u64) -> (Insta
     let remote_index = local_index + 1000;
     let o = d.install(&Install { peer, local_index, remote_index, send: &send, recv: &recv }, created_ns);
     let keys = SessionKeys { send: Key32::from_bytes(recv), recv: Key32::from_bytes(send) };
-    (o, Client { s: Session::new(keys, remote_index, local_index, created_ns), to: local_index })
+    (o, Client { s: Session::new(keys, remote_index, local_index, created_ns), to: local_index, at: created_ns })
 }
 
 fn install(d: &mut D, peer: u16, local_index: u32) -> Client {
@@ -88,7 +91,7 @@ fn recv<'o>(d: &mut D, src: Endpoint, msg: &[u8], out: &'o mut [u8]) -> InboundO
 
 fn confirm(d: &mut D, c: &mut Client) {
     let mut buf = [0u8; 64];
-    let o = recv(d, EP1, &c.packet(&[]), &mut buf);
+    let o = d.inbound(&Allowed, EP1, &c.packet(&[]), c.at, &mut buf);
     assert!(matches!(o, InboundOutcome::Authenticated { promoted: true, .. }), "{o:?}");
 }
 
@@ -604,11 +607,13 @@ fn received_keepalives_alone_do_not_arm() {
 fn expired_current_is_disarmed_and_a_later_peer_is_still_served() {
     let mut d = D::new();
     let mut a = confirmed(&mut d, 0, 1);
-    let (o, mut b) = install_at(&mut d, 1, 2, T0 + 20 * KEEPALIVE);
+    data_in(&mut d, &mut a, PEER0_IP, T0);
+    // Peer 1's session starts later, so it outlives peer 0's.
+    let t1 = T0 + 10 * KEEPALIVE;
+    let (o, mut b) = install_at(&mut d, 1, 2, t1);
     assert_eq!(o, InstallOutcome::Installed);
     confirm(&mut d, &mut b);
-    data_in(&mut d, &mut a, PEER0_IP, T0);
-    data_in(&mut d, &mut b, PEER1_IP, T0);
+    data_in(&mut d, &mut b, PEER1_IP, t1);
     // Peer 0's current has expired; peer 1's has not.
     let late = T0 + REJECT_AFTER_TIME_NS;
     let (peer, msg) = keepalive(&mut d, late).unwrap();
@@ -704,4 +709,89 @@ fn keepalive_fires_at_exactly_the_timeout_and_not_a_nanosecond_before() {
     data_in(&mut d, &mut a, PEER0_IP, T0);
     assert_eq!(keepalive(&mut d, T0 + KEEPALIVE - 1), None);
     assert!(keepalive(&mut d, T0 + KEEPALIVE).is_some());
+}
+
+// --- handler loop ---
+
+/// A PD stand-in for `run_passes`: `waiting` messages queue on installs,
+/// inbound and outbound; every call is logged in order.
+#[derive(Default)]
+struct FakePass {
+    waiting: [usize; 3],
+    log: Vec<&'static str>,
+    maxes: Vec<usize>,
+}
+
+impl FakePass {
+    fn queued(waiting: [usize; 3]) -> Self {
+        Self { waiting, ..Self::default() }
+    }
+
+    fn take(&mut self, input: usize, name: &'static str, max: usize) -> usize {
+        self.log.push(name);
+        self.maxes.push(max);
+        let n = self.waiting[input].min(max);
+        self.waiting[input] -= n;
+        n
+    }
+
+    fn passes(&self) -> usize {
+        self.log.iter().filter(|&&c| c == "end").count()
+    }
+}
+
+impl PassIo for FakePass {
+    fn expire(&mut self) {
+        self.log.push("expire");
+    }
+    fn serve_installs(&mut self, max: usize) -> usize {
+        self.take(0, "installs", max)
+    }
+    fn serve_inbound(&mut self, max: usize) -> usize {
+        self.take(1, "inbound", max)
+    }
+    fn serve_outbound(&mut self, max: usize) -> usize {
+        self.take(2, "outbound", max)
+    }
+    fn keepalives(&mut self) {
+        self.log.push("keepalives");
+    }
+    fn end_pass(&mut self) {
+        self.log.push("end");
+    }
+}
+
+#[test]
+fn every_pass_of_an_inbound_flood_runs_the_keepalives_and_ends_with_notify() {
+    let mut io = FakePass::queued([0, 3 * PASS_MSGS, 0]);
+    run_passes(&mut io);
+    let pass = ["expire", "installs", "inbound", "outbound", "keepalives", "end"];
+    // Three full passes, then one that finds the queue empty and breaks.
+    assert_eq!(io.log, pass.repeat(4), "each pass must end with end_pass, after expiry, installs first and keepalives last");
+}
+
+#[test]
+fn every_data_input_is_bounded_to_pass_msgs() {
+    let mut io = FakePass::queued([PASS_MSGS + 1; 3]);
+    run_passes(&mut io);
+    assert!(io.maxes.iter().all(|&m| m == PASS_MSGS), "inputs must be capped at PASS_MSGS: {:?}", io.maxes);
+    assert_eq!(io.passes(), 2);
+}
+
+#[test]
+fn k_on_any_one_data_input_runs_another_pass() {
+    for input in 0..3 {
+        let mut waiting = [0; 3];
+        waiting[input] = PASS_MSGS;
+        let mut io = FakePass::queued(waiting);
+        run_passes(&mut io);
+        assert_eq!(io.passes(), 2, "input {input}");
+    }
+}
+
+#[test]
+fn k_minus_one_on_every_data_input_is_the_last_pass() {
+    let mut io = FakePass::queued([PASS_MSGS - 1; 3]);
+    run_passes(&mut io);
+    assert_eq!((io.passes(), io.waiting), (1, [0; 3]));
 }

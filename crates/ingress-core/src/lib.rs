@@ -62,6 +62,8 @@ pub trait CookieCrypto {
 pub enum Outcome<'a> {
     /// Reply of this many bytes was written to `out`.
     ArpReplied(usize),
+    /// An ARP reply was due but the TX reserve was reached.
+    ArpSuppressed,
     /// The only outcome the PD sends to `hs`. `mac2_checked` is true when it
     /// passed under load with a valid mac2 (audited as `WgMac2Accepted`).
     Initiation { src: Endpoint, msg: &'a [u8; INITIATION_LEN], mac2_checked: bool },
@@ -108,7 +110,7 @@ pub fn respond<'a, C: CookieCrypto, M: Mac1, const N: usize>(
         Err(r) => return Outcome::Dropped(r),
     };
     match f.body {
-        Body::Arp(a) => arp(cfg, &f.eth, &a, out),
+        Body::Arp(a) => arp(cfg, &f.eth, &a, tx_free, out),
         Body::Udp4(u) => {
             if f.eth.dst != cfg.mac || u.dst != cfg.ipv4 {
                 return Outcome::NotForUs;
@@ -127,7 +129,7 @@ pub fn respond<'a, C: CookieCrypto, M: Mac1, const N: usize>(
     }
 }
 
-fn arp<'a>(cfg: &Config, eth: &EthAddrs, a: &ArpPacket, out: &mut [u8]) -> Outcome<'a> {
+fn arp<'a>(cfg: &Config, eth: &EthAddrs, a: &ArpPacket, tx_free: usize, out: &mut [u8]) -> Outcome<'a> {
     if (eth.dst != cfg.mac && eth.dst != BROADCAST) || a.tpa != cfg.ipv4 {
         return Outcome::NotForUs;
     }
@@ -136,6 +138,11 @@ fn arp<'a>(cfg: &Config, eth: &EthAddrs, a: &ArpPacket, out: &mut [u8]) -> Outco
     }
     if a.op != ArpOp::Request {
         return Outcome::NoService;
+    }
+    // Requests are attacker-paced and cheaper than initiations, so their
+    // replies stay out of the reserve too [code review S1].
+    if tx_free <= TX_RESERVE {
+        return Outcome::ArpSuppressed;
     }
     // Reply to the frame's sender (equal to sha, checked above), so a
     // forged sha cannot aim the reply at a third party.
@@ -269,7 +276,8 @@ impl<const N: usize> Buckets<N> {
 }
 
 /// Buffers per network ring. Equal to `layout::NET_BUFFERS`, which this
-/// crate does not depend on; the ingress PD asserts the two equal.
+/// crate does not depend on; hs-core's tests and the ingress PD assert the
+/// two equal.
 pub const NET_BUFFERS: usize = 64;
 
 /// Arrival meter: offered load, spent by every mac1-valid initiation.
@@ -291,15 +299,15 @@ pub const PASS_FRAMES: usize = NET_BUFFERS;
 /// Minimum spacing of `rotate` calls while no secret is held, so the RNG is
 /// never read at attacker-driven rate [R3-F-F5].
 pub const RETRY_INTERVAL_NS: u64 = 100_000_000;
-/// Cookie replies may use only the TX buffers above this; the rest stays
-/// for `hs` and `data` [R2-F-F4].
+/// Cookie and ARP replies may use only the TX buffers above this; the rest
+/// stays for `hs` and `data` [R2-F-F4].
 const TX_RESERVE: usize = NET_BUFFERS / 2;
 
 // Load must begin on arrivals no later than on forwards (plan, "Ordering of
 // the arrival constants").
 const _: () = assert!(ARRIVAL_INTERVAL_NS >= FORWARD_INTERVAL_NS, "ARRIVAL_INTERVAL_NS below FORWARD_INTERVAL_NS");
 const _: () = assert!(ARRIVAL_BURST <= FORWARD_BURST, "ARRIVAL_BURST above FORWARD_BURST");
-const _: () = assert!(ROTATE_AT_NS < COOKIE_SECRET_MAX_AGE_NS);
+const _: () = assert!(ROTATE_AT_NS < COOKIE_SECRET_MAX_AGE_NS, "ROTATE_AT_NS not below COOKIE_SECRET_MAX_AGE_NS");
 
 /// One global token bucket (the shape of `Bucket`): a burst of `BURST`,
 /// refilled at one per `INTERVAL_NS`, starting full. `Buckets` keeps its own
@@ -525,39 +533,8 @@ impl Gate {
     }
 }
 
-/// What the PD does at the end of a handler-loop pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PassActions {
-    /// Some input moved a frame: notify the peers its wake flags name and
-    /// flush audit. Edges from `tick_if_due` are not frames; the PD flushes
-    /// audit every pass anyway, which is free when nothing is pending.
-    pub flush: bool,
-    /// Some input moved PASS_FRAMES and may have more: run another pass.
-    /// Every pass runs all three inputs and the tick before this is decided.
-    pub continue_: bool,
-}
-
-/// The handler-loop bound (plan, "Handler loop"), from the frames moved in
-/// one pass by `serve_hs`, `serve_data` and `serve_outside`, each capped at
-/// PASS_FRAMES.
-pub fn pass_plan(n_hs: usize, n_data: usize, n_outside: usize) -> PassActions {
-    let moved = [n_hs, n_data, n_outside];
-    PassActions { flush: moved.iter().any(|&n| n > 0), continue_: moved.iter().any(|&n| n >= PASS_FRAMES) }
-}
-
-/// Runs `step` until it reports an empty input (`false`) or `max` messages
-/// were taken, and returns how many were taken. Every PD input loop is this
-/// call, so the per-pass cap is enforced here, where it is tested.
-pub fn drain(max: usize, mut step: impl FnMut() -> bool) -> usize {
-    let mut moved: usize = 0;
-    while moved < max && step() {
-        moved = moved.saturating_add(1);
-    }
-    moved
-}
-
 /// The PD's side of one handler-loop pass. Each input moves at most `max`
-/// messages and returns how many it moved.
+/// messages, through `ring::pass::drain`, and returns how many it moved.
 pub trait PassIo {
     fn serve_hs(&mut self, max: usize) -> usize;
     fn serve_data(&mut self, max: usize) -> usize;
@@ -567,21 +544,29 @@ pub trait PassIo {
     fn end_pass(&mut self);
 }
 
+/// `ingress`'s pass order (plan, "Handler loop") for `ring::pass`.
+struct Order<'a, T>(&'a mut T);
+
+impl<T: PassIo> ring::pass::Pass for Order<'_, T> {
+    fn serve(&mut self) -> bool {
+        let n_hs = self.0.serve_hs(PASS_FRAMES);
+        let n_data = self.0.serve_data(PASS_FRAMES);
+        self.0.tick();
+        let n_outside = self.0.serve_outside(PASS_FRAMES);
+        ring::pass::any_full(&[n_hs, n_data, n_outside], PASS_FRAMES)
+    }
+
+    fn end_pass(&mut self) {
+        self.0.end_pass();
+    }
+}
+
 /// The handler loop (plan, "Handler loop"): every pass serves all three
 /// inputs, at most PASS_FRAMES each, runs the tick between `serve_data` and
 /// `serve_outside`, and ends with `end_pass`, so a flood on any input starves
 /// neither the others, nor the tick, nor the peers waiting to be notified.
 pub fn run_passes(io: &mut impl PassIo) {
-    loop {
-        let n_hs = io.serve_hs(PASS_FRAMES);
-        let n_data = io.serve_data(PASS_FRAMES);
-        io.tick();
-        let n_outside = io.serve_outside(PASS_FRAMES);
-        io.end_pass();
-        if !pass_plan(n_hs, n_data, n_outside).continue_ {
-            return;
-        }
-    }
+    ring::pass::run_passes(&mut Order(io));
 }
 
 #[cfg(kani)]

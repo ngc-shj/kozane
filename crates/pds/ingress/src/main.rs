@@ -13,10 +13,11 @@ mod cookie;
 
 use audit_event::Event;
 use cookie::CookieAdapter;
-use ingress_core::{Buckets, Config, Endpoint, Gate, Mac1, Outcome, PassIo, drain, emit_udp, respond, run_passes};
+use ingress_core::{Buckets, Config, Endpoint, Gate, Mac1, Outcome, PassIo, emit_udp, respond, run_passes};
 use layout::ingress as ch;
 use msgs::ToIngress;
 use pdkit::{Audit, Buf, Rx, Tx};
+use ring::pass::drain;
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, debug_println, memory_region_symbol, protection_domain};
 use wg_core::crypto;
 use wg_core::noise::LABEL_MAC1;
@@ -32,7 +33,7 @@ const _: () = assert!(config::PEERS.len() <= MAX_PEERS);
 const BUCKETS: usize = 64;
 // The Gate's backlog and TX-reserve thresholds are fractions of the ring
 // size it was written against.
-const _: () = assert!(ingress_core::NET_BUFFERS == layout::NET_BUFFERS);
+const _: () = assert!(ingress_core::NET_BUFFERS == layout::NET_BUFFERS, "ingress-core NET_BUFFERS differs from layout");
 
 const CONFIG: Config = Config {
     mac: config::OUTSIDE_MAC,
@@ -270,6 +271,10 @@ impl Ingress {
                     self.audit.record(Event::ArpReplied);
                 }
                 return true;
+            }
+            Outcome::ArpSuppressed => {
+                self.audit.record(Event::ArpSuppressed);
+                None
             }
             Outcome::Initiation { src, msg, mac2_checked } => {
                 if mac2_checked {

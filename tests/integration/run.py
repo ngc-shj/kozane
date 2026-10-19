@@ -1119,6 +1119,16 @@ def check_band(what: str, start: tuple, end: tuple, lo: float, hi: float) -> flo
     return rate
 
 
+def check_low_band_first(what: str, start: tuple, end: tuple, lo: float, cause: Fail):
+    """On a behavioural failure: a harness that under-delivered the flood is
+    reported first, chained to `cause`, since the failure then says nothing
+    about the gateway [code review T4]."""
+    rate = (end[0] - start[0]) / (end[1] - start[1])
+    if rate < lo:
+        raise Fail(f"{what}: flood rate {rate:.0f}/s below its band's lower end {lo:.0f}/s; "
+                   f"the behavioural failure is not judged") from cause
+
+
 def cookie_totals(con: Console) -> tuple:
     """(lower, upper) bounds on initiations ingress answered on the cookie
     path so far, from the coalesced WgCookieSent / WgCookieSuppressed lines
@@ -1350,42 +1360,53 @@ def paired_case(con: Console, tap: Tap, peer_conf: str, gw_pub: bytes):
         mark = con.mark()
         start = flood.set_rate(BAND_RATE * refill)
         try:
-            m = con.wait_for(r"audit: src=ingress WgUnderLoad total=1 ", since=mark)
-        except Fail:
-            raise Fail("paired: WgUnderLoad total=1 did not appear under the band flood")
-        loaded_at = mark + m.start()
-        a, b = PyPeer(peer_conf, gw_pub), PyPeer(peer_conf, gw_pub)
-        cookie = learn_cookie(a, PAIRED_TRIES)
-        # Deny: a fresh initiation from port B with port A's cookie.
-        for _ in range(PAIRED_TRIES):
-            b.send(wg_mod.with_mac2(b.init.initiation(), cookie))
-            r = b.wait_kind((2, 3), COOKIE_WAIT_S)
-            if r is not None and r[0] == 2:
-                raise Fail("cookie deny: port B's initiation with port A's cookie got a handshake response")
-            if r is not None and b.open_cookie(r) is not None:
-                break
-        else:
-            raise Fail("cookie deny: no cookie reply at port B (positive signal missing)")
-        # Allow: port A with its own cookie. Had the deny step been accepted,
-        # total=1 would already be there.
-        if con.count(r"audit: src=ingress WgMac2Accepted total=\d+ "):
-            raise Fail("WgMac2Accepted appeared before the allow step: port B's initiation was accepted")
-        allow = con.mark()
-        for _ in range(PAIRED_TRIES):
-            a.send(wg_mod.with_mac2(a.init.initiation(), cookie))
-            r = a.wait_kind((2, 3), COOKIE_WAIT_S)
-            if r is not None and r[0] == 2:
-                break
-            cookie = (r and a.open_cookie(r)) or cookie
-        else:
-            raise Fail("cookie allow: no handshake response at port A")
-        con.wait_for(r"audit: src=ingress WgMac2Accepted total=1 ", since=allow)
-        if not a.init.consume_response(r):
-            raise Fail("cookie allow: the handshake response does not open")
-        if con.count(r"audit: src=ingress WgLoadCleared ", since=loaded_at):
-            raise Fail("WgLoadCleared during the paired flood: load did not hold")
-        if con.count(r"audit: src=ingress WgCookieSuppressed total=1 "):
-            raise Fail("WgCookieSuppressed total=1 during the paired flood: the TX reserve bound below capacity")
+            try:
+                m = con.wait_for(r"audit: src=ingress WgUnderLoad total=1 ", since=mark)
+            except Fail:
+                raise Fail("paired: WgUnderLoad total=1 did not appear under the band flood")
+            loaded_at = mark + m.start()
+            a, b = PyPeer(peer_conf, gw_pub), PyPeer(peer_conf, gw_pub)
+            cookie = learn_cookie(a, PAIRED_TRIES)
+            # Deny: a fresh initiation from port B with port A's cookie.
+            for _ in range(PAIRED_TRIES):
+                b.send(wg_mod.with_mac2(b.init.initiation(), cookie))
+                r = b.wait_kind((2, 3), COOKIE_WAIT_S)
+                if r is not None and r[0] == 2:
+                    raise Fail("cookie deny: port B's initiation with port A's cookie got a handshake response")
+                if r is not None and b.open_cookie(r) is not None:
+                    break
+            else:
+                raise Fail("cookie deny: no cookie reply at port B (positive signal missing)")
+            # Allow: port A with its own cookie. Had the deny step been
+            # accepted, total=1 would already be there.
+            if con.count(r"audit: src=ingress WgMac2Accepted total=\d+ "):
+                raise Fail("WgMac2Accepted appeared before the allow step: port B's initiation was accepted")
+            allow = con.mark()
+            first_allow = None
+            for _ in range(PAIRED_TRIES):
+                first_allow = first_allow or time.monotonic()
+                a.send(wg_mod.with_mac2(a.init.initiation(), cookie))
+                r = a.wait_kind((2, 3), COOKIE_WAIT_S)
+                if r is not None and r[0] == 2:
+                    break
+                cookie = (r and a.open_cookie(r)) or cookie
+            else:
+                raise Fail("cookie allow: no handshake response at port A")
+            m = con.wait_for(r"audit: src=ingress WgMac2Accepted total=1 ", since=allow)
+            # Read before port A's first allow send, the line is port B's,
+            # printed late by `audit` [code review T5].
+            if con.time_at(allow + m.end()) <= first_allow:
+                raise Fail("WgMac2Accepted total=1 was read before port A's first allow send: "
+                           "port B's initiation was accepted")
+            if not a.init.consume_response(r):
+                raise Fail("cookie allow: the handshake response does not open")
+            if con.count(r"audit: src=ingress WgLoadCleared ", since=loaded_at):
+                raise Fail("WgLoadCleared during the paired flood: load did not hold")
+            if con.count(r"audit: src=ingress WgCookieSuppressed total=1 "):
+                raise Fail("WgCookieSuppressed total=1 during the paired flood: the TX reserve bound below capacity")
+        except Fail as e:
+            check_low_band_first("paired flood", start, flood.snapshot(), BAND_LOW * refill, e)
+            raise
         end = flood.set_rate(0)
         last = flood.last_send
         lo, hi = load_cleared_window()
@@ -1528,7 +1549,8 @@ def flood_case(con: Console, tap: Tap, sniffer: Sniffer, deploy: str, gw_pub: by
     attempts = 1 + tries_for(s1 * s1)
     hs_deadline = attempts * REKEY_ATTEMPT_S + HANDSHAKE_SLACK_S
     ping1 = max(3, tries_for(s1))
-    # Over capacity a frame survives about C / rate (C from this run's probe).
+    # Over capacity a frame survives about C / rate. The ratio is the fixed
+    # STEP2_RATE, so s2 is a constant; step 2 measures its own survival.
     rate2 = STEP2_RATE * c
     s2 = SURVIVAL_MARGIN * c / rate2
     ping2 = tries_for(s2)
@@ -1537,30 +1559,41 @@ def flood_case(con: Console, tap: Tap, sniffer: Sniffer, deploy: str, gw_pub: by
           f"({ping_budget(ping2):.0f} s)", flush=True)
 
     # Flood step 1, below capacity: wireguard-go (re)started on a fixed port.
+    # The probe saturates ingress, where the reserve does bind, so this
+    # boot's first WgCookieSuppressed is the probe's; the paired case's
+    # fresh-boot total=1 check is the authoritative one. Here: no new line
+    # during step 1, which is blind to as many suppressions as fit before
+    # the next coalesced line [code review T3].
+    suppressed = [int(n) for n in con.count(r"audit: src=ingress WgCookieSuppressed total=(\d+) ")]
+    blind = 63 if suppressed else 0
+    print(f"\nflood step 1: highest WgCookieSuppressed total before it {max(suppressed, default=0)}; "
+          f"up to {blind} suppressions in step 1 would print no line", flush=True)
     step1 = flood.snapshot()
     step1_mark = con.mark()
     wg = WgGo(wg_go_conf(deploy), "10.200.0.2/32", cfg["gateway"]["inside_prefix"])
     opened.append(wg)
-    before_hs = wg.latest_handshake()
-    trigger = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    trigger.sendto(b"x", (ip_str(HOST_IP), 9))
-    trigger.close()
-    started = time.monotonic()
-    attribute_wireguard_go(sniffer, con, gw_pub, started + hs_deadline)
-    print(f"\nflood step 1: wireguard-go's mac2 accepted {time.monotonic() - started:.1f} s after its start", flush=True)
-    deadline = time.monotonic() + REKEY_ATTEMPT_S
-    while wg.latest_handshake() == before_hs:
-        if time.monotonic() > deadline:
-            raise Fail("cookie attribution failed: wireguard-go reports no new handshake")
-        time.sleep(0.1)
-    if con.count(r"audit: src=ingress WgLoadCleared "):
-        raise Fail("flood step 1: WgLoadCleared between WgUnderLoad and the handshake: load did not hold")
-    ping(tries=ping1)
-    # The probe saturates ingress, where the reserve does bind, so this
-    # boot's first WgCookieSuppressed is the probe's; the paired case holds
-    # the fresh-counter check. Here: no new line during step 1.
-    if con.count(r"audit: src=ingress WgCookieSuppressed ", since=step1_mark):
-        raise Fail("flood step 1: WgCookieSuppressed during step 1: the TX reserve bound below capacity")
+    try:
+        before_hs = wg.latest_handshake()
+        trigger = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        trigger.sendto(b"x", (ip_str(HOST_IP), 9))
+        trigger.close()
+        started = time.monotonic()
+        attribute_wireguard_go(sniffer, con, gw_pub, started + hs_deadline)
+        print(f"\nflood step 1: wireguard-go's mac2 accepted {time.monotonic() - started:.1f} s after its start",
+              flush=True)
+        deadline = time.monotonic() + REKEY_ATTEMPT_S
+        while wg.latest_handshake() == before_hs:
+            if time.monotonic() > deadline:
+                raise Fail("cookie attribution failed: wireguard-go reports no new handshake")
+            time.sleep(0.1)
+        if con.count(r"audit: src=ingress WgLoadCleared "):
+            raise Fail("flood step 1: WgLoadCleared between WgUnderLoad and the handshake: load did not hold")
+        ping(tries=ping1)
+        if con.count(r"audit: src=ingress WgCookieSuppressed ", since=step1_mark):
+            raise Fail("flood step 1: WgCookieSuppressed during step 1: the TX reserve bound below capacity")
+    except Fail as e:
+        check_low_band_first("flood step 1", step1, flood.snapshot(), lo1, e)
+        raise
     check_band("flood step 1", step1, flood.snapshot(), lo1, hi1)
     sniffer.check_drops()
     print("\nPASS [cookie flood step 1: wireguard-go drew a cookie, handshook with mac2 and pinged below capacity]",
@@ -1581,16 +1614,29 @@ def flood_case(con: Console, tap: Tap, sniffer: Sniffer, deploy: str, gw_pub: by
         raise Fail(f"precondition: session age {age:.0f} s leaves no room for step 2's {budget2:.0f} s budget")
 
     # Flood step 2, over capacity, running until the ping assertion concludes.
+    before2, _ = cookie_totals(con)
     step2 = flood.set_rate(rate2)
     time.sleep(STEP2_WARMUP_S)
     ok = py_ping(py, ping2, ident=0x4643)
     print(f"\nflood step 2: ping reply on try {ok} of {ping2}", flush=True)
     if not flood.running():
         raise Fail("flood step 2: the flood was not running when the ping assertion concluded")
-    check_band("flood step 2", step2, flood.snapshot(), STEP2_BAND[0] * c, STEP2_BAND[1] * c)
+    end2 = flood.set_rate(0)
+    check_band("flood step 2", step2, end2, STEP2_BAND[0] * c, STEP2_BAND[1] * c)
+    # Step 2's own survival, as probe_capacity counts it: what ingress
+    # answered until an ARP round trip proves the queues drained, over what
+    # was sent; the upper bound, so a shortfall is never overstated.
+    if arp_round_trip(tap, LINE_TIMEOUT_S) is None:
+        raise Fail("flood step 2: no ARP reply after the flood; the queues did not drain")
+    time.sleep(PROBE_SETTLE_S)
+    _, after2 = cookie_totals(con)
+    s2m = (after2 - before2) / (end2[0] - step2[0])
+    print(f"\nflood step 2: measured survival {s2m:.3f} (budget assumed {s2:.3f})", flush=True)
+    if not ok and s2m < s2:
+        raise Fail(f"flood step 2: measured survival {s2m:.3f} below the budget's assumption {s2:.3f}; "
+                   f"{ping2} failed ping tries not judged")
     if not ok:
         raise Fail(f"flood step 2: no ping reply through the established session in {ping2} tries over capacity")
-    flood.set_rate(0)
     sniffer.check_drops()
 
 

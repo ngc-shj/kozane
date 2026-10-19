@@ -3,8 +3,10 @@
 //!
 //! The gateway's static private key and the PSKs never enter this module:
 //! `StaticKey::dh` computes `DH(S_priv, point)` and `StaticKey::psk_mix`
-//! computes the IKpsk2 `KDF3(C, Q)` step. Cookies (mac2) are not
-//! implemented; mac2 is ignored on input and zero on output.
+//! computes the IKpsk2 `KDF3(C, Q)` step. This module ignores mac2 on
+//! input: `ingress` verifies it under load, through `crate::cookie`, before
+//! an initiation reaches `hs`. Responses carry mac2 = 0, since the gateway
+//! never needs a cookie from its peers (SC19).
 
 use wg_wire::{
     INITIATION_MAC1_OFFSET, MessageInitiation, MessageResponse, RESPONSE_LEN, RESPONSE_MAC1_OFFSET,

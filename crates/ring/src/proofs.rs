@@ -198,7 +198,7 @@ mod link_proofs {
     }
 
     /// The backlog read by `ingress`: whatever the peer returns, the count
-    /// never exceeds the pool, and a buffer returned before the call is
+    /// never exceeds what was sent, and a buffer returned before the call is
     /// already counted as back.
     #[kani::proof]
     #[kani::unwind(17)]
@@ -213,7 +213,7 @@ mod link_proofs {
         let sent = tx.send_with(&mut scratch, |_| Some(1));
         let r = tx.in_flight();
         if let Ok(n) = r {
-            assert!(n <= M);
+            assert!(n <= usize::from(sent == Ok(true)));
         }
         kani::cover!(sent == Ok(true) && r == Ok(0));
         kani::cover!(sent == Ok(true) && r == Ok(1));

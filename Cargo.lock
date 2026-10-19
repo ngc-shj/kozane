@@ -245,7 +245,9 @@ dependencies = [
 name = "data-core"
 version = "0.1.0"
 dependencies = [
+ "layout",
  "msgs",
+ "ring",
  "static_assertions",
  "wg-core",
  "wg-wire",
@@ -446,6 +448,7 @@ dependencies = [
 name = "ingress-core"
 version = "0.1.0"
 dependencies = [
+ "ring",
  "wg-wire",
  "wire",
 ]
@@ -754,6 +757,7 @@ dependencies = [
  "layout",
  "msgs",
  "pdkit",
+ "ring",
  "sel4-microkit",
 ]
 
@@ -808,6 +812,7 @@ dependencies = [
  "layout",
  "msgs",
  "pdkit",
+ "ring",
  "sel4-microkit",
  "wg-core",
 ]

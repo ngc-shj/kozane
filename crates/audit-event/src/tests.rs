@@ -158,11 +158,12 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::WgCookieDropped
         | Event::WgMac2Accepted
         | Event::CookieSecretExpired
-        | Event::CookieSecretUnavailable => true,
+        | Event::CookieSecretUnavailable
+        | Event::ArpSuppressed => true,
         Event::FrameDropped { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
-    assert_eq!(Event::FIXED.len(), 39);
+    assert_eq!(Event::FIXED.len(), 40);
 }
 
 #[test]
@@ -181,6 +182,16 @@ fn coalesced_cookie_kind_does_not_emit_its_second_occurrence() {
     let mut out = Vec::new();
     run(&mut c, Event::WgCookieSent, 2, &mut out);
     assert_eq!(out.iter().map(|r| r.a).collect::<Vec<_>>(), [1]);
+}
+
+#[test]
+fn arp_suppressed_is_coalesced_and_counted_apart_from_arp_replied() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::ArpReplied, 1, &mut out);
+    run(&mut c, Event::ArpSuppressed, 65, &mut out);
+    let got: Vec<_> = out.iter().map(|r| (r.code, r.a)).collect();
+    assert_eq!(got, [(0x0001, 1), (0x003c, 1), (0x003c, 65)]);
 }
 
 #[test]
@@ -214,7 +225,7 @@ fn decode_classifies_fixed_dropped_and_unknown_codes() {
     // fixed range.
     assert_eq!(decode(FRAME_DROPPED_BASE + 0x3f), Decoded::FrameDropped(0x3f));
     assert_eq!(decode(0x0019), Decoded::Unknown);
-    assert_eq!(decode(0x003c), Decoded::Unknown);
+    assert_eq!(decode(0x003d), Decoded::Unknown);
 }
 
 #[test]

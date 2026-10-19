@@ -98,6 +98,10 @@ fn arp(op: ArpOp, dst_mac: Mac, tpa: Ipv4) -> Vec<u8> {
 }
 
 fn run(frame: &[u8]) -> Outcome<'_> {
+    run_tx(frame, NET_BUFFERS)
+}
+
+fn run_tx(frame: &[u8], tx_free: usize) -> Outcome<'_> {
     respond(
         &CFG,
         &mut Gate::default(),
@@ -106,7 +110,7 @@ fn run(frame: &[u8]) -> Outcome<'_> {
         &mut Buckets::<4>::default(),
         0,
         0,
-        NET_BUFFERS,
+        tx_free,
         frame,
         &mut [0u8; wire::MAX_FRAME],
         &mut [0u8; wg_wire::COOKIE_REPLY_LEN],
@@ -253,12 +257,24 @@ fn answers_broadcast_arp_request_for_our_ip() {
     let req = arp(ArpOp::Request, [0xff; 6], CFG.ipv4);
     let mut cookie = [0u8; wg_wire::COOKIE_REPLY_LEN];
     let mut crypto = FakeCrypto::new(true);
-    let o = respond(&CFG, &mut Gate::default(), &mut crypto, &FakeMac1, &mut Buckets::<1>::default(), 0, 0, 0, &req, &mut out, &mut cookie);
+    let o = respond(&CFG, &mut Gate::default(), &mut crypto, &FakeMac1, &mut Buckets::<1>::default(), 0, 0, NET_BUFFERS, &req, &mut out, &mut cookie);
     let Outcome::ArpReplied(n) = o else { panic!("no reply") };
     let f = wire::parse_frame(&out[..n]).unwrap();
     assert_eq!(f.eth.dst, PEER_MAC);
     let Body::Arp(a) = f.body else { panic!("not arp") };
     assert_eq!((a.op, a.sha, a.spa, a.tha, a.tpa), (ArpOp::Reply, CFG.mac, CFG.ipv4, PEER_MAC, PEER_IP));
+}
+
+#[test]
+fn the_tx_reserve_refuses_an_arp_reply_at_exactly_half() {
+    let req = arp(ArpOp::Request, [0xff; 6], CFG.ipv4);
+    assert_eq!(run_tx(&req, NET_BUFFERS / 2), Outcome::ArpSuppressed, "ARP reply must not use the TX reserve");
+}
+
+#[test]
+fn an_arp_reply_is_sent_one_buffer_above_the_tx_reserve() {
+    let req = arp(ArpOp::Request, [0xff; 6], CFG.ipv4);
+    assert!(matches!(run_tx(&req, NET_BUFFERS / 2 + 1), Outcome::ArpReplied(_)));
 }
 
 #[test]
@@ -713,70 +729,45 @@ fn initiation_has_a_single_constructor() {
     assert_eq!(include_str!("lib.rs").matches("Outcome::Initiation {").count(), 1);
 }
 
-#[test]
-fn pass_plan_continues_when_any_input_moved_k_frames() {
-    let k = PASS_FRAMES;
-    for counts in [(k, 0, 0), (0, k, 0), (0, 0, k)] {
-        assert!(pass_plan(counts.0, counts.1, counts.2).continue_, "{counts:?}");
-    }
-}
-
-#[test]
-fn pass_plan_breaks_when_every_input_moved_fewer_than_k() {
-    let k = PASS_FRAMES;
-    assert!(!pass_plan(k - 1, k - 1, k - 1).continue_);
-    assert!(!pass_plan(0, 0, 0).continue_);
-}
-
-#[test]
-fn pass_plan_flushes_every_pass_with_work() {
-    for counts in [(1, 0, 0), (0, 1, 0), (0, 0, 1), (PASS_FRAMES, PASS_FRAMES, PASS_FRAMES)] {
-        assert!(pass_plan(counts.0, counts.1, counts.2).flush, "{counts:?}");
-    }
-}
-
-#[test]
-fn pass_plan_does_not_flush_an_idle_pass() {
-    assert_eq!(pass_plan(0, 0, 0), PassActions { flush: false, continue_: false });
-}
-
-#[test]
-fn pass_plan_decides_after_the_outside_input_ran() {
-    // K from `data` alone continues and flushes whatever `from_outside` and
-    // the tick then did in the same pass: the decision takes all three.
-    for n_outside in [0, 1, PASS_FRAMES] {
-        assert_eq!(pass_plan(0, PASS_FRAMES, n_outside), PassActions { flush: true, continue_: true });
-    }
-}
-
-/// A PD stand-in for `run_passes`: `outside` frames are waiting outside;
-/// every call is logged in order.
+/// A PD stand-in for `run_passes`: `waiting` messages queue on hs, data and
+/// outside; every call is logged in order.
+#[derive(Default)]
 struct FakePass {
-    outside: usize,
+    waiting: [usize; 3],
     log: std::vec::Vec<&'static str>,
     maxes: std::vec::Vec<usize>,
 }
 
+impl FakePass {
+    fn queued(waiting: [usize; 3]) -> Self {
+        Self { waiting, ..Self::default() }
+    }
+
+    fn take(&mut self, input: usize, name: &'static str, max: usize) -> usize {
+        self.log.push(name);
+        self.maxes.push(max);
+        let n = self.waiting[input].min(max);
+        self.waiting[input] -= n;
+        n
+    }
+
+    fn passes(&self) -> usize {
+        self.log.iter().filter(|&&c| c == "end").count()
+    }
+}
+
 impl PassIo for FakePass {
     fn serve_hs(&mut self, max: usize) -> usize {
-        self.log.push("hs");
-        self.maxes.push(max);
-        0
+        self.take(0, "hs", max)
     }
     fn serve_data(&mut self, max: usize) -> usize {
-        self.log.push("data");
-        self.maxes.push(max);
-        0
+        self.take(1, "data", max)
     }
     fn tick(&mut self) {
         self.log.push("tick");
     }
     fn serve_outside(&mut self, max: usize) -> usize {
-        self.log.push("outside");
-        self.maxes.push(max);
-        let n = self.outside.min(max);
-        self.outside -= n;
-        n
+        self.take(2, "outside", max)
     }
     fn end_pass(&mut self) {
         self.log.push("end");
@@ -785,46 +776,44 @@ impl PassIo for FakePass {
 
 #[test]
 fn every_pass_of_an_outside_flood_ends_with_notify_and_flush() {
-    let mut io = FakePass { outside: 3 * PASS_FRAMES, log: std::vec::Vec::new(), maxes: std::vec::Vec::new() };
+    let mut io = FakePass::queued([0, 0, 3 * PASS_FRAMES]);
     run_passes(&mut io);
     let pass = ["hs", "data", "tick", "outside", "end"];
     // Three full passes, then one that finds the queue empty and breaks.
-    assert_eq!(io.log, pass.repeat(4), "each pass must serve every input, tick, then end_pass");
+    assert_eq!(io.log, pass.repeat(4), "each pass must end with end_pass, after every input and the tick");
 }
 
 #[test]
 fn every_input_is_bounded_to_pass_frames() {
-    let mut io = FakePass { outside: PASS_FRAMES + 1, log: std::vec::Vec::new(), maxes: std::vec::Vec::new() };
+    let mut io = FakePass::queued([PASS_FRAMES + 1; 3]);
     run_passes(&mut io);
     assert!(io.maxes.iter().all(|&m| m == PASS_FRAMES), "inputs must be capped at PASS_FRAMES: {:?}", io.maxes);
-    assert_eq!(io.log.iter().filter(|&&c| c == "end").count(), 2, "a pass below K must break after its end_pass");
+    assert_eq!(io.passes(), 2, "a pass below K must break after its end_pass");
 }
 
 #[test]
-fn drain_stops_at_exactly_max_with_input_remaining() {
-    let mut waiting = PASS_FRAMES + 5;
-    let mut steps = 0;
-    let moved = drain(PASS_FRAMES, || {
-        steps += 1;
-        if waiting == 0 {
-            return false;
-        }
-        waiting -= 1;
-        true
-    });
-    assert_eq!((moved, steps), (PASS_FRAMES, PASS_FRAMES), "drain must take exactly max and not step again");
-    assert_eq!(waiting, 5);
+fn k_on_any_one_input_runs_another_pass() {
+    for input in 0..3 {
+        let mut waiting = [0; 3];
+        waiting[input] = PASS_FRAMES;
+        let mut io = FakePass::queued(waiting);
+        run_passes(&mut io);
+        assert_eq!(io.passes(), 2, "input {input}");
+    }
 }
 
 #[test]
-fn drain_returns_fewer_than_max_when_the_input_runs_dry() {
-    let mut waiting = 3;
-    let moved = drain(PASS_FRAMES, || {
-        if waiting == 0 {
-            return false;
-        }
-        waiting -= 1;
-        true
-    });
-    assert_eq!(moved, 3);
+fn k_minus_one_on_every_input_is_the_last_pass() {
+    let mut io = FakePass::queued([PASS_FRAMES - 1; 3]);
+    run_passes(&mut io);
+    assert_eq!((io.passes(), io.waiting), (1, [0; 3]));
+}
+
+#[test]
+fn k_from_data_still_runs_the_tick_and_outside_in_the_same_pass() {
+    let mut io = FakePass::queued([0, 2 * PASS_FRAMES, 1]);
+    run_passes(&mut io);
+    let first = &io.log[..5];
+    assert_eq!(first, ["hs", "data", "tick", "outside", "end"]);
+    assert_eq!(io.waiting[2], 0);
 }

@@ -12,4 +12,5 @@ data-core = { path = "../../data-core" }
 layout = { path = "../../layout" }
 msgs = { path = "../../msgs" }
 pdkit = { path = "../../pdkit" }
+ring = { path = "../../ring" }
 sel4-microkit.workspace = true

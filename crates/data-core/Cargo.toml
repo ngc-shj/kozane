@@ -5,7 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+layout = { path = "../layout" }
 msgs = { path = "../msgs" }
+ring = { path = "../ring" }
 wg-core = { path = "../wg-core" }
 wg-wire = { path = "../wg-wire" }
 wire = { path = "../wire" }
