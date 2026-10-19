@@ -23,8 +23,37 @@ pub fn check(system: &System, policy: &Policy) -> Vec<Finding> {
     check_irq_duplicates(system, &mut findings);
     check_data_confinement(system, policy, &mut findings);
     check_availability(system, policy, &tainted, &mut findings);
+    check_stack_guard(system, &mut findings);
 
     findings
+}
+
+/// Top of every pd's stack in Microkit 2.3.1 (`tool/microkit/src/sel4.rs`:
+/// the IPC buffer at 0xfffffff000, one unmapped guard page, then the
+/// stack growing down).
+const STACK_TOP: u64 = 0xff_ffff_e000;
+
+/// L4 (M3 GUARD): Microkit places a guard page above the stack only. The
+/// page below it is unmapped only if no `<map>` reaches it, so every map
+/// must end at least one page below the stack bottom. A pd without
+/// `stack_size` is judged at the largest stack Microkit accepts.
+fn check_stack_guard(system: &System, findings: &mut Vec<Finding>) {
+    for pd in &system.pds {
+        let bottom = STACK_TOP - pd.stack_size.unwrap_or(crate::sdf::MAX_STACK_SIZE);
+        for m in mrs_mapped_by(pd) {
+            let size = system.mrs.iter().find(|mr| mr.name == m.mr).map_or(0, |mr| mr.size.unwrap_or(mr.page_size));
+            let end = m.vaddr.saturating_add(size);
+            if end > bottom - 0x1000 {
+                findings.push(Finding::new(
+                    LawId::L4,
+                    format!(
+                        "pd '{}' maps mr '{}' up to {end:#x}, leaving no unmapped guard page below its stack at {bottom:#x}",
+                        pd.name, m.mr
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 fn pd_by_name<'a>(system: &'a System, name: &str) -> Option<&'a crate::sdf::Pd> {
@@ -303,7 +332,7 @@ fn timer_channel_is_exempt(
 }
 
 /// L1 (tainted pds map no secret mr) and L2 (M3 plan amendment): every
-/// secrets mr is mapped only by its policy owner, each `key`-role pd maps
+/// secrets mr is mapped only by its policy owner and only read-only, each `key`-role pd maps
 /// exactly its own secrets mr and nothing else, `prefill_path` appears
 /// only on secrets mrs, and no pd holds `pp` channels to two key pds.
 fn check_secrets_and_taint(
@@ -325,6 +354,15 @@ fn check_secrets_and_taint(
                     findings.push(Finding::new(
                         LawId::L2,
                         format!("secrets mr '{}' (owner '{owner}') is mapped into pd '{}'", m.mr, pd.name),
+                    ));
+                }
+                // The blob is prefilled by the loader and only ever read: a
+                // writable or executable mapping lets a compromised owner
+                // corrupt it in place.
+                if m.perms != (Perms { r: true, w: false, x: false }) {
+                    findings.push(Finding::new(
+                        LawId::L2,
+                        format!("secrets mr '{}' is mapped into pd '{}' with perms other than r", m.mr, pd.name),
                     ));
                 }
             }

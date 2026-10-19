@@ -5,23 +5,33 @@ Usage: run.py            (from `make test`)
 Generates fresh keys with tools/mksecrets into a temporary directory
 (removed on every exit path), builds the image against that configuration
 and packages it, then re-runs itself inside `unshare -rn` (no NET_ADMIN in
-the container; architecture R5) for five boots:
+the container; architecture R5) for six boots:
 
   1. raw frames: the outside NIC on a `-netdev dgram` socket; ARP, one frame
      per wire::DropReason, a coalesced flood, ARP as the liveness barrier;
-  2. WireGuard: the outside NIC on user-net with a hostfwd to 51820, the
-     inside NIC on a dgram socket played by a Python inside host;
-     wireguard-go is the interop oracle, tests/integration/wg.py sends what
-     wireguard-go will not. Every negative case asserts a positive audit
-     line and then a liveness barrier (a ping through wireguard-go);
+  2. WireGuard: the outside NIC on user-net with hostfwds to 51820 and the
+     Rosenpass port, the inside NIC on a dgram socket played by a Python
+     inside host; wireguard-go is the interop oracle, tests/integration/wg.py
+     sends what wireguard-go will not. Every negative case asserts a
+     positive audit line and then a liveness barrier (a ping through
+     wireguard-go). Also the M3 cases: the MCE-COST quiet window, L8 pair,
+     expiry, rotation, pq->hs link residue, and a reboot (system_reset);
   3. cookie-a and 4. cookie-b (M2.5 plan C6), each a fresh boot so audit
      totals start at zero: the outside NIC on a tap in the netns, which
      plays the router (10.0.2.2) for Python sockets and wireguard-go and
      carries spoofed frames injected with AF_PACKET. cookie-a runs the
-     passive keepalive case, then the paired cookie case under a
-     below-capacity flood; cookie-b the cookie-under-flood case;
-  5. a blob whose public key does not match the configuration: `key`
+     Rosenpass 0.2.3 interop and mac/bucket pairs, the passive keepalive
+     case, then the paired cookie case under a below-capacity flood;
+     cookie-b the cookie-under-flood case;
+  5. peer binding (M3 plan C7): a deployment whose peer records pair each
+     WireGuard key with the other peer's Rosenpass key;
+  6. a blob whose public key does not match the configuration: `key`
      prints the mismatch and halts.
+
+Since M3 (L8) hs refuses every WireGuard initiation without a fresh
+Rosenpass PSK, so each WireGuard peer first runs upstream rosenpass (the VE9
+oracle in the dev image) and its key_out is the PresharedKey. Boots 1 and 6
+run no Rosenpass.
 
 Missing prerequisites fail the run; nothing is skipped.
 """
@@ -345,6 +355,10 @@ class Monitor:
             buf += chunk
         return buf
 
+    def command(self, line: str) -> str:
+        self.sock.sendall(f"{line}\n".encode())
+        return self._read_until(b"(qemu) ").decode(errors="replace")
+
     def pmem(self, addr: int, size: int, path: str) -> bytes:
         # HMP parses an unquoted absolute path as part of the preceding
         # integer expression (`/tmp/...` starts with division). JSON string
@@ -377,7 +391,8 @@ class Monitor:
 OBJECT_RAM = (0x6000_0000, 0x0200_0000)
 
 
-def wait_absent(mon: Monitor, needle: bytes, control: bytes, scratch: str, timeout: float = 5.0):
+def wait_absent(mon: Monitor, needle: bytes, control: bytes, scratch: str, timeout: float = 5.0,
+                what: str = "install message", control_what: str = "live session key"):
     """Polls until `needle` occurs nowhere in OBJECT_RAM while `control`
     does, in the same snapshot (bounded: the 1 Hz timer retries the reclaim
     if a wakeup was missed). A missing control fails: the scan would prove
@@ -387,12 +402,12 @@ def wait_absent(mon: Monitor, needle: bytes, control: bytes, scratch: str, timeo
     while True:
         ram = mon.pmem(base, size, scratch)
         if ram.find(control) < 0:
-            raise Fail("scan window does not cover PD memory: live session key not found")
+            raise Fail(f"scan window does not cover PD memory: {control_what} not found")
         at = ram.find(needle)
         if at < 0:
             return
         if time.monotonic() > deadline:
-            raise Fail(f"install message still in guest RAM at {base + at:#x}")
+            raise Fail(f"{what} still in guest RAM at {base + at:#x}")
         time.sleep(0.2)
 
 
@@ -428,6 +443,19 @@ def install_bytes(peer: int, i) -> bytes:
     b = pack_install(peer, i.receiver, i.sender, i.recv_key, i.send_key)
     if len(b) != install_len_from_rust():
         raise Fail(f"install layout drifted: {len(b)} bytes vs msgs::INSTALL_LEN")
+    return b
+
+
+def psk_install_bytes(peer: int, osk: bytes) -> bytes:
+    """The `msgs::PskInstall` pq sent hs for `peer`: the peer index, then the
+    OSK (the client's key_out)."""
+    src = open(os.path.join(ROOT, "crates/msgs/src/lib.rs")).read()
+    if "put(out, &mut at, &self.peer.to_le_bytes())?;\n        put(out, &mut at, self.osk)?;" not in src:
+        raise Fail("PskInstall::encode in crates/msgs/src/lib.rs no longer writes peer then osk")
+    m = re.search(r"pub const PSK_INSTALL_LEN: usize = ([0-9 +]+);", src)
+    b = struct.pack("<H", peer) + osk
+    if not m or len(b) != sum(int(x) for x in m.group(1).split("+")):
+        raise Fail("PskInstall layout drifted from msgs::PSK_INSTALL_LEN")
     return b
 
 
@@ -594,15 +622,26 @@ def sh(*args, **kw):
 
 class WgGo:
     """wireguard-go in the test netns. Its UAPI socket directory is shared
-    by every netns in the container, so the interface name is per run."""
+    by every netns in the container, so the interface name is per run.
+    Its PresharedKey is the Rosenpass OSK: a watcher applies each new
+    key_out of `rp` with `wg set … preshared-key` (M3 plan C7)."""
 
-    def __init__(self, conf: str, address: str, inside_prefix: str):
+    def __init__(self, conf: str, address: str, inside_prefix: str, rp: "Rosenpass"):
         self.inside_prefix = inside_prefix
+        self.rp = rp
+        self.gw_pub = conf_value(open(conf).read(), "PublicKey")
+        self.psk_file = os.path.join(os.path.dirname(conf), "wg-go.psk")
+        self.applied = None
+        self.error = None
+        self.stopped = False
+        self.watcher = None
         self.dev = dev = f"wgt{os.getpid() % 100000}"
         self.proc = subprocess.Popen(DIE_WITH_PARENT + ["wireguard-go", "-f", dev], stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL, env={**os.environ, "LOG_LEVEL": "error"})
         try:
             self._configure(conf, address)
+            self.watcher = threading.Thread(target=self._watch, daemon=True)
+            start_without_stop_signals(self.watcher)
         except BaseException:
             self.close()
             raise
@@ -615,17 +654,56 @@ class WgGo:
                 raise Fail(f"wireguard-go did not create {dev}")
             time.sleep(0.05)
         sh("wg", "setconf", dev, conf)
+        psk = self.rp.osk()
+        if psk is None:
+            raise Fail("wireguard-go started before its rosenpass wrote key_out")
+        self._set_psk(psk)
         sh("ip", "addr", "add", address, "dev", dev)
         sh("ip", "link", "set", dev, "up")
         sh("ip", "route", "add", self.inside_prefix, "dev", dev)
+
+    def _set_psk(self, psk: bytes):
+        # A copy of the validated key: key_out itself may be mid-rewrite.
+        with open(os.open(self.psk_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+            f.write(base64.b64encode(psk).decode())
+        sh("wg", "set", self.dev, "peer", self.gw_pub, "preshared-key", self.psk_file)
+        self.applied = psk
+
+    def _watch(self):
+        while not self.stopped:
+            psk = self.rp.osk()
+            if psk is not None and psk != self.applied:
+                try:
+                    self._set_psk(psk)
+                except (subprocess.CalledProcessError, OSError) as e:
+                    self.error = e
+                    return
+            time.sleep(0.2)
+
+    def wait_applied(self, psk: bytes, timeout: float = 5.0):
+        deadline = time.monotonic() + timeout
+        while self.applied != psk:
+            if self.error is not None:
+                raise Fail(f"key_out watcher failed: {self.error}")
+            if time.monotonic() > deadline:
+                raise Fail("key_out watcher did not apply the new key to wireguard-go")
+            time.sleep(0.1)
+        shown = sh("wg", "show", self.dev, "preshared-keys").stdout.split()
+        if len(shown) < 2 or b64(shown[1]) != psk:
+            raise Fail("wireguard-go's preshared key differs from key_out")
 
     def latest_handshake(self) -> int:
         out = sh("wg", "show", self.dev, "latest-handshakes").stdout.split()
         return int(out[1]) if len(out) >= 2 else 0
 
     def close(self):
+        self.stopped = True
+        if self.watcher is not None:
+            self.watcher.join(timeout=5)
         self.proc.kill()
         self.proc.wait()
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self.psk_file)
         subprocess.run(["ip", "link", "del", self.dev], capture_output=True)
         # The socket outlives a killed daemon.
         try:
@@ -641,14 +719,162 @@ def ping(tries: int) -> None:
     raise Fail("no ping reply through the tunnel")
 
 
+# ---------------------------------------------------------------- rosenpass (M3 plan C7)
+
+RP_PORT = 51819
+RP_MASTER = "/opt/rosenpass-master/rosenpass"
+RP_023 = "/opt/rosenpass-023/rosenpass"
+PQKEY_CORE = "crates/pqkey-core/src/lib.rs"
+# A client's start until its PSK is installed at hs. On TCG at pq's budget
+# one InitHello costs about 8 s (MCE-COST), and ingress also admits the
+# client's early retransmissions, which pq answers in turn before it reaches
+# the InitConf: about 45 s measured for one client. The rest covers another
+# client's exchange queued in front of it.
+RP_EXCHANGE_S = 240.0
+PSK_RETRY_S = 2.0              # between Python-peer handshakes waiting for an install
+COST_SLACK = 0.25              # quiet window: high-water <= PQ_HANDSHAKE_COST_NS x (1 + this)
+EXPIRY_ALLOW_S = 10.0          # expiry allow side: this long before REJECT_AFTER_TIME
+EXPIRY_SLACK_S = 5.0           # expiry stale side: hs's 1 Hz tick plus scheduling
+ROTATION_PING_LOSS = 2         # pings lost while the client's rosenpass restarts
+PING_LOOP_S = 1.0
+RP_RESET_TRIES = 10            # reboot: replays of the capture until hs has booted
+PEER2_IP = bytes([10, 200, 0, 4])
+
+
+class Rosenpass:
+    """Upstream rosenpass as peer `peer`'s initiator, run from the bundle
+    mksecrets wrote, aimed at `endpoint`. A start removes the old key_out,
+    so every key read afterwards comes from this run."""
+
+    def __init__(self, deploy: str, peer: int, endpoint: str, binary: str = RP_MASTER):
+        self.deploy, self.peer, self.binary = deploy, peer, binary
+        self.key_out = os.path.join(deploy, f"peer-{peer}.osk")
+        text = open(os.path.join(deploy, f"peer-{peer}.rosenpass.toml")).read()
+        text, n = re.subn(r'^endpoint = ".*"$', f'endpoint = "{endpoint}"', text, flags=re.M)
+        if n != 1:
+            raise Fail(f"peer-{peer}.rosenpass.toml: expected one endpoint line, found {n}")
+        self.conf = os.path.join(deploy, f"rp-{peer}.toml")
+        with open(os.open(self.conf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
+            f.write(text)
+        self.proc = None
+        self.start()
+
+    def start(self):
+        self.stop()
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(self.key_out)
+        # The bundle's paths are relative to its directory.
+        self.proc = subprocess.Popen(DIE_WITH_PARENT + [self.binary, "exchange-config", self.conf], cwd=self.deploy,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def osk(self):
+        """The current key_out, or None (not written yet, or mid-write)."""
+        try:
+            text = open(self.key_out).read().strip()
+            key = base64.b64decode(text, validate=True)
+        except (FileNotFoundError, ValueError):
+            return None
+        return key if len(key) == 32 else None
+
+    def written_at(self) -> float:
+        """key_out's mtime on the monotonic clock. The client writes it on the
+        RespHello, before its InitConf: no later than pq's install."""
+        return time.monotonic() - (time.time() - os.stat(self.key_out).st_mtime)
+
+    def wait_key(self, deadline: float, other_than=None) -> bytes:
+        while True:
+            key = self.osk()
+            if key is not None and key != other_than:
+                return key
+            if self.proc.poll() is not None:
+                raise Fail(f"rosenpass for peer {self.peer} exited with {self.proc.returncode}")
+            if time.monotonic() > deadline:
+                raise Fail(f"rosenpass for peer {self.peer}: no new key_out within {RP_EXCHANGE_S:.0f} s")
+            time.sleep(0.1)
+
+    def stop(self):
+        if self.proc is not None:
+            self.proc.kill()
+            self.proc.wait()
+            self.proc = None
+
+    close = stop
+
+
+def exported(con: Console, rp: Rosenpass, since: int, what: str = "") -> bytes:
+    """Waits for `rp`'s key_out and the boot's first RpPskExported (later
+    ones coalesce, so only a boot's first export is ever printed)."""
+    deadline = time.monotonic() + RP_EXCHANGE_S
+    try:
+        key = rp.wait_key(deadline)
+        con.wait_for(r"audit: src=pq RpPskExported total=1 ", since=since,
+                     timeout=max(0.0, deadline - time.monotonic()))
+    except Fail as e:
+        raise Fail(f"{what}{e}") from e
+    return key
+
+
+def check_quiet_cost(con: Console, start: int, end: int):
+    """MCE-COST quiet window [R4-T-Q3, R5-T-R3]: the last RpCostHighWater
+    emitted in [start, end) against PQ_HANDSHAKE_COST_NS plus COST_SLACK;
+    none emitted in it fails."""
+    with con.lock:
+        text = con.text[start:end]
+    costs = [int(us) for us in re.findall(r"audit: src=pq RpCostHighWater us=(\d+) ", text)]
+    if not costs:
+        raise Fail("MCE-COST: no RpCostHighWater in the quiet window")
+    limit_us = rust_const(PQKEY_CORE, "PQ_HANDSHAKE_COST_NS") / 1000 * (1 + COST_SLACK)
+    print(f"\nMCE-COST quiet window: RpCostHighWater {costs} us, limit {limit_us:.0f} us", flush=True)
+    if costs[-1] > limit_us:
+        raise Fail(f"MCE-COST: handshake cost {costs[-1]} us above PQ_HANDSHAKE_COST_NS plus "
+                   f"{COST_SLACK:.0%} ({limit_us:.0f} us)")
+
+
+def wait_response(sock: socket.socket, i, timeout: float):
+    """The next handshake response to initiator `i` on `sock` before
+    `timeout`, or None; datagrams for earlier initiators are skipped."""
+    until = time.monotonic() + timeout
+    while (left := until - time.monotonic()) > 0:
+        sock.settimeout(left)
+        try:
+            d = sock.recv(2048)
+        except socket.timeout:
+            return None
+        if len(d) == 92 and d[0] == 2 and struct.unpack("<I", d[8:12])[0] == i.sender:
+            return d
+    return None
+
+
+class Pinger(threading.Thread):
+    """Pings the inside host through wireguard-go once per PING_LOOP_S,
+    counting the misses."""
+
+    def __init__(self):
+        super().__init__(daemon=True)
+        self.sent = self.lost = 0
+        self.stop = False
+
+    def run(self):
+        while not self.stop:
+            t = time.monotonic()
+            ok = subprocess.run(["ping", "-c", "1", "-W", "1", "10.99.0.2"], capture_output=True).returncode == 0
+            self.sent += 1
+            self.lost += not ok
+            time.sleep(max(0.0, t + PING_LOOP_S - time.monotonic()))
+
+
 def test_wireguard(loader: str, deploy: str, passed: list):
     inside = Wire()
     hostfwd = free_udp_port()
+    rp_fwd = free_udp_port()
     host = InsideHost(inside)
     monitor = os.path.join(deploy, "monitor.sock")
-    child, con = boot(loader, f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT}",
-                      inside.netdev("n1"), monitor)
+    child, con = boot(loader, f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT},"
+                              f"hostfwd=udp:127.0.0.1:{rp_fwd}-:{RP_PORT}", inside.netdev("n1"), monitor)
     wg = None
+    rps = []
+    threads = []
+    out = None
     try:
         start_without_stop_signals(host)
         mon = Monitor(monitor)
@@ -661,10 +887,24 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         with open(conf0, "w") as f:
             f.write(re.sub(r"^Endpoint = .*$", f"Endpoint = 127.0.0.1:{hostfwd}", peer0, flags=re.M))
         os.chmod(conf0, 0o600)
+        rp_endpoint = f"127.0.0.1:{rp_fwd}"
+        reject_s = rust_const(WG_CORE, "REJECT_AFTER_TIME_NS") / NS
 
-        # Case 1: wireguard-go handshakes (first ping triggers it; it
-        # retries every 5 s while the image is still booting).
-        wg = WgGo(conf0, "10.200.0.2/32", cfg["gateway"]["inside_prefix"])
+        # Prelude: peer 0's Rosenpass exchange, the only traffic until its
+        # export, which makes it the MCE-COST quiet window. Peer 1 is exempt:
+        # it is the L8 pair's.
+        con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        prelude = con.mark()
+        rp0 = Rosenpass(deploy, 0, rp_endpoint)
+        rps.append(rp0)
+        osk0 = exported(con, rp0, prelude, "prelude: ")
+        check_quiet_cost(con, prelude, con.mark())
+        passed.append("MCE-COST quiet window")
+        print("\nPASS [MCE-COST: the prelude's handshake cost is within PQ_HANDSHAKE_COST_NS]")
+
+        # Case 1: wireguard-go handshakes with key_out as its PSK (the first
+        # ping triggers it; it retries every 5 s).
+        wg = WgGo(conf0, "10.200.0.2/32", cfg["gateway"]["inside_prefix"], rp0)
         ping(tries=30)
         first = wg.latest_handshake()
         if not first:
@@ -678,19 +918,38 @@ def test_wireguard(loader: str, deploy: str, passed: list):
             raise Fail(f"echo requests arrived with TTLs {[ip[8] for ip in requests]}, want 63")
         passed.append("wireguard-go handshake and ping")
         print("\nPASS [wireguard-go handshake and ping]")
+        # Interop: hs mixed the OSK pq derived; the session opened with the
+        # client's key_out, so the two are equal.
+        if wg.applied != osk0:
+            raise Fail("wireguard-go's PSK is not the prelude's key_out")
+        passed.append("rosenpass interop (master)")
+        print("\nPASS [rosenpass master interop: the gateway's OSK is the client's key_out]")
 
-        def initiator(conf: str, psk=None, static=None):
-            return wg_mod.Initiator(static or b64(conf_value(conf, "PrivateKey")), gw_pub,
-                                    psk or b64(conf_value(conf, "PresharedKey")), sender=secrets.randbits(32))
+        def initiator(conf: str, psk: bytes, static=None):
+            return wg_mod.Initiator(static or b64(conf_value(conf, "PrivateKey")), gw_pub, psk,
+                                    sender=secrets.randbits(32))
 
         out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         out.bind(("127.0.0.1", 0))
         out.settimeout(REPLY_TIMEOUT_S)
 
-        def handshake(i) -> bool:
-            out.sendto(i.initiation(ts_offset_s=30), ("127.0.0.1", hostfwd))
-            resp, _ = out.recvfrom(2048)
-            return i.consume_response(resp)
+        def installed(conf: str, rp: Rosenpass, deadline: float) -> tuple:
+            """Handshakes with `rp`'s current key_out until the response
+            opens: proof that pq's export reached hs (later exports are not
+            printed). Returns the initiator and the initiation it sent."""
+            while True:
+                psk = rp.osk()
+                if psk is not None:
+                    i = initiator(conf, psk)
+                    msg = i.initiation(ts_offset_s=30)
+                    out.sendto(msg, ("127.0.0.1", hostfwd))
+                    r = wait_response(out, i, PSK_RETRY_S)
+                    if r is not None and i.consume_response(r):
+                        i.psk_used = psk
+                        return i, msg
+                if time.monotonic() > deadline:
+                    raise Fail(f"peer {rp.peer}: no handshake with its key_out was accepted within {RP_EXCHANGE_S:.0f} s")
+                time.sleep(PSK_RETRY_S)
 
         # Case 2: peer 0's own key with a wrong PSK and a newer timestamp.
         mark = con.mark()
@@ -699,7 +958,7 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         resp, _ = out.recvfrom(2048)
         # Allow side first: the same response opens with peer 0's real PSK,
         # so the failure below is the PSK, not a broken response.
-        probe = initiator(peer0)
+        probe = initiator(peer0, rp0.osk())
         probe.c, probe.h, probe.e, probe.sender = bad.c, bad.h, bad.e, bad.sender
         if not probe.consume_response(resp):
             raise Fail("response does not open even with the right PSK")
@@ -715,18 +974,71 @@ def test_wireguard(loader: str, deploy: str, passed: list):
 
         # Case 3: unknown static key.
         mark = con.mark()
-        out.sendto(initiator(peer1, static=secrets.token_bytes(32)).initiation(), ("127.0.0.1", hostfwd))
+        out.sendto(initiator(peer1, b"\0" * 32, static=secrets.token_bytes(32)).initiation(), ("127.0.0.1", hostfwd))
         con.wait_for(r"audit: src=hs HandshakeUnknownPeer total=1 ", since=mark)
         ping(tries=3)
         passed.append("unknown peer")
         print("\nPASS [unknown peer rejected]")
 
-        # Case 4: valid peer 1 sends a datagram with a source outside its
-        # allowed IPs (10.200.0.3/32).
+        # L8 pair [T3]: peer 1 has run no Rosenpass, so hs has no PSK for it
+        # and refuses (an absent PSK is never a zero one); meanwhile peer 0
+        # works; then peer 1 runs Rosenpass and succeeds.
         mark = con.mark()
-        good = initiator(peer1)
-        if not handshake(good):
-            raise Fail("peer 1 handshake failed")
+        nopsk = initiator(peer1, b"\0" * 32)
+        out.sendto(nopsk.initiation(ts_offset_s=30), ("127.0.0.1", hostfwd))
+        if wait_response(out, nopsk, REPLY_TIMEOUT_S) is not None:
+            raise Fail("L8: peer 1 got a handshake response without a Rosenpass PSK")
+        con.wait_for(r"audit: src=hs HandshakePskMissing total=1 ", since=mark)
+        ping(tries=3)
+        rp1 = Rosenpass(deploy, 1, rp_endpoint)
+        rps.append(rp1)
+        good, _ = installed(peer1, rp1, time.monotonic() + RP_EXCHANGE_S)
+        accepted_at = time.monotonic()
+        key_out_at = rp1.written_at()
+        osk1 = good.psk_used
+        # No rotation for peer 1 from here: the expiry case below.
+        rp1.stop()
+        passed.append("L8 pair")
+        print("\nPASS [L8 pair: peer 1 refused without a PSK while peer 0 works, accepted after Rosenpass]")
+
+        # Expiry, concurrently with the cases below [R2-T-N9]: accepted near
+        # REJECT_AFTER_TIME after key_out was written (no later than the
+        # install), refused once that long has passed since the accepted
+        # handshake (no earlier than the install).
+        expiry = {}
+
+        def expiry_probe():
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.bind(("127.0.0.1", 0))
+                try:
+                    allow_at = key_out_at + reject_s - EXPIRY_ALLOW_S
+                    if time.monotonic() > allow_at:
+                        raise Fail("expiry: the allow point passed before the probe started")
+                    time.sleep(allow_at - time.monotonic())
+                    i = initiator(peer1, osk1)
+                    sock.sendto(i.initiation(ts_offset_s=30), ("127.0.0.1", hostfwd))
+                    r = wait_response(sock, i, REPLY_TIMEOUT_S)
+                    if r is None or not i.consume_response(r):
+                        raise Fail(f"expiry: a handshake {reject_s - EXPIRY_ALLOW_S:.0f} s after key_out was not accepted")
+                    time.sleep(max(0.0, accepted_at + reject_s + EXPIRY_SLACK_S - time.monotonic()))
+                    expiry["mark"] = con.mark()
+                    i = initiator(peer1, osk1)
+                    sock.sendto(i.initiation(ts_offset_s=30), ("127.0.0.1", hostfwd))
+                    if wait_response(sock, i, REPLY_TIMEOUT_S) is not None:
+                        raise Fail(f"expiry: a handshake {reject_s + EXPIRY_SLACK_S:.0f} s after the install got a response")
+                finally:
+                    sock.close()
+            except (Fail, OSError) as e:
+                expiry["error"] = e
+
+        probe_thread = threading.Thread(target=expiry_probe, daemon=True)
+        threads.append(probe_thread)
+        start_without_stop_signals(probe_thread)
+
+        # Case 4: peer 1 sends a datagram with a source outside its allowed
+        # IPs (10.200.0.3/32) through the session it just made.
+        mark = con.mark()
         spoofed = icmp_echo(bytes([10, 200, 0, 99]), HOST_IP, 8, 1, 1, b"spoof")
         out.sendto(good.transport(spoofed), ("127.0.0.1", hostfwd))
         con.wait_for(r"audit: src=data SpoofedSource total=1 ", since=mark)
@@ -744,6 +1056,14 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         wait_absent(mon, install_bytes(1, good), good.recv_key, scratch)
         passed.append("spoofed inner source, install scrubbed")
         print("\nPASS [spoofed inner source dropped, install scrubbed]")
+
+        # pq->hs link residue [R2-T-N7]: the PskInstall for peer 1 (its OSK
+        # is the client's key_out) is gone from guest RAM once hs took it.
+        # Control: the OSK itself, live in hs's PSK table until expiry.
+        wait_absent(mon, psk_install_bytes(1, osk1), osk1, scratch, what="PskInstall message",
+                    control_what="peer 1's live OSK")
+        passed.append("pq->hs link scrubbed")
+        print("\nPASS [pq->hs link: the PskInstall is scrubbed, the OSK lives only in hs's table]")
 
         # Case 5: an inside datagram with TTL 1 must not be forwarded into
         # the tunnel; TTL 2 still is (the boundary).
@@ -769,17 +1089,142 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         ping(tries=3)
         passed.append("ttl expiry")
         print("\nPASS [TTL 1 dropped, TTL 2 forwarded at the inside hop]")
+
+        # Rotation without interruption: wireguard-go pings throughout while
+        # peer 0's rosenpass restarts; the new key is accepted by hs (a
+        # forced re-handshake with it opens) and applied to wireguard-go.
+        pinger = Pinger()
+        threads.append(pinger)
+        start_without_stop_signals(pinger)
+        old = rp0.osk()
+        rp0.start()
+        deadline = time.monotonic() + RP_EXCHANGE_S
+        new = rp0.wait_key(deadline, other_than=old)
+        forced, _ = installed(peer0, rp0, deadline)
+        if forced.psk_used != new:
+            raise Fail("rotation: the accepted handshake used another key than the restart's first")
+        wg.wait_applied(new)
+        pinger.stop = True
+        pinger.join()
+        print(f"\nrotation: {pinger.lost} of {pinger.sent} pings lost", flush=True)
+        if pinger.lost > ROTATION_PING_LOSS or pinger.sent - pinger.lost < 1:
+            raise Fail(f"rotation: {pinger.lost} of {pinger.sent} pings lost, budget {ROTATION_PING_LOSS}")
+        passed.append("rotation without interruption")
+        print("\nPASS [rotation: new OSK accepted and applied, pings kept flowing]")
+
+        probe_thread.join(timeout=max(0.0, accepted_at + reject_s + EXPIRY_SLACK_S + 2 * REPLY_TIMEOUT_S
+                                      - time.monotonic()))
+        if probe_thread.is_alive():
+            raise Fail("expiry: the probe did not finish")
+        if "error" in expiry:
+            raise expiry["error"]
+        con.wait_for(r"audit: src=hs HandshakePskStale total=1 ", since=expiry["mark"])
+        passed.append("PSK expiry")
+        print("\nPASS [expiry: accepted before REJECT_AFTER_TIME, HandshakePskStale after]")
+
+        # Reboot [S11]: an initiation that drew an opening response before a
+        # system_reset is refused with HandshakePskMissing after it, before
+        # any Rosenpass exchange.
+        _, capture = installed(peer0, rp0, time.monotonic() + RP_EXCHANGE_S)
+        # Nothing but the replay may initiate after the reset.
+        wg.close()
+        wg = None
+        rp0.stop()
+        mark = con.mark()
+        mon.command("system_reset")
+        con.wait_for(r"pq: ready", since=mark, timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        for _ in range(RP_RESET_TRIES):
+            out.sendto(capture, ("127.0.0.1", hostfwd))
+            try:
+                out.settimeout(PSK_RETRY_S)
+                d = out.recv(2048)
+                raise Fail(f"reboot: the replayed initiation drew a {len(d)}-byte reply")
+            except socket.timeout:
+                pass
+            if con.count(r"audit: src=hs HandshakePskMissing total=1 ", since=mark):
+                break
+        else:
+            raise Fail("reboot: no HandshakePskMissing for the replayed initiation")
+        passed.append("reboot replay refused")
+        print("\nPASS [reboot: the pre-reset initiation is refused with HandshakePskMissing]")
     finally:
         try:
             with signals_held():
                 host.stop = True
-                if wg:
-                    wg.close()
+                for t in threads:
+                    t.stop = True
+                close_all(wg, out, *rps)
                 kill(child)
         except SystemExit:
             host.stop = True
-            if wg:
-                wg.close()
+            close_all(wg, out, *rps)
+            kill(child)
+            raise
+
+
+# ---------------------------------------------------------------- peer binding (M3 plan C7)
+
+
+def swap_rp_records(path: str):
+    """Deployment `c` [S8, R3-T-M5]: peer records 0 and 1 trade their
+    Rosenpass keys, giving {wg0, rp1} and {wg1, rp0}; nothing else moves."""
+    text = open(path).read()
+    recs = list(re.finditer(r'^rp_pub_path = "peer-(\d+)\.rp\.pk"\nrp_hash = "[0-9a-f]+"$', text, re.M))
+    if [m.group(1) for m in recs][:2] != ["0", "1"]:
+        raise Fail(f"{path}: peer records 0 and 1 not found in order")
+    a, b = recs[0], recs[1]
+    text = text[:a.start()] + b.group(0) + text[a.end():b.start()] + a.group(0) + text[b.end():]
+    with open(path, "w") as f:
+        f.write(text)
+
+
+def test_peer_binding(loader: str, deploy: str, passed: list):
+    """Only client 0 runs, with WireGuard key wg0 and Rosenpass key rp0, on
+    deployment `c`, where rp0 belongs to record 1: its PSK lands at record 1,
+    so wg0 is refused, while wg1 with that PSK is accepted [R5-T-R1]. The
+    correctly bound allow side is boot 2's interop."""
+    hostfwd = free_udp_port()
+    rp_fwd = free_udp_port()
+    child, con = boot(loader, f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT},"
+                              f"hostfwd=udp:127.0.0.1:{rp_fwd}-:{RP_PORT}",
+                      dgram("n1", free_udp_port(), free_udp_port()))
+    rp = sock = None
+    try:
+        cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
+        gw_pub = b64(cfg["gateway"]["public_key"])
+        con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        mark = con.mark()
+        rp = Rosenpass(deploy, 0, f"127.0.0.1:{rp_fwd}")
+        # Precondition: the Rosenpass handshake completed.
+        osk = exported(con, rp, mark, "peer binding precondition: ")
+        rp.stop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.bind(("127.0.0.1", 0))
+
+        def initiation(peer: int, psk: bytes):
+            conf = open(os.path.join(deploy, f"peer-{peer}.conf")).read()
+            i = wg_mod.Initiator(b64(conf_value(conf, "PrivateKey")), gw_pub, psk, sender=secrets.randbits(32))
+            sock.sendto(i.initiation(), ("127.0.0.1", hostfwd))
+            return i
+
+        mark = con.mark()
+        if wait_response(sock, initiation(0, osk), REPLY_TIMEOUT_S) is not None:
+            raise Fail("peer binding: wg0 got a handshake response with the PSK rp0 exported to record 1")
+        con.wait_for(r"audit: src=hs HandshakePskMissing total=1 ", since=mark)
+        i = initiation(1, osk)
+        r = wait_response(sock, i, REPLY_TIMEOUT_S)
+        if r is None or not i.consume_response(r):
+            raise Fail("peer binding: wg1 with client 0's key_out was not accepted; the PSK did not land at record 1")
+        con.wait_for(r"audit: src=hs HandshakeOk total=1 ", since=mark)
+        passed.append("peer binding")
+        print("\nPASS [peer binding: rp0's PSK is record 1's; wg0 refused, wg1 accepted with it]")
+    finally:
+        try:
+            with signals_held():
+                close_all(rp, sock)
+                kill(child)
+        except SystemExit:
+            close_all(rp, sock)
             kill(child)
             raise
 
@@ -1178,10 +1623,9 @@ class PyPeer:
     """wg.py's initiator on its own UDP port at the tap's address: sends
     what wireguard-go will not and opens what the gateway sends back."""
 
-    def __init__(self, conf: str, gw_pub: bytes, port: int = 0):
+    def __init__(self, conf: str, gw_pub: bytes, psk: bytes, port: int = 0):
         self.gw_pub = gw_pub
-        self.init = wg_mod.Initiator(b64(conf_value(conf, "PrivateKey")), gw_pub, b64(conf_value(conf, "PresharedKey")),
-                                     sender=secrets.randbits(32))
+        self.init = wg_mod.Initiator(b64(conf_value(conf, "PrivateKey")), gw_pub, psk, sender=secrets.randbits(32))
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
             self.sock.bind((ip_str(PEER_IP), port))
@@ -1288,7 +1732,7 @@ def udp_packet(src: bytes, dst: bytes, sport: int, dport: int, data: bytes) -> b
     return ip_hdr(src, dst, 17, len(udp)) + udp
 
 
-def py_ping(peer: PyPeer, tries: int, ident: int) -> int:
+def py_ping(peer: PyPeer, tries: int, ident: int, src: bytes = PEER1_IP) -> int:
     """ICMP echoes through the Python peer's session to the inside host, one
     per PING_INTERVAL_S, each an independent try: the sequence number of the
     first reply, or 0 once PING_WAIT_S passed after the last send."""
@@ -1296,7 +1740,7 @@ def py_ping(peer: PyPeer, tries: int, ident: int) -> int:
     while True:
         if seq < tries and time.monotonic() >= next_send:
             seq += 1
-            peer.send(peer.init.transport(icmp_echo(PEER1_IP, HOST_IP, 8, ident, seq, b"secureos")))
+            peer.send(peer.init.transport(icmp_echo(src, HOST_IP, 8, ident, seq, b"secureos")))
             next_send = time.monotonic() + PING_INTERVAL_S
             if seq == tries:
                 until = time.monotonic() + PING_WAIT_S
@@ -1360,7 +1804,7 @@ def keepalive_case(con: Console, peer: PyPeer):
             raise Fail("keepalive deny side: a keepalive arrived after the inside reply was sealed")
 
 
-def paired_case(con: Console, tap: Tap, peer_conf: str, gw_pub: bytes):
+def paired_case(con: Console, tap: Tap, peer_conf: str, gw_pub: bytes, psk: bytes):
     """Cookie path, paired [M10, R2-T-N7]: learn a cookie at port A, deny it
     at port B, allow it at port A, all under a below-capacity flood, then
     the hysteresis' allow side once the flood stops."""
@@ -1376,7 +1820,7 @@ def paired_case(con: Console, tap: Tap, peer_conf: str, gw_pub: bytes):
             except Fail:
                 raise Fail("paired: WgUnderLoad total=1 did not appear under the band flood")
             loaded_at = mark + m.start()
-            a, b = PyPeer(peer_conf, gw_pub), PyPeer(peer_conf, gw_pub)
+            a, b = PyPeer(peer_conf, gw_pub, psk), PyPeer(peer_conf, gw_pub, psk)
             cookie = learn_cookie(a, PAIRED_TRIES)
             # Deny: a fresh initiation from port B with port A's cookie.
             for _ in range(PAIRED_TRIES):
@@ -1438,8 +1882,86 @@ def paired_case(con: Console, tap: Tap, peer_conf: str, gw_pub: bytes):
         close_all(a, b, flood)
 
 
+def py_installed(conf: str, gw_pub: bytes, rp: Rosenpass, deadline: float) -> PyPeer:
+    """A Python peer whose handshake with `rp`'s current key_out was
+    accepted: proof that pq's export reached hs (only a boot's first export
+    is printed). Unloaded only: no cookie path."""
+    while True:
+        psk = rp.osk()
+        if psk is not None:
+            peer = PyPeer(conf, gw_pub, psk)
+            peer.send(peer.init.initiation())
+            r = peer.wait_kind((2,), PSK_RETRY_S)
+            if r is not None and peer.init.consume_response(r):
+                return peer
+            peer.close()
+        if time.monotonic() > deadline:
+            raise Fail(f"peer {rp.peer}: no handshake with its key_out was accepted within {RP_EXCHANGE_S:.0f} s")
+        time.sleep(PSK_RETRY_S)
+
+
+def rust_usize(rel: str, name: str) -> int:
+    m = re.search(rf"pub const {name}: (?:usize|u\d+) = ([0-9_]+);", open(os.path.join(ROOT, rel)).read())
+    if not m:
+        raise Fail(f"{name} not found in {rel}")
+    return int(m.group(1))
+
+
+def sniffed_init_hello(sniffer: Sniffer) -> bytes:
+    """The first InitHello a client sent to the Rosenpass port."""
+    size = rust_usize(INGRESS_CORE, "RP_INIT_HELLO_LEN")
+    for _, f, outgoing in sniffer.since(0):
+        u = udp_fields(f)
+        if u is not None and outgoing and u[3] == RP_PORT and len(u[4]) == size and u[4][0] == 0x81:
+            return u[4]
+    raise Fail("no InitHello from the client was sniffed")
+
+
+def rp_deny_cases(con: Console, hello: bytes, passed: list):
+    """ingress's Rosenpass gates, paired [C4]: a genuine InitHello (sniffed
+    from a client) with one mac byte flipped is refused as RpBadMac while
+    the genuine bytes are answered; replayed above the per-source burst, it
+    draws RpRateLimited. The client after this completes once refilled."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.bind((ip_str(PEER_IP), 0))
+        bad = bytearray(hello)
+        bad[-32] ^= 1  # the envelope's mac, before the cookie field
+        mark = con.mark()
+        s.sendto(bytes(bad), (ip_str(GW_IP), RP_PORT))
+        con.wait_for(r"audit: src=ingress RpBadMac total=1 ", since=mark)
+        # The client's own InitHellos came from this source: wait out its
+        # meter, so only the mac decides the genuine bytes' fate.
+        time.sleep(rust_usize(INGRESS_CORE, "RP_HELLO_SRC_INTERVAL_NS") / 1e9 + 1)
+        s.sendto(hello, (ip_str(GW_IP), RP_PORT))
+        until = time.monotonic() + RP_EXCHANGE_S
+        while True:
+            s.settimeout(max(0.01, until - time.monotonic()))
+            try:
+                d = s.recv(2048)
+            except socket.timeout:
+                raise Fail("rosenpass mac pair: the genuine InitHello got no RespHello") from None
+            if d[:1] == b"\x82":
+                break
+        passed.append("rosenpass mac deny")
+        print("\nPASS [rosenpass mac: one flipped byte refused at ingress, the genuine bytes answered]")
+        # Enough above the burst that the refusals cross a coalesced line
+        # (the client's own retransmissions may have printed total=1).
+        n = rust_usize(INGRESS_CORE, "RP_HELLO_SRC_BURST") + 64 + 8
+        mark = con.mark()
+        for _ in range(n):
+            s.sendto(hello, (ip_str(GW_IP), RP_PORT))
+        con.wait_for(r"audit: src=ingress RpRateLimited total=\d+ ", since=mark)
+        passed.append("rosenpass bucket deny")
+        print(f"\nPASS [rosenpass bucket: {n} replays from one source drew RpRateLimited]")
+    finally:
+        s.close()
+
+
 def test_cookie_a(loader: str, deploy: str, passed: list):
-    """Boot "cookie-a": the keepalive case, then the paired cookie case."""
+    """Boot "cookie-a": Rosenpass 0.2.3 interop (peer 2) and ingress's
+    Rosenpass pairs, then the keepalive case and the paired cookie case
+    (peer 1)."""
     tap = Tap()
     inside = Wire()
     host = InsideHost(inside)
@@ -1448,30 +1970,55 @@ def test_cookie_a(loader: str, deploy: str, passed: list):
     except BaseException:
         tap.close()
         raise
-    py = None
+    py = py2 = sniffer = None
+    rps = []
     try:
         start_without_stop_signals(host)
+        sniffer = Sniffer(RP_PORT)
         wait_tap_ready(tap, con)
         cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
         gw_pub = b64(cfg["gateway"]["public_key"])
+        endpoint = f"{ip_str(GW_IP)}:{RP_PORT}"
+        con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        # 0.2.3 as its own peer, before the boot's first flood [R3-T-M6].
+        mark = con.mark()
+        rp2 = Rosenpass(deploy, 2, endpoint, RP_023)
+        rps.append(rp2)
+        osk2 = exported(con, rp2, mark, "rosenpass 0.2.3 interop: ")
+        peer2 = open(os.path.join(deploy, "peer-2.conf")).read()
+        py2 = py_installed(peer2, gw_pub, rp2, time.monotonic() + RP_EXCHANGE_S)
+        if py2.init.psk != osk2:
+            raise Fail("rosenpass 0.2.3 interop: the accepted handshake used another key than the export's")
+        if not py_ping(py2, 3, ident=0x3233, src=PEER2_IP):
+            raise Fail("rosenpass 0.2.3 interop: no ping reply through peer 2's session")
+        rp2.stop()
+        passed.append("rosenpass interop (0.2.3)")
+        print("\nPASS [rosenpass 0.2.3 interop: the gateway's OSK is the client's key_out, ping through]")
+        rp_deny_cases(con, sniffed_init_hello(sniffer), passed)
+
+        # Peer 1 for the cases below; its client stops once hs has the PSK,
+        # which both cases finish well within REJECT_AFTER_TIME of.
+        rp1 = Rosenpass(deploy, 1, endpoint)
+        rps.append(rp1)
         peer1 = open(os.path.join(deploy, "peer-1.conf")).read()
-        py = PyPeer(peer1, gw_pub)
+        py = py_installed(peer1, gw_pub, rp1, time.monotonic() + RP_EXCHANGE_S)
+        rp1.stop()
         keepalive_case(con, py)
         passed.append("passive keepalive")
         print("\nPASS [passive keepalive: one empty message 10-13 s after unanswered data, none after a reply]")
-        paired_case(con, tap, peer1, gw_pub)
+        paired_case(con, tap, peer1, gw_pub, py.init.psk)
         passed.append("cookie path, paired")
         print("\nPASS [cookie path, paired: port B denied, port A allowed, load cleared in its window]")
     finally:
         try:
             with signals_held():
                 host.stop = True
-                close_all(py)
+                close_all(py, py2, sniffer, *rps)
                 kill(child)
                 tap.close()
         except SystemExit:
             host.stop = True
-            close_all(py)
+            close_all(py, py2, sniffer, *rps)
             kill(child)
             tap.close()
             raise
@@ -1574,6 +2121,15 @@ def flood_case(con: Console, tap: Tap, sniffer: Sniffer, deploy: str, gw_pub: by
           f"({attempts} attempts), {ping1} ping tries; step 2 survival {s2:.3f} -> {ping2} ping tries "
           f"({ping_budget(ping2):.0f} s)", flush=True)
 
+    # WireGuard after a flood waits for a fresh PSK, under a named budget
+    # [R3-T-M7]; Rosenpass has its own meters, so it completes under the
+    # band flood. Peer 0's is the boot's first export, so it is printed.
+    endpoint = f"{ip_str(GW_IP)}:{RP_PORT}"
+    mark = con.mark()
+    rp0 = Rosenpass(deploy, 0, endpoint)
+    opened.append(rp0)
+    exported(con, rp0, mark, "PSK went stale during flood: ")
+
     # Flood step 1, below capacity: wireguard-go (re)started on a fixed port.
     # The probe saturates ingress, where the reserve does bind, so this
     # boot's first WgCookieSuppressed is the probe's; the paired case's
@@ -1586,7 +2142,7 @@ def flood_case(con: Console, tap: Tap, sniffer: Sniffer, deploy: str, gw_pub: by
           f"up to {blind} suppressions in step 1 would print no line", flush=True)
     step1 = flood.snapshot()
     step1_mark = con.mark()
-    wg = WgGo(wg_go_conf(deploy), "10.200.0.2/32", cfg["gateway"]["inside_prefix"])
+    wg = WgGo(wg_go_conf(deploy), "10.200.0.2/32", cfg["gateway"]["inside_prefix"], rp0)
     opened.append(wg)
     try:
         before_hs = wg.latest_handshake()
@@ -1618,11 +2174,25 @@ def flood_case(con: Console, tap: Tap, sniffer: Sniffer, deploy: str, gw_pub: by
     opened.remove(wg)
 
     # The Python peer's session, made under load through the cookie path
-    # right before step 2.
+    # right before step 2, once its fresh PSK is installed: until then hs
+    # has none for peer 1 and refuses, so the handshake is retried with the
+    # current key_out.
     peer1 = open(os.path.join(deploy, "peer-1.conf")).read()
-    py = PyPeer(peer1, gw_pub)
+    rp1 = Rosenpass(deploy, 1, endpoint)
+    opened.append(rp1)
+    deadline = time.monotonic() + RP_EXCHANGE_S
+    py = None
+    while py is None:
+        psk = rp1.wait_key(deadline)
+        py = PyPeer(peer1, gw_pub, psk)
+        if not cookie_handshake(py, tries_for(s1 * s1) + 1):
+            py.close()
+            py = None
+            if time.monotonic() > deadline:
+                raise Fail(f"PSK went stale during flood: no handshake for peer 1 within {RP_EXCHANGE_S:.0f} s "
+                           "of its rosenpass start")
     opened.append(py)
-    if not cookie_handshake(py, tries_for(s1 * s1) + 1) or not py_ping(py, ping1, ident=0x4642):
+    if not py_ping(py, ping1, ident=0x4642):
         raise Fail("precondition: no Python-peer session under load through the cookie path")
     budget2 = STEP2_WARMUP_S + ping_budget(ping2)
     age = time.monotonic() - py.established
@@ -1714,7 +2284,20 @@ def check_rosenpass_oracle():
             raise Fail(f"rebuild the image: {path} has sha256 {got}, the repo pins {want}")
 
 
+def check_oracle_not_in_image(loader: str):
+    """VE9: the oracle never enters an seL4 image. Each binary's ELF and
+    program headers (its entry point and segment layout, unique to it) must
+    not occur in the packaged loader. Code or tables could match by accident:
+    the oracle links some of the same crates."""
+    image = open(loader, "rb").read()
+    for path in sorted(ORACLE_BINS):
+        data = open(path, "rb").read()
+        if data[:256] in image:
+            raise Fail(f"{loader} contains part of {path}")
+
+
 def preflight():
+    check_rosenpass_oracle()
     missing = [t for t in ("unshare", "setpriv", "wireguard-go", "wg", "ip", "ping", "qemu-system-aarch64")
                if not shutil.which(t)]
     if missing:
@@ -1749,17 +2332,29 @@ def make(*args, env=None):
 
 
 def build(tmp: str) -> tuple:
-    """Two deployments: A (packaged normally) and B (only its blob, packaged
-    onto A's image for the mismatch case)."""
-    for name in ("a", "b"):
+    """Three deployments: A (packaged normally, three peers: the third is
+    the Rosenpass 0.2.3 client's), B (only its `key` blob, packaged onto
+    A's image for the mismatch case) and C (two peers with their Rosenpass
+    keys swapped, its own image: the peer binding case)."""
+    for name, peers in (("a", "3"), ("b", "3"), ("c", "2")):
         subprocess.run(["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "--template",
-                        os.path.join(ROOT, "config/gateway.toml"), "--peers", "2", "--out",
+                        os.path.join(ROOT, "config/gateway.toml"), "--peers", peers, "--out",
                         os.path.join(tmp, name)], check=True, cwd=ROOT)
+    swap_rp_records(os.path.join(tmp, "c/gateway.toml"))
     env = {**os.environ, "SECUREOS_CONFIG": os.path.join(tmp, "a/gateway.toml")}
     make("image", env=env)
-    make("package", f"SECRETS={tmp}/a/secrets.bin", f"OUT={tmp}/a/pkg", env=env)
-    make("package", f"SECRETS={tmp}/b/secrets.bin", f"OUT={tmp}/b/pkg", env=env)
-    return f"{tmp}/a/pkg/loader.img", f"{tmp}/b/pkg/loader.img"
+    make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin", f"OUT={tmp}/a/pkg",
+         env=env)
+    # Only `key`'s blob mismatches: pqkey keeps A's, so `key` is what halts.
+    make("package", f"SECRETS={tmp}/b/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin", f"OUT={tmp}/b/pkg",
+         env=env)
+    env_c = {**os.environ, "SECUREOS_CONFIG": os.path.join(tmp, "c/gateway.toml")}
+    make("package", f"SECRETS={tmp}/c/secrets.bin", f"PQ_SECRETS={tmp}/c/pqkey-secrets.bin", f"OUT={tmp}/c/pkg",
+         env=env_c)
+    loaders = tuple(f"{tmp}/{name}/pkg/loader.img" for name in ("a", "b", "c"))
+    for loader in loaders:
+        check_oracle_not_in_image(loader)
+    return loaders
 
 
 def check_harness_matches_config(deploy: str):
@@ -1775,6 +2370,7 @@ def check_harness_matches_config(deploy: str):
         "gateway.outside_mac": (g["outside_mac"], mac(GW_MAC)),
         "gateway.outside_router_mac": (g["outside_router_mac"], mac(PEER_MAC)),
         "gateway.listen_port": (g["listen_port"], WG_PORT),
+        "gateway.rp_port": (g["rp_port"], RP_PORT),
         "gateway.inside_ip": (g["inside_ip"], ip(INSIDE_IP)),
         "gateway.inside_mac": (g["inside_mac"], mac(INSIDE_MAC)),
         "neighbors[0].ip": (cfg["neighbors"][0]["ip"], ip(HOST_IP)),
@@ -1782,13 +2378,15 @@ def check_harness_matches_config(deploy: str):
         "peers[0].allowed_ips": (cfg["peers"][0]["allowed_ips"], ["10.200.0.2/32"]),
         # Case 4 sends from 10.200.0.99 as peer 1, which must not own it.
         "peers[1].allowed_ips": (cfg["peers"][1]["allowed_ips"], ["10.200.0.3/32"]),
+        # The Rosenpass 0.2.3 client's, pinged from as peer 2.
+        "peers[2].allowed_ips": (cfg["peers"][2]["allowed_ips"], [ip(PEER2_IP) + "/32"]),
     }
     wrong = [f"{k}={got!r} (harness uses {want!r})" for k, (got, want) in expected.items() if got != want]
     if wrong:
         raise Fail("config/gateway.toml no longer matches the harness: " + "; ".join(wrong))
 
 
-def in_netns(good: str, mismatched: str, deploy: str) -> int:
+def in_netns(good: str, mismatched: str, binding: str, deploy: str) -> int:
     guard_thread_starts()
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     try:
@@ -1811,6 +2409,7 @@ def in_netns(good: str, mismatched: str, deploy: str) -> int:
              ("wireguard", lambda: test_wireguard(good, deploy, passed)),
              ("cookie boot a", lambda: test_cookie_a(good, deploy, passed)),
              ("cookie boot b", lambda: test_cookie_b(good, deploy, passed)),
+             ("peer binding", lambda: test_peer_binding(binding, os.path.join(os.path.dirname(deploy), "c"), passed)),
              ("mismatched blob halts key", single("mismatched blob", lambda: test_mismatched_blob(mismatched)))]
     for name, fn in cases:
         try:
@@ -1901,16 +2500,16 @@ def main() -> int:
         if str(os.getppid()) != os.environ.get("SECUREOS_IT_PARENT"):
             print("\nFAIL [setup]: outer harness already gone", file=sys.stderr)
             return 1
-        return in_netns(*sys.argv[2:5])
+        return in_netns(*sys.argv[2:6])
     tmp = tempfile.mkdtemp(prefix="secureos-it-")
     status = 1
     try:
         preflight()
-        good, mismatched = build(tmp)
+        good, mismatched, binding = build(tmp)
         # `unshare` execs the child, so the Popen pid is the netns harness.
         # The outer harness has no threads, so preexec_fn is safe here.
         child = subprocess.Popen(["unshare", "-rn", sys.executable, os.path.abspath(__file__), "--netns",
-                                  good, mismatched, os.path.join(tmp, "a")], preexec_fn=die_with_parent,
+                                  good, mismatched, binding, os.path.join(tmp, "a")], preexec_fn=die_with_parent,
                                  env={**os.environ, "SECUREOS_IT_PARENT": str(os.getpid())})
         try:
             status = child.wait()

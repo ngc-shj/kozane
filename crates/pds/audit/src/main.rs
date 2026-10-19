@@ -24,7 +24,7 @@ struct Source {
 }
 
 struct Audit {
-    sources: [Source; 6],
+    sources: [Source; 7],
     unknown: UnknownCodes,
 }
 
@@ -43,6 +43,7 @@ fn init() -> Audit {
         source("inner", ch::CH_INNER, memory_region_symbol!(audit_inner: *mut u8)),
         source("hs", ch::CH_HS, memory_region_symbol!(audit_hs: *mut u8)),
         source("data", ch::CH_DATA, memory_region_symbol!(audit_data: *mut u8)),
+        source("pq", ch::CH_PQ, memory_region_symbol!(audit_pq: *mut u8)),
     ];
     debug_println!("audit: ready");
     Audit { sources, unknown: UnknownCodes::new() }
@@ -66,6 +67,10 @@ impl Audit {
                 }
                 None => false,
             },
+            Decoded::CostHighWater => {
+                debug_println!("audit: src={} RpCostHighWater us={} lost={}", src, r.a, r.b);
+                true
+            }
             Decoded::Unknown => false,
         };
         if !named && let Some(total) = self.unknown.record() {

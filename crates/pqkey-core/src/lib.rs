@@ -57,14 +57,34 @@ const _: () = assert!(pq::PK_LEN == cmr::CRYPTO_PUBLICKEYBYTES);
 const _: () = assert!(pq::CT_LEN == cmr::CRYPTO_CIPHERTEXTBYTES);
 const _: () = assert!(pq::SHK_LEN == cmr::CRYPTO_BYTES);
 
-// MCE-COST: placeholder values until the in-PD measurement sizes them
-// (M3 plan VE10, C2); the bucket assertion against `RP_HELLO_*` follows then.
 /// `pq`'s call budget: `PQ_KEY_BURST` calls, refilled at one per
-/// `PQ_KEY_INTERVAL_NS`.
-pub const PQ_KEY_BURST: u64 = 64;
-pub const PQ_KEY_INTERVAL_NS: u64 = 1_000_000_000 / 100;
+/// `PQ_KEY_INTERVAL_NS` (M3 plan C2). `pq` asserts at build time that
+/// ingress's InitHello meters cannot exhaust it: the burst covers the global
+/// InitHello burst, the link backlog, the one in hand and the boot calls,
+/// and the refill is no slower than the global InitHello refill.
+pub const PQ_KEY_BURST: u64 = 32;
+pub const PQ_KEY_INTERVAL_NS: u64 = 10_000_000_000;
+
+// The pqkey budget invariant (M3 plan C2), checked when `pqkey-core` is
+// built: every InitHello `ingress` can forward costs one `PQ_DECAPS`, so a
+// burst is the global InitHello burst, all that can wait on the link, and
+// the one `pq` has in hand.
+const _: () = assert!(
+    PQ_KEY_BURST - PQ_BOOT_CALLS > ingress_core::RP_HELLO_GLOBAL_BURST + ingress_core::RP_IN_FLIGHT as u64,
+    "C2: forwarded InitHellos plus the pq backlog can exhaust pqkey's bucket"
+);
+const _: () = assert!(
+    PQ_KEY_INTERVAL_NS <= ingress_core::RP_HELLO_GLOBAL_INTERVAL_NS,
+    "C2: ingress can forward InitHellos faster than pqkey refills"
+);
 /// Calls `pq` makes outside handshakes: `PQ_BOOT_SEED` at init.
 pub const PQ_BOOT_CALLS: u64 = 1;
+/// Wall-clock cost of one InitHello → RespHello in `pq` at its committed
+/// budget under TCG, preemption included: what `RpCostHighWater` reports.
+/// The measured maximum (16.1 s, N = 26, median 8.5 s) with 25% headroom;
+/// the integration quiet window checks the boot's high-water mark against
+/// it.
+pub const PQ_HANDSHAKE_COST_NS: u64 = 20_000_000_000;
 
 /// Domain label of the pq boot seed, distinct from `key`'s construction.
 pub const BOOT_SEED_LABEL: &[u8] = b"pq-boot-seed";

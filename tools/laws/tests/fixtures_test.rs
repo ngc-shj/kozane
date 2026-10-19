@@ -106,6 +106,21 @@ fn secrets_mr_into_key_only_is_allowed() {
 }
 
 #[test]
+fn map_ending_one_page_below_the_stack_is_allowed() {
+    assert_allow("stack_guard_allow");
+}
+
+#[test]
+fn map_reaching_the_page_below_the_stack_is_l4() {
+    assert_deny("stack_guard_deny", &["L4"]);
+}
+
+#[test]
+fn secrets_mr_mapped_writable_into_its_owner_is_l2() {
+    assert_deny("secrets_writable_deny", &["L2"]);
+}
+
+#[test]
 fn driver_maps_own_device_page_is_allowed() {
     assert_allow("device_page_own_allow");
 }

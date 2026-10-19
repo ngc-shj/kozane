@@ -13,5 +13,7 @@ layout = { path = "../../layout" }
 msgs = { path = "../../msgs" }
 pdkit = { path = "../../pdkit" }
 ring = { path = "../../ring" }
+rosenpass-core = { path = "../../rosenpass-core" }
+rosenpass-wire = { path = "../../rosenpass-wire" }
 sel4-microkit.workspace = true
 wg-core = { path = "../../wg-core" }

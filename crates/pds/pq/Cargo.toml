@@ -5,7 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+audit-event = { path = "../../audit-event" }
 config = { path = "../../config" }
 cpu = { path = "../../cpu" }
 layout = { path = "../../layout" }
+msgs = { path = "../../msgs" }
+pdkit = { path = "../../pdkit" }
+pqkey-core = { path = "../../pqkey-core" }
+ring = { path = "../../ring" }
+rosenpass-core = { path = "../../rosenpass-core" }
+rosenpass-wire = { path = "../../rosenpass-wire" }
+secret-blob = { path = "../../secret-blob" }
 sel4-microkit = { workspace = true }

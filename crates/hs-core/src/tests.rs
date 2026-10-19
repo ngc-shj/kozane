@@ -5,7 +5,7 @@ extern crate std;
 use std::collections::BTreeSet;
 
 use super::*;
-use key_core::{Bucket, Oracle};
+use key_core::{Bucket, Caller, Oracle};
 use wg_core::noise::{CONSTRUCTION, IDENTIFIER, LABEL_MAC1};
 
 use wg_core::wire::{INITIATION_LEN, INITIATION_MAC1_OFFSET, MessageInitiation, MessageResponse, RESPONSE_LEN};
@@ -31,7 +31,7 @@ fn peer_pub() -> [u8; 32] {
 
 fn region() -> [u8; secret_blob::REGION_SIZE] {
     let mut r = [0u8; secret_blob::REGION_SIZE];
-    secret_blob::write(&mut r, clamped(GW_PRIVATE).as_bytes(), &[0x99; 32], &[(peer_pub(), PSK)]).unwrap();
+    secret_blob::write(&mut r, clamped(GW_PRIVATE).as_bytes(), &[0x99; 32], &[peer_pub()]).unwrap();
     r
 }
 
@@ -45,7 +45,7 @@ struct Direct<'a> {
 impl KeyCall for &mut Direct<'_> {
     fn call(&mut self, label: u64, req: &[u64], reply: &mut [u64]) -> (u64, usize) {
         self.calls += 1;
-        self.oracle.handle(&mut self.bucket, 0, label, req, reply)
+        self.oracle.handle(Some(Caller::Hs), &mut self.bucket, 0, label, req, reply)
     }
 }
 
@@ -70,6 +70,13 @@ impl Hardware for FakeHw {
     }
 }
 
+/// Peer 0's PSK installed at time 0.
+fn live() -> PskTable<4> {
+    let mut t = PskTable::new();
+    t.install(0, &PSK, 0).unwrap();
+    t
+}
+
 fn entropy() -> HedgedEntropy<FakeHw> {
     HedgedEntropy::new(Key32::from_bytes([3; 32]), FakeHw { tick: 0, rndr: Some(42) })
 }
@@ -84,8 +91,12 @@ struct Initiator {
 
 impl Initiator {
     fn initiation(ts: [u8; 12]) -> (Self, [u8; INITIATION_LEN]) {
+        Self::initiation_from(PEER_PRIVATE, ts)
+    }
+
+    fn initiation_from(private: [u8; 32], ts: [u8; 12]) -> (Self, [u8; INITIATION_LEN]) {
         let sr_pub = gw_pub();
-        let s = clamped(PEER_PRIVATE);
+        let s = clamped(private);
         let s_pub = crypto::public_key(&s);
         let e = clamped([0x61; 32]);
         let e_pub = crypto::public_key(&e);
@@ -150,10 +161,10 @@ fn full_handshake_through_the_real_key_oracle() {
     let (init, msg) = Initiator::initiation(ts(1));
     let (mut install, mut response) = ([0u8; 128], [0u8; 128]);
     let peers = [peer_pub()];
-    let out = handshaker().handle(&input(&msg), 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&peers), &mut install, &mut response);
+    let out = handshaker().handle(&input(&msg), 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&peers), &live(), &mut install, &mut response);
     let Outcome::Accepted { peer, install_len, response_len } = out else { panic!("{out:?}") };
     assert_eq!(peer, PeerId(0));
-    assert_eq!(d.calls, 3, "StaticDh for es and ss, then PskMix");
+    assert_eq!(d.calls, 2, "StaticDh for es and ss");
 
     let resp = msgs::Response::decode(&response[..response_len]).unwrap();
     assert_eq!(resp.dst, SRC);
@@ -173,7 +184,7 @@ fn response_does_not_verify_with_another_psk() {
     let (mut install, mut response) = ([0u8; 128], [0u8; 128]);
     let peers = [peer_pub()];
     let Outcome::Accepted { response_len, .. } =
-        handshaker().handle(&input(&msg), 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&peers), &mut install, &mut response)
+        handshaker().handle(&input(&msg), 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&peers), &live(), &mut install, &mut response)
     else {
         panic!("not accepted")
     };
@@ -188,7 +199,7 @@ fn key_refusal_rejects_and_records_the_reason() {
     let (_, msg) = Initiator::initiation(ts(1));
     let mut client = KeyClient::new(&mut d);
     let peers = [peer_pub()];
-    let out = handshaker().handle(&input(&msg), 0, &mut client, &mut entropy(), &Peers(&peers), &mut [0; 128], &mut [0; 128]);
+    let out = handshaker().handle(&input(&msg), 0, &mut client, &mut entropy(), &Peers(&peers), &live(), &mut [0; 128], &mut [0; 128]);
     assert_eq!(out, Outcome::Rejected(Reject::Key(KeyError)));
     assert_eq!(client.last_error, key_core::ERR_RATE_LIMITED);
 }
@@ -200,7 +211,7 @@ fn bad_mac1_is_rejected_without_calling_key() {
     let (_, mut msg) = Initiator::initiation(ts(1));
     msg[INITIATION_MAC1_OFFSET] ^= 1;
     let peers = [peer_pub()];
-    let out = handshaker().handle(&input(&msg), 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&peers), &mut [0; 128], &mut [0; 128]);
+    let out = handshaker().handle(&input(&msg), 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&peers), &live(), &mut [0; 128], &mut [0; 128]);
     assert_eq!(out, Outcome::Rejected(Reject::BadMac1));
     assert_eq!(d.calls, 0);
 }
@@ -210,7 +221,7 @@ fn unknown_peer_is_rejected_after_one_key_call() {
     let r = region();
     let mut d = direct(&r, 100);
     let (_, msg) = Initiator::initiation(ts(1));
-    let out = handshaker().handle(&input(&msg), 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&[[7; 32]]), &mut [0; 128], &mut [0; 128]);
+    let out = handshaker().handle(&input(&msg), 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&[[7; 32]]), &live(), &mut [0; 128], &mut [0; 128]);
     assert_eq!(out, Outcome::Rejected(Reject::UnknownPeer));
     assert_eq!(d.calls, 1);
 }
@@ -219,7 +230,7 @@ fn unknown_peer_is_rejected_after_one_key_call() {
 fn malformed_ingress_message_is_bad_input() {
     let r = region();
     let mut d = direct(&r, 100);
-    let out = handshaker().handle(&[0; 10], 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&[]), &mut [0; 128], &mut [0; 128]);
+    let out = handshaker().handle(&[0; 10], 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&[]), &live(), &mut [0; 128], &mut [0; 128]);
     assert_eq!(out, Outcome::BadInput);
 }
 
@@ -239,6 +250,7 @@ fn successive_handshakes_get_distinct_indices() {
             &mut KeyClient::new(&mut d),
             &mut entropy(),
             &Peers(&peers),
+            &live(),
             &mut install,
             &mut [0; 128],
         ) else {
@@ -255,7 +267,7 @@ fn small_install_buffer_is_reported_and_left_zeroed() {
     let (_, msg) = Initiator::initiation(ts(1));
     let mut install = [0xffu8; 20];
     let peers = [peer_pub()];
-    let out = handshaker().handle(&input(&msg), 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&peers), &mut install, &mut [0; 128]);
+    let out = handshaker().handle(&input(&msg), 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&peers), &live(), &mut install, &mut [0; 128]);
     assert_eq!(out, Outcome::NoBuffer);
     assert_eq!(install, [0; 20]);
 }
@@ -335,7 +347,7 @@ fn rejected_initiations_do_not_use_up_indices() {
     let (_, msg) = Initiator::initiation(ts(5));
     let accept = |h: &mut Handshaker<4>, d: &mut Direct<'_>, now: u64| {
         let mut install = [0u8; 128];
-        let out = h.handle(&input(&msg), now, &mut KeyClient::new(d), &mut entropy(), &Peers(&peers), &mut install, &mut [0; 128]);
+        let out = h.handle(&input(&msg), now, &mut KeyClient::new(d), &mut entropy(), &Peers(&peers), &live(), &mut install, &mut [0; 128]);
         (out, install)
     };
     let (first, install) = accept(&mut h, &mut d, 0);
@@ -350,7 +362,7 @@ fn rejected_initiations_do_not_use_up_indices() {
     let second = expected.next_index().unwrap();
     let (_, msg2) = Initiator::initiation(ts(6));
     let mut install = [0u8; 128];
-    let out = h.handle(&input(&msg2), 30_000_000_000, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&peers), &mut install, &mut [0; 128]);
+    let out = h.handle(&input(&msg2), 30_000_000_000, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&peers), &live(), &mut install, &mut [0; 128]);
     let Outcome::Accepted { install_len, .. } = out else { panic!("{out:?}") };
     assert_eq!(msgs::Install::decode(&install[..install_len]).unwrap().local_index, second);
 }
@@ -371,7 +383,7 @@ fn exhausted_key_budget_reaches_the_audit_mapping() {
     let mut client = KeyClient::new(&mut d);
     let peers = [peer_pub()];
     let Outcome::Rejected(rej) =
-        handshaker().handle(&input(&msg), 0, &mut client, &mut entropy(), &Peers(&peers), &mut [0; 128], &mut [0; 128])
+        handshaker().handle(&input(&msg), 0, &mut client, &mut entropy(), &Peers(&peers), &live(), &mut [0; 128], &mut [0; 128])
     else {
         panic!("not rejected")
     };
@@ -396,11 +408,21 @@ fn every_initiation_exit_stays_within_the_key_call_budget() {
     out_of_range[4] = peer_pub();
     // One `handle` call with a fresh `key` bucket of `burst` calls; returns
     // the outcome and the calls that call alone made.
-    let run = |h: &mut Handshaker<4>, burst: u64, input: &[u8], now: u64, rndr: Option<u64>, peers: &[[u8; 32]], install: &mut [u8]| {
+    let run_with = |h: &mut Handshaker<4>,
+                    burst: u64,
+                    input: &[u8],
+                    now: u64,
+                    rndr: Option<u64>,
+                    peers: &[[u8; 32]],
+                    psks: &PskTable<4>,
+                    install: &mut [u8]| {
         let mut d = direct(&r, burst);
         let mut e = HedgedEntropy::new(Key32::from_bytes([3; 32]), FakeHw { tick: 0, rndr });
-        let out = h.handle(input, now, &mut KeyClient::new(&mut d), &mut e, &Peers(peers), install, &mut [0; 128]);
+        let out = h.handle(input, now, &mut KeyClient::new(&mut d), &mut e, &Peers(peers), psks, install, &mut [0; 128]);
         (out, d.calls)
+    };
+    let run = |h: &mut Handshaker<4>, burst, input: &[u8], now, rndr, peers: &[[u8; 32]], install: &mut [u8]| {
+        run_with(h, burst, input, now, rndr, peers, &live(), install)
     };
     let (_, good) = Initiator::initiation(ts(1));
     let (_, newer) = Initiator::initiation(ts(2));
@@ -430,7 +452,10 @@ fn every_initiation_exit_stays_within_the_key_call_budget() {
     fresh("ss refused (rate)", 1, &good, Some(42), &peers, rejected(Reject::Key(KeyError)), 2);
     fresh("timestamp decrypt", 100, &tampered(ENC_TIMESTAMP), Some(42), &peers, rejected(Reject::Decrypt), 2);
     fresh("entropy", 100, &good, None, &peers, rejected(Reject::Entropy), 2);
-    fresh("psk refused (rate)", 2, &good, Some(42), &peers, rejected(Reject::Key(KeyError)), 3);
+    let missing = run_with(&mut handshaker(), 100, &input(&good), 0, Some(42), &peers, &PskTable::new(), &mut [0; 128]);
+    cases.push(("psk missing", missing, rejected(Reject::Psk(PskRefusal::Missing)), 2));
+    let stale = run_with(&mut handshaker(), 100, &input(&good), REJECT_AFTER_TIME_NS, Some(42), &peers, &live(), &mut [0; 128]);
+    cases.push(("psk stale", stale, rejected(Reject::Psk(PskRefusal::Stale)), 2));
 
     cases.push(("bad input", run(&mut handshaker(), 100, &[0; 10], 0, Some(42), &peers, &mut [0; 128]), Outcome::BadInput, 0));
     let mut h = handshaker();
@@ -442,7 +467,7 @@ fn every_initiation_exit_stays_within_the_key_call_budget() {
     assert!(h.indices.next_index().is_some());
     cases.push(("index exhausted", run(&mut h, 100, &input(&good), 0, Some(42), &peers, &mut [0; 128]), rejected(Reject::IndexExhausted), 2));
     let no_buffer = run(&mut handshaker(), 100, &input(&good), 0, Some(42), &peers, &mut [0; 20]);
-    cases.push(("no buffer", no_buffer, Outcome::NoBuffer, 3));
+    cases.push(("no buffer", no_buffer, Outcome::NoBuffer, 2));
 
     let limit = usize::try_from(KEY_CALLS_PER_HANDSHAKE).unwrap();
     for (name, (out, calls), want, expected) in cases {
@@ -453,4 +478,161 @@ fn every_initiation_exit_stays_within_the_key_call_budget() {
     let (out, calls) = run(&mut handshaker(), 100, &input(&good), 0, Some(42), &peers, &mut [0; 128]);
     assert!(matches!(out, Outcome::Accepted { .. }), "{out:?}");
     assert_eq!(calls, limit, "accept spends exactly KEY_CALLS_PER_HANDSHAKE");
+}
+
+/// One `handle` with `psks`, a fresh handshaker-independent `key` and the
+/// default entropy; returns the outcome and the install bytes.
+fn handle_with(h: &mut Handshaker<4>, msg: &[u8; INITIATION_LEN], now: u64, peers: &[[u8; 32]], psks: &PskTable<4>) -> (Outcome, [u8; 128], [u8; 128]) {
+    let r = region();
+    let mut d = direct(&r, 100);
+    let (mut install, mut response) = ([0u8; 128], [0u8; 128]);
+    let out = h.handle(&input(msg), now, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(peers), psks, &mut install, &mut response);
+    (out, install, response)
+}
+
+const T_INSTALL: u64 = 1_000 * 1_000_000_000;
+
+#[test]
+fn psk_is_refused_at_exactly_reject_after_time_and_accepted_one_ns_before() {
+    let peers = [peer_pub()];
+    let mut psks = PskTable::<4>::new();
+    psks.install(0, &PSK, T_INSTALL).unwrap();
+    let (_, msg) = Initiator::initiation(ts(1));
+    let (out, ..) = handle_with(&mut handshaker(), &msg, T_INSTALL + REJECT_AFTER_TIME_NS - 1, &peers, &psks);
+    assert!(matches!(out, Outcome::Accepted { .. }), "{out:?}");
+    let (out, ..) = handle_with(&mut handshaker(), &msg, T_INSTALL + REJECT_AFTER_TIME_NS, &peers, &psks);
+    assert_eq!(out, Outcome::Rejected(Reject::Psk(PskRefusal::Stale)));
+}
+
+#[test]
+fn initiation_without_a_psk_is_refused_as_missing() {
+    let (_, msg) = Initiator::initiation(ts(1));
+    let (out, install, response) = handle_with(&mut handshaker(), &msg, 0, &[peer_pub()], &PskTable::new());
+    assert_eq!(out, Outcome::Rejected(Reject::Psk(PskRefusal::Missing)));
+    assert_eq!((install, response), ([0; 128], [0; 128]), "nothing produced for a refused initiation");
+    let Outcome::Rejected(r) = out else { unreachable!() };
+    assert_eq!(reject_event(r, key_core::OK), audit_event::Event::HandshakePskMissing);
+    assert_eq!(reject_event(Reject::Psk(PskRefusal::Stale), key_core::OK), audit_event::Event::HandshakePskStale);
+}
+
+#[test]
+fn psk_refusal_leaves_the_timestamp_and_flood_state_unchanged() {
+    let peers = [peer_pub()];
+    let mut h = handshaker();
+    let (_, first) = Initiator::initiation(ts(1));
+    let (_, second) = Initiator::initiation(ts(2));
+    assert!(matches!(handle_with(&mut h, &first, 0, &peers, &live()).0, Outcome::Accepted { .. }));
+    let t = 1_000_000_000;
+    let (out, ..) = handle_with(&mut h, &second, t, &peers, &PskTable::new());
+    assert_eq!(out, Outcome::Rejected(Reject::Psk(PskRefusal::Missing)));
+    // Had the refusal committed `second`'s timestamp this would be a
+    // Replay; had it committed its arrival time, a Flood.
+    let (out, ..) = handle_with(&mut h, &second, t, &peers, &live());
+    assert!(matches!(out, Outcome::Accepted { .. }), "{out:?}");
+}
+
+#[test]
+fn the_same_initiation_is_refused_before_install_and_accepted_after() {
+    let peers = [peer_pub()];
+    let mut h = handshaker();
+    let mut psks = PskTable::<4>::new();
+    let (init, msg) = Initiator::initiation(ts(1));
+    let t = 5_000_000_000;
+    assert_eq!(handle_with(&mut h, &msg, t, &peers, &psks).0, Outcome::Rejected(Reject::Psk(PskRefusal::Missing)));
+    psks.install_message(&psk_install(0, &PSK), t).unwrap();
+    let (out, _, response) = handle_with(&mut h, &msg, t, &peers, &psks);
+    let Outcome::Accepted { response_len, .. } = out else { panic!("{out:?}") };
+    let resp = msgs::Response::decode(&response[..response_len]).unwrap();
+    assert!(init.finish(resp.msg, &PSK).is_some(), "the response is keyed to the installed OSK");
+}
+
+#[test]
+fn tick_at_reject_after_time_expires_the_entry_and_later_initiations_are_stale() {
+    let mut psks = PskTable::<4>::new();
+    psks.install(0, &PSK, T_INSTALL).unwrap();
+    psks.tick(T_INSTALL + REJECT_AFTER_TIME_NS - 1);
+    assert!(matches!(psks.entries[0], Entry::Live { .. }), "the entry is still Live 1 ns before 180 s");
+    psks.tick(T_INSTALL + REJECT_AFTER_TIME_NS);
+    assert!(
+        matches!(psks.entries[0], Entry::Expired { installed_at: T_INSTALL }),
+        "the entry is `Expired` after the tick at 180 s"
+    );
+    let (_, msg) = Initiator::initiation(ts(1));
+    let (out, ..) = handle_with(&mut handshaker(), &msg, T_INSTALL + REJECT_AFTER_TIME_NS + 1, &[peer_pub()], &psks);
+    assert_eq!(out, Outcome::Rejected(Reject::Psk(PskRefusal::Stale)));
+}
+
+#[test]
+fn tick_leaves_absent_and_young_entries_alone() {
+    let mut psks = PskTable::<4>::new();
+    psks.install(1, &PSK, T_INSTALL).unwrap();
+    psks.tick(T_INSTALL + REJECT_AFTER_TIME_NS - 1);
+    assert!(matches!(psks.entries[0], Entry::Absent));
+    assert!(matches!(psks.entries[1], Entry::Live { .. }));
+}
+
+#[test]
+fn expired_entry_is_refused_whatever_its_installed_at_and_install_revives_it() {
+    let mut psks = PskTable::<4>::new();
+    psks.entries[0] = Entry::Expired { installed_at: T_INSTALL };
+    assert!(matches!(psks.fresh(PeerId(0), T_INSTALL + 1), Err(PskRefusal::Stale)));
+    psks.install(0, &PSK, T_INSTALL + 2).unwrap();
+    assert!(matches!(psks.entries[0], Entry::Live { installed_at, .. } if installed_at == T_INSTALL + 2));
+    assert_eq!(psks.fresh(PeerId(0), T_INSTALL + 3).ok().map(|p| *p.as_ref().as_bytes()), Some(PSK));
+}
+
+#[test]
+fn psk_freshness_is_per_peer() {
+    const OTHER_PRIVATE: [u8; 32] = [0x23; 32];
+    let peers = [peer_pub(), crypto::public_key(&clamped(OTHER_PRIVATE))];
+    let mut h = handshaker();
+    let psks = live();
+    let (_, from_0) = Initiator::initiation(ts(1));
+    let (_, from_1) = Initiator::initiation_from(OTHER_PRIVATE, ts(1));
+    assert!(matches!(handle_with(&mut h, &from_0, 0, &peers, &psks).0, Outcome::Accepted { peer: PeerId(0), .. }));
+    assert_eq!(handle_with(&mut h, &from_1, 0, &peers, &psks).0, Outcome::Rejected(Reject::Psk(PskRefusal::Missing)));
+}
+
+#[test]
+fn supersession_replaces_the_psk_and_keeps_no_copy_of_the_old_one() {
+    const NEWER: [u8; 32] = [0xa2; 32];
+    let mut psks = live();
+    psks.install(0, &NEWER, 10).unwrap();
+    let Entry::Live { osk, installed_at } = &psks.entries[0] else { panic!("not live") };
+    assert_eq!((osk.as_bytes(), *installed_at), (&NEWER, 10));
+    // The old OSK was dropped in place, which zeroizes it (`Key32`); no
+    // entry still holds it.
+    assert!(psks.entries.iter().all(|e| !matches!(e, Entry::Live { osk, .. } if osk.as_bytes() == &PSK)));
+    let (init, msg) = Initiator::initiation(ts(1));
+    let (out, _, response) = handle_with(&mut handshaker(), &msg, 20, &[peer_pub()], &psks);
+    let Outcome::Accepted { response_len, .. } = out else { panic!("{out:?}") };
+    let resp = msgs::Response::decode(&response[..response_len]).unwrap();
+    assert!(init.finish(resp.msg, &PSK).is_none(), "the superseded PSK no longer keys handshakes");
+}
+
+fn psk_install(peer: u16, osk: &[u8; 32]) -> std::vec::Vec<u8> {
+    let mut b = std::vec![0u8; msgs::PSK_INSTALL_LEN];
+    msgs::PskInstall { peer, osk }.encode(&mut b).unwrap();
+    b
+}
+
+#[test]
+fn psk_install_peer_is_bounds_checked() {
+    let mut psks = PskTable::<4>::new();
+    assert_eq!(psks.install_message(&psk_install(4, &PSK), 0), Err(InstallError::PeerOutOfRange));
+    assert_eq!(psks.install_message(&psk_install(u16::MAX, &PSK), 0), Err(InstallError::PeerOutOfRange));
+    assert!(psks.entries.iter().all(|e| matches!(e, Entry::Absent)));
+    assert_eq!(psks.install_message(&psk_install(3, &PSK), 0), Ok(PeerId(3)));
+    assert!(matches!(psks.entries[3], Entry::Live { .. }));
+}
+
+#[test]
+fn malformed_psk_install_is_refused() {
+    let mut psks = PskTable::<4>::new();
+    let msg = psk_install(0, &PSK);
+    assert_eq!(psks.install_message(&msg[..msgs::PSK_INSTALL_LEN - 1], 0), Err(InstallError::Malformed));
+    let mut long = msg.clone();
+    long.push(0);
+    assert_eq!(psks.install_message(&long, 0), Err(InstallError::Malformed));
+    assert!(matches!(psks.entries[0], Entry::Absent));
 }

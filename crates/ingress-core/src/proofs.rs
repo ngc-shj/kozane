@@ -12,8 +12,13 @@ impl Mac1 for AnyMac1 {
     }
 }
 
-const CFG: Config =
-    Config { mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56], ipv4: [10, 0, 2, 15], router_mac: [0x52, 0x55, 10, 0, 2, 2], port: 51820 };
+const CFG: Config = Config {
+    mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56],
+    ipv4: [10, 0, 2, 15],
+    router_mac: [0x52, 0x55, 10, 0, 2, 2],
+    port: 51820,
+    rp_port: 9999,
+};
 
 /// `respond` never panics and never claims more bytes than `out` holds;
 /// invariant (e) holds for ARP replies too [code review S1].
@@ -52,6 +57,7 @@ fn respond_is_total_and_bounded() {
     kani::cover!(o == Outcome::NoService);
     kani::cover!(o == Outcome::Spoofed);
     kani::cover!(o == Outcome::BadMessage);
+    kani::cover!(matches!(o, Outcome::Rosenpass { .. }));
 }
 
 /// Only an exactly-sized type-1 message with a valid mac1 and budget is
@@ -398,4 +404,154 @@ fn rotate_at_most_once_per_retry_interval() {
     gate.tick_if_due(&mut stub, t2, kani::any());
     assert!(stub.rotates <= 1);
     kani::cover!(no_secret && stub.rotates == 1);
+}
+
+// ---- Rosenpass (M3 plan C4), with the production constants ----
+
+/// Answers nondeterministically; records whether it was called.
+#[derive(Default)]
+struct AnyRpMac {
+    called: Cell<bool>,
+}
+
+impl RpMac for AnyRpMac {
+    fn verify(&self, _: &[u8]) -> bool {
+        self.called.set(true);
+        kani::any()
+    }
+}
+
+fn any_kind() -> RpKind {
+    if kani::any() { RpKind::Hello } else { RpKind::Conf }
+}
+
+fn any_sources<const B: u64, const I: u64>() -> SourceMeters<2, B, I> {
+    let slot = || if kani::any() { Some((kani::any(), any_meter::<B, I>())) } else { None };
+    SourceMeters { slots: [slot(), slot()] }
+}
+
+/// Any state: meters at any level within capacity, any source table and
+/// any ring accounting within its bounds. InitConf within its share is the
+/// invariant the harnesses below show is kept.
+fn any_rp_gate() -> RpGate<2> {
+    let in_flight = InFlight { kinds: core::array::from_fn(|_| any_kind()), head: kani::any(), len: kani::any() };
+    kani::assume(in_flight.head < RP_IN_FLIGHT && in_flight.len <= RP_IN_FLIGHT);
+    RpGate {
+        hello_src: any_sources(),
+        hello_global: any_meter(),
+        conf_src: any_sources(),
+        conf_global: any_meter(),
+        in_flight,
+    }
+}
+
+/// Classification is total: a forward is an InitHello or InitConf of its
+/// exact length; everything else of another type or length is dropped
+/// before the mac. Every outcome is reachable.
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_classify_is_total_and_typed() {
+    let payload: [u8; RP_INIT_HELLO_LEN + 1] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= payload.len());
+    let msg = payload.get(..len).unwrap_or(&[]);
+    let mut gate = any_rp_gate();
+    let mac = AnyRpMac::default();
+    let o = rp_classify(&mut gate, &mac, kani::any(), Endpoint { ip: kani::any(), port: kani::any() }, msg);
+    let typed = (len == RP_INIT_HELLO_LEN && payload[0] == RP_MSG_INIT_HELLO)
+        || (len == RP_INIT_CONF_LEN && payload[0] == RP_MSG_INIT_CONF);
+    match o {
+        RpOutcome::ForwardHello { msg, .. } => assert!(len == RP_INIT_HELLO_LEN && msg[0] == RP_MSG_INIT_HELLO),
+        RpOutcome::ForwardConf { msg, .. } => assert!(len == RP_INIT_CONF_LEN && msg[0] == RP_MSG_INIT_CONF),
+        RpOutcome::TypeDropped => assert!(!typed && !mac.called.get()),
+        _ => assert!(typed && mac.called.get()),
+    }
+    kani::cover!(matches!(o, RpOutcome::ForwardHello { .. }));
+    kani::cover!(matches!(o, RpOutcome::ForwardConf { .. }));
+    kani::cover!(o == RpOutcome::TypeDropped);
+    kani::cover!(o == RpOutcome::BadMac);
+    kani::cover!(o == RpOutcome::RateLimited);
+    kani::cover!(o == RpOutcome::RingReserved);
+}
+
+/// A failed mac, or a type that is dropped, leaves every meter and the
+/// ring accounting exactly as they were.
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_refusals_before_admission_spend_nothing() {
+    let payload: [u8; RP_INIT_HELLO_LEN] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len == RP_INIT_HELLO_LEN || len == RP_INIT_CONF_LEN || len < 4);
+    let mut gate = any_rp_gate();
+    let before = gate.clone();
+    let o = rp_classify(&mut gate, &AnyRpMac::default(), kani::any(), Endpoint { ip: kani::any(), port: kani::any() }, payload.get(..len).unwrap_or(&[]));
+    if matches!(o, RpOutcome::BadMac | RpOutcome::TypeDropped | RpOutcome::RingReserved) {
+        assert!(gate == before);
+    }
+    kani::cover!(o == RpOutcome::BadMac);
+    kani::cover!(o == RpOutcome::RingReserved);
+}
+
+/// A forward went through its type's constructor: it spent exactly one
+/// token of its type's global meter, touched no meter of the other type,
+/// and was counted once as in flight under its type.
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_forward_spends_its_own_meters_once() {
+    let payload: [u8; RP_INIT_HELLO_LEN] = kani::any();
+    let hello: bool = kani::any();
+    let msg = if hello { &payload[..] } else { &payload[..RP_INIT_CONF_LEN] };
+    let mut gate = any_rp_gate();
+    let before = gate.clone();
+    let now: u64 = kani::any();
+    let o = rp_classify(&mut gate, &AnyRpMac::default(), now, Endpoint { ip: kani::any(), port: kani::any() }, msg);
+    match o {
+        RpOutcome::ForwardHello { .. } => {
+            assert!(spec_level(&gate.hello_global, now) + RP_HELLO_GLOBAL_INTERVAL_NS == spec_level(&before.hello_global, now));
+            assert!(gate.conf_global == before.conf_global && gate.conf_src == before.conf_src);
+            assert!(gate.in_flight.count(RpKind::Hello) == before.in_flight.count(RpKind::Hello) + 1);
+            assert!(gate.in_flight.count(RpKind::Conf) == before.in_flight.count(RpKind::Conf));
+        }
+        RpOutcome::ForwardConf { .. } => {
+            assert!(spec_level(&gate.conf_global, now) + RP_CONF_GLOBAL_INTERVAL_NS == spec_level(&before.conf_global, now));
+            assert!(gate.hello_global == before.hello_global && gate.hello_src == before.hello_src);
+            assert!(gate.in_flight.count(RpKind::Conf) == before.in_flight.count(RpKind::Conf) + 1);
+            assert!(gate.in_flight.count(RpKind::Hello) == before.in_flight.count(RpKind::Hello));
+        }
+        _ => assert!(gate.in_flight == before.in_flight),
+    }
+    kani::cover!(matches!(o, RpOutcome::ForwardHello { .. }));
+    kani::cover!(matches!(o, RpOutcome::ForwardConf { .. }));
+}
+
+/// From any state with InitConf within its share, one datagram, a reclaim
+/// or an unsent keeps it there and keeps the ring within RP_IN_FLIGHT; and
+/// while the ring has room, an InitHello is never refused for the ring.
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_init_conf_never_exceeds_its_share() {
+    let mut gate = any_rp_gate();
+    kani::assume(gate.in_flight.count(RpKind::Conf) <= RP_CONF_SHARE);
+    let room = gate.in_flight.len < RP_IN_FLIGHT;
+    let payload: [u8; RP_INIT_HELLO_LEN] = kani::any();
+    let hello: bool = kani::any();
+    let msg = if hello { &payload[..] } else { &payload[..RP_INIT_CONF_LEN] };
+    let o = match kani::any::<u8>() {
+        0 => {
+            gate.reclaimed(kani::any());
+            None
+        }
+        1 => {
+            gate.unsent();
+            None
+        }
+        _ => Some(rp_classify(&mut gate, &AnyRpMac::default(), kani::any(), Endpoint { ip: kani::any(), port: kani::any() }, msg)),
+    };
+    assert!(gate.in_flight.count(RpKind::Conf) <= RP_CONF_SHARE);
+    assert!(gate.in_flight.len <= RP_IN_FLIGHT);
+    if hello && room {
+        assert!(o != Some(RpOutcome::RingReserved));
+    }
+    kani::cover!(o == Some(RpOutcome::RingReserved) && !hello && room);
+    kani::cover!(matches!(o, Some(RpOutcome::ForwardConf { .. })) && gate.in_flight.count(RpKind::Conf) == RP_CONF_SHARE);
 }

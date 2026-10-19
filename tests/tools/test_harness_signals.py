@@ -229,7 +229,8 @@ for s in run.STOP_SIGNALS:
 done = []
 env = dict(vars(run), kill=lambda child: done.append("kill"), child=None, host=types.SimpleNamespace(stop=False),
            wg=types.SimpleNamespace(close=lambda: done.append("wg")),
-           tap=types.SimpleNamespace(close=lambda: done.append("tap")), py=None, sniffer=None, opened=[])
+           tap=types.SimpleNamespace(close=lambda: done.append("tap")), py=None, py2=None, sniffer=None, opened=[],
+           out=None, rp=None, rps=[], sock=None, threads=[])
 
 def trace(frame, event, arg):
     # The pending handler runs on the way into the context manager, before

@@ -28,8 +28,8 @@ Rules:
 
 Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
 fail until they are removed from PENDING; --enforce-pending makes them fail
-now (the fixtures use it). P7 is pending until wg-core, hs-core and key-core
-drop PSK_MIX in M3a; removing it from PENDING raises CHECK-PINS-RULES.
+now (the fixtures use it). None is pending: P7 became enforced once
+wg-core, hs-core and key-core dropped PSK_MIX in M3a.
 
 Control class: P1-P4 are fail-closed checks over the files they read. P5 is
 a best-effort tripwire: make and bash decide what a recipe does, and a
@@ -52,7 +52,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9"]
-PENDING = {"P7"}
+PENDING: set[str] = set()
 # Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
 SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq"]
 

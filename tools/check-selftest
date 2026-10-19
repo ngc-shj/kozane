@@ -42,6 +42,15 @@ def append(tree: pathlib.Path, rel: str, text: str):
     p.write_text(p.read_text() + text)
 
 
+def two_key_channel(tree: pathlib.Path, caller: str, caller_id: int, callee: str, callee_id: int):
+    edit(tree, "system/secureos.system", "</system>",
+         f'    <channel>\n        <end pd="{caller}" id="{caller_id}" pp="true" notify="false" />\n'
+         f'        <end pd="{callee}" id="{callee_id}" pp="false" />\n    </channel>\n</system>')
+    append(tree, "policy/laws.toml",
+           f'\n[[channels]]\nbetween = ["{caller}", "{callee}"]\n'
+           f'pp = {{ {caller} = true, {callee} = false }}\nnotify = {{ {caller} = false, {callee} = true }}\n')
+
+
 UNIT_TEST = "\n#[test]\nfn selftest_injected_failure() {\n    assert_eq!(1, 2);\n}\n"
 KANI_HARNESS = (
     "\n#[kani::proof]\nfn selftest_unsatisfiable_cover() {\n"
@@ -54,15 +63,17 @@ KANI_HARNESS = (
 CASES_FOR_GATE = {
     "clean-counts": {"stale-counts", "check-propagation"},
     # pins runs the package checker fixtures; package-release drives the real target.
-    "pins": {"pins", "package-release"},
+    "pins": {"pins", "package-release", "package-waiver"},
     "lint": {"lint"},
     "unit": {"unit", "c5-forward-burst", "c5-backlog", "c5-interval", "c5-key-calls",
              "arrival-interval-order", "arrival-burst-order", "late-notify", "unbounded-drain",
-             "rotate-before-max-age", "net-buffers-equal"},
+             "rotate-before-max-age", "net-buffers-equal", "l8-stale", "l8-expiry-tick", "l8-order",
+             "rp-domain-label", "rp-mac-always", "c2-hello-burst", "c2-hello-interval"},
     "kani": {"kani", "kani-cache"},
     "bolero": {"bolero", "bolero-wg-wire"},
-    "laws": {"laws", "laws-timer-ingress"},
-    "test": {"integration", "integration-count", "integration-residue", "integration-cookie"},
+    "laws": {"laws", "laws-timer-ingress", "laws-pq-key", "laws-hs-pqkey", "laws-pq-secrets-writable"},
+    "test": {"integration", "integration-count", "integration-residue", "integration-cookie",
+             "integration-pq-residue", "l8-fallback"},
     "manifest": {"manifest"},
 }
 
@@ -138,10 +149,24 @@ CASES = {
                                                      "        if let Err(e) = self.to_data.reclaim() {\n",
                                                      "        if let Err(e) = Ok::<(), _>(()) {\n"),
                             "install message still in guest RAM"),
+    # The same scan over the pq->hs link (M3 plan C7): without pq's reclaim
+    # on hs's notify, the PskInstall (an OSK) stays in guest RAM.
+    "integration-pq-residue": (["test"], lambda t: edit(t, "crates/pds/pq/src/main.rs",
+                                                        "        // buffer back now, which zeroes it (law L12).\n"
+                                                        "        if let Err(e) = self.pq.to_hs.reclaim() {\n",
+                                                        "        // buffer back now, which zeroes it (law L12).\n"
+                                                        "        if let Err(e) = Ok::<(), ring::link::LinkError>(()) {\n"),
+                               "PskInstall message still in guest RAM"),
+    # L8 end to end: an absent PSK treated as an all-zero one must let a peer
+    # without a Rosenpass exchange get a response.
+    "l8-fallback": (["test"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
+                                             "            Some(Entry::Absent) | None => Err(PskRefusal::Missing),",
+                                             "            Some(Entry::Absent) | None => Ok(FreshPsk(Key32::from_bytes([0; 32]))),"),
+                    "L8: peer 1 got a handshake response without a Rosenpass PSK"),
     # A case that stops counting must fail the manifest, not just print fewer PASS lines.
     "integration-count": (["test", "manifest"], lambda t: edit(t, "tests/integration/run.py",
                                                                '        passed.append("unknown peer")\n', ""),
-                          "INTEGRATION-CASES: 10 < manifest 11"),
+                          "INTEGRATION-CASES: 21 < manifest 22"),
     # Under load an initiation without a valid mac2 must not reach hs (M2.5
     # plan C6): forwarding regardless of mac2 must fail the paired case at
     # port A, whose initiation without mac2 then draws a handshake response.
@@ -149,23 +174,62 @@ CASES = {
                                                     "        if !self.observe_load(now_ns, backlog) {\n",
                                                     "        if !self.observe_load(now_ns, backlog) || true {\n"),
                            "cookie attribution failed: an initiation without mac2 under load got a handshake response"),
-    # The key budget invariant (M2.5 plan C5): each operand of the two
-    # compile-time inequalities, and the per-path count, loosened on its own.
+    # The key budget invariant (M2.5 plan C5, 2 key calls since M3): each
+    # operand of the two compile-time inequalities, and the per-path count,
+    # loosened on its own, to the first value that crosses.
     "c5-forward-burst": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
-                                                  "pub const FORWARD_BURST: u64 = 16;", "pub const FORWARD_BURST: u64 = 22;"),
+                                                  "pub const FORWARD_BURST: u64 = 16;", "pub const FORWARD_BURST: u64 = 63;"),
                          "C5: forwarded burst plus ih backlog can exhaust key's bucket"),
     "c5-backlog": (["unit"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                             "const IH_BACKLOG: u64 = layout::NET_BUFFERS as u64 + 1;",
-                                            "const IH_BACKLOG: u64 = layout::NET_BUFFERS as u64 + 7;"),
+                                            "const IH_BACKLOG: u64 = layout::NET_BUFFERS as u64 + 48;"),
                    "C5: forwarded burst plus ih backlog can exhaust key's bucket"),
     "c5-interval": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
                                              "pub const KEY_INTERVAL_NS: u64 = 1_000_000_000 / 2_000;",
-                                             "pub const KEY_INTERVAL_NS: u64 = 1_000_000_000 / 500;"),
+                                             "pub const KEY_INTERVAL_NS: u64 = 1_000_000_000 / 399;"),
                     "C5: hs can spend key calls faster than key refills"),
     "c5-key-calls": (["unit"], lambda t: edit(t, "crates/hs-core/src/lib.rs", "            Ok(a) => a,\n",
                                               "            Ok(a) => {\n                let _ = key.dh(&[9; 32]);\n"
                                               "                a\n            }\n"),
                      "key calls exceeds KEY_CALLS_PER_HANDSHAKE"),
+    # L8 (M3 plan C5): a stale PSK, an expiry tick that expires nothing, and
+    # a PSK check moved after the replay/flood commit must each fail `unit`.
+    "l8-stale": (["unit"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
+                                          "Some(Entry::Live { osk, installed_at }) if now_ns.saturating_sub(*installed_at) < REJECT_AFTER_TIME_NS =>",
+                                          "Some(Entry::Live { osk, installed_at: _ }) =>"),
+                 "psk_is_refused_at_exactly_reject_after_time_and_accepted_one_ns_before"),
+    "l8-expiry-tick": (["unit"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
+                                                "                *entry = Entry::Expired { installed_at };\n",
+                                                "                let _ = installed_at;\n"),
+                       "the entry is `Expired` after the tick at 180 s"),
+    "l8-order": (["unit"], lambda t: edit(t, "crates/wg-core/src/noise.rs",
+                                          "        let psk = psks.fresh(peer, now_ns).map_err(Reject::Psk)?;\n"
+                                          "        // The initiation is authentic: commit before building the response,\n"
+                                          "        // so a later failure cannot let the same initiation be replayed.\n"
+                                          "        state.last_timestamp = timestamp;\n"
+                                          "        state.last_accept_ns = Some(now_ns);\n",
+                                          "        state.last_timestamp = timestamp;\n"
+                                          "        state.last_accept_ns = Some(now_ns);\n"
+                                          "        let psk = psks.fresh(peer, now_ns).map_err(Reject::Psk)?;\n"),
+                 "psk_refusal_leaves_the_timestamp_and_flood_state_unchanged"),
+    # One Rosenpass domain label changed must break the upstream vectors.
+    "rp-domain-label": (["unit"], lambda t: edit(t, "crates/rosenpass-core/src/crypto.rs",
+                                                 'mix: kh_public(&ckextract, b"mix")?', 'mix: kh_public(&ckextract, b"miy")?'),
+                        "resp_hello_and_its_ck_chain_match_upstream_byte_for_byte"),
+    # The pqkey budget invariant (M3 plan C2): each side loosened on its own.
+    "c2-hello-burst": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                "pub const RP_HELLO_GLOBAL_BURST: u64 = 8;",
+                                                "pub const RP_HELLO_GLOBAL_BURST: u64 = 15;"),
+                       "C2: forwarded InitHellos plus the pq backlog can exhaust pqkey's bucket"),
+    "c2-hello-interval": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                   "pub const RP_HELLO_GLOBAL_INTERVAL_NS: u64 = 10_000_000_000;",
+                                                   "pub const RP_HELLO_GLOBAL_INTERVAL_NS: u64 = 9_999_999_999;"),
+                          "C2: ingress can forward InitHellos faster than pqkey refills"),
+    # ingress's Rosenpass mac gate accepting everything must fail `unit`.
+    "rp-mac-always": (["unit"], lambda t: edit(t, "crates/pds/ingress/src/rp_mac.rs",
+                                               "(Ok(want), Some(got)) => ct_eq(&want, got),",
+                                               "(Ok(want), Some(got)) => ct_eq(&want, got) || true,"),
+                      "a_flipped_mac_byte_fails"),
     # Load must begin on arrivals no later than on forwards (M2.5 plan C3).
     "arrival-interval-order": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
                                                         "pub const ARRIVAL_INTERVAL_NS: u64 = 5_000_000;",
@@ -205,15 +269,30 @@ CASES = {
         edit(t, "policy/laws.toml", "notify = { timer = true, ingress = false }",
              "notify = { timer = true, ingress = true }")),
                            "timer pd 'timer' is tainted"),
+    # The M3 key-PD edges (L2 as amended), each declared in the policy too so
+    # only the law can object.
+    "laws-pq-key": (["laws"], lambda t: two_key_channel(t, "pq", 6, "key", 2), "pd 'pq' has pp channels to more than one key pd"),
+    "laws-hs-pqkey": (["laws"], lambda t: two_key_channel(t, "hs", 7, "pqkey", 2),
+                      "pd 'hs' has pp channels to more than one key pd"),
+    "laws-pq-secrets-writable": (["laws"], lambda t: edit(t, "system/secureos.system",
+                                                          '<map mr="pq_secrets" vaddr="0x2_000_000" perms="r" ',
+                                                          '<map mr="pq_secrets" vaddr="0x2_000_000" perms="rw" '),
+                                 "secrets mr 'pq_secrets' is mapped into pd 'pqkey' with perms other than r"),
     # Until release kernels are tested (SC20) only debug kernels may be
     # packaged, judged from the kernel's gen_config.h (M2 plan F10/T13).
     # Refused before any secrets are read, so the paths need not exist.
-    "package-release": (["package", "MICROKIT_CONFIG=release", "SECRETS=/nonexistent/s.bin", "OUT=/nonexistent/pkg"],
+    "package-release": (["package", "MICROKIT_CONFIG=release", "SECRETS=/nonexistent/s.bin",
+                         "PQ_SECRETS=/nonexistent/pq.bin", "OUT=/nonexistent/pkg"],
                         lambda t: None, "kernel config is not debug"),
+    # The open-waiver refusal is reported on its own, next to SC20 (M3
+    # plan, Packaging): dropping the waiver check loses this needle.
+    "package-waiver": (["package", "MICROKIT_CONFIG=release", "SECRETS=/nonexistent/s.bin",
+                        "PQ_SECRETS=/nonexistent/pq.bin", "OUT=/nonexistent/pkg"],
+                       lambda t: None, "waiver SC23 (owner M4) is open"),
     # Deleting a test keeps `unit` green; only the manifest comparison notices.
     "manifest": (["unit", "manifest"], lambda t: edit(t, "crates/audit-event/src/tests.rs",
                                                      "#[test]\nfn first_occurrence_emits()",
-                                                     "#[allow(dead_code)]\nfn first_occurrence_emits()"), "UNIT-AUDIT-EVENT: 18 < manifest 19"),
+                                                     "#[allow(dead_code)]\nfn first_occurrence_emits()"), "UNIT-AUDIT-EVENT: 29 < manifest 30"),
 }
 
 

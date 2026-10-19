@@ -24,7 +24,6 @@ fn gw_pub() -> [u8; 32] {
 /// Test double for the `key` PD.
 struct TestKey {
     s: Key32,
-    psk: [u8; 32],
     dh_calls: usize,
     /// Return raw zeros instead of an error for low-order points, as a
     /// careless key holder might.
@@ -33,7 +32,7 @@ struct TestKey {
 
 impl TestKey {
     fn new() -> Self {
-        Self { s: Key32::from_bytes(GW_PRIV), psk: PSK, dh_calls: 0, permissive: false }
+        Self { s: Key32::from_bytes(GW_PRIV), dh_calls: 0, permissive: false }
     }
 }
 
@@ -46,10 +45,26 @@ impl StaticKey for TestKey {
             Err(_) => Err(KeyError),
         }
     }
+}
 
-    fn psk_mix(&mut self, peer: PeerId, chaining: &Key32) -> Result<(Key32, Key32, Key32), KeyError> {
+/// Test double for `hs`'s PSK table: peer 1's PSK, or a fixed refusal.
+struct TestPsks(Result<[u8; 32], PskRefusal>);
+
+const PSKS: TestPsks = TestPsks(Ok(PSK));
+
+struct TestPsk(Key32);
+
+impl AsRef<Key32> for TestPsk {
+    fn as_ref(&self) -> &Key32 {
+        &self.0
+    }
+}
+
+impl PskSource for TestPsks {
+    type Psk = TestPsk;
+    fn fresh(&self, peer: PeerId, _now_ns: u64) -> Result<TestPsk, PskRefusal> {
         assert_eq!(peer, PeerId(1));
-        crypto::kdf3(chaining, &self.psk).map_err(|_| KeyError)
+        self.0.map(|k| TestPsk(Key32::from_bytes(k)))
     }
 }
 
@@ -165,7 +180,7 @@ fn valid_initiation(ts: [u8; 12]) -> (Initiator, [u8; INITIATION_LEN]) {
 }
 
 fn consume(r: &mut Responder<4>, msg: &[u8; INITIATION_LEN], now: u64, key: &mut TestKey) -> Result<Accepted, Reject> {
-    r.consume_initiation(msg, now, || Some(0xaabb_ccdd), key, &mut CountingEntropy(0), &Peers)
+    r.consume_initiation(msg, now, || Some(0xaabb_ccdd), key, &mut CountingEntropy(0), &Peers, &PSKS)
 }
 
 #[test]
@@ -203,10 +218,10 @@ fn full_handshake_and_transport_in_both_directions() {
 fn responder_ephemeral_comes_from_entropy() {
     let (_, msg) = valid_initiation(tai64n(100, 0));
     let a = responder()
-        .consume_initiation(&msg, T0, || Some(1), &mut TestKey::new(), &mut CountingEntropy(0), &Peers)
+        .consume_initiation(&msg, T0, || Some(1), &mut TestKey::new(), &mut CountingEntropy(0), &Peers, &PSKS)
         .unwrap();
     let b = responder()
-        .consume_initiation(&msg, T0, || Some(1), &mut TestKey::new(), &mut CountingEntropy(7), &Peers)
+        .consume_initiation(&msg, T0, || Some(1), &mut TestKey::new(), &mut CountingEntropy(7), &Peers, &PSKS)
         .unwrap();
     let ea = MessageResponse::parse(&a.response).unwrap().ephemeral;
     let eb = MessageResponse::parse(&b.response).unwrap().ephemeral;
@@ -220,6 +235,52 @@ fn wrong_psk_gets_a_response_the_initiator_cannot_use() {
     let (init, msg) = Initiator::initiation(PEER_PRIV, [0x61; 32], [0x51; 32], tai64n(100, 0));
     let acc = consume(&mut r, &msg, T0, &mut TestKey::new()).unwrap();
     assert!(init.consume_response(&acc.response).is_none());
+}
+
+#[test]
+fn response_is_keyed_to_the_psk_the_source_hands_out() {
+    let (init, msg) = Initiator::initiation(PEER_PRIV, [0x61; 32], [0x51; 32], tai64n(100, 0));
+    let acc = responder()
+        .consume_initiation(&msg, T0, || Some(1), &mut TestKey::new(), &mut CountingEntropy(0), &Peers, &TestPsks(Ok([0x51; 32])))
+        .unwrap();
+    assert!(init.consume_response(&acc.response).is_some());
+}
+
+#[test]
+fn psk_refusal_comes_after_ss_and_names_its_reason() {
+    for refusal in [PskRefusal::Missing, PskRefusal::Stale] {
+        let mut key = TestKey::new();
+        let (_, msg) = valid_initiation(tai64n(100, 0));
+        let res = responder().consume_initiation(&msg, T0, || Some(1), &mut key, &mut CountingEntropy(0), &Peers, &TestPsks(Err(refusal)));
+        assert_eq!(res.err(), Some(Reject::Psk(refusal)));
+        assert_eq!(key.dh_calls, 2);
+    }
+}
+
+#[test]
+fn psk_refusal_commits_no_replay_or_flood_state_and_takes_no_index() {
+    let mut r = responder();
+    let mut key = TestKey::new();
+    let (_, msg) = valid_initiation(tai64n(100, 0));
+    let res = r.consume_initiation(&msg, T0, || panic!("index taken on refusal"), &mut key, &mut CountingEntropy(0), &Peers, &TestPsks(Err(PskRefusal::Missing)));
+    assert_eq!(res.err(), Some(Reject::Psk(PskRefusal::Missing)));
+    // The same initiation at the same instant: neither its timestamp nor
+    // its arrival time was recorded.
+    assert!(consume(&mut r, &msg, T0, &mut key).is_ok());
+}
+
+#[test]
+fn replay_and_flood_are_checked_before_the_psk() {
+    let mut r = responder();
+    let mut key = TestKey::new();
+    let (_, msg) = valid_initiation(tai64n(100, 0));
+    let (_, newer) = valid_initiation(tai64n(101, 0));
+    assert!(consume(&mut r, &msg, T0, &mut key).is_ok());
+    let missing = TestPsks(Err(PskRefusal::Missing));
+    let replay = r.consume_initiation(&msg, T0 + 1_000 * MS, || Some(1), &mut key, &mut CountingEntropy(0), &Peers, &missing);
+    assert_eq!(replay.err(), Some(Reject::Replay));
+    let flood = r.consume_initiation(&newer, T0 + MS, || Some(1), &mut key, &mut CountingEntropy(0), &Peers, &missing);
+    assert_eq!(flood.err(), Some(Reject::Flood));
 }
 
 #[test]
@@ -325,7 +386,7 @@ fn low_order_ephemeral_refused_by_key_holder_is_rejected() {
 fn entropy_failure_refuses_the_handshake() {
     let mut r = responder();
     let (_, msg) = valid_initiation(tai64n(100, 0));
-    let res = r.consume_initiation(&msg, T0, || Some(1), &mut TestKey::new(), &mut NoEntropy, &Peers);
+    let res = r.consume_initiation(&msg, T0, || Some(1), &mut TestKey::new(), &mut NoEntropy, &Peers, &PSKS);
     assert_eq!(res.err(), Some(Reject::Entropy));
 }
 
@@ -340,7 +401,7 @@ fn peer_id_beyond_capacity_is_rejected_before_ss() {
     let mut r = responder();
     let mut key = TestKey::new();
     let (_, msg) = valid_initiation(tai64n(100, 0));
-    let res = r.consume_initiation(&msg, T0, || Some(1), &mut key, &mut CountingEntropy(0), &FarPeers);
+    let res = r.consume_initiation(&msg, T0, || Some(1), &mut key, &mut CountingEntropy(0), &FarPeers, &PSKS);
     assert_eq!(res.err(), Some(Reject::PeerOutOfRange));
     assert_eq!(key.dh_calls, 1);
 }

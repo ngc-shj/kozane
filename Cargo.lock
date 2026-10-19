@@ -955,6 +955,8 @@ dependencies = [
  "msgs",
  "pdkit",
  "ring",
+ "rosenpass-core",
+ "rosenpass-wire",
  "sel4-microkit",
  "wg-core",
 ]
@@ -988,9 +990,17 @@ dependencies = [
 name = "pd-pq"
 version = "0.1.0"
 dependencies = [
+ "audit-event",
  "config",
  "cpu",
  "layout",
+ "msgs",
+ "pdkit",
+ "pqkey-core",
+ "ring",
+ "rosenpass-core",
+ "rosenpass-wire",
+ "secret-blob",
  "sel4-microkit",
 ]
 
@@ -1001,6 +1011,8 @@ dependencies = [
  "config",
  "cpu",
  "layout",
+ "pqkey-core",
+ "secret-blob",
  "sel4-microkit",
 ]
 
@@ -1092,6 +1104,7 @@ name = "pqkey-core"
 version = "0.1.0"
 dependencies = [
  "classic-mceliece-rust",
+ "ingress-core",
  "secret-blob",
  "zeroize",
 ]

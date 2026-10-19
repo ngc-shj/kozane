@@ -188,3 +188,251 @@ Implementation decisions not spelled out by plan rev 7, or departing from it.
   - the Makefile needs a `PQ_SECRETS` variable and the new argument;
   - check-selftest `package-release` needs `PQ_SECRETS`;
   - the .system needs a `pq_secrets` MR.
+
+## Batch E2 (C4: ingress Rosenpass path)
+
+- **Rosenpass classification has its own outcome type.** `respond` only
+  routes by port to `Outcome::Rosenpass`, and the PD then calls
+  `rp_classify`, which returns `RpOutcome`. Neither path takes the other's
+  state, so the isolation is enforced by the signatures.
+- **Order inside `admit`:** ring room, then the per-source meter, then the
+  global meter. A ring refusal therefore spends no tokens. (The plan
+  listed the meters before the ring reservation.)
+- **In-flight accounting** is a FIFO queue of message kinds. It relies on
+  pq returning buffers in ring order through the standard `Receiver`.
+  A link error retires nothing, which fails safe.
+- **Provisional constants**, marked MCE-COST:
+  - InitHello: per-source burst 3 per 1 s; global burst 4 per 100 ms;
+  - InitConf: per-source burst 3 per 1 s; global burst 8 per 50 ms;
+  - `RP_IN_FLIGHT` 16, of which InitHello reserves 8 and InitConf may
+    take 8.
+- **RespHello and EmptyData** are subject to the same TX reserve as the
+  other unauthenticated replies. A suppressed reply is audited as
+  `TxNoBuffer` for now.
+- **Open items for integration / Phase 3:**
+  - The 512 KiB `spkm` is compiled into the ingress ELF, because
+    `gateway_rp_public!()` is expanded there to derive the 32-byte mac
+    key. A precomputed `config::GATEWAY_RP_MAC_KEY` would remove it.
+  - ingress trusts the peer endpoint `pq` gives for each reply. A
+    compromised `pq` could aim replies at any endpoint, bounded only by
+    the drain cap and the TX reserve. Restricting replies to endpoints
+    with an outstanding forward is not yet done.
+  - Ring refusals are audited as `RpRateLimited`, and refused replies as
+    `TxNoBuffer`; neither has a dedicated event.
+- **Cargo.lock:** pd-ingress gains path dependencies on `rosenpass-core`
+  and `rosenpass-wire`. No new packages.
+
+## Batch E1 (C5 / L8: wg-core, hs-core, pds/hs)
+
+- **PSK source:** wg-core now takes its PSK from a generic
+  `PskSource::Psk: AsRef<Key32>`, because wg-core cannot depend on
+  hs-core. `FreshPsk` lives in hs-core with a private field, so
+  `PskTable::fresh` is its only constructor, and `Handshaker::handle`
+  takes a concrete `&PskTable`.
+- **Supersession:** the old OSK being zeroized cannot be observed in safe
+  Rust. The test pins replacement instead, and the zeroization relies on
+  `Key32` zeroizing on drop.
+- **Unread field:** `Expired { installed_at }` is never read and carries
+  `#[allow(dead_code)]`.
+- **Tick placement:** hs ticks the table on every wakeup, not only on
+  timer notifications. The tick is idempotent, and `fresh` re-checks the
+  age anyway.
+- **Install bounds:** a `PskInstall` peer index is bounds-checked against
+  `MAX_PEERS`. A slot above the configured peer count never matches a
+  lookup.
+- **Audit:** a malformed `PskInstall` is audited as
+  `RpPskInstallFailed`.
+- **Side fix:** the hs-core tests were stale at HEAD after Batch B (blob v2
+  and the `Caller` argument) and were adapted.
+- **Selftest anchors for the C5 cases.** Each mutation is the first value
+  that breaks the 2-call budget:
+  - `FORWARD_BURST` 22 → 63;
+  - `IH_BACKLOG` from `+7` to `+48`;
+  - `KEY_INTERVAL_NS` from `/500` to `/399`. /399, not the plan's /300,
+    because it is the tightest value that fails.
+
+## Batch E3 (C2 PD side, C3: pq, pqkey, system, laws)
+
+- **Errors with no dedicated event** (Malformed, BadMac, Auth, UnknownPeer,
+  NoBiscuitKey, Encaps, Decaps refused, Internal, DuplicatePeer) are
+  audited as `HandshakeOther` from src=pq.
+- **Boot hash check:** pq checks H(spkm) against `GATEWAY_RP_HASH` at
+  boot, in addition to the planned spkt checks.
+- **Cost:** only InitHello → RespHello is timed.
+  - `RpCostHighWater` uses code 0x0048, has its own slot, does not
+    coalesce, and carries the exact µs value.
+  - It fires on the first observation and then on any rise of at least
+    1/8 (`8·us ≥ 9·last`).
+- **Hedged RNG:** it lives in pq and has no unit tests; its inputs are the
+  boot seed, the draw counter, CNTPCT and RNDR. → Phase 3.
+- **Export path:** the `PskInstall` is already sent to hs when
+  `commit_conf` runs. If `commit_conf` then fails, hs holds an OSK that pq
+  never committed.
+  - That OSK comes from an authenticated InitConf and matches what the
+    initiator already derived.
+  - Only the EmptyData is missing, and the client retransmits.
+- **Provisional budgets (MCE-COST):**
+  - pq 500/10_000 (0.05), pqkey 1_000/10_000. The sum is exactly 0.9.
+  - Both stacks are 0x40_000.
+- **ELF size:** pd-pq is 1.29 MB with one peer, ≈ 4.7 MB with eight,
+  because the McEliece public keys are embedded.
+- **Not added (integration batch):** check-selftest laws cases for a
+  pq→key channel, an hs→pqkey channel, and `pq_secrets` mapped writable or
+  shared.
+
+## Integration
+
+- **Host freeze.** E2 and E3 ran Kani concurrently in the dev container,
+  which had no memory limit. cbmc for msgs peaked near 28 GB RSS; the host
+  thrashed and needed a hard reset.
+  - `tools/kani-gate.sh` now holds `flock build/kani.lock` around
+    `cargo kani`.
+  - `docker/Makefile run` sets `--memory`/`--memory-swap 64g`, and the
+    running container was updated to match.
+
+## Batch F (C7 integration, MCE-COST, GUARD)
+
+### Integration
+- **INTEGRATION-CASES:** 11 → 22. The suite takes 729 s in the container.
+- **New cases:**
+  - interop with master and with 0.2.3;
+  - the L8 pair;
+  - the pq→hs link scrub;
+  - rotation without interruption;
+  - PSK expiry;
+  - reboot replay refused;
+  - the Rosenpass mac deny and bucket deny;
+  - peer binding;
+  - the MCE-COST quiet window.
+- **Raw-frame and mismatched-blob boots** run no Rosenpass, as planned.
+- **`preflight()`:**
+  - verifies the oracle binaries' hashes;
+  - checks that no oracle ELF header occurs in a packaged loader. A
+    4 KiB code slice matched by accident, because the oracle binaries
+    share crates with the image.
+- **Deployments:** b is packaged with a's `PQ_SECRETS`, so only `key`
+  halts in the mismatch boot. Deployment c (records swapped by editing
+  gateway.toml) gets its own image.
+- **`RpPskExported` stays coalesced.** Only a boot's first export is
+  visible.
+  - **How the cases prove later installs:** after a rotation, for peer 1,
+    in cookie-b and in the reboot capture, a WireGuard handshake with the
+    current `key_out` must open its response.
+  - **Why not a dedicated event:** a non-coalesced export event would
+    need its own audit slot. → Phase 3 / M3b.
+- **`key_out` timing:** the client writes `key_out` on RespHello, before
+  the install (8.9 s vs 47 s).
+  - The expiry case uses its mtime as the lower bound on the install
+    time; the allow side is at +170 s.
+  - The deny side is measured from the first accepted handshake, as an
+    upper bound, plus 185 s.
+- **Rotation:** the forced re-handshake is a Python peer-0 handshake with
+  the new key. wireguard-go's key is checked with `wg show`. 0 of 53 and
+  0 of 43 pings were lost.
+- **Peer binding:** client 0's WireGuard side is a Python initiator, not
+  wireguard-go.
+- **Mac / bucket pair:**
+  - Both use an InitHello sniffed from the 0.2.3 client.
+  - The bucket deny sends burst + 72 replays to cross a coalesced
+    `RpRateLimited` line.
+  - The "after refill" side is peer 1's following exchange.
+- **Not done:** "a WireGuard flood leaves the Rosenpass meters untouched,
+  and the reverse". It is shown only indirectly: cookie-b's exchange
+  completes under the band flood. → Phase 3.
+- **Red-proved on scratch copies:**
+  - `l8-fallback`;
+  - pq reclaim removed;
+  - RpMac always true;
+  - records not swapped;
+  - the quiet-window check, offline.
+- **Not red-proved:** rotation, expiry, reboot, bucket.
+- **Selftest:**
+  - `integration-count` needle → "21 < manifest 22";
+  - new `integration-pq-residue` and `l8-fallback` cases;
+  - the other integration anchors are unchanged.
+
+### MCE-COST (TCG, release PDs)
+
+| Measurement | Median | Max | N |
+|---|---|---|---|
+| InitHello→RespHello, full budget | 174.8 ms | 215.8 ms | 30 |
+| ↳ decapsulation over PPC | 163 ms | 204 ms | |
+| ↳ Kyber encapsulation | 1.4 ms | 8.7 ms | |
+| ↳ McEliece encapsulation | 3.2 ms | 4.2 ms | |
+| ↳ rest (hashing 524 KB keys, AEAD) | 6.4 ms | 9.8 ms | |
+| InitConf | 0.14 ms | 0.85 ms | |
+| InitHello at the committed budget (500/10_000), wall | 8.5 s | 16.1 s | 26 |
+
+- **Effective CPU share:** pq gets about 2% of the CPU, not the nominal 5%.
+- **Boot:** the pqkey boot KAT takes 3.39 s.
+- **Stack peaks:** pq 37,360 B; pqkey 53,872 B.
+- **Quiet-window `RpCostHighWater`** in real runs: 10.7 s and 7.06 s.
+- **Host load:** a Kani run shared the host during the measurement, so
+  TCG wall times follow host load.
+
+**Settled values:**
+- **pq budget:** 500/10_000 (0.05) kept. Eight peers rekeying every 120 s
+  with one retransmission each need about 2.9%. The sum stays at 0.9.
+- **pqkey budget:** 1_000/10_000 kept; it only covers init.
+- **Stacks:** both 0x20_000, 3.5× and 2.4× the measured peaks.
+- **`PQ_HANDSHAKE_COST_NS`:** 20 s, the measured max plus 25%. It lives
+  in pqkey-core.
+- **InitHello per-source meter:** `RP_HELLO_SRC` 1 per 20 s (the plan said
+  3 per 1 s).
+  - **Why:** queued retransmissions each cost about 8 s of decapsulation,
+    which stretched an exchange to about 45 s. One answer per initiator
+    retransmission series suffices.
+- **InitHello global meter:** `RP_HELLO_GLOBAL` burst 8 (one per peer
+  after a reboot), one per 10 s.
+  - **Why 10 s:** that is 12 per 120 s rekey interval, which covers 8
+    peers.
+  - **Why not 20 s:** the proposed 20 s (≥ cost) would give 6 per 120 s,
+    below the steady demand.
+  - **Backlog:** the link backlog stays bounded by `RP_IN_FLIGHT`
+    regardless.
+- **Unchanged:** `RP_CONF_*`, `RP_IN_FLIGHT` 16, `RP_HELLO_RESERVED` 8
+  (equal to the global burst).
+- **pqkey call budget:** `PQ_KEY_BURST` 32, `PQ_KEY_INTERVAL_NS` 10 s,
+  `PQ_BOOT_CALLS` 1.
+  - **The C2 invariant**, a compile-time assertion in pqkey-core (now
+    depending on ingress-core):
+    - `PQ_KEY_BURST - PQ_BOOT_CALLS > RP_HELLO_GLOBAL_BURST + RP_IN_FLIGHT`;
+    - `PQ_KEY_INTERVAL_NS <= RP_HELLO_GLOBAL_INTERVAL_NS`.
+  - **Selftest:** `c2-hello-burst` (8 → 15, the first value that
+    crosses) and `c2-hello-interval` (10 s → 10 s − 1 ns).
+- **`PQ_DECAPS` per-day bound (L2 waiver):**
+  - at most 8640 + 32 per day, from one per 10 s plus the burst;
+  - this is the timing-oracle query bound for cmr until SC23 closes.
+- **Not measured:** hs handshakes per second, and ingress's cost per
+  Rosenpass datagram.
+- **Delay pqkey imposes on hs:** pqkey runs on pq's scheduling context, so
+  it is bounded by pq's budget. This is reasoned, not measured.
+
+### GUARD
+- **Finding:** Microkit 2.3.1 (`tool/microkit/src/sel4.rs:558-581`)
+  places its one guard page *above* the stack, between the stack and the
+  IPC buffer.
+  - The stack top is 0xffffffe000.
+  - A `<map>` ending exactly at the stack bottom is accepted.
+  - The page below each stack is unmapped only by layout today.
+- **Enforcement:** new laws check `check_stack_guard` (L4).
+  - Every map must end at least one page below `STACK_TOP - stack_size`.
+  - A pd without `stack_size` is judged at the 16 MiB maximum.
+  - Fixtures: `stack_guard_allow` (ends exactly one page below) and
+    `stack_guard_deny` (reaches the page).
+
+### Laws: secrets mapped read-only
+- **Gap:** `laws` accepted a secrets MR mapped `rw`. This dates from M2
+  (`key`'s `secrets`), and the plan's "writable or shared mapping of the
+  pqkey secrets MR" edge depended on it.
+- **Fix:** L2 now requires perms exactly `r`.
+  - Fixture `secrets_writable_deny` added.
+  - Seven fixtures that mapped secrets `rw` for unrelated laws now map
+    them `r`.
+  - Selftest: `laws-pq-key`, `laws-hs-pqkey`, `laws-pq-secrets-writable`.
+- **mac pair:** the case now waits out the per-source InitHello meter
+  before sending the genuine bytes. The 0.2.3 client had just used the
+  same source, so the 20 s meter refused them as RpRateLimited.
+- **Verification:** `make check` exit 0 (586 s, with the Kani cache warm)
+  on the commit that records this entry. INTEGRATION-CASES 22,
+  KANI-HARNESSES 48, UNIT-TESTS 647.

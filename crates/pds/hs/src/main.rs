@@ -1,12 +1,14 @@
 //! Handshake PD (plan C11): initiations from `ingress` → session install
 //! to `data`, then the response to `ingress`. Static secrets stay in `key`
-//! (PPC); this PD holds only ephemeral state. Tainted (law L1).
+//! (PPC). WireGuard PSKs are the Rosenpass OSKs `pq` installs; an
+//! initiation is accepted only with a fresh one (M3 plan L8). Tainted
+//! (law L1).
 
 #![no_std]
 #![no_main]
 
 use audit_event::Event;
-use hs_core::{Handshaker, HedgedEntropy, KeyCall, KeyClient, Outcome, Peers};
+use hs_core::{Handshaker, HedgedEntropy, KeyCall, KeyClient, Outcome, Peers, PskTable};
 use key_core::MAX_WORDS;
 use layout::hs as ch;
 use pdkit::{Audit, Buf, Rx, Tx};
@@ -18,6 +20,7 @@ use sel4_microkit::{
 const KEY: Channel = Channel::new(ch::CH_KEY);
 const INGRESS: Channel = Channel::new(ch::CH_INGRESS);
 const DATA: Channel = Channel::new(ch::CH_DATA);
+const PQ: Channel = Channel::new(ch::CH_PQ);
 const MAX_PEERS: usize = config::MAX_PEERS;
 // The configuration was validated against this bound at build time; the
 // assertion keeps the PD's tables from silently diverging from it.
@@ -60,6 +63,7 @@ impl hs_core::Hardware for Hw {
 }
 
 struct Hs {
+    from_pq: Rx,
     from_ingress: Rx,
     to_ingress: Tx,
     to_data: Tx,
@@ -67,9 +71,12 @@ struct Hs {
     key: KeyClient<Ppc>,
     entropy: HedgedEntropy<Hw>,
     handshaker: Handshaker<MAX_PEERS>,
+    psks: PskTable<MAX_PEERS>,
     peers: [[u8; 32]; MAX_PEERS],
     peer_count: usize,
     input: Buf,
+    /// One `PskInstall` copied off the `pq` link; zeroed after each.
+    psk_input: Buf,
     install: Buf,
     response: Buf,
     scratch: Buf,
@@ -84,8 +91,13 @@ fn halt(msg: &str) -> ! {
 fn init() -> Hs {
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout` (checked by tools/laws and layout tests).
-    let (from_ingress, to_ingress, to_data, audit) = unsafe {
+    let (from_pq, from_ingress, to_ingress, to_data, audit) = unsafe {
         (
+            pdkit::rx(
+                memory_region_symbol!(pqh_used: *mut u8),
+                memory_region_symbol!(pqh_free: *mut u8),
+                memory_region_symbol!(pqh_data: *mut u8),
+            ),
             pdkit::rx(
                 memory_region_symbol!(ih_used: *mut u8),
                 memory_region_symbol!(ih_free: *mut u8),
@@ -116,6 +128,7 @@ fn init() -> Hs {
     }
     debug_println!("hs: ready");
     Hs {
+        from_pq,
         from_ingress,
         to_ingress,
         to_data,
@@ -123,9 +136,11 @@ fn init() -> Hs {
         key,
         entropy: HedgedEntropy::new(seed, Hw),
         handshaker,
+        psks: PskTable::new(),
         peers,
         peer_count: config::PEERS.len(),
         input: [0; layout::NET_BUF_SIZE],
+        psk_input: [0; layout::NET_BUF_SIZE],
         install: [0; layout::NET_BUF_SIZE],
         response: [0; layout::NET_BUF_SIZE],
         scratch: [0; layout::NET_BUF_SIZE],
@@ -133,6 +148,22 @@ fn init() -> Hs {
 }
 
 impl Hs {
+    /// Installs every `PskInstall` queued by `pq`. Each is copied out of the
+    /// link (which hands the buffer back), then the copy is zeroed; returns
+    /// whether any was taken, so `pq` can reclaim and scrub its buffers.
+    fn drain_pq(&mut self) -> bool {
+        let mut consumed = false;
+        while let Some(n) = pdkit::recv(&mut self.from_pq, &mut self.psk_input, &mut self.audit) {
+            consumed = true;
+            let r = self.psks.install_message(self.psk_input.get(..n).unwrap_or(&[]), cpu::now_ns());
+            self.psk_input.fill(0);
+            if r.is_err() {
+                self.audit.record(Event::RpPskInstallFailed);
+            }
+        }
+        consumed
+    }
+
     /// Returns (sent to data, sent to ingress, consumed input).
     fn poll(&mut self) -> (bool, bool, bool) {
         let (mut to_data, mut to_ingress, mut consumed) = (false, false, false);
@@ -145,6 +176,7 @@ impl Hs {
                 &mut self.key,
                 &mut self.entropy,
                 &peers,
+                &self.psks,
                 &mut self.install,
                 &mut self.response,
             );
@@ -192,6 +224,15 @@ impl Handler for Hs {
         // (law L12). The 1 Hz timer tick retries if that notify was missed.
         if let Err(e) = self.to_data.reclaim() {
             self.audit.link_error(e);
+        }
+        // Expire on every wakeup; the 1 Hz timer guarantees one (law L12).
+        // `fresh` also checks the age, so a late tick never accepts a
+        // stale PSK.
+        self.psks.tick(cpu::now_ns());
+        // `pq` first, so an initiation queued behind its OSK finds it (M3
+        // plan F8).
+        if self.drain_pq() {
+            PQ.notify();
         }
         let (_, to_ingress, consumed) = self.poll();
         if to_ingress || consumed {

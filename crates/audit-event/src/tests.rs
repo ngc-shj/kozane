@@ -171,7 +171,7 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::RpPskInstallFailed
         | Event::RpRngFailed
         | Event::RpDecapsRateLimited => true,
-        Event::FrameDropped { .. } => false,
+        Event::FrameDropped { .. } | Event::RpCostHighWater { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
     assert_eq!(Event::FIXED.len(), 51);
@@ -213,6 +213,7 @@ fn only_state_edge_kinds_are_never_coalesced() {
         [Event::WgUnderLoad, Event::WgLoadCleared, Event::CookieSecretExpired, Event::CookieSecretUnavailable]
     );
     assert!(Event::FrameDropped { reason: 0 }.is_coalesced());
+    assert!(!Event::RpCostHighWater { us: 0 }.is_coalesced());
 }
 
 #[test]
@@ -236,7 +237,7 @@ fn decode_classifies_fixed_dropped_and_unknown_codes() {
     // fixed range.
     assert_eq!(decode(FRAME_DROPPED_BASE + 0x3f), Decoded::FrameDropped(0x3f));
     assert_eq!(decode(0x0019), Decoded::Unknown);
-    assert_eq!(decode(0x0048), Decoded::Unknown);
+    assert_eq!(decode(0x0049), Decoded::Unknown);
 }
 
 #[test]
@@ -244,4 +245,100 @@ fn unknown_codes_share_one_coalesced_counter() {
     let mut u = UnknownCodes::new();
     let due: Vec<u32> = (0..130).filter_map(|_| u.record()).collect();
     assert_eq!(due, [1, 65, 129]);
+}
+
+#[test]
+fn cost_high_water_record_carries_the_exact_cost_not_a_count() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::RpCostHighWater { us: 123_457 }, 1, &mut out);
+    run(&mut c, Event::RpCostHighWater { us: 200_001 }, 1, &mut out);
+    assert_eq!(
+        out,
+        [
+            Record { code: COST_HIGH_WATER, _reserved: 0, a: 123_457, b: 0 },
+            Record { code: COST_HIGH_WATER, _reserved: 0, a: 200_001, b: 0 },
+        ]
+    );
+}
+
+#[test]
+fn cost_high_water_is_never_coalesced() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::RpCostHighWater { us: 7 }, 65, &mut out);
+    assert_eq!(out.len(), 65);
+    assert!(out.iter().all(|r| r.a == 7));
+}
+
+#[test]
+fn cost_high_water_code_is_distinct_and_decodes_as_its_own_kind() {
+    assert!(Event::FIXED.iter().all(|e| e.code() != COST_HIGH_WATER));
+    assert_eq!(Event::RpCostHighWater { us: 1 }.code(), COST_HIGH_WATER);
+    assert_eq!(decode(COST_HIGH_WATER), Decoded::CostHighWater);
+    assert_eq!(Event::RpCostHighWater { us: 1 }.name(), "RpCostHighWater");
+}
+
+#[test]
+fn cost_high_water_does_not_share_a_counter_with_fixed_kinds() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::RpInitHello, 2, &mut out);
+    run(&mut c, Event::RpCostHighWater { us: 9 }, 1, &mut out);
+    run(&mut c, Event::FrameDropped { reason: 0x3f }, 1, &mut out);
+    let got: Vec<_> = out.iter().map(|r| (r.code, r.a)).collect();
+    assert_eq!(got, [(Event::RpInitHello.code(), 1), (COST_HIGH_WATER, 9), (FRAME_DROPPED_BASE | 0x3f, 1)]);
+}
+
+fn emitted(costs: impl IntoIterator<Item = u32>) -> Vec<u32> {
+    let mut hw = CostHighWater::new();
+    costs.into_iter().filter_map(|us| hw.observe(us)).map(|e| e.value().unwrap()).collect()
+}
+
+#[test]
+fn first_cost_always_emits() {
+    assert_eq!(emitted([5_000]), [5_000]);
+}
+
+#[test]
+fn monotone_costs_emit_at_most_log_one_and_an_eighth_of_the_range_plus_one() {
+    let (min, max) = (1_000u32, 64_000u32);
+    let got = emitted(min..=max);
+    let bound = ((f64::from(max) / f64::from(min)).ln() / 1.125f64.ln()).ceil() as usize + 1;
+    assert!(got.len() <= bound, "{} events > bound {bound}", got.len());
+    // Each emission is at least 1/8 above the one before it.
+    assert!(got.windows(2).all(|w| u64::from(w[1]) * 8 >= u64::from(w[0]) * 9));
+    // The last emitted value is within 1/8 of the true maximum.
+    let last = *got.last().unwrap();
+    assert!(u64::from(max) * 8 < u64::from(last) * 9, "last {last} too far below {max}");
+}
+
+#[test]
+fn a_rise_inside_one_power_of_two_bucket_still_emits() {
+    // 1100 and 1240 both lie in [1024, 2048): a log2-bucket gate would
+    // stay silent, the 1/8 rule must not.
+    assert_eq!(emitted([1_100, 1_240]), [1_100, 1_240]);
+}
+
+#[test]
+fn rise_of_exactly_one_eighth_emits_and_just_below_does_not() {
+    assert_eq!(emitted([1_000, 1_124]), [1_000]);
+    assert_eq!(emitted([1_000, 1_125]), [1_000, 1_125]);
+}
+
+#[test]
+fn the_gate_compares_with_the_last_emitted_value_not_the_last_seen() {
+    // 1100 and 1200 are each less than 1/8 above their predecessor, but
+    // 1200 is at least 1/8 above the last emission (1000), so it fires.
+    assert_eq!(emitted([1_000, 1_100, 1_200]), [1_000, 1_200]);
+}
+
+#[test]
+fn lower_or_equal_costs_never_emit() {
+    assert_eq!(emitted([1_000, 1_000, 999, 1]), [1_000]);
+}
+
+#[test]
+fn a_run_of_zero_costs_emits_once() {
+    assert_eq!(emitted([0, 0, 0]), [0]);
 }

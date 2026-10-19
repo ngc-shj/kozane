@@ -68,9 +68,13 @@ impl Perms {
     }
 }
 
+/// The largest `stack_size` Microkit accepts.
+pub const MAX_STACK_SIZE: u64 = 0x100_0000;
+
 #[derive(Debug, Clone)]
 pub struct Map {
     pub mr: String,
+    pub vaddr: u64,
     pub perms: Perms,
 }
 
@@ -89,6 +93,8 @@ pub struct Pd {
     pub period_us: u64,
     pub period_explicit: bool,
     pub passive: bool,
+    /// `stack_size` if given; `None` means Microkit's default.
+    pub stack_size: Option<u64>,
     pub program_image: String,
     pub path_for_symbols: Option<String>,
     pub maps: Vec<Map>,
@@ -259,12 +265,16 @@ fn parse_pd(node: Node, findings: &mut Vec<Finding>) -> Result<Pd, SdfError> {
         None => false,
     };
 
-    if let Some(v) = node.attribute("stack_size") {
-        let size = parse_u64(v).map_err(|e| err(e.to_string()))?;
-        if !(0x1000..=0x100_0000).contains(&size) || size % 0x1000 != 0 {
-            return Err(err(format!("stack_size {size:#x} on pd '{name}' is out of range or not page-aligned")));
+    let stack_size = match node.attribute("stack_size") {
+        Some(v) => {
+            let size = parse_u64(v).map_err(|e| err(e.to_string()))?;
+            if !(0x1000..=MAX_STACK_SIZE).contains(&size) || size % 0x1000 != 0 {
+                return Err(err(format!("stack_size {size:#x} on pd '{name}' is out of range or not page-aligned")));
+            }
+            Some(size)
         }
-    }
+        None => None,
+    };
 
     if let Some(v) = node.attribute("smc")
         && parse_bool(v).map_err(|e| err(e.to_string()))?
@@ -297,7 +307,7 @@ fn parse_pd(node: Node, findings: &mut Vec<Finding>) -> Result<Pd, SdfError> {
                     findings,
                 );
                 let mr = required_attr(child, "mr")?.to_string();
-                required_attr(child, "vaddr")?;
+                let vaddr = parse_u64(required_attr(child, "vaddr")?).map_err(|e| err(e.to_string()))?;
                 let perms = match child.attribute("perms") {
                     Some(v) => Perms::parse(v)?,
                     None => Perms::DEFAULT,
@@ -305,7 +315,7 @@ fn parse_pd(node: Node, findings: &mut Vec<Finding>) -> Result<Pd, SdfError> {
                 if let Some(v) = child.attribute("cached") {
                     parse_bool(v).map_err(|e| err(e.to_string()))?;
                 }
-                maps.push(Map { mr, perms });
+                maps.push(Map { mr, vaddr, perms });
             }
             "setvar" => {
                 check_unknown_attrs(child, &["symbol", "region_paddr"], findings);
@@ -340,6 +350,7 @@ fn parse_pd(node: Node, findings: &mut Vec<Finding>) -> Result<Pd, SdfError> {
         period_us,
         period_explicit,
         passive,
+        stack_size,
         program_image,
         path_for_symbols,
         maps,

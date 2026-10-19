@@ -1,6 +1,9 @@
 image := secureos-dev
 container := secureos-dev
 repo := $(abspath ..)
+# Hard cap (swap included) so a runaway cbmc is OOM-killed inside the
+# container instead of thrashing the host; one Kani proof peaks near 28 GB.
+memory ?= 64g
 
 .PHONY: build
 build:
@@ -17,6 +20,7 @@ run: build
 	docker run -d --name $(container) \
 		--security-opt seccomp=$(abspath seccomp-userns.json) \
 		--device /dev/net/tun \
+		--memory $(memory) --memory-swap $(memory) \
 		--mount type=bind,src=$(repo),dst=/work \
 		--mount type=volume,src=secureos-cargo-registry,dst=/home/dev/.cargo/registry \
 		$(image) sleep inf

@@ -1,9 +1,11 @@
 //! Responder side of Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s as used by
 //! WireGuard (whitepaper sections 5.4.2 - 5.4.5).
 //!
-//! The gateway's static private key and the PSKs never enter this module:
-//! `StaticKey::dh` computes `DH(S_priv, point)` and `StaticKey::psk_mix`
-//! computes the IKpsk2 `KDF3(C, Q)` step. This module ignores mac2 on
+//! The gateway's static private key never enters this module:
+//! `StaticKey::dh` computes `DH(S_priv, point)`. The IKpsk2 PSK `Q` comes
+//! only from a `PskSource`, which hands out a PSK it vouches is fresh or
+//! refuses (M3 plan L8); there is no static or default PSK, and the
+//! responder mixes `Q` itself. This module ignores mac2 on
 //! input: `ingress` verifies it under load, through `crate::cookie`, before
 //! an initiation reaches `hs`. Responses carry mac2 = 0, since the gateway
 //! never needs a cookie from its peers (SC19).
@@ -35,12 +37,29 @@ pub struct KeyError;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EntropyError;
 
-/// Holder of the gateway's static private key and the per-peer PSKs.
+/// Holder of the gateway's static private key.
 pub trait StaticKey {
     /// `DH(S_priv, peer_point)`.
     fn dh(&mut self, peer_point: &[u8; 32]) -> Result<Key32, KeyError>;
-    /// `(C', tau, kappa) = KDF3(chaining, Q_peer)`.
-    fn psk_mix(&mut self, peer: PeerId, chaining: &Key32) -> Result<(Key32, Key32, Key32), KeyError>;
+}
+
+/// Why a `PskSource` gave no PSK for a peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PskRefusal {
+    /// No PSK was ever installed for the peer.
+    Missing,
+    /// The peer's PSK is REJECT_AFTER_TIME old or older, or has expired.
+    Stale,
+}
+
+/// The per-peer PSKs (M3 plan L8). `fresh` is asked once per initiation,
+/// after the sender has authenticated and passed the replay and flood
+/// checks and before they are committed, so a refusal commits nothing.
+/// `Psk` is the source's own proof of freshness; the responder only reads
+/// its bytes, as the IKpsk2 `Q`.
+pub trait PskSource {
+    type Psk: AsRef<Key32>;
+    fn fresh(&self, peer: PeerId, now_ns: u64) -> Result<Self::Psk, PskRefusal>;
 }
 
 pub trait Entropy {
@@ -85,6 +104,8 @@ pub enum Reject {
     Replay,
     /// Less than `INITIATION_MIN_INTERVAL_NS` since this peer's last accepted initiation.
     Flood,
+    /// The `PskSource` holds no fresh PSK for this peer.
+    Psk(PskRefusal),
     Entropy,
     /// No receiver index left to issue (after 2^32 accepted handshakes).
     IndexExhausted,
@@ -142,8 +163,15 @@ impl<const MAX_PEERS: usize> Responder<MAX_PEERS> {
     /// mac1 is checked before any DH; an unknown static key is rejected
     /// after the first DH (`es`) and before the second (`ss`). `local_index`
     /// is asked for our receiver index only once the initiation has
-    /// authenticated and passed the replay and flood checks, so rejected
-    /// initiations cannot use up the index space.
+    /// authenticated and passed the replay, flood and PSK checks, so
+    /// rejected initiations cannot use up the index space.
+    ///
+    /// Order (M3 plan, `hs`): `es`, static decrypt and peer lookup, `ss`,
+    /// timestamp decrypt, replay and flood, `psks.fresh`, commit. The
+    /// timestamp key comes from `ss`, so the PSK check is the earliest point
+    /// at which the sender is authenticated; a refusal there commits no
+    /// replay or flood state.
+    #[allow(clippy::too_many_arguments)]
     pub fn consume_initiation(
         &mut self,
         msg: &[u8; wg_wire::INITIATION_LEN],
@@ -152,6 +180,7 @@ impl<const MAX_PEERS: usize> Responder<MAX_PEERS> {
         key: &mut impl StaticKey,
         entropy: &mut impl Entropy,
         peers: &impl PeerTable,
+        psks: &impl PskSource,
     ) -> Result<Accepted, Reject> {
         let init = MessageInitiation::parse(msg).map_err(Reject::Malformed)?;
         let covered = msg.get(..INITIATION_MAC1_OFFSET).ok_or(Reject::Malformed(WireError::TooShort))?;
@@ -194,6 +223,7 @@ impl<const MAX_PEERS: usize> Responder<MAX_PEERS> {
         {
             return Err(Reject::Flood);
         }
+        let psk = psks.fresh(peer, now_ns).map_err(Reject::Psk)?;
         // The initiation is authentic: commit before building the response,
         // so a later failure cannot let the same initiation be replayed.
         state.last_timestamp = timestamp;
@@ -213,7 +243,8 @@ impl<const MAX_PEERS: usize> Responder<MAX_PEERS> {
         let se = crypto::dh(&e_priv, &static_pub)?;
         let c = crypto::kdf1(&c, se.as_bytes())?;
         // psk
-        let (c, tau, kappa) = key.psk_mix(peer, &c).map_err(Reject::Key)?;
+        let (c, tau, kappa) = crypto::kdf3(&c, psk.as_ref().as_bytes())?;
+        drop(psk);
         let h = crypto::hash(&[&h, tau.as_bytes()])?;
         let mut enc_nothing = [0u8; crypto::TAG_LEN];
         crypto::aead_seal(&kappa, 0, &[], &h, &mut enc_nothing)?;

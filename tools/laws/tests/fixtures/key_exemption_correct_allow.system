@@ -10,7 +10,7 @@
 
     <protection_domain name="key" priority="1" passive="true" budget="1_000" period="10_000">
         <program_image path="key.elf" />
-        <map mr="secrets_mr" vaddr="0x2_000_000" perms="rw" />
+        <map mr="secrets_mr" vaddr="0x2_000_000" perms="r" />
     </protection_domain>
 
     <channel>

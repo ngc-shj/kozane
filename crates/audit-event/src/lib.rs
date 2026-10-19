@@ -7,6 +7,10 @@
 //! The few kinds for which `Event::is_coalesced` is false are emitted on
 //! every occurrence; producers raise them only on state edges, never at a
 //! rate an attacker drives.
+//!
+//! One kind carries a value instead of a running total:
+//! `RpCostHighWater`'s `a` is the measured cost in µs, and `CostHighWater`
+//! gates how often it fires.
 
 #![no_std]
 #![deny(
@@ -25,7 +29,7 @@
 pub struct Record {
     pub code: u16,
     pub _reserved: u16,
-    /// Running total of this event kind.
+    /// Running total of this event kind (`RpCostHighWater`: its value).
     pub a: u32,
     /// Events lost to a full audit ring since the last successful push.
     pub b: u32,
@@ -127,6 +131,9 @@ pub enum Event {
     RpPskInstallFailed,
     RpRngFailed,
     RpDecapsRateLimited,
+    /// `pq`'s handshake cost rose to a new high-water mark; `us` travels as
+    /// the record's `a` (never coalesced; `CostHighWater` bounds it).
+    RpCostHighWater { us: u32 },
 }
 
 impl Event {
@@ -183,13 +190,15 @@ impl Event {
             Event::RpPskInstallFailed => 0x0045,
             Event::RpRngFailed => 0x0046,
             Event::RpDecapsRateLimited => 0x0047,
+            Event::RpCostHighWater { .. } => COST_HIGH_WATER,
             Event::FrameDropped { reason } => {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
             }
         }
     }
 
-    /// Every variant except the parameterised `FrameDropped`.
+    /// Every variant except the parameterised `FrameDropped` and
+    /// `RpCostHighWater`.
     pub const FIXED: [Event; 51] = [
         Event::ArpReplied,
         Event::UdpEchoed,
@@ -298,6 +307,7 @@ impl Event {
             Event::RpPskInstallFailed => "RpPskInstallFailed",
             Event::RpRngFailed => "RpRngFailed",
             Event::RpDecapsRateLimited => "RpDecapsRateLimited",
+            Event::RpCostHighWater { .. } => "RpCostHighWater",
             Event::FrameDropped { .. } => "FrameDropped",
         }
     }
@@ -306,9 +316,11 @@ impl Event {
     /// variant must be classified here.
     pub const fn is_coalesced(self) -> bool {
         match self {
-            Event::WgUnderLoad | Event::WgLoadCleared | Event::CookieSecretExpired | Event::CookieSecretUnavailable => {
-                false
-            }
+            Event::WgUnderLoad
+            | Event::WgLoadCleared
+            | Event::CookieSecretExpired
+            | Event::CookieSecretUnavailable
+            | Event::RpCostHighWater { .. } => false,
             Event::ArpReplied
             | Event::UdpEchoed
             | Event::FrameDropped { .. }
@@ -357,6 +369,14 @@ impl Event {
             | Event::RpPskInstallFailed
             | Event::RpRngFailed
             | Event::RpDecapsRateLimited => true,
+        }
+    }
+
+    /// The value a record carries in place of the running total.
+    pub const fn value(self) -> Option<u32> {
+        match self {
+            Event::RpCostHighWater { us } => Some(us),
+            _ => None,
         }
     }
 
@@ -419,6 +439,7 @@ impl Event {
             Event::RpPskInstallFailed => 48,
             Event::RpRngFailed => 49,
             Event::RpDecapsRateLimited => 50,
+            Event::RpCostHighWater { .. } => COST_HIGH_WATER_SLOT,
             Event::FrameDropped { reason } => {
                 // FIXED_SLOTS..FIXED_SLOTS+64, clamped like `code`.
                 let r = if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason };
@@ -429,7 +450,11 @@ impl Event {
 }
 
 const FIXED_SLOTS: usize = 51;
-const SLOTS: usize = FIXED_SLOTS + MAX_DROP_REASON as usize + 1;
+const COST_HIGH_WATER_SLOT: usize = FIXED_SLOTS + MAX_DROP_REASON as usize + 1;
+const SLOTS: usize = COST_HIGH_WATER_SLOT + 1;
+
+/// `RpCostHighWater`'s code, the first after the fixed range.
+pub const COST_HIGH_WATER: u16 = 0x0048;
 
 /// Per-producer coalescing state.
 pub struct Coalescer {
@@ -463,7 +488,11 @@ impl Coalescer {
         if ev.is_coalesced() && !total.wrapping_sub(1).is_multiple_of(COALESCE_EVERY) {
             return false;
         }
-        let rec = Record { code: ev.code(), _reserved: 0, a: *total, b: self.overflow };
+        let a = match ev.value() {
+            Some(v) => v,
+            None => *total,
+        };
+        let rec = Record { code: ev.code(), _reserved: 0, a, b: self.overflow };
         if push(rec) {
             self.overflow = 0;
         } else {
@@ -483,6 +512,8 @@ pub enum Decoded {
     Fixed(Event),
     /// `wire::DropReason` discriminant.
     FrameDropped(u16),
+    /// `RpCostHighWater`: the record's `a` is the cost in µs.
+    CostHighWater,
     Unknown,
 }
 
@@ -490,9 +521,44 @@ pub fn decode(code: u16) -> Decoded {
     if let Some(ev) = Event::from_fixed_code(code) {
         return Decoded::Fixed(ev);
     }
+    if code == COST_HIGH_WATER {
+        return Decoded::CostHighWater;
+    }
     match code.checked_sub(FRAME_DROPPED_BASE) {
         Some(r) if r <= MAX_DROP_REASON => Decoded::FrameDropped(r),
         _ => Decoded::Unknown,
+    }
+}
+
+/// `pq`'s gate for `RpCostHighWater` (M3 plan VE10): the first
+/// measurement always fires, later ones only when the cost exceeds the
+/// last *emitted* value by at least 1/8. A boot therefore emits at most
+/// about log₁.₁₂₅(max/min) + 1 of them (L10; one more if the first cost
+/// is 0 µs), and the last one emitted is less than 1/8 below the true
+/// maximum. The record carries the exact cost; the rule only gates.
+#[derive(Default)]
+pub struct CostHighWater {
+    last: Option<u32>,
+}
+
+impl CostHighWater {
+    pub const fn new() -> Self {
+        Self { last: None }
+    }
+
+    /// The event to record for a handshake that cost `us`, if one is due.
+    pub fn observe(&mut self, us: u32) -> Option<Event> {
+        let due = match self.last {
+            None => true,
+            // 8·us ≥ 9·last, i.e. us ≥ last + last/8 without rounding; the
+            // strict `>` keeps a run of zeros from firing every time.
+            Some(last) => us > last && u64::from(us).saturating_mul(8) >= u64::from(last).saturating_mul(9),
+        };
+        if !due {
+            return None;
+        }
+        self.last = Some(us);
+        Some(Event::RpCostHighWater { us })
     }
 }
 

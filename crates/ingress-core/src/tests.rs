@@ -7,8 +7,13 @@ use std::vec::Vec;
 
 use super::*;
 
-const CFG: Config =
-    Config { mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56], ipv4: [10, 0, 2, 15], router_mac: [0x52, 0x55, 10, 0, 2, 2], port: 51820 };
+const CFG: Config = Config {
+    mac: [0x52, 0x54, 0, 0x12, 0x34, 0x56],
+    ipv4: [10, 0, 2, 15],
+    router_mac: [0x52, 0x55, 10, 0, 2, 2],
+    port: 51820,
+    rp_port: 9999,
+};
 const PEER_MAC: Mac = [0x52, 0x55, 10, 0, 2, 2];
 const PEER_IP: Ipv4 = [10, 0, 2, 2];
 const SRC: Endpoint = Endpoint { ip: PEER_IP, port: 40000 };
@@ -304,7 +309,7 @@ fn malformed_frame_reports_parser_reason() {
 #[test]
 fn emit_udp_goes_from_the_listen_port_to_the_router() {
     let mut out = [0u8; wire::MAX_FRAME];
-    let n = emit_udp(&CFG, SRC, b"resp", &mut out).unwrap();
+    let n = emit_udp(&CFG, CFG.port, SRC, b"resp", &mut out).unwrap();
     let f = wire::parse_frame(&out[..n]).unwrap();
     assert_eq!(f.eth, EthAddrs { src: CFG.mac, dst: CFG.router_mac });
     let Body::Udp4(u) = f.body else { panic!("not udp") };
@@ -729,17 +734,17 @@ fn initiation_has_a_single_constructor() {
     assert_eq!(include_str!("lib.rs").matches("Outcome::Initiation {").count(), 1);
 }
 
-/// A PD stand-in for `run_passes`: `waiting` messages queue on hs, data and
-/// outside; every call is logged in order.
+/// A PD stand-in for `run_passes`: `waiting` messages queue on hs, pq, data
+/// and outside; every call is logged in order.
 #[derive(Default)]
 struct FakePass {
-    waiting: [usize; 3],
+    waiting: [usize; 4],
     log: std::vec::Vec<&'static str>,
     maxes: std::vec::Vec<usize>,
 }
 
 impl FakePass {
-    fn queued(waiting: [usize; 3]) -> Self {
+    fn queued(waiting: [usize; 4]) -> Self {
         Self { waiting, ..Self::default() }
     }
 
@@ -760,14 +765,17 @@ impl PassIo for FakePass {
     fn serve_hs(&mut self, max: usize) -> usize {
         self.take(0, "hs", max)
     }
+    fn serve_pq(&mut self, max: usize) -> usize {
+        self.take(1, "pq", max)
+    }
     fn serve_data(&mut self, max: usize) -> usize {
-        self.take(1, "data", max)
+        self.take(2, "data", max)
     }
     fn tick(&mut self) {
         self.log.push("tick");
     }
     fn serve_outside(&mut self, max: usize) -> usize {
-        self.take(2, "outside", max)
+        self.take(3, "outside", max)
     }
     fn end_pass(&mut self) {
         self.log.push("end");
@@ -776,16 +784,16 @@ impl PassIo for FakePass {
 
 #[test]
 fn every_pass_of_an_outside_flood_ends_with_notify_and_flush() {
-    let mut io = FakePass::queued([0, 0, 3 * PASS_FRAMES]);
+    let mut io = FakePass::queued([0, 0, 0, 3 * PASS_FRAMES]);
     run_passes(&mut io);
-    let pass = ["hs", "data", "tick", "outside", "end"];
+    let pass = ["hs", "pq", "data", "tick", "outside", "end"];
     // Three full passes, then one that finds the queue empty and breaks.
     assert_eq!(io.log, pass.repeat(4), "each pass must end with end_pass, after every input and the tick");
 }
 
 #[test]
 fn every_input_is_bounded_to_pass_frames() {
-    let mut io = FakePass::queued([PASS_FRAMES + 1; 3]);
+    let mut io = FakePass::queued([PASS_FRAMES + 1; 4]);
     run_passes(&mut io);
     assert!(io.maxes.iter().all(|&m| m == PASS_FRAMES), "inputs must be capped at PASS_FRAMES: {:?}", io.maxes);
     assert_eq!(io.passes(), 2, "a pass below K must break after its end_pass");
@@ -793,8 +801,8 @@ fn every_input_is_bounded_to_pass_frames() {
 
 #[test]
 fn k_on_any_one_input_runs_another_pass() {
-    for input in 0..3 {
-        let mut waiting = [0; 3];
+    for input in 0..4 {
+        let mut waiting = [0; 4];
         waiting[input] = PASS_FRAMES;
         let mut io = FakePass::queued(waiting);
         run_passes(&mut io);
@@ -804,16 +812,359 @@ fn k_on_any_one_input_runs_another_pass() {
 
 #[test]
 fn k_minus_one_on_every_input_is_the_last_pass() {
-    let mut io = FakePass::queued([PASS_FRAMES - 1; 3]);
+    let mut io = FakePass::queued([PASS_FRAMES - 1; 4]);
     run_passes(&mut io);
-    assert_eq!((io.passes(), io.waiting), (1, [0; 3]));
+    assert_eq!((io.passes(), io.waiting), (1, [0; 4]));
 }
 
 #[test]
 fn k_from_data_still_runs_the_tick_and_outside_in_the_same_pass() {
-    let mut io = FakePass::queued([0, 2 * PASS_FRAMES, 1]);
+    let mut io = FakePass::queued([0, 0, 2 * PASS_FRAMES, 1]);
     run_passes(&mut io);
-    let first = &io.log[..5];
-    assert_eq!(first, ["hs", "data", "tick", "outside", "end"]);
-    assert_eq!(io.waiting[2], 0);
+    let first = &io.log[..6];
+    assert_eq!(first, ["hs", "pq", "data", "tick", "outside", "end"]);
+    assert_eq!(io.waiting[3], 0);
+}
+
+// ---- Rosenpass (M3 plan C4) ----
+
+/// The mac is valid iff its first byte (32 from the end) is 0x11; counts
+/// its calls.
+#[derive(Default)]
+struct FakeRpMac {
+    calls: Cell<usize>,
+}
+
+impl RpMac for FakeRpMac {
+    fn verify(&self, msg: &[u8]) -> bool {
+        self.calls.set(self.calls.get() + 1);
+        msg[msg.len() - 32] == 0x11
+    }
+}
+
+fn rp_msg(kind: u8, len: usize, mac_ok: bool) -> Vec<u8> {
+    let mut m = std::vec![0u8; len];
+    if len > 0 {
+        m[0] = kind;
+    }
+    if len >= 32 {
+        m[len - 32] = if mac_ok { 0x11 } else { 0x22 };
+    }
+    m
+}
+
+fn hello() -> Vec<u8> {
+    rp_msg(RP_MSG_INIT_HELLO, RP_INIT_HELLO_LEN, true)
+}
+
+fn conf() -> Vec<u8> {
+    rp_msg(RP_MSG_INIT_CONF, RP_INIT_CONF_LEN, true)
+}
+
+fn src(n: u8) -> Endpoint {
+    Endpoint { ip: [10, 0, 3, n], port: 40000 }
+}
+
+fn rp<'a>(gate: &mut RpGate<8>, now: u64, from: Endpoint, payload: &'a [u8]) -> RpOutcome<'a> {
+    rp_classify(gate, &FakeRpMac::default(), now, from, payload)
+}
+
+fn forwarded(o: RpOutcome<'_>) -> bool {
+    matches!(o, RpOutcome::ForwardHello { .. } | RpOutcome::ForwardConf { .. })
+}
+
+#[test]
+fn a_datagram_to_the_rp_port_takes_the_rosenpass_path() {
+    let m = hello();
+    let f = udp_to(CFG.mac, CFG.ipv4, CFG.rp_port, &m);
+    let Outcome::Rosenpass { src, payload } = run(&f) else { panic!("not routed to Rosenpass") };
+    assert_eq!(src, SRC);
+    assert_eq!(payload, &m[..]);
+    // The same bytes on the listen port are WireGuard's (and malformed there).
+    assert_eq!(run(&udp_to(CFG.mac, CFG.ipv4, CFG.port, &m)), Outcome::BadMessage);
+}
+
+#[test]
+fn emit_udp_goes_from_the_given_port() {
+    let mut out = [0u8; wire::MAX_FRAME];
+    let n = emit_udp(&CFG, CFG.rp_port, SRC, b"resp", &mut out).unwrap();
+    let Body::Udp4(u) = wire::parse_frame(&out[..n]).unwrap().body else { panic!("not udp") };
+    assert_eq!((u.sport, u.dst, u.dport), (CFG.rp_port, PEER_IP, 40000));
+}
+
+#[test]
+fn init_hello_and_init_conf_of_exact_length_are_forwarded() {
+    let mut g = RpGate::default();
+    let (h, c) = (hello(), conf());
+    let RpOutcome::ForwardHello { src: s, msg } = rp(&mut g, 0, SRC, &h) else { panic!("hello not forwarded") };
+    assert_eq!((s, &msg[..]), (SRC, &h[..]));
+    let RpOutcome::ForwardConf { src: s, msg } = rp(&mut g, 0, SRC, &c) else { panic!("conf not forwarded") };
+    assert_eq!((s, &msg[..]), (SRC, &c[..]));
+}
+
+#[test]
+fn every_other_type_or_length_is_dropped_before_the_mac() {
+    let cases = [
+        rp_msg(0x82, 1132, true), // RespHello
+        rp_msg(0x84, 64, true),   // EmptyData
+        rp_msg(0x86, 72, true),   // CookieReply
+        rp_msg(0x01, RP_INIT_HELLO_LEN, true),
+        rp_msg(0x00, RP_INIT_CONF_LEN, true),
+        rp_msg(RP_MSG_INIT_HELLO, RP_INIT_HELLO_LEN - 1, true),
+        rp_msg(RP_MSG_INIT_HELLO, RP_INIT_HELLO_LEN + 1, true),
+        rp_msg(RP_MSG_INIT_HELLO, RP_INIT_CONF_LEN, true),
+        rp_msg(RP_MSG_INIT_CONF, RP_INIT_CONF_LEN - 1, true),
+        rp_msg(RP_MSG_INIT_CONF, RP_INIT_CONF_LEN + 1, true),
+        rp_msg(RP_MSG_INIT_CONF, RP_INIT_HELLO_LEN, true),
+        std::vec![],
+    ];
+    let mut g = RpGate::<8>::default();
+    let mac = FakeRpMac::default();
+    for m in &cases {
+        assert_eq!(rp_classify(&mut g, &mac, 0, SRC, m), RpOutcome::TypeDropped, "len {}", m.len());
+    }
+    assert_eq!(mac.calls.get(), 0);
+    assert_eq!(g, RpGate::default());
+}
+
+#[test]
+fn a_bad_mac_is_refused_and_spends_nothing() {
+    let mut g = RpGate::default();
+    for _ in 0..100 {
+        assert_eq!(rp(&mut g, 0, SRC, &rp_msg(RP_MSG_INIT_HELLO, RP_INIT_HELLO_LEN, false)), RpOutcome::BadMac);
+        assert_eq!(rp(&mut g, 0, SRC, &rp_msg(RP_MSG_INIT_CONF, RP_INIT_CONF_LEN, false)), RpOutcome::BadMac);
+    }
+    assert_eq!(g, RpGate::default());
+    assert!(forwarded(rp(&mut g, 0, SRC, &hello())));
+}
+
+/// Sends `msg` from `from` at `now`, retiring every forward first so the
+/// ring never decides.
+fn rp_drained<'a>(g: &mut RpGate<8>, now: u64, from: Endpoint, msg: &'a [u8]) -> RpOutcome<'a> {
+    g.reclaimed(0);
+    rp(g, now, from, msg)
+}
+
+#[test]
+fn a_source_over_its_hello_burst_is_rate_limited_then_refills() {
+    let mut g = RpGate::default();
+    let h = hello();
+    for _ in 0..RP_HELLO_SRC_BURST {
+        assert!(forwarded(rp_drained(&mut g, 0, SRC, &h)));
+    }
+    assert_eq!(rp_drained(&mut g, 0, SRC, &h), RpOutcome::RateLimited);
+    // The global meter still had tokens: another source passes.
+    assert!(forwarded(rp_drained(&mut g, 0, src(9), &h)));
+    assert!(forwarded(rp_drained(&mut g, RP_HELLO_SRC_INTERVAL_NS, SRC, &h)));
+}
+
+#[test]
+fn hellos_over_the_global_burst_are_rate_limited_then_refill() {
+    let mut g = RpGate::default();
+    let h = hello();
+    for i in 0..RP_HELLO_GLOBAL_BURST as u8 {
+        assert!(forwarded(rp_drained(&mut g, 0, src(i), &h)));
+    }
+    assert_eq!(rp_drained(&mut g, 0, src(100), &h), RpOutcome::RateLimited);
+    assert!(forwarded(rp_drained(&mut g, RP_HELLO_GLOBAL_INTERVAL_NS, src(101), &h)));
+}
+
+#[test]
+fn a_source_refusal_does_not_spend_the_global_hello_meter() {
+    let mut g = RpGate::default();
+    let h = hello();
+    for _ in 0..RP_HELLO_SRC_BURST {
+        assert!(forwarded(rp_drained(&mut g, 0, SRC, &h)));
+    }
+    for _ in 0..50 {
+        assert_eq!(rp_drained(&mut g, 0, SRC, &h), RpOutcome::RateLimited);
+    }
+    let left = RP_HELLO_GLOBAL_BURST - RP_HELLO_SRC_BURST;
+    for i in 0..left as u8 {
+        assert!(forwarded(rp_drained(&mut g, 0, src(i), &h)));
+    }
+    assert_eq!(rp_drained(&mut g, 0, src(200), &h), RpOutcome::RateLimited);
+}
+
+#[test]
+fn a_source_over_its_conf_burst_is_rate_limited_then_refills() {
+    let mut g = RpGate::default();
+    let c = conf();
+    for _ in 0..RP_CONF_SRC_BURST {
+        assert!(forwarded(rp_drained(&mut g, 0, SRC, &c)));
+    }
+    assert_eq!(rp_drained(&mut g, 0, SRC, &c), RpOutcome::RateLimited);
+    assert!(forwarded(rp_drained(&mut g, 0, src(9), &c)));
+    assert!(forwarded(rp_drained(&mut g, RP_CONF_SRC_INTERVAL_NS, SRC, &c)));
+}
+
+#[test]
+fn confs_over_the_global_burst_are_rate_limited_then_refill() {
+    let mut g = RpGate::default();
+    let c = conf();
+    for i in 0..RP_CONF_GLOBAL_BURST as u8 {
+        assert!(forwarded(rp_drained(&mut g, 0, src(i), &c)));
+    }
+    assert_eq!(rp_drained(&mut g, 0, src(100), &c), RpOutcome::RateLimited);
+    assert!(forwarded(rp_drained(&mut g, RP_CONF_GLOBAL_INTERVAL_NS, src(101), &c)));
+}
+
+#[test]
+fn hello_and_conf_meters_are_separate() {
+    let mut g = RpGate::default();
+    let (h, c) = (hello(), conf());
+    for i in 0..=RP_HELLO_GLOBAL_BURST as u8 {
+        rp_drained(&mut g, 0, src(i), &h);
+    }
+    assert_eq!(rp_drained(&mut g, 0, src(50), &h), RpOutcome::RateLimited);
+    assert!(forwarded(rp_drained(&mut g, 0, src(0), &c)), "an exhausted hello meter refused a conf");
+}
+
+#[test]
+fn a_full_source_table_evicts_the_least_recently_used_source() {
+    let mut m = SourceMeters::<2, RP_HELLO_SRC_BURST, RP_HELLO_SRC_INTERVAL_NS>::default();
+    for _ in 0..RP_HELLO_SRC_BURST {
+        assert!(m.allow([1, 1, 1, 1], 10));
+    }
+    assert!(!m.allow([1, 1, 1, 1], 10));
+    assert!(m.allow([2, 2, 2, 2], 20));
+    assert!(m.allow([3, 3, 3, 3], 30));
+    assert!(m.allow([1, 1, 1, 1], 40), "the evicted source starts fresh");
+}
+
+/// Forwards `n` messages of one kind, spaced so every meter has refilled,
+/// so only the ring can refuse.
+fn fill(g: &mut RpGate<8>, t: &mut u64, msg: &[u8], n: usize) {
+    for _ in 0..n {
+        *t += METERS_REFILLED;
+        assert!(forwarded(rp(g, *t, SRC, msg)), "refused at {:?}", (g.in_flight(RpKind::Hello), g.in_flight(RpKind::Conf)));
+    }
+}
+
+/// Longer than every Rosenpass meter's refill interval.
+const METERS_REFILLED: u64 = RP_HELLO_SRC_INTERVAL_NS;
+const _: () = assert!(
+    METERS_REFILLED >= RP_HELLO_GLOBAL_INTERVAL_NS
+        && METERS_REFILLED >= RP_CONF_SRC_INTERVAL_NS
+        && METERS_REFILLED >= RP_CONF_GLOBAL_INTERVAL_NS
+);
+
+#[test]
+fn init_conf_cannot_take_the_share_reserved_for_init_hello() {
+    let mut g = RpGate::default();
+    let (h, c) = (hello(), conf());
+    let mut t = 0;
+    fill(&mut g, &mut t, &c, RP_CONF_SHARE);
+    t += METERS_REFILLED;
+    assert_eq!(rp(&mut g, t, SRC, &c), RpOutcome::RingReserved, "conf past its share");
+    assert_eq!(g.in_flight(RpKind::Conf), RP_CONF_SHARE);
+    fill(&mut g, &mut t, &h, RP_HELLO_RESERVED);
+    t += METERS_REFILLED;
+    assert_eq!(rp(&mut g, t, SRC, &h), RpOutcome::RingReserved, "hello past the ring");
+}
+
+#[test]
+fn init_hello_may_use_the_whole_ring() {
+    let mut g = RpGate::default();
+    let mut t = 0;
+    fill(&mut g, &mut t, &hello(), RP_IN_FLIGHT);
+    t += METERS_REFILLED;
+    assert_eq!(rp(&mut g, t, SRC, &hello()), RpOutcome::RingReserved);
+    // A hello-filled ring leaves no room for conf either.
+    assert_eq!(rp(&mut g, t, SRC, &conf()), RpOutcome::RingReserved);
+}
+
+#[test]
+fn a_ring_refusal_spends_no_meter() {
+    let mut g = RpGate::default();
+    let mut t = 0;
+    fill(&mut g, &mut t, &conf(), RP_CONF_SHARE);
+    let before = g.clone();
+    assert_eq!(rp(&mut g, t, src(77), &conf()), RpOutcome::RingReserved);
+    assert_eq!(g, before);
+}
+
+#[test]
+fn reclaim_retires_the_oldest_forwards_first() {
+    let mut g = RpGate::default();
+    let mut t = 0;
+    fill(&mut g, &mut t, &conf(), RP_CONF_SHARE);
+    fill(&mut g, &mut t, &hello(), 2);
+    g.reclaimed(RP_CONF_SHARE + 2 - 1);
+    assert_eq!((g.in_flight(RpKind::Conf), g.in_flight(RpKind::Hello)), (RP_CONF_SHARE - 1, 2));
+    t += METERS_REFILLED;
+    assert!(forwarded(rp(&mut g, t, SRC, &conf())), "a reclaimed conf slot is free again");
+    // An outstanding count above ours (a link error) retires nothing.
+    g.reclaimed(usize::MAX);
+    assert_eq!(g.in_flight(RpKind::Conf), RP_CONF_SHARE);
+    g.reclaimed(0);
+    assert_eq!((g.in_flight(RpKind::Conf), g.in_flight(RpKind::Hello)), (0, 0));
+}
+
+#[test]
+fn unsent_takes_back_the_newest_forward() {
+    let mut g = RpGate::default();
+    let mut t = 0;
+    fill(&mut g, &mut t, &conf(), 1);
+    fill(&mut g, &mut t, &hello(), 1);
+    g.unsent();
+    assert_eq!((g.in_flight(RpKind::Conf), g.in_flight(RpKind::Hello)), (1, 0));
+}
+
+#[test]
+fn a_wireguard_flood_leaves_the_rosenpass_meters_untouched() {
+    let mut r = Rig::idle();
+    let mut g = RpGate::default();
+    let m = initiation(true);
+    let f = udp_to(CFG.mac, CFG.ipv4, CFG.port, &m);
+    let mut limited = 0;
+    for _ in 0..1000 {
+        let o = respond(&CFG, &mut r.gate, &mut r.crypto, &FakeMac1, &mut r.buckets, 0, LOADED, TX_FREE, &f, &mut [0u8; wire::MAX_FRAME], &mut r.out);
+        limited += usize::from(o != Outcome::Initiation { src: SRC, msg: m[..].try_into().unwrap(), mac2_checked: false });
+    }
+    assert!(limited > 0 && r.loaded(0, IDLE), "the flood did not load the WireGuard path");
+    assert_eq!(g, RpGate::default());
+    for i in 0..RP_HELLO_GLOBAL_BURST as u8 {
+        assert!(forwarded(rp_drained(&mut g, 0, src(i), &hello())));
+    }
+}
+
+#[test]
+fn a_rosenpass_flood_leaves_the_wireguard_meters_untouched() {
+    let mut r = Rig::idle();
+    let mut g = RpGate::default();
+    let h = hello();
+    let f = udp_to(CFG.mac, CFG.ipv4, CFG.rp_port, &h);
+    let mut limited = 0;
+    for _ in 0..1000 {
+        let o = respond(&CFG, &mut r.gate, &mut r.crypto, &FakeMac1, &mut r.buckets, 0, IDLE, TX_FREE, &f, &mut [0u8; wire::MAX_FRAME], &mut r.out);
+        let Outcome::Rosenpass { src, payload } = o else { panic!("{o:?}") };
+        limited += usize::from(rp_drained(&mut g, 0, src, payload) == RpOutcome::RateLimited);
+    }
+    assert!(limited > 0);
+    assert!(!r.loaded(0, IDLE), "Rosenpass datagrams spent the WireGuard arrival meter");
+    let m = initiation(true);
+    for _ in 0..BURST {
+        assert!(matches!(r.send(0, IDLE, TX_FREE, SRC, &m), Outcome::Initiation { mac2_checked: false, .. }));
+    }
+}
+
+#[test]
+fn a_rosenpass_reply_may_not_use_the_tx_reserve() {
+    assert!(!rp_reply_allowed(NET_BUFFERS / 2));
+    assert!(rp_reply_allowed(NET_BUFFERS / 2 + 1));
+}
+
+#[test]
+fn rosenpass_forwards_have_a_single_constructor_each() {
+    // Plan C4: the PD's only send to `pq` is fed by these two outcomes, each
+    // built once, in `rp_forward_hello` and `rp_forward_conf`. A tripwire.
+    let src = include_str!("lib.rs");
+    assert_eq!(src.matches("RpOutcome::ForwardHello {").count(), 1);
+    assert_eq!(src.matches("RpOutcome::ForwardConf {").count(), 1);
+    let hello_at = src.find("RpOutcome::ForwardHello {").unwrap();
+    let conf_at = src.find("RpOutcome::ForwardConf {").unwrap();
+    let fn_before = |at: usize| src[..at].rfind("fn ").map(|i| &src[i..i + 20]).unwrap();
+    assert!(fn_before(hello_at).starts_with("fn rp_forward_hello"));
+    assert!(fn_before(conf_at).starts_with("fn rp_forward_conf"));
 }

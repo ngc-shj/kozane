@@ -3,8 +3,9 @@
 //! window live in `wg-wire` (re-exported as `wire` and `replay`) so Kani
 //! can check them without compiling libcrux.
 //!
-//! `noise` never sees the gateway's static private key or any PSK: both
-//! stay behind the `StaticKey` trait, which the `key` PD implements over PPC.
+//! `noise` never sees the gateway's static private key: it stays behind
+//! the `StaticKey` trait, which the `key` PD implements over PPC. PSKs come
+//! only fresh, from a `PskSource` (M3 plan L8).
 
 #![no_std]
 #![deny(

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  M2 layout (WireGuard responder). Sizes and channel ids must match
+  M3a layout (WireGuard responder with a Rosenpass V02 responder). Sizes and channel ids must match
   crates/layout (checked by its tests); laws are checked by tools/laws
   against policy/laws.toml before the Microkit tool runs. Each link is a
   used ring, a free ring and a data region (crates/ring::link).
@@ -17,6 +17,9 @@
     <!-- Static secrets (law L2): zero placeholder here; `make package` swaps
          only this prefill_path for a real blob. -->
     <memory_region name="secrets" size="0x1000" prefill_path="secrets-placeholder.bin" />
+    <!-- pqkey's McEliece secrets (law L2, owner pqkey): zero placeholder;
+         `make package` swaps this prefill_path too (secret_blob::pq). -->
+    <memory_region name="pq_secrets" size="0x4000" prefill_path="pq-secrets-placeholder.bin" />
 
     <!-- net_rx: eth_out -> ingress, outside frames in -->
     <memory_region name="net_rx_used" size="0x1000" />
@@ -62,6 +65,18 @@
     <memory_region name="nd_used" size="0x1000" />
     <memory_region name="nd_free" size="0x1000" />
     <memory_region name="nd_data" size="0x20_000" />
+    <!-- ipq: ingress -> pq, InitHello and InitConf -->
+    <memory_region name="ipq_used" size="0x1000" />
+    <memory_region name="ipq_free" size="0x1000" />
+    <memory_region name="ipq_data" size="0x20_000" />
+    <!-- pqi: pq -> ingress, RespHello and EmptyData -->
+    <memory_region name="pqi_used" size="0x1000" />
+    <memory_region name="pqi_free" size="0x1000" />
+    <memory_region name="pqi_data" size="0x20_000" />
+    <!-- pqh: pq -> hs, PskInstall (OSK; sender scrubs) -->
+    <memory_region name="pqh_used" size="0x1000" />
+    <memory_region name="pqh_free" size="0x1000" />
+    <memory_region name="pqh_data" size="0x20_000" />
 
     <memory_region name="audit_ingress" size="0x1000" />
     <memory_region name="audit_eth_out" size="0x1000" />
@@ -69,6 +84,7 @@
     <memory_region name="audit_inner" size="0x1000" />
     <memory_region name="audit_hs" size="0x1000" />
     <memory_region name="audit_data" size="0x1000" />
+    <memory_region name="audit_pq" size="0x1000" />
 
     <protection_domain name="eth_out" priority="150" budget="1_000" period="10_000" stack_size="0x10_000">
         <program_image path="pd-eth-out.elf" />
@@ -111,6 +127,14 @@
         <map mr="secrets" vaddr="0x2_000_000" perms="r" setvar_vaddr="secrets" />
     </protection_domain>
 
+    <!-- Passive: decapsulation runs on pq's scheduling context; this
+         budget only covers init (the boot KAT, 3.4 s under TCG). Stack:
+         53,872 B measured peak (deviation log, MCE-COST). -->
+    <protection_domain name="pqkey" priority="130" budget="1_000" period="10_000" passive="true" stack_size="0x20_000">
+        <program_image path="pd-pqkey.elf" />
+        <map mr="pq_secrets" vaddr="0x2_000_000" perms="r" setvar_vaddr="pq_secrets" />
+    </protection_domain>
+
     <protection_domain name="hs" priority="110" budget="2_000" period="10_000" stack_size="0x20_000">
         <program_image path="pd-hs.elf" />
         <map mr="ih_used" vaddr="0x6_000_000" perms="rw" setvar_vaddr="ih_used" />
@@ -122,7 +146,26 @@
         <map mr="ih_data" vaddr="0x10_000_000" perms="r" setvar_vaddr="ih_data" />
         <map mr="hi_data" vaddr="0x10_100_000" perms="rw" setvar_vaddr="hi_data" />
         <map mr="hd_data" vaddr="0x10_200_000" perms="rw" setvar_vaddr="hd_data" />
+        <map mr="pqh_used" vaddr="0x6_006_000" perms="rw" setvar_vaddr="pqh_used" />
+        <map mr="pqh_free" vaddr="0x6_007_000" perms="rw" setvar_vaddr="pqh_free" />
+        <map mr="pqh_data" vaddr="0x10_300_000" perms="r" setvar_vaddr="pqh_data" />
         <map mr="audit_hs" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_hs" />
+    </protection_domain>
+
+    <!-- 0.05 covers 8 peers' rekeys every 120 s (about 2.9% measured).
+         Stack: 37,360 B measured peak (deviation log, MCE-COST). -->
+    <protection_domain name="pq" priority="105" budget="500" period="10_000" stack_size="0x20_000">
+        <program_image path="pd-pq.elf" />
+        <map mr="ipq_used" vaddr="0x6_000_000" perms="rw" setvar_vaddr="ipq_used" />
+        <map mr="ipq_free" vaddr="0x6_001_000" perms="rw" setvar_vaddr="ipq_free" />
+        <map mr="pqi_used" vaddr="0x6_002_000" perms="rw" setvar_vaddr="pqi_used" />
+        <map mr="pqi_free" vaddr="0x6_003_000" perms="rw" setvar_vaddr="pqi_free" />
+        <map mr="pqh_used" vaddr="0x6_004_000" perms="rw" setvar_vaddr="pqh_used" />
+        <map mr="pqh_free" vaddr="0x6_005_000" perms="rw" setvar_vaddr="pqh_free" />
+        <map mr="ipq_data" vaddr="0x10_000_000" perms="r" setvar_vaddr="ipq_data" />
+        <map mr="pqi_data" vaddr="0x10_100_000" perms="rw" setvar_vaddr="pqi_data" />
+        <map mr="pqh_data" vaddr="0x10_200_000" perms="rw" setvar_vaddr="pqh_data" />
+        <map mr="audit_pq" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_pq" />
     </protection_domain>
 
     <protection_domain name="ingress" priority="100" budget="1_000" period="10_000" stack_size="0x10_000">
@@ -145,6 +188,12 @@
         <map mr="hi_data" vaddr="0x10_300_000" perms="r" setvar_vaddr="hi_data" />
         <map mr="id_data" vaddr="0x10_400_000" perms="rw" setvar_vaddr="id_data" />
         <map mr="di_data" vaddr="0x10_500_000" perms="r" setvar_vaddr="di_data" />
+        <map mr="ipq_used" vaddr="0x6_00c_000" perms="rw" setvar_vaddr="ipq_used" />
+        <map mr="ipq_free" vaddr="0x6_00d_000" perms="rw" setvar_vaddr="ipq_free" />
+        <map mr="pqi_used" vaddr="0x6_00e_000" perms="rw" setvar_vaddr="pqi_used" />
+        <map mr="pqi_free" vaddr="0x6_00f_000" perms="rw" setvar_vaddr="pqi_free" />
+        <map mr="ipq_data" vaddr="0x10_600_000" perms="rw" setvar_vaddr="ipq_data" />
+        <map mr="pqi_data" vaddr="0x10_700_000" perms="r" setvar_vaddr="pqi_data" />
         <map mr="audit_ingress" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_ingress" />
     </protection_domain>
 
@@ -193,6 +242,7 @@
         <map mr="audit_inner" vaddr="0x7_003_000" perms="rw" setvar_vaddr="audit_inner" />
         <map mr="audit_hs" vaddr="0x7_004_000" perms="rw" setvar_vaddr="audit_hs" />
         <map mr="audit_data" vaddr="0x7_005_000" perms="rw" setvar_vaddr="audit_data" />
+        <map mr="audit_pq" vaddr="0x7_006_000" perms="rw" setvar_vaddr="audit_pq" />
     </protection_domain>
 
     <channel>
@@ -258,5 +308,25 @@
     <channel>
         <end pd="timer" id="3" />
         <end pd="ingress" id="5" notify="false" />
+    </channel>
+    <channel>
+        <end pd="pq" id="1" pp="true" notify="false" />
+        <end pd="pqkey" id="1" pp="false" />
+    </channel>
+    <channel>
+        <end pd="ingress" id="6" />
+        <end pd="pq" id="2" />
+    </channel>
+    <channel>
+        <end pd="pq" id="3" />
+        <end pd="hs" id="6" />
+    </channel>
+    <channel>
+        <end pd="timer" id="4" />
+        <end pd="pq" id="4" notify="false" />
+    </channel>
+    <channel>
+        <end pd="pq" id="5" />
+        <end pd="audit" id="7" />
     </channel>
 </system>

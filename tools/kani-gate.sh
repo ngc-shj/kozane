@@ -54,6 +54,13 @@ fi
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
 
+# One proof at a time per checkout: a single cbmc can exceed 28 GB RSS, and
+# two concurrent runs (parallel agents) once exhausted the host's memory and
+# froze it. The lock is released when this script exits.
+mkdir -p "$root/build"
+exec 9>"$root/build/kani.lock"
+flock 9
+
 if ! cargo kani "$@" >"$log" 2>&1; then
     cat "$log"
     echo "kani-gate: cargo kani failed" >&2

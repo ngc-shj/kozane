@@ -107,18 +107,21 @@
 #     parser itself (exit 2, a parse error), not reported as a law
 #     violation — see tools/laws/src/sdf.rs.
 #
-# Current system (M2.5: WireGuard responder with cookies; see
-# system/secureos.system):
+# Current system (M3a: WireGuard responder with cookies and a Rosenpass V02
+# responder; see system/secureos.system):
 #   `eth_out` and `eth_in` own one virtio-net device each (L5) and seed
 #   taint. `ingress` (outside) and `inner` (inside) parse attacker-
 #   controlled frames; `ingress` also holds the cookie secret, which only
 #   gates DoS protection. `hs` parses initiations relayed by `ingress`;
 #   `data` holds transport keys and is, with `inner`, the only reader of
 #   tunnelled plaintext (L3: the `dn`/`nd` data regions). All of these and
-#   `audit` are tainted. `key` is the taint-exempt secrets holder (passive,
-#   PPC from `hs` only, maps only `secrets`). `timer` is exempt as
-#   notify-only (L1): it notifies `data`, `hs` and `ingress`, none of which
-#   can notify it.
+#   `audit` are tainted. `pq` (M3a) runs the Rosenpass responder on
+#   datagrams relayed by `ingress` and sends each fresh OSK to `hs`; it is
+#   tainted too. `key` and `pqkey` are the taint-exempt secrets holders
+#   (passive; `key` takes PPC from `hs` only and maps only `secrets`,
+#   `pqkey` from `pq` only and maps only `pq_secrets`; L2 as amended).
+#   `timer` is exempt as notify-only (L1): it notifies `data`, `hs`,
+#   `ingress` and `pq`, none of which can notify it.
 
 [pds.eth_out]
 role = "driver"
@@ -150,6 +153,12 @@ role = "untrusted_input"
 [pds.audit]
 role = "service"
 
+[pds.pq]
+role = "untrusted_input"
+
+[pds.pqkey]
+role = "key"
+
 [mrs.eth_out_mmio]
 kind = "device"
 owner = "eth_out"
@@ -179,6 +188,10 @@ size = 0x1000
 [mrs.secrets]
 kind = "secrets"
 owner = "key"
+
+[mrs.pq_secrets]
+kind = "secrets"
+owner = "pqkey"
 
 # net_rx: eth_out -> ingress, outside frames in
 [mrs.net_rx_used]
@@ -334,6 +347,48 @@ kind = "data"
 producer = "inner"
 consumers = ["data"]
 
+# ipq: ingress -> pq, InitHello and InitConf
+[mrs.ipq_used]
+kind = "plain"
+shares = { ingress = "rw", pq = "rw" }
+
+[mrs.ipq_free]
+kind = "plain"
+shares = { ingress = "rw", pq = "rw" }
+
+[mrs.ipq_data]
+kind = "data"
+producer = "ingress"
+consumers = ["pq"]
+
+# pqi: pq -> ingress, RespHello and EmptyData
+[mrs.pqi_used]
+kind = "plain"
+shares = { pq = "rw", ingress = "rw" }
+
+[mrs.pqi_free]
+kind = "plain"
+shares = { pq = "rw", ingress = "rw" }
+
+[mrs.pqi_data]
+kind = "data"
+producer = "pq"
+consumers = ["ingress"]
+
+# pqh: pq -> hs, PskInstall (OSK; sender scrubs)
+[mrs.pqh_used]
+kind = "plain"
+shares = { pq = "rw", hs = "rw" }
+
+[mrs.pqh_free]
+kind = "plain"
+shares = { pq = "rw", hs = "rw" }
+
+[mrs.pqh_data]
+kind = "data"
+producer = "pq"
+consumers = ["hs"]
+
 [mrs.audit_ingress]
 kind = "plain"
 shares = { ingress = "rw", audit = "rw" }
@@ -357,6 +412,10 @@ shares = { hs = "rw", audit = "rw" }
 [mrs.audit_data]
 kind = "plain"
 shares = { data = "rw", audit = "rw" }
+
+[mrs.audit_pq]
+kind = "plain"
+shares = { pq = "rw", audit = "rw" }
 
 [[channels]]
 between = ["eth_out", "ingress"]
@@ -438,6 +497,31 @@ between = ["timer", "ingress"]
 pp = { timer = false, ingress = false }
 notify = { timer = true, ingress = false }
 
+[[channels]]
+between = ["pq", "pqkey"]
+pp = { pq = true, pqkey = false }
+notify = { pq = false, pqkey = true }
+
+[[channels]]
+between = ["ingress", "pq"]
+pp = { ingress = false, pq = false }
+notify = { ingress = true, pq = true }
+
+[[channels]]
+between = ["pq", "hs"]
+pp = { pq = false, hs = false }
+notify = { pq = true, hs = true }
+
+[[channels]]
+between = ["timer", "pq"]
+pp = { timer = false, pq = false }
+notify = { timer = true, pq = false }
+
+[[channels]]
+between = ["pq", "audit"]
+pp = { pq = false, audit = false }
+notify = { pq = true, audit = true }
+
 [priority]
 # L13: untrusted-input and tunnel PDs run strictly below `key` and `timer`.
 below = [
@@ -451,7 +535,9 @@ below = [
 
 [budgets]
 # Tainted ratios: drivers, ingress and inner 0.1 each, hs and data 0.2 (crypto),
-# audit 0.05; sum 0.85.
+# audit 0.05, pq 0.05; sum 0.9, at the cap. pq's measured need is about
+# 0.029 (M3 deviation log, MCE-COST); the cap may rise to the 0.95 ceiling
+# only through the Law amendments table (L13).
 ratio_cap = 0.25
 ratio_sum_cap = 0.9
 

@@ -8,4 +8,6 @@ license.workspace = true
 config = { path = "../../config" }
 cpu = { path = "../../cpu" }
 layout = { path = "../../layout" }
+pqkey-core = { path = "../../pqkey-core" }
+secret-blob = { path = "../../secret-blob" }
 sel4-microkit = { workspace = true }

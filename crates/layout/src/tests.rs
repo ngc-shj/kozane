@@ -31,8 +31,10 @@ fn mr_sizes() -> HashMap<String, usize> {
 }
 
 /// Every link (pdkit / ring::link): used ring, free ring, data region.
-const LINKS: [&str; 11] = ["net_rx", "net_tx", "inner_rx", "inner_tx", "ih", "hi", "hd", "id", "di", "dn", "nd"];
-const AUDITS: [&str; 6] = ["audit_ingress", "audit_eth_out", "audit_eth_in", "audit_inner", "audit_hs", "audit_data"];
+const LINKS: [&str; 14] =
+    ["net_rx", "net_tx", "inner_rx", "inner_tx", "ih", "hi", "hd", "id", "di", "dn", "nd", "ipq", "pqi", "pqh"];
+const AUDITS: [&str; 7] =
+    ["audit_ingress", "audit_eth_out", "audit_eth_in", "audit_inner", "audit_hs", "audit_data", "audit_pq"];
 
 #[test]
 fn link_data_regions_match_net_region_size() {
@@ -75,7 +77,10 @@ fn every_region_is_a_link_an_audit_ring_or_a_named_singleton() {
         .iter()
         .flat_map(|l| ["used", "free", "data"].map(|s| std::format!("{l}_{s}")))
         .chain(AUDITS.iter().map(|a| String::from(*a)))
-        .chain(["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "secrets"].map(String::from))
+        .chain(
+            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "secrets", "pq_secrets"]
+                .map(String::from),
+        )
         .collect();
     expected.sort();
     let mut actual: std::vec::Vec<String> = mr_sizes().into_keys().collect();
@@ -87,6 +92,12 @@ fn every_region_is_a_link_an_audit_ring_or_a_named_singleton() {
 fn secrets_region_holds_one_blob() {
     // Mirrors secret_blob::REGION_SIZE (key maps it whole).
     assert_eq!(mr_sizes()["secrets"], 4096);
+}
+
+#[test]
+fn pq_secrets_region_holds_one_blob() {
+    // Mirrors secret_blob::pq::REGION_SIZE (pqkey maps it whole).
+    assert_eq!(mr_sizes()["pq_secrets"], 16384);
 }
 
 // NET_RING_SLOTS >= NET_BUFFERS is a compile-time assert in ring::link.
@@ -134,6 +145,11 @@ fn channel_ids_match_layout() {
         (("timer", timer::CH_DATA), ("data", data::CH_TIMER)),
         (("timer", timer::CH_HS), ("hs", hs::CH_TIMER)),
         (("timer", timer::CH_INGRESS), ("ingress", ingress::CH_TIMER)),
+        (("pq", pq::CH_PQKEY), ("pqkey", pqkey::CH_PQ)),
+        (("ingress", ingress::CH_PQ), ("pq", pq::CH_INGRESS)),
+        (("pq", pq::CH_HS), ("hs", hs::CH_PQ)),
+        (("timer", timer::CH_PQ), ("pq", pq::CH_TIMER)),
+        (("pq", pq::CH_AUDIT), ("audit", audit::CH_PQ)),
     ];
     for (a, b) in expected {
         assert!(has_channel(a, b), "{a:?} <-> {b:?}");

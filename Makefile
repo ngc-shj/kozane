@@ -20,9 +20,9 @@ policy := policy/laws.toml
 loader := $(BUILD)/loader.img
 counts := $(BUILD)/counts
 
-pds := eth-out eth-in ingress audit timer key hs inner data
-host_crates := wire ring audit-event ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu
-kani_crates := wire ring ingress-core inner-core wg-wire msgs
+pds := eth-out eth-in ingress audit timer key hs inner data pq pqkey
+host_crates := wire ring audit-event ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core
+kani_crates := wire ring ingress-core inner-core wg-wire msgs rosenpass-wire
 
 .PHONY: clean-counts
 .PHONY: all image package run test check check-selftest lint unit kani bolero fuzz-long laws pins manifest kernel-config clean
@@ -61,8 +61,13 @@ $(BUILD)/secrets-placeholder.bin:
 	mkdir -p $(BUILD)
 	head -c 4096 /dev/zero > $@
 
+# Same for the pqkey secrets region (`pqkey` halts on it).
+$(BUILD)/pq-secrets-placeholder.bin:
+	mkdir -p $(BUILD)
+	head -c 16384 /dev/zero > $@
+
 # The laws checker runs on the exact file handed to the Microkit tool.
-image: pds kernel-config $(BUILD)/secrets-placeholder.bin
+image: pds kernel-config $(BUILD)/secrets-placeholder.bin $(BUILD)/pq-secrets-placeholder.bin
 	cargo run --locked -q -p laws -- check --system $(system) --policy $(policy) --search-path $(BUILD)
 	$(MICROKIT_SDK)/bin/microkit $(system) \
 		--search-path $(BUILD) \
@@ -74,12 +79,12 @@ image: pds kernel-config $(BUILD)/secrets-placeholder.bin
 # Same system with only the secrets prefill_path changed; tools/package
 # refuses anything else, and refuses non-debug kernels until SC20.
 ifneq ($(filter package,$(MAKECMDGOALS)),)
-ifeq ($(and $(SECRETS),$(OUT)),)
-$(error package: set SECRETS=<blob> OUT=<dir>)
+ifeq ($(and $(SECRETS),$(PQ_SECRETS),$(OUT)),)
+$(error package: set SECRETS=<blob> PQ_SECRETS=<blob> OUT=<dir>)
 endif
 endif
 package: image
-	tools/package --secrets $(SECRETS) --out $(OUT) --system $(system) --policy $(policy) \
+	tools/package --secrets $(SECRETS) --pq-secrets $(PQ_SECRETS) --out $(OUT) --system $(system) --policy $(policy) \
 		--image $(loader) --gen-config $(sdk_config_dir)/include/kernel/gen_config.h \
 		--search-path $(BUILD) --board $(MICROKIT_BOARD) --config $(MICROKIT_CONFIG) \
 		--microkit $(MICROKIT_SDK)/bin/microkit
@@ -134,7 +139,8 @@ kani: | $(counts)
 		$(counts)/kani.log > $(counts)/kani
 
 bolero_targets := wire/tests::fuzz_parse_never_panics_and_round_trips \
-	wg-wire/tests::fuzz_parsers_never_panic_and_round_trip
+	wg-wire/tests::fuzz_parsers_never_panic_and_round_trip \
+	rosenpass-wire/tests::fuzz_parsers_never_panic_and_round_trip
 
 # Each target must load its committed seed corpus and complete > 0 runs, so
 # a target that silently stops running fails (BOLERO-TARGETS).

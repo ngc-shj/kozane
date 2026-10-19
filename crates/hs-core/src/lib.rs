@@ -2,8 +2,10 @@
 //! `ingress`, asks `key` for the two static-secret operations over PPC,
 //! and produces the session install for `data` and the response for
 //! `ingress` — in that order, so `data` knows the session before the
-//! initiator can use it. Host-testable: the PPC, the clock and the
-//! hardware entropy sources are traits.
+//! initiator can use it. Each initiation needs a fresh PSK for its peer
+//! from the `PskTable`, which `pq` fills with Rosenpass OSKs (M3 plan L8).
+//! Host-testable: the PPC, the clock and the hardware entropy sources are
+//! traits.
 
 #![no_std]
 #![deny(
@@ -17,15 +19,19 @@
 
 pub mod index;
 
-use key_core::{LABEL_BOOT_SEED, LABEL_PSK_MIX, LABEL_STATIC_DH, MAX_WORDS, OK, pack32, unpack32};
+use key_core::{LABEL_BOOT_SEED, LABEL_STATIC_DH, MAX_WORDS, OK, pack32, unpack32};
+use wg_core::REJECT_AFTER_TIME_NS;
 use wg_core::crypto::{self, Key32};
-use wg_core::noise::{Entropy, EntropyError, KeyError, PeerId, PeerTable, Reject, Responder, StaticKey};
+use wg_core::noise::{
+    Entropy, EntropyError, KeyError, PeerId, PeerTable, PskRefusal, PskSource, Reject, Responder, StaticKey,
+};
 
 /// Most `key` calls one initiation can cost, over every exit of `handle`:
-/// `es`, `ss`, then `PskMix` on accept (M2.5 plan C5).
-pub const KEY_CALLS_PER_HANDSHAKE: u64 = 3;
+/// `es` and `ss`. Every exit that reaches `ss` costs exactly this, PSK
+/// refusals included (M3 plan C5).
+pub const KEY_CALLS_PER_HANDSHAKE: u64 = 2;
 
-// The key budget invariant (M2.5 plan C5), checked when `hs` itself is
+// The key budget invariant (M2.5 plan C5), checked when `hs-core` is
 // built, so an image whose constants could exhaust `key` does not compile. `hs` spends key calls when it
 // drains `ih`, so a burst is everything `ingress` can forward plus all that
 // can wait in `ih` (NET_BUFFERS) and the one `hs` has already dequeued.
@@ -94,21 +100,103 @@ impl<C: KeyCall> StaticKey for KeyClient<C> {
         reply.fill(0);
         out
     }
+}
 
-    fn psk_mix(&mut self, peer: PeerId, chaining: &Key32) -> Result<(Key32, Key32, Key32), KeyError> {
-        let mut req = [0u64; key_core::PSK_MIX_REQ_WORDS];
-        let (head, c) = req.split_at_mut(1);
-        if let Some(p) = head.first_mut() {
-            *p = u64::from(peer.0);
+/// A peer's PSK as `PskTable::fresh` found it: installed less than
+/// REJECT_AFTER_TIME ago and not expired. Only `fresh` makes one, so the
+/// responder cannot be handed a static, zero or stale PSK (M3 plan L8).
+/// Zeroized on drop.
+pub struct FreshPsk(Key32);
+
+impl AsRef<Key32> for FreshPsk {
+    fn as_ref(&self) -> &Key32 {
+        &self.0
+    }
+}
+
+/// One peer's PSK slot. `Expired` keeps no key at all, so no path can turn
+/// an expired PSK into a zero one (M3 plan, `hs` [R4-S-P1]).
+enum Entry {
+    Absent,
+    /// A Rosenpass OSK installed at `installed_at` (hs's clock).
+    Live { osk: Key32, installed_at: u64 },
+    /// A `Live` entry that the tick found REJECT_AFTER_TIME old; its OSK
+    /// was zeroized. `installed_at` is kept for inspection only: no
+    /// decision reads it, so it can never make the entry fresh again.
+    #[allow(dead_code)]
+    Expired { installed_at: u64 },
+}
+
+/// A `PskInstall` that `hs` refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallError {
+    Malformed,
+    /// The peer index is at or beyond the table's capacity.
+    PeerOutOfRange,
+}
+
+/// `peer → Entry` for every configured peer (M3 plan, `hs`).
+pub struct PskTable<const MAX_PEERS: usize> {
+    entries: [Entry; MAX_PEERS],
+}
+
+impl<const MAX_PEERS: usize> Default for PskTable<MAX_PEERS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<const MAX_PEERS: usize> PskTable<MAX_PEERS> {
+    pub const fn new() -> Self {
+        Self { entries: [const { Entry::Absent }; MAX_PEERS] }
+    }
+
+    /// Installs `osk` as `peer`'s PSK, fresh from `now_ns`. Supersedes (and
+    /// zeroizes) a `Live` OSK and revives an `Expired` entry.
+    pub fn install(&mut self, peer: u16, osk: &[u8; 32], now_ns: u64) -> Result<(), InstallError> {
+        let entry = self.entries.get_mut(usize::from(peer)).ok_or(InstallError::PeerOutOfRange)?;
+        // Assigning drops the old entry in place; `Key32` zeroizes on drop.
+        *entry = Entry::Live { osk: Key32::from_bytes(*osk), installed_at: now_ns };
+        Ok(())
+    }
+
+    /// Decodes a `msgs::PskInstall` from `pq` and installs it. Returns the
+    /// peer it was for.
+    pub fn install_message(&mut self, input: &[u8], now_ns: u64) -> Result<PeerId, InstallError> {
+        let msg = msgs::PskInstall::decode(input).map_err(|_| InstallError::Malformed)?;
+        self.install(msg.peer, msg.osk, now_ns)?;
+        Ok(PeerId(msg.peer))
+    }
+
+    /// `peer`'s PSK if it is `Live` and younger than REJECT_AFTER_TIME at
+    /// `now_ns`; otherwise why not.
+    pub fn fresh(&self, peer: PeerId, now_ns: u64) -> Result<FreshPsk, PskRefusal> {
+        match self.entries.get(usize::from(peer.0)) {
+            Some(Entry::Live { osk, installed_at }) if now_ns.saturating_sub(*installed_at) < REJECT_AFTER_TIME_NS => {
+                Ok(FreshPsk(Key32::from_bytes(*osk.as_bytes())))
+            }
+            Some(Entry::Live { .. } | Entry::Expired { .. }) => Err(PskRefusal::Stale),
+            Some(Entry::Absent) | None => Err(PskRefusal::Missing),
         }
-        c.copy_from_slice(&pack32(chaining.as_bytes()));
-        let mut reply = [0u64; MAX_WORDS];
-        let r = self.request(LABEL_PSK_MIX, &req, key_core::PSK_MIX_REPLY_WORDS, &mut reply);
-        req.fill(0);
-        r?;
-        let out = (|| Ok((take32(&reply, 0)?, take32(&reply, 4)?, take32(&reply, 8)?)))();
-        reply.fill(0);
-        out
+    }
+
+    /// The expiry tick (law L12): every `Live` entry at or past
+    /// REJECT_AFTER_TIME becomes `Expired`, zeroizing its OSK.
+    pub fn tick(&mut self, now_ns: u64) {
+        for entry in &mut self.entries {
+            if let Entry::Live { installed_at, .. } = *entry
+                && now_ns.saturating_sub(installed_at) >= REJECT_AFTER_TIME_NS
+            {
+                *entry = Entry::Expired { installed_at };
+            }
+        }
+    }
+}
+
+impl<const MAX_PEERS: usize> PskSource for PskTable<MAX_PEERS> {
+    type Psk = FreshPsk;
+    fn fresh(&self, peer: PeerId, now_ns: u64) -> Result<FreshPsk, PskRefusal> {
+        PskTable::fresh(self, peer, now_ns)
     }
 }
 
@@ -197,6 +285,7 @@ impl<const MAX_PEERS: usize> Handshaker<MAX_PEERS> {
         key: &mut impl StaticKey,
         entropy: &mut impl Entropy,
         peers: &impl PeerTable,
+        psks: &PskTable<MAX_PEERS>,
         install: &mut [u8],
         response: &mut [u8],
     ) -> Outcome {
@@ -204,7 +293,7 @@ impl<const MAX_PEERS: usize> Handshaker<MAX_PEERS> {
             return Outcome::BadInput;
         };
         let indices = &mut self.indices;
-        let accepted = match self.responder.consume_initiation(init.msg, now_ns, || indices.next_index(), key, entropy, peers) {
+        let accepted = match self.responder.consume_initiation(init.msg, now_ns, || indices.next_index(), key, entropy, peers, psks) {
             Ok(a) => a,
             Err(r) => return Outcome::Rejected(r),
         };
@@ -239,6 +328,8 @@ pub fn reject_event(r: Reject, key_error: u64) -> audit_event::Event {
         Reject::Decrypt => Event::HandshakeDecrypt,
         Reject::Replay => Event::HandshakeReplay,
         Reject::Flood => Event::HandshakeFlood,
+        Reject::Psk(PskRefusal::Missing) => Event::HandshakePskMissing,
+        Reject::Psk(PskRefusal::Stale) => Event::HandshakePskStale,
         Reject::Key(_) if key_error == key_core::ERR_RATE_LIMITED => Event::HandshakeKeyRateLimited,
         Reject::Key(_) => Event::HandshakeKeyRefused,
         Reject::Malformed(_)

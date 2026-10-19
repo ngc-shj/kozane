@@ -1,0 +1,29 @@
+[pds.driver]
+role = "driver"
+
+[pds.ingress]
+role = "untrusted_input"
+
+[pds.key]
+role = "key"
+
+[mrs.device_mr]
+kind = "device"
+owner = "driver"
+phys_addr = 0x9000000
+size = 0x1000
+
+[mrs.shared_mr]
+kind = "plain"
+shares = { driver = "rw", ingress = "rw" }
+
+[mrs.secrets_mr]
+kind = "secrets"
+owner = "key"
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

@@ -14,8 +14,8 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools/check-pins"
 FILES = ["docker/Dockerfile", "Makefile", "rust-toolchain.toml", "Cargo.toml", "Cargo.lock", "policy/waivers.toml"]
-# P7 runs as a pending rule until the PSK_MIX path is removed; its cases
-# enforce it on a tree whose crates/ is replaced by a synthetic one.
+# P7's cases run on a tree whose crates/ is replaced by a synthetic one.
+# --enforce-pending is kept so they stay meaningful if P7 is ever pending.
 ENFORCE = ["--enforce-pending"]
 
 
@@ -161,7 +161,7 @@ CASES = [
     ("P6 waiver with an unknown key", {"P6"},
      lambda t: edit(t / "policy/waivers.toml", SC23, SC23 + 'expires = "never"\n')),
     ("P6 waiver id listed twice", {"P6"}, lambda t: edit(t / "policy/waivers.toml", SC23, SC23 + "\n" + SC23)),
-    # P7 (pending): enforced here on synthetic crates.
+    # P7: on synthetic crates.
     ("allow synthetic crates without psk_mix", set(), lambda t: synthetic_crates(t), ENFORCE),
     ("P7 psk_mix identifier", {"P7"}, lambda t: synthetic_crates(t, "pub fn psk_mix() {}\n"), ENFORCE),
     ("P7 PSK_MIX constant", {"P7"}, lambda t: synthetic_crates(t, "pub const LABEL_PSK_MIX: u64 = 2;\n"), ENFORCE),

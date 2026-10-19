@@ -294,30 +294,7 @@ impl<'a> ToIngress<'a> {
 }
 
 #[cfg(kani)]
-mod proofs {
-    use super::*;
-
-    /// Every decoder is total, and whatever decodes re-encodes to the
-    /// same bytes (so no field is silently dropped).
-    #[kani::proof]
-    #[kani::unwind(20)]
-    fn small_decoders_are_total_and_round_trip() {
-        let buf: [u8; 16] = kani::any();
-        let len: usize = kani::any();
-        kani::assume(len <= buf.len());
-        let b = buf.get(..len).unwrap_or(&[]);
-        let mut out = [0u8; 16];
-        if let Ok(m) = ToIngress::decode(b) {
-            kani::cover!(matches!(m, ToIngress::Outbound { .. }));
-            kani::cover!(matches!(m, ToIngress::EndpointUpdate { .. }));
-            assert!(m.encode(&mut out) == Some(len) && out.get(..len) == Some(b));
-        }
-        if let Ok(m) = Transport::decode(b) {
-            kani::cover!(!m.msg.is_empty());
-            assert!(m.encode(&mut out) == Some(len) && out.get(..len) == Some(b));
-        }
-    }
-}
+mod proofs;
 
 #[cfg(test)]
 mod tests;
