@@ -799,3 +799,32 @@ fn every_input_is_bounded_to_pass_frames() {
     assert!(io.maxes.iter().all(|&m| m == PASS_FRAMES), "inputs must be capped at PASS_FRAMES: {:?}", io.maxes);
     assert_eq!(io.log.iter().filter(|&&c| c == "end").count(), 2, "a pass below K must break after its end_pass");
 }
+
+#[test]
+fn drain_stops_at_exactly_max_with_input_remaining() {
+    let mut waiting = PASS_FRAMES + 5;
+    let mut steps = 0;
+    let moved = drain(PASS_FRAMES, || {
+        steps += 1;
+        if waiting == 0 {
+            return false;
+        }
+        waiting -= 1;
+        true
+    });
+    assert_eq!((moved, steps), (PASS_FRAMES, PASS_FRAMES), "drain must take exactly max and not step again");
+    assert_eq!(waiting, 5);
+}
+
+#[test]
+fn drain_returns_fewer_than_max_when_the_input_runs_dry() {
+    let mut waiting = 3;
+    let moved = drain(PASS_FRAMES, || {
+        if waiting == 0 {
+            return false;
+        }
+        waiting -= 1;
+        true
+    });
+    assert_eq!(moved, 3);
+}

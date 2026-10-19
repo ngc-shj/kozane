@@ -354,8 +354,9 @@ refusal's comments and messages move from SC13 to SC20 (M7).
 - **Member set (R42):**
   - `rg -n 'Outcome::Initiation \{' crates/ingress-core/src/lib.rs`: the
     single constructor.
-  - `rg -n 'self\.to_hs' crates/pds/ingress/src`: the single send, fed
-    only by the `Initiation` arm.
+  - `rg -n 'pdkit::send\(&mut self\.to_hs' crates/pds/ingress/src`: the
+    single send, fed only by the `Initiation` arm. Other uses of `to_hs`
+    are the field, its initialisation and the backlog read.
   - Both are pinned by a review checklist entry and a unit test.
 - **Control class:** enforceable boundary for (a)–(f) with respect to
   `hs`'s input. `hs` has no other input channel, which L4's channel

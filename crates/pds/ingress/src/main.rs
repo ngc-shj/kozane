@@ -13,7 +13,7 @@ mod cookie;
 
 use audit_event::Event;
 use cookie::CookieAdapter;
-use ingress_core::{Buckets, Config, Endpoint, Gate, Mac1, Outcome, PassIo, emit_udp, respond, run_passes};
+use ingress_core::{Buckets, Config, Endpoint, Gate, Mac1, Outcome, PassIo, drain, emit_udp, respond, run_passes};
 use layout::ingress as ch;
 use msgs::ToIngress;
 use pdkit::{Audit, Buf, Rx, Tx};
@@ -190,19 +190,22 @@ fn record_edges(gate: &mut Gate, audit: &mut Audit) {
 impl Ingress {
     /// `to_hs` buffers `hs` has not returned and free `to_driver` buffers,
     /// each read after a reclaim. A link error counts as under load and as
-    /// no TX reserve, which fails safe. Borrows the links by destructuring,
-    /// so the member-set grep for the send to `hs` still finds one line
-    /// (R42).
+    /// no TX reserve, which fails safe.
     fn levels(&mut self) -> (usize, usize) {
-        let Self { to_hs, to_driver, audit, .. } = self;
-        let backlog = to_hs.in_flight().unwrap_or_else(|e| {
-            audit.link_error(e);
-            usize::MAX
-        });
-        let tx_free = to_driver.free().unwrap_or_else(|e| {
-            audit.link_error(e);
-            0
-        });
+        let backlog = match self.to_hs.in_flight() {
+            Ok(n) => n,
+            Err(e) => {
+                self.audit.link_error(e);
+                usize::MAX
+            }
+        };
+        let tx_free = match self.to_driver.free() {
+            Ok(n) => n,
+            Err(e) => {
+                self.audit.link_error(e);
+                0
+            }
+        };
         (backlog, tx_free)
     }
 
@@ -236,153 +239,156 @@ impl Ingress {
     }
 
     fn from_outside(&mut self, wake: &mut Wake, max: usize) -> usize {
-        let mut moved = 0;
-        while moved < max {
-            let Some(n) = pdkit::recv(&mut self.from_driver, &mut self.frame, &mut self.audit) else { break };
-            moved += 1;
-            wake.driver = true;
-            let (backlog, tx_free) = self.levels();
-            let frame = self.frame.get(..n).unwrap_or(&[]);
-            let mut msg_len = None;
-            let outcome = respond(
-                &CONFIG,
-                &mut self.gate,
-                &mut self.cookies,
-                &self.mac1,
-                &mut self.buckets,
-                cpu::now_ns(),
-                backlog,
-                tx_free,
-                frame,
-                &mut self.reply,
-                &mut self.cookie,
-            );
-            record_edges(&mut self.gate, &mut self.audit);
-            let target = match outcome {
-                Outcome::ArpReplied(len) => {
-                    let reply = self.reply.get(..len).unwrap_or(&[]);
-                    if pdkit::send(&mut self.to_driver, &mut self.scratch, reply, &mut self.audit) {
-                        self.audit.record(Event::ArpReplied);
-                    }
-                    continue;
+        drain(max, || self.outside_one(wake))
+    }
+
+    /// Takes and handles one message; `false` when the input is empty.
+    fn outside_one(&mut self, wake: &mut Wake) -> bool {
+        let Some(n) = pdkit::recv(&mut self.from_driver, &mut self.frame, &mut self.audit) else { return false };
+        wake.driver = true;
+        let (backlog, tx_free) = self.levels();
+        let frame = self.frame.get(..n).unwrap_or(&[]);
+        let mut msg_len = None;
+        let outcome = respond(
+            &CONFIG,
+            &mut self.gate,
+            &mut self.cookies,
+            &self.mac1,
+            &mut self.buckets,
+            cpu::now_ns(),
+            backlog,
+            tx_free,
+            frame,
+            &mut self.reply,
+            &mut self.cookie,
+        );
+        record_edges(&mut self.gate, &mut self.audit);
+        let target = match outcome {
+            Outcome::ArpReplied(len) => {
+                let reply = self.reply.get(..len).unwrap_or(&[]);
+                if pdkit::send(&mut self.to_driver, &mut self.scratch, reply, &mut self.audit) {
+                    self.audit.record(Event::ArpReplied);
                 }
-                Outcome::Initiation { src, msg, mac2_checked } => {
-                    if mac2_checked {
-                        self.audit.record(Event::WgMac2Accepted);
-                    }
-                    msg_len = msgs::Initiation { src: ep(src), msg }.encode(&mut self.msg);
-                    Some(true)
-                }
-                Outcome::Transport { src, msg } => {
-                    msg_len = msgs::Transport { src: ep(src), msg }.encode(&mut self.msg);
-                    Some(false)
-                }
-                Outcome::CookieReply { dst, len } => {
-                    // Public bytes: the cookie inside is sealed.
-                    let cookie = self.cookie;
-                    if self.to_peer(dst, cookie.get(..len).unwrap_or(&[]), wake) {
-                        self.audit.record(Event::WgCookieSent);
-                    }
-                    None
-                }
-                Outcome::CookieSuppressed => {
-                    self.audit.record(Event::WgCookieSuppressed);
-                    None
-                }
-                Outcome::NoCookieSecret | Outcome::CookieSecretExpired => {
-                    self.audit.record(Event::WgCookieDropped);
-                    None
-                }
-                Outcome::Dropped(reason) => {
-                    self.audit.record(Event::FrameDropped { reason: reason as u16 });
-                    None
-                }
-                Outcome::NotForUs => {
-                    self.audit.record(Event::NotForUs);
-                    None
-                }
-                Outcome::NoService => {
-                    self.audit.record(Event::NoService);
-                    None
-                }
-                Outcome::Spoofed => {
-                    self.audit.record(Event::Spoofed);
-                    None
-                }
-                Outcome::BadMessage => {
-                    self.audit.record(Event::WgBadMessage);
-                    None
-                }
-                Outcome::BadMac1 => {
-                    self.audit.record(Event::WgBadMac1);
-                    None
-                }
-                Outcome::RateLimited => {
-                    self.audit.record(Event::WgRateLimited);
-                    None
-                }
-            };
-            let (Some(to_hs), Some(len)) = (target, msg_len) else { continue };
-            let msg = self.msg.get(..len).unwrap_or(&[]);
-            if to_hs {
-                wake.hs |= pdkit::send(&mut self.to_hs, &mut self.scratch, msg, &mut self.audit);
-            } else {
-                wake.data |= pdkit::send(&mut self.to_data, &mut self.scratch, msg, &mut self.audit);
+                return true;
             }
+            Outcome::Initiation { src, msg, mac2_checked } => {
+                if mac2_checked {
+                    self.audit.record(Event::WgMac2Accepted);
+                }
+                msg_len = msgs::Initiation { src: ep(src), msg }.encode(&mut self.msg);
+                Some(true)
+            }
+            Outcome::Transport { src, msg } => {
+                msg_len = msgs::Transport { src: ep(src), msg }.encode(&mut self.msg);
+                Some(false)
+            }
+            Outcome::CookieReply { dst, len } => {
+                // Public bytes: the cookie inside is sealed.
+                let cookie = self.cookie;
+                if self.to_peer(dst, cookie.get(..len).unwrap_or(&[]), wake) {
+                    self.audit.record(Event::WgCookieSent);
+                }
+                None
+            }
+            Outcome::CookieSuppressed => {
+                self.audit.record(Event::WgCookieSuppressed);
+                None
+            }
+            Outcome::NoCookieSecret | Outcome::CookieSecretExpired => {
+                self.audit.record(Event::WgCookieDropped);
+                None
+            }
+            Outcome::Dropped(reason) => {
+                self.audit.record(Event::FrameDropped { reason: reason as u16 });
+                None
+            }
+            Outcome::NotForUs => {
+                self.audit.record(Event::NotForUs);
+                None
+            }
+            Outcome::NoService => {
+                self.audit.record(Event::NoService);
+                None
+            }
+            Outcome::Spoofed => {
+                self.audit.record(Event::Spoofed);
+                None
+            }
+            Outcome::BadMessage => {
+                self.audit.record(Event::WgBadMessage);
+                None
+            }
+            Outcome::BadMac1 => {
+                self.audit.record(Event::WgBadMac1);
+                None
+            }
+            Outcome::RateLimited => {
+                self.audit.record(Event::WgRateLimited);
+                None
+            }
+        };
+        let (Some(to_hs), Some(len)) = (target, msg_len) else { return true };
+        let msg = self.msg.get(..len).unwrap_or(&[]);
+        if to_hs {
+            wake.hs |= pdkit::send(&mut self.to_hs, &mut self.scratch, msg, &mut self.audit);
+        } else {
+            wake.data |= pdkit::send(&mut self.to_data, &mut self.scratch, msg, &mut self.audit);
         }
-        moved
+        true
     }
 
     fn from_hs(&mut self, wake: &mut Wake, max: usize) -> usize {
-        let mut moved = 0;
-        while moved < max {
-            let Some(n) = pdkit::recv(&mut self.from_hs, &mut self.msg, &mut self.audit) else { break };
-            moved += 1;
-            wake.hs = true;
-            let Ok(r) = msgs::Response::decode(self.msg.get(..n).unwrap_or(&[])) else {
-                self.audit.record(Event::BadDescriptor);
-                continue;
-            };
-            let (dst, payload) = (Endpoint { ip: r.dst.ip, port: r.dst.port }, *r.msg);
-            self.to_peer(dst, &payload, wake);
-        }
-        moved
+        drain(max, || self.hs_one(wake))
+    }
+
+    /// Takes and handles one message; `false` when the input is empty.
+    fn hs_one(&mut self, wake: &mut Wake) -> bool {
+        let Some(n) = pdkit::recv(&mut self.from_hs, &mut self.msg, &mut self.audit) else { return false };
+        wake.hs = true;
+        let Ok(r) = msgs::Response::decode(self.msg.get(..n).unwrap_or(&[])) else {
+            self.audit.record(Event::BadDescriptor);
+            return true;
+        };
+        let (dst, payload) = (Endpoint { ip: r.dst.ip, port: r.dst.port }, *r.msg);
+        self.to_peer(dst, &payload, wake);
+        true
     }
 
     fn from_data(&mut self, wake: &mut Wake, max: usize) -> usize {
-        let mut moved = 0;
-        while moved < max {
-            let Some(n) = pdkit::recv(&mut self.from_data, &mut self.msg, &mut self.audit) else { break };
-            moved += 1;
-            wake.data = true;
-            let len = n.min(self.msg.len());
-            let mut payload = [0u8; layout::NET_BUF_SIZE];
-            let (dst, plen) = match ToIngress::decode(self.msg.get(..len).unwrap_or(&[])) {
-                Ok(ToIngress::Outbound { peer, msg }) => {
-                    let Some(dst) = self.endpoints.get(usize::from(peer)).copied().flatten() else {
-                        self.audit.record(Event::NoSession);
-                        continue;
-                    };
-                    let Some(p) = payload.get_mut(..msg.len()) else { continue };
-                    p.copy_from_slice(msg);
-                    (dst, msg.len())
+        drain(max, || self.data_one(wake))
+    }
+
+    /// Takes and handles one message; `false` when the input is empty.
+    fn data_one(&mut self, wake: &mut Wake) -> bool {
+        let Some(n) = pdkit::recv(&mut self.from_data, &mut self.msg, &mut self.audit) else { return false };
+        wake.data = true;
+        let len = n.min(self.msg.len());
+        let mut payload = [0u8; layout::NET_BUF_SIZE];
+        let (dst, plen) = match ToIngress::decode(self.msg.get(..len).unwrap_or(&[])) {
+            Ok(ToIngress::Outbound { peer, msg }) => {
+                let Some(dst) = self.endpoints.get(usize::from(peer)).copied().flatten() else {
+                    self.audit.record(Event::NoSession);
+                    return true;
+                };
+                let Some(p) = payload.get_mut(..msg.len()) else { return true };
+                p.copy_from_slice(msg);
+                (dst, msg.len())
+            }
+            Ok(ToIngress::EndpointUpdate { peer, endpoint }) => {
+                if usize::from(peer) < config::PEERS.len()
+                    && let Some(slot) = self.endpoints.get_mut(usize::from(peer))
+                {
+                    *slot = Some(Endpoint { ip: endpoint.ip, port: endpoint.port });
                 }
-                Ok(ToIngress::EndpointUpdate { peer, endpoint }) => {
-                    if usize::from(peer) < config::PEERS.len()
-                        && let Some(slot) = self.endpoints.get_mut(usize::from(peer))
-                    {
-                        *slot = Some(Endpoint { ip: endpoint.ip, port: endpoint.port });
-                    }
-                    continue;
-                }
-                Err(_) => {
-                    self.audit.record(Event::BadDescriptor);
-                    continue;
-                }
-            };
-            self.to_peer(dst, payload.get(..plen).unwrap_or(&[]), wake);
-        }
-        moved
+                return true;
+            }
+            Err(_) => {
+                self.audit.record(Event::BadDescriptor);
+                return true;
+            }
+        };
+        self.to_peer(dst, payload.get(..plen).unwrap_or(&[]), wake);
+        true
     }
 }
 

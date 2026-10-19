@@ -89,7 +89,7 @@ pub enum Outcome<'a> {
 
 const BROADCAST: Mac = [0xff; 6];
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // each argument is an independent input the PD reads per frame (state, crypto, levels, frame); bundling them would only rename the list
 pub fn respond<'a, C: CookieCrypto, M: Mac1, const N: usize>(
     cfg: &Config,
     gate: &mut Gate,
@@ -160,7 +160,7 @@ fn arp<'a>(cfg: &Config, eth: &EthAddrs, a: &ArpPacket, out: &mut [u8]) -> Outco
 /// `backlog` is the number of `to_hs` buffers `hs` has not returned and
 /// `tx_free` the free `to_driver` buffers, both read fresh by the PD. A
 /// cookie reply goes to `out`.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // each argument is an independent input the PD reads per frame (state, crypto, levels, frame); bundling them would only rename the list
 pub fn classify<'a, C: CookieCrypto, M: Mac1, const N: usize>(
     gate: &mut Gate,
     crypto: &mut C,
@@ -221,8 +221,9 @@ struct Bucket {
 
 /// Per-source token buckets in a fixed table. A new source takes a free
 /// slot or evicts the least recently used one, so a spoofed-source flood
-/// churns budgets rather than exhausting memory; `key`'s own quota is the
-/// backstop for that case (plan, DoS).
+/// churns budgets rather than exhausting memory; the forward bucket and the
+/// cookie gate bound that case, with `key`'s quota as the audited backstop
+/// (M2.5 plan C3, C5).
 #[derive(Debug, Clone)]
 pub struct Buckets<const N: usize> {
     slots: [Option<Bucket>; N],
@@ -301,7 +302,10 @@ const _: () = assert!(ARRIVAL_BURST <= FORWARD_BURST, "ARRIVAL_BURST above FORWA
 const _: () = assert!(ROTATE_AT_NS < COOKIE_SECRET_MAX_AGE_NS);
 
 /// One global token bucket (the shape of `Bucket`): a burst of `BURST`,
-/// refilled at one per `INTERVAL_NS`, starting full.
+/// refilled at one per `INTERVAL_NS`, starting full. `Buckets` keeps its own
+/// per-slot copy of the same arithmetic: it is M2 code with its own Kani
+/// proofs, and adopting `Meter` there would change proved code for no
+/// behavioural gain.
 #[derive(Debug, Clone, Copy)]
 pub struct Meter<const BURST: u64, const INTERVAL_NS: u64> {
     /// Budget in nanoseconds of refill time; one token costs INTERVAL_NS.
@@ -422,7 +426,7 @@ impl Gate {
     }
 
     /// The gate after mac1 passed (plan, "Under load").
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // each argument is an independent input the PD reads per frame (state, crypto, levels, frame); bundling them would only rename the list
     fn initiation<'a, C: CookieCrypto, const N: usize>(
         &mut self,
         crypto: &mut C,
@@ -539,6 +543,17 @@ pub struct PassActions {
 pub fn pass_plan(n_hs: usize, n_data: usize, n_outside: usize) -> PassActions {
     let moved = [n_hs, n_data, n_outside];
     PassActions { flush: moved.iter().any(|&n| n > 0), continue_: moved.iter().any(|&n| n >= PASS_FRAMES) }
+}
+
+/// Runs `step` until it reports an empty input (`false`) or `max` messages
+/// were taken, and returns how many were taken. Every PD input loop is this
+/// call, so the per-pass cap is enforced here, where it is tested.
+pub fn drain(max: usize, mut step: impl FnMut() -> bool) -> usize {
+    let mut moved: usize = 0;
+    while moved < max && step() {
+        moved = moved.saturating_add(1);
+    }
+    moved
 }
 
 /// The PD's side of one handler-loop pass. Each input moves at most `max`

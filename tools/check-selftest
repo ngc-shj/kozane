@@ -180,9 +180,11 @@ CASES = {
                                                      "        io.end_pass();\n        if !pass_plan(n_hs, n_data, n_outside).continue_ {\n            return;",
                                                      "        if !pass_plan(n_hs, n_data, n_outside).continue_ {\n            io.end_pass();\n            return;"),
                             "each pass must serve every input, tick, then end_pass"),
+    # `drain` is the loop every PD input runs, so its bound is the one the
+    # PD executes.
     "ingress-unbounded-loop": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
-                                                        "io.serve_outside(PASS_FRAMES)", "io.serve_outside(usize::MAX)"),
-                               "inputs must be capped at PASS_FRAMES"),
+                                                        "while moved < max && step() {", "while step() {"),
+                               "drain must take exactly max and not step again"),
     # A timer that can be notified is tainted (L1): flipped in both the
     # system and the policy, so only the law can object (M2.5 plan C4).
     "laws-timer-ingress": (["laws"], lambda t: (

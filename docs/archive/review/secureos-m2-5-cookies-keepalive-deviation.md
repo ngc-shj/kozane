@@ -302,8 +302,9 @@ Implementation decisions not spelled out by plan rev 6, or departing from it.
 - **C4, gate `laws`:** `laws-timer-ingress`.
 - **C6, gate `test`:** `integration-cookie` uses `observe_load(..) || true`
   to forward regardless of mac2; needle `cookie attribution failed`.
-- **Not added:** `ingress-unbounded-loop` and `ingress-late-notify` (see
-  the next section).
+- **Not added here:** `ingress-unbounded-loop` and `ingress-late-notify`.
+  They were resolved after batch 4 as unit-gate cases; see "Orchestrator
+  follow-up after batch 4".
 - **Red-proved** by `tools/check-selftest <case>`, every case `ok`:
   - the seven `unit` and `laws` cases;
   - `integration-cookie`;
@@ -313,7 +314,7 @@ Implementation decisions not spelled out by plan rev 6, or departing from it.
   - `integration-count` is now `INTEGRATION-CASES: 10 < manifest 11`;
   - `manifest` is now `UNIT-AUDIT-EVENT: 17 < manifest 18`.
 
-### Loop mutations cannot fail the flood case under TCG (open)
+### Loop mutations cannot fail the flood case under TCG (resolved by the follow-up below)
 
 - **Plan premise:** C4 assumes that a flood above `ingress`'s capacity
   keeps its input ring non-empty. Then an unbounded `from_outside` never
@@ -385,3 +386,25 @@ Implementation decisions not spelled out by plan rev 6, or departing from it.
   - `ingress-unbounded-loop` uncaps `serve_outside`.
 - **Residual:** the PD's `from_*` loops honouring `max` rests on review,
   not a test. Each is a three-line `while moved < max`.
+
+## Phase 2 self-R-check fixes
+
+- **RT5 (testing).** The loop red-proofs did not execute the PD code that
+  enforces the cap.
+  - Every PD input loop is now `ingress_core::drain(max, step)`. Each step
+    takes and handles one message and returns `false` when the input is
+    empty.
+  - Unit tests:
+    - `drain` stops at exactly `max` with input remaining, and does not
+      step again;
+    - it returns fewer than `max` when the input runs dry.
+  - `ingress-unbounded-loop` now removes `drain`'s bound, so the mutation
+    lands in code the PD executes. It is red-proved.
+- **R47 (functionality).** `levels()` no longer destructures `self` to
+  dodge a spelling grep. The member-set check now names the primitive,
+  `pdkit::send(&mut self.to_hs`, which matches once.
+- **R29 (functionality).** Fixed two stale statements:
+  - the `Buckets` doc that called `key`'s quota the backstop for floods;
+  - this log's "open" heading for the loop mutations.
+- **R17 (functionality).** The reason `Buckets` keeps its own bucket
+  arithmetic (M2 code with its own Kani proofs) is now in `Meter`'s doc.
