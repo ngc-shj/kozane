@@ -159,11 +159,22 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::WgMac2Accepted
         | Event::CookieSecretExpired
         | Event::CookieSecretUnavailable
-        | Event::ArpSuppressed => true,
+        | Event::ArpSuppressed
+        | Event::HandshakePskMissing
+        | Event::HandshakePskStale
+        | Event::RpBadMac
+        | Event::RpRateLimited
+        | Event::RpTypeDropped
+        | Event::RpInitHello
+        | Event::RpBiscuitReplay
+        | Event::RpPskExported
+        | Event::RpPskInstallFailed
+        | Event::RpRngFailed
+        | Event::RpDecapsRateLimited => true,
         Event::FrameDropped { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
-    assert_eq!(Event::FIXED.len(), 40);
+    assert_eq!(Event::FIXED.len(), 51);
 }
 
 #[test]
@@ -225,7 +236,7 @@ fn decode_classifies_fixed_dropped_and_unknown_codes() {
     // fixed range.
     assert_eq!(decode(FRAME_DROPPED_BASE + 0x3f), Decoded::FrameDropped(0x3f));
     assert_eq!(decode(0x0019), Decoded::Unknown);
-    assert_eq!(decode(0x003d), Decoded::Unknown);
+    assert_eq!(decode(0x0048), Decoded::Unknown);
 }
 
 #[test]

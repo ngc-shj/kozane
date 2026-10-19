@@ -116,6 +116,17 @@ pub enum Event {
     CookieSecretUnavailable,
     /// An ARP reply was due but the TX reserve was reached.
     ArpSuppressed,
+    HandshakePskMissing,
+    HandshakePskStale,
+    RpBadMac,
+    RpRateLimited,
+    RpTypeDropped,
+    RpInitHello,
+    RpBiscuitReplay,
+    RpPskExported,
+    RpPskInstallFailed,
+    RpRngFailed,
+    RpDecapsRateLimited,
 }
 
 impl Event {
@@ -161,6 +172,17 @@ impl Event {
             Event::CookieSecretExpired => 0x003a,
             Event::CookieSecretUnavailable => 0x003b,
             Event::ArpSuppressed => 0x003c,
+            Event::HandshakePskMissing => 0x003d,
+            Event::HandshakePskStale => 0x003e,
+            Event::RpBadMac => 0x003f,
+            Event::RpRateLimited => 0x0040,
+            Event::RpTypeDropped => 0x0041,
+            Event::RpInitHello => 0x0042,
+            Event::RpBiscuitReplay => 0x0043,
+            Event::RpPskExported => 0x0044,
+            Event::RpPskInstallFailed => 0x0045,
+            Event::RpRngFailed => 0x0046,
+            Event::RpDecapsRateLimited => 0x0047,
             Event::FrameDropped { reason } => {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
             }
@@ -168,7 +190,7 @@ impl Event {
     }
 
     /// Every variant except the parameterised `FrameDropped`.
-    pub const FIXED: [Event; 40] = [
+    pub const FIXED: [Event; 51] = [
         Event::ArpReplied,
         Event::UdpEchoed,
         Event::RingCorrupt,
@@ -209,6 +231,17 @@ impl Event {
         Event::CookieSecretExpired,
         Event::CookieSecretUnavailable,
         Event::ArpSuppressed,
+        Event::HandshakePskMissing,
+        Event::HandshakePskStale,
+        Event::RpBadMac,
+        Event::RpRateLimited,
+        Event::RpTypeDropped,
+        Event::RpInitHello,
+        Event::RpBiscuitReplay,
+        Event::RpPskExported,
+        Event::RpPskInstallFailed,
+        Event::RpRngFailed,
+        Event::RpDecapsRateLimited,
     ];
 
     /// Display name; exhaustive, so a new variant fails to compile here.
@@ -254,6 +287,17 @@ impl Event {
             Event::CookieSecretExpired => "CookieSecretExpired",
             Event::CookieSecretUnavailable => "CookieSecretUnavailable",
             Event::ArpSuppressed => "ArpSuppressed",
+            Event::HandshakePskMissing => "HandshakePskMissing",
+            Event::HandshakePskStale => "HandshakePskStale",
+            Event::RpBadMac => "RpBadMac",
+            Event::RpRateLimited => "RpRateLimited",
+            Event::RpTypeDropped => "RpTypeDropped",
+            Event::RpInitHello => "RpInitHello",
+            Event::RpBiscuitReplay => "RpBiscuitReplay",
+            Event::RpPskExported => "RpPskExported",
+            Event::RpPskInstallFailed => "RpPskInstallFailed",
+            Event::RpRngFailed => "RpRngFailed",
+            Event::RpDecapsRateLimited => "RpDecapsRateLimited",
             Event::FrameDropped { .. } => "FrameDropped",
         }
     }
@@ -301,7 +345,18 @@ impl Event {
             | Event::WgCookieSuppressed
             | Event::WgCookieDropped
             | Event::WgMac2Accepted
-            | Event::ArpSuppressed => true,
+            | Event::ArpSuppressed
+            | Event::HandshakePskMissing
+            | Event::HandshakePskStale
+            | Event::RpBadMac
+            | Event::RpRateLimited
+            | Event::RpTypeDropped
+            | Event::RpInitHello
+            | Event::RpBiscuitReplay
+            | Event::RpPskExported
+            | Event::RpPskInstallFailed
+            | Event::RpRngFailed
+            | Event::RpDecapsRateLimited => true,
         }
     }
 
@@ -353,6 +408,17 @@ impl Event {
             Event::CookieSecretExpired => 37,
             Event::CookieSecretUnavailable => 38,
             Event::ArpSuppressed => 39,
+            Event::HandshakePskMissing => 40,
+            Event::HandshakePskStale => 41,
+            Event::RpBadMac => 42,
+            Event::RpRateLimited => 43,
+            Event::RpTypeDropped => 44,
+            Event::RpInitHello => 45,
+            Event::RpBiscuitReplay => 46,
+            Event::RpPskExported => 47,
+            Event::RpPskInstallFailed => 48,
+            Event::RpRngFailed => 49,
+            Event::RpDecapsRateLimited => 50,
             Event::FrameDropped { reason } => {
                 // FIXED_SLOTS..FIXED_SLOTS+64, clamped like `code`.
                 let r = if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason };
@@ -362,7 +428,7 @@ impl Event {
     }
 }
 
-const FIXED_SLOTS: usize = 40;
+const FIXED_SLOTS: usize = 51;
 const SLOTS: usize = FIXED_SLOTS + MAX_DROP_REASON as usize + 1;
 
 /// Per-producer coalescing state.

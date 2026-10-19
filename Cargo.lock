@@ -985,6 +985,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pd-pq"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "cpu",
+ "layout",
+ "sel4-microkit",
+]
+
+[[package]]
+name = "pd-pqkey"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "cpu",
+ "layout",
+ "sel4-microkit",
+]
+
+[[package]]
 name = "pd-timer"
 version = "0.1.0"
 dependencies = [

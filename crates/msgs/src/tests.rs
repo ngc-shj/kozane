@@ -79,3 +79,37 @@ fn install_encoding_matches_the_golden_vector() {
         assert_eq!(*b, u8::from_str_radix(pair, 16).unwrap(), "byte {i}");
     }
 }
+
+#[test]
+fn rp_datagram_round_trips_each_responder_length() {
+    let mut out = [0u8; 1200];
+    for len in RP_LENS {
+        let msg = [0x5au8; 1132];
+        let m = RpDatagram { peer: EP, msg: &msg[..len] };
+        let n = m.encode(&mut out).unwrap();
+        assert_eq!(RpDatagram::decode(&out[..n]), Ok(m));
+    }
+}
+
+#[test]
+fn rp_datagram_refuses_lengths_a_responder_never_sends_or_accepts() {
+    let msg = [0u8; 1133];
+    let mut out = [0u8; 1200];
+    for len in [0, 63, 65, 175, 177, 1091, 1093, 1131, 1133] {
+        assert_eq!(RpDatagram { peer: EP, msg: &msg[..len] }.encode(&mut out), None, "encode {len}");
+        let mut b = [0u8; 1200];
+        b[..6].copy_from_slice(&[10, 0, 2, 2, 0x40, 0x9c]);
+        assert_eq!(RpDatagram::decode(&b[..6 + len]), Err(Malformed), "decode {len}");
+    }
+}
+
+#[test]
+fn psk_install_round_trips_and_rejects_other_sizes() {
+    let osk = [0xa5u8; 32];
+    let mut out = [0u8; 64];
+    let n = PskInstall { peer: 7, osk: &osk }.encode(&mut out).unwrap();
+    assert_eq!(n, PSK_INSTALL_LEN);
+    assert!(PskInstall::decode(&out[..n]) == Ok(PskInstall { peer: 7, osk: &osk }));
+    assert!(PskInstall::decode(&out[..n - 1]).is_err());
+    assert!(PskInstall::decode(&out[..n + 1]).is_err());
+}

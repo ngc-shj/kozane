@@ -51,6 +51,7 @@ pub mod ingress {
     pub const CH_HS: usize = 3;
     pub const CH_DATA: usize = 4;
     pub const CH_TIMER: usize = 5;
+    pub const CH_PQ: usize = 6;
 }
 
 pub mod audit {
@@ -60,6 +61,7 @@ pub mod audit {
     pub const CH_INNER: usize = 4;
     pub const CH_HS: usize = 5;
     pub const CH_DATA: usize = 6;
+    pub const CH_PQ: usize = 7;
 }
 
 #[cfg(test)]
@@ -70,6 +72,7 @@ pub mod timer {
     pub const CH_DATA: usize = 1;
     pub const CH_HS: usize = 2;
     pub const CH_INGRESS: usize = 3;
+    pub const CH_PQ: usize = 4;
 }
 
 pub mod key {
@@ -82,6 +85,7 @@ pub mod hs {
     pub const CH_DATA: usize = 3;
     pub const CH_TIMER: usize = 4;
     pub const CH_AUDIT: usize = 5;
+    pub const CH_PQ: usize = 6;
 }
 
 pub mod data {
@@ -96,4 +100,18 @@ pub mod inner {
     pub const CH_ETH_IN: usize = 1;
     pub const CH_DATA: usize = 2;
     pub const CH_AUDIT: usize = 3;
+}
+
+/// M3: the Rosenpass responder (plan C3).
+pub mod pq {
+    pub const CH_PQKEY: usize = 1;
+    pub const CH_INGRESS: usize = 2;
+    pub const CH_HS: usize = 3;
+    pub const CH_TIMER: usize = 4;
+    pub const CH_AUDIT: usize = 5;
+}
+
+/// M3: the McEliece decapsulation oracle (plan C2), a passive key-role PD.
+pub mod pqkey {
+    pub const CH_PQ: usize = 1;
 }

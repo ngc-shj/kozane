@@ -10,6 +10,8 @@
 //! | ingress → data  | `Transport`: src ip[4] port[2] msg[..]              |
 //! | data → ingress  | tag 1 `Outbound` peer[2] msg[..]; tag 2 `EndpointUpdate` peer[2] ip[4] port[2] |
 //! | data ↔ inner    | a bare IPv4 datagram (validated by `wire`)          |
+//! | ingress ↔ pq    | `RpDatagram`: peer ip[4] port[2] msg[176 or 1092 / 64 or 1132] |
+//! | pq → hs         | `PskInstall`: peer[2] osk[32] (secret)              |
 //!
 //! Integers are little-endian.
 
@@ -179,6 +181,69 @@ impl<'a> Transport<'a> {
         let mut at = 0;
         let src = take_ep(b, &mut at)?;
         Ok(Self { src, msg: rest(b, at)? })
+    }
+}
+
+/// ingress → pq (the source) and pq → ingress (the destination): a
+/// Rosenpass message. Only InitHello and InitConf travel inbound, and only
+/// RespHello and EmptyData outbound, so the length is one of four (M3 plan
+/// C3/C4); anything else is malformed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RpDatagram<'a> {
+    pub peer: Endpoint,
+    pub msg: &'a [u8],
+}
+
+/// Wire lengths of the Rosenpass messages a responder exchanges.
+pub const RP_LENS: [usize; 4] = [1092, 1132, 176, 64];
+
+impl<'a> RpDatagram<'a> {
+    pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+        if !RP_LENS.contains(&self.msg.len()) {
+            return None;
+        }
+        let mut at = 0;
+        put_ep(out, &mut at, &self.peer)?;
+        put(out, &mut at, self.msg)?;
+        Some(at)
+    }
+
+    pub fn decode(b: &'a [u8]) -> Result<Self, Malformed> {
+        let mut at = 0;
+        let peer = take_ep(b, &mut at)?;
+        let msg = rest(b, at)?;
+        if !RP_LENS.contains(&msg.len()) {
+            return Err(Malformed);
+        }
+        Ok(Self { peer, msg })
+    }
+}
+
+/// pq → hs: a fresh Rosenpass OSK for `peer`, the WireGuard PSK under L8.
+/// Secret, so the receiving buffer is zeroed once copied out; not
+/// `Debug`/`Clone`/`Copy`.
+#[derive(PartialEq, Eq)]
+pub struct PskInstall<'a> {
+    pub peer: u16,
+    pub osk: &'a [u8; 32],
+}
+
+pub const PSK_INSTALL_LEN: usize = 2 + 32;
+
+impl<'a> PskInstall<'a> {
+    pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+        let mut at = 0;
+        put(out, &mut at, &self.peer.to_le_bytes())?;
+        put(out, &mut at, self.osk)?;
+        Some(at)
+    }
+
+    pub fn decode(b: &'a [u8]) -> Result<Self, Malformed> {
+        let mut at = 0;
+        let peer = u16::from_le_bytes(*take::<2>(b, &mut at)?);
+        let osk = take::<32>(b, &mut at)?;
+        exact(b, at)?;
+        Ok(Self { peer, osk })
     }
 }
 
