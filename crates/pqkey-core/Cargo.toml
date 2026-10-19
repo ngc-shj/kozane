@@ -1,0 +1,10 @@
+[package]
+name = "pqkey-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+classic-mceliece-rust = { version = "=2.0.2", default-features = false, features = ["mceliece460896", "zeroize"] }
+libcrux-blake2 = { version = "=0.0.9", default-features = false }
+zeroize = { version = "=1.8.1", default-features = false }
