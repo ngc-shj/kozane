@@ -1,5 +1,5 @@
 # Code Review: secureos-m2-5-cookies-keepalive
-Date: 2026-10-20
+Date: 2026-10-19
 Review round: 1
 
 ## Changes from Previous Round
@@ -167,3 +167,13 @@ the test harness only.
 All three experts returned "No findings" in Round 3. Code review is
 complete after 3 rounds; every finding from Rounds 1–2 is resolved, and
 `make check` passed alone on `ac3e2ba`.
+
+# Post-review: external review of 3750758..3fca70f
+- **Minor: the C5 inequalities existed only in test builds.** Moved into
+  hs-core's library, so the production `pd-hs` build rejects unsafe
+  constants (red-proved).
+- **Known Minor: a keepalive was consumed on seal, not delivery.** Debt is
+  now restored on a failed send and retried on a later pass (red-proved).
+- **Record inconsistency:** the date is corrected to 2026-10-19.
+
+Details are in the deviation log ("External review after code review").

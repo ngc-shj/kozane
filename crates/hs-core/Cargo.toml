@@ -6,11 +6,11 @@ license.workspace = true
 
 [dependencies]
 audit-event = { path = "../audit-event" }
+ingress-core = { path = "../ingress-core" }
 key-core = { path = "../key-core" }
+layout = { path = "../layout" }
 msgs = { path = "../msgs" }
 wg-core = { path = "../wg-core" }
 
 [dev-dependencies]
-ingress-core = { path = "../ingress-core" }
-layout = { path = "../layout" }
 secret-blob = { path = "../secret-blob" }

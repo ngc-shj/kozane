@@ -25,6 +25,22 @@ use wg_core::noise::{Entropy, EntropyError, KeyError, PeerId, PeerTable, Reject,
 /// `es`, `ss`, then `PskMix` on accept (M2.5 plan C5).
 pub const KEY_CALLS_PER_HANDSHAKE: u64 = 3;
 
+// The key budget invariant (M2.5 plan C5), checked when `hs` itself is
+// built, so an image whose constants could exhaust `key` does not compile. `hs` spends key calls when it
+// drains `ih`, so a burst is everything `ingress` can forward plus all that
+// can wait in `ih` (NET_BUFFERS) and the one `hs` has already dequeued.
+const IH_BACKLOG: u64 = layout::NET_BUFFERS as u64 + 1;
+const _: () = assert!(
+    (ingress_core::FORWARD_BURST + IH_BACKLOG) * KEY_CALLS_PER_HANDSHAKE
+        <= key_core::KEY_BURST - key_core::KEY_BOOT_CALLS,
+    "C5: forwarded burst plus ih backlog can exhaust key's bucket"
+);
+const _: () = assert!(
+    KEY_CALLS_PER_HANDSHAKE * key_core::KEY_INTERVAL_NS <= ingress_core::FORWARD_INTERVAL_NS,
+    "C5: hs can spend key calls faster than key refills"
+);
+const _: () = assert!(ingress_core::NET_BUFFERS == layout::NET_BUFFERS, "ingress-core NET_BUFFERS differs from layout");
+
 /// One synchronous call into `key`: (label, request words) → (reply
 /// label, reply word count). The PD implements it with a PPC; tests with
 /// `key_core::Oracle` directly.

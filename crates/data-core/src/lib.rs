@@ -92,10 +92,13 @@ pub enum InboundOutcome<'o> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutboundOutcome {
     /// A transport message of `len` bytes is at the start of `out`; the PD
-    /// wraps it as `msgs::ToIngress::Outbound { peer, msg }`.
+    /// wraps it as `msgs::ToIngress::Outbound { peer, msg }`. `unacked` is
+    /// the keepalive debt this seal cleared: if the message is not
+    /// delivered, hand it back with `restore_unacked`.
     Sealed {
         peer: u16,
         len: usize,
+        unacked: Option<u64>,
     },
     Dropped(DropReason),
     /// Larger than `MTU`.
@@ -270,10 +273,7 @@ impl<const MAX_PEERS: usize> Data<MAX_PEERS> {
         plain.fill(0);
         let peer = u16::try_from(peer).unwrap_or(u16::MAX);
         match sealed {
-            Ok(len) => {
-                p.unacked_since = None;
-                OutboundOutcome::Sealed { peer, len }
-            }
+            Ok(len) => OutboundOutcome::Sealed { peer, len, unacked: p.unacked_since.take() },
             Err(e) => OutboundOutcome::Rejected(e),
         }
     }
@@ -299,14 +299,15 @@ impl<const MAX_PEERS: usize> Data<MAX_PEERS> {
 
     /// Seals an empty transport message (a keepalive) on `current` for the
     /// first peer whose data has gone unanswered for KEEPALIVE_TIMEOUT, and
-    /// returns `(peer, len)` with the message at the start of `out`. A peer
-    /// whose `current` cannot seal is disarmed and skipped, so one failing
-    /// peer never starves the rest. Call until `None`.
-    pub fn keepalive(&mut self, now_ns: u64, out: &mut [u8]) -> Option<(u16, usize)> {
+    /// returns `(peer, len, unacked_since)` with the message at the start of
+    /// `out`; if it is not delivered, hand `unacked_since` back with
+    /// `restore_unacked`. A peer whose `current` cannot seal is disarmed and
+    /// skipped, so one failing peer never starves the rest. Call until `None`.
+    pub fn keepalive(&mut self, now_ns: u64, out: &mut [u8]) -> Option<(u16, usize, u64)> {
         for (peer, p) in self.peers.iter_mut().enumerate() {
             // `checked_sub`: a clock reading before the arming never fires.
-            let due = p.unacked_since.and_then(|t| now_ns.checked_sub(t)).is_some_and(|d| d >= KEEPALIVE_TIMEOUT_NS);
-            if !due {
+            let Some(t) = p.unacked_since else { continue };
+            if now_ns.checked_sub(t).is_none_or(|d| d < KEEPALIVE_TIMEOUT_NS) {
                 continue;
             }
             p.unacked_since = None;
@@ -314,10 +315,18 @@ impl<const MAX_PEERS: usize> Data<MAX_PEERS> {
                 continue;
             };
             if let Ok(len) = seal_into(s, &[], now_ns, out) {
-                return Some((u16::try_from(peer).unwrap_or(u16::MAX), len));
+                return Some((u16::try_from(peer).unwrap_or(u16::MAX), len, t));
             }
         }
         None
+    }
+
+    /// Re-arms a keepalive debt that a sealed message did not discharge
+    /// because it never reached `ingress`, keeping the earlier deadline.
+    pub fn restore_unacked(&mut self, peer: u16, since: Option<u64>) {
+        if let (Some(t), Some(p)) = (since, self.peers.get_mut(usize::from(peer))) {
+            p.unacked_since = Some(p.unacked_since.map_or(t, |e| e.min(t)));
+        }
     }
 
     /// The peer and slot of the live session whose local index is `index`.

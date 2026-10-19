@@ -486,7 +486,7 @@ fn outbound_pads_plaintext_to_a_multiple_of_16() {
     let mut trailing = pkt.clone();
     trailing.extend_from_slice(&[0xee; 7]);
     let (o, msg) = send(&mut d, &trailing);
-    assert_eq!(o, OutboundOutcome::Sealed { peer: 0, len: TRANSPORT_MIN_LEN + 48 });
+    assert_eq!(o, OutboundOutcome::Sealed { peer: 0, len: TRANSPORT_MIN_LEN + 48, unacked: None });
     let pt = a.open(&msg).unwrap();
     assert_eq!(pt[..33], pkt[..]);
     assert_eq!(pt[33..], [0; 15]);
@@ -502,7 +502,7 @@ fn outbound_padding_is_bounded_by_the_mtu() {
     confirm(&mut d, &mut a);
     let full = datagram_with(HOST_IP, PEER0_IP, &[7; MTU - 28]);
     let (o, msg) = send(&mut d, &full);
-    assert_eq!(o, OutboundOutcome::Sealed { peer: 0, len: MAX_TRANSPORT });
+    assert_eq!(o, OutboundOutcome::Sealed { peer: 0, len: MAX_TRANSPORT, unacked: None });
     assert_eq!(a.open(&msg).unwrap(), full);
     let over = datagram_with(HOST_IP, PEER0_IP, &[7; MTU - 27]);
     assert_eq!(send(&mut d, &over).0, OutboundOutcome::TooLarge);
@@ -544,7 +544,7 @@ fn data_in(d: &mut D, c: &mut Client, src: Ipv4, now_ns: u64) {
 
 fn keepalive(d: &mut D, now_ns: u64) -> Option<(u16, Vec<u8>)> {
     let mut out = [0u8; MAX_TRANSPORT];
-    d.keepalive(now_ns, &mut out).map(|(peer, len)| (peer, out[..len].to_vec()))
+    d.keepalive(now_ns, &mut out).map(|(peer, len, _)| (peer, out[..len].to_vec()))
 }
 
 fn confirmed(d: &mut D, peer: u16, local_index: u32) -> Client {
@@ -709,6 +709,44 @@ fn keepalive_fires_at_exactly_the_timeout_and_not_a_nanosecond_before() {
     data_in(&mut d, &mut a, PEER0_IP, T0);
     assert_eq!(keepalive(&mut d, T0 + KEEPALIVE - 1), None);
     assert!(keepalive(&mut d, T0 + KEEPALIVE).is_some());
+}
+
+#[test]
+fn undelivered_keepalive_is_retried_with_its_original_deadline() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    data_in(&mut d, &mut a, PEER0_IP, T0);
+    let mut out = [0u8; MAX_TRANSPORT];
+    let (peer, _, since) = d.keepalive(T0 + KEEPALIVE, &mut out).unwrap();
+    assert_eq!((peer, since), (0, T0));
+    // The link was full: without the restore the debt is gone for good.
+    d.restore_unacked(peer, Some(since));
+    assert!(keepalive(&mut d, T0 + KEEPALIVE).is_some(), "an undelivered keepalive must be retried");
+    assert_eq!(keepalive(&mut d, T0 + KEEPALIVE), None, "a delivered one is not");
+}
+
+#[test]
+fn undelivered_reply_restores_the_debt_and_a_delivered_one_clears_it() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    data_in(&mut d, &mut a, PEER0_IP, T0);
+    let (o, _) = send(&mut d, &datagram(HOST_IP, PEER0_IP));
+    let OutboundOutcome::Sealed { peer, unacked, .. } = o else { panic!("{o:?}") };
+    assert_eq!(unacked, Some(T0));
+    assert_eq!(keepalive(&mut d, T0 + KEEPALIVE), None, "the seal cleared the debt");
+    d.restore_unacked(peer, unacked);
+    assert!(keepalive(&mut d, T0 + KEEPALIVE).is_some(), "an undelivered reply must not discharge the debt");
+}
+
+#[test]
+fn restoring_no_debt_arms_nothing() {
+    let mut d = D::new();
+    let _a = confirmed(&mut d, 0, 1);
+    let (o, _) = send(&mut d, &datagram(HOST_IP, PEER0_IP));
+    let OutboundOutcome::Sealed { peer, unacked, .. } = o else { panic!("{o:?}") };
+    assert_eq!(unacked, None);
+    d.restore_unacked(peer, unacked);
+    assert_eq!(keepalive(&mut d, T0 + 2 * KEEPALIVE), None);
 }
 
 // --- handler loop ---

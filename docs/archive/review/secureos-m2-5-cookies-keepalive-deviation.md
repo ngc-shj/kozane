@@ -546,3 +546,33 @@ No committed file was mutated to prove a test.
   Not red-proved by execution: the mutant would need `audit` to print late
   *and* B's handshake response to be lost. The change only adds a wait and
   narrows which reply counts.
+
+## External review after code review (3fca70f)
+
+- **C5 enforced only under `cfg(test)`.**
+  - The key-budget assertions moved from hs-core's tests to `hs-core`'s
+    library, beside `KEY_CALLS_PER_HANDSHAKE`. `ingress-core` and `layout`
+    became normal dependencies of hs-core.
+  - An image whose constants could exhaust `key` no longer compiles.
+  - Red-proved on a throwaway copy: with `FORWARD_BURST = 22`, the
+    production `pd-hs` build fails with "C5: forwarded burst plus ih backlog
+    can exhaust key's bucket".
+  - The selftest case `c5-backlog` now edits `hs-core/src/lib.rs`. All four
+    C5/equality cases were re-run and are ok.
+- **A keepalive or reply was consumed on seal, not on delivery.**
+  - `OutboundOutcome::Sealed` carries `unacked`, the debt the seal
+    cleared, and `keepalive()` returns the deadline it cleared.
+  - When the send to `ingress` fails, the data PD hands the debt back with
+    `Data::restore_unacked`, which keeps the earlier deadline. The keepalive
+    loop then stops for that pass, so a full link is retried on a later
+    pass rather than re-sealed at once.
+  - Tests:
+    - an undelivered keepalive is retried;
+    - an undelivered reply restores the debt;
+    - restoring no debt arms nothing.
+  - Red-proved on a throwaway copy: a no-op `restore_unacked` fails the
+    first two tests.
+  - This supersedes batch 2a's "a keepalive whose send fails is consumed"
+    entry.
+- **Audit-trail date:** the code-review record's date is corrected to
+  2026-10-19, the date of the commits.

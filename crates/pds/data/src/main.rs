@@ -189,12 +189,20 @@ impl DataPd {
         let r = self.data.outbound(&Config, self.buf.get(..n).unwrap_or(&[]), cpu::now_ns(), &mut self.msg);
         self.buf.fill(0);
         match r {
-            OutboundOutcome::Sealed { peer, len } => {
+            OutboundOutcome::Sealed { peer, len, unacked } => {
                 let mut sealed = [0u8; layout::NET_BUF_SIZE];
-                if let (Some(dst), Some(src)) = (sealed.get_mut(..len), self.msg.get(..len)) {
-                    dst.copy_from_slice(src);
-                    let m = ToIngress::Outbound { peer, msg: sealed.get(..len).unwrap_or(&[]) };
-                    wake.ingress |= send_to_ingress(&mut self.to_ingress, &mut self.scratch, &mut self.audit, m);
+                let sent = match (sealed.get_mut(..len), self.msg.get(..len)) {
+                    (Some(dst), Some(src)) => {
+                        dst.copy_from_slice(src);
+                        let m = ToIngress::Outbound { peer, msg: sealed.get(..len).unwrap_or(&[]) };
+                        send_to_ingress(&mut self.to_ingress, &mut self.scratch, &mut self.audit, m)
+                    }
+                    _ => false,
+                };
+                wake.ingress |= sent;
+                // An undelivered reply discharges no keepalive debt.
+                if !sent {
+                    self.data.restore_unacked(peer, unacked);
                 }
             }
             OutboundOutcome::Dropped(reason) => self.audit.record(Event::FrameDropped { reason: reason as u16 }),
@@ -208,12 +216,22 @@ impl DataPd {
 
     /// Passive keepalives (plan C7) for peers whose data went unanswered.
     fn keepalives(&mut self, wake: &mut Wake) {
-        while let Some((peer, len)) = self.data.keepalive(cpu::now_ns(), &mut self.msg) {
+        while let Some((peer, len, since)) = self.data.keepalive(cpu::now_ns(), &mut self.msg) {
             let mut sealed = [0u8; layout::NET_BUF_SIZE];
-            if let (Some(dst), Some(src)) = (sealed.get_mut(..len), self.msg.get(..len)) {
-                dst.copy_from_slice(src);
-                let m = ToIngress::Outbound { peer, msg: sealed.get(..len).unwrap_or(&[]) };
-                wake.ingress |= send_to_ingress(&mut self.to_ingress, &mut self.scratch, &mut self.audit, m);
+            let sent = match (sealed.get_mut(..len), self.msg.get(..len)) {
+                (Some(dst), Some(src)) => {
+                    dst.copy_from_slice(src);
+                    let m = ToIngress::Outbound { peer, msg: sealed.get(..len).unwrap_or(&[]) };
+                    send_to_ingress(&mut self.to_ingress, &mut self.scratch, &mut self.audit, m)
+                }
+                _ => false,
+            };
+            wake.ingress |= sent;
+            if !sent {
+                // The link is full: re-arm and retry on a later pass, not in
+                // this loop, which would seal the same peer again at once.
+                self.data.restore_unacked(peer, Some(since));
+                break;
             }
         }
     }

@@ -154,7 +154,7 @@ CASES = {
     "c5-forward-burst": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
                                                   "pub const FORWARD_BURST: u64 = 16;", "pub const FORWARD_BURST: u64 = 22;"),
                          "C5: forwarded burst plus ih backlog can exhaust key's bucket"),
-    "c5-backlog": (["unit"], lambda t: edit(t, "crates/hs-core/src/tests.rs",
+    "c5-backlog": (["unit"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                             "const IH_BACKLOG: u64 = layout::NET_BUFFERS as u64 + 1;",
                                             "const IH_BACKLOG: u64 = layout::NET_BUFFERS as u64 + 7;"),
                    "C5: forwarded burst plus ih backlog can exhaust key's bucket"),
