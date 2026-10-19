@@ -156,3 +156,35 @@ Implementation decisions not spelled out by plan rev 7, or departing from it.
   `crates/rosenpass-core/src/crypto.rs`. Changing it fails 16 tests.
 - **Mutation check:** 14 scratch mutations were each caught by their
   intended tests.
+
+## Batch E4 (tools/package: two blobs, waiver gate)
+
+- **Two blobs, each validated by kind.** `--pq-secrets` is a new required
+  option. The MRs are found by name (`secrets`, `pq_secrets`). A blob
+  carrying the other kind's magic is refused first.
+  - The key blob is now also checked for version, checksum and padding;
+    before, only size, non-zero and magic were checked.
+- **The image may differ only inside the two blob ranges.** Each blob
+  appears exactly once, the ranges do not overlap, and the placeholder
+  is zero inside both.
+- **Waiver gate:**
+  - `check_waivers` decides "debug kernel?" with its own predicate, so
+    stubbing SC20 cannot mask it.
+  - `main` runs SC20 and the waiver check both, always, before any secret
+    is read.
+  - The waiver file path is fixed to `policy/waivers.toml`. It is not a
+    CLI option, so the gate cannot be pointed at another file.
+  - **More fail-closed than the plan:** a missing or unparsable waiver
+    file refuses even a debug kernel. Only open waivers are limited to
+    non-debug kernels.
+- **Messages and needles changed:**
+  - `no secrets magic` → `no SOSSECR1 magic`;
+  - `differs outside the blob` → `…outside the blobs`;
+  - the new open-waiver message is
+    `package: waiver SC23 (owner M4) is open; …`.
+- **Red-proofs:** 16 mutants were run on scratch copies, and all went
+  red. `PACKAGE-FIXTURES` rises from 45 to 84.
+- **Pending for the integration batch:**
+  - the Makefile needs a `PQ_SECRETS` variable and the new argument;
+  - check-selftest `package-release` needs `PQ_SECRETS`;
+  - the .system needs a `pq_secrets` MR.

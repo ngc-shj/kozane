@@ -1,27 +1,32 @@
 #!/usr/bin/env python3
-"""Packages a deployment image: the `make image` system with only the
-secrets region's `prefill_path` pointed at a real blob (plan C16).
+"""Packages a deployment image: the `make image` system with only the two
+secrets regions' `prefill_path`s pointed at real blobs (plan C16, M3 plan
+L6): `key`'s blob in the `secrets` mr and `pqkey`'s in `pq_secrets`.
 
-Usage: package --secrets FILE --out DIR --system FILE --policy FILE
-               --image LOADER --gen-config gen_config.h --search-path DIR
-               --board BOARD --config CONFIG --microkit BIN
+Usage: package --secrets FILE --pq-secrets FILE --out DIR --system FILE
+               --policy FILE --image LOADER --gen-config gen_config.h
+               --search-path DIR --board BOARD --config CONFIG --microkit BIN
 
 The result is accepted only if, against the placeholder build:
-  - the .system differs in nothing but that one attribute;
+  - the .system differs in nothing but those two attributes;
   - the loader images have equal length, differ somewhere, and every
-    differing byte lies inside the one place the blob appears in the new
-    image, where the placeholder image held zeros;
-  - the blob is a full, non-zero region with the right magic.
-Both the blob and OUT must resolve outside the repository (and so `build/`)
+    differing byte lies inside one of the two places the blobs appear in
+    the new image, where the placeholder image held zeros;
+  - each blob is a full region of its own kind (magic, version, checksum,
+    zero padding), so neither can be placed into the other's mr.
+Both blobs and OUT must resolve outside the repository (and so `build/`)
 and the toolchain caches. OUT must not exist yet: the image is built in a
 fresh 0700 staging directory beside it under umask 077, renamed into place
 only after every check passed, and removed on every failure path.
 Until a release kernel has been booted and tested (SC20, architecture R4)
 only `debug` kernels may be packaged, read from the kernel's own
-gen_config.h rather than a make variable.
+gen_config.h rather than a make variable. Independently, a non-debug kernel
+is refused while policy/waivers.toml lists an open waiver (M3 plan,
+Packaging), and a missing or unparsable waiver file refuses any package.
 """
 
 import argparse
+import hashlib
 import os
 import pathlib
 import shutil
@@ -30,29 +35,92 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+from typing import NamedTuple
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import waivers  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-SECRETS_MR = "secrets"
-REGION_SIZE = 4096
-MAGIC = b"SOSSECR1"
+WAIVERS = ROOT / "policy" / "waivers.toml"
 DEBUG_LINE = "#define CONFIG_DEBUG_BUILD  1"
 
 
+class BlobKind(NamedTuple):
+    """One secrets region (crates/secret-blob). `body` gives the length the
+    checksum covers, or None for a malformed header field."""
+    mr: str
+    magic: bytes
+    version: int
+    size: int
+    body: object
+
+
+KEY_MAX_PEERS = (4096 - 80 - 32) // 32
+
+
+def _key_body(blob: bytes):
+    peers = int.from_bytes(blob[12:16], "little")
+    return 80 + 32 * peers if 1 <= peers <= KEY_MAX_PEERS else None
+
+
+# `key` blob v2: header 16 B, gateway key and boot seed, 32 B per peer.
+KEY = BlobKind("secrets", b"SOSSECR1", 2, 4096, _key_body)
+# `pqkey` blob v1: header 12 B, McEliece sk 13608 B, then 4 x 32 B and a
+# 188 B ciphertext: the checksum covers [..13904] (secret_blob::pq).
+PQ = BlobKind("pq_secrets", b"SOSPQKY1", 1, 16384, lambda _blob: 13904)
+KINDS = (KEY, PQ)
+SECRETS_MRS = tuple(k.mr for k in KINDS)
+
+
+def is_debug(gen_config: str) -> bool:
+    return DEBUG_LINE in gen_config.splitlines()
+
+
 def require_debug(gen_config: str) -> list:
-    if DEBUG_LINE in gen_config.splitlines():
+    """The SC20 predicate."""
+    if is_debug(gen_config):
         return []
     return ["package: kernel config is not debug; images are dev-only until release kernels are tested (SC20)"]
 
 
-def check_blob(blob: bytes) -> list:
-    errors = []
-    if len(blob) != REGION_SIZE:
-        errors.append(f"package: blob is {len(blob)} bytes, expected {REGION_SIZE}")
+def check_waivers(gen_config: str, path: pathlib.Path) -> list:
+    """Judged on its own, not through require_debug, so the SC20 refusal
+    cannot mask it. The file is read for every kernel: a missing or
+    unparsable one refuses even a debug package."""
+    try:
+        listed = waivers.load(path)
+    except waivers.WaiverError as e:
+        return [f"package: waiver file unusable, refusing: {e}"]
+    if is_debug(gen_config):
+        return []
+    return [f"package: waiver {w.id} (owner {w.owner}) is open; non-debug kernels are refused until it closes"
+            for w in waivers.open_waivers(listed)]
+
+
+def check_blob(kind: BlobKind, blob: bytes) -> list:
+    """Stops at the first failure: later fields mean nothing past it."""
+    name = f"package: '{kind.mr}' blob"
+    for other in KINDS:
+        if other is not kind and blob.startswith(other.magic):
+            return [f"{name} holds a '{other.mr}' blob ({other.magic.decode()})"]
+    if len(blob) != kind.size:
+        return [f"{name} is {len(blob)} bytes, expected {kind.size}"]
     if not any(blob):
-        errors.append("package: blob is all zero")
-    elif blob[: len(MAGIC)] != MAGIC:
-        errors.append("package: blob has no secrets magic")
-    return errors
+        return [f"{name} is all zero"]
+    if blob[: len(kind.magic)] != kind.magic:
+        return [f"{name} has no {kind.magic.decode()} magic"]
+    version = int.from_bytes(blob[8:12], "little")
+    if version != kind.version:
+        return [f"{name} is version {version}, expected {kind.version}"]
+    body = kind.body(blob)
+    if body is None:
+        return [f"{name} peer count is out of range"]
+    if hashlib.blake2s(blob[:body]).digest() != blob[body:body + 32]:
+        return [f"{name} checksum mismatch"]
+    if any(blob[body + 32:]):
+        return [f"{name} has non-zero padding"]
+    return []
 
 
 def forbidden_roots(repo: pathlib.Path) -> list:
@@ -97,7 +165,7 @@ def _diff_elements(a: ET.Element, b: ET.Element, where: str, errors: list):
         errors.append(f"package: {where}: element <{a.tag}> became <{b.tag}>")
         return
     attrs_a, attrs_b = dict(a.attrib), dict(b.attrib)
-    if a.tag == "memory_region" and a.get("name") == SECRETS_MR and b.get("name") == SECRETS_MR:
+    if a.tag == "memory_region" and a.get("name") == b.get("name") and a.get("name") in SECRETS_MRS:
         attrs_a.pop("prefill_path", None)
         attrs_b.pop("prefill_path", None)
     if attrs_a != attrs_b:
@@ -114,41 +182,54 @@ def _diff_elements(a: ET.Element, b: ET.Element, where: str, errors: list):
 
 def check_systems(placeholder: str, package: str) -> list:
     """The package .system must equal the placeholder one except for the
-    secrets mr's prefill_path, which must be set in both."""
+    two secrets mrs' prefill_paths, which must be set in both."""
     a, b = ET.fromstring(placeholder), ET.fromstring(package)
     errors = []
     _diff_elements(a, b, a.tag, errors)
     for name, root in (("placeholder", a), ("package", b)):
-        mrs = [m for m in root.iter("memory_region") if m.get("name") == SECRETS_MR]
-        if len(mrs) != 1 or not mrs[0].get("prefill_path"):
-            errors.append(f"package: {name} system needs one '{SECRETS_MR}' mr with a prefill_path")
+        for mr in SECRETS_MRS:
+            mrs = [m for m in root.iter("memory_region") if m.get("name") == mr]
+            if len(mrs) != 1 or not mrs[0].get("prefill_path"):
+                errors.append(f"package: {name} system needs one '{mr}' mr with a prefill_path")
     return errors
 
 
-def check_images(placeholder: bytes, package: bytes, blob: bytes) -> list:
+def check_images(placeholder: bytes, package: bytes, blobs: list) -> list:
+    """Every differing byte must lie inside one of the blobs' ranges, each
+    blob appearing exactly once, the ranges disjoint and zero beforehand."""
     if len(placeholder) != len(package):
         return ["package: image length changed"]
     diffs = [i for i, (x, y) in enumerate(zip(placeholder, package)) if x != y]
     if not diffs:
         return ["package: image is identical to the placeholder build"]
-    at = package.find(blob)
-    if at < 0 or package.find(blob, at + 1) >= 0:
-        return ["package: blob does not appear exactly once in the image"]
-    end = at + len(blob)
+    ranges = []
+    for blob in blobs:
+        at = package.find(blob)
+        if at < 0 or package.find(blob, at + 1) >= 0:
+            return [f"package: '{blob[:8].decode(errors='replace')}' blob does not appear exactly once in the image"]
+        ranges.append((at, at + len(blob)))
+    ranges.sort()
+    if any(prev_end > at for (_, prev_end), (at, _) in zip(ranges, ranges[1:])):
+        return ["package: blobs overlap in the image"]
     errors = []
-    if any(placeholder[at:end]):
-        errors.append("package: placeholder image is not zero where the blob lands")
-    if diffs[0] < at or diffs[-1] >= end:
-        errors.append(f"package: image differs outside the blob ({diffs[0]:#x}..{diffs[-1]:#x} vs {at:#x}..{end:#x})")
+    for at, end in ranges:
+        if any(placeholder[at:end]):
+            errors.append(f"package: placeholder image is not zero where a blob lands ({at:#x}..{end:#x})")
+    outside = [i for i in diffs if not any(at <= i < end for at, end in ranges)]
+    if outside:
+        spans = ", ".join(f"{at:#x}..{end:#x}" for at, end in ranges)
+        errors.append(f"package: image differs outside the blobs ({outside[0]:#x}..{outside[-1]:#x} vs {spans})")
     return errors
 
 
-def with_prefill(system: str, blob_path: str) -> str:
+def with_prefill(system: str, blob_paths: dict) -> str:
+    """Points each secrets mr, found by name, at its blob."""
     root = ET.fromstring(system)
-    mrs = [m for m in root.iter("memory_region") if m.get("name") == SECRETS_MR]
-    if len(mrs) != 1:
-        raise SystemExit(f"package: system needs exactly one '{SECRETS_MR}' mr")
-    mrs[0].set("prefill_path", blob_path)
+    for mr in SECRETS_MRS:
+        mrs = [m for m in root.iter("memory_region") if m.get("name") == mr]
+        if len(mrs) != 1:
+            raise SystemExit(f"package: system needs exactly one '{mr}' mr")
+        mrs[0].set("prefill_path", blob_paths[mr])
     return ET.tostring(root, encoding="unicode")
 
 
@@ -183,26 +264,29 @@ def main() -> int:
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(s, exit_on_signal)
     ap = argparse.ArgumentParser()
-    for opt in ("secrets", "out", "system", "policy", "image", "gen-config", "search-path", "board", "config", "microkit"):
+    for opt in ("secrets", "pq-secrets", "out", "system", "policy", "image", "gen-config", "search-path", "board", "config", "microkit"):
         ap.add_argument(f"--{opt}", required=True)
     a = ap.parse_args()
 
-    secrets = pathlib.Path(a.secrets)
+    secrets = {mr: pathlib.Path(path) for mr, path in blob_args(a).items()}
     out = pathlib.Path(a.out)
-    errors = require_debug(pathlib.Path(a.gen_config).read_text())
+    # Both run, so either refusal stays reachable with the other removed.
+    gen_config = pathlib.Path(a.gen_config).read_text()
+    errors = require_debug(gen_config) + check_waivers(gen_config, WAIVERS)
     if errors:
         print("\n".join(errors))
         return 1
     try:
-        errors = check_secrets_path(secrets, ROOT) + check_out_path(out, ROOT)
+        errors = [e for path in secrets.values() for e in check_secrets_path(path, ROOT)]
+        errors += check_out_path(out, ROOT)
     except OSError as e:
         print(f"package: cannot resolve a path to check: {e}")
         return 1
     if errors:
         print("\n".join(errors))
         return 1
-    blob = secrets.read_bytes()
-    errors = check_blob(blob)
+    blobs = {mr: path.read_bytes() for mr, path in secrets.items()}
+    errors = [e for kind in KINDS for e in check_blob(kind, blobs[kind.mr])]
     if errors:
         print("\n".join(errors))
         return 1
@@ -219,7 +303,7 @@ def main() -> int:
         errors = check_location("staging directory", staging, forbidden_roots(ROOT))
         if errors:
             print("\n".join(errors))
-        elif build(a, blob, staging) == 0:
+        elif build(a, blobs, staging) == 0:
             if out.exists() or out.is_symlink():
                 print(f"package: output directory {out} appeared during the build")
             else:
@@ -276,15 +360,22 @@ def publish(src: pathlib.Path, dst: pathlib.Path):
         raise OSError(f"package: cannot publish {dst}: {os.strerror(err)}")
 
 
-def build(a, blob: bytes, out: pathlib.Path) -> int:
-    """Builds in the staging dir `out`. The image is made from a private copy
-    of the blob bytes that were checked, never from the caller's path again,
-    so swapping that path after the check cannot change what is embedded."""
-    blob_copy = out / "secrets.bin"
-    blob_copy.write_bytes(blob)
+def blob_args(a) -> dict:
+    """The operator's blob path for each secrets mr."""
+    return {KEY.mr: a.secrets, PQ.mr: a.pq_secrets}
+
+
+def build(a, blobs: dict, out: pathlib.Path) -> int:
+    """Builds in the staging dir `out`. The image is made from private copies
+    of the blob bytes that were checked (`blobs`, by mr), never from the
+    caller's paths again, so swapping a path after the check cannot change
+    what is embedded."""
+    copies = {mr: out / f"{mr}.bin" for mr in SECRETS_MRS}
+    for mr, copy in copies.items():
+        copy.write_bytes(blobs[mr])
     placeholder_system = pathlib.Path(a.system).read_text()
     system = out / "secureos.system"
-    system.write_text(with_prefill(placeholder_system, str(blob_copy)))
+    system.write_text(with_prefill(placeholder_system, {mr: str(copy) for mr, copy in copies.items()}))
     loader = out / "loader.img"
 
     subprocess.run(["cargo", "run", "--locked", "-q", "-p", "laws", "--", "check", "--system", str(system),
@@ -292,15 +383,18 @@ def build(a, blob: bytes, out: pathlib.Path) -> int:
     subprocess.run([a.microkit, str(system), "--search-path", a.search_path, "--board", a.board,
                     "--config", a.config, "-r", str(out / "report.txt"), "-o", str(loader)], check=True)
 
-    # The blob now lives only inside the image; drop the private copy. The
+    # The blobs now live only inside the image; drop the private copies. The
     # .system microkit consumed is checked before it is replaced by one that
-    # names the operator's blob again (a name only: nothing here follows it),
-    # so the operator can rebuild the image from that file; both are checked.
-    blob_copy.unlink()
+    # names the operator's blobs again (names only: nothing here follows
+    # them), so the operator can rebuild the image from that file; both are
+    # checked.
+    for copy in copies.values():
+        copy.unlink()
     errors = check_systems(placeholder_system, system.read_text())
-    system.write_text(with_prefill(placeholder_system, os.path.abspath(a.secrets)))
+    system.write_text(with_prefill(placeholder_system,
+                                   {mr: os.path.abspath(path) for mr, path in blob_args(a).items()}))
     errors += check_systems(placeholder_system, system.read_text())
-    errors += check_images(pathlib.Path(a.image).read_bytes(), loader.read_bytes(), blob)
+    errors += check_images(pathlib.Path(a.image).read_bytes(), loader.read_bytes(), list(blobs.values()))
     if errors:
         print("\n".join(errors))
         return 1

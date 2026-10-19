@@ -6,6 +6,7 @@ Prints "PACKAGE-FIXTURES <n>" and exits non-zero on any mismatch.
 """
 
 import contextlib
+import hashlib
 import importlib.machinery
 import io
 import importlib.util
@@ -15,6 +16,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 loader = importlib.machinery.SourceFileLoader("package", str(ROOT / "tools/package"))
@@ -24,27 +26,130 @@ loader.exec_module(pkg)
 
 SYSTEM = """<system>
     <memory_region name="secrets" size="0x1000" prefill_path="placeholder.bin" />
+    <memory_region name="pq_secrets" size="0x4000" prefill_path="pq-placeholder.bin" />
     <memory_region name="ring" size="0x1000" />
     <protection_domain name="key" priority="140" passive="true">
         <program_image path="pd-key.elf" />
         <map mr="secrets" vaddr="0x8_000_000" perms="r" />
     </protection_domain>
+    <protection_domain name="pqkey" priority="139" passive="true">
+        <program_image path="pd-pqkey.elf" />
+        <map mr="pq_secrets" vaddr="0x8_000_000" perms="r" />
+    </protection_domain>
 </system>"""
 
-BLOB = pkg.MAGIC + bytes(range(1, 101)) + bytes(pkg.REGION_SIZE - len(pkg.MAGIC) - 100)
+
+def seal(body: bytes, size: int) -> bytes:
+    """As secret_blob's Writer::seal: checksum, then zero padding."""
+    sealed = body + hashlib.blake2s(body).digest()
+    return sealed + bytes(size - len(sealed))
+
+
+def le32(n: int) -> bytes:
+    return n.to_bytes(4, "little")
+
+
+# `key` blob v2 with one peer; `pqkey` blob v1 (crates/secret-blob).
+KEY_BODY = b"SOSSECR1" + le32(2) + le32(1) + bytes(range(1, 97))
+BLOB = seal(KEY_BODY, 4096)
+PQ_BODY = b"SOSPQKY1" + le32(1) + bytes((i * 7 + 3) % 256 for i in range(13904 - 12))
+PQ_BLOB = seal(PQ_BODY, 16384)
+BLOBS = {"secrets": BLOB, "pq_secrets": PQ_BLOB}
 PAD = bytes(5000)
-PLACEHOLDER_IMG = b"\x7fELF" + PAD + bytes(pkg.REGION_SIZE) + PAD
-PACKAGE_IMG = b"\x7fELF" + PAD + BLOB + PAD
+KEY_AT = 4 + len(PAD)
+PQ_AT = KEY_AT + len(BLOB) + len(PAD)
+PQ_END = PQ_AT + len(PQ_BLOB)
+PLACEHOLDER_IMG = b"\x7fELF" + PAD + bytes(4096) + PAD + bytes(16384) + PAD
+PACKAGE_IMG = b"\x7fELF" + PAD + BLOB + PAD + PQ_BLOB + PAD
+SPANS = f"{KEY_AT:#x}..{KEY_AT + len(BLOB):#x}, {PQ_AT:#x}..{PQ_END:#x}"
 GEN_DEBUG = "/* x */\n#define CONFIG_DEBUG_BUILD  1\n#define CONFIG_PRINTING  1\n"
 GEN_RELEASE = "/* disabled: CONFIG_DEBUG_BUILD */\n/* disabled: CONFIG_PRINTING */\n"
+SC20 = "package: kernel config is not debug; images are dev-only until release kernels are tested (SC20)"
+WAIVERS_OPEN = '[[waivers]]\nid = "SC23"\nowner = "M4"\nstatus = "open"\n' \
+    '[[waivers]]\nid = "SC9"\nowner = "M3b"\nstatus = "closed"\n'
+WAIVERS_CLOSED = WAIVERS_OPEN.replace('"open"', '"closed"')
+MISSING_WAIVERS = "package: waiver file unusable, refusing: cannot read <d>/waivers.toml: " \
+    "[Errno 2] No such file or directory: '<d>/waivers.toml'"
+SC23_OPEN = "package: waiver SC23 (owner M4) is open; non-debug kernels are refused until it closes"
 
 
-def package_system(path="/elsewhere/secrets.bin"):
-    return pkg.with_prefill(SYSTEM, path)
+def package_system(path="/elsewhere/secrets.bin", pq_path="/elsewhere/pq.bin"):
+    return pkg.with_prefill(SYSTEM, {"secrets": path, "pq_secrets": pq_path})
 
 
 def flip(img: bytes, at: int) -> bytes:
     return img[:at] + bytes([img[at] ^ 1]) + img[at + 1:]
+
+
+def resealed(blob: bytes, at: int, value: bytes, body: int) -> bytes:
+    """`blob` with `value` written at `at`, its checksum recomputed."""
+    changed = blob[:at] + value + blob[at + len(value):]
+    return seal(changed[:body], len(blob))
+
+
+def waivers_file(text):
+    """check_waivers against a scratch file holding `text` (None: no file)."""
+    def run(gen_config):
+        d = tmp_tree()
+        try:
+            if text is not None:
+                (d / "waivers.toml").write_text(text)
+            return pkg.check_waivers(gen_config, d / "waivers.toml")
+        finally:
+            shutil.rmtree(d)
+    return run
+
+
+def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, stub_sc20=False):
+    """Runs `main()` with `build` replaced and the waiver file pointed at a
+    scratch one (None: absent). Returns what it printed (the success line
+    dropped, the scratch dir shown as <d>), plus a note when the outcome disagrees with that output, so
+    an accepted run returns [] and a refused one exactly its messages.
+    With `stub_sc20` the SC20 predicate passes, so it cannot mask what
+    comes after it."""
+    def run():
+        d = tmp_tree()
+        real = (pkg.build, pkg.require_debug, pkg.WAIVERS, sys.argv)
+        real_umask = os.umask(0o022)
+        os.umask(real_umask)
+        real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+        built = []
+        try:
+            (d / "secrets.bin").write_bytes(key)
+            (d / "pq.bin").write_bytes(pq)
+            (d / "gen_config.h").write_text(gen)
+            if waivers_text is not None:
+                (d / "waivers.toml").write_text(waivers_text)
+            pkg.WAIVERS = d / "waivers.toml"
+            if stub_sc20:
+                pkg.require_debug = lambda _gen: []
+
+            def fake_build(a, blobs, staging):
+                built.append(blobs)
+                (staging / "loader.img").write_bytes(b"image")
+                return 0
+            pkg.build = fake_build
+            sys.argv = ["package", "--secrets", str(d / "secrets.bin"), "--pq-secrets", str(d / "pq.bin"),
+                        "--out", str(d / "pkg"), "--system", "x", "--policy", "x", "--image", "x",
+                        "--gen-config", str(d / "gen_config.h"), "--search-path", "x", "--board", "x",
+                        "--config", "x", "--microkit", "x"]
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured):
+                status = pkg.main()
+            printed = [line.replace(str(d), "<d>") for line in captured.getvalue().splitlines()
+                       if not line.startswith("package: wrote ")]
+            if status == 0 and (printed or built != [BLOBS]):
+                printed.append(f"accepted, but printed {printed} and built {len(built)}")
+            if status != 0 and (not printed or built):
+                printed.append(f"refused (status {status}) with built {len(built)}")
+            return printed
+        finally:
+            pkg.build, pkg.require_debug, pkg.WAIVERS, sys.argv = real
+            os.umask(real_umask)
+            for s, h in real_handlers.items():
+                signal.signal(s, h)
+            shutil.rmtree(d)
+    return run
 
 
 def tmp_tree():
@@ -106,13 +211,14 @@ def run_main(build_result):
         try:
             blob = d / "secrets.bin"
             blob.write_bytes(BLOB)
+            (d / "pq.bin").write_bytes(PQ_BLOB)
             gen = d / "gen_config.h"
             gen.write_text(GEN_DEBUG)
             out = d / "pkg"
 
             built = []
 
-            def fake_build(a, blob_bytes, staging):
+            def fake_build(a, blobs, staging):
                 built.append(1)
                 (staging / "loader.img").write_bytes(b"image")
                 if build_result == "raise":
@@ -148,7 +254,8 @@ def run_main(build_result):
                 return build_result
 
             pkg.build = fake_build
-            sys.argv = ["package", "--secrets", str(blob), "--out", str(out), "--system", "x", "--policy", "x",
+            sys.argv = ["package", "--secrets", str(blob), "--pq-secrets", str(d / "pq.bin"), "--out", str(out),
+                        "--system", "x", "--policy", "x",
                         "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
                         "--config", "x", "--microkit", "x"]
             real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
@@ -276,19 +383,21 @@ def staging_in_forbidden_root():
     try:
         blob = d / "secrets.bin"
         blob.write_bytes(BLOB)
+        (d / "pq.bin").write_bytes(PQ_BLOB)
         gen = d / "gen_config.h"
         gen.write_text(GEN_DEBUG)
         calls = []
 
         def roots(repo):
             calls.append(1)
-            # The first two calls are the blob and OUT checks; the third is
-            # the staging re-check, which now sees `d` as forbidden.
-            return real_roots(repo) + ([d.resolve()] if len(calls) > 2 else [])
+            # The first three calls are the two blob and the OUT checks; the
+            # fourth is the staging re-check, which now sees `d` as forbidden.
+            return real_roots(repo) + ([d.resolve()] if len(calls) > 3 else [])
 
         pkg.forbidden_roots = roots
         pkg.build = lambda *a: built.append(1) or 0
-        sys.argv = ["package", "--secrets", str(blob), "--out", str(d / "pkg"), "--system", "x", "--policy", "x",
+        sys.argv = ["package", "--secrets", str(blob), "--pq-secrets", str(d / "pq.bin"), "--out", str(d / "pkg"),
+                    "--system", "x", "--policy", "x",
                     "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
                     "--config", "x", "--microkit", "x"]
         out = io.StringIO()
@@ -298,7 +407,7 @@ def staging_in_forbidden_root():
         if status != 1 or built or (d / "pkg").exists() or [p for p in d.iterdir() if p.name.startswith(".pkg.")]:
             errors.append(f"staging in a forbidden root was not refused cleanly (status {status}, built {built})")
         # Refused by the staging re-check itself, not by an earlier check.
-        if "staging directory" not in out.getvalue() or len(calls) != 3:
+        if "staging directory" not in out.getvalue() or len(calls) != 4:
             errors.append(f"refused by another check: {out.getvalue().strip()!r}, {len(calls)} root lookups")
         return errors
     finally:
@@ -404,10 +513,10 @@ def _build_case(tamper: bool):
             if cmd[0] == "cargo":
                 return
             system = pathlib.Path(cmd[1])
-            prefill = [m.get("prefill_path") for m in pkg.ET.fromstring(system.read_text()).iter("memory_region")
-                       if m.get("name") == pkg.SECRETS_MR][0]
-            seen["prefill"] = prefill
-            seen["bytes"] = pathlib.Path(prefill).read_bytes()
+            for mr in pkg.SECRETS_MRS:
+                prefill = [m.get("prefill_path") for m in pkg.ET.fromstring(system.read_text())
+                           .iter("memory_region") if m.get("name") == mr][0]
+                seen[mr] = (prefill, pathlib.Path(prefill).read_bytes() if pathlib.Path(prefill).is_file() else b"")
             if tamper:
                 system.write_text(system.read_text().replace('priority="140"', 'priority="141"'))
             pathlib.Path(cmd[cmd.index("-o") + 1]).write_bytes(PACKAGE_IMG)
@@ -418,10 +527,11 @@ def _build_case(tamper: bool):
             system, image, policy, search_path, board, config, microkit = (
                 str(d / "system.xml"), str(d / "placeholder.img"), "p", "s", "b", "c", "microkit")
             secrets = str(d / "operator" / "secrets.bin")
+            pq_secrets = str(d / "operator" / "pq.bin")
 
         captured = io.StringIO()
         with contextlib.redirect_stdout(captured):
-            status = pkg.build(A, BLOB, staging)
+            status = pkg.build(A, BLOBS, staging)
         if tamper:
             if status != 1 or "attributes of <protection_domain>" not in captured.getvalue():
                 return [f"a changed consumed .system was accepted (status {status})"]
@@ -429,14 +539,17 @@ def _build_case(tamper: bool):
         errors = []
         if status != 0:
             errors.append(f"build failed ({status})")
-        if not seen.get("prefill", "").startswith(str(staging)) or seen.get("bytes") != BLOB:
-            errors.append(f"image not built from the private copy: {seen.get('prefill')}")
-        if (staging / "secrets.bin").exists():
-            errors.append("private blob copy left beside the image")
-        packaged = [m.get("prefill_path") for m in pkg.ET.fromstring((staging / "secureos.system").read_text())
-                    .iter("memory_region") if m.get("name") == pkg.SECRETS_MR][0]
-        if packaged != A.secrets:
-            errors.append(f"packaged .system names {packaged}, not the operator's blob")
+        for mr, operator in (("secrets", A.secrets), ("pq_secrets", A.pq_secrets)):
+            prefill, consumed = seen.get(mr, ("", b""))
+            if not prefill.startswith(str(staging)) or consumed != BLOBS[mr]:
+                errors.append(f"'{mr}' not built from its private copy: {prefill}")
+            packaged = [m.get("prefill_path") for m in pkg.ET.fromstring((staging / "secureos.system").read_text())
+                        .iter("memory_region") if m.get("name") == mr][0]
+            if packaged != operator:
+                errors.append(f"packaged .system names {packaged} for '{mr}', not the operator's blob")
+        left = sorted(p.name for p in staging.iterdir() if p.suffix == ".bin")
+        if left:
+            errors.append(f"private blob copies left beside the image: {left}")
         return errors
     finally:
         pkg.subprocess.run = real_run
@@ -471,33 +584,132 @@ def existing_out(d):
     return d / "pkg"
 
 
-# (name, expected error substring or None for accept, check)
+def toml_error(text: str) -> str:
+    try:
+        tomllib.loads(text)
+    except tomllib.TOMLDecodeError as e:
+        return str(e)
+    raise AssertionError(f"{text!r} parses")
+
+
+def outside(at: int) -> list:
+    return [f"package: image differs outside the blobs ({at:#x}..{at:#x} vs {SPANS})"]
+
+
+IMAGE_BLOBS = [BLOB, PQ_BLOB]
+
+# (name, expected: an error substring, a list of the exact errors, or None
+# for accept; check)
 CASES = [
     ("real package accepted", None,
-     lambda: pkg.check_systems(SYSTEM, package_system()) + pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG, BLOB)
-     + pkg.check_blob(BLOB) + pkg.require_debug(GEN_DEBUG)),
-    ("empty image diff", "identical to the placeholder", lambda: pkg.check_images(PLACEHOLDER_IMG, PLACEHOLDER_IMG, BLOB)),
+     lambda: pkg.check_systems(SYSTEM, package_system())
+     + pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG, IMAGE_BLOBS)
+     + pkg.check_blob(pkg.KEY, BLOB) + pkg.check_blob(pkg.PQ, PQ_BLOB) + pkg.require_debug(GEN_DEBUG)),
+    ("both blobs swapped in, in either order", None,
+     lambda: pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG, [PQ_BLOB, BLOB])),
+    ("empty image diff", "identical to the placeholder",
+     lambda: pkg.check_images(PLACEHOLDER_IMG, PLACEHOLDER_IMG, IMAGE_BLOBS)),
     ("image diff outside the blob", "differs outside the blob",
-     lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, 2), BLOB)),
+     lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, 2), IMAGE_BLOBS)),
     ("image diff just past the blob", "differs outside the blob",
-     lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, 4 + len(PAD) + len(BLOB)), BLOB)),
-    ("image length changed", "length changed", lambda: pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG + b"\0", BLOB)),
-    ("placeholder not zero under the blob", "not zero where the blob lands",
-     lambda: pkg.check_images(flip(PLACEHOLDER_IMG, 4 + len(PAD) + 200), PACKAGE_IMG, BLOB)),
+     lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, KEY_AT + len(BLOB)), IMAGE_BLOBS)),
+    ("image diff just before the key blob", outside(KEY_AT - 1),
+     lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, KEY_AT - 1), IMAGE_BLOBS)),
+    ("image diff between the two blobs", outside(PQ_AT - 100),
+     lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, PQ_AT - 100), IMAGE_BLOBS)),
+    ("image diff just before the pq blob", outside(PQ_AT - 1),
+     lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, PQ_AT - 1), IMAGE_BLOBS)),
+    ("image diff just past the pq blob", outside(PQ_END),
+     lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, PQ_END), IMAGE_BLOBS)),
+    ("image diff in the last byte", outside(len(PACKAGE_IMG) - 1),
+     lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, len(PACKAGE_IMG) - 1), IMAGE_BLOBS)),
+    ("pq blob missing from the image", ["package: 'SOSPQKY1' blob does not appear exactly once in the image"],
+     lambda: pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG[:PQ_AT] + bytes(len(PQ_BLOB)) + PACKAGE_IMG[PQ_END:],
+                              IMAGE_BLOBS)),
+    ("image length changed", "length changed",
+     lambda: pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG + b"\0", IMAGE_BLOBS)),
+    ("placeholder not zero under the blob", "not zero where a blob lands",
+     lambda: pkg.check_images(flip(PLACEHOLDER_IMG, KEY_AT + 200), PACKAGE_IMG, IMAGE_BLOBS)),
+    ("placeholder not zero under the pq blob",
+     [f"package: placeholder image is not zero where a blob lands ({PQ_AT:#x}..{PQ_END:#x})"],
+     lambda: pkg.check_images(flip(PLACEHOLDER_IMG, PQ_AT + 200), PACKAGE_IMG, IMAGE_BLOBS)),
     # A second copy present at the same offset in both images: no extra
     # diff, so only the uniqueness clause can reject it.
     ("blob appears twice", "exactly once",
-     lambda: pkg.check_images(PLACEHOLDER_IMG + BLOB, PACKAGE_IMG + BLOB, BLOB)),
-    ("all-zero blob", "all zero", lambda: pkg.check_blob(bytes(pkg.REGION_SIZE))),
-    ("short blob", "expected 4096", lambda: pkg.check_blob(BLOB[:-1])),
-    ("blob without magic", "no secrets magic", lambda: pkg.check_blob(b"X" + BLOB[1:])),
+     lambda: pkg.check_images(PLACEHOLDER_IMG + BLOB, PACKAGE_IMG + BLOB, IMAGE_BLOBS)),
+    ("pq blob appears twice", ["package: 'SOSPQKY1' blob does not appear exactly once in the image"],
+     lambda: pkg.check_images(PLACEHOLDER_IMG + PQ_BLOB, PACKAGE_IMG + PQ_BLOB, IMAGE_BLOBS)),
+    ("all-zero blob", "all zero", lambda: pkg.check_blob(pkg.KEY, bytes(4096))),
+    ("short blob", "expected 4096", lambda: pkg.check_blob(pkg.KEY, BLOB[:-1])),
+    ("blob without magic", "no SOSSECR1 magic", lambda: pkg.check_blob(pkg.KEY, b"X" + BLOB[1:])),
+    ("key blob version 1", ["package: 'secrets' blob is version 1, expected 2"],
+     lambda: pkg.check_blob(pkg.KEY, resealed(BLOB, 8, le32(1), len(KEY_BODY)))),
+    ("key blob peer count zero", ["package: 'secrets' blob peer count is out of range"],
+     lambda: pkg.check_blob(pkg.KEY, resealed(BLOB, 12, le32(0), len(KEY_BODY)))),
+    ("key blob checksum mismatch", ["package: 'secrets' blob checksum mismatch"],
+     lambda: pkg.check_blob(pkg.KEY, flip(BLOB, 20))),
+    ("key blob non-zero padding", ["package: 'secrets' blob has non-zero padding"],
+     lambda: pkg.check_blob(pkg.KEY, flip(BLOB, 4095))),
+    ("pq blob in the key's mr", ["package: 'secrets' blob holds a 'pq_secrets' blob (SOSPQKY1)"],
+     lambda: pkg.check_blob(pkg.KEY, PQ_BLOB)),
+    ("key blob in the pq mr", ["package: 'pq_secrets' blob holds a 'secrets' blob (SOSSECR1)"],
+     lambda: pkg.check_blob(pkg.PQ, BLOB)),
+    ("pq blob bad magic", ["package: 'pq_secrets' blob has no SOSPQKY1 magic"],
+     lambda: pkg.check_blob(pkg.PQ, b"X" + PQ_BLOB[1:])),
+    ("pq blob version 2", ["package: 'pq_secrets' blob is version 2, expected 1"],
+     lambda: pkg.check_blob(pkg.PQ, resealed(PQ_BLOB, 8, le32(2), len(PQ_BODY)))),
+    ("pq blob checksum mismatch", ["package: 'pq_secrets' blob checksum mismatch"],
+     lambda: pkg.check_blob(pkg.PQ, flip(PQ_BLOB, 13903))),
+    ("pq blob checksum field changed", ["package: 'pq_secrets' blob checksum mismatch"],
+     lambda: pkg.check_blob(pkg.PQ, flip(PQ_BLOB, 13904))),
+    ("pq blob non-zero padding", ["package: 'pq_secrets' blob has non-zero padding"],
+     lambda: pkg.check_blob(pkg.PQ, flip(PQ_BLOB, 13936))),
+    ("short pq blob", ["package: 'pq_secrets' blob is 16383 bytes, expected 16384"],
+     lambda: pkg.check_blob(pkg.PQ, PQ_BLOB[:-1])),
+    ("main() packages both blobs", None, main_checks()),
+    ("main() refuses the pq blob given as --secrets",
+     ["package: 'secrets' blob holds a 'pq_secrets' blob (SOSPQKY1)",
+      "package: 'pq_secrets' blob holds a 'secrets' blob (SOSSECR1)"],
+     main_checks(key=PQ_BLOB, pq=BLOB)),
+    ("main() refuses a bad pq blob", ["package: 'pq_secrets' blob checksum mismatch"],
+     main_checks(pq=flip(PQ_BLOB, 100))),
     ("other attribute changed", "attributes of <protection_domain>",
      lambda: pkg.check_systems(SYSTEM, package_system().replace('priority="140"', 'priority="141"'))),
     ("other mr's attribute changed", "attributes of <memory_region>",
      lambda: pkg.check_systems(SYSTEM, package_system().replace('name="ring" size="0x1000"', 'name="ring" size="0x2000"'))),
+    ("prefill_path added to a non-secrets mr", ["package: system/memory_region[2]: attributes of <memory_region> changed"],
+     lambda: pkg.check_systems(SYSTEM, package_system().replace('name="ring"', 'name="ring" prefill_path="/x"'))),
+    ("package system without the pq mr's prefill_path",
+     ["package: package system needs one 'pq_secrets' mr with a prefill_path"],
+     lambda: pkg.check_systems(SYSTEM, package_system().replace('prefill_path="/elsewhere/pq.bin"', 'prefill_path=""'))),
     ("element added", "children",
      lambda: pkg.check_systems(SYSTEM, package_system().replace("</system>", '<memory_region name="x" size="0x1000" /></system>'))),
     ("non-debug kernel", "not debug", lambda: pkg.require_debug(GEN_RELEASE)),
+    ("open waiver refuses a non-debug kernel, named", [SC23_OPEN], lambda: waivers_file(WAIVERS_OPEN)(GEN_RELEASE)),
+    ("each open waiver is named",
+     [SC23_OPEN, "package: waiver SC9 (owner M3b) is open; non-debug kernels are refused until it closes"],
+     lambda: waivers_file(WAIVERS_OPEN.replace('"closed"', '"open"'))(GEN_RELEASE)),
+    ("open waiver allows a debug kernel", None, lambda: waivers_file(WAIVERS_OPEN)(GEN_DEBUG)),
+    ("no open waiver allows a non-debug kernel", None, lambda: waivers_file(WAIVERS_CLOSED)(GEN_RELEASE)),
+    ("the repository's waiver file parses", None, lambda: pkg.check_waivers(GEN_DEBUG, pkg.WAIVERS)),
+    # With the SC20 predicate stubbed to pass, so it cannot mask the waiver
+    # gate (M3 plan, Packaging).
+    ("SC20 stubbed: an open waiver refuses and names itself", [SC23_OPEN],
+     main_checks(gen=GEN_RELEASE, stub_sc20=True)),
+    ("SC20 stubbed: a missing waiver file refuses", [MISSING_WAIVERS],
+     main_checks(gen=GEN_RELEASE, waivers_text=None, stub_sc20=True)),
+    ("SC20 stubbed: an unparsable waiver file refuses",
+     [f"package: waiver file unusable, refusing: not valid TOML: {toml_error('[[waivers]')}"],
+     main_checks(gen=GEN_RELEASE, waivers_text="[[waivers]", stub_sc20=True)),
+    ("SC20 stubbed: a waiver outside the schema refuses",
+     ["package: waiver file unusable, refusing: waiver SC23: status 'maybe' is not one of open, closed"],
+     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_OPEN.replace('"open"', '"maybe"'), stub_sc20=True)),
+    ("SC20 stubbed: no open waiver allows", None,
+     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, stub_sc20=True)),
+    ("a missing waiver file refuses a debug kernel too", [MISSING_WAIVERS], main_checks(waivers_text=None)),
+    ("non-debug kernel with no open waiver: SC20 alone", [SC20],
+     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED)),
+    ("non-debug kernel with an open waiver: both refusals", [SC20, SC23_OPEN], main_checks(gen=GEN_RELEASE)),
     ("secrets path inside the repo", "inside", lambda: pkg.check_secrets_path(ROOT / "build/secrets.bin", ROOT)),
     ("secrets path outside the repo", None, lambda: pkg.check_secrets_path(pathlib.Path("/tmp/s.bin"), ROOT)),
     ("secrets path inside the cargo home", "inside", secrets_in_cargo_home),
@@ -538,6 +750,8 @@ def main() -> int:
         errors = run()
         if want is None:
             ok = not errors
+        elif isinstance(want, list):
+            ok = errors == want
         else:
             ok = len(errors) == 1 and want in errors[0]
         failures += not ok
