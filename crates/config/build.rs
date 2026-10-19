@@ -4,7 +4,7 @@
 //! validation error fails the build.
 
 // Shared with mksecrets, which also uses the encoders.
-#[allow(dead_code)]
+#[allow(dead_code)] // intentional: the encoders shared with mksecrets are unused here
 mod validate {
     include!("src/validate.rs");
 }

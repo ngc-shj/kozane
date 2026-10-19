@@ -123,7 +123,7 @@ enum Entry {
     /// A `Live` entry that the tick found REJECT_AFTER_TIME old; its OSK
     /// was zeroized. `installed_at` is kept for inspection only: no
     /// decision reads it, so it can never make the entry fresh again.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // kept for inspection only, see above
     Expired { installed_at: u64 },
 }
 

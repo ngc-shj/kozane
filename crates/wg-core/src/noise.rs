@@ -171,7 +171,7 @@ impl<const MAX_PEERS: usize> Responder<MAX_PEERS> {
     /// timestamp key comes from `ss`, so the PSK check is the earliest point
     /// at which the sender is authenticated; a refusal there commits no
     /// replay or flood state.
-    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // each seam is a distinct trust boundary; see the PD wiring
     pub fn consume_initiation(
         &mut self,
         msg: &[u8; wg_wire::INITIATION_LEN],

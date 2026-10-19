@@ -493,7 +493,7 @@ impl<'k, const P: usize> Responder<'k, P> {
 
 /// RHR6: `pidi ‖ biscuit_no ‖ ck` sealed under the biscuit key with ad
 /// KH(KH(KH(biscuit_ad, spkm), sidi), sidr); the nonce's top bit is the slot.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)] // mirrors upstream's RHR6 inputs one to one
 fn seal_biscuit<R: Rng>(
     ad_m: &[u8; KEY_LEN],
     key: &BiscuitKey,

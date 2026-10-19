@@ -2,7 +2,7 @@
 
 Implementation decisions not spelled out by plan rev 7, or departing from it.
 
-## Prep (db99846)
+## Prep (`db99846`)
 
 - **Crate skeletons and pinned dependencies were committed once, up
   front,** so that parallel batches would not race on `Cargo.lock`. The
