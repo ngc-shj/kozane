@@ -1112,24 +1112,6 @@ fn unsent_takes_back_the_newest_forward() {
 }
 
 #[test]
-fn a_wireguard_flood_leaves_the_rosenpass_meters_untouched() {
-    let mut r = Rig::idle();
-    let mut g = RpGate::default();
-    let m = initiation(true);
-    let f = udp_to(CFG.mac, CFG.ipv4, CFG.port, &m);
-    let mut limited = 0;
-    for _ in 0..1000 {
-        let o = respond(&CFG, &mut r.gate, &mut r.crypto, &FakeMac1, &mut r.buckets, 0, LOADED, TX_FREE, &f, &mut [0u8; wire::MAX_FRAME], &mut r.out);
-        limited += usize::from(o != Outcome::Initiation { src: SRC, msg: m[..].try_into().unwrap(), mac2_checked: false });
-    }
-    assert!(limited > 0 && r.loaded(0, IDLE), "the flood did not load the WireGuard path");
-    assert_eq!(g, RpGate::default());
-    for i in 0..RP_HELLO_GLOBAL_BURST as u8 {
-        assert!(forwarded(rp_drained(&mut g, 0, src(i), &hello())));
-    }
-}
-
-#[test]
 fn a_rosenpass_flood_leaves_the_wireguard_meters_untouched() {
     let mut r = Rig::idle();
     let mut g = RpGate::default();

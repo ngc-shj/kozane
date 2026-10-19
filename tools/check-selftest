@@ -68,12 +68,13 @@ CASES_FOR_GATE = {
     "unit": {"unit", "c5-forward-burst", "c5-backlog", "c5-interval", "c5-key-calls",
              "arrival-interval-order", "arrival-burst-order", "late-notify", "unbounded-drain",
              "rotate-before-max-age", "net-buffers-equal", "l8-stale", "l8-expiry-tick", "l8-order",
-             "rp-domain-label", "rp-mac-always", "c2-hello-burst", "c2-hello-interval"},
+             "rp-domain-label", "rp-mac-always", "c2-hello-burst", "c2-hello-interval", "c2-boot-spkm",
+             "c2-boot-kat", "c4-hello-src", "c4-hello-global", "c4-conf-src", "c4-conf-global", "c4-type-filter"},
     "kani": {"kani", "kani-cache"},
-    "bolero": {"bolero", "bolero-wg-wire"},
+    "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire"},
     "laws": {"laws", "laws-timer-ingress", "laws-pq-key", "laws-hs-pqkey", "laws-pq-secrets-writable"},
     "test": {"integration", "integration-count", "integration-residue", "integration-cookie",
-             "integration-pq-residue", "l8-fallback"},
+             "integration-pq-residue", "l8-fallback", "integration-rp-src-meter"},
     "manifest": {"manifest"},
 }
 
@@ -121,6 +122,10 @@ CASES = {
                                           "for_each(|bytes: &[u8]| if bytes.len() >= 20 { std::eprintln!(\"selftest-bolero-injected\"); panic!() })"),
                # bolero hides the panic message, so the injection prints its own.
                "selftest-bolero-injected"),
+    "bolero-rosenpass-wire": (["bolero"], lambda t: edit(t, "crates/rosenpass-wire/src/tests.rs",
+                                                         "bolero::check!().for_each(fuzz_one);",
+                                                         "bolero::check!().for_each(|b: &[u8]| if b.len() >= 20 { std::eprintln!(\"selftest-bolero-rp-injected\"); panic!() });"),
+                              "selftest-bolero-rp-injected"),
     "bolero-wg-wire": (["bolero"], lambda t: edit(t, "crates/wg-wire/src/tests.rs",
                                                   "bolero::check!().for_each(fuzz_one);",
                                                   "bolero::check!().for_each(|b: &[u8]| if b.len() >= 20 { std::eprintln!(\"selftest-bolero-wg-injected\"); panic!() });"),
@@ -149,6 +154,12 @@ CASES = {
                                                      "        if let Err(e) = self.to_data.reclaim() {\n",
                                                      "        if let Err(e) = Ok::<(), _>(()) {\n"),
                             "install message still in guest RAM"),
+    # The integration bucket pair (M3 plan C4): without the per-source
+    # InitHello meter, a replay inside the source interval is answered.
+    "integration-rp-src-meter": (["test"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                          "RpKind::Hello => self.hello_src.allow(ip, now_ns) && self.hello_global.allow(now_ns),",
+                                                          "RpKind::Hello => self.hello_global.allow(now_ns),"),
+                                 "rosenpass bucket: a replay within the source's interval was answered"),
     # The same scan over the pq->hs link (M3 plan C7): without pq's reclaim
     # on hs's notify, the PskInstall (an OSK) stays in guest RAM.
     "integration-pq-residue": (["test"], lambda t: edit(t, "crates/pds/pq/src/main.rs",
@@ -197,7 +208,7 @@ CASES = {
     "l8-stale": (["unit"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                           "Some(Entry::Live { osk, installed_at }) if now_ns.saturating_sub(*installed_at) < REJECT_AFTER_TIME_NS =>",
                                           "Some(Entry::Live { osk, installed_at: _ }) =>"),
-                 "psk_is_refused_at_exactly_reject_after_time_and_accepted_one_ns_before"),
+                 "---- tests::psk_is_refused_at_exactly_reject_after_time_and_accepted_one_ns_before stdout ----"),
     "l8-expiry-tick": (["unit"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                                 "                *entry = Entry::Expired { installed_at };\n",
                                                 "                let _ = installed_at;\n"),
@@ -211,11 +222,11 @@ CASES = {
                                           "        state.last_timestamp = timestamp;\n"
                                           "        state.last_accept_ns = Some(now_ns);\n"
                                           "        let psk = psks.fresh(peer, now_ns).map_err(Reject::Psk)?;\n"),
-                 "psk_refusal_leaves_the_timestamp_and_flood_state_unchanged"),
+                 "---- tests::psk_refusal_leaves_the_timestamp_and_flood_state_unchanged stdout ----"),
     # One Rosenpass domain label changed must break the upstream vectors.
     "rp-domain-label": (["unit"], lambda t: edit(t, "crates/rosenpass-core/src/crypto.rs",
                                                  'mix: kh_public(&ckextract, b"mix")?', 'mix: kh_public(&ckextract, b"miy")?'),
-                        "resp_hello_and_its_ck_chain_match_upstream_byte_for_byte"),
+                        "---- tests::resp_hello_and_its_ck_chain_match_upstream_byte_for_byte stdout ----"),
     # The pqkey budget invariant (M3 plan C2): each side loosened on its own.
     "c2-hello-burst": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
                                                 "pub const RP_HELLO_GLOBAL_BURST: u64 = 8;",
@@ -225,11 +236,39 @@ CASES = {
                                                    "pub const RP_HELLO_GLOBAL_INTERVAL_NS: u64 = 10_000_000_000;",
                                                    "pub const RP_HELLO_GLOBAL_INTERVAL_NS: u64 = 9_999_999_999;"),
                           "C2: ingress can forward InitHellos faster than pqkey refills"),
+    # pqkey's boot checks (M3 plan C2, fixtures a/b), each skipped alone.
+    "c2-boot-spkm": (["unit"], lambda t: edit(t, "crates/pqkey-core/src/lib.rs",
+                                              "        return Err(BootError::SpkmMismatch);\n", "        let _ = ();\n"),
+                     "---- tests::foreign_blob_halts_on_the_public_key_hash stdout ----"),
+    "c2-boot-kat": (["unit"], lambda t: edit(t, "crates/pqkey-core/src/lib.rs",
+                                             "        return Err(BootError::KatMismatch);\n", "        let _ = ();\n"),
+                    "---- tests::another_valid_secret_key_with_kat_and_hash_kept_halts_on_the_kat stdout ----"),
+    # ingress's Rosenpass meters and type filter (M3 plan C4), each bypassed
+    # alone.
+    "c4-hello-src": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                              "RpKind::Hello => self.hello_src.allow(ip, now_ns) && self.hello_global.allow(now_ns),",
+                                              "RpKind::Hello => self.hello_global.allow(now_ns),"),
+                     "---- tests::a_source_over_its_hello_burst_is_rate_limited_then_refills stdout ----"),
+    "c4-hello-global": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                 "RpKind::Hello => self.hello_src.allow(ip, now_ns) && self.hello_global.allow(now_ns),",
+                                                 "RpKind::Hello => self.hello_src.allow(ip, now_ns),"),
+                        "---- tests::hellos_over_the_global_burst_are_rate_limited_then_refill stdout ----"),
+    "c4-conf-src": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                             "RpKind::Conf => self.conf_src.allow(ip, now_ns) && self.conf_global.allow(now_ns),",
+                                             "RpKind::Conf => self.conf_global.allow(now_ns),"),
+                    "---- tests::a_source_over_its_conf_burst_is_rate_limited_then_refills stdout ----"),
+    "c4-conf-global": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                "RpKind::Conf => self.conf_src.allow(ip, now_ns) && self.conf_global.allow(now_ns),",
+                                                "RpKind::Conf => self.conf_src.allow(ip, now_ns),"),
+                       "---- tests::confs_over_the_global_burst_are_rate_limited_then_refill stdout ----"),
+    "c4-type-filter": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                "        Some(&RP_MSG_INIT_HELLO) => {", "        Some(&RP_MSG_INIT_HELLO | &0x01) => {"),
+                       "---- tests::every_other_type_or_length_is_dropped_before_the_mac stdout ----"),
     # ingress's Rosenpass mac gate accepting everything must fail `unit`.
     "rp-mac-always": (["unit"], lambda t: edit(t, "crates/pds/ingress/src/rp_mac.rs",
                                                "(Ok(want), Some(got)) => ct_eq(&want, got),",
                                                "(Ok(want), Some(got)) => ct_eq(&want, got) || true,"),
-                      "a_flipped_mac_byte_fails"),
+                      "---- a_flipped_mac_byte_fails stdout ----"),
     # Load must begin on arrivals no later than on forwards (M2.5 plan C3).
     "arrival-interval-order": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
                                                         "pub const ARRIVAL_INTERVAL_NS: u64 = 5_000_000;",

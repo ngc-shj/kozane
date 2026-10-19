@@ -500,8 +500,15 @@ fn psk_is_refused_at_exactly_reject_after_time_and_accepted_one_ns_before() {
     let (_, msg) = Initiator::initiation(ts(1));
     let (out, ..) = handle_with(&mut handshaker(), &msg, T_INSTALL + REJECT_AFTER_TIME_NS - 1, &peers, &psks);
     assert!(matches!(out, Outcome::Accepted { .. }), "{out:?}");
-    let (out, ..) = handle_with(&mut handshaker(), &msg, T_INSTALL + REJECT_AFTER_TIME_NS, &peers, &psks);
+    let mut h = handshaker();
+    let (out, install, response) = handle_with(&mut h, &msg, T_INSTALL + REJECT_AFTER_TIME_NS, &peers, &psks);
     assert_eq!(out, Outcome::Rejected(Reject::Psk(PskRefusal::Stale)));
+    assert!(install.iter().chain(&response).all(|&b| b == 0), "a stale refusal produced output");
+    // Nothing was committed: the same initiation is accepted once a fresh
+    // PSK is installed.
+    psks.install(0, &PSK, T_INSTALL + REJECT_AFTER_TIME_NS).unwrap();
+    let (out, ..) = handle_with(&mut h, &msg, T_INSTALL + REJECT_AFTER_TIME_NS, &peers, &psks);
+    assert!(matches!(out, Outcome::Accepted { .. }), "{out:?}");
 }
 
 #[test]

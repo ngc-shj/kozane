@@ -34,7 +34,8 @@ const PEERS: usize = config::PEERS.len();
 const _: () = assert!(PEERS <= config::MAX_PEERS);
 
 /// Our McEliece public key and each peer's, in `config::PEERS` order (about
-/// 4.5 MiB). Only this crate expands the macros, so only `pq` carries them.
+/// 4.5 MiB). Only `pq` expands both macros; `ingress` expands
+/// `gateway_rp_public!` alone, to derive its mac key.
 static SPKM: &[u8; SPK_LEN] = config::gateway_rp_public!();
 static SPKTS: [&[u8; SPK_LEN]; PEERS] = config::peer_rp_publics!();
 

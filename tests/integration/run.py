@@ -75,7 +75,6 @@ HOST_MAC = bytes.fromhex("0200000099" "02")
 HOST_IP = bytes([10, 99, 0, 2])
 BCAST = b"\xff" * 6
 
-READY = ["eth_out: ready", "ingress: ready", "audit: ready", "inner: ready", "data: ready", "hs: ready"]
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 
 
@@ -190,7 +189,7 @@ def check_reason_list_matches_rust():
 
 
 # QEMU's serial console ends lines with "\r\r\n".
-READY_LINE = re.compile(r"(eth_out|eth_in|ingress|inner|data|hs|audit): ready\r*\n")
+READY_LINE = re.compile(r"(eth_out|eth_in|ingress|inner|data|hs|audit|pq): ready\r*\n")
 
 
 def start_without_stop_signals(thread: threading.Thread):
@@ -265,7 +264,8 @@ class Console:
             with self.lock:
                 text = self.text[since:]
             if strip_ready:
-                text = READY_LINE.sub("", text)
+                # Keep the ready line being waited for.
+                text = READY_LINE.sub(lambda r: r.group(0) if f"{r.group(1)}: ready" in pattern else "", text)
             m = rx.search(text)
             if m:
                 return m
@@ -1254,6 +1254,7 @@ def test_mismatched_blob(loader: str):
 # Every timing and band the cookie cases judge is named here, once; the
 # protocol constants come from the Rust sources.
 INGRESS_CORE = "crates/ingress-core/src/lib.rs"
+ROSENPASS_WIRE = "crates/rosenpass-wire/src/lib.rs"
 WG_CORE = "crates/wg-core/src/lib.rs"
 NS = 1e9
 TIMER_TICK_S = 1.0             # pd-timer notifies once per second
@@ -1901,10 +1902,10 @@ def py_installed(conf: str, gw_pub: bytes, rp: Rosenpass, deadline: float) -> Py
 
 
 def rust_usize(rel: str, name: str) -> int:
-    m = re.search(rf"pub const {name}: (?:usize|u\d+) = ([0-9_]+);", open(os.path.join(ROOT, rel)).read())
+    m = re.search(rf"pub const {name}: (?:usize|u\d+) = (0x[0-9a-fA-F_]+|[0-9_]+);", open(os.path.join(ROOT, rel)).read())
     if not m:
         raise Fail(f"{name} not found in {rel}")
-    return int(m.group(1))
+    return int(m.group(1), 0)
 
 
 def sniffed_init_hello(sniffer: Sniffer) -> bytes:
@@ -1919,41 +1920,64 @@ def sniffed_init_hello(sniffer: Sniffer) -> bytes:
 
 def rp_deny_cases(con: Console, hello: bytes, passed: list):
     """ingress's Rosenpass gates, paired [C4]: a genuine InitHello (sniffed
-    from a client) with one mac byte flipped is refused as RpBadMac while
-    the genuine bytes are answered; replayed above the per-source burst, it
-    draws RpRateLimited. The client after this completes once refilled."""
+    from a client) with one mac byte flipped is refused as RpBadMac and
+    draws no RespHello, while the genuine bytes are answered. A replay right
+    after, while the global meter still holds tokens, draws no RespHello:
+    only the per-source meter can refuse it. The client after this
+    completes once refilled."""
+    resp_hello = rust_usize(ROSENPASS_WIRE, "MSG_RESP_HELLO")
+    mac_at = len(hello) - rust_usize(ROSENPASS_WIRE, "COOKIE_LEN") - rust_usize(ROSENPASS_WIRE, "MAC_LEN")
+    src_interval = rust_usize(INGRESS_CORE, "RP_HELLO_SRC_INTERVAL_NS") / 1e9
+    global_interval = rust_usize(INGRESS_CORE, "RP_HELLO_GLOBAL_INTERVAL_NS") / 1e9
+    cost = rust_usize(PQKEY_CORE, "PQ_HANDSHAKE_COST_NS") / 1e9
+    # Waiting out the source meter must refill the global one by at least
+    # two tokens: one for the genuine bytes, one left for the replay.
+    if src_interval + 1 < 2 * global_interval:
+        raise Fail("rosenpass bucket: the source wait no longer refills the global meter twice")
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+    def resp_hellos(window: float, first: bool = False) -> int:
+        """RespHellos received within `window`; with `first`, returns at the
+        first one, so the caller's next send stays inside the meter's
+        interval."""
+        n, until = 0, time.monotonic() + window
+        while (left := until - time.monotonic()) > 0:
+            s.settimeout(left)
+            try:
+                n += s.recv(2048)[:1] == bytes([resp_hello])
+            except socket.timeout:
+                break
+            if first and n:
+                break
+        return n
+
     try:
         s.bind((ip_str(PEER_IP), 0))
         bad = bytearray(hello)
-        bad[-32] ^= 1  # the envelope's mac, before the cookie field
+        bad[mac_at] ^= 1
         mark = con.mark()
         s.sendto(bytes(bad), (ip_str(GW_IP), RP_PORT))
         con.wait_for(r"audit: src=ingress RpBadMac total=1 ", since=mark)
         # The client's own InitHellos came from this source: wait out its
-        # meter, so only the mac decides the genuine bytes' fate.
-        time.sleep(rust_usize(INGRESS_CORE, "RP_HELLO_SRC_INTERVAL_NS") / 1e9 + 1)
+        # meter (watching for any answer to the flipped bytes), so only the
+        # mac decides the genuine bytes' fate.
+        if resp_hellos(src_interval + 1):
+            raise Fail("rosenpass mac pair: the flipped-mac InitHello got a RespHello")
         s.sendto(hello, (ip_str(GW_IP), RP_PORT))
-        until = time.monotonic() + RP_EXCHANGE_S
-        while True:
-            s.settimeout(max(0.01, until - time.monotonic()))
-            try:
-                d = s.recv(2048)
-            except socket.timeout:
-                raise Fail("rosenpass mac pair: the genuine InitHello got no RespHello") from None
-            if d[:1] == b"\x82":
-                break
+        sent = time.monotonic()
+        if not resp_hellos(RP_EXCHANGE_S, first=True):
+            raise Fail("rosenpass mac pair: the genuine InitHello got no RespHello")
         passed.append("rosenpass mac deny")
         print("\nPASS [rosenpass mac: one flipped byte refused at ingress, the genuine bytes answered]")
-        # Enough above the burst that the refusals cross a coalesced line
-        # (the client's own retransmissions may have printed total=1).
-        n = rust_usize(INGRESS_CORE, "RP_HELLO_SRC_BURST") + 64 + 8
-        mark = con.mark()
-        for _ in range(n):
-            s.sendto(hello, (ip_str(GW_IP), RP_PORT))
-        con.wait_for(r"audit: src=ingress RpRateLimited total=\d+ ", since=mark)
+        # The replay must land inside the source interval that the genuine
+        # send opened, or the per-source meter has refilled.
+        if time.monotonic() - sent >= src_interval:
+            raise Fail("rosenpass bucket: the genuine answer took the whole source interval; no room for the replay")
+        s.sendto(hello, (ip_str(GW_IP), RP_PORT))
+        if resp_hellos(2 * cost):
+            raise Fail("rosenpass bucket: a replay within the source's interval was answered")
         passed.append("rosenpass bucket deny")
-        print(f"\nPASS [rosenpass bucket: {n} replays from one source drew RpRateLimited]")
+        print("\nPASS [rosenpass bucket: a replay inside the source interval drew no RespHello]")
     finally:
         s.close()
 

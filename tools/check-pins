@@ -23,8 +23,9 @@ Rules:
      is removed (M3 plan L8, F21)
   P8 no `getrandom|thread_rng|OsRng` in crates/ (*.rs, Cargo.toml):
      randomness comes only through `cpu` and the hedged source
-  P9 no derive(Clone|Copy|Debug) on a type wrapping `Secret<` in
-     rosenpass-core, pqkey-core or pds/pq (L12, M3 plan S12)
+  P9 no derive(Clone|Copy|Debug) on a type wrapping `Secret<` or
+     `Zeroizing<` in rosenpass-core, pqkey-core, pds/pq or pds/pqkey (L12,
+     M3 plan S12; pqkey-core holds its secrets in `Zeroizing`)
 
 Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
 fail until they are removed from PENDING; --enforce-pending makes them fail
@@ -39,6 +40,16 @@ D := -) and masks built from variables or functions. The adjudicating
 control for "a failing gate fails `make check`" is tools/check-selftest's
 check-propagation case, which runs the real `make check` once per gate with
 that gate made to fail.
+
+P6 is a fail-closed binding check (Cargo.lock against policy/waivers.toml).
+P7-P9 are best-effort tripwires over source text. Known bypasses: a
+hand-written `impl Debug`/`impl Clone` or a macro-generated derive (P9), a
+`use ... as` alias or a renamed dependency key (`package = "getrandom"`)
+(P8), and spellings outside the pattern (P7). The adjudicating control for
+L12 is the compiler: `Secret<N>` is not Clone/Copy/Debug, so a derive on a
+type wrapping it does not build; `Zeroizing<[u8; N]>` is Clone, so P9 is
+the only guard for pqkey-core's wrappers. L8's adjudicating control is
+`PskTable::fresh` being the only constructor of `FreshPsk`.
 """
 
 import argparse
@@ -54,7 +65,7 @@ import waivers  # noqa: E402
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9"]
 PENDING: set[str] = set()
 # Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
-SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq"]
+SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey"]
 
 
 def run_blocks(dockerfile: str):
@@ -229,9 +240,10 @@ def check_secret_derives(root: pathlib.Path, out: list):
             for m in re.finditer(r"\bderive\(([^)]*)\)", code):
                 if not re.search(r"\b(Clone|Copy|Debug)\b", m.group(1)):
                     continue
-                if "Secret<" in item_after(code, m.end()):
+                wrapped = next((w for w in ("Secret<", "Zeroizing<") if w in item_after(code, m.end())), None)
+                if wrapped:
                     n = code.count("\n", 0, m.start()) + 1
-                    out.append(f"P9 {rel}:{n}: derive({m.group(1)}) on a type wrapping Secret<")
+                    out.append(f"P9 {rel}:{n}: derive({m.group(1)}) on a type wrapping {wrapped}")
 
 
 def main() -> int:

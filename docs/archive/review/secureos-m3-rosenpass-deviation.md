@@ -436,3 +436,95 @@ Implementation decisions not spelled out by plan rev 7, or departing from it.
 - **Verification:** `make check` exit 0 (586 s, with the Kani cache warm)
   on the commit that records this entry. INTEGRATION-CASES 22,
   KANI-HARNESSES 48, UNIT-TESTS 647.
+
+## Step 2-5 self-R-check
+
+- **Security, 4 Minor:**
+  - **RS1 (fixed):** `PskInstall` no longer derives `PartialEq`. The test
+    compares fields.
+  - **R2 (fixed):** `msgs::RP_LENS` is asserted against `rosenpass-wire`'s
+    lengths in pd-ingress.
+  - **R3 (fixed):** P9 also matches `Zeroizing<`, since pqkey-core holds
+    its secrets that way, and covers `crates/pds/pqkey`. Two new fixtures;
+    CHECK-PINS-FIXTURES 63 → 65.
+  - **R1, kept:** three `ct_eq` copies remain, in wg-core, rosenpass-core
+    and pqkey-core.
+    - The check proposed moving them into `secret-blob`, but only
+      pqkey-core depends on it.
+    - Doing so would make wg-core and rosenpass-core depend on the key
+      blob format crate, which inverts the layering for a five-line
+      function.
+    - The three copies are identical. The P9 gate and Phase 3 review read
+      them as one primitive.
+    - Revisit if a shared no_std primitives crate appears.
+
+### Testing findings (3 Major, 4 Minor), all fixed
+
+1. **RT7, selftest needles matched passing runs.**
+   - `l8-stale`, `l8-order`, `rp-domain-label` and `rp-mac-always` used
+     bare test names, which `unit.log` also prints for a test that
+     passes.
+   - Each needle is now cargo's failure-only header
+     `---- <test> stdout ----`.
+2. **RT7/RT8, the integration bucket deny could not attribute the
+   refusal.**
+   - It sent 73 replays and waited for a coalesced `RpRateLimited`. The
+     global meter or the ring could produce that line just as well.
+   - Now one replay follows the genuine InitHello. It is sent after the
+     source wait has refilled the global meter by at least two tokens (the
+     harness asserts that precondition), and must draw no RespHello
+     within 2× `PQ_HANDSHAKE_COST_NS`.
+   - The mac deny also asserts that the flipped bytes draw no RespHello.
+   - New selftest case `integration-rp-src-meter` removes the per-source
+     InitHello meter.
+3. **RT7, plan-required red-proofs were missing.**
+   - New unit selftest cases, each with a failure-only needle:
+     - `c2-boot-spkm` and `c2-boot-kat` (fixtures a/b);
+     - `c4-hello-src`, `c4-hello-global`, `c4-conf-src` and
+       `c4-conf-global` (each meter bypassed alone);
+     - `c4-type-filter` (0x01 accepted as InitHello).
+4. **Decorative test removed:**
+   `a_wireguard_flood_leaves_the_rosenpass_meters_untouched` never passed
+   its `RpGate` to `respond`. The isolation in that direction holds by
+   signature (Batch E2). UNIT-INGRESS-CORE 80 → 79.
+5. **Missing bolero case:** new `bolero-rosenpass-wire` selftest case for
+   the third bolero target.
+6. **Weak Stale test:** the Stale refusal test now also asserts that it
+   produced no install or response. It also asserts that the same
+   initiation is accepted once a fresh PSK is installed (nothing was
+   committed).
+7. **Hard-coded wire constants:**
+   - The integration pair reads the mac offset, RespHello's type, the
+     meter intervals and `PQ_HANDSHAKE_COST_NS` from source.
+   - `rust_usize` now also parses hex constants.
+
+### Functionality findings (1 Major, 3 Minor), all fixed
+
+1. **R49:** the check-pins docstring now declares control classes.
+   - P6 is fail-closed; P7–P9 are tripwires, with their known bypasses
+     listed.
+   - It names the adjudicating controls: the compiler for `Secret<N>`,
+     and `PskTable::fresh` for L8.
+   - It notes that `Zeroizing` wrappers rely on P9 alone.
+2. **R3, mksecrets RNG:** `Urandom` fills a failed read with LCG bytes, as
+   `CmrRng` does. A zero fill could hang cmr's sampling before `check()`
+   refuses the output.
+3. **R3/R42:** `READY_LINE` includes `pq`. The unused `READY` list is
+   removed.
+4. **R29:** comments corrected.
+   - `pq` and `ingress` both expand `gateway_rp_public!`.
+   - The C2 assertion lives in pqkey-core.
+
+### Verification after the self-check fixes
+- **New selftest cases:** all 13 fail with their failure-only needles,
+  including `integration-rp-src-meter`, which takes one integration run.
+- **Harness fixes found by the reruns:**
+  - `strip_ready` kept removing the ready line being waited for, once
+    `pq` joined `READY_LINE`. It now keeps the awaited line, as its
+    docstring always said.
+  - The bucket pair's reply wait returned only at the end of its
+    240 s window, so the replay landed after the source meter had
+    refilled. It now returns at the first RespHello, and the harness
+    refuses to send the replay outside the source interval.
+- **`make check`:** exit 0 (604 s) on the commit that records this entry.
+  UNIT-TESTS 646, INTEGRATION-CASES 22, CHECK-PINS-FIXTURES 65.

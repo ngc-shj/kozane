@@ -49,6 +49,15 @@ const _: () = assert!(ingress_core::RP_MSG_INIT_HELLO == rosenpass_wire::MSG_INI
 const _: () = assert!(ingress_core::RP_INIT_HELLO_LEN == rosenpass_wire::INIT_HELLO_LEN);
 const _: () = assert!(ingress_core::RP_MSG_INIT_CONF == rosenpass_wire::MSG_INIT_CONF);
 const _: () = assert!(ingress_core::RP_INIT_CONF_LEN == rosenpass_wire::INIT_CONF_LEN);
+// msgs' accepted Rosenpass lengths are rosenpass-wire's, which it does not
+// depend on.
+const _: () = assert!(
+    msgs::RP_LENS[0] == rosenpass_wire::INIT_HELLO_LEN
+        && msgs::RP_LENS[1] == rosenpass_wire::RESP_HELLO_LEN
+        && msgs::RP_LENS[2] == rosenpass_wire::INIT_CONF_LEN
+        && msgs::RP_LENS[3] == rosenpass_wire::EMPTY_DATA_LEN,
+    "msgs::RP_LENS differs from rosenpass-wire"
+);
 // An encoded `RpDatagram` (endpoint + the longest message) fits a buffer.
 const _: () = assert!(6 + rosenpass_wire::RESP_HELLO_LEN <= layout::NET_BUF_SIZE);
 

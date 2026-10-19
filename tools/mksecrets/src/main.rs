@@ -80,12 +80,13 @@ fn keypair() -> Result<KeyPair, String> {
 struct Urandom {
     file: std::fs::File,
     failed: bool,
+    filler: u64,
 }
 
 impl Urandom {
     fn open() -> Result<Self, String> {
         let file = std::fs::File::open("/dev/urandom").map_err(|e| format!("/dev/urandom: {e}"))?;
-        Ok(Urandom { file, failed: false })
+        Ok(Urandom { file, failed: false, filler: 0 })
     }
 
     fn check(&self) -> Result<(), String> {
@@ -109,7 +110,13 @@ impl rand_core::RngCore for Urandom {
     fn fill_bytes(&mut self, dest: &mut [u8]) {
         if self.file.read_exact(dest).is_err() {
             self.failed = true;
-            dest.fill(0);
+            // Discarded output (`check` refuses it); varying bytes end cmr's
+            // rejection sampling, which a zero fill would loop forever in.
+            for b in dest.iter_mut() {
+                self.filler = self.filler.wrapping_mul(0x5851_f42d_4c95_7f2d).wrapping_add(1);
+                let [top, ..] = self.filler.to_be_bytes();
+                *b = top;
+            }
         }
     }
 

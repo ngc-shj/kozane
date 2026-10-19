@@ -180,7 +180,7 @@ CASES = [
      lambda t: append(t / "crates/pqkey-core/Cargo.toml", '\n[features]\nstd = ["rand_core/getrandom"]\n')),
     ("allow getrandom in Cargo.lock", set(),
      lambda t: append(t / "Cargo.lock", '\n[[package]]\nname = "getrandom"\nversion = "0.2.15"\n')),
-    # P9: Secret<-wrapping types in rosenpass-core, pqkey-core and pds/pq.
+    # P9: Secret<- or Zeroizing<-wrapping types in the secret crates.
     ("P9 derive(Clone) on a Secret wrapper", {"P9"},
      lambda t: append(t / "crates/rosenpass-core/src/lib.rs", SECRET + "#[derive(Clone)]\npub struct Osk(Secret<32>);\n")),
     ("P9 derive(Debug) behind another attribute", {"P9"},
@@ -189,6 +189,11 @@ CASES = [
     ("P9 cfg_attr derive(Copy) in pds/pq", {"P9"},
      lambda t: write(t / "crates/pds/pq/src/main.rs",
                      SECRET + "#[cfg_attr(test, derive(Copy))]\nenum Slot {\n    Live(Secret<32>),\n    Empty,\n}\n")),
+    ("P9 derive(Clone) on a Zeroizing wrapper in pqkey-core", {"P9"},
+     lambda t: append(t / "crates/pqkey-core/src/lib.rs",
+                      "\n#[derive(Clone)]\npub struct Seed(zeroize::Zeroizing<[u8; 32]>);\n")),
+    ("P9 derive(Debug) on a Secret wrapper in pds/pqkey", {"P9"},
+     lambda t: write(t / "crates/pds/pqkey/src/main.rs", SECRET + "#[derive(Debug)]\nstruct Shk(Secret<32>);\n")),
     ("P9 derive(Debug) on Secret itself", {"P9"},
      lambda t: append(t / "crates/rosenpass-core/src/lib.rs", "\n#[derive(Debug)]\npub struct Secret<const N: usize>([u8; N]);\n")),
     ("allow derive(Clone) on a type without a Secret", set(),

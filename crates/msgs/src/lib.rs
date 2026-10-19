@@ -221,8 +221,8 @@ impl<'a> RpDatagram<'a> {
 
 /// pq → hs: a fresh Rosenpass OSK for `peer`, the WireGuard PSK under L8.
 /// Secret, so the receiving buffer is zeroed once copied out; not
-/// `Debug`/`Clone`/`Copy`.
-#[derive(PartialEq, Eq)]
+/// `Debug`/`Clone`/`Copy`, nor `PartialEq` (no variable-time `==` on the
+/// OSK).
 pub struct PskInstall<'a> {
     pub peer: u16,
     pub osk: &'a [u8; 32],

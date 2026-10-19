@@ -109,7 +109,8 @@ fn psk_install_round_trips_and_rejects_other_sizes() {
     let mut out = [0u8; 64];
     let n = PskInstall { peer: 7, osk: &osk }.encode(&mut out).unwrap();
     assert_eq!(n, PSK_INSTALL_LEN);
-    assert!(PskInstall::decode(&out[..n]) == Ok(PskInstall { peer: 7, osk: &osk }));
+    let got = PskInstall::decode(&out[..n]).ok().unwrap();
+    assert_eq!((got.peer, got.osk), (7, &osk));
     assert!(PskInstall::decode(&out[..n - 1]).is_err());
     assert!(PskInstall::decode(&out[..n + 1]).is_err());
 }

@@ -58,7 +58,7 @@ const _: () = assert!(pq::CT_LEN == cmr::CRYPTO_CIPHERTEXTBYTES);
 const _: () = assert!(pq::SHK_LEN == cmr::CRYPTO_BYTES);
 
 /// `pq`'s call budget: `PQ_KEY_BURST` calls, refilled at one per
-/// `PQ_KEY_INTERVAL_NS` (M3 plan C2). `pq` asserts at build time that
+/// `PQ_KEY_INTERVAL_NS` (M3 plan C2). Asserted below, at build time, so
 /// ingress's InitHello meters cannot exhaust it: the burst covers the global
 /// InitHello burst, the link backlog, the one in hand and the boot calls,
 /// and the refill is no slower than the global InitHello refill.

@@ -314,8 +314,9 @@ pub fn check(text: &str, max_peers: usize, load: &dyn Fn(&str) -> Result<Vec<u8>
 
 /// Renders the compiled configuration. `gateway_rp_file` and `peer_rp_files`
 /// are the absolute paths of the McEliece public keys copied to OUT_DIR:
-/// the generated macros embed them only in the crate that expands them
-/// (`pq`, M3 plan F9/L6), never in `config` itself.
+/// the generated macros embed them only in the crates that expand them
+/// (`pq` both, `ingress` the gateway's; M3 plan F9/L6), never in `config`
+/// itself.
 pub fn render(c: &Checked, gateway_rp_file: &str, peer_rp_files: &[String]) -> String {
     let mut s = String::new();
     s += &format!("pub const MAX_PEERS: usize = {MAX_PEERS};\n");
