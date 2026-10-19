@@ -903,11 +903,22 @@ def ignore_signals():
 def signals_held():
     """Blocks stop signals for a teardown in the middle of the run; one that
     arrives meanwhile is delivered when the teardown has finished."""
-    old = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    held = None
+    try:
+        old = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+    except SystemExit as e:
+        # A handler already pending ran inside the blocking call (CPython
+        # runs it once the mask is set) and has ignored further signals:
+        # still run the teardown, then end the run.
+        held = e
+        old = None
     try:
         yield
     finally:
-        signal.pthread_sigmask(signal.SIG_SETMASK, old)
+        if old is not None:
+            signal.pthread_sigmask(signal.SIG_SETMASK, old)
+        if held is not None:
+            raise held
 
 
 def exit_on_signal(signum, _frame):

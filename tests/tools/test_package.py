@@ -120,6 +120,9 @@ def run_main(build_result):
                 if build_result == "out-appears":
                     out.mkdir()
                     return 0
+                if build_result == "publish-fails":
+                    pkg.publish = failing_publish
+                    return 0
                 if build_result in ("sigterm", "two-signals", "early-second-signal"):
                     os.kill(os.getpid(), signal.SIGTERM)
                 if build_result == "sigint":
@@ -183,6 +186,10 @@ def run_main(build_result):
                     real_rmtree(path, **kw)
                 pkg.shutil.rmtree = second_signal
             real_remove = pkg.remove_staging
+            real_publish = pkg.publish
+
+            def failing_publish(src, dst):
+                raise OSError(22, "Invalid argument")
             if build_result == "early-second-signal":
                 # The second signal lands after the first ended the build and
                 # before the removal: the teardown's own ignoring covers it
@@ -205,6 +212,7 @@ def run_main(build_result):
                 signal.signal = real_signal
                 pkg.shutil.rmtree = real_rmtree
                 pkg.remove_staging = real_remove
+                pkg.publish = real_publish
                 left_blocked = signal.pthread_sigmask(signal.SIG_SETMASK, real_sigmask)
                 for s, h in real_handlers.items():
                     signal.signal(s, h)
@@ -225,7 +233,10 @@ def run_main(build_result):
                 errors.append("main() returned before building")
             if left_blocked != real_sigmask:
                 errors.append(f"main() left signals blocked: {sorted(left_blocked - real_sigmask)}")
-            expected = {1: 1, "raise": "raised", "out-appears": 1, 0: 0, "signal-in-ignore-loop": 1}.get(build_result)
+            expected = {1: 1, "raise": "raised", "out-appears": 1, 0: 0, "signal-in-ignore-loop": 1,
+                        "publish-fails": 1}.get(build_result)
+            if build_result == "publish-fails" and "package: cannot publish" not in captured.getvalue():
+                errors.append("a failed publish was not reported as a package: message")
             if expected is not None and status != expected:
                 errors.append(f"status {status}, want {expected}")
             if build_result in ("removal-fails", "signal-and-removal-fails"):
@@ -395,6 +406,7 @@ def build_uses_the_checked_bytes():
         class A:
             system, image, policy, search_path, board, config, microkit = (
                 str(d / "system.xml"), str(d / "placeholder.img"), "p", "s", "b", "c", "microkit")
+            secrets = str(d / "operator" / "secrets.bin")
 
         status = pkg.build(A, BLOB, staging)
         errors = []
@@ -404,6 +416,10 @@ def build_uses_the_checked_bytes():
             errors.append(f"image not built from the private copy: {seen.get('prefill')}")
         if (staging / "secrets.bin").exists():
             errors.append("private blob copy left beside the image")
+        packaged = [m.get("prefill_path") for m in pkg.ET.fromstring((staging / "secureos.system").read_text())
+                    .iter("memory_region") if m.get("name") == pkg.SECRETS_MR][0]
+        if packaged != A.secrets:
+            errors.append(f"packaged .system names {packaged}, not the operator's blob")
         return errors
     finally:
         pkg.subprocess.run = real_run
@@ -489,6 +505,7 @@ CASES = [
     ("the image is built from a private copy of the checked blob", None, build_uses_the_checked_bytes),
     ("publishing refuses to replace an OUT that appeared", None, publish_never_replaces(True)),
     ("publishing to a free OUT succeeds", None, publish_never_replaces(False)),
+    ("a failed publish is reported and leaves no OUT or staging", None, run_main("publish-fails")),
     ("output inside build/", "inside", lambda: pkg.check_out_path(ROOT / "build/pkg", ROOT)),
     ("output inside the repo", "inside", lambda: pkg.check_out_path(ROOT / "pkg-out", ROOT)),
     ("output through a symlink into the repo", "inside", out_case(link_into_repo)),

@@ -326,3 +326,26 @@ Functionality: no findings (fixture fidelity, sibling parity, R29/R49, R2/R12, R
 - X9-2: both boots' QEMU teardown runs under `signals_held()`.
 - X9-3: a key listed twice in the manifest is refused (fixture, red-proved).
 - X9-4: the Kani harness asserts that any datagram the parser accepts with TTL 0 or 1 is refused as `TtlExpired` (proved by the kani gate in `make check`).
+
+# Round 10
+Date: 2026-10-19 — incremental review of `6c8bcad..f1c4fb0` (the loop limit). No Critical or Major findings from any expert; R43: no widening; all Round-9 findings resolved.
+
+## Findings (all Minor)
+| ID | Finding |
+|---|---|
+| S10-1 | `signals_held` blocked outside its own try: a pending handler raising on entry skipped `kill(child)` / `wg.close()` (pdeathsig was the only backstop) |
+| F-R10-1 | A failed publish (race, or renameat2 unavailable) ended in a traceback instead of a `package:` message |
+| F-R10-2 | The packaged `.system` named the deleted staging copy of the blob, so it no longer reproduced the image |
+| T10-1 | The Kani TTL deny-side assertion had no cover of its own |
+
+## Recurring Issue Check (Round 10)
+Functionality: sibling parity (F-R10-1), consumers of changed outputs (F-R10-2); R2/R12, R29/R49, R43 checked. Security: RS5 (S10-1); R3, R43, RS1–RS4 checked; RS6 N/A. Testing: RT3 robustness (T10-1); RT1, RT2, RT4–RT11 checked; RT9 8/8 anchors.
+
+## Resolution Status (Round 10)
+- S10-1: `signals_held` holds an exit raised by its own blocking call, runs the guarded teardown, then re-raises; fixture "signals_held runs its teardown even if entering it raises", red-proved by removing the hold.
+- F-R10-1: a failed publish prints `package: cannot publish …` and exits 1 with staging removed (fixture, red-proved: without the handling the fixture run crashes on the OSError).
+- F-R10-2: after microkit, the packaged `.system` is rewritten to name the operator's blob (a name only; package never follows it); fixture asserts it, red-proved.
+- T10-1: `kani::cover!` for TTL 1 and TTL 0 inside the deny-side block (proved by the kani gate in `make check`).
+
+## Termination
+The 10-round limit is reached. Every finding through Round 10 is fixed, each with a red-proven fixture or proof and `make check` green; the Round-10 fixes themselves have not had an eleventh review round. Decision recorded with the user (see below).

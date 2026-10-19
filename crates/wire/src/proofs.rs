@@ -117,6 +117,10 @@ fn forward_decrements_ttl_and_keeps_the_datagram_valid() {
     // with TTL 0 or 1 is always refused as TtlExpired.
     if let Ok(p) = parse_ipv4_packet(input) {
         if p.packet[8] <= 1 {
+            // Pins reachability directly, not by inference through
+            // forward_ipv4's internal order.
+            kani::cover!(p.packet[8] == 1);
+            kani::cover!(p.packet[8] == 0);
             assert!(forward_ipv4(input, &mut out) == Err(DropReason::TtlExpired));
         }
     }

@@ -225,8 +225,11 @@ def main() -> int:
             else:
                 # Atomic and never replacing: an OUT created after the check
                 # above makes the rename fail instead of being overwritten.
-                publish(staging, out)
-                status = 0
+                try:
+                    publish(staging, out)
+                    status = 0
+                except OSError as e:
+                    print(e if str(e).startswith("package:") else f"package: cannot publish {out}: {e}")
     finally:
         # The final teardown: no stop signal may cut it short or skip its
         # leftover report. All three are blocked in one call, then ignored,
@@ -288,8 +291,11 @@ def build(a, blob: bytes, out: pathlib.Path) -> int:
     subprocess.run([a.microkit, str(system), "--search-path", a.search_path, "--board", a.board,
                     "--config", a.config, "-r", str(out / "report.txt"), "-o", str(loader)], check=True)
 
-    # The blob now lives only inside the image; drop the private copy.
+    # The blob now lives only inside the image; drop the private copy, and
+    # make the packaged .system name the operator's blob again (a name only:
+    # nothing here follows it), so it can rebuild the image from that file.
     blob_copy.unlink()
+    system.write_text(with_prefill(placeholder_system, os.path.abspath(a.secrets)))
     errors = check_systems(placeholder_system, system.read_text())
     errors += check_images(pathlib.Path(a.image).read_bytes(), loader.read_bytes(), blob)
     if errors:

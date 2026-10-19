@@ -184,6 +184,41 @@ def main_holds_and_reraises(mode: str, want: str):
     return check
 
 
+HELD_CHILD = r"""
+import importlib.util, signal, sys
+spec = importlib.util.spec_from_file_location("run", sys.argv[1])
+run = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(run)
+for s in run.STOP_SIGNALS:
+    signal.signal(s, run.exit_on_signal)
+real_mask = signal.pthread_sigmask
+
+def raising_once(how, mask):
+    signal.pthread_sigmask = real_mask
+    real_mask(how, mask)
+    run.exit_on_signal(signal.SIGTERM, None)
+
+signal.pthread_sigmask = raising_once
+done = []
+try:
+    with run.signals_held():
+        done.append("teardown")
+    print(f"no exit, done={done}")
+except SystemExit as e:
+    print(f"exit {e.code}, done={done}")
+"""
+
+
+def signals_held_runs_the_teardown_first() -> list:
+    """A handler raising as signals_held blocks must not skip the teardown it
+    guards (S10-1): the body runs, then the run ends."""
+    r = subprocess.run([sys.executable, "-c", HELD_CHILD, str(ROOT / "tests/integration/run.py")],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0 or "exit 143, done=['teardown']" not in r.stdout:
+        return [f"signals_held skipped its teardown: rc={r.returncode} {r.stdout.strip()!r} {r.stderr[-200:]!r}"]
+    return []
+
+
 def netns_harness_installs_the_guard() -> list:
     """The guard only protects runs that install it: in_netns must do so
     before anything else."""
@@ -215,6 +250,7 @@ CHECKS = [
     ("the netns harness installs the guard first", lambda: netns_harness_installs_the_guard()),
     ("the final teardown holds an exit until removal", lambda: final_teardown_holds_an_exit()),
     ("ignore_signals blocks before ignoring", lambda: ignore_signals_has_no_window()),
+    ("signals_held runs its teardown even if entering it raises", lambda: signals_held_runs_the_teardown_first()),
     ("main returns the failure status when no signal arrives", main_holds_and_reraises("plain", "returned 1, gone=True")),
     ("main re-raises an exit held on entry to its teardown", main_holds_and_reraises("entry", "exit 143, gone=True")),
 ]
