@@ -150,3 +150,20 @@ incremental review.
   - a 1 s settle (`DENY_SETTLE_S`) runs before the `WgMac2Accepted` count;
   - the time check is kept.
 - **Verification:** `make check` exit 0 alone.
+
+# Review round: 3
+Round 3 reviewed `7a86aef..ac3e2ba`, an incremental diff touching docs and
+the test harness only.
+- **Functionality:** No findings. R2-F1 resolved, and the R2-T5 change is
+  sound.
+- **Security:** No findings. S2 resolved, and R43 shows no widening.
+- **Testing:** No findings.
+  - R2-T5 resolved.
+  - The "not red-proved" justification is accepted: reaching the count
+    needs a gateway that accepts only B's first initiation plus a forced
+    audit delay, and even then the settle would not be isolated.
+
+## Termination
+All three experts returned "No findings" in Round 3. Code review is
+complete after 3 rounds; every finding from Rounds 1–2 is resolved, and
+`make check` passed alone on `ac3e2ba`.
