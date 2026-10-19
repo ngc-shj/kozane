@@ -1,7 +1,7 @@
-//! Timer PD: an sp804 in periodic mode notifies `data` and `hs` once per
-//! second. Notify-only by construction (L1 timer exemption): it maps only
-//! its own device page, takes no PPCs, and its peers cannot notify it, so
-//! nothing an attacker controls can reach it.
+//! Timer PD: an sp804 in periodic mode notifies `data`, `hs` and `ingress`
+//! once per second. Notify-only by construction (L1 timer exemption): it
+//! maps only its own device page, takes no PPCs, and its peers cannot
+//! notify it, so nothing an attacker controls can reach it.
 
 #![no_std]
 #![no_main]
@@ -23,7 +23,7 @@ const CTRL_INT_ENABLE: u32 = 1 << 5;
 const CTRL_32BIT: u32 = 1 << 1;
 
 const DEVICE: Channel = Channel::new(ch::CH_DEVICE);
-const PEERS: [Channel; 2] = [Channel::new(ch::CH_DATA), Channel::new(ch::CH_HS)];
+const PEERS: [Channel; 3] = [Channel::new(ch::CH_DATA), Channel::new(ch::CH_HS), Channel::new(ch::CH_INGRESS)];
 
 struct Sp804 {
     base: NonNull<u32>,

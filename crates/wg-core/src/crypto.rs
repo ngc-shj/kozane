@@ -2,6 +2,8 @@
 //! HASH = BLAKE2s-256, MAC = keyed BLAKE2s-128, HMAC = RFC 2104 over
 //! BLAKE2s (64-byte block), KDF1..3, AEAD = ChaCha20-Poly1305 with nonce
 //! `0u32 || counter_le64`, DH = X25519 rejecting the all-zero output.
+//! Cookies (section 5.4.7) add MAC under a 16-byte key and XAEAD =
+//! XChaCha20-Poly1305.
 //!
 //! libcrux's internal stack state (BLAKE2s state, ChaCha20 key stream) is
 //! not zeroized by libcrux; only values owned here are.
@@ -13,6 +15,7 @@ pub const KEY_LEN: usize = 32;
 pub const HASH_LEN: usize = 32;
 pub const MAC_LEN: usize = 16;
 pub const TAG_LEN: usize = 16;
+pub const XNONCE_LEN: usize = 24;
 
 const HMAC_BLOCK: usize = 64;
 
@@ -88,6 +91,18 @@ pub fn hash(parts: &[&[u8]]) -> Result<[u8; HASH_LEN], CryptoError> {
 
 /// MAC(key, parts...) = keyed BLAKE2s with a 16-byte digest.
 pub fn mac(key: &[u8; HASH_LEN], parts: &[&[u8]]) -> Result<[u8; MAC_LEN], CryptoError> {
+    let mut st = Blake2sBuilder::new_keyed_const(key).build_const_digest_len::<MAC_LEN>();
+    for p in parts {
+        st.update(p).map_err(|_| CryptoError::Hash)?;
+    }
+    let mut out = [0u8; MAC_LEN];
+    st.finalize(&mut out);
+    Ok(out)
+}
+
+/// MAC keyed with a 16-byte key (a cookie). BLAKE2s puts the key length in
+/// its parameter block, so this is not `mac` over the key zero-padded to 32.
+pub fn mac16(key: &[u8; MAC_LEN], parts: &[&[u8]]) -> Result<[u8; MAC_LEN], CryptoError> {
     let mut st = Blake2sBuilder::new_keyed_const(key).build_const_digest_len::<MAC_LEN>();
     for p in parts {
         st.update(p).map_err(|_| CryptoError::Hash)?;
@@ -204,5 +219,20 @@ pub fn aead_open(
             libcrux_chacha20poly1305::AeadError::InvalidCiphertext => CryptoError::Auth,
             _ => CryptoError::Buffer,
         })?;
+    Ok(len)
+}
+
+/// XAEAD(key, nonce, plaintext, aad): writes ciphertext || tag to `out`,
+/// returns its length.
+pub fn xaead_seal(
+    key: &Key32,
+    nonce: &[u8; XNONCE_LEN],
+    plaintext: &[u8],
+    aad: &[u8],
+    out: &mut [u8],
+) -> Result<usize, CryptoError> {
+    let len = plaintext.len().checked_add(TAG_LEN).ok_or(CryptoError::Buffer)?;
+    libcrux_chacha20poly1305::xchacha20_poly1305::encrypt(key.as_bytes(), plaintext, out, aad, nonce)
+        .map_err(|_| CryptoError::Buffer)?;
     Ok(len)
 }

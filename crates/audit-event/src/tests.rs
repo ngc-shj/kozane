@@ -150,11 +150,58 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::SessionPromoted
         | Event::SessionExpired
         | Event::HandshakeKeyRateLimited
-        | Event::TransportUnknownIndex => true,
+        | Event::TransportUnknownIndex
+        | Event::WgUnderLoad
+        | Event::WgLoadCleared
+        | Event::WgCookieSent
+        | Event::WgCookieSuppressed
+        | Event::WgCookieDropped
+        | Event::WgMac2Accepted
+        | Event::CookieSecretExpired
+        | Event::CookieSecretUnavailable => true,
         Event::FrameDropped { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
-    assert_eq!(Event::FIXED.len(), 31);
+    assert_eq!(Event::FIXED.len(), 39);
+}
+
+#[test]
+fn never_coalesced_kind_emits_every_occurrence() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::WgUnderLoad, 65, &mut out);
+    assert_eq!(out.len(), 65);
+    assert_eq!(out[1], Record { code: Event::WgUnderLoad.code(), _reserved: 0, a: 2, b: 0 });
+    assert_eq!(out[64].a, 65);
+}
+
+#[test]
+fn coalesced_cookie_kind_does_not_emit_its_second_occurrence() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::WgCookieSent, 2, &mut out);
+    assert_eq!(out.iter().map(|r| r.a).collect::<Vec<_>>(), [1]);
+}
+
+#[test]
+fn only_state_edge_kinds_are_never_coalesced() {
+    let never: Vec<Event> = Event::FIXED.iter().copied().filter(|e| !e.is_coalesced()).collect();
+    assert_eq!(
+        never,
+        [Event::WgUnderLoad, Event::WgLoadCleared, Event::CookieSecretExpired, Event::CookieSecretUnavailable]
+    );
+    assert!(Event::FrameDropped { reason: 0 }.is_coalesced());
+}
+
+#[test]
+fn never_coalesced_kind_is_counted_apart_from_coalesced_ones() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::WgCookieDropped, 1000, &mut out);
+    run(&mut c, Event::CookieSecretUnavailable, 1, &mut out);
+    assert_eq!(out.len(), 1000usize.div_ceil(64) + 1);
+    let last = out.last().unwrap();
+    assert_eq!((last.code, last.a), (Event::CookieSecretUnavailable.code(), 1));
 }
 
 #[test]
@@ -167,6 +214,7 @@ fn decode_classifies_fixed_dropped_and_unknown_codes() {
     // fixed range.
     assert_eq!(decode(FRAME_DROPPED_BASE + 0x3f), Decoded::FrameDropped(0x3f));
     assert_eq!(decode(0x0019), Decoded::Unknown);
+    assert_eq!(decode(0x003c), Decoded::Unknown);
 }
 
 #[test]

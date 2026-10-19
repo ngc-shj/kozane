@@ -7,6 +7,21 @@ use std::collections::BTreeSet;
 use super::*;
 use key_core::{Bucket, Oracle};
 use wg_core::noise::{CONSTRUCTION, IDENTIFIER, LABEL_MAC1};
+
+// The key budget invariant (M2.5 plan C5). `hs` spends key calls when it
+// drains `ih`, so a burst is everything `ingress` can forward plus all that
+// can wait in `ih` (NET_BUFFERS) and the one `hs` has already dequeued.
+const IH_BACKLOG: u64 = layout::NET_BUFFERS as u64 + 1;
+const _: () = assert!(
+    (ingress_core::FORWARD_BURST + IH_BACKLOG) * KEY_CALLS_PER_HANDSHAKE
+        <= key_core::KEY_BURST - key_core::KEY_BOOT_CALLS,
+    "C5: forwarded burst plus ih backlog can exhaust key's bucket"
+);
+const _: () = assert!(
+    KEY_CALLS_PER_HANDSHAKE * key_core::KEY_INTERVAL_NS <= ingress_core::FORWARD_INTERVAL_NS,
+    "C5: hs can spend key calls faster than key refills"
+);
+const _: () = assert!(ingress_core::NET_BUFFERS == layout::NET_BUFFERS, "ingress-core NET_BUFFERS differs from layout");
 use wg_core::wire::{INITIATION_LEN, INITIATION_MAC1_OFFSET, MessageInitiation, MessageResponse, RESPONSE_LEN};
 
 const GW_PRIVATE: [u8; 32] = [0x11; 32];
@@ -375,4 +390,81 @@ fn exhausted_key_budget_reaches_the_audit_mapping() {
         panic!("not rejected")
     };
     assert_eq!(reject_event(rej, client.last_error), audit_event::Event::HandshakeKeyRateLimited);
+}
+
+/// Re-signs mac1 after a test tampers with the covered bytes.
+fn remac(msg: &mut [u8; INITIATION_LEN]) {
+    let mac1_key = crypto::hash(&[LABEL_MAC1, &gw_pub()]).unwrap();
+    let mac1 = crypto::mac(&mac1_key, &[&msg[..INITIATION_MAC1_OFFSET]]).unwrap();
+    msg[INITIATION_MAC1_OFFSET..INITIATION_MAC1_OFFSET + 16].copy_from_slice(&mac1);
+}
+
+#[test]
+fn every_initiation_exit_stays_within_the_key_call_budget() {
+    const EPHEMERAL: core::ops::Range<usize> = 8..40;
+    const ENC_STATIC: usize = 40;
+    const ENC_TIMESTAMP: usize = 88;
+    let r = region();
+    let peers = [peer_pub()];
+    let mut out_of_range = [[7u8; 32]; 5];
+    out_of_range[4] = peer_pub();
+    // One `handle` call with a fresh `key` bucket of `burst` calls; returns
+    // the outcome and the calls that call alone made.
+    let run = |h: &mut Handshaker<4>, burst: u64, input: &[u8], now: u64, rndr: Option<u64>, peers: &[[u8; 32]], install: &mut [u8]| {
+        let mut d = direct(&r, burst);
+        let mut e = HedgedEntropy::new(Key32::from_bytes([3; 32]), FakeHw { tick: 0, rndr });
+        let out = h.handle(input, now, &mut KeyClient::new(&mut d), &mut e, &Peers(peers), install, &mut [0; 128]);
+        (out, d.calls)
+    };
+    let (_, good) = Initiator::initiation(ts(1));
+    let (_, newer) = Initiator::initiation(ts(2));
+    let tampered = |at: usize| {
+        let mut m = good;
+        m[at] ^= 1;
+        remac(&mut m);
+        m
+    };
+    let mut zero_ephemeral = good;
+    zero_ephemeral[EPHEMERAL].fill(0);
+    remac(&mut zero_ephemeral);
+    let mut bad_mac1 = good;
+    bad_mac1[INITIATION_MAC1_OFFSET] ^= 1;
+
+    let rejected = |r: Reject| Outcome::Rejected(r);
+    let mut cases: std::vec::Vec<(&str, (Outcome, usize), Outcome, usize)> = std::vec::Vec::new();
+    let mut fresh = |name, burst, msg: &[u8; INITIATION_LEN], rndr, peers: &[[u8; 32]], want, calls| {
+        cases.push((name, run(&mut handshaker(), burst, &input(msg), 0, rndr, peers, &mut [0; 128]), want, calls));
+    };
+    fresh("bad mac1", 100, &bad_mac1, Some(42), &peers, rejected(Reject::BadMac1), 0);
+    fresh("es refused (rate)", 0, &good, Some(42), &peers, rejected(Reject::Key(KeyError)), 1);
+    fresh("es zero", 100, &zero_ephemeral, Some(42), &peers, rejected(Reject::Key(KeyError)), 1);
+    fresh("static decrypt", 100, &tampered(ENC_STATIC), Some(42), &peers, rejected(Reject::Decrypt), 1);
+    fresh("unknown peer", 100, &good, Some(42), &[[7; 32]], rejected(Reject::UnknownPeer), 1);
+    fresh("peer out of range", 100, &good, Some(42), &out_of_range, rejected(Reject::PeerOutOfRange), 1);
+    fresh("ss refused (rate)", 1, &good, Some(42), &peers, rejected(Reject::Key(KeyError)), 2);
+    fresh("timestamp decrypt", 100, &tampered(ENC_TIMESTAMP), Some(42), &peers, rejected(Reject::Decrypt), 2);
+    fresh("entropy", 100, &good, None, &peers, rejected(Reject::Entropy), 2);
+    fresh("psk refused (rate)", 2, &good, Some(42), &peers, rejected(Reject::Key(KeyError)), 3);
+
+    cases.push(("bad input", run(&mut handshaker(), 100, &[0; 10], 0, Some(42), &peers, &mut [0; 128]), Outcome::BadInput, 0));
+    let mut h = handshaker();
+    assert!(matches!(run(&mut h, 100, &input(&good), 0, Some(42), &peers, &mut [0; 128]).0, Outcome::Accepted { .. }));
+    cases.push(("replay", run(&mut h, 100, &input(&good), 1_000_000_000, Some(42), &peers, &mut [0; 128]), rejected(Reject::Replay), 2));
+    cases.push(("flood", run(&mut h, 100, &input(&newer), 1, Some(42), &peers, &mut [0; 128]), rejected(Reject::Flood), 2));
+    let mut h = handshaker();
+    h.indices.set_counter_for_test(u32::MAX);
+    assert!(h.indices.next_index().is_some());
+    cases.push(("index exhausted", run(&mut h, 100, &input(&good), 0, Some(42), &peers, &mut [0; 128]), rejected(Reject::IndexExhausted), 2));
+    let no_buffer = run(&mut handshaker(), 100, &input(&good), 0, Some(42), &peers, &mut [0; 20]);
+    cases.push(("no buffer", no_buffer, Outcome::NoBuffer, 3));
+
+    let limit = usize::try_from(KEY_CALLS_PER_HANDSHAKE).unwrap();
+    for (name, (out, calls), want, expected) in cases {
+        assert_eq!(out, want, "{name}");
+        assert!(calls <= limit, "{name}: {calls} key calls exceeds KEY_CALLS_PER_HANDSHAKE");
+        assert_eq!(calls, expected, "{name}");
+    }
+    let (out, calls) = run(&mut handshaker(), 100, &input(&good), 0, Some(42), &peers, &mut [0; 128]);
+    assert!(matches!(out, Outcome::Accepted { .. }), "{out:?}");
+    assert_eq!(calls, limit, "accept spends exactly KEY_CALLS_PER_HANDSHAKE");
 }

@@ -10,6 +10,11 @@
 //! receiving) and the old `previous` is dropped. Only `current` seals.
 //! Dropping a `Session` zeroizes its keys (`wg_core::crypto::Key32`).
 //!
+//! Passive keepalive (plan C7): data received from a peer arms
+//! `unacked_since`; anything sealed for the peer, or `current` being
+//! dropped by `tick`, disarms it. A promotion does not: the new `current`
+//! owes the same reply and carries the keepalive.
+//!
 //! Memory: every slot holds a `wg_core::session::Session`, whose replay
 //! window is `REPLAY_BITS` = 2048 one-byte flags, so a slot is ~2.1 KiB and
 //! `Data<N>` is ~6.3 KiB per peer. That is fine for the handful of peers a
@@ -27,6 +32,7 @@
 )]
 
 use msgs::{Endpoint, Install};
+use wg_core::KEEPALIVE_TIMEOUT_NS;
 use wg_core::crypto::Key32;
 use wg_core::noise::SessionKeys;
 use wg_core::session::{Session, SessionError};
@@ -118,6 +124,8 @@ struct Peer {
     /// Last endpoint `ingress` is known to have been told (see
     /// `endpoint_delivered`); suppresses repeated identical updates.
     endpoint: Option<Endpoint>,
+    /// When the oldest data packet nothing has been sent back for arrived.
+    unacked_since: Option<u64>,
 }
 
 impl Peer {
@@ -214,6 +222,9 @@ impl<const MAX_PEERS: usize> Data<MAX_PEERS> {
             p.promote();
         }
         let payload = classify(allowed, peer, out, n);
+        if matches!(payload, Payload::Forward(_)) && p.unacked_since.is_none() {
+            p.unacked_since = Some(now_ns);
+        }
         // `find` only yields peers below MAX_PEERS, which fit in u16.
         let peer = u16::try_from(peer).unwrap_or(u16::MAX);
         InboundOutcome::Authenticated { peer, endpoint, promoted, payload }
@@ -259,7 +270,10 @@ impl<const MAX_PEERS: usize> Data<MAX_PEERS> {
         plain.fill(0);
         let peer = u16::try_from(peer).unwrap_or(u16::MAX);
         match sealed {
-            Ok(len) => OutboundOutcome::Sealed { peer, len },
+            Ok(len) => {
+                p.unacked_since = None;
+                OutboundOutcome::Sealed { peer, len }
+            }
             Err(e) => OutboundOutcome::Rejected(e),
         }
     }
@@ -274,10 +288,36 @@ impl<const MAX_PEERS: usize> Data<MAX_PEERS> {
                 if s.as_ref().is_some_and(|s| s.expired(now_ns)) {
                     *s = None;
                     dropped = dropped.saturating_add(1);
+                    if slot == Slot::Current {
+                        p.unacked_since = None;
+                    }
                 }
             }
         }
         dropped
+    }
+
+    /// Seals an empty transport message (a keepalive) on `current` for the
+    /// first peer whose data has gone unanswered for KEEPALIVE_TIMEOUT, and
+    /// returns `(peer, len)` with the message at the start of `out`. A peer
+    /// whose `current` cannot seal is disarmed and skipped, so one failing
+    /// peer never starves the rest. Call until `None`.
+    pub fn keepalive(&mut self, now_ns: u64, out: &mut [u8]) -> Option<(u16, usize)> {
+        for (peer, p) in self.peers.iter_mut().enumerate() {
+            // `checked_sub`: a clock reading before the arming never fires.
+            let due = p.unacked_since.and_then(|t| now_ns.checked_sub(t)).is_some_and(|d| d >= KEEPALIVE_TIMEOUT_NS);
+            if !due {
+                continue;
+            }
+            p.unacked_since = None;
+            let Some(s) = p.current.as_mut() else {
+                continue;
+            };
+            if let Ok(len) = seal_into(s, &[], now_ns, out) {
+                return Some((u16::try_from(peer).unwrap_or(u16::MAX), len));
+            }
+        }
+        None
     }
 
     /// The peer and slot of the live session whose local index is `index`.

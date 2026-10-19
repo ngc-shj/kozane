@@ -18,10 +18,12 @@ pub mod replay;
 
 pub const MSG_INITIATION: u8 = 1;
 pub const MSG_RESPONSE: u8 = 2;
+pub const MSG_COOKIE: u8 = 3;
 pub const MSG_TRANSPORT: u8 = 4;
 
 pub const INITIATION_LEN: usize = 148;
 pub const RESPONSE_LEN: usize = 92;
+pub const COOKIE_REPLY_LEN: usize = 64;
 pub const TRANSPORT_HEADER_LEN: usize = 16;
 pub const TAG_LEN: usize = 16;
 /// Header plus an empty (keepalive) payload's tag.
@@ -29,6 +31,8 @@ pub const TRANSPORT_MIN_LEN: usize = TRANSPORT_HEADER_LEN + TAG_LEN;
 
 /// Bytes of an initiation covered by mac1 (everything before it).
 pub const INITIATION_MAC1_OFFSET: usize = 116;
+/// Bytes of an initiation covered by mac2 (everything before it).
+pub const INITIATION_MAC2_OFFSET: usize = 132;
 /// Bytes of a response covered by mac1 (everything before it).
 pub const RESPONSE_MAC1_OFFSET: usize = 60;
 
@@ -62,6 +66,15 @@ pub struct MessageResponse {
     pub enc_nothing: [u8; 16],
     pub mac1: [u8; 16],
     pub mac2: [u8; 16],
+}
+
+/// Cookie reply (whitepaper section 5.4.7). `encrypted_cookie` is the
+/// 16-byte cookie sealed under XChaCha20-Poly1305, followed by its tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CookieReply {
+    pub receiver: u32,
+    pub nonce: [u8; 24],
+    pub encrypted_cookie: [u8; 32],
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,6 +189,26 @@ impl MessageResponse {
         w.put(&self.mac1)?;
         w.put(&self.mac2)?;
         Ok(RESPONSE_LEN)
+    }
+}
+
+impl CookieReply {
+    pub fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+        if bytes.len() != COOKIE_REPLY_LEN {
+            return Err(WireError::WrongLength);
+        }
+        let mut r = Reader(bytes);
+        r.header(MSG_COOKIE)?;
+        Ok(Self { receiver: r.u32()?, nonce: r.take()?, encrypted_cookie: r.take()? })
+    }
+
+    pub fn emit(&self, out: &mut [u8]) -> Result<usize, WireError> {
+        let mut w = Writer(out);
+        w.header(MSG_COOKIE)?;
+        w.put(&self.receiver.to_le_bytes())?;
+        w.put(&self.nonce)?;
+        w.put(&self.encrypted_cookie)?;
+        Ok(COOKIE_REPLY_LEN)
     }
 }
 

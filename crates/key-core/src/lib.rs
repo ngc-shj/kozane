@@ -49,6 +49,16 @@ pub const BOOT_SEED_REPLY_WORDS: usize = 4;
 /// Largest request or reply.
 pub const MAX_WORDS: usize = PSK_MIX_REPLY_WORDS;
 
+/// `hs`'s call budget: `KEY_BURST` calls, refilled at one per
+/// `KEY_INTERVAL_NS` (2 000/s). Far beyond what `hs`'s CPU budget can drive,
+/// while still bounding a runaway caller. The initiations `ingress` can
+/// forward must never exhaust it (M2.5 plan C5).
+pub const KEY_BURST: u64 = 256;
+pub const KEY_INTERVAL_NS: u64 = 1_000_000_000 / 2_000;
+/// Calls `hs` makes outside handshakes: the `BOOT_SEED` request at init
+/// (crates/pds/hs/src/main.rs).
+pub const KEY_BOOT_CALLS: u64 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootError {
     Blob(BlobError),

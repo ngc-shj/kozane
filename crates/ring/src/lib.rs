@@ -207,6 +207,11 @@ impl<const M: usize, const BUF: usize> Pool<M, BUF> {
     pub fn first_mine(&self) -> Option<usize> {
         self.mine.iter().position(|m| *m)
     }
+
+    /// Number of buffers this side owns.
+    pub fn mine_count(&self) -> usize {
+        self.mine.iter().filter(|m| **m).count()
+    }
 }
 
 #[cfg(kani)]

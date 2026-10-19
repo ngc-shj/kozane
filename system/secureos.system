@@ -255,4 +255,8 @@
         <end pd="timer" id="2" />
         <end pd="hs" id="4" notify="false" />
     </channel>
+    <channel>
+        <end pd="timer" id="3" />
+        <end pd="ingress" id="5" notify="false" />
+    </channel>
 </system>

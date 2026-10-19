@@ -133,6 +133,7 @@ fn channel_ids_match_layout() {
         (("hs", hs::CH_KEY), ("key", key::CH_HS)),
         (("timer", timer::CH_DATA), ("data", data::CH_TIMER)),
         (("timer", timer::CH_HS), ("hs", hs::CH_TIMER)),
+        (("timer", timer::CH_INGRESS), ("ingress", ingress::CH_TIMER)),
     ];
     for (a, b) in expected {
         assert!(has_channel(a, b), "{a:?} <-> {b:?}");

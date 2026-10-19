@@ -16,6 +16,7 @@
     clippy::arithmetic_side_effects
 )]
 
+pub mod cookie;
 pub mod crypto;
 pub mod noise;
 pub mod session;
@@ -29,11 +30,15 @@ pub const REKEY_AFTER_MESSAGES: u64 = 1 << 60;
 pub const REKEY_AFTER_TIME_NS: u64 = 120 * NS_PER_SEC;
 pub const REJECT_AFTER_TIME_NS: u64 = 180 * NS_PER_SEC;
 pub const REKEY_TIMEOUT_NS: u64 = 5 * NS_PER_SEC;
+pub const KEEPALIVE_TIMEOUT_NS: u64 = 10 * NS_PER_SEC;
 
 const NS_PER_SEC: u64 = 1_000_000_000;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod tests_cookie;
 
 #[cfg(test)]
 mod tests_handshake;

@@ -46,6 +46,22 @@ fn response_parse_is_total() {
 
 #[kani::proof]
 #[kani::unwind(150)]
+fn cookie_reply_parse_is_total() {
+    let buf: [u8; MAX_LEN] = kani::any();
+    let r = CookieReply::parse(any_bytes(&buf));
+    kani::cover!(r.is_ok());
+    kani::cover!(r == Err(WireError::WrongLength));
+    kani::cover!(r == Err(WireError::WrongType));
+    kani::cover!(r == Err(WireError::ReservedNonZero));
+    if let Ok(m) = r {
+        let mut out = [0u8; COOKIE_REPLY_LEN];
+        assert_eq!(m.emit(&mut out), Ok(COOKIE_REPLY_LEN));
+        assert_eq!(CookieReply::parse(&out), Ok(m));
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(150)]
 fn transport_parse_is_total() {
     let buf: [u8; MAX_LEN] = kani::any();
     let bytes = any_bytes(&buf);

@@ -202,6 +202,18 @@ impl DataPd {
             }
         }
     }
+
+    /// Passive keepalives (plan C7) for peers whose data went unanswered.
+    fn keepalives(&mut self, wake: &mut Wake) {
+        while let Some((peer, len)) = self.data.keepalive(cpu::now_ns(), &mut self.msg) {
+            let mut sealed = [0u8; layout::NET_BUF_SIZE];
+            if let (Some(dst), Some(src)) = (sealed.get_mut(..len), self.msg.get(..len)) {
+                dst.copy_from_slice(src);
+                let m = ToIngress::Outbound { peer, msg: sealed.get(..len).unwrap_or(&[]) };
+                wake.ingress |= send_to_ingress(&mut self.to_ingress, &mut self.scratch, &mut self.audit, m);
+            }
+        }
+    }
 }
 
 impl Handler for DataPd {
@@ -219,6 +231,8 @@ impl Handler for DataPd {
         self.installs(&mut wake);
         self.inbound(&mut wake);
         self.outbound(&mut wake);
+        // After `inner` is drained, so a reply already queued disarms first.
+        self.keepalives(&mut wake);
         if wake.hs {
             HS.notify();
         }

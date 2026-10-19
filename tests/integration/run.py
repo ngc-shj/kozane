@@ -5,7 +5,7 @@ Usage: run.py            (from `make test`)
 Generates fresh keys with tools/mksecrets into a temporary directory
 (removed on every exit path), builds the image against that configuration
 and packages it, then re-runs itself inside `unshare -rn` (no NET_ADMIN in
-the container; architecture R5) for three boots:
+the container; architecture R5) for five boots:
 
   1. raw frames: the outside NIC on a `-netdev dgram` socket; ARP, one frame
      per wire::DropReason, a coalesced flood, ARP as the liveness barrier;
@@ -14,16 +14,25 @@ the container; architecture R5) for three boots:
      wireguard-go is the interop oracle, tests/integration/wg.py sends what
      wireguard-go will not. Every negative case asserts a positive audit
      line and then a liveness barrier (a ping through wireguard-go);
-  3. a blob whose public key does not match the configuration: `key`
+  3. cookie-a and 4. cookie-b (M2.5 plan C6), each a fresh boot so audit
+     totals start at zero: the outside NIC on a tap in the netns, which
+     plays the router (10.0.2.2) for Python sockets and wireguard-go and
+     carries spoofed frames injected with AF_PACKET. cookie-a runs the
+     passive keepalive case, then the paired cookie case under a
+     below-capacity flood; cookie-b the cookie-under-flood case;
+  5. a blob whose public key does not match the configuration: `key`
      prints the mismatch and halts.
 
 Missing prerequisites fail the run; nothing is skipped.
 """
 
 import base64
+import bisect
 import contextlib
 import ctypes
+import errno
 import json
+import math
 import os
 import re
 import secrets
@@ -206,6 +215,9 @@ class Console:
     def __init__(self, child: pexpect.spawn):
         self.child = child
         self.text = ""
+        # Arrival time of each chunk, by the text length after it.
+        self.ends = []
+        self.times = []
         self.lock = threading.Lock()
         self.alive = True
         start_without_stop_signals(threading.Thread(target=self._drain, daemon=True))
@@ -223,6 +235,8 @@ class Console:
             sys.stdout.flush()
             with self.lock:
                 self.text += s
+                self.ends.append(len(self.text))
+                self.times.append(time.monotonic())
 
     def mark(self) -> int:
         with self.lock:
@@ -252,6 +266,14 @@ class Console:
     def count(self, pattern: str, since: int = 0) -> list:
         with self.lock:
             return re.findall(pattern, self.text[since:])
+
+    def time_at(self, offset: int) -> float:
+        """When the text up to `offset` had been read (monotonic)."""
+        with self.lock:
+            i = bisect.bisect_left(self.ends, offset)
+            if i == len(self.ends):
+                raise Fail(f"console offset {offset} not read yet")
+            return self.times[i]
 
 
 _handed_out = set()
@@ -781,6 +803,832 @@ def test_mismatched_blob(loader: str):
             raise
 
 
+# ---------------------------------------------------------------- cookie boots (M2.5 plan C6)
+
+# Every timing and band the cookie cases judge is named here, once; the
+# protocol constants come from the Rust sources.
+INGRESS_CORE = "crates/ingress-core/src/lib.rs"
+WG_CORE = "crates/wg-core/src/lib.rs"
+NS = 1e9
+TIMER_TICK_S = 1.0             # pd-timer notifies once per second
+KEEPALIVE_SLACK_S = 3.0        # keepalive window: [KEEPALIVE_TIMEOUT, + this]
+KEEPALIVE_QUIET_S = 10.0       # no second keepalive within this after the first
+KEEPALIVE_DENY_S = 13.0        # no keepalive this long after an inside reply
+LOAD_CLEARED_SLACK_S = 0.5     # WgLoadCleared window: [UNDER_LOAD_AFTER, + 2 ticks + this]
+BAND_LOW = 1.2                 # below-capacity floods: >= BAND_LOW x arrival refill
+BAND_HIGH = 0.8                #   ... and <= BAND_HIGH x C
+BAND_RATE = 1.4                # x arrival refill: inside that band whenever C >= C_MIN x refill
+C_MIN = 2.0                    # x arrival refill (the CF precondition)
+STEP2_RATE = 3.0               # Flood step 2, over capacity: x C
+STEP2_BAND = (2.5, 3.5)        #   asserted band, x C
+STEP2_WARMUP_S = 1.0           #   over capacity this long before the ping starts
+PROBE_RATE = 1e6               # unpaced: the injector's own ceiling
+PROBE_S = 2.0
+PROBE_SETTLE_S = 0.3           # audit lines still printing after the drain
+PROBE_SATURATION = 1.5         # the probe must offer at least this x C
+PRECONDITION_S = 4.0           # band flood measuring the below-capacity survival ratio
+FAIL_P = 1e-3                  # chance failure allowed per retry budget
+SURVIVAL_MARGIN = 0.5          # Flood step 2's survival estimate, C / rate, is scaled by this
+COOKIE_WAIT_S = 1.0            # per try, for a cookie reply or a handshake response
+PING_INTERVAL_S = 1.0          # Python-peer pings: one try per interval,
+PING_WAIT_S = 3.0              #   each answered within this (queueing over capacity)
+REKEY_ATTEMPT_S = 5.0 + 0.334  # wireguard-go: REKEY_TIMEOUT plus at most its jitter
+HANDSHAKE_SLACK_S = 3.0
+FLOOD_STALL_S = 0.5            # a flood that sent nothing for this long is not running
+PAIRED_TRIES = 5               # below capacity (survival >= 0.87 measured): < 1e-4 to fail
+SPOOF_SOURCES = 256            # > BUCKETS (64): the per-source table churns
+WG_LISTEN_PORT = 51900         # wireguard-go's fixed ListenPort in boot b (sniffer filter)
+PEER1_IP = bytes([10, 200, 0, 3])
+TAP = "tapo0"                  # the netns is private to the run
+SNIFF_RCVBUF = 8 << 20
+
+ETH_P_ALL = 0x0003
+ETH_P_ARP = 0x0806
+SOL_PACKET = 263
+PACKET_STATISTICS = 6
+PACKET_QDISC_BYPASS = 20
+PACKET_OUTGOING = 4
+SO_ATTACH_FILTER = 26
+
+
+def rust_const(rel: str, name: str) -> int:
+    """`pub const NAME: u64 = <integer expression>;` from a Rust source."""
+    src = open(os.path.join(ROOT, rel)).read()
+    m = re.search(rf"pub const {name}: u\d+ = ([^;]+);", src)
+    if not m:
+        raise Fail(f"{name} not found in {rel}")
+    expr = m.group(1).replace("NS_PER_SEC", "1_000_000_000")
+    if not re.fullmatch(r"[0-9_ *+/]+", expr):
+        raise Fail(f"{name} in {rel} is not a plain integer expression: {expr}")
+    return int(eval(expr))  # digits and operators only, checked above
+
+
+def arrival_refill() -> float:
+    return NS / rust_const(INGRESS_CORE, "ARRIVAL_INTERVAL_NS")
+
+
+def keepalive_window() -> tuple:
+    timeout = rust_const(WG_CORE, "KEEPALIVE_TIMEOUT_NS") / NS
+    return timeout, timeout + KEEPALIVE_SLACK_S
+
+
+def load_cleared_window() -> tuple:
+    """[UNDER_LOAD_AFTER, UNDER_LOAD_AFTER + 2 ticks + 0.5 s] after the last
+    flood send: the allow side of the hysteresis. The lower end is coarse;
+    the C3 boundary unit test pins the 1 s."""
+    after = rust_const(INGRESS_CORE, "UNDER_LOAD_AFTER_NS") / NS
+    return after, after + 2 * TIMER_TICK_S + LOAD_CLEARED_SLACK_S
+
+
+def ip_str(b: bytes) -> str:
+    return ".".join(map(str, b))
+
+
+def tries_for(p: float) -> int:
+    """Independent tries, each succeeding with probability p, so that all
+    fail with probability below FAIL_P."""
+    if p >= 1:
+        return 1
+    if p <= 0:
+        raise Fail(f"survival ratio {p:.3f}: no retry budget can succeed")
+    return max(1, math.ceil(math.log(FAIL_P) / math.log(1 - p)))
+
+
+def close_all(*resources):
+    """Closes what was opened, in order; None is skipped (teardown helper)."""
+    for r in resources:
+        if r is not None:
+            r.close()
+
+
+class Tap:
+    """The outside NIC on a tap in the test netns: the kernel end plays the
+    router (10.0.2.2/24 with outside_router_mac), so Python sockets and
+    wireguard-go reach the gateway directly, and AF_PACKET injects spoofed
+    frames."""
+
+    def __init__(self):
+        self.inject = None
+        sh("ip", "tuntap", "add", "dev", TAP, "mode", "tap")
+        try:
+            sh("ip", "link", "set", TAP, "address", PEER_MAC.hex(":"))
+            sh("ip", "addr", "add", f"{ip_str(PEER_IP)}/24", "dev", TAP)
+            sh("ip", "link", "set", TAP, "up")
+            # The gateway's MAC is static, so the kernel sends it no ARP.
+            sh("ip", "neigh", "replace", ip_str(GW_IP), "lladdr", GW_MAC.hex(":"), "dev", TAP, "nud", "permanent")
+            self.inject = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0)
+            # Straight to the tap's queue: a frame beyond it is dropped, as on
+            # a wire, rather than held in a qdisc.
+            self.inject.setsockopt(SOL_PACKET, PACKET_QDISC_BYPASS, 1)
+            self.inject.bind((TAP, 0))
+        except BaseException:
+            self.close()
+            raise
+
+    def netdev(self, name: str) -> str:
+        return f"tap,id={name},ifname={TAP},script=no,downscript=no"
+
+    def send(self, frame: bytes):
+        self.inject.send(frame)
+
+    def close(self):
+        if self.inject:
+            self.inject.close()
+        subprocess.run(["ip", "link", "del", TAP], capture_output=True)
+
+
+def arp_round_trip(tap: Tap, timeout: float):
+    """ARP requests on the tap, one per 0.5 s, until the gateway answers:
+    the monotonic time of the reply, or None. The rings are FIFO, so the
+    reply also proves every frame queued before its request was handled."""
+    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ETH_P_ARP))
+    try:
+        s.bind((TAP, ETH_P_ARP))
+        s.settimeout(0.1)
+        want = arp(2, GW_MAC, GW_IP, PEER_MAC, PEER_IP, dst=PEER_MAC)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                tap.send(arp(1, PEER_MAC, PEER_IP, b"\0" * 6, GW_IP))
+            except OSError as e:
+                # QEMU has not attached the tap yet, or its queue is full.
+                if e.errno != errno.ENOBUFS:
+                    raise
+            until = time.monotonic() + 0.5
+            while time.monotonic() < until:
+                try:
+                    f = s.recv(2048)
+                except socket.timeout:
+                    continue
+                if f[:42] == want:
+                    return time.monotonic()
+        return None
+    finally:
+        s.close()
+
+
+def wait_tap_ready(tap: Tap, con: Console):
+    """ARP round trips on the tap until the gateway answers (boot done)."""
+    if arp_round_trip(tap, BOOT_TIMEOUT_S) is None:
+        raise Fail("QEMU exited during boot" if not con.alive else "no ARP reply on the tap after boot")
+
+
+def udp_fields(frame: bytes):
+    """(src ip, sport, dst ip, dport, payload) of an IPv4/UDP frame, or None."""
+    if len(frame) < 42 or frame[12:14] != b"\x08\x00" or frame[23] != 17:
+        return None
+    u = 14 + (frame[14] & 0xF) * 4
+    sport, dport, ulen = struct.unpack("!HHH", frame[u:u + 6])
+    return frame[26:30], sport, frame[30:34], dport, frame[u + 8:u + ulen]
+
+
+def udp_filter(port: int) -> bytes:
+    """Classic BPF: unfragmented IPv4/UDP to or from `port`."""
+    prog = [
+        (0x28, 0, 0, 12),       # ldh [12]
+        (0x15, 0, 9, 0x0800),   # IPv4, else drop
+        (0x30, 0, 0, 23),       # ldb [23]
+        (0x15, 0, 7, 17),       # UDP, else drop
+        (0x28, 0, 0, 20),       # ldh [20]
+        (0x45, 5, 0, 0x1FFF),   # a fragment: drop
+        (0xB1, 0, 0, 14),       # x = IP header length
+        (0x48, 0, 0, 14),       # ldh [x + 14]: source port
+        (0x15, 3, 0, port),     # accept
+        (0x48, 0, 0, 16),       # ldh [x + 16]: destination port
+        (0x15, 1, 0, port),     # accept
+        (0x06, 0, 0, 0),        # drop
+        (0x06, 0, 0, 0x40000),  # accept
+    ]
+    return b"".join(struct.pack("HBBI", *i) for i in prog)
+
+
+class Sniffer:
+    """AF_PACKET on the tap keeping only UDP to and from one port (classic
+    BPF, enlarged SO_RCVBUF). A kernel-side drop (PACKET_STATISTICS) aborts
+    the case, so a lost frame never reads as an attribution failure."""
+
+    def __init__(self, port: int):
+        self.frames = []  # (monotonic, frame, outgoing)
+        self.lock = threading.Lock()
+        self.drops = 0
+        self.alive = True
+        # Protocol 0 receives nothing until the bind, after the filter.
+        self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0)
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SNIFF_RCVBUF)
+            prog = udp_filter(port)
+            buf = ctypes.create_string_buffer(prog, len(prog))
+            self.sock.setsockopt(socket.SOL_SOCKET, SO_ATTACH_FILTER,
+                                 struct.pack("HL", len(prog) // 8, ctypes.addressof(buf)))
+            self.sock.bind((TAP, ETH_P_ALL))
+            self.sock.settimeout(0.2)
+        except BaseException:
+            self.sock.close()
+            raise
+        start_without_stop_signals(threading.Thread(target=self._run, daemon=True))
+
+    def _run(self):
+        while self.alive:
+            try:
+                f, addr = self.sock.recvfrom(65535)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            with self.lock:
+                self.frames.append((time.monotonic(), f, addr[2] == PACKET_OUTGOING))
+
+    def since(self, i: int) -> list:
+        with self.lock:
+            return self.frames[i:]
+
+    def check_drops(self):
+        _, drops = struct.unpack("II", self.sock.getsockopt(SOL_PACKET, PACKET_STATISTICS, 8))
+        self.drops += drops  # reading resets the kernel's counters
+        if self.drops:
+            raise Fail(f"sniffer dropped {self.drops} frames (PACKET_STATISTICS); attribution not judged")
+
+    def close(self):
+        self.alive = False
+        self.sock.close()
+
+
+class Flood:
+    """Spoofed mac1-valid initiations (random body, zero mac2) from
+    SPOOF_SOURCES addresses, sent on the tap at `rate` per second by a helper
+    thread. `set_rate` takes effect at once and returns where the new step
+    starts, so each step's achieved rate can be checked against its band."""
+
+    def __init__(self, tap: Tap, gw_pub: bytes):
+        msg = wg_mod.with_mac1(struct.pack("<I", 1) + secrets.token_bytes(112), gw_pub)
+        self.frames = [ipv4_udp(bytes([172, 16, i // 200, 1 + i % 200]), GW_IP, 20000 + i, WG_PORT, msg)
+                       for i in range(SPOOF_SOURCES)]
+        self.tap = tap
+        self.lock = threading.Lock()
+        self.rate, self.base, self.t0 = 0.0, 0, time.monotonic()
+        self.sent = 0
+        self.last_send = 0.0
+        self.error = None
+        self.stopped = False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        start_without_stop_signals(self.thread)
+
+    def _run(self):
+        try:
+            while not self.stopped:
+                with self.lock:
+                    n = min(self.base + int((time.monotonic() - self.t0) * self.rate) - self.sent, 256)
+                    for _ in range(n):
+                        try:
+                            self.tap.send(self.frames[self.sent % SPOOF_SOURCES])
+                        except OSError as e:
+                            # The tap's queue is full: offered and lost, as on a wire.
+                            if e.errno != errno.ENOBUFS:
+                                raise
+                        self.sent += 1
+                        self.last_send = time.monotonic()
+                if n <= 0:
+                    time.sleep(0.001)
+        except OSError as e:
+            self.error = e
+
+    def set_rate(self, rate: float) -> tuple:
+        """(frames sent, time) at the switch."""
+        with self.lock:
+            self.rate, self.base, self.t0 = rate, self.sent, time.monotonic()
+            return self.sent, self.t0
+
+    def snapshot(self) -> tuple:
+        with self.lock:
+            return self.sent, time.monotonic()
+
+    def running(self) -> bool:
+        return (self.thread.is_alive() and self.error is None
+                and time.monotonic() - self.last_send < FLOOD_STALL_S)
+
+    def close(self):
+        self.stopped = True
+        self.thread.join(timeout=5)
+
+
+def check_band(what: str, start: tuple, end: tuple, lo: float, hi: float) -> float:
+    """The harness's own send rate over [start, end] against a step's band."""
+    rate = (end[0] - start[0]) / (end[1] - start[1])
+    if not lo <= rate <= hi:
+        raise Fail(f"{what}: flood rate {rate:.0f}/s outside its band [{lo:.0f}, {hi:.0f}]")
+    return rate
+
+
+def cookie_totals(con: Console) -> tuple:
+    """(lower, upper) bounds on initiations ingress answered on the cookie
+    path so far, from the coalesced WgCookieSent / WgCookieSuppressed lines
+    (each line stands for 64)."""
+    lo = hi = 0
+    for event in ("WgCookieSent", "WgCookieSuppressed"):
+        totals = [int(t) for t in con.count(rf"audit: src=ingress {event} total=(\d+) ")]
+        if totals:
+            lo += max(totals)
+            hi += max(totals) + 63
+    return lo, hi
+
+
+def probe_capacity(con: Console, tap: Tap, flood: Flood, after_rate: float) -> tuple:
+    """Per-run C [R5-T-S1]: ingress's processing rate on the cookie path,
+    from a short over-capacity probe. C is what was answered from the
+    probe's start until an ARP round trip proves the queues drained, over
+    that time: a starved handler loop flushes audit only then. The flood
+    then continues at `after_rate`, soon enough for load to hold. Returns
+    (C, the probe's survival ratio)."""
+    _, before = cookie_totals(con)
+    start = flood.set_rate(PROBE_RATE)
+    time.sleep(PROBE_S)
+    end = flood.set_rate(0)
+    drained = arp_round_trip(tap, LINE_TIMEOUT_S)
+    if drained is None:
+        raise Fail("capacity probe: no ARP reply after the probe; the queues did not drain")
+    time.sleep(PROBE_SETTLE_S)
+    after, _ = cookie_totals(con)
+    flood.set_rate(after_rate)
+    done = after - before
+    c = done / (drained - start[1])
+    offered = (end[0] - start[0]) / (end[1] - start[1])
+    refill = arrival_refill()
+    print(f"\ncapacity probe: C = {c:.0f}/s (offered {offered:.0f}/s, survival {done / (end[0] - start[0]):.3f}, "
+          f"drained {drained - end[1]:.1f} s after it, arrival refill {refill:.0f}/s)", flush=True)
+    if offered < PROBE_SATURATION * c:
+        raise Fail(f"capacity probe offered {offered:.0f}/s, not {PROBE_SATURATION} x C = {c:.0f}/s: C not measured")
+    if c < C_MIN * refill:
+        raise Fail(f"C = {c:.0f}/s is below {C_MIN} x the arrival refill ({refill:.0f}/s): flood bands are empty")
+    return c, done / (end[0] - start[0])
+
+
+class PyPeer:
+    """wg.py's initiator on its own UDP port at the tap's address: sends
+    what wireguard-go will not and opens what the gateway sends back."""
+
+    def __init__(self, conf: str, gw_pub: bytes, port: int = 0):
+        self.gw_pub = gw_pub
+        self.init = wg_mod.Initiator(b64(conf_value(conf, "PrivateKey")), gw_pub, b64(conf_value(conf, "PresharedKey")),
+                                     sender=secrets.randbits(32))
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            self.sock.bind((ip_str(PEER_IP), port))
+        except BaseException:
+            self.sock.close()
+            raise
+        self.sent = []  # initiations, to open late cookie replies
+        self.established = None
+
+    def send(self, msg: bytes):
+        if msg[0] == 1:
+            self.sent.append(msg)
+        try:
+            self.sock.sendto(msg, (ip_str(GW_IP), WG_PORT))
+        except OSError as e:
+            # The tap's queue is full over capacity: a lost datagram, which
+            # the caller's retry budget covers.
+            if e.errno != errno.ENOBUFS:
+                raise
+
+    def recv(self, until: float):
+        """The next datagram before monotonic `until`, or None."""
+        left = until - time.monotonic()
+        if left <= 0:
+            return None
+        self.sock.settimeout(left)
+        try:
+            return self.sock.recv(2048)
+        except socket.timeout:
+            return None
+
+    def wait_kind(self, kinds: tuple, timeout: float):
+        until = time.monotonic() + timeout
+        while (d := self.recv(until)) is not None:
+            if d[:1] and d[0] in kinds:
+                return d
+        return None
+
+    def open_cookie(self, reply: bytes):
+        """The cookie in a reply to one of our initiations, or None."""
+        if struct.unpack("<I", reply[4:8])[0] != self.init.sender:
+            return None
+        for msg in reversed(self.sent):
+            try:
+                return wg_mod.open_cookie_reply(self.gw_pub, reply, msg)
+            except Exception:
+                continue
+        return None
+
+    def close(self):
+        self.sock.close()
+
+
+def learn_cookie(peer: PyPeer, tries: int) -> bytes:
+    """Under load an initiation without mac2 must draw a cookie reply that
+    opens with the public cookie key."""
+    for _ in range(tries):
+        peer.send(peer.init.initiation())
+        r = peer.wait_kind((2, 3), COOKIE_WAIT_S)
+        if r is not None and r[0] == 2:
+            raise Fail("cookie attribution failed: an initiation without mac2 under load got a handshake response")
+        if r is not None:
+            cookie = peer.open_cookie(r)
+            if cookie is None:
+                raise Fail("cookie attribution failed: the cookie reply does not open with the public cookie key")
+            return cookie
+    raise Fail(f"cookie attribution failed: no cookie reply to {tries} initiations under load")
+
+
+def cookie_handshake(peer: PyPeer, tries: int) -> bool:
+    """A handshake under load through the cookie path: an initiation draws a
+    cookie, a fresh one with mac2 gets the response. A cookie reply instead
+    of a response (secret rotated, or the cookie was lost) is learned again."""
+    cookie = None
+    for _ in range(tries):
+        if cookie is None:
+            peer.send(peer.init.initiation())
+            r = peer.wait_kind((3,), COOKIE_WAIT_S)
+            cookie = r and peer.open_cookie(r)
+            if cookie is None:
+                continue
+        peer.send(wg_mod.with_mac2(peer.init.initiation(), cookie))
+        r = peer.wait_kind((2, 3), COOKIE_WAIT_S)
+        if r is not None and r[0] == 2:
+            if not peer.init.consume_response(r):
+                raise Fail("handshake response under load does not open")
+            peer.established = time.monotonic()
+            return True
+        cookie = r and peer.open_cookie(r)
+    return False
+
+
+def udp_packet(src: bytes, dst: bytes, sport: int, dport: int, data: bytes) -> bytes:
+    udp = struct.pack("!HHHH", sport, dport, 8 + len(data), 0) + data
+    return ip_hdr(src, dst, 17, len(udp)) + udp
+
+
+def py_ping(peer: PyPeer, tries: int, ident: int) -> int:
+    """ICMP echoes through the Python peer's session to the inside host, one
+    per PING_INTERVAL_S, each an independent try: the sequence number of the
+    first reply, or 0 once PING_WAIT_S passed after the last send."""
+    seq, next_send, until = 0, time.monotonic(), None
+    while True:
+        if seq < tries and time.monotonic() >= next_send:
+            seq += 1
+            peer.send(peer.init.transport(icmp_echo(PEER1_IP, HOST_IP, 8, ident, seq, b"secureos")))
+            next_send = time.monotonic() + PING_INTERVAL_S
+            if seq == tries:
+                until = time.monotonic() + PING_WAIT_S
+        d = peer.recv(next_send if seq < tries else until)
+        if d is None:
+            if seq == tries and time.monotonic() >= until:
+                return 0
+            continue
+        try:
+            _, plain = peer.init.open_transport(d)
+        except Exception:
+            continue
+        if len(plain) >= 28 and plain[9] == 1 and plain[20] == 0 and plain[24:26] == struct.pack("!H", ident):
+            got = struct.unpack("!H", plain[26:28])[0]
+            if 1 <= got <= seq:
+                return got
+
+
+def ping_budget(tries: int) -> float:
+    return (tries - 1) * PING_INTERVAL_S + PING_WAIT_S
+
+
+def keepalive_case(con: Console, peer: PyPeer):
+    """Passive keepalive [C7]: allow, then deny."""
+    for _ in range(3):
+        peer.send(peer.init.initiation())
+        r = peer.wait_kind((2,), REPLY_TIMEOUT_S)
+        if r is not None:
+            break
+    else:
+        raise Fail("keepalive: no handshake response")
+    if not peer.init.consume_response(r):
+        raise Fail("keepalive: handshake response does not open")
+    lo, hi = keepalive_window()
+    # Allow: data the inside never answers, then exactly one keepalive.
+    sent = time.monotonic()
+    peer.send(peer.init.transport(udp_packet(PEER1_IP, HOST_IP, 40001, 9, b"never answered")))
+    got = []
+    until = sent + hi + KEEPALIVE_QUIET_S
+    while (d := peer.recv(until)) is not None:
+        got.append((time.monotonic() - sent, d))
+    if len(got) != 1 or not lo <= got[0][0] <= hi:
+        raise Fail(f"keepalive: want exactly one message {lo:.0f}-{hi:.0f} s after the send, then none for "
+                   f"{KEEPALIVE_QUIET_S:.0f} s; got at {[round(t, 2) for t, _ in got]} s")
+    try:
+        counter, plain = peer.init.open_transport(got[0][1])
+    except Exception as e:
+        raise Fail(f"keepalive: the message does not open with the session key: {e!r}")
+    if plain or counter != 0:
+        raise Fail(f"keepalive: counter {counter}, {len(plain)} plaintext bytes; want the first counter, empty")
+    # Deny: an inside reply sealed first clears the debt.
+    if not py_ping(peer, 3, ident=0x4b41):
+        raise Fail("keepalive deny side: the inside reply did not arrive")
+    until = time.monotonic() + KEEPALIVE_DENY_S
+    while (d := peer.recv(until)) is not None:
+        try:
+            _, plain = peer.init.open_transport(d)
+        except Exception:
+            continue
+        if not plain:
+            raise Fail("keepalive deny side: a keepalive arrived after the inside reply was sealed")
+
+
+def paired_case(con: Console, tap: Tap, peer_conf: str, gw_pub: bytes):
+    """Cookie path, paired [M10, R2-T-N7]: learn a cookie at port A, deny it
+    at port B, allow it at port A, all under a below-capacity flood, then
+    the hysteresis' allow side once the flood stops."""
+    refill = arrival_refill()
+    flood = a = b = None
+    try:
+        flood = Flood(tap, gw_pub)
+        mark = con.mark()
+        start = flood.set_rate(BAND_RATE * refill)
+        try:
+            m = con.wait_for(r"audit: src=ingress WgUnderLoad total=1 ", since=mark)
+        except Fail:
+            raise Fail("paired: WgUnderLoad total=1 did not appear under the band flood")
+        loaded_at = mark + m.start()
+        a, b = PyPeer(peer_conf, gw_pub), PyPeer(peer_conf, gw_pub)
+        cookie = learn_cookie(a, PAIRED_TRIES)
+        # Deny: a fresh initiation from port B with port A's cookie.
+        for _ in range(PAIRED_TRIES):
+            b.send(wg_mod.with_mac2(b.init.initiation(), cookie))
+            r = b.wait_kind((2, 3), COOKIE_WAIT_S)
+            if r is not None and r[0] == 2:
+                raise Fail("cookie deny: port B's initiation with port A's cookie got a handshake response")
+            if r is not None and b.open_cookie(r) is not None:
+                break
+        else:
+            raise Fail("cookie deny: no cookie reply at port B (positive signal missing)")
+        # Allow: port A with its own cookie. Had the deny step been accepted,
+        # total=1 would already be there.
+        if con.count(r"audit: src=ingress WgMac2Accepted total=\d+ "):
+            raise Fail("WgMac2Accepted appeared before the allow step: port B's initiation was accepted")
+        allow = con.mark()
+        for _ in range(PAIRED_TRIES):
+            a.send(wg_mod.with_mac2(a.init.initiation(), cookie))
+            r = a.wait_kind((2, 3), COOKIE_WAIT_S)
+            if r is not None and r[0] == 2:
+                break
+            cookie = (r and a.open_cookie(r)) or cookie
+        else:
+            raise Fail("cookie allow: no handshake response at port A")
+        con.wait_for(r"audit: src=ingress WgMac2Accepted total=1 ", since=allow)
+        if not a.init.consume_response(r):
+            raise Fail("cookie allow: the handshake response does not open")
+        if con.count(r"audit: src=ingress WgLoadCleared ", since=loaded_at):
+            raise Fail("WgLoadCleared during the paired flood: load did not hold")
+        if con.count(r"audit: src=ingress WgCookieSuppressed total=1 "):
+            raise Fail("WgCookieSuppressed total=1 during the paired flood: the TX reserve bound below capacity")
+        end = flood.set_rate(0)
+        last = flood.last_send
+        lo, hi = load_cleared_window()
+        m = con.wait_for(r"audit: src=ingress WgLoadCleared total=1 ", since=loaded_at, timeout=hi + 1)
+        after = con.time_at(loaded_at + m.end()) - last
+        if not lo <= after <= hi:
+            raise Fail(f"WgLoadCleared {after:.2f} s after the last flood send, outside [{lo}, {hi}] s")
+        # The band's upper end needs this boot's C, measured only now so its
+        # own load cannot hide an edge in the window above.
+        c, _ = probe_capacity(con, tap, flood, after_rate=0)
+        check_band("paired flood", start, end, BAND_LOW * refill, BAND_HIGH * c)
+    finally:
+        close_all(a, b, flood)
+
+
+def test_cookie_a(loader: str, deploy: str, passed: list):
+    """Boot "cookie-a": the keepalive case, then the paired cookie case."""
+    tap = Tap()
+    inside = Wire()
+    host = InsideHost(inside)
+    try:
+        child, con = boot(loader, tap.netdev("n0"), inside.netdev("n1"))
+    except BaseException:
+        tap.close()
+        raise
+    py = None
+    try:
+        start_without_stop_signals(host)
+        wait_tap_ready(tap, con)
+        cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
+        gw_pub = b64(cfg["gateway"]["public_key"])
+        peer1 = open(os.path.join(deploy, "peer-1.conf")).read()
+        py = PyPeer(peer1, gw_pub)
+        keepalive_case(con, py)
+        passed.append("passive keepalive")
+        print("\nPASS [passive keepalive: one empty message 10-13 s after unanswered data, none after a reply]")
+        paired_case(con, tap, peer1, gw_pub)
+        passed.append("cookie path, paired")
+        print("\nPASS [cookie path, paired: port B denied, port A allowed, load cleared in its window]")
+    finally:
+        try:
+            with signals_held():
+                host.stop = True
+                close_all(py)
+                kill(child)
+                tap.close()
+        except SystemExit:
+            host.stop = True
+            close_all(py)
+            kill(child)
+            tap.close()
+            raise
+
+
+def attribute_wireguard_go(sniffer: Sniffer, con: Console, gw_pub: bytes, deadline: float):
+    """Flood step 1's attribution, judged before the ping: a cookie reply to
+    wireguard-go's port answers one of its sniffed initiations and opens
+    with the public cookie key; then wireguard-go sends an initiation whose
+    mac2 is made from that cookie; then WgMac2Accepted total=1 appears. By
+    exclusion it is wireguard-go's: nothing else in this boot has sent a
+    mac2 yet."""
+    inits, cookies = [], []
+    mac2_at = None
+    seen = 0
+    while mac2_at is None:
+        frames = sniffer.since(seen)
+        seen += len(frames)
+        for t, f, outgoing in frames:
+            u = udp_fields(f)
+            if u is None:
+                continue
+            _, sport, _, dport, p = u
+            if outgoing and (sport, dport) == (WG_LISTEN_PORT, WG_PORT) and len(p) == 148 and p[0] == 1:
+                if any(wg_mod.with_mac2(p, c) == p for c in cookies):
+                    mac2_at = t
+                    break
+                inits.append(p)
+            elif not outgoing and (sport, dport) == (WG_PORT, WG_LISTEN_PORT) and len(p) == 64 and p[0] == 3:
+                for i in inits:
+                    if i[4:8] != p[4:8]:
+                        continue
+                    try:
+                        cookies.append(wg_mod.open_cookie_reply(gw_pub, p, i))
+                        break
+                    except Exception:
+                        continue
+        sniffer.check_drops()
+        if mac2_at is None and time.monotonic() > deadline:
+            if not inits:
+                raise Fail("cookie attribution failed: no initiation from wireguard-go sniffed")
+            if not cookies:
+                raise Fail("cookie attribution failed: no cookie reply to wireguard-go's port opens for its initiations")
+            raise Fail("cookie attribution failed: wireguard-go sent no initiation with a mac2 under the cookie")
+        time.sleep(0.05)
+    left = max(0.0, deadline - time.monotonic()) + LINE_TIMEOUT_S
+    m = con.wait_for(r"audit: src=ingress WgMac2Accepted total=1 ", timeout=left)
+    if con.time_at(m.end()) < mac2_at:
+        raise Fail("cookie attribution failed: WgMac2Accepted total=1 came before wireguard-go's mac2 initiation")
+
+
+def wg_go_conf(deploy: str) -> str:
+    """Peer 0 straight at the gateway's outside address, from a fixed port."""
+    conf = open(os.path.join(deploy, "peer-0.conf")).read()
+    conf = re.sub(r"^Endpoint = .*$", f"Endpoint = {ip_str(GW_IP)}:{WG_PORT}", conf, flags=re.M)
+    conf = conf.replace("[Interface]\n", f"[Interface]\nListenPort = {WG_LISTEN_PORT}\n", 1)
+    path = os.path.join(deploy, "wg-cookie.conf")
+    with open(path, "w") as f:
+        f.write(conf)
+    os.chmod(path, 0o600)
+    return path
+
+
+def flood_case(con: Console, tap: Tap, sniffer: Sniffer, deploy: str, gw_pub: bytes, cfg: dict, opened: list):
+    """Cookie under flood [M1, M2, R2-S-N2, R3-F-F3, R3-T-P1]. `opened`
+    collects what the caller's teardown must close."""
+    refill = arrival_refill()
+    flood = Flood(tap, gw_pub)
+    opened.append(flood)
+    band = BAND_RATE * refill
+    # C first, from an over-capacity probe; the band flood follows without a
+    # gap, so load holds from WgUnderLoad total=1 on.
+    c, _ = probe_capacity(con, tap, flood, after_rate=band)
+    try:
+        con.wait_for(r"audit: src=ingress WgUnderLoad total=1 ")
+    except Fail:
+        raise Fail("precondition: WgUnderLoad total=1 did not appear before any peer traffic")
+    lo1, hi1 = BAND_LOW * refill, BAND_HIGH * c
+    # The below-capacity survival ratio, from this band flood.
+    _, before = cookie_totals(con)
+    pre = flood.snapshot()
+    time.sleep(PRECONDITION_S)
+    post = flood.snapshot()
+    time.sleep(0.2)
+    after, _ = cookie_totals(con)
+    late = flood.snapshot()
+    check_band("precondition flood", pre, post, lo1, hi1)
+    # Conservative: line totals bound the counts from the safe side, and
+    # what was sent while the lines settled is not credited.
+    s1 = min(1.0, max(0.0, (after - before - (late[0] - post[0])) / (post[0] - pre[0])))
+    attempts = 1 + tries_for(s1 * s1)
+    hs_deadline = attempts * REKEY_ATTEMPT_S + HANDSHAKE_SLACK_S
+    ping1 = max(3, tries_for(s1))
+    # Over capacity a frame survives about C / rate (C from this run's probe).
+    rate2 = STEP2_RATE * c
+    s2 = SURVIVAL_MARGIN * c / rate2
+    ping2 = tries_for(s2)
+    print(f"\nbudgets: below capacity survival {s1:.3f} -> wireguard-go deadline {hs_deadline:.1f} s "
+          f"({attempts} attempts), {ping1} ping tries; step 2 survival {s2:.3f} -> {ping2} ping tries "
+          f"({ping_budget(ping2):.0f} s)", flush=True)
+
+    # Flood step 1, below capacity: wireguard-go (re)started on a fixed port.
+    step1 = flood.snapshot()
+    step1_mark = con.mark()
+    wg = WgGo(wg_go_conf(deploy), "10.200.0.2/32", cfg["gateway"]["inside_prefix"])
+    opened.append(wg)
+    before_hs = wg.latest_handshake()
+    trigger = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    trigger.sendto(b"x", (ip_str(HOST_IP), 9))
+    trigger.close()
+    started = time.monotonic()
+    attribute_wireguard_go(sniffer, con, gw_pub, started + hs_deadline)
+    print(f"\nflood step 1: wireguard-go's mac2 accepted {time.monotonic() - started:.1f} s after its start", flush=True)
+    deadline = time.monotonic() + REKEY_ATTEMPT_S
+    while wg.latest_handshake() == before_hs:
+        if time.monotonic() > deadline:
+            raise Fail("cookie attribution failed: wireguard-go reports no new handshake")
+        time.sleep(0.1)
+    if con.count(r"audit: src=ingress WgLoadCleared "):
+        raise Fail("flood step 1: WgLoadCleared between WgUnderLoad and the handshake: load did not hold")
+    ping(tries=ping1)
+    # The probe saturates ingress, where the reserve does bind, so this
+    # boot's first WgCookieSuppressed is the probe's; the paired case holds
+    # the fresh-counter check. Here: no new line during step 1.
+    if con.count(r"audit: src=ingress WgCookieSuppressed ", since=step1_mark):
+        raise Fail("flood step 1: WgCookieSuppressed during step 1: the TX reserve bound below capacity")
+    check_band("flood step 1", step1, flood.snapshot(), lo1, hi1)
+    sniffer.check_drops()
+    print("\nPASS [cookie flood step 1: wireguard-go drew a cookie, handshook with mac2 and pinged below capacity]",
+          flush=True)
+    wg.close()
+    opened.remove(wg)
+
+    # The Python peer's session, made under load through the cookie path
+    # right before step 2.
+    peer1 = open(os.path.join(deploy, "peer-1.conf")).read()
+    py = PyPeer(peer1, gw_pub)
+    opened.append(py)
+    if not cookie_handshake(py, tries_for(s1 * s1) + 1) or not py_ping(py, ping1, ident=0x4642):
+        raise Fail("precondition: no Python-peer session under load through the cookie path")
+    budget2 = STEP2_WARMUP_S + ping_budget(ping2)
+    age = time.monotonic() - py.established
+    if age + budget2 >= rust_const(WG_CORE, "REJECT_AFTER_TIME_NS") / NS:
+        raise Fail(f"precondition: session age {age:.0f} s leaves no room for step 2's {budget2:.0f} s budget")
+
+    # Flood step 2, over capacity, running until the ping assertion concludes.
+    step2 = flood.set_rate(rate2)
+    time.sleep(STEP2_WARMUP_S)
+    ok = py_ping(py, ping2, ident=0x4643)
+    print(f"\nflood step 2: ping reply on try {ok} of {ping2}", flush=True)
+    if not flood.running():
+        raise Fail("flood step 2: the flood was not running when the ping assertion concluded")
+    check_band("flood step 2", step2, flood.snapshot(), STEP2_BAND[0] * c, STEP2_BAND[1] * c)
+    if not ok:
+        raise Fail(f"flood step 2: no ping reply through the established session in {ping2} tries over capacity")
+    flood.set_rate(0)
+    sniffer.check_drops()
+
+
+def test_cookie_b(loader: str, deploy: str, passed: list):
+    """Boot "cookie-b": the flood case."""
+    tap = Tap()
+    inside = Wire()
+    host = InsideHost(inside)
+    try:
+        child, con = boot(loader, tap.netdev("n0"), inside.netdev("n1"))
+    except BaseException:
+        tap.close()
+        raise
+    sniffer = None
+    opened = []
+    try:
+        start_without_stop_signals(host)
+        sniffer = Sniffer(WG_LISTEN_PORT)
+        wait_tap_ready(tap, con)
+        cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
+        flood_case(con, tap, sniffer, deploy, b64(cfg["gateway"]["public_key"]), cfg, opened)
+        passed.append("cookie under flood")
+        print("\nPASS [cookie under flood: step 1 attributed below capacity, step 2 ping over capacity]")
+    finally:
+        try:
+            with signals_held():
+                host.stop = True
+                close_all(*opened, sniffer)
+                kill(child)
+                tap.close()
+        except SystemExit:
+            host.stop = True
+            close_all(*opened, sniffer)
+            kill(child)
+            tap.close()
+            raise
+
+
 # ---------------------------------------------------------------- driver
 
 
@@ -800,6 +1648,16 @@ def preflight():
     r = subprocess.run(["unshare", "-r", "--uts", "true"], capture_output=True, text=True)
     if r.returncode == 0 or "unshare failed" not in r.stderr:
         raise Fail(f"unshare(NEWUSER|NEWUTS) not refused by the filter: rc={r.returncode} {r.stderr.strip()}")
+    # VE8: the cookie boots need a tap and AF_PACKET inside the netns.
+    r = subprocess.run(["unshare", "-rn", "ip", "tuntap", "add", "dev", "tapcheck", "mode", "tap"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Fail(f"cannot create a tap device inside unshare -rn (VE8): {r.stderr.strip()}")
+    r = subprocess.run(["unshare", "-rn", sys.executable, "-c",
+                        "import socket; socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0).close()"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Fail(f"cannot open an AF_PACKET socket inside unshare -rn (VE8): {r.stderr.strip()[-300:]}")
 
 
 def make(*args, env=None):
@@ -869,6 +1727,8 @@ def in_netns(good: str, mismatched: str, deploy: str) -> int:
     cases = [("reason list in sync", single("reason list", check_reason_list_matches_rust)),
              ("raw frames", single("raw frames", lambda: test_raw(good))),
              ("wireguard", lambda: test_wireguard(good, deploy, passed)),
+             ("cookie boot a", lambda: test_cookie_a(good, deploy, passed)),
+             ("cookie boot b", lambda: test_cookie_b(good, deploy, passed)),
              ("mismatched blob halts key", single("mismatched blob", lambda: test_mismatched_blob(mismatched)))]
     for name, fn in cases:
         try:

@@ -130,9 +130,9 @@ code [R3-T-P5]:
   than on forwards.
 - **Accepted cost:** an attacker sending more than `1 / ARRIVAL_INTERVAL_NS`
   mac1-valid initiations/s (public key only; 200/s at the initial values)
-  keeps the gateway under load. If `C-FEASIBLE` retunes the arrival
-  constants, this figure is updated in R6 and the deviation log
-  [R5-S-1]. Every
+  keeps the gateway under load. Batch 4 measured C at 740–1 650/s under
+  TCG, at least 2 × the refill (CF), so the arrival constants stand and
+  this figure is the one in R6 and the deviation log [R5-S-1]. Every
   handshake then pays one cookie round trip plus up to one retransmit
   (5 s + jitter). This is inherent to WireGuard cookies and is stated in
   R6.
@@ -513,15 +513,12 @@ refusal's comments and messages move from SC13 to SC20 (M7).
     sources.
   - **Implementation Phase 2 measures,** under TCG, `ingress`'s
     processing rate C.
-    - **Feasibility precondition (marker `C-FEASIBLE`, settled like M3
-      before Phase 3):** C must be at least 2 × the arrival refill
-      (400/s).
+    - **Feasibility precondition (CF, settled in batch 4):** C must be
+      at least 2 × the arrival refill (400/s).
       - A cookie-gated flood holds load only through the arrival meter,
         which needs `ingress` to process more than the refill.
-      - If the measurement fails, `ARRIVAL_*` is retuned (within the
-        compile-time ordering assertion) before Phase 3. The
-        accepted-cost figure in R6 and the deviation log is updated to
-        match; the R6 text carries the marker until then.
+      - Measured C: 740–1 650/s per run under TCG (deviation log, batch
+        4), so `ARRIVAL_*` was not retuned.
       - At run time, the harness aborts with a distinct message if the
         measured C falls below it [R4-T-Q3, R4-F-F1].
   - **Per-run C [R5-T-S1]:**
@@ -579,8 +576,8 @@ refusal's comments and messages move from SC13 to SC20 (M7).
     - `SO_RCVBUF` is enlarged;
     - `PACKET_STATISTICS` with `tp_drops > 0` aborts with a distinct
       message, so a drop never reads as an attribution failure.
-- **Key-exhaustion positive control [M3, R2-T-N3]: PROVISIONAL, decided in
-  Phase 2 (marker `M3-PENDING`).**
+- **Key-exhaustion positive control [M3, R2-T-N3]: decided in batch 4,
+  branch 2.**
   - **Measurement run** [R3-T-P2]:
     - The mutation disables the forward bucket, the mac2 requirement
       [R2-F-A1] *and* the per-source bucket.
@@ -594,14 +591,14 @@ refusal's comments and messages move from SC13 to SC20 (M7).
       composition, and asserts that it never appears;
     - check-selftest `integration-key-exhaustion` is the measurement
       mutation.
-  - **Branch 2 (it does not appear):**
+  - **Branch 2 (it does not appear) — taken:**
     - the clause is dropped;
-    - the measured `hs` rate is recorded in the deviation log;
+    - the measured `hs` rate is recorded in the deviation log: about
+      100–120 initiations/s, under 300 key calls/s against `key`'s
+      2 000/s refill, with no `HandshakeKeyRateLimited`;
     - "`key` unreachable" rests on C5 and Kani (b) alone.
-  - **Settled before Phase 3:** the branch is chosen and recorded,
-    `M3-PENDING` is removed, and the Go/No-Go row "M3 decision" flips to
-    `locked`. The Phase-3 entry check is that
-    `rg 'M3-PENDING|C-FEASIBLE' docs/` is empty.
+  - **Settled in batch 4:** the branch is recorded in the deviation log
+    and the Go/No-Go row "M3" is `locked`.
 - **Manifest:** `INTEGRATION-CASES` increases by 3.
 - **check-selftest:**
   - `integration-cookie` removes the mac2 requirement under load. Its
@@ -609,7 +606,7 @@ refusal's comments and messages move from SC13 to SC20 (M7).
   - The integration-count needle becomes `10 < manifest 11`.
   - `ingress-unbounded-loop` and `ingress-late-notify` (C4). Each also
     checks that Flood step 1's PASS line printed before its needle.
-  - `integration-key-exhaustion` in branch 1 only.
+  - `integration-key-exhaustion` in branch 1 only (not taken).
 
 **C7 — data-core passive keepalive**
 - **Signature:** `Data::keepalive(&mut self, now_ns, out) -> Option<(u16, usize)>`.
@@ -686,7 +683,8 @@ refusal's comments and messages move from SC13 to SC20 (M7).
 - **check-selftest cases:**
   - C5: four;
   - C4: `laws-timer-ingress`;
-  - C6: `integration-cookie`, plus `integration-key-exhaustion` in branch 1;
+  - C6: `integration-cookie` (`integration-key-exhaustion` was for branch 1,
+    not taken);
   - C4: `ingress-unbounded-loop`, `ingress-late-notify`;
   - C3: one case per arrival/forward ordering assertion.
 
@@ -733,10 +731,10 @@ refusal's comments and messages move from SC13 to SC20 (M7).
 ## Carried-Forward Plan Findings
 
 Plan review closed at Round 5 by saturation; every Round-5 finding is
-resolved in rev 6. Two decisions are carried into Phase 2 by design,
-because they depend on measurements under TCG.
+resolved in rev 6. Two decisions were carried into Phase 2 by design,
+because they depend on measurements under TCG; batch 4 settled both.
 
-### M3 [Major, Round 1] Key-exhaustion positive control — Accepted (carried to Phase 2)
+### M3 [Major, Round 1] Key-exhaustion positive control — Decided in batch 4 (branch 2)
 - **Anti-Deferral check:** this is a measurement-dependent branch, not a
   deferred fix. Both branches are specified in C6.
 - **Cost of not deciding now:** none to correctness. C5 and Kani (b)
@@ -745,17 +743,18 @@ because they depend on measurements under TCG.
   gating and per-source bucket disabled; peer-keyed flood for 60 s)
   either shows `HandshakeKeyRateLimited total=1`, giving branch 1, or does
   not, giving branch 2.
-- **Gate:** the marker `M3-PENDING` and the Go/No-Go row M3. The Phase-3
-  entry check `rg 'M3-PENDING|C-FEASIBLE' docs/` must be empty.
+- **Outcome:** no `HandshakeKeyRateLimited` in the measurement run;
+  branch 2 (deviation log, batch 4). Go/No-Go row M3 is `locked`.
 
-### CF [Minor, Round 4] Flood-case feasibility — Accepted (carried to Phase 2)
+### CF [Minor, Round 4] Flood-case feasibility — Decided in batch 4 (feasible)
 - **Anti-Deferral check:** a measurement precondition, not a deferred fix.
 - **Cost:** if it fails, the arrival constants are retuned within the
   compile-time ordering assertion, and R6's accepted-cost figure is
   updated to match.
 - **What would settle it:** the measured C ≥ 2 × the arrival refill.
-- **Gate:** the marker `C-FEASIBLE` and the Go/No-Go row CF, with the same
-  Phase-3 entry check.
+- **Outcome:** C measured at 740–1 650/s per run, at least 2 × the
+  200/s refill; no retune (deviation log, batch 4). Go/No-Go row CF is
+  `locked`.
 
 ## Go/No-Go Gate
 
@@ -766,7 +765,80 @@ because they depend on measurements under TCG.
 | C3 | ingress-core gate: load (forward, arrivals, backlog), mac2, caps, rotation, pass plan | locked |
 | C4 | ingress PD, timer channel, `in_flight`/`free`, bounded loop, audit classes | locked |
 | C5 | key budget invariant incl. ring backlog | locked |
-| C6 | integration: tap, two boots, keepalive, cookie paired, flood; M3 provisional | locked |
+| C6 | integration: tap, two boots, keepalive, cookie paired, flood; M3 branch 2 | locked |
 | C7 | data-core passive keepalive | locked |
-| M3 | Key-exhaustion branch decision (Phase 2 measurement; `M3-PENDING`) | pending (by design until Phase 2) |
-| CF | Flood-case feasibility C ≥ 2 × arrival refill (`C-FEASIBLE`) | pending (by design until Phase 2) |
+| M3 | Key-exhaustion branch decision (batch 4 measurement: branch 2) | locked |
+| CF | Flood-case feasibility C ≥ 2 × arrival refill (batch 4: C 740–1 650/s) | locked |
+
+## Implementation Checklist
+
+Base ref for every diff: `feature/m2-wireguard` (`3750758`). M2 is not on
+`main` yet.
+
+**Carried-forward items** (from the section above):
+- M3: decided in batch 4 by measurement.
+- CF: decided in batch 4 by measurement.
+
+Each gets a deviation-log entry when decided.
+
+**Batches** (files are disjoint within a batch):
+1. **Batch 1a — C1, C2:**
+   - `crates/wg-core/{src/cookie.rs (new), src/crypto.rs, src/lib.rs (pub mod cookie, KEEPALIVE_TIMEOUT_NS), src/tests*.rs, Cargo.toml if a feature is needed}`
+   - `crates/wg-wire/{src/lib.rs, src/tests.rs, src/proofs.rs, src/__fuzz__/…/corpus/seed-cookie-reply}`
+   - Python vector generator under `tests/tools/` (checked-in script, with
+     its output pinned in the Rust tests)
+2. **Batch 1b — ring, audit-event, C5:**
+   - `crates/ring/src/link.rs` (`in_flight`, `free`, both reclaiming
+     first) plus tests (and proofs if the existing harnesses touch
+     `Pool`);
+   - `crates/audit-event` (new events, never-coalesced class, `FIXED`,
+     `FIXED_SLOTS`, tests);
+   - `crates/key-core` (`KEY_BURST`, `KEY_INTERVAL_NS`, `KEY_BOOT_CALLS`);
+   - `crates/pds/key/src/main.rs` (uses them);
+   - `crates/hs-core` (`KEY_CALLS_PER_HANDSHAKE`, per-path counting test,
+     const asserts; dev-dependencies on `ingress-core` and `layout`). The
+     asserts reference ingress-core constants that land in batch 2, so 1b
+     adds the asserts against placeholder-free names only after batch 2,
+     or batch 2 adds them.
+3. **Batch 2a — C7:** `crates/data-core`, `crates/pds/data/src/main.rs`.
+4. **Batch 2b — C3:** `crates/ingress-core/{lib.rs, proofs.rs, tests.rs}`,
+   plus the hs-core C5 const asserts that need its constants.
+5. **Batch 3 — C4:**
+   - `crates/pds/ingress/src/main.rs`;
+   - `crates/pds/timer/src/main.rs`;
+   - `crates/layout/{lib.rs, tests.rs}`;
+   - `system/secureos.system`;
+   - `policy/laws.toml`.
+6. **Batch 4 — C6, gates, M3/CF:**
+   - `tests/integration/{run.py, wg.py}`;
+   - `tools/check-selftest` (new cases);
+   - `tests/manifest.txt`;
+   - SC13 → SC20 text in `tools/package`, `Makefile`,
+     `tests/tools/test_package.py`;
+   - the architecture plan's R6;
+   - the deviation log.
+
+**Shared code that must be reused, not reimplemented:**
+- `wg_core::crypto::{hash, mac, ct_eq}` (add `mac16` beside `mac`);
+- the `libcrux-chacha20poly1305` `xchacha20_poly1305` module;
+- `cpu::fill_random` (zeroes on failure);
+- the token-bucket shape of `ingress_core::Buckets` and `key_core::Bucket`;
+- `pdkit::{send, recv, Audit}`;
+- `ingress_core::emit_udp`;
+- `msgs::ToIngress::Outbound` (keepalives);
+- `audit_event` coalescing (`COALESCE_EVERY`).
+
+**Patterns to follow at every site:**
+- `#![deny(clippy::indexing_slicing, unwrap_used, expect_used, panic, arithmetic_side_effects)]`
+  in core crates;
+- secret types are not `Copy`, `Clone` or `Debug`, and are zeroized on
+  drop;
+- totals and decoders are total;
+- every new gate gets a check-selftest case.
+
+**Not applicable:**
+- No CI (SC9). `make check` is the full local gate, and no parity diff
+  exists.
+- The fingerprint hook does not support Rust; the inventory above is
+  manual.
+- No `feedback_*` memories.

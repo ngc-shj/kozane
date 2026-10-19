@@ -50,6 +50,7 @@ pub mod ingress {
     pub const CH_AUDIT: usize = 2;
     pub const CH_HS: usize = 3;
     pub const CH_DATA: usize = 4;
+    pub const CH_TIMER: usize = 5;
 }
 
 pub mod audit {
@@ -68,6 +69,7 @@ pub mod timer {
     pub const CH_DEVICE: usize = 0;
     pub const CH_DATA: usize = 1;
     pub const CH_HS: usize = 2;
+    pub const CH_INGRESS: usize = 3;
 }
 
 pub mod key {

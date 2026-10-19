@@ -8,7 +8,7 @@
 
 use core::ptr::NonNull;
 
-use key_core::{Bucket, ERR_BAD_REQUEST, MAX_WORDS, Oracle};
+use key_core::{Bucket, ERR_BAD_REQUEST, KEY_BURST, KEY_INTERVAL_NS, MAX_WORDS, Oracle};
 use layout::key as ch;
 use sel4_microkit::{
     Channel, Handler, Infallible, MessageInfo, debug_println, memory_region_symbol, protection_domain,
@@ -20,11 +20,6 @@ const HS: Channel = Channel::new(ch::CH_HS);
 
 /// RNDR samples mixed into the boot seed.
 const SEED_SAMPLES: usize = 4;
-
-/// `hs` makes three calls per handshake (es, ss, PskMix); this allows bursts far beyond what
-/// its CPU budget can drive while still bounding a runaway caller.
-const BUCKET_BURST: u64 = 256;
-const BUCKET_INTERVAL_NS: u64 = 1_000_000_000 / 2_000;
 
 struct Key {
     oracle: Oracle<'static>,
@@ -56,7 +51,7 @@ fn init() -> Key {
         .unwrap_or_else(|_| halt("boot seed derivation failed"));
     samples.fill(0);
     debug_println!("key: secrets valid ({} peers)", blob.peer_count());
-    Key { oracle: Oracle::new(blob, Key32::from_bytes(seed)), bucket: Bucket::new(BUCKET_BURST, BUCKET_INTERVAL_NS) }
+    Key { oracle: Oracle::new(blob, Key32::from_bytes(seed)), bucket: Bucket::new(KEY_BURST, KEY_INTERVAL_NS) }
 }
 
 impl Handler for Key {

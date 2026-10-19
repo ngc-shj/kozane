@@ -16,9 +16,9 @@ Both the blob and OUT must resolve outside the repository (and so `build/`)
 and the toolchain caches. OUT must not exist yet: the image is built in a
 fresh 0700 staging directory beside it under umask 077, renamed into place
 only after every check passed, and removed on every failure path.
-Until cookies land (SC13, architecture R6) only `debug` kernels may be
-packaged, read from the kernel's own gen_config.h rather than a make
-variable.
+Until a release kernel has been booted and tested (SC20, architecture R4)
+only `debug` kernels may be packaged, read from the kernel's own
+gen_config.h rather than a make variable.
 """
 
 import argparse
@@ -41,7 +41,7 @@ DEBUG_LINE = "#define CONFIG_DEBUG_BUILD  1"
 def require_debug(gen_config: str) -> list:
     if DEBUG_LINE in gen_config.splitlines():
         return []
-    return ["package: kernel config is not debug; M2 images are dev-only until cookies (SC13)"]
+    return ["package: kernel config is not debug; images are dev-only until release kernels are tested (SC20)"]
 
 
 def check_blob(blob: bytes) -> list:

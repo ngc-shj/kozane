@@ -528,3 +528,180 @@ fn outbound_refuses_an_expired_current() {
     let o = d.outbound(&Allowed, &datagram(HOST_IP, PEER0_IP), T0 + REJECT_AFTER_TIME_NS, &mut out);
     assert_eq!(o, OutboundOutcome::Rejected(SessionError::Expired));
 }
+
+// --- passive keepalive ---
+
+const KEEPALIVE: u64 = wg_core::KEEPALIVE_TIMEOUT_NS;
+
+fn data_in(d: &mut D, c: &mut Client, src: Ipv4, now_ns: u64) {
+    let mut out = [0u8; 64];
+    let o = d.inbound(&Allowed, EP1, &c.packet(&datagram(src, HOST_IP)), now_ns, &mut out);
+    assert!(matches!(o, InboundOutcome::Authenticated { payload: Payload::Forward(_), .. }), "{o:?}");
+}
+
+fn keepalive(d: &mut D, now_ns: u64) -> Option<(u16, Vec<u8>)> {
+    let mut out = [0u8; MAX_TRANSPORT];
+    d.keepalive(now_ns, &mut out).map(|(peer, len)| (peer, out[..len].to_vec()))
+}
+
+fn confirmed(d: &mut D, peer: u16, local_index: u32) -> Client {
+    let mut c = install(d, peer, local_index);
+    confirm(d, &mut c);
+    c
+}
+
+#[test]
+fn keepalive_is_not_sent_when_a_reply_went_out() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    data_in(&mut d, &mut a, PEER0_IP, T0);
+    assert!(matches!(send(&mut d, &datagram(HOST_IP, PEER0_IP)).0, OutboundOutcome::Sealed { .. }));
+    assert_eq!(keepalive(&mut d, T0 + KEEPALIVE), None);
+}
+
+#[test]
+fn unanswered_data_gets_exactly_one_empty_message_on_the_next_counter() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    let (_, first) = send(&mut d, &datagram(HOST_IP, PEER0_IP));
+    assert!(a.open(&first).is_some());
+    data_in(&mut d, &mut a, PEER0_IP, T0);
+    let (peer, msg) = keepalive(&mut d, T0 + KEEPALIVE).unwrap();
+    assert_eq!((peer, msg.len()), (0, TRANSPORT_MIN_LEN));
+    assert_eq!(Transport::parse(&msg).unwrap().counter, 1);
+    assert_eq!(a.open(&msg), Some(Vec::new()));
+    assert_eq!(keepalive(&mut d, T0 + KEEPALIVE), None);
+    assert_eq!(keepalive(&mut d, T0 + 2 * KEEPALIVE), None);
+}
+
+#[test]
+fn sent_keepalive_is_classified_as_keepalive_by_a_receiving_data() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    data_in(&mut d, &mut a, PEER0_IP, T0);
+    let (_, msg) = keepalive(&mut d, T0 + KEEPALIVE).unwrap();
+    // The peer's side as another `Data`: its receive key is our send key.
+    let mut peer = D::new();
+    let (send, recv_key) = ([1u8 ^ 0x80; 32], [1u8; 32]);
+    let o = peer.install(&Install { peer: 0, local_index: 1001, remote_index: 1, send: &send, recv: &recv_key }, T0);
+    assert_eq!(o, InstallOutcome::Installed);
+    let mut out = [0u8; 16];
+    let o = peer.inbound(&Allowed, EP1, &msg, T0 + KEEPALIVE, &mut out);
+    assert!(matches!(o, InboundOutcome::Authenticated { payload: Payload::Keepalive, .. }), "{o:?}");
+}
+
+#[test]
+fn received_keepalives_alone_do_not_arm() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    for _ in 0..3 {
+        recv(&mut d, EP1, &a.packet(&[]), &mut [0u8; 16]);
+    }
+    assert_eq!(keepalive(&mut d, T0 + KEEPALIVE), None);
+}
+
+#[test]
+fn expired_current_is_disarmed_and_a_later_peer_is_still_served() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    let (o, mut b) = install_at(&mut d, 1, 2, T0 + 20 * KEEPALIVE);
+    assert_eq!(o, InstallOutcome::Installed);
+    confirm(&mut d, &mut b);
+    data_in(&mut d, &mut a, PEER0_IP, T0);
+    data_in(&mut d, &mut b, PEER1_IP, T0);
+    // Peer 0's current has expired; peer 1's has not.
+    let late = T0 + REJECT_AFTER_TIME_NS;
+    let (peer, msg) = keepalive(&mut d, late).unwrap();
+    assert_eq!(peer, 1);
+    assert_eq!(b.open(&msg), Some(Vec::new()));
+    assert_eq!(keepalive(&mut d, late), None);
+    // Peer 0 was disarmed, not merely skipped: a fresh current sends nothing.
+    let (_, mut a2) = install_at(&mut d, 0, 3, late);
+    confirm(&mut d, &mut a2);
+    assert_eq!(keepalive(&mut d, late), None);
+}
+
+#[test]
+fn tick_dropping_current_disarms() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    data_in(&mut d, &mut a, PEER0_IP, T0);
+    let late = T0 + REJECT_AFTER_TIME_NS;
+    assert_eq!(d.tick(late), 1);
+    let (_, mut a2) = install_at(&mut d, 0, 2, late);
+    confirm(&mut d, &mut a2);
+    assert_eq!(keepalive(&mut d, late), None);
+}
+
+#[test]
+fn data_on_previous_gets_a_keepalive_on_current() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    let mut b = confirmed(&mut d, 0, 2);
+    data_in(&mut d, &mut a, PEER0_IP, T0);
+    let (_, msg) = keepalive(&mut d, T0 + KEEPALIVE).unwrap();
+    assert_eq!(a.open(&msg), None);
+    assert_eq!(b.open(&msg), Some(Vec::new()));
+}
+
+#[test]
+fn promotion_keeps_the_debt_and_the_new_current_carries_the_keepalive() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    data_in(&mut d, &mut a, PEER0_IP, T0);
+    let mut b = confirmed(&mut d, 0, 2);
+    let (_, msg) = keepalive(&mut d, T0 + KEEPALIVE).unwrap();
+    assert_eq!(b.open(&msg), Some(Vec::new()));
+}
+
+#[test]
+fn second_data_packet_does_not_move_the_deadline() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    data_in(&mut d, &mut a, PEER0_IP, T0);
+    data_in(&mut d, &mut a, PEER0_IP, T0 + KEEPALIVE / 2);
+    assert_eq!(keepalive(&mut d, T0 + KEEPALIVE - 1), None);
+    assert!(keepalive(&mut d, T0 + KEEPALIVE).is_some());
+}
+
+#[test]
+fn rejected_packet_does_not_arm() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    let mut forged = a.packet(&datagram(PEER0_IP, HOST_IP));
+    forged[TRANSPORT_HEADER_LEN] ^= 1;
+    assert_eq!(recv(&mut d, EP1, &forged, &mut [0u8; 64]), InboundOutcome::Rejected(SessionError::Auth));
+    assert_eq!(keepalive(&mut d, T0 + KEEPALIVE), None);
+}
+
+#[test]
+fn spoofed_or_invalid_payloads_do_not_arm() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    let mut out = [0u8; 64];
+    let o = recv(&mut d, EP1, &a.packet(&datagram(PEER1_IP, HOST_IP)), &mut out);
+    assert!(matches!(o, InboundOutcome::Authenticated { payload: Payload::SpoofedSource, .. }));
+    let o = recv(&mut d, EP1, &a.packet(&[0x60; 40]), &mut out);
+    assert!(matches!(o, InboundOutcome::Authenticated { payload: Payload::Invalid(_), .. }));
+    assert_eq!(keepalive(&mut d, T0 + KEEPALIVE), None);
+}
+
+#[test]
+fn backwards_clock_does_not_fire() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    data_in(&mut d, &mut a, PEER0_IP, T0);
+    assert_eq!(keepalive(&mut d, T0 - 1), None);
+    assert_eq!(keepalive(&mut d, 0), None);
+    // Still armed for the real deadline.
+    assert!(keepalive(&mut d, T0 + KEEPALIVE).is_some());
+}
+
+#[test]
+fn keepalive_fires_at_exactly_the_timeout_and_not_a_nanosecond_before() {
+    let mut d = D::new();
+    let mut a = confirmed(&mut d, 0, 1);
+    data_in(&mut d, &mut a, PEER0_IP, T0);
+    assert_eq!(keepalive(&mut d, T0 + KEEPALIVE - 1), None);
+    assert!(keepalive(&mut d, T0 + KEEPALIVE).is_some());
+}

@@ -31,6 +31,7 @@ fn limits_match_whitepaper_section_6_1() {
     assert_eq!(REKEY_AFTER_TIME_NS, 120_000_000_000);
     assert_eq!(REJECT_AFTER_TIME_NS, 180_000_000_000);
     assert_eq!(REKEY_TIMEOUT_NS, 5_000_000_000);
+    assert_eq!(KEEPALIVE_TIMEOUT_NS, 10_000_000_000);
 }
 
 // RFC 7748 section 5.2 (the first scalar is unclamped: X25519 clamps internally).

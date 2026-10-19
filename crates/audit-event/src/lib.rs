@@ -4,6 +4,9 @@
 //! reach the log through this channel. Producers coalesce: each event kind
 //! is emitted on its 1st occurrence and every 64th after (running totals
 //! 1, 65, 129, ...), so a flood of K events yields about K/64 records.
+//! The few kinds for which `Event::is_coalesced` is false are emitted on
+//! every occurrence; producers raise them only on state edges, never at a
+//! rate an attacker drives.
 
 #![no_std]
 #![deny(
@@ -94,6 +97,23 @@ pub enum Event {
     HandshakeKeyRateLimited,
     /// Transport packet for a receiver index with no live session.
     TransportUnknownIndex,
+    /// `ingress` entered the under-load state (edge; never coalesced).
+    WgUnderLoad,
+    /// `ingress` left the under-load state (edge; never coalesced).
+    WgLoadCleared,
+    /// Under load, an initiation without a valid mac2 drew a cookie reply.
+    WgCookieSent,
+    /// A cookie reply was due but not sent (TX reserve or seal failure).
+    WgCookieSuppressed,
+    /// A cookie reply was due but no usable cookie secret was held.
+    WgCookieDropped,
+    /// Under load, an initiation with a valid mac2 was forwarded to `hs`.
+    WgMac2Accepted,
+    /// The cookie secret reached its maximum age unrotated (edge; never
+    /// coalesced).
+    CookieSecretExpired,
+    /// The cookie secret could not be generated (edge; never coalesced).
+    CookieSecretUnavailable,
 }
 
 impl Event {
@@ -130,6 +150,14 @@ impl Event {
             Event::SessionExpired => 0x0031,
             Event::HandshakeKeyRateLimited => 0x0032,
             Event::TransportUnknownIndex => 0x0033,
+            Event::WgUnderLoad => 0x0034,
+            Event::WgLoadCleared => 0x0035,
+            Event::WgCookieSent => 0x0036,
+            Event::WgCookieSuppressed => 0x0037,
+            Event::WgCookieDropped => 0x0038,
+            Event::WgMac2Accepted => 0x0039,
+            Event::CookieSecretExpired => 0x003a,
+            Event::CookieSecretUnavailable => 0x003b,
             Event::FrameDropped { reason } => {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
             }
@@ -137,7 +165,7 @@ impl Event {
     }
 
     /// Every variant except the parameterised `FrameDropped`.
-    pub const FIXED: [Event; 31] = [
+    pub const FIXED: [Event; 39] = [
         Event::ArpReplied,
         Event::UdpEchoed,
         Event::RingCorrupt,
@@ -169,6 +197,14 @@ impl Event {
         Event::SessionExpired,
         Event::HandshakeKeyRateLimited,
         Event::TransportUnknownIndex,
+        Event::WgUnderLoad,
+        Event::WgLoadCleared,
+        Event::WgCookieSent,
+        Event::WgCookieSuppressed,
+        Event::WgCookieDropped,
+        Event::WgMac2Accepted,
+        Event::CookieSecretExpired,
+        Event::CookieSecretUnavailable,
     ];
 
     /// Display name; exhaustive, so a new variant fails to compile here.
@@ -205,7 +241,61 @@ impl Event {
             Event::SessionExpired => "SessionExpired",
             Event::HandshakeKeyRateLimited => "HandshakeKeyRateLimited",
             Event::TransportUnknownIndex => "TransportUnknownIndex",
+            Event::WgUnderLoad => "WgUnderLoad",
+            Event::WgLoadCleared => "WgLoadCleared",
+            Event::WgCookieSent => "WgCookieSent",
+            Event::WgCookieSuppressed => "WgCookieSuppressed",
+            Event::WgCookieDropped => "WgCookieDropped",
+            Event::WgMac2Accepted => "WgMac2Accepted",
+            Event::CookieSecretExpired => "CookieSecretExpired",
+            Event::CookieSecretUnavailable => "CookieSecretUnavailable",
             Event::FrameDropped { .. } => "FrameDropped",
+        }
+    }
+
+    /// False for kinds emitted on every occurrence. Exhaustive, so a new
+    /// variant must be classified here.
+    pub const fn is_coalesced(self) -> bool {
+        match self {
+            Event::WgUnderLoad | Event::WgLoadCleared | Event::CookieSecretExpired | Event::CookieSecretUnavailable => {
+                false
+            }
+            Event::ArpReplied
+            | Event::UdpEchoed
+            | Event::FrameDropped { .. }
+            | Event::RingCorrupt
+            | Event::RxNoBuffer
+            | Event::TxNoBuffer
+            | Event::BadDescriptor
+            | Event::NotForUs
+            | Event::NoService
+            | Event::Spoofed
+            | Event::DeviceFault
+            | Event::FrameTooLong
+            | Event::HandshakeOk
+            | Event::HandshakeUnknownPeer
+            | Event::HandshakeDecrypt
+            | Event::HandshakeReplay
+            | Event::HandshakeFlood
+            | Event::HandshakeKeyRefused
+            | Event::HandshakeOther
+            | Event::WgBadMessage
+            | Event::WgBadMac1
+            | Event::WgRateLimited
+            | Event::SessionInstalled
+            | Event::SessionCollision
+            | Event::TransportRejected
+            | Event::SpoofedSource
+            | Event::NoSession
+            | Event::UnknownNeighbor
+            | Event::SessionPromoted
+            | Event::SessionExpired
+            | Event::HandshakeKeyRateLimited
+            | Event::TransportUnknownIndex
+            | Event::WgCookieSent
+            | Event::WgCookieSuppressed
+            | Event::WgCookieDropped
+            | Event::WgMac2Accepted => true,
         }
     }
 
@@ -248,6 +338,14 @@ impl Event {
             Event::SessionExpired => 28,
             Event::HandshakeKeyRateLimited => 29,
             Event::TransportUnknownIndex => 30,
+            Event::WgUnderLoad => 31,
+            Event::WgLoadCleared => 32,
+            Event::WgCookieSent => 33,
+            Event::WgCookieSuppressed => 34,
+            Event::WgCookieDropped => 35,
+            Event::WgMac2Accepted => 36,
+            Event::CookieSecretExpired => 37,
+            Event::CookieSecretUnavailable => 38,
             Event::FrameDropped { reason } => {
                 // FIXED_SLOTS..FIXED_SLOTS+64, clamped like `code`.
                 let r = if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason };
@@ -257,7 +355,7 @@ impl Event {
     }
 }
 
-const FIXED_SLOTS: usize = 31;
+const FIXED_SLOTS: usize = 39;
 const SLOTS: usize = FIXED_SLOTS + MAX_DROP_REASON as usize + 1;
 
 /// Per-producer coalescing state.
@@ -289,7 +387,7 @@ impl Coalescer {
             return false;
         };
         *total = total.saturating_add(1);
-        if !total.wrapping_sub(1).is_multiple_of(COALESCE_EVERY) {
+        if ev.is_coalesced() && !total.wrapping_sub(1).is_multiple_of(COALESCE_EVERY) {
             return false;
         }
         let rec = Record { code: ev.code(), _reserved: 0, a: *total, b: self.overflow };

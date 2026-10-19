@@ -85,6 +85,20 @@ where
         Ok(())
     }
 
+    /// Buffers held by the receiver, counted after a `reclaim`, so a buffer
+    /// already returned is never counted as outstanding. Fails as `reclaim`
+    /// does.
+    pub fn in_flight(&mut self) -> Result<usize, LinkError> {
+        self.reclaim()?;
+        Ok(M.saturating_sub(self.pool.mine_count()))
+    }
+
+    /// Buffers owned by this side, counted after a `reclaim`.
+    pub fn free(&mut self) -> Result<usize, LinkError> {
+        self.reclaim()?;
+        Ok(self.pool.mine_count())
+    }
+
     /// Fills a free buffer via `fill`, which writes into private scratch
     /// space and returns the length used (or `None` to send nothing), then
     /// hands the buffer to the receiver.

@@ -21,6 +21,10 @@ use key_core::{LABEL_BOOT_SEED, LABEL_PSK_MIX, LABEL_STATIC_DH, MAX_WORDS, OK, p
 use wg_core::crypto::{self, Key32};
 use wg_core::noise::{Entropy, EntropyError, KeyError, PeerId, PeerTable, Reject, Responder, StaticKey};
 
+/// Most `key` calls one initiation can cost, over every exit of `handle`:
+/// `es`, `ss`, then `PskMix` on accept (M2.5 plan C5).
+pub const KEY_CALLS_PER_HANDSHAKE: u64 = 3;
+
 /// One synchronous call into `key`: (label, request words) → (reply
 /// label, reply word count). The PD implements it with a PPC; tests with
 /// `key_core::Oracle` directly.

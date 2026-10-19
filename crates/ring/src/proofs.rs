@@ -196,4 +196,26 @@ mod link_proofs {
         kani::cover!(r == Ok(true));
         kani::cover!(matches!(r, Err(LinkError::BadDesc(_))));
     }
+
+    /// The backlog read by `ingress`: whatever the peer returns, the count
+    /// never exceeds the pool, and a buffer returned before the call is
+    /// already counted as back.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn sender_in_flight_stays_within_pool() {
+        let mut mem = [0u8; M * BUF];
+        // SAFETY: `mem` outlives `tx` and has the stated length.
+        let region = unsafe { Region::new(mem.as_mut_ptr(), mem.len()) };
+        let used = Adversary::<M>::default();
+        let free = Adversary::<M>::default();
+        let mut tx: Sender<&Adversary<M>, &Adversary<M>, M, M, BUF> = Sender::new(&used, &free, region);
+        let mut scratch = [0u8; BUF];
+        let sent = tx.send_with(&mut scratch, |_| Some(1));
+        let r = tx.in_flight();
+        if let Ok(n) = r {
+            assert!(n <= M);
+        }
+        kani::cover!(sent == Ok(true) && r == Ok(0));
+        kani::cover!(sent == Ok(true) && r == Ok(1));
+    }
 }

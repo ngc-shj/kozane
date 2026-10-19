@@ -103,7 +103,7 @@ Plan rev 2 addressed M1–M19: arrival meter + backlog load signal, forward cap 
 | R2-3 | Func F2 | Major | design | in_flight/tx_free stale; tick lacks backlog | Reclaim-then-count accessors; backlog passed to tick_if_due; drain/full tests |
 | R2-4 | Sec N2 | Major | design | ingress handler never leaves from_outside under flood (pre-existing, fixed in scope) | Bounded loop K=NET_BUFFERS with from_hs/from_data/tick_if_due each pass; pass_plan unit tests; ingress-unbounded-loop selftest; C6 data-path and hs-response assertions under over-capacity flood |
 | R2-5 | Test N2, Sec N3 | Major | design | Load continuity unevidenced; TX reserve as implicit cookie cap | In-guest continuity (no WgLoadCleared, no WgCookieSuppressed); Phase-2 TX vs reply-rate measurement; handshake-class reservation if it binds; residual text |
-| R2-6 | Test N3 | Major | design | M3 lacks rule; recorded resolved while pending | Numeric/observable rule, peer-keyed flood, mutation also disables mac2 gating; marked PROVISIONAL `M3-PENDING`, must be decided before Phase 3 |
+| R2-6 | Test N3 | Major | design | M3 lacks rule; recorded resolved while pending | Numeric/observable rule, peer-keyed flood, mutation also disables mac2 gating; marked PROVISIONAL with the M3 pending marker, must be decided before Phase 3 |
 | R2-7 | Func F4 | Minor | design | TX reserve boundary inconsistent | `> NET_BUFFERS/2` everywhere |
 | R2-8 | Func F5 | Minor | prose | Idle clearing vs rotation | Rotation is the only clearing; scenario 3 reworded |
 | R2-9 | Func F6, Test N5 | Minor | prose | laws needle / single-file flip | Exact needle, flip both files |
@@ -165,14 +165,14 @@ Plan rev 3 addressed R2-1..R2-15 (third load trigger, reclaim-then-count, bounde
 | R3-2 | Func F2, Sec P3 | Major | design | Never-coalesced CookieSecret* mapped from per-initiation outcomes | Edge-only emission from Gate state; per-initiation → coalesced `WgCookieDropped`; 1000-outcome unit test |
 | R3-3 | Func F3, Test P1 | Major | design | Flood unbounded above; allow side flaky | Two phases (near-capacity ≤1.5·C for interop/attribution; short ~3·C for data path); budgets sized for <1e-3 failure, recorded; no-flood allow check |
 | R3-4 | Func F4, Test P4 | Major | design | Paired case load clears before allow step | Flood persists to allow-step response; no-WgLoadCleared guard; WgLoadCleared within 2 s after stop |
-| R3-5 | Test P2 | Major | design | M3 measurement throttled by per-source bucket; weaker branch-1 absence; no mechanical tie | Mutation disables per-source bucket; measured hs rate from totals; peer-keyed absence phase; Go/No-Go row "M3 decision" + `rg M3-PENDING` Phase-3 entry check |
+| R3-5 | Test P2 | Major | design | M3 measurement throttled by per-source bucket; weaker branch-1 absence; no mechanical tie | Mutation disables per-source bucket; measured hs rate from totals; peer-keyed absence phase; Go/No-Go row "M3 decision" + Phase-3 entry check for the M3 marker |
 | R3-6 | Sec P2 | Minor | design | from_hs/from_data unbounded per pass | All three inputs bounded to K; break only when all < K |
 | R3-7 | Sec P4 | Minor | prose | Invariant (d) forbade first-contact cookie | Reworded; Kani cover CookieReply with zero mac2 |
 | R3-8 | Func F5 | Minor | design | RNDR retry attacker-paced | RETRY_INTERVAL 100 ms, invariant (g) |
 | R3-9 | Test P3 | Minor | design | Sniffer drops / port / sender indices | BPF + SO_RCVBUF + tp_drops abort; fixed ListenPort; match set of sender indices |
 | R3-10 | Test P5 | Minor | design | Kani (f) assumption | Under-load computed → (f) definitional |
 
-Testing: M3-PENDING acceptable as a carried item (marker satisfies Anti-Deferral item 4). Security checked clean: transition event rates, TX reserve, reclaim, M3.
+Testing: the M3 pending marker is acceptable as a carried item (marker satisfies Anti-Deferral item 4). Security checked clean: transition event rates, TX reserve, reclaim, M3.
 
 ## Raw expert outputs
 # Functionality expert — Round 3
@@ -191,9 +191,9 @@ P3 Minor design (R29,R49): never-coalesced CookieSecret* mapped from per-initiat
 P4 Minor prose (R29): invariant (d) wording forbids seal_reply for zero mac2. Fix: no crypto when mac1 failed; no mac2_valid when mac2 zero; Kani cover CookieReply with zero mac2.
 
 # Testing expert — Round 3
-Resolved: R2-1, R2-9, R2-10, R2-11, R2-12, R2-5, new unit tests and selftests valid. M3-PENDING acceptable as carried item (marker meets Anti-Deferral 4) given P2 fixes.
+Resolved: R2-1, R2-9, R2-10, R2-11, R2-12, R2-5, new unit tests and selftests valid. The M3 pending marker is acceptable as carried item (marker meets Anti-Deferral 4) given P2 fixes.
 P1 Major design (RT4,R53): over-capacity flood sheds legit frames; retry budgets not derived from survival ratio → flaky; conflicting with unbounded-loop red-proof need. Fix: bound offered rate (<=1.5·C) and size budgets for <1e-3 failure; or two phases (near-capacity for attribution/interop, short over-capacity for data-path starvation).
-P2 Major design (R50,RT4): M3 measurement keeps per-source bucket (20/s/IP) → branch 2 for wrong reason; branch-1 absence on weaker flood; no mechanical tie. Fix: disable per-source bucket or enough spoofed sources; assert forwarded rate; branch-1 absence with peer-keyed composition; Phase-3 entry check rg M3-PENDING empty / Go-No-Go row.
+P2 Major design (R50,RT4): M3 measurement keeps per-source bucket (20/s/IP) → branch 2 for wrong reason; branch-1 absence on weaker flood; no mechanical tie. Fix: disable per-source bucket or enough spoofed sources; assert forwarded rate; branch-1 absence with peer-keyed composition; Phase-3 entry check no M3 marker left / Go-No-Go row.
 P3 Minor (RT4): sniffer drops under flood, wg-go listen port changes on restart, multiple sender indices. Fix: BPF filter + SO_RCVBUF, PACKET_STATISTICS tp_drops abort, ListenPort / wg show listen-port, match set of sender indices.
 P4 Minor (RT4): paired flood must persist through allow step; guard no WgLoadCleared; keep below capacity.
 P5 Minor (RT4,RT7): Kani (f) from symbolic Gate — state whether under-load is computed (definitional) or stored (inductive with minimal assume + cover).
@@ -217,7 +217,7 @@ Plan rev 4 addressed R3-1..R3-10 (per-pass notify/flush, all inputs bounded, edg
 | R4-S-Q1 | Sec | Minor | design (b) | Secret usability decided twice; infallible make_cookie → zero-key cookie on divergence (fail-open of (a)) | CookieSecret validity flag; make_cookie/reply_nonce → Option; adapter fails closed; deny/allow tests |
 | R4-T-Q1 | Test | Major | design | WgLoadCleared within 2 s too short; no lower bound | [1 s, 3.5 s] from named constants |
 | R4-T-Q2 | Test | Minor | design (b) | Over-capacity phase not tied to ping budget | Flood runs until ping concludes, asserted |
-| R4-T-Q3 | Test | Minor | design (b) | Phase-1 band may be empty; session age | C-FEASIBLE gate (Go/No-Go row CF); session set up before Phase 2 with age check |
+| R4-T-Q3 | Test | Minor | design (b) | Phase-1 band may be empty; session age | the CF feasibility marker gate (Go/No-Go row CF); session set up before Phase 2 with age check |
 | R4-T-Q4 | Test | Minor | prose (a) | Gate lacks last_retry / edge flags | Fields added; Kani symbolic Gate ranges over them; (g) two-call harness |
 | R4-F-F1 | Func | Minor | design (b) | Bands empty if C ≤ refill; paired flood lacks lower bound | C ≥ 2×refill gate; bands [1.2×refill, 0.8·C] |
 | R4-F-F2 | Func | Minor | design (b) | Phase-1 above C breaks loop red-proofs | Phase 1/precondition below 0.8·C; PASS-line sanity in selftests |
@@ -236,7 +236,7 @@ Security: all R3 fixes verified; R43 widening checked clean. Testing: R3 fixes v
 Date: 2026-10-19
 
 ## Changes from Previous Round
-Plan rev 5 addressed Round-4 findings (validity flag, [1 s, 3.5 s] window, flood bands [1.2×refill, 0.8·C], C-FEASIBLE, Gate fields, RETRY wording).
+Plan rev 5 addressed Round-4 findings (validity flag, [1 s, 3.5 s] window, flood bands [1.2×refill, 0.8·C], the CF feasibility marker, Gate fields, RETRY wording).
 
 ## Round-5 findings (labels as filed by the experts)
 | ID | Expert | Severity | Label / reach | Subject | Resolution (rev 6) |
@@ -252,7 +252,7 @@ Plan rev 5 addressed Round-4 findings (validity flag, [1 s, 3.5 s] window, flood
 - Condition 3: no Round-5 finding against the contracts, control classes or invariants. The one design-labelled finding (R5-T-S1) concerns harness parameter sourcing and is reachable only by building and executing.
 - Condition 4: the remaining Minors are prose-only (a) or (b), and all were applied in rev 6 anyway.
 
-Decision: plan review closed. Proceed to Phase 2. C1–C7 locked; M3 and CF carried, with the Phase-3 entry check `rg 'M3-PENDING|C-FEASIBLE' docs/` empty.
+Decision: plan review closed. Proceed to Phase 2. C1–C7 locked; M3 and CF carried, with the Phase-3 entry check that neither pending marker is left in docs/ (both settled and removed in batch 4).
 
 ## Recurring Issue Check (round 5, non-N/A)
 - Functionality: R29 F1; R38, R43, R50, R53 checked; others N/A.

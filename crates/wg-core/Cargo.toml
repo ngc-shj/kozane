@@ -12,6 +12,7 @@ wg-wire = { path = "../wg-wire" }
 zeroize = { version = "=1.8.1", default-features = false }
 
 [dev-dependencies]
+ingress-core = { path = "../ingress-core" }
 static_assertions = "=1.1.0"
 
 [lints.rust]

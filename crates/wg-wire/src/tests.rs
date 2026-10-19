@@ -27,6 +27,10 @@ fn response() -> MessageResponse {
     }
 }
 
+fn cookie_reply() -> CookieReply {
+    CookieReply { receiver: 0x0403_0201, nonce: [0xaa; 24], encrypted_cookie: [0xbb; 32] }
+}
+
 #[test]
 fn initiation_layout_matches_the_whitepaper() {
     let mut b = [0u8; INITIATION_LEN];
@@ -36,7 +40,7 @@ fn initiation_layout_matches_the_whitepaper() {
     assert_eq!(&b[40..88], &[0x22; 48]);
     assert_eq!(&b[88..116], &[0x33; 28]);
     assert_eq!(&b[INITIATION_MAC1_OFFSET..132], &[0x44; 16]);
-    assert_eq!(&b[132..148], &[0x55; 16]);
+    assert_eq!(&b[INITIATION_MAC2_OFFSET..148], &[0x55; 16]);
     assert_eq!(MessageInitiation::parse(&b), Ok(initiation()));
 }
 
@@ -50,6 +54,31 @@ fn response_layout_matches_the_whitepaper() {
     assert_eq!(&b[60..76], &[0x88; 16]);
     assert_eq!(&b[76..92], &[0x99; 16]);
     assert_eq!(MessageResponse::parse(&b), Ok(response()));
+}
+
+#[test]
+fn cookie_reply_layout_matches_the_whitepaper_and_round_trips() {
+    let mut b = [0u8; COOKIE_REPLY_LEN];
+    assert_eq!(cookie_reply().emit(&mut b), Ok(COOKIE_REPLY_LEN));
+    assert_eq!(&b[..8], &[3, 0, 0, 0, 1, 2, 3, 4]);
+    assert_eq!(&b[8..32], &[0xaa; 24]);
+    assert_eq!(&b[32..64], &[0xbb; 32]);
+    assert_eq!(CookieReply::parse(&b), Ok(cookie_reply()));
+}
+
+#[test]
+fn cookie_reply_rejects_wrong_length_type_and_reserved() {
+    let mut b = [0u8; COOKIE_REPLY_LEN + 1];
+    cookie_reply().emit(&mut b).unwrap();
+    assert_eq!(CookieReply::parse(&b), Err(WireError::WrongLength));
+    assert_eq!(CookieReply::parse(&b[..COOKIE_REPLY_LEN - 1]), Err(WireError::WrongLength));
+    let mut m = [0u8; COOKIE_REPLY_LEN];
+    m.copy_from_slice(&b[..COOKIE_REPLY_LEN]);
+    m[0] = MSG_TRANSPORT;
+    assert_eq!(CookieReply::parse(&m), Err(WireError::WrongType));
+    m[0] = MSG_COOKIE;
+    m[2] = 1;
+    assert_eq!(CookieReply::parse(&m), Err(WireError::ReservedNonZero));
 }
 
 #[test]
@@ -87,6 +116,7 @@ fn response_rejects_wrong_type_and_reserved() {
 fn emitters_refuse_short_buffers() {
     assert_eq!(initiation().emit(&mut [0u8; INITIATION_LEN - 1]), Err(WireError::BufferTooSmall));
     assert_eq!(response().emit(&mut [0u8; RESPONSE_LEN - 1]), Err(WireError::BufferTooSmall));
+    assert_eq!(cookie_reply().emit(&mut [0u8; COOKIE_REPLY_LEN - 1]), Err(WireError::BufferTooSmall));
     assert_eq!(emit_transport_header(1, 2, &mut [0u8; 15]), Err(WireError::BufferTooSmall));
 }
 
@@ -210,6 +240,10 @@ fn fuzz_one(bytes: &[u8]) {
         assert_eq!(&out[..n], bytes);
     }
     if let Ok(m) = MessageResponse::parse(bytes) {
+        let n = m.emit(&mut out).unwrap();
+        assert_eq!(&out[..n], bytes);
+    }
+    if let Ok(m) = CookieReply::parse(bytes) {
         let n = m.emit(&mut out).unwrap();
         assert_eq!(&out[..n], bytes);
     }

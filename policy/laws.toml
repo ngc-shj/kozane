@@ -102,14 +102,18 @@
 #     parser itself (exit 2, a parse error), not reported as a law
 #     violation — see tools/laws/src/sdf.rs.
 #
-# Current system (M2: WireGuard responder; see system/secureos.system):
+# Current system (M2.5: WireGuard responder with cookies; see
+# system/secureos.system):
 #   `eth_out` and `eth_in` own one virtio-net device each (L5) and seed
 #   taint. `ingress` (outside) and `inner` (inside) parse attacker-
-#   controlled frames; `hs` parses initiations relayed by `ingress`; `data`
-#   holds transport keys and is, with `inner`, the only reader of tunnelled
-#   plaintext (L3: the `dn`/`nd` data regions). All of these and `audit` are
-#   tainted. `key` is the taint-exempt secrets holder (passive, PPC from `hs`
-#   only, maps only `secrets`). `timer` is exempt as notify-only (L1).
+#   controlled frames; `ingress` also holds the cookie secret, which only
+#   gates DoS protection. `hs` parses initiations relayed by `ingress`;
+#   `data` holds transport keys and is, with `inner`, the only reader of
+#   tunnelled plaintext (L3: the `dn`/`nd` data regions). All of these and
+#   `audit` are tainted. `key` is the taint-exempt secrets holder (passive,
+#   PPC from `hs` only, maps only `secrets`). `timer` is exempt as
+#   notify-only (L1): it notifies `data`, `hs` and `ingress`, none of which
+#   can notify it.
 
 [pds.eth_out]
 role = "driver"
@@ -422,6 +426,11 @@ notify = { timer = true, data = false }
 between = ["timer", "hs"]
 pp = { timer = false, hs = false }
 notify = { timer = true, hs = false }
+
+[[channels]]
+between = ["timer", "ingress"]
+pp = { timer = false, ingress = false }
+notify = { timer = true, ingress = false }
 
 [priority]
 # L13: untrusted-input and tunnel PDs run strictly below `key` and `timer`.

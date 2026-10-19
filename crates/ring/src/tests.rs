@@ -314,6 +314,57 @@ mod link_tests {
     }
 
     #[test]
+    fn in_flight_and_free_start_with_every_buffer_owned() {
+        let (mut tx, _rx, _s) = link();
+        assert_eq!(tx.in_flight(), Ok(0));
+        assert_eq!(tx.free(), Ok(M));
+    }
+
+    #[test]
+    fn in_flight_counts_each_send() {
+        let (mut tx, _rx, _s) = link();
+        send(&mut tx, b"x").unwrap();
+        send(&mut tx, b"y").unwrap();
+        assert_eq!(tx.in_flight(), Ok(2));
+        assert_eq!(tx.free(), Ok(M - 2));
+    }
+
+    #[test]
+    fn in_flight_is_exact_after_returns_without_an_explicit_reclaim() {
+        // The count must include buffers the receiver has returned but the
+        // sender has not yet reclaimed, before the next send.
+        let (mut tx, mut rx, _s) = link();
+        for _ in 0..M {
+            send(&mut tx, b"x").unwrap();
+        }
+        let mut out = [0u8; BUF];
+        rx.recv_into(&mut out).unwrap();
+        rx.recv_into(&mut out).unwrap();
+        assert_eq!(tx.in_flight(), Ok(M - 2));
+        rx.recv_into(&mut out).unwrap();
+        assert_eq!(tx.free(), Ok(3));
+    }
+
+    #[test]
+    fn in_flight_and_free_fail_on_a_dead_link() {
+        let (mut tx, _rx, s) = link();
+        // A free-ring write index more than N ahead marks the link corrupt.
+        // SAFETY: `write` is the first header field of the leaked, aligned ring.
+        unsafe { s.free.cast::<u32>().write_volatile((N as u32) + 1) };
+        assert_eq!(tx.in_flight(), Err(LinkError::Corrupt));
+        assert_eq!(tx.free(), Err(LinkError::Corrupt));
+    }
+
+    #[test]
+    fn in_flight_reports_a_forged_return() {
+        let (mut tx, _rx, s) = link();
+        let mut forger: Producer<ShmRing<Desc, N>, Desc, N> =
+            Producer::new(unsafe { ShmRing::producer(s.free) });
+        forger.push(Desc { offset: 0, len: 0 }).unwrap(); // never sent
+        assert!(matches!(tx.in_flight(), Err(LinkError::BadDesc(_))));
+    }
+
+    #[test]
     fn sender_rejects_forged_return() {
         let (mut tx, _rx, s) = link();
         let mut forger: Producer<ShmRing<Desc, N>, Desc, N> =

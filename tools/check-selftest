@@ -56,11 +56,12 @@ CASES_FOR_GATE = {
     # pins runs the package checker fixtures; package-release drives the real target.
     "pins": {"pins", "package-release"},
     "lint": {"lint"},
-    "unit": {"unit"},
+    "unit": {"unit", "c5-forward-burst", "c5-backlog", "c5-interval", "c5-key-calls",
+             "arrival-interval-order", "arrival-burst-order", "ingress-late-notify", "ingress-unbounded-loop"},
     "kani": {"kani", "kani-cache"},
     "bolero": {"bolero", "bolero-wg-wire"},
-    "laws": {"laws"},
-    "test": {"integration", "integration-count", "integration-residue"},
+    "laws": {"laws", "laws-timer-ingress"},
+    "test": {"integration", "integration-count", "integration-residue", "integration-cookie"},
     "manifest": {"manifest"},
 }
 
@@ -139,16 +140,66 @@ CASES = {
     # A case that stops counting must fail the manifest, not just print fewer PASS lines.
     "integration-count": (["test", "manifest"], lambda t: edit(t, "tests/integration/run.py",
                                                                '        passed.append("unknown peer")\n', ""),
-                          "INTEGRATION-CASES: 7 < manifest 8"),
-    # Until cookies (SC13) only debug kernels may be packaged, judged from
-    # the kernel's gen_config.h (M2 plan F10/T13). Refused before any
-    # secrets are read, so the paths need not exist.
+                          "INTEGRATION-CASES: 10 < manifest 11"),
+    # Under load an initiation without a valid mac2 must not reach hs (M2.5
+    # plan C6): forwarding regardless of mac2 must fail the cookie
+    # attribution (paired case at port A, or wireguard-go in the flood case).
+    "integration-cookie": (["test"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                    "        if !self.observe_load(now_ns, backlog) {\n",
+                                                    "        if !self.observe_load(now_ns, backlog) || true {\n"),
+                           "cookie attribution failed"),
+    # The key budget invariant (M2.5 plan C5): each operand of the two
+    # compile-time inequalities, and the per-path count, loosened on its own.
+    "c5-forward-burst": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                  "pub const FORWARD_BURST: u64 = 16;", "pub const FORWARD_BURST: u64 = 22;"),
+                         "C5: forwarded burst plus ih backlog can exhaust key's bucket"),
+    "c5-backlog": (["unit"], lambda t: edit(t, "crates/hs-core/src/tests.rs",
+                                            "const IH_BACKLOG: u64 = layout::NET_BUFFERS as u64 + 1;",
+                                            "const IH_BACKLOG: u64 = layout::NET_BUFFERS as u64 + 7;"),
+                   "C5: forwarded burst plus ih backlog can exhaust key's bucket"),
+    "c5-interval": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+                                             "pub const KEY_INTERVAL_NS: u64 = 1_000_000_000 / 2_000;",
+                                             "pub const KEY_INTERVAL_NS: u64 = 1_000_000_000 / 500;"),
+                    "C5: hs can spend key calls faster than key refills"),
+    "c5-key-calls": (["unit"], lambda t: edit(t, "crates/hs-core/src/lib.rs", "            Ok(a) => a,\n",
+                                              "            Ok(a) => {\n                let _ = key.dh(&[9; 32]);\n"
+                                              "                a\n            }\n"),
+                     "key calls exceeds KEY_CALLS_PER_HANDSHAKE"),
+    # Load must begin on arrivals no later than on forwards (M2.5 plan C3).
+    "arrival-interval-order": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                        "pub const ARRIVAL_INTERVAL_NS: u64 = 5_000_000;",
+                                                        "pub const ARRIVAL_INTERVAL_NS: u64 = 4_000_000;"),
+                               "ARRIVAL_INTERVAL_NS below FORWARD_INTERVAL_NS"),
+    "arrival-burst-order": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                     "pub const ARRIVAL_BURST: u64 = 16;", "pub const ARRIVAL_BURST: u64 = 17;"),
+                            "ARRIVAL_BURST above FORWARD_BURST"),
+    # The handler loop is unit-tested in ingress-core (TCG cannot saturate
+    # ingress behind eth_out, so the flood case cannot red these): notifying
+    # only once the loop ends, or uncapping an input, must fail the unit gate.
+    "ingress-late-notify": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                     "        io.end_pass();\n        if !pass_plan(n_hs, n_data, n_outside).continue_ {\n            return;",
+                                                     "        if !pass_plan(n_hs, n_data, n_outside).continue_ {\n            io.end_pass();\n            return;"),
+                            "each pass must serve every input, tick, then end_pass"),
+    "ingress-unbounded-loop": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                        "io.serve_outside(PASS_FRAMES)", "io.serve_outside(usize::MAX)"),
+                               "inputs must be capped at PASS_FRAMES"),
+    # A timer that can be notified is tainted (L1): flipped in both the
+    # system and the policy, so only the law can object (M2.5 plan C4).
+    "laws-timer-ingress": (["laws"], lambda t: (
+        edit(t, "system/secureos.system", '<end pd="ingress" id="5" notify="false" />',
+             '<end pd="ingress" id="5" notify="true" />'),
+        edit(t, "policy/laws.toml", "notify = { timer = true, ingress = false }",
+             "notify = { timer = true, ingress = true }")),
+                           "timer pd 'timer' is tainted"),
+    # Until release kernels are tested (SC20) only debug kernels may be
+    # packaged, judged from the kernel's gen_config.h (M2 plan F10/T13).
+    # Refused before any secrets are read, so the paths need not exist.
     "package-release": (["package", "MICROKIT_CONFIG=release", "SECRETS=/nonexistent/s.bin", "OUT=/nonexistent/pkg"],
                         lambda t: None, "kernel config is not debug"),
     # Deleting a test keeps `unit` green; only the manifest comparison notices.
     "manifest": (["unit", "manifest"], lambda t: edit(t, "crates/audit-event/src/tests.rs",
                                                      "#[test]\nfn first_occurrence_emits()",
-                                                     "#[allow(dead_code)]\nfn first_occurrence_emits()"), "UNIT-AUDIT-EVENT: 13 < manifest 14"),
+                                                     "#[allow(dead_code)]\nfn first_occurrence_emits()"), "UNIT-AUDIT-EVENT: 17 < manifest 18"),
 }
 
 

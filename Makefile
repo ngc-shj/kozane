@@ -72,7 +72,7 @@ image: pds kernel-config $(BUILD)/secrets-placeholder.bin
 		-o $(loader)
 
 # Same system with only the secrets prefill_path changed; tools/package
-# refuses anything else, and refuses non-debug kernels until SC13.
+# refuses anything else, and refuses non-debug kernels until SC20.
 ifneq ($(filter package,$(MAKECMDGOALS)),)
 ifeq ($(and $(SECRETS),$(OUT)),)
 $(error package: set SECRETS=<blob> OUT=<dir>)
