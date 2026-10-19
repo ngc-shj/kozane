@@ -124,6 +124,21 @@ def run_main(build_result):
                     os.kill(os.getpid(), signal.SIGTERM)
                 if build_result == "sigint":
                     os.kill(os.getpid(), signal.SIGINT)
+                if build_result == "signal-in-ignore-loop":
+                    return 1
+                if build_result == "exit-at-block":
+                    # A handler already pending when the teardown blocks
+                    # signals runs inside that call: simulate it raising
+                    # there, as exit_on_signal would.
+                    real_mask = signal.pthread_sigmask
+
+                    def raising_once(how, mask):
+                        signal.pthread_sigmask = real_mask
+                        for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
+                            signal.signal(s, signal.SIG_IGN)
+                        raise SystemExit(128 + signal.SIGTERM)
+                    signal.pthread_sigmask = raising_once
+                    return 1
                 return build_result
 
             pkg.build = fake_build
@@ -131,6 +146,22 @@ def run_main(build_result):
                         "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
                         "--config", "x", "--microkit", "x"]
             real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
+            real_sigmask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            real_signal = signal.signal
+            if build_result == "signal-in-ignore-loop":
+                # A signal landing between the teardown's per-signal SIG_IGN
+                # calls: only blocking all three first keeps it out.
+                sent = []
+
+                def signal_then_other(s, h):
+                    old = real_signal(s, h)
+                    if h == signal.SIG_IGN and not sent:
+                        # Right after the first SIG_IGN, a signal that is
+                        # still handled (whatever the loop's order).
+                        sent.append(signal.SIGTERM if s != signal.SIGTERM else signal.SIGHUP)
+                        os.kill(os.getpid(), sent[0])
+                    return old
+                pkg.signal.signal = signal_then_other
             real_rmtree = pkg.shutil.rmtree
             if build_result in ("removal-fails", "signal-and-removal-fails"):
                 # main()'s cleanup cannot remove the staging dir: it must say
@@ -165,8 +196,10 @@ def run_main(build_result):
             except SystemExit as e:
                 status = f"exit {e.code}"
             finally:
+                signal.signal = real_signal
                 pkg.shutil.rmtree = real_rmtree
                 pkg.remove_staging = real_remove
+                left_blocked = signal.pthread_sigmask(signal.SIG_SETMASK, real_sigmask)
                 for s, h in real_handlers.items():
                     signal.signal(s, h)
             errors = []
@@ -184,7 +217,9 @@ def run_main(build_result):
                 errors.append(f"OUT exists after a failed build (status {status})")
             if not built:
                 errors.append("main() returned before building")
-            expected = {1: 1, "raise": "raised", "out-appears": 1, 0: 0}.get(build_result)
+            if left_blocked != real_sigmask:
+                errors.append(f"main() left signals blocked: {sorted(left_blocked - real_sigmask)}")
+            expected = {1: 1, "raise": "raised", "out-appears": 1, 0: 0, "signal-in-ignore-loop": 1}.get(build_result)
             if expected is not None and status != expected:
                 errors.append(f"status {status}, want {expected}")
             if build_result in ("removal-fails", "signal-and-removal-fails"):
@@ -198,7 +233,7 @@ def run_main(build_result):
                         shutil.rmtree(p)
             if build_result == "sigint" and status != f"exit {128 + signal.SIGINT}":
                 errors.append(f"SIGINT did not end the run through SystemExit (status {status})")
-            if build_result in ("sigterm", "two-signals", "early-second-signal") \
+            if build_result in ("sigterm", "two-signals", "early-second-signal", "exit-at-block") \
                     and status != f"exit {128 + signal.SIGTERM}":
                 errors.append(f"SIGTERM did not end the run through SystemExit (status {status})")
             return errors
@@ -372,6 +407,8 @@ CASES = [
     ("a second SIGTERM before the removal is ignored", None, run_main("early-second-signal")),
     ("the signal handler ignores further signals before raising", None, handler_ignores_further_signals),
     ("SIGINT during the build leaves no OUT and no staging", None, run_main("sigint")),
+    ("an exit raised as the teardown blocks signals waits for the removal", None, run_main("exit-at-block")),
+    ("a signal between the teardown's ignore calls cannot skip the removal", None, run_main("signal-in-ignore-loop")),
     ("main() reports a staging dir it could not remove", None, run_main("removal-fails")),
     ("a signal during a failing removal does not hide the report", None, run_main("signal-and-removal-fails")),
     ("staging that resolves into a forbidden root is refused", None, staging_in_forbidden_root),

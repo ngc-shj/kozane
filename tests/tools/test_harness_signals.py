@@ -45,22 +45,74 @@ CASES = [
 ]
 
 
+GUARD_CHILD = r"""
+import importlib.util, sys, threading
+spec = importlib.util.spec_from_file_location("run", sys.argv[1])
+run = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(run)
+run.guard_thread_starts()
+run.start_without_stop_signals(threading.Thread(target=lambda: None))
+try:
+    threading.Thread(target=lambda: None).start()
+    print("plain start allowed")
+except RuntimeError:
+    print("plain start refused")
+"""
+
+
+IGNORE_CHILD = r"""
+import importlib.util, os, signal, sys
+spec = importlib.util.spec_from_file_location("run", sys.argv[1])
+run = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(run)
+for s in run.STOP_SIGNALS:
+    signal.signal(s, run.exit_on_signal)
+real_signal, sent = signal.signal, []
+
+def signal_then_other(s, h):
+    old = real_signal(s, h)
+    if h == signal.SIG_IGN and not sent:
+        sent.append(signal.SIGTERM if s != signal.SIGTERM else signal.SIGHUP)
+        os.kill(os.getpid(), sent[0])
+    return old
+
+signal.signal = signal_then_other
+try:
+    run.ignore_signals()
+    print("teardown continued")
+except SystemExit as e:
+    print(f"cut short: exit {e.code}")
+"""
+
+
+def ignore_signals_has_no_window() -> list:
+    """A signal landing between ignore_signals' per-signal calls must not
+    end the final teardown (S6-1): it blocks all of them first."""
+    r = subprocess.run([sys.executable, "-c", IGNORE_CHILD, str(ROOT / "tests/integration/run.py")],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0 or "teardown continued" not in r.stdout:
+        return [f"ignore_signals let a signal through: rc={r.returncode} {r.stdout.strip()!r}"]
+    return []
+
+
 def threads_started_only_through_the_helper() -> list:
-    """A thread started any other way would bring back F-R5-1 silently: its
-    signal mask lets a stop signal through mid-teardown."""
-    import re
-    src = (ROOT / "tests/integration/run.py").read_text()
-    starts = [m.start() for m in re.finditer(r"\.start\(\)", src)]
-    helper = src.index("def start_without_stop_signals")
-    helper_end = src.index("\n\n\n", helper)
-    stray = [src.count("\n", 0, i) + 1 for i in starts if not helper <= i < helper_end]
-    return [f"run.py line {n}: thread started outside start_without_stop_signals" for n in stray]
+    """In the netns harness a thread started with stop signals unblocked
+    would bring back F-R5-1; the run-time guard must refuse it and allow
+    the helper's way."""
+    r = subprocess.run([sys.executable, "-c", GUARD_CHILD, str(ROOT / "tests/integration/run.py")],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0 or "plain start refused" not in r.stdout:
+        return [f"guard did not refuse a plain thread start: rc={r.returncode} {r.stdout.strip()!r} {r.stderr[-200:]!r}"]
+    return []
 
 
 def main() -> int:
     failures = 0
     errors = threads_started_only_through_the_helper()
-    print(f"{'ok  ' if not errors else 'FAIL'} threads start only through start_without_stop_signals: {errors or 'ok'}")
+    print(f"{'ok  ' if not errors else 'FAIL'} the run-time guard refuses threads with unblocked stop signals: {errors or 'ok'}")
+    failures += bool(errors)
+    errors = ignore_signals_has_no_window()
+    print(f"{'ok  ' if not errors else 'FAIL'} ignore_signals blocks before ignoring: {errors or 'ok'}")
     failures += bool(errors)
     for name, want in CASES:
         r = subprocess.run([sys.executable, "-c", CHILD, str(ROOT / "tests/integration/run.py")],
@@ -68,7 +120,7 @@ def main() -> int:
         ok = r.returncode == 0 and want in r.stdout
         failures += not ok
         print(f"{'ok  ' if ok else 'FAIL'} {name}: rc={r.returncode} {r.stdout.strip()!r} {r.stderr.strip()[-200:]!r}")
-    print(f"HARNESS-SIGNAL-FIXTURES {len(CASES) + 1}")
+    print(f"HARNESS-SIGNAL-FIXTURES {len(CASES) + 2}")
     return 1 if failures else 0
 
 

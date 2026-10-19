@@ -257,3 +257,25 @@ Functionality: R2 (F-R6-1), R29/R49 (F-R6-3), R52 (F-R6-2) violated; R3, R12, R1
 - T6-1: fixture calls `exit_on_signal` and requires all three stop signals ignored before SystemExit 143; red-proved by removing its loop; the early-second-signal comment corrected.
 - T6-2: a manifest line of 0 with a count of 0 is refused (fixture), red-proved by removing `v == 0`.
 - T6-4: a key reported by two counts files is refused naming both (fixture), red-proved.
+
+# Round 7
+Date: 2026-10-19 — incremental review of `2185ba2..f53a6c4`. No Critical or Major findings from any expert; R43: no widening; all Round-6 findings resolved (two only partly, below).
+
+## Findings (all Minor)
+| ID | Finding |
+|---|---|
+| S7-1 / F-R7-1 / T7-2 | Thread-start guard was a text regex (bypassable by spacing, executors, `_thread`; fragile end marker) |
+| S7-2 / F-R7-2 / T7-1 | check-manifest let a key repeated within one counts file win silently; docstring out of date |
+| T7-3 | S6-1's one-call signal block had no regression fixture (package or run.py) |
+| T7-4 | `run_main` did not save/restore the signal mask; the package's mask restore was guarded only by cross-fixture leakage |
+| (note, S6-1) | The "inherent" one-statement window could be closed by holding an exit raised at the blocking call |
+
+## Recurring Issue Check (Round 7)
+Functionality: R29/R49 (F-R7-2) violated; R2, R3, R12, R16, R43, R44, R50, R52 checked. Security: RS2 (S7-1); RS5 (S7-2); RS1, RS4, RS6 checked; RS3 N/A. Testing: RT1/RT3 (T7-3), RT4 (T7-4), RT6 (T7-1); RT9 8/8 anchors; others checked.
+
+## Resolution Status (Round 7)
+- S7-1 / F-R7-1 / T7-2: replaced the source scan with a run-time guard: `guard_thread_starts()` (installed at the start of the netns harness) makes `threading.Thread.start` refuse to run while the stop signals are unblocked, which covers executors and any other path through `threading`; the fixture checks a plain start is refused and the helper's start allowed, red-proved by disabling the guard. Raw `_thread` is not used by the harness or its imports (accepted).
+- S7-2 / F-R7-2 / T7-1: every repeat of a key is refused, within a file or across files (fixture); docstring states all rules.
+- T7-3: package fixture sends a still-handled signal right after the teardown's first SIG_IGN and requires the removal to complete with status 1; harness fixture does the same for `ignore_signals`. Both red-proved by removing the one-call block.
+- T7-4: `run_main` saves and restores the signal mask and fails any variant that leaves signals blocked; red-proved by removing the package's restore (every main() fixture names it).
+- S6-1 note: an exit raised by the blocking call itself is held until the teardown is done and then re-raised; fixture "an exit raised as the teardown blocks signals waits for the removal", red-proved. No exposed statement remains in the package's final teardown.

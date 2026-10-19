@@ -184,6 +184,20 @@ def start_without_stop_signals(thread: threading.Thread):
         signal.pthread_sigmask(signal.SIG_SETMASK, old)
 
 
+def guard_thread_starts():
+    """From here on, starting a thread while the stop signals are unblocked
+    raises: such a thread would let a stop signal through mid-teardown
+    (F-R5-1). Enforced at run time, so no way of starting one escapes it."""
+    original = threading.Thread.start
+
+    def start(self):
+        if not STOP_SIGNALS <= signal.pthread_sigmask(signal.SIG_BLOCK, set()):
+            raise RuntimeError("thread started with stop signals unblocked; use start_without_stop_signals")
+        original(self)
+
+    threading.Thread.start = start
+
+
 class Console:
     """QEMU serial output, drained by a thread so QEMU never blocks on a
     full pty. Waits search the text after a cursor."""
@@ -817,6 +831,7 @@ def check_harness_matches_config(deploy: str):
 
 
 def in_netns(good: str, mismatched: str, deploy: str) -> int:
+    guard_thread_starts()
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     try:
         check_harness_matches_config(deploy)

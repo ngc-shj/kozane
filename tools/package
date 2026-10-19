@@ -226,17 +226,25 @@ def main() -> int:
                 status = 0
     finally:
         # The final teardown: no stop signal may cut it short or skip its
-        # leftover report. Blocking all three in one call first leaves only
-        # that statement exposed (inherent to Python's signal handling);
-        # ignoring them afterwards discards whatever was blocked.
+        # leftover report. All three are blocked in one call, then ignored,
+        # so whatever arrives meanwhile is discarded on unblock. A handler
+        # already pending runs inside that blocking call and raises; that
+        # exit is held until the teardown is done (its handler has already
+        # set the signals to ignored).
         stop = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
-        mask = signal.pthread_sigmask(signal.SIG_BLOCK, stop)
+        held_exit = None
+        try:
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, stop)
+        except SystemExit as e:
+            held_exit = e
+            mask = signal.pthread_sigmask(signal.SIG_BLOCK, stop)
         for s in stop:
             signal.signal(s, signal.SIG_IGN)
         if staging.exists() and not remove_staging(staging):
             status = 1
-        # Anything blocked meanwhile is discarded on unblock (ignored).
         signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        if held_exit is not None:
+            raise held_exit
     if status == 0:
         print(f"package: wrote {out / 'loader.img'}")
     return status

@@ -2,12 +2,13 @@
 """Compares gate counts in a counts directory with the committed manifest.
 
 Usage: check-manifest <manifest.txt> <counts-dir>
-Each manifest line is "<KEY> <count>". Every key must appear in some counts
-file with exactly that value, and > 0. Fewer means a gate ran less than it
-should; more fails too ("raise the manifest"), since a number left below the
-real count is a test that can be deleted without any gate noticing; and a
-count with no manifest line fails ("add it"), so a new gate or crate cannot
-go unpinned. Exit 1 otherwise.
+Each manifest line is "<KEY> <count>". Every key must appear in the counts
+exactly once, with exactly that value, and > 0. Fewer means a gate ran less
+than it should; more fails too ("raise the manifest"), since a number left
+below the real count is a test that can be deleted without any gate
+noticing; a count with no manifest line fails (add it, or, if it is 0, add
+tests); and a key reported twice, in one file or two, fails rather than
+letting one value hide the other. Exit 1 otherwise.
 """
 
 import pathlib
@@ -29,7 +30,7 @@ def main() -> int:
             for line in f.read_text().splitlines():
                 parts = line.split()
                 if len(parts) == 2 and parts[1].isdigit():
-                    if parts[0] in source and source[parts[0]] != f.name:
+                    if parts[0] in source:
                         bad.append(f"{parts[0]}: reported by both {source[parts[0]]} and {f.name}")
                     got[parts[0]] = int(parts[1])
                     source.setdefault(parts[0], f.name)

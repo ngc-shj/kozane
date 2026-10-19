@@ -25,6 +25,8 @@ CASES = [
     # A manifest line of 0 does not make a count of 0 acceptable.
     ("zero refused even when listed as zero", "A-TESTS 5\nB-TESTS 2\nZ-TESTS 0\n", "Z-TESTS: 0 < manifest 0"),
     ("unlisted key refused", "A-TESTS 5\nB-TESTS 2\nC-TESTS 3\n", "C-TESTS: 3 not in the manifest (add it)"),
+    ("key repeated within one counts file refused", "A-TESTS 5\nB-TESTS 2\nA-TESTS 7\n",
+     "A-TESTS: reported by both gate and gate"),
     ("duplicate key across counts files refused", "A-TESTS 5\nB-TESTS 2\n", "A-TESTS: reported by both"),
     ("unlisted zero gets actionable advice", "A-TESTS 5\nB-TESTS 2\nC-TESTS 0\n",
      "C-TESTS: 0, the gate counted nothing"),
