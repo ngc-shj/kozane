@@ -279,3 +279,25 @@ Functionality: R29/R49 (F-R7-2) violated; R2, R3, R12, R16, R43, R44, R50, R52 c
 - T7-3: package fixture sends a still-handled signal right after the teardown's first SIG_IGN and requires the removal to complete with status 1; harness fixture does the same for `ignore_signals`. Both red-proved by removing the one-call block.
 - T7-4: `run_main` saves and restores the signal mask and fails any variant that leaves signals blocked; red-proved by removing the package's restore (every main() fixture names it).
 - S6-1 note: an exit raised by the blocking call itself is held until the teardown is done and then re-raised; fixture "an exit raised as the teardown blocks signals waits for the removal", red-proved. No exposed statement remains in the package's final teardown.
+
+# Round 8
+Date: 2026-10-19 — incremental review of `f53a6c4..d2352ff`. No Critical or Major findings from any expert; R43: no widening. All Round-7 findings resolved.
+
+## Findings (all Minor)
+| ID | Finding |
+|---|---|
+| F-R8-1 / S8-1 / T8-2 | Held-exit path restored a mask already containing the stop signals (CPython runs pending handlers after the mask is set); the fixture's mock raised before blocking, hiding it |
+| S8-2 / T8-3 | run.py's final teardown lacked the held exit the package got (key-bearing temp dir could be skipped) |
+| F-R8-2 / T8-1 | Nothing checked that in_netns installs the thread-start guard |
+| T8-4 | run_main restored the patched pthread_sigmask only through the patch's own call |
+| T8-5 | HARNESS-SIGNAL-FIXTURES was a hard-coded count |
+| T8-6 | A fixture's failure message omitted stderr |
+
+## Recurring Issue Check (Round 8)
+Functionality: fixture fidelity (F-R8-1); others checked. Security: R3 (S8-2: fix applied to one of two sibling teardowns); RS1/RS4 (S8-1, S8-2); RS2 guard holds (start-time check; a target unblocking signals itself is not covered, none does). Testing: RT1/RT3 (T8-1, T8-3), RT4 (T8-4), RT5 (T8-2), RT6 (T8-5), RT8 (T8-6); RT9 8/8; RT10 no vacuous fixture.
+
+## Resolution Status (Round 8)
+- F-R8-1 / S8-1 / T8-2: tools/package records the signal mask at the top of main() (before any handler is installed) and restores exactly that; the exit-at-block mock now applies the real mask before raising, as CPython does. Red-proved: restoring the second call's mask fails the fixture ("left signals blocked").
+- S8-2 / T8-3: run.py's teardown moved into `final_teardown`, which holds an exit raised by ignore_signals' blocking call until the key-bearing temp dir is removed and reported; fixture with the faithful mock; red-proved by removing the hold.
+- F-R8-2 / T8-1: an AST check requires `guard_thread_starts()` as in_netns's first statement; red-proved by deleting it.
+- T8-4: run_main saves the real pthread_sigmask before patching and restores it first in `finally`. T8-5: the harness fixture count is the number of checks that ran. T8-6: stderr included. Guard docstring states its limits (start-time check; `_thread` and targets that unblock signals themselves not covered; none exist).

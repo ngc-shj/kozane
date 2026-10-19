@@ -91,8 +91,58 @@ def ignore_signals_has_no_window() -> list:
     r = subprocess.run([sys.executable, "-c", IGNORE_CHILD, str(ROOT / "tests/integration/run.py")],
                        capture_output=True, text=True, timeout=60)
     if r.returncode != 0 or "teardown continued" not in r.stdout:
-        return [f"ignore_signals let a signal through: rc={r.returncode} {r.stdout.strip()!r}"]
+        return [f"ignore_signals let a signal through: rc={r.returncode} {r.stdout.strip()!r} {r.stderr[-200:]!r}"]
     return []
+
+
+TEARDOWN_CHILD = r"""
+import importlib.util, os, signal, sys, tempfile
+spec = importlib.util.spec_from_file_location("run", sys.argv[1])
+run = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(run)
+for s in run.STOP_SIGNALS:
+    signal.signal(s, run.exit_on_signal)
+tmp = tempfile.mkdtemp(prefix="teardown-test-")
+open(os.path.join(tmp, "secrets.bin"), "wb").write(b"key")
+real_mask = signal.pthread_sigmask
+
+def raising_once(how, mask):
+    # As CPython does: the mask is set, then a pending handler raises.
+    signal.pthread_sigmask = real_mask
+    real_mask(how, mask)
+    run.exit_on_signal(signal.SIGTERM, None)
+
+signal.pthread_sigmask = raising_once
+try:
+    removed, held = run.final_teardown(tmp)
+    print(f"removed={removed} gone={not os.path.exists(tmp)} held={getattr(held, 'code', None)}")
+except SystemExit as e:
+    print(f"escaped exit {e.code}, gone={not os.path.exists(tmp)}")
+"""
+
+
+def final_teardown_holds_an_exit() -> list:
+    """An exit raised as the final teardown blocks signals must wait until
+    the key-bearing temp dir is removed (S8-2)."""
+    r = subprocess.run([sys.executable, "-c", TEARDOWN_CHILD, str(ROOT / "tests/integration/run.py")],
+                       capture_output=True, text=True, timeout=60)
+    if r.returncode != 0 or "removed=True gone=True held=143" not in r.stdout:
+        return [f"final teardown did not hold the exit: rc={r.returncode} {r.stdout.strip()!r} {r.stderr[-200:]!r}"]
+    return []
+
+
+def netns_harness_installs_the_guard() -> list:
+    """The guard only protects runs that install it: in_netns must do so
+    before anything else."""
+    import ast
+    tree = ast.parse((ROOT / "tests/integration/run.py").read_text())
+    fn = next((n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "in_netns"), None)
+    if fn is None:
+        return ["in_netns not found in run.py"]
+    first = fn.body[0]
+    is_call = (isinstance(first, ast.Expr) and isinstance(first.value, ast.Call)
+               and isinstance(first.value.func, ast.Name) and first.value.func.id == "guard_thread_starts")
+    return [] if is_call else ["in_netns does not call guard_thread_starts() first"]
 
 
 def threads_started_only_through_the_helper() -> list:
@@ -106,21 +156,31 @@ def threads_started_only_through_the_helper() -> list:
     return []
 
 
+# Standalone checks: each returns a list of errors (empty when it holds).
+CHECKS = [
+    ("the run-time guard refuses threads with unblocked stop signals", lambda: threads_started_only_through_the_helper()),
+    ("the netns harness installs the guard first", lambda: netns_harness_installs_the_guard()),
+    ("the final teardown holds an exit until removal", lambda: final_teardown_holds_an_exit()),
+    ("ignore_signals blocks before ignoring", lambda: ignore_signals_has_no_window()),
+]
+
+
 def main() -> int:
-    failures = 0
-    errors = threads_started_only_through_the_helper()
-    print(f"{'ok  ' if not errors else 'FAIL'} the run-time guard refuses threads with unblocked stop signals: {errors or 'ok'}")
-    failures += bool(errors)
-    errors = ignore_signals_has_no_window()
-    print(f"{'ok  ' if not errors else 'FAIL'} ignore_signals blocks before ignoring: {errors or 'ok'}")
-    failures += bool(errors)
+    failures = ran = 0
+    for name, check in CHECKS:
+        errors = check()
+        ran += 1
+        failures += bool(errors)
+        print(f"{'ok  ' if not errors else 'FAIL'} {name}: {errors or 'ok'}")
     for name, want in CASES:
         r = subprocess.run([sys.executable, "-c", CHILD, str(ROOT / "tests/integration/run.py")],
                            capture_output=True, text=True, timeout=60)
         ok = r.returncode == 0 and want in r.stdout
+        ran += 1
         failures += not ok
         print(f"{'ok  ' if ok else 'FAIL'} {name}: rc={r.returncode} {r.stdout.strip()!r} {r.stderr.strip()[-200:]!r}")
-    print(f"HARNESS-SIGNAL-FIXTURES {len(CASES) + 2}")
+    # The count is what ran, so dropping a check lowers it (manifest).
+    print(f"HARNESS-SIGNAL-FIXTURES {ran}")
     return 1 if failures else 0
 
 

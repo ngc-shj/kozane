@@ -177,6 +177,9 @@ def remove_staging(staging: pathlib.Path) -> bool:
 
 
 def main() -> int:
+    # Taken before any Python handler is installed, so nothing can raise
+    # here; the final teardown restores exactly this.
+    entry_mask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(s, exit_on_signal)
     ap = argparse.ArgumentParser()
@@ -234,15 +237,17 @@ def main() -> int:
         stop = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
         held_exit = None
         try:
-            mask = signal.pthread_sigmask(signal.SIG_BLOCK, stop)
+            signal.pthread_sigmask(signal.SIG_BLOCK, stop)
         except SystemExit as e:
+            # Raised after the block took effect (CPython runs pending
+            # handlers once the mask is set); block again to be sure.
             held_exit = e
-            mask = signal.pthread_sigmask(signal.SIG_BLOCK, stop)
+            signal.pthread_sigmask(signal.SIG_BLOCK, stop)
         for s in stop:
             signal.signal(s, signal.SIG_IGN)
         if staging.exists() and not remove_staging(staging):
             status = 1
-        signal.pthread_sigmask(signal.SIG_SETMASK, mask)
+        signal.pthread_sigmask(signal.SIG_SETMASK, entry_mask)
         if held_exit is not None:
             raise held_exit
     if status == 0:

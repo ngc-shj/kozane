@@ -31,7 +31,8 @@ def main() -> int:
                 parts = line.split()
                 if len(parts) == 2 and parts[1].isdigit():
                     if parts[0] in source:
-                        bad.append(f"{parts[0]}: reported by both {source[parts[0]]} and {f.name}")
+                        where = f"twice by {f.name}" if source[parts[0]] == f.name else f"by both {source[parts[0]]} and {f.name}"
+                        bad.append(f"{parts[0]}: reported {where}")
                     got[parts[0]] = int(parts[1])
                     source.setdefault(parts[0], f.name)
     for key, n in want.items():

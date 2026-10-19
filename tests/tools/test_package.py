@@ -134,6 +134,9 @@ def run_main(build_result):
 
                     def raising_once(how, mask):
                         signal.pthread_sigmask = real_mask
+                        # As CPython does: the mask is set first, then the
+                        # pending handler runs and raises.
+                        real_mask(how, mask)
                         for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
                             signal.signal(s, signal.SIG_IGN)
                         raise SystemExit(128 + signal.SIGTERM)
@@ -148,6 +151,7 @@ def run_main(build_result):
             real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
             real_sigmask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
             real_signal = signal.signal
+            real_mask_fn = signal.pthread_sigmask
             if build_result == "signal-in-ignore-loop":
                 # A signal landing between the teardown's per-signal SIG_IGN
                 # calls: only blocking all three first keeps it out.
@@ -196,6 +200,8 @@ def run_main(build_result):
             except SystemExit as e:
                 status = f"exit {e.code}"
             finally:
+                # Restored first: a patched pthread_sigmask must not run here.
+                signal.pthread_sigmask = real_mask_fn
                 signal.signal = real_signal
                 pkg.shutil.rmtree = real_rmtree
                 pkg.remove_staging = real_remove

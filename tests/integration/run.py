@@ -185,9 +185,10 @@ def start_without_stop_signals(thread: threading.Thread):
 
 
 def guard_thread_starts():
-    """From here on, starting a thread while the stop signals are unblocked
-    raises: such a thread would let a stop signal through mid-teardown
-    (F-R5-1). Enforced at run time, so no way of starting one escapes it."""
+    """From here on, starting a thread through `threading` while the stop
+    signals are unblocked raises: such a thread would let a stop signal
+    through mid-teardown (F-R5-1). Checked at start time; a thread target
+    that unblocks signals itself, or raw `_thread`, is not covered (none do)."""
     original = threading.Thread.start
 
     def start(self):
@@ -955,14 +956,32 @@ def main() -> int:
     except Fail as e:
         print(f"\nFAIL [setup]: {e}", file=sys.stderr)
     finally:
-        ignore_signals()
-        left = []
-        shutil.rmtree(tmp, onexc=lambda _f, p, e: left.append(f"{p}: {e}"))
-        if left or os.path.exists(tmp):
-            # A key-bearing leftover must fail the run.
-            print(f"\nFAIL [teardown]: could not remove {tmp} (holds keys): {left}", file=sys.stderr)
+        removed, held = final_teardown(tmp)
+        if not removed:
             status = 1
+        if held is not None:
+            raise held
     return status
+
+
+def final_teardown(tmp: str):
+    """Removes the key-bearing temp dir with stop signals off. A handler
+    already pending runs inside ignore_signals' blocking call and raises;
+    that exit is held and returned so the removal and its report still
+    happen. Returns (removed, held exit or None)."""
+    held = None
+    try:
+        ignore_signals()
+    except SystemExit as e:
+        held = e
+        ignore_signals()
+    left = []
+    shutil.rmtree(tmp, onexc=lambda _f, p, e: left.append(f"{p}: {e}"))
+    if left or os.path.exists(tmp):
+        # A key-bearing leftover must fail the run.
+        print(f"\nFAIL [teardown]: could not remove {tmp} (holds keys): {left}", file=sys.stderr)
+        return False, held
+    return True, held
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wg as wg_mod  # noqa: E402
