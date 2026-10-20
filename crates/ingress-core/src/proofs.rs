@@ -193,13 +193,15 @@ fn any_gate() -> Gate {
         arrivals: any_meter(),
         forward: any_meter(),
         under_load_until_ns: kani::any(),
-        born_ns: kani::any(),
         entered_load: kani::any(),
-        last_retry_ns: kani::any(),
-        expired_reported: kani::any(),
-        unavailable_reported: kani::any(),
         in_load: kani::any(),
-        expired_edge: kani::any(),
+        life: SecretLife {
+            born_ns: kani::any(),
+            last_retry_ns: kani::any(),
+            expired_reported: kani::any(),
+            unavailable_reported: kani::any(),
+            expired_edge: kani::any(),
+        },
     }
 }
 
@@ -229,7 +231,7 @@ fn spec_loaded(g: &Gate, now: u64, backlog: usize) -> bool {
 }
 
 fn spec_secret_usable(g: &Gate, now: u64) -> bool {
-    matches!(g.born_ns, Some(b) if now >= b && now - b < COOKIE_SECRET_MAX_AGE_NS)
+    matches!(g.life.born_ns, Some(b) if now >= b && now - b < COOKIE_SECRET_MAX_AGE_NS)
 }
 
 /// One `classify` call from any Gate state: invariants (a), (b) one-step,
@@ -370,9 +372,9 @@ fn tick_rotates_only_when_due() {
     let mut stub = Stub::default();
     let now: u64 = kani::any();
     let r = gate.tick_if_due(&mut stub, now, kani::any());
-    let due = match before.born_ns {
+    let due = match before.life.born_ns {
         Some(b) => now < b || now - b >= ROTATE_AT_NS,
-        None => match before.last_retry_ns {
+        None => match before.life.last_retry_ns {
             None => true,
             Some(t) => now >= t && now - t >= RETRY_INTERVAL_NS,
         },
@@ -380,12 +382,12 @@ fn tick_rotates_only_when_due() {
     assert!(stub.rotates == u32::from(due));
     assert!(stub.mac2_calls.get() == 0 && stub.seals == 0);
     if r.rotated {
-        assert!(gate.born_ns == Some(now) && stub.clears == 0 && !r.secret_unavailable);
+        assert!(gate.life.born_ns == Some(now) && stub.clears == 0 && !r.secret_unavailable);
     } else if due {
-        assert!(gate.born_ns.is_none() && stub.clears == 1);
-        assert!(r.secret_unavailable == !before.unavailable_reported);
+        assert!(gate.life.born_ns.is_none() && stub.clears == 1);
+        assert!(r.secret_unavailable == !before.life.unavailable_reported);
     } else {
-        assert!(gate.born_ns == before.born_ns && stub.clears == 0 && !r.secret_unavailable);
+        assert!(gate.life.born_ns == before.life.born_ns && stub.clears == 0 && !r.secret_unavailable);
     }
     if r.left_load {
         assert!(before.in_load && !gate.in_load);
@@ -405,7 +407,7 @@ fn rotate_at_most_once_per_retry_interval() {
     let gap: u64 = kani::any();
     kani::assume(gap < RETRY_INTERVAL_NS);
     let t2 = t1.saturating_add(gap);
-    let no_secret = gate.born_ns.is_none();
+    let no_secret = gate.life.born_ns.is_none();
     gate.tick_if_due(&mut stub, t1, kani::any());
     gate.tick_if_due(&mut stub, t2, kani::any());
     assert!(stub.rotates <= 1);

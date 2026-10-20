@@ -409,22 +409,79 @@ pub struct Gate {
     /// Load holds while `now` is before this: the last time a trigger held,
     /// plus UNDER_LOAD_AFTER_NS.
     under_load_until_ns: u64,
-    born_ns: Option<u64>,
     /// Load entered and not yet taken by the PD.
     entered_load: bool,
-    last_retry_ns: Option<u64>,
-    /// The expiry backstop fired since the last successful rotation.
-    expired_reported: bool,
-    /// A failed rotation was reported since the last successful one.
-    unavailable_reported: bool,
     /// Load as last announced by an edge, so `WgUnderLoad` and
     /// `WgLoadCleared` alternate. Needed beyond the plan's field list:
     /// `entered_load` is cleared when taken, so it cannot tell `tick_if_due`
     /// that a leaving edge is due.
     in_load: bool,
-    /// Expiry edge raised by `classify` and not yet taken by the PD; the
-    /// counterpart of `entered_load` for `CookieSecretExpired`.
+    /// The cookie secret's age and edges, shared with `RpGate` (M3b C5).
+    life: SecretLife,
+}
+
+/// When a cookie secret is born, due, usable and reported, shared by the
+/// WireGuard and the Rosenpass gates (M3b plan C5). Holds no secret: each
+/// gate's PD adapter does, and `tick_if_due` only says when to call it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SecretLife {
+    born_ns: Option<u64>,
+    last_retry_ns: Option<u64>,
+    /// The expiry backstop fired since the last successful rotation.
+    expired_reported: bool,
+    /// A failed rotation was reported since the last successful one.
+    unavailable_reported: bool,
+    /// Expiry edge raised by a classification and not yet taken by the PD;
+    /// the counterpart of `entered_load` for `CookieSecretExpired`.
     expired_edge: bool,
+}
+
+impl SecretLife {
+    fn secret(&self, now_ns: u64) -> Secret {
+        match self.born_ns.map(|b| now_ns.checked_sub(b)) {
+            None => Secret::Missing,
+            Some(Some(age)) if age < COOKIE_SECRET_MAX_AGE_NS => Secret::Usable,
+            Some(_) => Secret::Expired,
+        }
+    }
+
+    /// The expiry backstop fired; raises the edge the first time since a
+    /// valid secret.
+    fn note_expired(&mut self) {
+        if !self.expired_reported {
+            self.expired_reported = true;
+            self.expired_edge = true;
+        }
+    }
+
+    /// Rotates once the secret reaches ROTATE_AT, or while none is held at
+    /// most once per RETRY_INTERVAL; a birth in the future (clock went back)
+    /// rotates too. `rotate` refills the PD's secret; on failure `clear`
+    /// zeroizes it. Returns (rotated, unavailable edge).
+    fn tick(&mut self, now_ns: u64, rotate: impl FnOnce() -> bool, clear: impl FnOnce()) -> (bool, bool) {
+        let due = match self.born_ns {
+            Some(b) => now_ns.checked_sub(b).is_none_or(|age| age >= ROTATE_AT_NS),
+            None => self.last_retry_ns.is_none_or(|t| now_ns.saturating_sub(t) >= RETRY_INTERVAL_NS),
+        };
+        if !due {
+            return (false, false);
+        }
+        self.last_retry_ns = Some(now_ns);
+        if rotate() {
+            self.born_ns = Some(now_ns);
+            self.unavailable_reported = false;
+            self.expired_reported = false;
+            (true, false)
+        } else {
+            self.born_ns = None;
+            clear();
+            (false, !core::mem::replace(&mut self.unavailable_reported, true))
+        }
+    }
+
+    fn take_expired(&mut self) -> bool {
+        core::mem::take(&mut self.expired_edge)
+    }
 }
 
 impl Gate {
@@ -441,14 +498,6 @@ impl Gate {
             self.entered_load = true;
         }
         loaded
-    }
-
-    fn secret(&self, now_ns: u64) -> Secret {
-        match self.born_ns.map(|b| now_ns.checked_sub(b)) {
-            None => Secret::Missing,
-            Some(Some(age)) if age < COOKIE_SECRET_MAX_AGE_NS => Secret::Usable,
-            Some(_) => Secret::Expired,
-        }
     }
 
     /// The gate after mac1 passed (plan, "Under load").
@@ -472,17 +521,14 @@ impl Gate {
         }
         // An all-zero mac2 is invalid by definition; skip its MAC [R2-S-N3].
         let mac2_zero = msg.get(INITIATION_MAC2_OFFSET..).is_none_or(|m| m.iter().all(|&b| b == 0));
-        let secret = self.secret(now_ns);
+        let secret = self.life.secret(now_ns);
         if !mac2_zero && secret == Secret::Usable && crypto.mac2_valid(src, msg) {
             return self.forward(buckets, now_ns, src, msg, true);
         }
         match secret {
             Secret::Missing => Outcome::NoCookieSecret,
             Secret::Expired => {
-                if !self.expired_reported {
-                    self.expired_reported = true;
-                    self.expired_edge = true;
-                }
+                self.life.note_expired();
                 Outcome::CookieSecretExpired
             }
             Secret::Usable if tx_free > TX_RESERVE && crypto.seal_reply(src, msg, out) => {
@@ -514,24 +560,9 @@ impl Gate {
     /// only clearing. Also notices load leaving with no initiation arriving.
     pub fn tick_if_due<C: CookieCrypto>(&mut self, crypto: &mut C, now_ns: u64, backlog: usize) -> TickReport {
         let mut report = TickReport::default();
-        let due = match self.born_ns {
-            // A birth in the future (clock went back) rotates too.
-            Some(b) => now_ns.checked_sub(b).is_none_or(|age| age >= ROTATE_AT_NS),
-            None => self.last_retry_ns.is_none_or(|t| now_ns.saturating_sub(t) >= RETRY_INTERVAL_NS),
-        };
-        if due {
-            self.last_retry_ns = Some(now_ns);
-            if crypto.rotate() {
-                self.born_ns = Some(now_ns);
-                self.unavailable_reported = false;
-                self.expired_reported = false;
-                report.rotated = true;
-            } else {
-                self.born_ns = None;
-                crypto.clear();
-                report.secret_unavailable = !core::mem::replace(&mut self.unavailable_reported, true);
-            }
-        }
+        let crypto = core::cell::RefCell::new(crypto);
+        (report.rotated, report.secret_unavailable) =
+            self.life.tick(now_ns, || crypto.borrow_mut().rotate(), || crypto.borrow_mut().clear());
         if !self.observe_load(now_ns, backlog) && self.in_load {
             self.in_load = false;
             report.left_load = true;
@@ -547,7 +578,7 @@ impl Gate {
     /// Whether the expiry backstop fired for the first time since a valid
     /// secret, since the last call (`CookieSecretExpired`, never coalesced).
     pub fn take_expired(&mut self) -> bool {
-        core::mem::take(&mut self.expired_edge)
+        self.life.take_expired()
     }
 }
 

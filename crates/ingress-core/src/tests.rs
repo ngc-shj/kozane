@@ -564,14 +564,14 @@ fn failed_rotation_leaves_no_secret_and_clears_it() {
     r.crypto.rotate_ok = false;
     let report = r.tick(ROTATE_AT_NS, IDLE);
     assert!(!report.rotated && report.secret_unavailable);
-    assert_eq!(r.gate.born_ns, None);
+    assert_eq!(r.gate.life.born_ns, None);
     assert_eq!(r.crypto.clears, 1);
 }
 
 #[test]
 fn successful_rotation_records_the_birth_and_clears_nothing() {
     let r = Rig::idle();
-    assert_eq!(r.gate.born_ns, Some(0));
+    assert_eq!(r.gate.life.born_ns, Some(0));
     assert_eq!(r.crypto.clears, 0);
 }
 
@@ -703,7 +703,7 @@ fn only_initiation_spends_the_forward_bucket() {
                         payloads.extend([Mac2::Zero, Mac2::Valid, Mac2::Invalid].map(init_mac2));
                         for p in &payloads {
                             let mut r = Rig::idle();
-                            r.gate.born_ns = born;
+                            r.gate.life.born_ns = born;
                             r.gate.forward = Meter { budget_ns: forward, last_ns: now };
                             if exhausted {
                                 for _ in 0..BURST {
