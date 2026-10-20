@@ -646,3 +646,11 @@ The full record is in the code review's Resolution Status. Deviations from the p
   - SC23 cannot close while any cmr is locked (P6 and `check_bindings`).
 - **What the dudect result says about it:** nothing.
 - **M4 requirement (c) is widened, and (b) likewise:** the disassembly check must reject secret-fed load and store addresses, not only conditional branches. The ctgrind-style test must flag secret-dependent addresses.
+
+## Selftest time (code review T11)
+- **Full run:** `tools/check-selftest` on 35ccd4f, in the dev container: 4105 s (68 min), 53 layers.
+  - It includes `check-propagation`, which runs `make check` once per gate, and 10 integration cases (one full suite run each).
+  - No M2.5 time was recorded, so this run is the baseline for the plan's rule: add an integration case filter only if the time exceeds 2× this baseline.
+- **One failure, from a stale needle:** the `manifest` case expected "UNIT-AUDIT-EVENT: 29 < manifest 30", but Phase 3 had added audit-event tests.
+  - That needle and the `integration-count` one are now derived from `tests/manifest.txt`, so they follow it.
+  - Re-run: `manifest` ok ("32 < manifest 33"). `integration-count` derives the string it already passed with ("21 < manifest 22").

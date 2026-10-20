@@ -1,6 +1,6 @@
 # Code Review: secureos-m3-rosenpass
 Date: 2026-10-20
-Review round: 5
+Review round: 6 (complete)
 Branch: feature/m3-rosenpass, `5b406c4..ab933ee` (M3 base is the M2.5 tip; `main` is several milestones behind)
 
 ## Changes from Previous Round
@@ -517,3 +517,21 @@ The comment now gives the actual reason: nothing initiates for peer 0 between th
 - **Correction:** the Round 4 claim now states that the retry rescues only a gap of about 175–180 s.
 - **Mutant proof unaffected:** the mutant still dies on "rotation: hs did not accept restart".
 - **Verification:** `make check` exit 0 (645 s, 0 of 50 pings lost); `integration-rotation` ok.
+
+# Round 6
+
+- **Scope:** the Round 5 change only (`e1b2681..35ccd4f`), reviewed in three separate passes.
+- **Functionality:** No findings.
+- **Security:** No findings.
+- **Testing:** No findings. The integration-rotation mutant still dies on its needle only. The new stale check cannot be reached under the mutant.
+
+```json
+[]
+```
+
+## Termination
+All three perspectives returned "No findings" in Round 6.
+
+## Full selftest (T11)
+- **Run:** 4105 s, 53 layers. See the deviation log, "Selftest time".
+- **The one failure:** a stale `manifest` needle, fixed by deriving the `manifest` and `integration-count` needles from `tests/manifest.txt`. The re-run is ok.

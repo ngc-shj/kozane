@@ -27,6 +27,19 @@ MAKE_ENV = {**os.environ, "LC_ALL": "C", "GIT_DIR": str(ROOT / ".git")}
 SKIP = {"build", "target", ".git", "crashes"}
 
 
+def manifest_count(key: str) -> int:
+    """`key`'s count in tests/manifest.txt, so a needle derived from it
+    follows the manifest instead of going stale when tests are added."""
+    for line in (ROOT / "tests/manifest.txt").read_text().splitlines():
+        if line.split()[:1] == [key]:
+            return int(line.split()[1])
+    raise SystemExit(f"selftest: {key} not in tests/manifest.txt")
+
+
+AUDIT_EVENT_TESTS = manifest_count("UNIT-AUDIT-EVENT")
+INTEGRATION_CASES = manifest_count("INTEGRATION-CASES")
+
+
 def edit(tree: pathlib.Path, rel: str, old: str, new: str):
     p = tree / rel
     text = p.read_text()
@@ -199,7 +212,7 @@ CASES = {
     # A case that stops counting must fail the manifest, not just print fewer PASS lines.
     "integration-count": (["test", "manifest"], lambda t: edit(t, "tests/integration/run.py",
                                                                '        passed.append("unknown peer")\n', ""),
-                          "INTEGRATION-CASES: 21 < manifest 22"),
+                          f"INTEGRATION-CASES: {INTEGRATION_CASES - 1} < manifest {INTEGRATION_CASES}"),
     # Under load an initiation without a valid mac2 must not reach hs (M2.5
     # plan C6): forwarding regardless of mac2 must fail the paired case at
     # port A, whose initiation without mac2 then draws a handshake response.
@@ -359,7 +372,8 @@ CASES = {
     # Deleting a test keeps `unit` green; only the manifest comparison notices.
     "manifest": (["unit", "manifest"], lambda t: edit(t, "crates/audit-event/src/tests.rs",
                                                      "#[test]\nfn first_occurrence_emits()",
-                                                     "#[allow(dead_code)]\nfn first_occurrence_emits()"), "UNIT-AUDIT-EVENT: 29 < manifest 30"),
+                                                     "#[allow(dead_code)]\nfn first_occurrence_emits()"),
+                 f"UNIT-AUDIT-EVENT: {AUDIT_EVENT_TESTS - 1} < manifest {AUDIT_EVENT_TESTS}"),
 }
 
 
