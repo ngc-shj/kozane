@@ -1,6 +1,6 @@
 # Code Review: secureos-m3-rosenpass
 Date: 2026-10-20
-Review round: 3
+Review round: 4
 Branch: feature/m3-rosenpass, `5b406c4..ab933ee` (M3 base is the M2.5 tip; `main` is several milestones behind)
 
 ## Changes from Previous Round
@@ -449,3 +449,46 @@ The `required_open` docstring now names the structural `WaiverError`.
 ### Verification (Round 3 fixes)
 - `make check` exit 0. INTEGRATION-CASES 22, PACKAGE-FIXTURES 93, CHECK-PINS-FIXTURES 72, LINT-PDS 11.
 - Selftest cases `integration-rotation` (needle "rotation: hs did not accept restart"), `integration-expiry` and `lint-pds` each fail with their failure-only needles.
+
+# Round 4
+
+## Findings (Round 4)
+- **Security:** No findings. S-9 and F4 are verified, with no R43 widening.
+  - Noted, not filed: the hash-function internals keep by-value copies, which is the dependency residue P10 already declares.
+- **Functionality:** F1–F4 resolved.
+  - F5 [Major]: moving the rotation before Case 2 broke Case 2's latest-handshake baseline once the rotation exceeded REKEY_AFTER_TIME.
+  - F6 [Minor]: the rotation precondition bounded restart 2's key_out write, not its install.
+  - F7 [Minor]: the expiry comment's freshness reason was wrong.
+- **Testing:** R3-T1, R3-T3 and R3-T4 resolved; R3-T2 partial.
+  - R4-T1 [Major]: the same as F5.
+  - R4-T2 [Minor]: the same as F6. In addition, `k1_at` was read after `installed()`, and a slow clean run hard-failed instead of retrying.
+
+```json
+[{"id":"F5","severity":"Major","title":"Case 2 baseline invalidated by rotation placement","file":"tests/integration/run.py","line":1014,"adjacent":false,"escalate":null},
+{"id":"F6","severity":"Minor","title":"rotation precondition bounds write not install","file":"tests/integration/run.py","line":980,"adjacent":false,"escalate":null},
+{"id":"F7","severity":"Minor","title":"expiry comment reason wrong","file":"tests/integration/run.py","line":1153,"adjacent":false,"escalate":null},
+{"id":"R4-T1","severity":"Major","title":"same as F5","file":"tests/integration/run.py","line":1014,"adjacent":false,"escalate":null},
+{"id":"R4-T2","severity":"Minor","title":"same as F6; k1_at late; no retry","file":"tests/integration/run.py","line":980,"adjacent":false,"escalate":null}]
+```
+
+## Resolution Status (Round 4)
+
+### F5 / R4-T1 — Fixed
+- **Action:** the rotation now runs after Cases 2 and 3 and before the L8 pair.
+  - Cases 2 and 3 take seconds and install nothing over peer 0's entry, so the prelude entry is still Live at restart 1.
+  - Cases 2 and 3 also pass under the mutant, so no earlier case fails outside the needle.
+  - Case 2's baseline is again taken seconds after Case 1.
+
+### F6 / R4-T2 — Fixed
+- **New precondition:** a restart's key must be accepted less than `REJECT_AFTER_TIME − EXPIRY_SLACK_S` after the previous accepted restart's key was written.
+  - The acceptance time is an upper bound on the new install, and the write time is a lower bound on the previous one. So the previous entry is provably Live.
+  - The write time is captured right after `wait_key`.
+- **Retries:** if a pair is too far apart, the client restarts again, up to `ROTATION_RESTARTS = 4`. A slow clean run stays green.
+  - A mutant can only escape by every consecutive gap exceeding the bound. It then ends at the named precondition failure, not the needle, so the selftest goes red loudly.
+- **Verification:**
+  - `make test`: 22 cases, 0 of 46 pings lost.
+  - `integration-rotation`: ok.
+
+### F7 — Fixed
+The comment now gives the actual reason: nothing initiates for peer 0 between the mark and the join.
+- `make check` exit 0 on the commit that records this entry.
