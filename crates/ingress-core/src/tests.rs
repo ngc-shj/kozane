@@ -3,6 +3,7 @@
 extern crate std;
 
 use core::cell::Cell;
+use std::vec;
 use std::vec::Vec;
 
 use super::*;
@@ -938,10 +939,9 @@ fn a_bad_mac_is_refused_and_spends_nothing() {
     assert!(forwarded(rp(&mut g, 0, SRC, &hello())));
 }
 
-/// Sends `msg` from `from` at `now`, retiring every forward first so the
-/// ring never decides.
+/// Classifies `msg` without sending it: nothing is recorded in flight
+/// (only `sent` does that), so only the meters decide.
 fn rp_drained<'a>(g: &mut RpGate<8>, now: u64, from: Endpoint, msg: &'a [u8]) -> RpOutcome<'a> {
-    g.reclaimed(0);
     rp(g, now, from, msg)
 }
 
@@ -1032,13 +1032,23 @@ fn a_full_source_table_evicts_the_least_recently_used_source() {
     assert!(m.allow([1, 1, 1, 1], 40), "the evicted source starts fresh");
 }
 
-/// Forwards `n` messages of one kind, spaced so every meter has refilled,
-/// so only the ring can refuse.
-fn fill(g: &mut RpGate<8>, t: &mut u64, msg: &[u8], n: usize) {
+/// Forwards `n` messages of one kind from `from`, spaced so every meter has
+/// refilled (only the ring can refuse), and records each as sent.
+fn fill_from(g: &mut RpGate<8>, t: &mut u64, from: Endpoint, msg: &[u8], n: usize) {
     for _ in 0..n {
         *t += METERS_REFILLED;
-        assert!(forwarded(rp(g, *t, SRC, msg)), "refused at {:?}", (g.in_flight(RpKind::Hello), g.in_flight(RpKind::Conf)));
+        let o = rp(g, *t, from, msg);
+        let kind = match o {
+            RpOutcome::ForwardHello { .. } => RpKind::Hello,
+            RpOutcome::ForwardConf { .. } => RpKind::Conf,
+            _ => panic!("refused at {:?}: {o:?}", (g.in_flight(RpKind::Hello), g.in_flight(RpKind::Conf))),
+        };
+        g.sent(kind, from);
     }
+}
+
+fn fill(g: &mut RpGate<8>, t: &mut u64, msg: &[u8], n: usize) {
+    fill_from(g, t, SRC, msg, n);
 }
 
 /// Longer than every Rosenpass meter's refill interval.
@@ -1050,65 +1060,324 @@ const _: () = assert!(
 );
 
 #[test]
-fn init_conf_cannot_take_the_share_reserved_for_init_hello() {
+fn init_conf_cannot_take_init_hello_slots() {
     let mut g = RpGate::default();
-    let (h, c) = (hello(), conf());
     let mut t = 0;
-    fill(&mut g, &mut t, &c, RP_CONF_SHARE);
+    fill(&mut g, &mut t, &conf(), RP_CONF_IN_FLIGHT);
     t += METERS_REFILLED;
-    assert_eq!(rp(&mut g, t, SRC, &c), RpOutcome::RingReserved, "conf past its share");
-    assert_eq!(g.in_flight(RpKind::Conf), RP_CONF_SHARE);
-    fill(&mut g, &mut t, &h, RP_HELLO_RESERVED);
-    t += METERS_REFILLED;
-    assert_eq!(rp(&mut g, t, SRC, &h), RpOutcome::RingReserved, "hello past the ring");
+    assert_eq!(rp(&mut g, t, SRC, &conf()), RpOutcome::RingReserved, "conf past its slots");
+    fill(&mut g, &mut t, &hello(), RP_HELLO_IN_FLIGHT);
 }
 
 #[test]
-fn init_hello_may_use_the_whole_ring() {
+fn an_init_hello_flood_leaves_the_init_conf_slots_free() {
     let mut g = RpGate::default();
     let mut t = 0;
-    fill(&mut g, &mut t, &hello(), RP_IN_FLIGHT);
+    fill(&mut g, &mut t, &hello(), RP_HELLO_IN_FLIGHT);
+    t += METERS_REFILLED;
+    assert_eq!(rp(&mut g, t, SRC, &hello()), RpOutcome::RingReserved, "hello past its slots");
+    fill(&mut g, &mut t, &conf(), RP_CONF_IN_FLIGHT);
+}
+
+#[test]
+fn the_hello_being_processed_counts_against_the_cap() {
+    // S14: `pq` holds the buffer of the InitHello it is working on, so one
+    // processing and one queued fill a cap of two.
+    let mut g = RpGate::default();
+    let mut t = 0;
+    fill(&mut g, &mut t, &hello(), 1); // `pq` took this one and holds it
+    fill(&mut g, &mut t, &hello(), 1); // queued behind it
     t += METERS_REFILLED;
     assert_eq!(rp(&mut g, t, SRC, &hello()), RpOutcome::RingReserved);
-    // A hello-filled ring leaves no room for conf either.
+    assert_eq!(g.in_flight(RpKind::Hello), RP_HELLO_IN_FLIGHT);
+}
+
+#[test]
+fn the_link_holds_rp_in_flight_and_no_more() {
+    let mut g = RpGate::default();
+    let mut t = 0;
+    fill(&mut g, &mut t, &hello(), RP_HELLO_IN_FLIGHT);
+    fill(&mut g, &mut t, &conf(), RP_CONF_IN_FLIGHT);
+    assert_eq!(g.in_flight(RpKind::Hello) + g.in_flight(RpKind::Conf), RP_IN_FLIGHT);
+    t += METERS_REFILLED;
+    assert_eq!(rp(&mut g, t, SRC, &hello()), RpOutcome::RingReserved);
     assert_eq!(rp(&mut g, t, SRC, &conf()), RpOutcome::RingReserved);
+    assert!(!g.pq_dead());
+    // A forward recorded past the capacity cannot be paired: the path stops.
+    g.sent(RpKind::Conf, SRC);
+    assert!(g.pq_dead());
 }
 
 #[test]
 fn a_ring_refusal_spends_no_meter() {
     let mut g = RpGate::default();
     let mut t = 0;
-    fill(&mut g, &mut t, &conf(), RP_CONF_SHARE);
+    fill(&mut g, &mut t, &conf(), RP_CONF_IN_FLIGHT);
     let before = g.clone();
     assert_eq!(rp(&mut g, t, src(77), &conf()), RpOutcome::RingReserved);
     assert_eq!(g, before);
 }
 
 #[test]
-fn reclaim_retires_the_oldest_forwards_first() {
+fn a_forward_is_counted_only_once_sent() {
+    // A failed send leaves no entry: classification alone records nothing.
     let mut g = RpGate::default();
-    let mut t = 0;
-    fill(&mut g, &mut t, &conf(), RP_CONF_SHARE);
-    fill(&mut g, &mut t, &hello(), 2);
-    g.reclaimed(RP_CONF_SHARE + 2 - 1);
-    assert_eq!((g.in_flight(RpKind::Conf), g.in_flight(RpKind::Hello)), (RP_CONF_SHARE - 1, 2));
-    t += METERS_REFILLED;
-    assert!(forwarded(rp(&mut g, t, SRC, &conf())), "a reclaimed conf slot is free again");
-    // An outstanding count above ours (a link error) retires nothing.
-    g.reclaimed(usize::MAX);
-    assert_eq!(g.in_flight(RpKind::Conf), RP_CONF_SHARE);
-    g.reclaimed(0);
-    assert_eq!((g.in_flight(RpKind::Conf), g.in_flight(RpKind::Hello)), (0, 0));
+    assert!(forwarded(rp(&mut g, 0, SRC, &hello())));
+    assert_eq!(g.in_flight(RpKind::Hello), 0);
+    g.sent(RpKind::Hello, SRC);
+    assert_eq!(g.in_flight(RpKind::Hello), 1);
+}
+
+// ---- the completion protocol (M3b plan C2, I9a-I9c) ----
+
+const E1: Endpoint = Endpoint { ip: [10, 0, 3, 1], port: 41001 };
+const E2: Endpoint = Endpoint { ip: [10, 0, 3, 2], port: 41002 };
+const PEERS: usize = 3;
+
+fn record(r: msgs::RpReply<'_>) -> Vec<u8> {
+    let mut out = [0u8; RP_RECORD_MAX];
+    let n = r.encode(&mut out).unwrap();
+    out[..n].to_vec()
+}
+
+fn resp_hello_record(tag: u8) -> Vec<u8> {
+    let msg = [tag; RP_RESP_HELLO_LEN];
+    record(msgs::RpReply::Reply { index: msgs::RP_NO_PEER, msg: &msg })
+}
+
+fn empty_data_record(index: u8) -> Vec<u8> {
+    let msg = [0x84; RP_EMPTY_DATA_LEN];
+    record(msgs::RpReply::Reply { index, msg: &msg })
+}
+
+fn no_reply_record() -> Vec<u8> {
+    record(msgs::RpReply::NoReply)
+}
+
+/// The PD side of a sync, scripted: how many buffers `pq` still holds, the
+/// records it queued, and what went out.
+struct FakePq {
+    outstanding: Option<usize>,
+    records: std::collections::VecDeque<Option<Vec<u8>>>,
+    tx_ok: bool,
+    sent: Vec<(Endpoint, Vec<u8>)>,
+    reads: usize,
+}
+
+impl FakePq {
+    fn new(outstanding: usize, records: Vec<Vec<u8>>) -> Self {
+        Self { outstanding: Some(outstanding), records: records.into_iter().map(Some).collect(), tx_ok: true, sent: Vec::new(), reads: 0 }
+    }
+
+    fn sent_to(&self) -> Vec<Endpoint> {
+        self.sent.iter().map(|(e, _)| *e).collect()
+    }
+}
+
+impl PqSync for FakePq {
+    fn outstanding(&mut self) -> Option<usize> {
+        self.outstanding
+    }
+
+    fn next_record(&mut self, out: &mut [u8; RP_RECORD_MAX]) -> Option<Option<usize>> {
+        self.reads += 1;
+        let r = self.records.pop_front()?;
+        Some(r.and_then(|b| {
+            out.get_mut(..b.len())?.copy_from_slice(&b);
+            Some(b.len())
+        }))
+    }
+
+    fn transmit(&mut self, dst: Endpoint, reply: &[u8]) -> bool {
+        if self.tx_ok {
+            self.sent.push((dst, reply.to_vec()));
+        }
+        self.tx_ok
+    }
+}
+
+fn gate_with(forwards: &[(RpKind, Endpoint)]) -> RpGate<8> {
+    let mut g = RpGate::default();
+    for (k, e) in forwards {
+        g.sent(*k, *e);
+    }
+    g
 }
 
 #[test]
-fn unsent_takes_back_the_newest_forward() {
-    let mut g = RpGate::default();
-    let mut t = 0;
-    fill(&mut g, &mut t, &conf(), 1);
-    fill(&mut g, &mut t, &hello(), 1);
-    g.unsent();
-    assert_eq!((g.in_flight(RpKind::Conf), g.in_flight(RpKind::Hello)), (1, 0));
+fn records_drained_in_one_sync_are_paired_in_order() {
+    // F16: `pq` answered two forwards before `ingress` synced once.
+    let mut g = gate_with(&[(RpKind::Hello, E1), (RpKind::Hello, E2)]);
+    let mut pq = FakePq::new(0, vec![resp_hello_record(1), resp_hello_record(2)]);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { relayed: 2 });
+    assert_eq!(pq.sent_to(), [E1, E2]);
+    assert_eq!((pq.sent[0].1[0], pq.sent[1].1[0]), (1, 2));
+    assert_eq!(g.in_flight(RpKind::Hello), 0);
+}
+
+#[test]
+fn a_refused_request_does_not_take_the_next_reply() {
+    // `pq` refused E1's InitHello (NoReply) and answered E2's: E2's reply
+    // goes to E2, never to E1.
+    let mut g = gate_with(&[(RpKind::Hello, E1), (RpKind::Hello, E2)]);
+    let mut pq = FakePq::new(0, vec![no_reply_record(), resp_hello_record(2)]);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { relayed: 1 });
+    assert_eq!(pq.sent_to(), [E2]);
+}
+
+#[test]
+fn a_reply_goes_to_the_stored_source_and_nowhere_else() {
+    // T19: the EmptyData names peer 1, whose WireGuard endpoint is not E2;
+    // only the forward's stored source is a destination.
+    let peer_1_wireguard = Endpoint { ip: [192, 0, 2, 1], port: 51820 };
+    assert_ne!(peer_1_wireguard, E2);
+    let mut g = gate_with(&[(RpKind::Conf, E2)]);
+    let mut pq = FakePq::new(0, vec![empty_data_record(1)]);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { relayed: 1 });
+    assert_eq!(pq.sent_to(), [E2]);
+}
+
+#[test]
+fn a_record_seen_before_its_return_is_retired_by_the_next_sync() {
+    // The record is published before the return; a sync between the two
+    // relays it and retires nothing, the next one retires it.
+    let mut g = gate_with(&[(RpKind::Hello, E1)]);
+    let mut pq = FakePq::new(1, vec![resp_hello_record(1)]);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { relayed: 1 });
+    assert_eq!(g.in_flight(RpKind::Hello), 1);
+    pq.outstanding = Some(0);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { relayed: 0 });
+    assert_eq!(g.in_flight(RpKind::Hello), 0);
+    assert_eq!(pq.sent_to(), [E1]);
+}
+
+#[test]
+fn every_order_of_record_and_return_completes_the_forward() {
+    // I9c: whenever the sync's snapshot, drain and retire fall relative to
+    // `pq`'s "enqueue record j, then return j", record j is relayed once
+    // and the forward is retired without the path dying.
+    for sync_after in 0..3 {
+        let mut g = gate_with(&[(RpKind::Hello, E1)]);
+        let mut pq = FakePq::new(1, vec![]);
+        // Events of an honest pq: 1 = record enqueued, 2 = buffer returned.
+        for step in 1..=2 {
+            if step == 1 {
+                pq.records.push_back(Some(resp_hello_record(7)));
+            } else {
+                pq.outstanding = Some(0);
+            }
+            if step == sync_after {
+                assert!(matches!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { .. }), "sync after step {step}");
+            }
+        }
+        assert!(matches!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { .. }));
+        assert_eq!(pq.sent_to(), [E1], "sync after step {sync_after}");
+        assert_eq!(g.in_flight(RpKind::Hello), 0);
+    }
+}
+
+#[test]
+fn a_return_without_its_record_stops_the_path() {
+    let mut g = gate_with(&[(RpKind::Hello, E1)]);
+    let mut pq = FakePq::new(0, vec![]);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow);
+    assert!(g.pq_dead());
+    // Nothing was guessed: the entry is still there.
+    assert_eq!(g.in_flight(RpKind::Hello), 1);
+}
+
+#[test]
+fn an_extra_or_duplicate_record_stops_the_path() {
+    let mut g = RpGate::<8>::default();
+    assert_eq!(sync_pq(&mut g, &mut FakePq::new(0, vec![no_reply_record()]), PEERS), SyncOutcome::DiedNow);
+    let mut g = gate_with(&[(RpKind::Hello, E1)]);
+    let mut pq = FakePq::new(0, vec![resp_hello_record(1), resp_hello_record(1)]);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow);
+    assert_eq!(pq.sent_to(), [E1], "the duplicate was not relayed");
+}
+
+#[test]
+fn a_reply_of_the_other_kind_stops_the_path() {
+    let mut g = gate_with(&[(RpKind::Conf, E1)]);
+    let mut pq = FakePq::new(0, vec![resp_hello_record(1)]);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow);
+    assert!(pq.sent.is_empty());
+    let mut g = gate_with(&[(RpKind::Hello, E1)]);
+    let mut pq = FakePq::new(0, vec![empty_data_record(0)]);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow);
+    assert!(pq.sent.is_empty());
+}
+
+#[test]
+fn a_malformed_record_or_a_bad_index_stops_the_path() {
+    let msg = [0u8; RP_RESP_HELLO_LEN];
+    let cases: Vec<(RpKind, Option<Vec<u8>>)> = vec![
+        (RpKind::Conf, Some(empty_data_record(PEERS as u8))), // index = peers
+        (RpKind::Conf, Some(empty_data_record(msgs::RP_NO_PEER))),
+        (RpKind::Hello, Some(record(msgs::RpReply::Reply { index: 0, msg: &msg }))),
+        (RpKind::Hello, Some(vec![9])),
+        (RpKind::Hello, None), // unreadable
+    ];
+    for (kind, r) in cases {
+        let mut g = gate_with(&[(kind, E1)]);
+        let mut pq = FakePq::new(0, vec![]);
+        pq.records.push_back(r.clone());
+        assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow, "{kind:?} {r:?}");
+        assert!(pq.sent.is_empty());
+    }
+    // The allow side: the last configured peer's EmptyData is accepted.
+    let mut g = gate_with(&[(RpKind::Conf, E1)]);
+    let mut pq = FakePq::new(0, vec![empty_data_record(PEERS as u8 - 1)]);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { relayed: 1 });
+}
+
+#[test]
+fn a_snapshot_above_the_fifo_or_a_link_error_stops_the_path() {
+    let mut g = gate_with(&[(RpKind::Hello, E1)]);
+    assert_eq!(sync_pq(&mut g, &mut FakePq::new(2, vec![]), PEERS), SyncOutcome::DiedNow);
+    let mut g = gate_with(&[(RpKind::Hello, E1)]);
+    let mut pq = FakePq::new(0, vec![]);
+    pq.outstanding = None;
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow);
+    // The boundary: outstanding == len retires nothing and is fine.
+    let mut g = gate_with(&[(RpKind::Hello, E1)]);
+    assert_eq!(sync_pq(&mut g, &mut FakePq::new(1, vec![]), PEERS), SyncOutcome::Synced { relayed: 0 });
+}
+
+#[test]
+fn an_endless_record_stream_stops_the_path_within_the_drain_cap() {
+    let mut g = gate_with(&[(RpKind::Hello, E1)]);
+    let mut pq = FakePq::new(0, (0..200).map(|_| no_reply_record()).collect());
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow);
+    assert!(pq.reads <= PASS_FRAMES + 1);
+}
+
+#[test]
+fn a_reply_tx_refuses_still_spends_its_credit() {
+    let mut g = gate_with(&[(RpKind::Hello, E1)]);
+    let mut pq = FakePq::new(1, vec![resp_hello_record(1)]);
+    pq.tx_ok = false;
+    // Not a protocol violation: the record is consumed and nothing resent.
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { relayed: 0 });
+    assert!(!g.pq_dead());
+    // A resent copy finds no waiting entry.
+    pq.tx_ok = true;
+    pq.records.push_back(Some(resp_hello_record(1)));
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow);
+    assert!(pq.sent.is_empty());
+}
+
+#[test]
+fn a_dead_path_forwards_relays_and_retires_nothing() {
+    let mut g = gate_with(&[(RpKind::Hello, E1)]);
+    assert_eq!(sync_pq(&mut g, &mut FakePq::new(0, vec![]), PEERS), SyncOutcome::DiedNow);
+    // Sticky: an honest record later is not relayed, nothing is retired.
+    let mut pq = FakePq::new(0, vec![resp_hello_record(1)]);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Dead);
+    assert!(pq.sent.is_empty() && pq.reads == 0);
+    assert_eq!(g.in_flight(RpKind::Hello), 1);
+    assert_eq!(rp(&mut g, METERS_REFILLED, src(5), &conf()), RpOutcome::PqDown);
+    assert_eq!(rp(&mut g, METERS_REFILLED, src(6), &hello()), RpOutcome::PqDown);
 }
 
 #[test]

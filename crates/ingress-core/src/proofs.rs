@@ -431,16 +431,25 @@ fn any_kind() -> RpKind {
     if kani::any() { RpKind::Hello } else { RpKind::Conf }
 }
 
+fn any_entry() -> Entry {
+    let state = match kani::any::<u8>() % 3 {
+        0 => EntryState::AwaitingRecord,
+        1 => EntryState::CompletedReply,
+        _ => EntryState::CompletedNoReply,
+    };
+    Entry { kind: any_kind(), src: Endpoint { ip: kani::any(), port: kani::any() }, state }
+}
+
 fn any_sources<const B: u64, const I: u64>() -> SourceMeters<2, B, I> {
     let slot = || if kani::any() { Some((kani::any(), any_meter::<B, I>())) } else { None };
     SourceMeters { slots: [slot(), slot()] }
 }
 
-/// Any state: meters at any level within capacity, any source table and
-/// any ring accounting within its bounds. InitConf within its share is the
-/// invariant the harnesses below show is kept.
+/// Any state: meters at any level within capacity, any source table, any
+/// FIFO within its bounds and either `pq` state. Each kind within its slots
+/// is the invariant the harnesses below show is kept.
 fn any_rp_gate() -> RpGate<2> {
-    let in_flight = InFlight { kinds: core::array::from_fn(|_| any_kind()), head: kani::any(), len: kani::any() };
+    let in_flight = InFlight { entries: core::array::from_fn(|_| any_entry()), head: kani::any(), len: kani::any() };
     kani::assume(in_flight.head < RP_IN_FLIGHT && in_flight.len <= RP_IN_FLIGHT);
     RpGate {
         hello_src: any_sources(),
@@ -448,6 +457,7 @@ fn any_rp_gate() -> RpGate<2> {
         conf_src: any_sources(),
         conf_global: any_meter(),
         in_flight,
+        pq_dead: kani::any(),
     }
 }
 
@@ -502,8 +512,8 @@ fn rp_refusals_before_admission_spend_nothing() {
 /// A forward went through its type's constructor: it spent exactly one
 /// token of its type's global meter and exactly one of the source's own
 /// slot in its type's per-source table (a new source's slot starts full),
-/// touched no meter of the other type, and was counted once as in flight
-/// under its type.
+/// touched no meter of the other type, and recorded nothing in flight
+/// (only `sent` does, after the PD's send succeeded).
 #[kani::proof]
 #[kani::unwind(20)]
 fn rp_forward_spends_its_own_meters_once() {
@@ -522,8 +532,6 @@ fn rp_forward_spends_its_own_meters_once() {
                 spec_src_level(&gate.hello_src, ip, now) + RP_HELLO_SRC_INTERVAL_NS == spec_src_level(&before.hello_src, ip, now)
             );
             assert!(gate.conf_global == before.conf_global && gate.conf_src == before.conf_src);
-            assert!(gate.in_flight.count(RpKind::Hello) == before.in_flight.count(RpKind::Hello) + 1);
-            assert!(gate.in_flight.count(RpKind::Conf) == before.in_flight.count(RpKind::Conf));
         }
         RpOutcome::ForwardConf { .. } => {
             assert!(spec_level(&gate.conf_global, now) + RP_CONF_GLOBAL_INTERVAL_NS == spec_level(&before.conf_global, now));
@@ -531,43 +539,130 @@ fn rp_forward_spends_its_own_meters_once() {
                 spec_src_level(&gate.conf_src, ip, now) + RP_CONF_SRC_INTERVAL_NS == spec_src_level(&before.conf_src, ip, now)
             );
             assert!(gate.hello_global == before.hello_global && gate.hello_src == before.hello_src);
-            assert!(gate.in_flight.count(RpKind::Conf) == before.in_flight.count(RpKind::Conf) + 1);
-            assert!(gate.in_flight.count(RpKind::Hello) == before.in_flight.count(RpKind::Hello));
         }
-        _ => assert!(gate.in_flight == before.in_flight),
+        _ => {}
     }
+    assert!(gate.in_flight == before.in_flight && gate.pq_dead == before.pq_dead);
     kani::cover!(matches!(o, RpOutcome::ForwardHello { .. }));
     kani::cover!(matches!(o, RpOutcome::ForwardConf { .. }));
 }
 
-/// From any state with InitConf within its share, one datagram, a reclaim
-/// or an unsent keeps it there and keeps the ring within RP_IN_FLIGHT; and
-/// while the ring has room, an InitHello is never refused for the ring.
+/// From any state with each kind within its slots (S14: the one `pq` is
+/// working on counted), one datagram (recorded as sent if forwarded) or a
+/// retirement keeps each kind within its slots and the FIFO within
+/// RP_IN_FLIGHT; and while a kind has room and the path is up, it is never
+/// refused for the ring.
 #[kani::proof]
 #[kani::unwind(20)]
-fn rp_init_conf_never_exceeds_its_share() {
+fn rp_shares_stay_disjoint_and_bounded() {
     let mut gate = any_rp_gate();
-    kani::assume(gate.in_flight.count(RpKind::Conf) <= RP_CONF_SHARE);
-    let room = gate.in_flight.len < RP_IN_FLIGHT;
+    kani::assume(gate.in_flight.count(RpKind::Hello) <= RP_HELLO_IN_FLIGHT);
+    kani::assume(gate.in_flight.count(RpKind::Conf) <= RP_CONF_IN_FLIGHT);
     let payload: [u8; RP_INIT_HELLO_LEN] = kani::any();
     let hello: bool = kani::any();
+    let kind = if hello { RpKind::Hello } else { RpKind::Conf };
+    let cap = if hello { RP_HELLO_IN_FLIGHT } else { RP_CONF_IN_FLIGHT };
+    let room = !gate.pq_dead && gate.in_flight.count(kind) < cap;
     let msg = if hello { &payload[..] } else { &payload[..RP_INIT_CONF_LEN] };
-    let o = match kani::any::<u8>() {
-        0 => {
-            gate.reclaimed(kani::any());
-            None
+    let src = Endpoint { ip: kani::any(), port: kani::any() };
+    let o = if kani::any() {
+        let _ = gate.retire(kani::any());
+        None
+    } else {
+        let o = rp_classify(&mut gate, &AnyRpMac::default(), kani::any(), src, msg);
+        if matches!(o, RpOutcome::ForwardHello { .. } | RpOutcome::ForwardConf { .. }) {
+            gate.sent(kind, src);
         }
-        1 => {
-            gate.unsent();
-            None
-        }
-        _ => Some(rp_classify(&mut gate, &AnyRpMac::default(), kani::any(), Endpoint { ip: kani::any(), port: kani::any() }, msg)),
+        Some(o)
     };
-    assert!(gate.in_flight.count(RpKind::Conf) <= RP_CONF_SHARE);
+    assert!(gate.in_flight.count(RpKind::Hello) <= RP_HELLO_IN_FLIGHT);
+    assert!(gate.in_flight.count(RpKind::Conf) <= RP_CONF_IN_FLIGHT);
     assert!(gate.in_flight.len <= RP_IN_FLIGHT);
-    if hello && room {
+    if room {
         assert!(o != Some(RpOutcome::RingReserved));
     }
-    kani::cover!(o == Some(RpOutcome::RingReserved) && !hello && room);
-    kani::cover!(matches!(o, Some(RpOutcome::ForwardConf { .. })) && gate.in_flight.count(RpKind::Conf) == RP_CONF_SHARE);
+    kani::cover!(o == Some(RpOutcome::RingReserved) && !room);
+    kani::cover!(matches!(o, Some(RpOutcome::ForwardConf { .. })) && gate.in_flight.count(RpKind::Conf) == RP_CONF_IN_FLIGHT);
+}
+
+/// The completion protocol (I9a-I9c) against any FIFO, any snapshot and any
+/// sequence of up to three records of any shape: every reply goes to the
+/// stored source of the entry it was paired with, in FIFO order; no entry
+/// takes two records; a sync that did not die retired exactly the observed
+/// returns, each completed; and a dead path does nothing at all.
+#[kani::proof]
+#[kani::unwind(12)]
+fn rp_sync_relays_only_to_stored_sources_in_order() {
+    let mut gate = any_rp_gate();
+    let before = gate.clone();
+    let mut pq = AnyPq { outstanding: kani::any(), left: kani::any(), sent: [None; 3], n_sent: 0, n_ok: 0 };
+    kani::assume(pq.left <= 3);
+    let o = sync_pq(&mut gate, &mut pq, 2);
+    // Each reply went to the source of a distinct entry, oldest first.
+    let mut cursor = 0usize;
+    for dst in pq.sent.iter().take(pq.n_sent).flatten() {
+        let mut found = false;
+        while cursor < before.in_flight.len {
+            let e = before.in_flight.get(cursor);
+            cursor += 1;
+            if e.is_some_and(|e| e.src == *dst && e.state == EntryState::AwaitingRecord) {
+                found = true;
+                break;
+            }
+        }
+        assert!(found);
+    }
+    match o {
+        SyncOutcome::Dead => assert!(before.pq_dead && gate == before && pq.n_sent == 0),
+        SyncOutcome::DiedNow => assert!(gate.pq_dead),
+        SyncOutcome::Synced { relayed } => {
+            assert!(!gate.pq_dead && relayed == pq.n_ok);
+            let r = before.in_flight.len - pq.outstanding.unwrap_or(0);
+            assert!(gate.in_flight.len == before.in_flight.len - r);
+        }
+    }
+    kani::cover!(matches!(o, SyncOutcome::Synced { relayed: 2 }));
+    kani::cover!(o == SyncOutcome::DiedNow);
+}
+
+/// A scripted `pq`: any snapshot, then `left` records, each a NoReply, a
+/// RespHello or an EmptyData for any index, or unreadable.
+struct AnyPq {
+    outstanding: Option<usize>,
+    left: u8,
+    sent: [Option<Endpoint>; 3],
+    n_sent: usize,
+    /// Sends that went out (`transmit` returned true).
+    n_ok: usize,
+}
+
+impl PqSync for AnyPq {
+    fn outstanding(&mut self) -> Option<usize> {
+        self.outstanding
+    }
+
+    fn next_record(&mut self, out: &mut [u8; RP_RECORD_MAX]) -> Option<Option<usize>> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        let index: u8 = kani::any();
+        let r = match kani::any::<u8>() % 4 {
+            0 => msgs::RpReply::NoReply,
+            1 => msgs::RpReply::Reply { index, msg: &[0x82; RP_RESP_HELLO_LEN] },
+            2 => msgs::RpReply::Reply { index, msg: &[0x84; RP_EMPTY_DATA_LEN] },
+            _ => return Some(None),
+        };
+        Some(r.encode(out))
+    }
+
+    fn transmit(&mut self, dst: Endpoint, _reply: &[u8]) -> bool {
+        if let Some(s) = self.sent.get_mut(self.n_sent) {
+            *s = Some(dst);
+        }
+        self.n_sent += 1;
+        let ok: bool = kani::any();
+        self.n_ok += usize::from(ok);
+        ok
+    }
 }

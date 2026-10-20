@@ -584,16 +584,22 @@ pub const RP_CONF_SRC_BURST: u64 = 3;
 pub const RP_CONF_SRC_INTERVAL_NS: u64 = 1_000_000_000;
 pub const RP_CONF_GLOBAL_BURST: u64 = 8;
 pub const RP_CONF_GLOBAL_INTERVAL_NS: u64 = 50_000_000;
-/// Forwards `ingress` lets wait on the `ingress`→`pq` link at once (the
-/// "pq ring backlog" of the C2 key-bucket assertion).
-pub const RP_IN_FLIGHT: usize = 16;
-/// Of those, the share InitConf can never take, so a flood of InitConfs
-/// cannot starve InitHello [R2-F-N10]. Equal to the global InitHello burst.
-pub const RP_HELLO_RESERVED: usize = 8;
-pub const RP_CONF_SHARE: usize = RP_IN_FLIGHT - RP_HELLO_RESERVED;
+/// InitHellos `ingress` lets be unreturned on the `ingress`→`pq` link at
+/// once, the one `pq` is working on included: `pq` returns a buffer only
+/// after its completion record (M3b plan, S14). Each costs `pq` seconds
+/// (MCE-COST), so a deeper queue would only delay the InitConfs behind it.
+pub const RP_HELLO_IN_FLIGHT: usize = 2;
+/// InitConfs likewise. InitHellos never take these slots, nor InitConfs
+/// InitHello's [S-3].
+pub const RP_CONF_IN_FLIGHT: usize = 8;
+/// Forwards unreturned at once (the "pq ring backlog" of the C2 key-bucket
+/// assertion), and so the most completion records ever owed.
+pub const RP_IN_FLIGHT: usize = RP_HELLO_IN_FLIGHT + RP_CONF_IN_FLIGHT;
 
-const _: () = assert!(RP_HELLO_RESERVED > 0 && RP_HELLO_RESERVED < RP_IN_FLIGHT, "RP_HELLO_RESERVED out of range");
+const _: () = assert!(RP_HELLO_IN_FLIGHT > 0 && RP_CONF_IN_FLIGHT > 0, "an empty Rosenpass share");
 const _: () = assert!(RP_IN_FLIGHT <= NET_BUFFERS, "RP_IN_FLIGHT above the link's buffers");
+// One drain of the completion link empties it whenever `pq` is honest.
+const _: () = assert!(RP_IN_FLIGHT < PASS_FRAMES, "RP_IN_FLIGHT not below PASS_FRAMES");
 // A single source can never be allowed more than all sources together.
 const _: () = assert!(RP_HELLO_SRC_INTERVAL_NS >= RP_HELLO_GLOBAL_INTERVAL_NS, "RP_HELLO source rate above global");
 const _: () = assert!(RP_CONF_SRC_INTERVAL_NS >= RP_CONF_GLOBAL_INTERVAL_NS, "RP_CONF source rate above global");
@@ -640,38 +646,82 @@ pub enum RpKind {
     Conf,
 }
 
-/// The kinds of the forwards still on the `ingress`→`pq` link, oldest
-/// first. `pq`'s receiver returns each buffer as it copies it out, in ring
-/// order, so the buffers come back in the order they were sent and a
-/// reclaim of k buffers retires the k oldest entries.
+/// What `pq` has said about a forward (M3b plan, "Reply ownership").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryState {
+    AwaitingRecord,
+    CompletedReply,
+    CompletedNoReply,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Entry {
+    kind: RpKind,
+    /// Where the forward came from: the only destination its reply may have.
+    src: Endpoint,
+    state: EntryState,
+}
+
+const NO_ENTRY: Entry = Entry { kind: RpKind::Hello, src: Endpoint { ip: [0; 4], port: 0 }, state: EntryState::AwaitingRecord };
+
+/// The forwards sent to `pq` whose return `ingress` has not yet seen,
+/// oldest first. It is also the table of what `pq` may answer: each entry
+/// takes exactly one completion record, in order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InFlight {
-    kinds: [RpKind; RP_IN_FLIGHT],
+    entries: [Entry; RP_IN_FLIGHT],
     head: usize,
     len: usize,
 }
 
 impl Default for InFlight {
     fn default() -> Self {
-        Self { kinds: [RpKind::Hello; RP_IN_FLIGHT], head: 0, len: 0 }
+        Self { entries: [NO_ENTRY; RP_IN_FLIGHT], head: 0, len: 0 }
     }
 }
 
 impl InFlight {
-    fn count(&self, kind: RpKind) -> usize {
-        (0..self.len).filter(|i| self.kinds.get(self.head.wrapping_add(*i) % RP_IN_FLIGHT) == Some(&kind)).count()
+    fn get(&self, i: usize) -> Option<&Entry> {
+        if i >= self.len {
+            return None;
+        }
+        self.entries.get(self.head.wrapping_add(i) % RP_IN_FLIGHT)
     }
 
-    fn push(&mut self, kind: RpKind) -> bool {
+    fn get_mut(&mut self, i: usize) -> Option<&mut Entry> {
+        if i >= self.len {
+            return None;
+        }
+        self.entries.get_mut(self.head.wrapping_add(i) % RP_IN_FLIGHT)
+    }
+
+    fn count(&self, kind: RpKind) -> usize {
+        (0..self.len).filter(|i| self.get(*i).is_some_and(|e| e.kind == kind)).count()
+    }
+
+    fn push(&mut self, kind: RpKind, src: Endpoint) -> bool {
         if self.len >= RP_IN_FLIGHT {
             return false;
         }
-        let Some(k) = self.kinds.get_mut(self.head.wrapping_add(self.len) % RP_IN_FLIGHT) else {
+        let Some(e) = self.entries.get_mut(self.head.wrapping_add(self.len) % RP_IN_FLIGHT) else {
             return false;
         };
-        *k = kind;
+        *e = Entry { kind, src, state: EntryState::AwaitingRecord };
         self.len = self.len.saturating_add(1);
         true
+    }
+
+    /// The oldest entry still waiting for its record.
+    fn first_awaiting(&mut self) -> Option<&mut Entry> {
+        let i = (0..self.len).find(|i| self.get(*i).is_some_and(|e| e.state == EntryState::AwaitingRecord))?;
+        self.get_mut(i)
+    }
+
+    /// Drops the `r` oldest entries; `r` was checked against `len`.
+    fn pop(&mut self, r: usize) {
+        let r = r.min(self.len);
+        self.head = self.head.wrapping_add(r) % RP_IN_FLIGHT;
+        self.len = self.len.saturating_sub(r);
     }
 }
 
@@ -685,6 +735,10 @@ pub struct RpGate<const N: usize> {
     conf_src: SourceMeters<N, RP_CONF_SRC_BURST, RP_CONF_SRC_INTERVAL_NS>,
     conf_global: Meter<RP_CONF_GLOBAL_BURST, RP_CONF_GLOBAL_INTERVAL_NS>,
     in_flight: InFlight,
+    /// Sticky: `pq`'s records and returns fell out of step, so no entry can
+    /// be trusted. Nothing more is forwarded, relayed or retired until
+    /// reboot (M3b plan, R4-F2).
+    pq_dead: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -698,9 +752,10 @@ pub enum RpOutcome<'a> {
     BadMac,
     /// Over the source's or the global meter of its type.
     RateLimited,
-    /// No room on the link for its type: InitConf at its share, or the link
-    /// at RP_IN_FLIGHT.
+    /// No room on the link for its type: its kind's slots are all taken.
     RingReserved,
+    /// The `pq` path stopped for good (`pq_sync_dead`); nothing is sent.
+    PqDown,
 }
 
 /// Rosenpass checks on a datagram addressed to the Rosenpass port, in
@@ -760,15 +815,19 @@ impl<const N: usize> RpGate<N> {
         }
     }
 
-    /// Room on the link first, so a refusal there spends nothing; then the
-    /// source's meter, then the global one (spent only if the source had a
-    /// token); then the forward is counted as in flight.
+    /// The `pq` path first, then room on the link, so a refusal there
+    /// spends nothing; then the source's meter, then the global one (spent
+    /// only if the source had a token). Nothing is counted here: the PD
+    /// calls `sent` once the forward is on the link.
     fn admit(&mut self, kind: RpKind, now_ns: u64, ip: Ipv4) -> Result<(), RpOutcome<'static>> {
-        let room = match kind {
-            RpKind::Hello => self.in_flight.len < RP_IN_FLIGHT,
-            RpKind::Conf => self.in_flight.len < RP_IN_FLIGHT && self.in_flight.count(RpKind::Conf) < RP_CONF_SHARE,
+        if self.pq_dead {
+            return Err(RpOutcome::PqDown);
+        }
+        let cap = match kind {
+            RpKind::Hello => RP_HELLO_IN_FLIGHT,
+            RpKind::Conf => RP_CONF_IN_FLIGHT,
         };
-        if !room {
+        if self.in_flight.len >= RP_IN_FLIGHT || self.in_flight.count(kind) >= cap {
             return Err(RpOutcome::RingReserved);
         }
         let allowed = match kind {
@@ -778,30 +837,174 @@ impl<const N: usize> RpGate<N> {
         if !allowed {
             return Err(RpOutcome::RateLimited);
         }
-        if !self.in_flight.push(kind) {
-            return Err(RpOutcome::RingReserved);
-        }
         Ok(())
     }
 
-    /// Forwards of `kind` not yet returned by `pq`.
+    /// Forwards of `kind` whose return has not been seen.
     pub fn in_flight(&self, kind: RpKind) -> usize {
         self.in_flight.count(kind)
     }
 
-    /// Retires the oldest forwards until at most `outstanding` remain:
-    /// `outstanding` is the link's in-flight count, read after a reclaim. A
-    /// link error reads as usize::MAX and retires nothing, which fails safe.
-    pub fn reclaimed(&mut self, outstanding: usize) {
-        while self.in_flight.len > outstanding {
-            self.in_flight.head = self.in_flight.head.wrapping_add(1) % RP_IN_FLIGHT;
-            self.in_flight.len = self.in_flight.len.saturating_sub(1);
+    /// Whether the `pq` path has stopped for good.
+    pub fn pq_dead(&self) -> bool {
+        self.pq_dead
+    }
+
+    /// Records a forward the PD just put on the link, as awaiting its
+    /// record. Only a send that succeeded is recorded, so a failed send
+    /// leaves nothing. A forward with no room to be recorded cannot be
+    /// paired with its record, which stops the `pq` path.
+    pub fn sent(&mut self, kind: RpKind, src: Endpoint) {
+        if !self.in_flight.push(kind, src) {
+            self.pq_dead = true;
         }
     }
 
-    /// Takes back the newest forward, which the PD failed to send.
-    pub fn unsent(&mut self) {
-        self.in_flight.len = self.in_flight.len.saturating_sub(1);
+    /// Pairs `pq`'s next completion record with the oldest forward still
+    /// waiting for one. A `Reply` must be that forward's reply type and goes
+    /// to its stored source, never to anything the record says. An extra
+    /// record, a wrong type, a malformed record or an index outside
+    /// `peers` stops the `pq` path.
+    pub fn complete<'r>(&mut self, record: &'r [u8], peers: usize) -> Result<Completion<'r>, SyncDead> {
+        if self.pq_dead {
+            return Err(SyncDead);
+        }
+        let pairing = msgs::RpReply::decode(record).ok().and_then(|r| {
+            let e = self.in_flight.first_awaiting()?;
+            match r {
+                msgs::RpReply::NoReply => {
+                    e.state = EntryState::CompletedNoReply;
+                    Some(None)
+                }
+                msgs::RpReply::Reply { index, msg } => {
+                    let peer = match (e.kind, msg.len()) {
+                        (RpKind::Hello, RP_RESP_HELLO_LEN) if index == msgs::RP_NO_PEER => None,
+                        (RpKind::Conf, RP_EMPTY_DATA_LEN) if usize::from(index) < peers => Some(index),
+                        _ => return None,
+                    };
+                    e.state = EntryState::CompletedReply;
+                    Some(Some((e.src, e.kind, peer)))
+                }
+            }
+        });
+        let reply = record.get(2..).unwrap_or(&[]);
+        match pairing {
+            Some(Some((dst, kind, peer))) => Ok(Completion::Reply { dst, kind, peer, msg: reply }),
+            Some(None) => Ok(Completion::NoReply),
+            None => {
+                self.pq_dead = true;
+                Err(SyncDead)
+            }
+        }
+    }
+
+    /// Retires the `r` oldest forwards, whose returns the sync observed,
+    /// only if each has its record; otherwise the `pq` path stops and
+    /// nothing is retired.
+    fn retire(&mut self, r: usize) -> Result<(), SyncDead> {
+        let all_done = r <= self.in_flight.len
+            && (0..r).all(|i| self.in_flight.get(i).is_some_and(|e| e.state != EntryState::AwaitingRecord));
+        if self.pq_dead || !all_done {
+            self.pq_dead = true;
+            return Err(SyncDead);
+        }
+        self.in_flight.pop(r);
+        Ok(())
+    }
+}
+
+/// The reply lengths `pq` answers with (rosenpass-wire's, which this crate
+/// does not depend on; the PD asserts the two agree).
+pub const RP_RESP_HELLO_LEN: usize = 1132;
+pub const RP_EMPTY_DATA_LEN: usize = 64;
+
+/// The `pq` path broke its completion protocol; it is now stopped for good.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncDead;
+
+/// What one completion record means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Completion<'a> {
+    /// Send `msg` to `dst`, the stored source of the forward it answers.
+    /// `peer` is the configured peer of an EmptyData.
+    Reply { dst: Endpoint, kind: RpKind, peer: Option<u8>, msg: &'a [u8] },
+    NoReply,
+}
+
+/// The longest completion record: tag, index, RespHello.
+pub const RP_RECORD_MAX: usize = 2 + RP_RESP_HELLO_LEN;
+
+/// The PD's side of a sync with `pq` (M3b plan C2/C3). It mirrors `PassIo`:
+/// the order lives in `sync_pq`, and the PD only moves bytes.
+pub trait PqSync {
+    /// Buffers `pq` still holds on the `ingress`→`pq` link, read after a
+    /// validated reclaim; `None` on a link error.
+    fn outstanding(&mut self) -> Option<usize>;
+    /// Copies the next completion record into `out`: `None` when the link
+    /// is empty, `Some(None)` for a record that could not be read.
+    fn next_record(&mut self, out: &mut [u8; RP_RECORD_MAX]) -> Option<Option<usize>>;
+    /// Sends `reply` to `dst`; false when it could not go out. The PD gets
+    /// no index and no record, so it cannot choose another destination.
+    fn transmit(&mut self, dst: Endpoint, reply: &[u8]) -> bool;
+}
+
+/// How one sync ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncOutcome {
+    /// Every observed return was retired; `relayed` replies went out.
+    Synced { relayed: usize },
+    /// This sync found the protocol broken (audit `RpPqSyncDead` once).
+    DiedNow,
+    /// The path was already stopped; nothing was done.
+    Dead,
+}
+
+/// One sync with `pq`, in the only order the completion protocol allows
+/// (M3b plan, "The sync"):
+///
+/// 1. snapshot how many forwards `pq` has returned;
+/// 2. drain every completion record, pairing each with the oldest forward
+///    still waiting and sending each reply to that forward's source;
+/// 3. retire exactly the snapshotted returns, if each has its record.
+///
+/// `pq` sends a forward's record before returning its buffer, so every
+/// return counted in step 1 has its record visible in step 2. A return
+/// after the snapshot waits for the next sync.
+pub fn sync_pq<T: PqSync, const N: usize>(gate: &mut RpGate<N>, io: &mut T, peers: usize) -> SyncOutcome {
+    if gate.pq_dead {
+        return SyncOutcome::Dead;
+    }
+    let len_before = gate.in_flight.len;
+    let returned = io.outstanding().and_then(|outstanding| len_before.checked_sub(outstanding));
+    let Some(returned) = returned else {
+        gate.pq_dead = true;
+        return SyncOutcome::DiedNow;
+    };
+    let mut relayed = 0usize;
+    let mut out = [0u8; RP_RECORD_MAX];
+    let mut drained = 0usize;
+    while let Some(read) = io.next_record(&mut out) {
+        // An honest `pq` owes at most RP_IN_FLIGHT records (< PASS_FRAMES).
+        drained = drained.saturating_add(1);
+        let record = read.filter(|_| drained <= PASS_FRAMES).and_then(|n| out.get(..n));
+        let Some(record) = record else {
+            gate.pq_dead = true;
+            return SyncOutcome::DiedNow;
+        };
+        match gate.complete(record, peers) {
+            Ok(Completion::Reply { dst, msg, .. }) => {
+                if io.transmit(dst, msg) {
+                    relayed = relayed.saturating_add(1);
+                }
+            }
+            Ok(Completion::NoReply) => {}
+            Err(SyncDead) => return SyncOutcome::DiedNow,
+        }
+    }
+    out.fill(0);
+    match gate.retire(returned) {
+        Ok(()) => SyncOutcome::Synced { relayed },
+        Err(SyncDead) => SyncOutcome::DiedNow,
     }
 }
 

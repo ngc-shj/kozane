@@ -529,6 +529,7 @@ dependencies = [
 name = "ingress-core"
 version = "0.1.0"
 dependencies = [
+ "msgs",
  "ring",
  "wg-wire",
  "wire",

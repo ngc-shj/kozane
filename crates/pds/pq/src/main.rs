@@ -9,9 +9,10 @@
 
 use audit_event::{CostHighWater, Event};
 use layout::pq as ch;
-use msgs::{Endpoint, RpDatagram};
-use pdkit::{Audit, Buf, Rx, Tx};
+use msgs::{RP_NO_PEER, RpDatagram, RpReply};
+use pdkit::{Audit, Buf, Rx, Take, Tx};
 use pqkey_core::{LABEL_PQ_BOOT_SEED, LABEL_PQ_DECAPS, MAX_WORDS, OK, PQ_DECAPS_REQ_WORDS};
+use ring::link::Taken;
 use ring::pass::{any_full, drain, run_passes};
 use rosenpass_core::{
     Conf, Decaps, DecapsError, Error, HedgeHw, Hedged, KEY_LEN, Kyber512, McEliece460896, Responder, SHK_LEN,
@@ -32,6 +33,9 @@ const PEERS: usize = config::PEERS.len();
 // The configuration was validated against this bound at build time; the
 // assertion keeps the responder's table from silently diverging from it.
 const _: () = assert!(PEERS <= config::MAX_PEERS);
+// A configured peer's index travels in `RpReply` as one byte, apart from
+// `RP_NO_PEER`.
+const _: () = assert!(config::MAX_PEERS < RP_NO_PEER as usize);
 
 /// Our McEliece public key and each peer's, in `config::PEERS` order (about
 /// 4.5 MiB). Only `pq` expands both macros; `ingress` expands
@@ -123,12 +127,15 @@ fn reject_event(e: Error) -> Event {
     }
 }
 
-fn send_rp(tx: &mut Tx, scratch: &mut Buf, audit: &mut Audit, m: RpDatagram<'_>) -> bool {
+/// Sends the one completion record of the input being handled.
+fn send_record(tx: &mut Tx, scratch: &mut Buf, audit: &mut Audit, r: RpReply<'_>) -> bool {
     let mut enc = [0u8; layout::NET_BUF_SIZE];
-    match m.encode(&mut enc) {
+    let sent = match r.encode(&mut enc) {
         Some(len) => pdkit::send(tx, scratch, enc.get(..len).unwrap_or(&[]), audit),
         None => false,
-    }
+    };
+    enc.fill(0);
+    sent
 }
 
 /// Sends `PskInstall` to `hs`, encoded straight into the scrubbing link's
@@ -161,6 +168,9 @@ struct Pq {
     input: Buf,
     resp_hello: [u8; RESP_HELLO_LEN],
     scratch: Buf,
+    /// A completion record could not be sent, so the input is still held
+    /// and the Rosenpass path is stopped for good (M3b plan C3).
+    stuck: bool,
 }
 
 fn halt(msg: &str) -> ! {
@@ -234,6 +244,7 @@ fn init() -> Pq {
         input: [0; layout::NET_BUF_SIZE],
         resp_hello: [0; RESP_HELLO_LEN],
         scratch: [0; layout::NET_BUF_SIZE],
+        stuck: false,
     }
 }
 
@@ -244,84 +255,136 @@ struct Wake {
 }
 
 impl Pq {
-    /// Takes and handles one datagram from `ingress`; `false` when the
-    /// input is empty.
+    /// Takes one datagram from `ingress`, handles it, sends exactly one
+    /// completion record and only then returns the input's buffer (M3b
+    /// plan C3, the order contract). `false` when the input is empty.
+    ///
+    /// `ingress` pairs each record with its record of the forward. The
+    /// completion ring's Release (the record) is program-ordered before the
+    /// input ring's Release (the return), and `ingress` reads the return
+    /// with an Acquire before draining records, so every return it counts
+    /// has its record visible. Taking the next input before the return is
+    /// refused by the held receive.
     fn one(&mut self, wake: &mut Wake) -> bool {
-        let Some(n) = pdkit::recv(&mut self.from_ingress, &mut self.input, &mut self.audit) else { return false };
-        // The buffer went back to `ingress`, which reclaims on notification.
-        wake.ingress = true;
+        if self.stuck {
+            return false;
+        }
+        let n = match pdkit::take(&mut self.from_ingress, &mut self.input, &mut self.audit) {
+            Take::Empty => return false,
+            Take::Skipped => return true,
+            Take::Got(Taken::Payload(n)) => Some(n),
+            Take::Got(Taken::Unreadable) => None,
+        };
         let mut msg = [0u8; layout::NET_BUF_SIZE];
-        let decoded = RpDatagram::decode(self.input.get(..n).unwrap_or(&[])).ok().and_then(|d| {
+        let decoded = n.and_then(|n| RpDatagram::decode(self.input.get(..n).unwrap_or(&[])).ok()).and_then(|d| {
             let dst = msg.get_mut(..d.msg.len())?;
             dst.copy_from_slice(d.msg);
-            Some((d.peer, d.msg.len()))
+            Some(d.msg.len())
         });
         self.input.fill(0);
-        match decoded {
-            Some((src, INIT_HELLO_LEN)) => self.init_hello(src, msg.get(..INIT_HELLO_LEN).unwrap_or(&[]), wake),
-            Some((src, INIT_CONF_LEN)) => self.init_conf(src, msg.get(..INIT_CONF_LEN).unwrap_or(&[]), wake),
+        let mut reply = [0u8; RESP_HELLO_LEN];
+        let record = match decoded {
+            Some(INIT_HELLO_LEN) => self.init_hello(msg.get(..INIT_HELLO_LEN).unwrap_or(&[]), &mut reply),
+            Some(INIT_CONF_LEN) => self.init_conf(msg.get(..INIT_CONF_LEN).unwrap_or(&[]), &mut reply, wake),
             // `ingress` forwards InitHello and InitConf only.
-            Some(_) => self.audit.record(Event::RpTypeDropped),
-            None => self.audit.record(Event::BadDescriptor),
-        }
+            Some(_) => {
+                self.audit.record(Event::RpTypeDropped);
+                None
+            }
+            None => {
+                self.audit.record(Event::BadDescriptor);
+                None
+            }
+        };
         msg.fill(0);
+        let r = match record {
+            Some((index, len)) => RpReply::Reply { index, msg: reply.get(..len).unwrap_or(&[]) },
+            None => RpReply::NoReply,
+        };
+        let Self { to_ingress, scratch, audit, from_ingress, .. } = self;
+        let sent = send_record(to_ingress, scratch, audit, r);
+        reply.fill(0);
+        scratch.fill(0);
+        if !sent {
+            // The link has room for a record per input in flight, so only a
+            // broken link gets here. Returning the input without its record
+            // would put `ingress` out of step; keep it and stop.
+            self.stuck = true;
+            self.audit.record(Event::RpPqRecordStuck);
+            return false;
+        }
+        wake.ingress = true;
+        pdkit::release(from_ingress, audit);
         true
     }
 
-    /// IHR/RHR, then the RespHello to `ingress`. The wall-clock cost of the
-    /// whole path, preemption included, feeds `RpCostHighWater` (VE10).
-    fn init_hello(&mut self, src: Endpoint, msg: &[u8], wake: &mut Wake) {
+    /// IHR/RHR into `reply`. The wall-clock cost of the whole path,
+    /// preemption included, feeds `RpCostHighWater` (VE10). Returns the
+    /// record's index and length, or `None` for `NoReply`.
+    fn init_hello(&mut self, msg: &[u8], reply: &mut [u8; RESP_HELLO_LEN]) -> Option<(u8, usize)> {
         let start = cpu::cntpct();
-        let Self { responder, rng, resp_hello, to_ingress, scratch, audit, cost, freq, .. } = self;
+        let Self { responder, rng, resp_hello, audit, cost, freq, .. } = self;
         let mut seams = Seams { decaps: &mut PqKey, kyber: &mut Kyber512, mceliece: &mut McEliece460896, rng };
-        match responder.handle_init_hello(msg, cpu::now_ns(), &mut seams, resp_hello) {
+        let out = match responder.handle_init_hello(msg, cpu::now_ns(), &mut seams, resp_hello) {
             Ok(_) => {
-                wake.ingress |= send_rp(to_ingress, scratch, audit, RpDatagram { peer: src, msg: resp_hello.as_slice() });
+                reply.copy_from_slice(resp_hello);
                 audit.record(Event::RpInitHello);
                 let us = cpu::ticks_to_ns(cpu::cntpct().saturating_sub(start), *freq) / 1000;
                 cost.observe_with(u32::try_from(us).unwrap_or(u32::MAX), |ev| audit.record_delivered(ev));
+                Some((RP_NO_PEER, RESP_HELLO_LEN))
             }
-            Err(e) => audit.record(reject_event(e)),
-        }
+            Err(e) => {
+                audit.record(reject_event(e));
+                None
+            }
+        };
         resp_hello.fill(0);
-        scratch.fill(0);
+        out
     }
 
     /// ICR, then the OSK export order (M3 plan F8, S15): `PskInstall` to
     /// `hs` first; only once it was sent is the InitConf committed and the
-    /// EmptyData sent. A failed send leaves no trace, so the client's
-    /// retransmission is processed again.
-    fn init_conf(&mut self, src: Endpoint, msg: &[u8], wake: &mut Wake) {
-        let Self { responder, to_ingress, to_hs, scratch, audit, .. } = self;
+    /// EmptyData produced. A failed send leaves no trace, so the client's
+    /// retransmission is processed again. Returns the record's index (the
+    /// configured peer) and length, or `None` for `NoReply`.
+    fn init_conf(&mut self, msg: &[u8], reply: &mut [u8; RESP_HELLO_LEN], wake: &mut Wake) -> Option<(u8, usize)> {
+        let Self { responder, to_hs, scratch, audit, .. } = self;
         let now = cpu::now_ns();
-        let response = match responder.handle_init_conf(msg, now) {
-            Ok(Conf::Retransmission { response, .. }) => response,
+        let (peer, response) = match responder.handle_init_conf(msg, now) {
+            Ok(Conf::Retransmission { peer, response }) => (peer, response),
             Ok(Conf::Fresh(pending)) => {
                 let install = pending.psk_install();
-                if !send_psk(to_hs, scratch, audit, install.peer, install.osk) {
+                let sent = send_psk(to_hs, scratch, audit, install.peer, install.osk);
+                scratch.fill(0);
+                if !sent {
                     responder.abort_conf(pending);
                     audit.record(Event::RpPskInstallFailed);
-                    return;
+                    return None;
                 }
                 wake.hs = true;
+                let peer = pending.peer();
                 match responder.commit_conf(pending, now) {
                     Ok(response) => {
                         audit.record(Event::RpPskExported);
-                        response
+                        (peer, response)
                     }
                     Err(e) => {
                         audit.record(reject_event(e));
-                        return;
+                        return None;
                     }
                 }
             }
             Err(e) => {
                 audit.record(reject_event(e));
-                return;
+                return None;
             }
         };
-        wake.ingress |= send_rp(to_ingress, scratch, audit, RpDatagram { peer: src, msg: &response });
-        scratch.fill(0);
+        // `PEERS <= MAX_PEERS` (asserted above), so the index fits a byte
+        // and never collides with `RP_NO_PEER`.
+        let index = u8::try_from(peer).ok().filter(|i| *i != RP_NO_PEER)?;
+        let dst = reply.get_mut(..response.len())?;
+        dst.copy_from_slice(&response);
+        Some((index, response.len()))
     }
 }
 

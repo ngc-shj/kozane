@@ -16,8 +16,8 @@ mod rp_mac;
 use audit_event::Event;
 use cookie::CookieAdapter;
 use ingress_core::{
-    Buckets, Config, Endpoint, Gate, Mac1, Outcome, PassIo, RpGate, RpMac, RpOutcome, emit_udp, respond, rp_classify,
-    rp_reply_allowed, run_passes,
+    Buckets, Config, Endpoint, Gate, Mac1, Outcome, PassIo, PqSync, RP_RECORD_MAX, RpGate, RpKind, RpMac, RpOutcome,
+    SyncOutcome, emit_udp, respond, rp_classify, rp_reply_allowed, run_passes,
 };
 use layout::ingress as ch;
 use msgs::ToIngress;
@@ -60,6 +60,16 @@ const _: () = assert!(
 );
 // An encoded `RpDatagram` (endpoint + the longest message) fits a buffer.
 const _: () = assert!(6 + rosenpass_wire::RESP_HELLO_LEN <= layout::NET_BUF_SIZE);
+// The completion records `sync_pq` pairs: ingress-core's and msgs' reply
+// lengths are rosenpass-wire's, a record fits a buffer, and the `pq` link
+// has a buffer for every record ever owed (M3b plan C3).
+const _: () = assert!(ingress_core::RP_RESP_HELLO_LEN == rosenpass_wire::RESP_HELLO_LEN);
+const _: () = assert!(ingress_core::RP_EMPTY_DATA_LEN == rosenpass_wire::EMPTY_DATA_LEN);
+const _: () = assert!(
+    msgs::RP_REPLY_LENS[0] == rosenpass_wire::RESP_HELLO_LEN && msgs::RP_REPLY_LENS[1] == rosenpass_wire::EMPTY_DATA_LEN
+);
+const _: () = assert!(ingress_core::RP_RECORD_MAX <= layout::NET_BUF_SIZE);
+const _: () = assert!(layout::NET_BUFFERS >= ingress_core::RP_IN_FLIGHT);
 
 const CONFIG: Config = Config {
     mac: config::OUTSIDE_MAC,
@@ -304,9 +314,13 @@ impl Ingress {
     fn outside_one(&mut self, wake: &mut Wake) -> bool {
         let Some(n) = pdkit::recv(&mut self.from_driver, &mut self.frame, &mut self.audit) else { return false };
         wake.driver = true;
+        // Retire what `pq` has finished before any Rosenpass admission
+        // decides on room (a sync is a reclaim and, usually, an empty read).
+        self.sync_pq(wake);
         let (backlog, tx_free) = self.levels();
         let frame = self.frame.get(..n).unwrap_or(&[]);
         let mut msg_len = None;
+        let mut rp_forward = None;
         let now = cpu::now_ns();
         let outcome = respond(
             &CONFIG,
@@ -346,18 +360,15 @@ impl Ingress {
                 Some(Target::Data)
             }
             Outcome::Rosenpass { src, payload } => {
-                // Retire the forwards `pq` has taken before deciding on room.
-                let outstanding = match self.to_pq.in_flight() {
-                    Ok(n) => n,
-                    Err(e) => {
-                        self.audit.link_error(e);
-                        usize::MAX
-                    }
-                };
-                self.rp.reclaimed(outstanding);
                 let msg = match rp_classify(&mut self.rp, &self.rp_mac, now, src, payload) {
-                    RpOutcome::ForwardHello { src, msg } => msgs::RpDatagram { peer: ep(src), msg }.encode(&mut self.msg),
-                    RpOutcome::ForwardConf { src, msg } => msgs::RpDatagram { peer: ep(src), msg }.encode(&mut self.msg),
+                    RpOutcome::ForwardHello { src, msg } => {
+                        rp_forward = Some((RpKind::Hello, src));
+                        msgs::RpDatagram { peer: ep(src), msg }.encode(&mut self.msg)
+                    }
+                    RpOutcome::ForwardConf { src, msg } => {
+                        rp_forward = Some((RpKind::Conf, src));
+                        msgs::RpDatagram { peer: ep(src), msg }.encode(&mut self.msg)
+                    }
                     RpOutcome::BadMac => {
                         self.audit.record(Event::RpBadMac);
                         return true;
@@ -372,10 +383,9 @@ impl Ingress {
                         self.audit.record(Event::RpTypeDropped);
                         return true;
                     }
+                    // Audited once, when the sync stopped.
+                    RpOutcome::PqDown => return true,
                 };
-                if msg.is_none() {
-                    self.rp.unsent();
-                }
                 msg_len = msg;
                 Some(Target::Pq)
             }
@@ -431,8 +441,9 @@ impl Ingress {
             Target::Data => wake.data |= pdkit::send(&mut self.to_data, &mut self.scratch, msg, &mut self.audit),
             Target::Pq => {
                 let sent = pdkit::send(&mut self.to_pq, &mut self.scratch, msg, &mut self.audit);
-                if !sent {
-                    self.rp.unsent();
+                // Only a forward on the link awaits a record (I9a).
+                if let (true, Some((kind, src))) = (sent, rp_forward) {
+                    self.rp.sent(kind, src);
                 }
                 wake.pq |= sent;
             }
@@ -440,42 +451,21 @@ impl Ingress {
         true
     }
 
-    fn drain_pq(&mut self, wake: &mut Wake, max: usize) -> usize {
-        drain(max, || self.pq_one(wake))
-    }
-
-    /// Takes and handles one message; `false` when the input is empty.
-    /// `pq` sends only RespHello and EmptyData, each answering a mac-valid
-    /// InitHello or InitConf, which proves nothing about its source; so,
-    /// like cookie replies, they stay out of the TX reserve.
-    fn pq_one(&mut self, wake: &mut Wake) -> bool {
-        let Some(n) = pdkit::recv(&mut self.from_pq, &mut self.msg, &mut self.audit) else { return false };
-        wake.pq = true;
-        let mut payload = [0u8; layout::NET_BUF_SIZE];
-        let (dst, plen) = match msgs::RpDatagram::decode(self.msg.get(..n).unwrap_or(&[])) {
-            Ok(d) if matches!(d.msg.len(), rosenpass_wire::RESP_HELLO_LEN | rosenpass_wire::EMPTY_DATA_LEN) => {
-                let Some(p) = payload.get_mut(..d.msg.len()) else { return true };
-                p.copy_from_slice(d.msg);
-                (Endpoint { ip: d.peer.ip, port: d.peer.port }, d.msg.len())
-            }
-            _ => {
-                self.audit.record(Event::BadDescriptor);
-                return true;
-            }
-        };
-        let tx_free = match self.to_driver.free() {
-            Ok(n) => n,
-            Err(e) => {
-                self.audit.link_error(e);
+    /// One sync with `pq` through ingress-core's `sync_pq`, which owns the
+    /// order (snapshot, drain, pair, retire) and every destination; this
+    /// side only moves bytes. Returns the replies relayed.
+    fn sync_pq(&mut self, wake: &mut Wake) -> usize {
+        let mut rp = core::mem::take(&mut self.rp);
+        let outcome = ingress_core::sync_pq(&mut rp, &mut PqLink { ingress: self, wake }, config::PEERS.len());
+        self.rp = rp;
+        match outcome {
+            SyncOutcome::Synced { relayed } => relayed,
+            SyncOutcome::DiedNow => {
+                self.audit.record(Event::RpPqSyncDead);
                 0
             }
-        };
-        if !rp_reply_allowed(tx_free) {
-            self.audit.record(Event::TxNoBuffer);
-            return true;
+            SyncOutcome::Dead => 0,
         }
-        self.send_to_peer(CONFIG.rp_port, dst, payload.get(..plen).unwrap_or(&[]), wake);
-        true
     }
 
     fn drain_hs(&mut self, wake: &mut Wake, max: usize) -> usize {
@@ -552,7 +542,8 @@ impl PassIo for Pass<'_> {
     }
 
     fn serve_pq(&mut self, max: usize) -> usize {
-        self.ingress.drain_pq(&mut self.wake, max)
+        // One sync empties an honest `pq`'s records (RP_IN_FLIGHT < max).
+        self.ingress.sync_pq(&mut self.wake).min(max.saturating_sub(1))
     }
 
     fn serve_data(&mut self, max: usize) -> usize {
@@ -570,6 +561,65 @@ impl PassIo for Pass<'_> {
     fn end_pass(&mut self) {
         core::mem::take(&mut self.wake).notify();
         self.ingress.audit.flush();
+    }
+}
+
+/// The PD's side of `sync_pq`. `transmit` gets a destination and bytes
+/// only, never the record or its index, so it cannot pick another
+/// destination (M3b plan, T19).
+struct PqLink<'a> {
+    ingress: &'a mut Ingress,
+    wake: &'a mut Wake,
+}
+
+impl PqSync for PqLink<'_> {
+    fn outstanding(&mut self) -> Option<usize> {
+        match self.ingress.to_pq.in_flight() {
+            Ok(n) => Some(n),
+            Err(e) => {
+                self.ingress.audit.link_error(e);
+                None
+            }
+        }
+    }
+
+    /// Reads the link directly rather than through `pdkit::recv`, which
+    /// skips bad descriptors: a skipped record would put the pairing out of
+    /// step, so it must reach `sync_pq` as unreadable.
+    fn next_record(&mut self, out: &mut [u8; RP_RECORD_MAX]) -> Option<Option<usize>> {
+        let r = self.ingress.from_pq.recv_into(&mut self.ingress.msg);
+        let read = match r {
+            Ok(None) => return None,
+            Ok(Some(n)) => self.ingress.msg.get(..n).and_then(|b| {
+                out.get_mut(..b.len())?.copy_from_slice(b);
+                Some(b.len())
+            }),
+            Err(e) => {
+                self.ingress.audit.link_error(e);
+                None
+            }
+        };
+        // The buffer went back to `pq`, which reclaims on notification.
+        self.wake.pq = true;
+        Some(read)
+    }
+
+    /// RespHello and EmptyData each answer a mac-valid InitHello or
+    /// InitConf, which proves nothing about its source; so, like cookie
+    /// replies, they stay out of the TX reserve.
+    fn transmit(&mut self, dst: Endpoint, reply: &[u8]) -> bool {
+        let tx_free = match self.ingress.to_driver.free() {
+            Ok(n) => n,
+            Err(e) => {
+                self.ingress.audit.link_error(e);
+                0
+            }
+        };
+        if !rp_reply_allowed(tx_free) {
+            self.ingress.audit.record(Event::TxNoBuffer);
+            return false;
+        }
+        self.ingress.send_to_peer(CONFIG.rp_port, dst, reply, self.wake)
     }
 }
 
