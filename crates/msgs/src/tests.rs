@@ -114,3 +114,35 @@ fn psk_install_round_trips_and_rejects_other_sizes() {
     assert!(PskInstall::decode(&out[..n - 1]).is_err());
     assert!(PskInstall::decode(&out[..n + 1]).is_err());
 }
+
+#[test]
+fn rp_reply_round_trips_both_reply_lengths_and_no_reply() {
+    let mut out = [0u8; 1200];
+    let msg = [0x5au8; 1132];
+    for (index, len) in [(RP_NO_PEER, 1132), (3, 64)] {
+        let m = RpReply::Reply { index, msg: &msg[..len] };
+        let n = m.encode(&mut out).unwrap();
+        assert_eq!(n, 2 + len);
+        assert_eq!(RpReply::decode(&out[..n]), Ok(m));
+    }
+    let n = RpReply::NoReply.encode(&mut out).unwrap();
+    assert_eq!(&out[..n], &[2]);
+    assert_eq!(RpReply::decode(&out[..n]), Ok(RpReply::NoReply));
+}
+
+#[test]
+fn rp_reply_refuses_other_lengths_tags_and_trailing_bytes() {
+    let msg = [0u8; 1133];
+    let mut out = [0u8; 1200];
+    // Request lengths and near misses are not replies.
+    for len in [0, 63, 65, 176, 1092, 1131, 1133] {
+        assert_eq!(RpReply::Reply { index: 0, msg: &msg[..len] }.encode(&mut out), None, "encode {len}");
+        let mut b = [0u8; 1200];
+        b[0] = 1;
+        assert_eq!(RpReply::decode(&b[..2 + len]), Err(Malformed), "decode {len}");
+    }
+    assert_eq!(RpReply::decode(&[]), Err(Malformed));
+    assert_eq!(RpReply::decode(&[2, 0]), Err(Malformed));
+    assert_eq!(RpReply::decode(&[3]), Err(Malformed));
+    assert_eq!(RpReply::decode(&[0]), Err(Malformed));
+}

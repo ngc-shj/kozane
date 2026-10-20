@@ -10,7 +10,8 @@
 //! | ingress → data  | `Transport`: src ip[4] port[2] msg[..]              |
 //! | data → ingress  | tag 1 `Outbound` peer[2] msg[..]; tag 2 `EndpointUpdate` peer[2] ip[4] port[2] |
 //! | data ↔ inner    | a bare IPv4 datagram (validated by `wire`)          |
-//! | ingress ↔ pq    | `RpDatagram`: peer ip[4] port[2] msg[176 or 1092 / 64 or 1132] |
+//! | ingress → pq    | `RpDatagram`: peer ip[4] port[2] msg[176 or 1092]   |
+//! | pq → ingress    | `RpReply`, one per input: tag 1 `Reply` index[1] msg[1132 or 64]; tag 2 `NoReply` |
 //! | pq → hs         | `PskInstall`: peer[2] osk[32] (secret)              |
 //!
 //! Integers are little-endian.
@@ -216,6 +217,66 @@ impl<'a> RpDatagram<'a> {
             return Err(Malformed);
         }
         Ok(Self { peer, msg })
+    }
+}
+
+/// pq → ingress: the completion record of one input (M3b plan C3). `pq`
+/// sends exactly one per input it took, in input order, before returning
+/// the input's buffer; `ingress` pairs it with its own record of that
+/// forward. There is no endpoint: the reply goes where `ingress` recorded
+/// the forward came from, so `pq` cannot aim it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpReply<'a> {
+    /// A RespHello or an EmptyData. `index` is the configured peer an
+    /// EmptyData belongs to, `RP_NO_PEER` otherwise; `ingress` range-checks
+    /// it.
+    Reply { index: u8, msg: &'a [u8] },
+    /// The input was refused, dropped or unreadable: nothing to send.
+    NoReply,
+}
+
+/// `RpReply::Reply`'s `index` when no configured peer is named.
+pub const RP_NO_PEER: u8 = 0xff;
+
+/// The reply lengths a responder sends: RespHello, EmptyData.
+pub const RP_REPLY_LENS: [usize; 2] = [1132, 64];
+
+const TAG_REPLY: u8 = 1;
+const TAG_NO_REPLY: u8 = 2;
+
+impl<'a> RpReply<'a> {
+    pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+        let mut at = 0;
+        match *self {
+            RpReply::Reply { index, msg } => {
+                if !RP_REPLY_LENS.contains(&msg.len()) {
+                    return None;
+                }
+                put(out, &mut at, &[TAG_REPLY, index])?;
+                put(out, &mut at, msg)?;
+            }
+            RpReply::NoReply => put(out, &mut at, &[TAG_NO_REPLY])?,
+        }
+        Some(at)
+    }
+
+    pub fn decode(b: &'a [u8]) -> Result<Self, Malformed> {
+        let mut at = 0;
+        match take::<1>(b, &mut at)? {
+            [TAG_REPLY] => {
+                let [index] = *take::<1>(b, &mut at)?;
+                let msg = rest(b, at)?;
+                if !RP_REPLY_LENS.contains(&msg.len()) {
+                    return Err(Malformed);
+                }
+                Ok(RpReply::Reply { index, msg })
+            }
+            [TAG_NO_REPLY] => {
+                exact(b, at)?;
+                Ok(RpReply::NoReply)
+            }
+            _ => Err(Malformed),
+        }
     }
 }
 

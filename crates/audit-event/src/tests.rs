@@ -170,11 +170,13 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::RpPskExported
         | Event::RpPskInstallFailed
         | Event::RpRngFailed
-        | Event::RpDecapsRateLimited => true,
+        | Event::RpDecapsRateLimited
+        | Event::RpPqRecordStuck
+        | Event::RpPqSyncDead => true,
         Event::FrameDropped { .. } | Event::RpCostHighWater { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
-    assert_eq!(Event::FIXED.len(), 51);
+    assert_eq!(Event::FIXED.len(), 53);
 }
 
 #[test]
@@ -210,7 +212,14 @@ fn only_state_edge_kinds_are_never_coalesced() {
     let never: Vec<Event> = Event::FIXED.iter().copied().filter(|e| !e.is_coalesced()).collect();
     assert_eq!(
         never,
-        [Event::WgUnderLoad, Event::WgLoadCleared, Event::CookieSecretExpired, Event::CookieSecretUnavailable]
+        [
+            Event::WgUnderLoad,
+            Event::WgLoadCleared,
+            Event::CookieSecretExpired,
+            Event::CookieSecretUnavailable,
+            Event::RpPqRecordStuck,
+            Event::RpPqSyncDead,
+        ]
     );
     assert!(Event::FrameDropped { reason: 0 }.is_coalesced());
     assert!(!Event::RpCostHighWater { us: 0 }.is_coalesced());
@@ -237,7 +246,9 @@ fn decode_classifies_fixed_dropped_and_unknown_codes() {
     // fixed range.
     assert_eq!(decode(FRAME_DROPPED_BASE + 0x3f), Decoded::FrameDropped(0x3f));
     assert_eq!(decode(0x0019), Decoded::Unknown);
-    assert_eq!(decode(0x0049), Decoded::Unknown);
+    assert_eq!(decode(0x0049), Decoded::Fixed(Event::RpPqRecordStuck));
+    assert_eq!(decode(0x004a), Decoded::Fixed(Event::RpPqSyncDead));
+    assert_eq!(decode(0x004b), Decoded::Unknown);
 }
 
 #[test]

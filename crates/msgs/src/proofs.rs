@@ -78,3 +78,36 @@ fn psk_install_decode_is_total() {
         }
     }
 }
+
+/// Longest `RpReply` (tag, index, RespHello) plus one byte.
+const RP_REPLY_MAX: usize = 2 + 1132 + 1;
+
+/// `RpReply::decode` is total and closed: a `Reply` is exactly tag 1, an
+/// index and a reply length; `NoReply` is exactly the one tag byte; the
+/// message is the rest of the input and re-encodes to the same length.
+#[kani::proof]
+#[kani::unwind(8)]
+fn rp_reply_decode_is_total() {
+    let buf: [u8; RP_REPLY_MAX] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= buf.len());
+    let b = buf.get(..len).unwrap_or(&[]);
+    let mut out = [0u8; RP_REPLY_MAX];
+    match RpReply::decode(b) {
+        Ok(RpReply::Reply { index, msg }) => {
+            kani::cover!(msg.len() == 1132);
+            kani::cover!(msg.len() == 64);
+            assert!(RP_REPLY_LENS.contains(&msg.len()));
+            assert!(b.first() == Some(&1) && b.get(1) == Some(&index));
+            assert!(core::ptr::eq(msg, b.get(2..).unwrap_or(&[])));
+            assert!(RpReply::Reply { index, msg }.encode(&mut out) == Some(len));
+        }
+        Ok(RpReply::NoReply) => {
+            assert!(b == [2]);
+        }
+        Err(Malformed) => {
+            kani::cover!(len == 2 + 1092);
+            kani::cover!(len == 2);
+        }
+    }
+}

@@ -131,6 +131,14 @@ pub enum Event {
     RpPskInstallFailed,
     RpRngFailed,
     RpDecapsRateLimited,
+    /// `pq` could not enqueue a completion record, so it keeps the input
+    /// held and stops its Rosenpass path for good (M3b plan C3; never
+    /// coalesced, raised once).
+    RpPqRecordStuck,
+    /// `ingress` found `pq`'s completion records and buffer returns out of
+    /// step and stopped relaying for good (M3b plan, `pq_sync_dead`; never
+    /// coalesced, raised once).
+    RpPqSyncDead,
     /// `pq`'s handshake cost rose to a new high-water mark; `us` travels as
     /// the record's `a` (never coalesced; `CostHighWater` bounds it).
     RpCostHighWater { us: u32 },
@@ -190,6 +198,8 @@ impl Event {
             Event::RpPskInstallFailed => 0x0045,
             Event::RpRngFailed => 0x0046,
             Event::RpDecapsRateLimited => 0x0047,
+            Event::RpPqRecordStuck => 0x0049,
+            Event::RpPqSyncDead => 0x004a,
             Event::RpCostHighWater { .. } => COST_HIGH_WATER,
             Event::FrameDropped { reason } => {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
@@ -199,7 +209,7 @@ impl Event {
 
     /// Every variant except the parameterised `FrameDropped` and
     /// `RpCostHighWater`.
-    pub const FIXED: [Event; 51] = [
+    pub const FIXED: [Event; 53] = [
         Event::ArpReplied,
         Event::UdpEchoed,
         Event::RingCorrupt,
@@ -251,6 +261,8 @@ impl Event {
         Event::RpPskInstallFailed,
         Event::RpRngFailed,
         Event::RpDecapsRateLimited,
+        Event::RpPqRecordStuck,
+        Event::RpPqSyncDead,
     ];
 
     /// Display name; exhaustive, so a new variant fails to compile here.
@@ -307,6 +319,8 @@ impl Event {
             Event::RpPskInstallFailed => "RpPskInstallFailed",
             Event::RpRngFailed => "RpRngFailed",
             Event::RpDecapsRateLimited => "RpDecapsRateLimited",
+            Event::RpPqRecordStuck => "RpPqRecordStuck",
+            Event::RpPqSyncDead => "RpPqSyncDead",
             Event::RpCostHighWater { .. } => "RpCostHighWater",
             Event::FrameDropped { .. } => "FrameDropped",
         }
@@ -320,6 +334,8 @@ impl Event {
             | Event::WgLoadCleared
             | Event::CookieSecretExpired
             | Event::CookieSecretUnavailable
+            | Event::RpPqRecordStuck
+            | Event::RpPqSyncDead
             | Event::RpCostHighWater { .. } => false,
             Event::ArpReplied
             | Event::UdpEchoed
@@ -439,6 +455,8 @@ impl Event {
             Event::RpPskInstallFailed => 48,
             Event::RpRngFailed => 49,
             Event::RpDecapsRateLimited => 50,
+            Event::RpPqRecordStuck => 51,
+            Event::RpPqSyncDead => 52,
             Event::RpCostHighWater { .. } => COST_HIGH_WATER_SLOT,
             Event::FrameDropped { reason } => {
                 // FIXED_SLOTS..FIXED_SLOTS+64, clamped like `code`.
@@ -449,7 +467,7 @@ impl Event {
     }
 }
 
-const FIXED_SLOTS: usize = 51;
+const FIXED_SLOTS: usize = 53;
 const COST_HIGH_WATER_SLOT: usize = FIXED_SLOTS + MAX_DROP_REASON as usize + 1;
 const SLOTS: usize = COST_HIGH_WATER_SLOT + 1;
 
