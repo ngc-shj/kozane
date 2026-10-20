@@ -11,7 +11,16 @@ and sha256), so the gate is offline and reproducible. Exit 0 only when:
     policy/audit-ignore.toml by advisory id and crate;
   - every listed exception still matches a reported warning (a stale one
     must be removed, so the list never hides a later advisory);
-  - the database loaded advisories and the lock file listed crates.
+  - the database loaded advisories and the lock file listed crates;
+  - the report's own settings show nothing filtered: no ignored ids, no
+    severity threshold, no target OS/arch filter, and the unmaintained,
+    unsound and notice warnings enabled; and its vulnerability count agrees
+    with its list.
+cargo-audit reads `audit.toml` from $CARGO_HOME, ~/.cargo and the working
+directory's `.cargo/`, any of which could ignore an advisory. The binary is
+therefore run directly from an empty temporary HOME, CARGO_HOME and
+working directory, so no such file is read; the settings check above
+catches one that is read anyway.
 Prints "AUDIT-ADVISORIES <n>" (advisories in the pinned snapshot) for the
 count manifest; a refreshed snapshot changes it on purpose.
 
@@ -23,13 +32,35 @@ manual step (record it in the deviation log), and a fresh check is
 
 import argparse
 import json
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
+import tempfile
 import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 FIELDS = ("id", "crate", "reason", "owner")
+REQUIRED_WARNINGS = {"unmaintained", "unsound", "notice"}
+
+
+def settings_errors(settings) -> list:
+    """Anything in the report's settings that would hide an advisory."""
+    if not isinstance(settings, dict):
+        return ["audit-gate: the report has no settings; refusing"]
+    errors = []
+    if settings.get("ignore") != []:
+        errors.append(f"audit-gate: cargo audit ran with ignored advisories {settings.get('ignore')!r}")
+    if settings.get("severity") is not None:
+        errors.append(f"audit-gate: cargo audit ran with a severity threshold {settings.get('severity')!r}")
+    for k in ("target_arch", "target_os"):
+        if settings.get(k) != []:
+            errors.append(f"audit-gate: cargo audit ran with a {k} filter {settings.get(k)!r}")
+    enabled = settings.get("informational_warnings")
+    if not isinstance(enabled, list) or not REQUIRED_WARNINGS <= set(enabled):
+        errors.append(f"audit-gate: cargo audit ran without the warnings {sorted(REQUIRED_WARNINGS)} (got {enabled!r})")
+    return errors
 
 
 def load_ignores(path: pathlib.Path) -> dict:
@@ -53,20 +84,32 @@ def main() -> int:
     ap.add_argument("--ignore", default=str(ROOT / "policy/audit-ignore.toml"))
     a = ap.parse_args()
     ignores = load_ignores(pathlib.Path(a.ignore))
-    r = subprocess.run(["cargo", "audit", "--no-fetch", "--db", a.db, "--file", a.lock, "--json"],
-                       capture_output=True, text=True)
+    binary = shutil.which("cargo-audit")
+    if binary is None:
+        print("audit-gate: cargo-audit not found on PATH")
+        return 1
+    with tempfile.TemporaryDirectory(prefix="audit-gate-") as empty:
+        env = {**os.environ, "HOME": empty, "CARGO_HOME": empty}
+        r = subprocess.run([binary, "audit", "--no-fetch", "--db", os.path.abspath(a.db),
+                            "--file", os.path.abspath(a.lock), "--json"],
+                           capture_output=True, text=True, cwd=empty, env=env)
     try:
         report = json.loads(r.stdout)
     except json.JSONDecodeError:
         print(r.stdout + r.stderr)
         print(f"audit-gate: cargo audit produced no report (exit {r.returncode})")
         return 1
-    errors = []
+    errors = settings_errors(report.get("settings"))
     advisories = report.get("database", {}).get("advisory-count", 0)
     crates = report.get("lockfile", {}).get("dependency-count", 0)
     if not advisories or not crates:
         errors.append(f"audit-gate: examined nothing ({advisories} advisories, {crates} crates)")
-    for v in report.get("vulnerabilities", {}).get("list", []):
+    vulns = report.get("vulnerabilities", {})
+    listed = vulns.get("list", [])
+    if vulns.get("count") != len(listed) or vulns.get("found") != bool(listed):
+        errors.append(f"audit-gate: inconsistent report (count {vulns.get('count')!r}, found {vulns.get('found')!r}, "
+                      f"{len(listed)} listed)")
+    for v in listed:
         errors.append(f"audit-gate: vulnerability {v['advisory']['id']} in {v['package']['name']} "
                       f"{v['package']['version']}: {v['advisory']['title']}")
     seen = set()

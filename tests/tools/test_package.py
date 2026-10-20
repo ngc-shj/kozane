@@ -306,8 +306,9 @@ def run_main(build_result):
             real_publish = pkg.publish
 
             def signalling_publish(src, dst):
-                # A stop signal at the commit point: during the rename, or
-                # right after it succeeded.
+                # A stop signal inside the commit: after the block began but
+                # before the rename (held, then discarded), or right after
+                # the rename succeeded.
                 if build_result == "signal-during-publish":
                     os.kill(os.getpid(), signal.SIGTERM)
                 real_publish(src, dst)
@@ -777,7 +778,8 @@ CASES = [
     ("publishing refuses to replace an OUT that appeared", None, publish_never_replaces(True)),
     ("publishing to a free OUT succeeds", None, publish_never_replaces(False)),
     ("a failed publish is reported and leaves no OUT or staging", None, run_main("publish-fails")),
-    ("a SIGTERM during the publishing rename completes the run as a success", None, run_main("signal-during-publish")),
+    ("a SIGTERM after the commit block began, before the rename, still publishes and succeeds", None,
+     run_main("signal-during-publish")),
     ("a SIGTERM right after the rename completes the run as a success", None, run_main("signal-after-rename")),
     ("output inside build/", "inside", lambda: pkg.check_out_path(ROOT / "build/pkg", ROOT)),
     ("output inside the repo", "inside", lambda: pkg.check_out_path(ROOT / "pkg-out", ROOT)),

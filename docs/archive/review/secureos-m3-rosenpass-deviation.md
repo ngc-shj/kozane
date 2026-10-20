@@ -662,14 +662,14 @@ Verdict: no Critical, High or Major. M3a stays dev-only until M3b (SC26, cookie 
 1. **mksecrets left a partial secrets directory on failure (Minor) — fixed.**
    - `stage_and_publish` writes everything into a 0700 staging directory beside OUT. It publishes with `renameat2(RENAME_NOREPLACE)`, so it never replaces an OUT, even an empty one that appeared.
    - On any error it removes the staging directory and reports both errors if that fails.
-   - SIGTERM, SIGINT and SIGHUP are blocked while secrets are staged.
-     - On success, the rename is the commit point: pending stop signals are discarded, and the run succeeds.
+   - SIGTERM, SIGINT and SIGHUP are blocked from before the staging directory exists until the outcome is settled. A signal during staging does not cancel the run.
+     - On success, pending stop signals are discarded, and the run succeeds.
      - On failure, staging is removed first; then the restored mask delivers the signal, with nothing published.
    - Adds `libc =0.2.191` (already in Cargo.lock).
    - Tests: published owner-only; a failed write publishes nothing and leaves no staging; an existing OUT is never replaced; the signal mask is restored.
    - Red-proved on scratch copies: no cleanup, a replacing rename, and an unrestored mask each fail their test.
 2. **tools/package: a stop signal between the rename and `status = 0` ended a run that had published OUT (Minor) — fixed.**
-   - Stop signals are blocked across `publish`. One already pending exits before the rename, with nothing published.
+   - Stop signals are blocked across `publish`, and the block is the commit point (corrected after the follow-up review). One already pending when the block takes effect exits first, with nothing published. One arriving after it, even before the rename, is held and then discarded.
    - Once the rename succeeds, they are set to SIG_IGN, so the run completes as a success.
    - New fixtures: a SIGTERM during the rename and right after it, both expected to succeed with OUT. The existing "SIGTERM during the build" stays the deny side.
    - Red-proved: without the hold, both new fixtures fail with exit 143. PACKAGE-FIXTURES 95.
@@ -691,3 +691,24 @@ Verdict: no Critical, High or Major. M3a stays dev-only until M3b (SC26, cookie 
     - Kani recomputed in the new container.
   - **Selftest case `audit`:** ok.
   - **Dev image:** rebuilt with `docker build --network host`. The default bridge network timed out on IPv6 downloads during this session. That is a host network issue, so `docker/Makefile` is unchanged.
+
+## Follow-up external review of 5dece87
+
+1 Major and 2 Minor, all fixed.
+
+1. **audit-gate could be bypassed by an `audit.toml` (Major) — fixed.**
+   - **The bypass:** cargo-audit reads `audit.toml` from $CARGO_HOME, ~/.cargo and `./.cargo/`. Such a file can ignore advisories, set a severity threshold, filter targets or disable warning kinds. The CLI's `--ignore` only adds to a configured list.
+   - **Isolation:** the gate now runs the resolved `cargo-audit` binary directly, with HOME, CARGO_HOME and the working directory set to an empty temporary directory, so no such file is read.
+   - **Settings check:** it also requires the report's settings to be clean: `ignore == []`, `severity` null, empty `target_os`/`target_arch`, and the unmaintained, unsound and notice warnings enabled.
+   - **Count check:** the vulnerability count and `found` must agree with the list.
+   - **Shown against the real cargo-audit:** with a hostile `audit.toml` in HOME, CARGO_HOME and the cwd, a raw `cargo audit` reports `settings.ignore = [RUSTSEC-2024-0436]` and hides that warning; the gate, run from the same place, reads none of them.
+   - **Fixtures:** the fake is now a `cargo-audit` that reads `audit.toml` from the same three places, as the real tool does. AUDIT-GATE-FIXTURES 9 → 17: missing settings, ignored ids, a severity threshold, OS and arch filters, disabled warnings, a count mismatch, and the isolation case.
+   - **Red-proved:** removing the isolation, the settings check or the count check each fails its fixtures.
+2. **mksecrets removed a staging directory it had not created (Minor) — fixed.**
+   - The staging name now carries 8 random bytes from /dev/urandom.
+   - A staging directory that already exists makes the creation fail, and nothing is removed: only a directory this call created is ever removed (`stage_and_publish_at`).
+   - Test: an existing same-name staging directory is left untouched. Red-proved by removing on a failed creation.
+3. **The package and mksecrets wording put the commit at the rename; the boundary is the signal block (Minor) — fixed.**
+   - A signal that arrives after the block took effect, even before the rename, is held and then discarded on success. The comments, the fixture name and this log now say so.
+   - The behaviour is unchanged: the safety property — a run that published never ends as a failure — was already right.
+- **Verification:** `make check` exit 0 (673 s; AUDIT-GATE-FIXTURES 17, UNIT-MKSECRETS 22). The selftest case `audit` passes.

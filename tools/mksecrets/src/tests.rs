@@ -318,3 +318,16 @@ fn the_signal_mask_is_restored_after_staging() {
     assert_eq!(mask(), before, "SIGTERM left blocked after a failed staging");
     std::fs::remove_dir_all(&parent).unwrap();
 }
+
+#[test]
+fn a_staging_directory_that_already_exists_is_left_untouched() {
+    let parent = scratch("taken");
+    let staging = parent.join(".deploy.mksecrets-taken");
+    std::fs::create_dir(&staging).unwrap();
+    std::fs::write(staging.join("theirs"), b"x").unwrap();
+    let r = stage_and_publish_at(&parent.join("deploy"), &staging, |s| write_private(&s.join("secrets.bin"), b"k"));
+    assert!(r.is_err(), "a taken staging name must refuse");
+    assert_eq!(leftovers(&staging), ["theirs"], "someone else's staging directory was modified");
+    assert_eq!(leftovers(&parent), [".deploy.mksecrets-taken"], "nothing was published");
+    std::fs::remove_dir_all(&parent).unwrap();
+}

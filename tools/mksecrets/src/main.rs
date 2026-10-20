@@ -330,30 +330,40 @@ fn generate(template: &str, peers: usize, endpoint: &str, rp_endpoint: Option<&s
 
 /// Writes a deployment through `write` into a fresh 0700 staging directory
 /// beside `dir`, then publishes it as `dir` in one rename that never
-/// replaces anything. Stop signals are held while secrets are staged: on
-/// success they are discarded (the rename is the commit point, so a run that
-/// published always succeeds), on failure the staging directory is removed
-/// first and a pending signal then ends the process with nothing published.
+/// replaces anything. Stop signals are held from before the staging
+/// directory exists until the outcome is settled, so a signal cannot leave
+/// staged secrets behind: on success it is discarded (a signal during
+/// staging does not cancel the run, and a run that published always
+/// succeeds); on failure the staging directory is removed first and the
+/// signal then ends the process with nothing published.
 fn stage_and_publish(dir: &Path, write: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
     let name = dir.file_name().ok_or_else(|| format!("{}: no directory name", dir.display()))?;
     let parent = dir.parent().ok_or_else(|| format!("{}: no parent", dir.display()))?;
-    let staging = parent.join(format!(".{}.mksecrets-{}", name.to_string_lossy(), std::process::id()));
+    let mut token = [0u8; 8];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut token))
+        .map_err(|e| format!("/dev/urandom: {e}"))?;
+    let token: String = token.iter().map(|b| format!("{b:02x}")).collect();
+    let staging = parent.join(format!(".{}.mksecrets-{token}", name.to_string_lossy()));
+    stage_and_publish_at(dir, &staging, write)
+}
+
+/// `stage_and_publish` with the staging path given. Only a staging directory
+/// this call created is ever removed: one that already exists makes the
+/// creation fail, and is left as it was.
+fn stage_and_publish_at(dir: &Path, staging: &Path, write: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
     let held = StopSignals::hold()?;
-    let staged = std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(&staging)
-        .map_err(|e| format!("{}: {e}", staging.display()))
-        .and_then(|()| write(&staging))
-        .and_then(|()| rename_noreplace(&staging, dir).map_err(|e| format!("cannot publish {}: {e}", dir.display())));
+    std::fs::DirBuilder::new().mode(0o700).create(staging).map_err(|e| format!("{}: {e}", staging.display()))?;
+    let staged = write(staging)
+        .and_then(|()| rename_noreplace(staging, dir).map_err(|e| format!("cannot publish {}: {e}", dir.display())));
     match staged {
         Ok(()) => {
             held.discard_pending();
             Ok(())
         }
         Err(e) => {
-            let removed = match std::fs::remove_dir_all(&staging) {
+            let removed = match std::fs::remove_dir_all(staging) {
                 Ok(()) => Ok(()),
-                Err(r) if r.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(r) => Err(format!("{e}; and could not remove staging directory {}: {r}", staging.display())),
             };
             drop(held);

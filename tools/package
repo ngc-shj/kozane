@@ -327,10 +327,13 @@ def main() -> int:
             else:
                 # Atomic and never replacing: an OUT created after the check
                 # above makes the rename fail instead of being overwritten.
-                # The rename is the commit point: stop signals are held
-                # across it (one already pending exits before it, publishing
-                # nothing), and once it succeeds they are discarded, so a run
-                # that published OUT always completes as a success.
+                # Blocking stop signals here starts the commit: one already
+                # pending when the block takes effect exits first, publishing
+                # nothing; one that arrives after it is held, and once the
+                # rename succeeds it is discarded, so a run that published OUT
+                # always completes as a success. (A signal during the rename
+                # itself therefore cannot cancel it: the boundary is the
+                # block, not the rename.)
                 stop = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
                 try:
                     signal.pthread_sigmask(signal.SIG_BLOCK, stop)
