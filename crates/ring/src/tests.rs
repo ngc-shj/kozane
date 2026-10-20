@@ -295,6 +295,104 @@ mod link_tests {
         assert_eq!(rx.recv_into(&mut out), Ok(Some(2)));
     }
 
+    // ---- held receive (M3b plan C3, F17) ----
+
+    use crate::link::Taken;
+
+    #[test]
+    fn a_taken_message_stays_in_flight_until_release() {
+        let (mut tx, mut rx, _s) = link();
+        assert_eq!(send(&mut tx, b"held"), Ok(true));
+        let mut out = [0u8; BUF];
+        assert_eq!(rx.take_into(&mut out), Ok(Some(Taken::Payload(4))));
+        assert_eq!(&out[..4], b"held");
+        // The sender still counts the message being worked on.
+        assert_eq!(tx.in_flight(), Ok(1));
+        assert_eq!(rx.release(), Ok(()));
+        assert_eq!(tx.in_flight(), Ok(0));
+    }
+
+    #[test]
+    fn a_second_take_or_receive_before_release_is_refused() {
+        let (mut tx, mut rx, _s) = link();
+        send(&mut tx, b"a").unwrap();
+        send(&mut tx, b"b").unwrap();
+        let mut out = [0u8; BUF];
+        assert_eq!(rx.take_into(&mut out), Ok(Some(Taken::Payload(1))));
+        assert_eq!(rx.take_into(&mut out), Err(LinkError::Held));
+        assert_eq!(rx.recv_into(&mut out), Err(LinkError::Held));
+        // The refusals took nothing: the second message is still queued.
+        rx.release().unwrap();
+        assert_eq!(rx.take_into(&mut out), Ok(Some(Taken::Payload(1))));
+        assert_eq!(out[0], b'b');
+    }
+
+    #[test]
+    fn release_with_nothing_held_is_refused() {
+        let (_tx, mut rx, _s) = link();
+        assert_eq!(rx.release(), Err(LinkError::NoBuffer));
+    }
+
+    #[test]
+    fn a_take_on_an_empty_link_holds_nothing() {
+        let (_tx, mut rx, _s) = link();
+        let mut out = [0u8; BUF];
+        assert_eq!(rx.take_into(&mut out), Ok(None));
+        assert_eq!(rx.release(), Err(LinkError::NoBuffer));
+    }
+
+    #[test]
+    fn a_bad_descriptor_holds_nothing_and_the_next_take_works() {
+        let (_tx, mut rx, s) = link();
+        let mut forger: Producer<ShmRing<Desc, N>, Desc, N> =
+            Producer::new(unsafe { ShmRing::producer(s.used) });
+        forger.push(Desc { offset: 3, len: 1 }).unwrap(); // misaligned
+        forger.push(Desc { offset: 0, len: 2 }).unwrap(); // valid
+        let mut out = [0u8; BUF];
+        assert!(matches!(rx.take_into(&mut out), Err(LinkError::BadDesc(_))));
+        assert_eq!(rx.release(), Err(LinkError::NoBuffer));
+        assert_eq!(rx.take_into(&mut out), Ok(Some(Taken::Payload(2))));
+    }
+
+    #[test]
+    fn a_copy_failure_after_accept_is_unreadable_and_stays_held() {
+        let s = shm();
+        // The receiver's view of the data region covers only buffer 0, so
+        // the accepted descriptor for buffer 1 cannot be copied.
+        // SAFETY: as in `link`; the receiver's region is a prefix of it.
+        let (mut tx, mut rx): (Tx, Rx) = unsafe {
+            (
+                Sender::new(ShmRing::producer(s.used), ShmRing::consumer(s.free), Region::new(s.data, M * BUF)),
+                Receiver::new(ShmRing::consumer(s.used), ShmRing::producer(s.free), Region::new(s.data, BUF)),
+            )
+        };
+        send(&mut tx, b"zero").unwrap();
+        send(&mut tx, b"one").unwrap();
+        let mut out = [0u8; BUF];
+        assert_eq!(rx.take_into(&mut out), Ok(Some(Taken::Payload(4))));
+        rx.release().unwrap();
+        // Unreadable, not an error, and the buffer has not gone back.
+        assert_eq!(rx.take_into(&mut out), Ok(Some(Taken::Unreadable)));
+        assert_eq!(tx.in_flight(), Ok(1));
+        assert_eq!(rx.take_into(&mut out), Err(LinkError::Held));
+        rx.release().unwrap();
+        assert_eq!(tx.in_flight(), Ok(0));
+    }
+
+    #[test]
+    fn a_failed_release_kills_the_link() {
+        let (mut tx, mut rx, s) = link();
+        send(&mut tx, b"x").unwrap();
+        let mut out = [0u8; BUF];
+        rx.take_into(&mut out).unwrap();
+        // The sender claims to have read a return never written.
+        // SAFETY: `read` is the second header field of the leaked, aligned ring.
+        unsafe { s.free.cast::<u32>().add(1).write_volatile(1) };
+        assert_eq!(rx.release(), Err(LinkError::Corrupt));
+        assert_eq!(rx.take_into(&mut out), Err(LinkError::Corrupt));
+        assert_eq!(rx.release(), Err(LinkError::Corrupt));
+    }
+
     #[test]
     fn link_is_dead_after_peer_stalls_its_read_index() {
         // A receiver that returns buffers but never advances its read index

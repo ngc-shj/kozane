@@ -9,7 +9,7 @@ use core::ptr::NonNull;
 use audit_event::{Coalescer, Event, Record};
 use layout::{AUDIT_RING_SLOTS, NET_BUF_SIZE, NET_BUFFERS, NET_REGION_SIZE, NET_RING_SLOTS};
 use ring::Producer;
-use ring::link::{LinkError, Receiver, Sender};
+use ring::link::{LinkError, Receiver, Sender, Taken};
 use ring::shmem::{Region, ShmRing};
 use sel4_microkit::Channel;
 
@@ -97,6 +97,9 @@ impl Audit {
             LinkError::Corrupt => Event::RingCorrupt,
             LinkError::BadDesc(_) => Event::BadDescriptor,
             LinkError::NoBuffer => Event::TxNoBuffer,
+            // A broken take/release protocol is a local fault, reported as a
+            // dead link.
+            LinkError::Held => Event::RingCorrupt,
         });
     }
 
@@ -119,6 +122,48 @@ pub fn send(tx: &mut Tx, scratch: &mut Buf, data: &[u8], audit: &mut Audit) -> b
     });
     match r {
         Ok(sent) => sent,
+        Err(e) => {
+            audit.link_error(e);
+            false
+        }
+    }
+}
+
+/// What one `take` found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Take {
+    /// Nothing to complete: the link is empty or dead.
+    Empty,
+    /// A bad descriptor, audited and dropped; nothing is held, more may be
+    /// queued.
+    Skipped,
+    /// A message whose buffer is held until `release`.
+    Got(Taken),
+}
+
+/// Takes one message into `buf` and keeps its buffer until `release` (M3b
+/// plan C3). Tries once: unlike `recv` it never loops, so a broken
+/// take/release protocol cannot spin.
+pub fn take(rx: &mut Rx, buf: &mut Buf, audit: &mut Audit) -> Take {
+    match rx.take_into(buf) {
+        Ok(Some(t)) => Take::Got(t),
+        Ok(None) => Take::Empty,
+        Err(LinkError::BadDesc(e)) => {
+            audit.link_error(LinkError::BadDesc(e));
+            Take::Skipped
+        }
+        Err(e) => {
+            audit.link_error(e);
+            Take::Empty
+        }
+    }
+}
+
+/// Returns the buffer `take` held. Failures are audited; afterwards the
+/// link is dead and every later `take` finds it empty.
+pub fn release(rx: &mut Rx, audit: &mut Audit) -> bool {
+    match rx.release() {
+        Ok(()) => true,
         Err(e) => {
             audit.link_error(e);
             false

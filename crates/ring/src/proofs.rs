@@ -145,7 +145,7 @@ mod link_proofs {
     #![allow(unsafe_code)]
 
     use super::Adversary;
-    use crate::link::{LinkError, Receiver, Sender};
+    use crate::link::{LinkError, Receiver, Sender, Taken};
     use crate::shmem::Region;
 
     const M: usize = 2;
@@ -173,6 +173,36 @@ mod link_proofs {
         kani::cover!(matches!(r, Ok(Some(_))));
         kani::cover!(matches!(r, Err(LinkError::BadDesc(_))));
         kani::cover!(matches!(r, Err(LinkError::Corrupt)));
+    }
+
+    /// The held receive (M3b plan C3): whatever descriptor and indices the
+    /// peer writes, `take_into` never reads outside the data region, never
+    /// reports more than BUF bytes, and holds a buffer exactly when it
+    /// reports one; a second take is refused and `release` returns it.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn held_receive_stays_in_region_and_holds_what_it_reports() {
+        let mut mem = [0u8; M * BUF];
+        // SAFETY: `mem` outlives `rx` and has the stated length.
+        let region = unsafe { Region::new(mem.as_mut_ptr(), mem.len()) };
+        let used = Adversary::<M>::default();
+        let free = Adversary::<M>::default();
+        let mut rx: Receiver<&Adversary<M>, &Adversary<M>, M, M, BUF> = Receiver::new(&used, &free, region);
+        let mut out = [0u8; BUF];
+        let r = rx.take_into(&mut out);
+        if let Ok(Some(Taken::Payload(n))) = r {
+            assert!(n <= BUF);
+        }
+        if let Ok(Some(_)) = r {
+            assert!(rx.take_into(&mut out) == Err(LinkError::Held));
+            let rel = rx.release();
+            assert!(rel.is_ok() || rel == Err(LinkError::Corrupt));
+        } else {
+            let rel = rx.release();
+            assert!(rel == Err(LinkError::NoBuffer) || rel == Err(LinkError::Corrupt));
+        }
+        kani::cover!(matches!(r, Ok(Some(Taken::Payload(_)))));
+        kani::cover!(matches!(r, Err(LinkError::BadDesc(_))));
     }
 
     /// The copy-out path: whatever length the fill step reports, the sender

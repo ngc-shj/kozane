@@ -161,6 +161,9 @@ impl Driver {
             LinkError::Corrupt => Event::RingCorrupt,
             LinkError::BadDesc(_) => Event::BadDescriptor,
             LinkError::NoBuffer => Event::RxNoBuffer,
+            // A broken take/release protocol is a local fault, reported as a
+            // dead link.
+            LinkError::Held => Event::RingCorrupt,
         });
     }
 

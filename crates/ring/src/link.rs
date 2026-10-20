@@ -1,7 +1,9 @@
 //! One direction of buffer exchange, built from a used ring, a free ring, a
 //! `Pool` and a data `Region`. The `Sender` starts owning every buffer; the
 //! `Receiver` copies each payload into private memory and returns the buffer
-//! before the caller looks at the bytes.
+//! before the caller looks at the bytes (`recv_into`), or keeps it until the
+//! caller has finished with the message (`take_into` / `release`, M3b plan
+//! C3), so the sender can count the message in progress as in flight.
 
 use crate::shmem::Region;
 use crate::{Consumer, Desc, DescError, Pool, Producer, RingError, SharedAccess};
@@ -14,6 +16,21 @@ pub enum LinkError {
     BadDesc(DescError),
     /// No buffer is currently owned by this side.
     NoBuffer,
+    /// A held receive is outstanding: a second take, or a plain receive,
+    /// before `release`. Only a caller that broke the take/release protocol
+    /// sees it.
+    Held,
+}
+
+/// A message taken by `take_into`; its buffer stays held until `release`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Taken {
+    /// This many bytes were copied out.
+    Payload(usize),
+    /// The descriptor was accepted but its bytes could not be copied. The
+    /// buffer is still held, so the caller still completes the message (its
+    /// record, then `release`) and stays in step with the sender.
+    Unreadable,
 }
 
 impl From<RingError> for LinkError {
@@ -133,6 +150,8 @@ pub struct Receiver<U, F, const N: usize, const M: usize, const BUF: usize> {
     region: Region,
     /// Set once any ring operation fails; the link is never used again.
     dead: bool,
+    /// The buffer of a message taken by `take_into` and not yet released.
+    held: Option<usize>,
 }
 
 impl<U, F, const N: usize, const M: usize, const BUF: usize> Receiver<U, F, N, M, BUF>
@@ -144,7 +163,7 @@ where
 
     pub fn new(used: U, free: F, region: Region) -> Self {
         let () = Self::RING_HOLDS_ALL_BUFFERS;
-        Self { used: Consumer::new(used), free: Producer::new(free), pool: Pool::new(false), region, dead: false }
+        Self { used: Consumer::new(used), free: Producer::new(free), pool: Pool::new(false), region, dead: false, held: None }
     }
 
     /// Copies the next payload into `out` and returns the buffer to the
@@ -152,6 +171,9 @@ where
     pub fn recv_into(&mut self, out: &mut [u8; BUF]) -> Result<Option<usize>, LinkError> {
         if self.dead {
             return Err(LinkError::Corrupt);
+        }
+        if self.held.is_some() {
+            return Err(LinkError::Held);
         }
         let Some(d) = self.used.pop().inspect_err(|_| self.dead = true)? else {
             return Ok(None);
@@ -165,5 +187,48 @@ where
         self.free.push(back).inspect_err(|_| self.dead = true)?;
         copied.map_err(|_| LinkError::BadDesc(DescError::OutOfRange))?;
         Ok(Some(len))
+    }
+
+    /// Copies the next payload into `out` and keeps its buffer until
+    /// `release`. `Ok(None)` when nothing is queued. A descriptor that fails
+    /// validation holds nothing (`BadDesc`); once a descriptor is accepted
+    /// the call never fails, because returning the buffer here would be a
+    /// return the caller never completed. A copy that fails after that is
+    /// `Taken::Unreadable`, still held.
+    pub fn take_into(&mut self, out: &mut [u8; BUF]) -> Result<Option<Taken>, LinkError> {
+        if self.dead {
+            return Err(LinkError::Corrupt);
+        }
+        if self.held.is_some() {
+            return Err(LinkError::Held);
+        }
+        let Some(d) = self.used.pop().inspect_err(|_| self.dead = true)? else {
+            return Ok(None);
+        };
+        let idx = self.pool.accept(d).map_err(LinkError::BadDesc)?;
+        self.held = Some(idx);
+        let copied = usize::try_from(d.len).ok().and_then(|len| {
+            let dst = out.get_mut(..len)?;
+            self.region.read_into(buf_offset::<BUF>(idx), dst).ok().map(|()| len)
+        });
+        Ok(Some(copied.map_or(Taken::Unreadable, Taken::Payload)))
+    }
+
+    /// Returns the held buffer to the sender. `NoBuffer` when nothing is
+    /// held; a failed return kills the link, since the sender would then
+    /// count a message as in flight that is not.
+    pub fn release(&mut self) -> Result<(), LinkError> {
+        if self.dead {
+            return Err(LinkError::Corrupt);
+        }
+        let Some(idx) = self.held.take() else {
+            return Err(LinkError::NoBuffer);
+        };
+        let Some(back) = self.pool.give(idx, 0) else {
+            self.dead = true;
+            return Err(LinkError::Corrupt);
+        };
+        self.free.push(back).inspect_err(|_| self.dead = true)?;
+        Ok(())
     }
 }

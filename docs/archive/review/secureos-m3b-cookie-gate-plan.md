@@ -1102,3 +1102,51 @@ Plan review closed after Round 4 by the stopping rule: no open Critical or Major
 | C5 | SecretLife extraction | locked |
 | C6 | Integration: flood, latency, attribution | locked |
 | C7 | Guest-RAM OSK residue scan | locked |
+
+## Implementation Checklist
+
+Derived in Phase 2 Step 2-1 with `rg` over `crates/`. Slices are in the
+order of the memory note risk-tiered-review; each closes with its own fast
+gate.
+
+1. **`ring` held receive:** `crates/ring/src/{link.rs, tests.rs, proofs.rs}`.
+   - `LinkError::Held` is a new variant. Its exhaustive matches are
+     `crates/pdkit/src/lib.rs:97` and `crates/netdrv/src/lib.rs:161`, and
+     each gets an arm.
+   - `pdkit::take` is new. `pdkit::recv` (`lib.rs:131`) stays for the 13
+     other call sites; `rg -n 'pdkit::recv'` lists them.
+2. **`pq` completion record:**
+   - `crates/msgs/{lib.rs, tests.rs, proofs.rs}` get `RpReply`. The
+     `RpDatagram` users are `pds/pq/src/main.rs:126/254/279/323` and
+     `pds/ingress/src/main.rs:61/359/360/455`.
+   - `pds/pq/src/main.rs` `one()` moves to `take` → one record → `release`.
+3. **The `InFlight` state machine:** `crates/ingress-core/src/lib.rs`.
+   - `InFlight`, `RpGate::admit/reclaimed/unsent` (`:643-805`).
+   - The PD call sites of `reclaimed`/`unsent`: `pds/ingress/src/main.rs:357/377/435`.
+4. **Pure `sync_pq` and `PqSync`:** `crates/ingress-core/src/lib.rs`, next
+   to `PassIo` (`:808-845`), with tests and Kani in
+   `crates/ingress-core/src/{tests.rs, proofs.rs}`.
+5. **PD wiring:** `pds/ingress/src/main.rs`.
+   - `pq_one` (`:451-479`) becomes `PqSync`.
+   - The outside path's lazy reclaim (`:348-357`) is replaced.
+   - Every TX-reserve user moves to `rp_tx_allowed`: `ingress-core/src/lib.rs:156/488/742` and `pds/ingress/src/main.rs:473`.
+6. **Cookie gate, lanes, binding (C1–C5):**
+   - `crates/rosenpass-core` (cookie module; remove `Domains` cookie fields, `crypto.rs:91-93/115-118`);
+   - `crates/rosenpass-wire`;
+   - `crates/ingress-core`;
+   - `pds/ingress` (`rp_cookie.rs`);
+   - `crates/audit-event` and `crates/pds/audit`.
+7. **Kani and mutations, then C6/C7 integration,** check-selftest cases,
+   and `tests/manifest.txt`.
+
+**Reuse, not reimplement (R1):**
+- `ring::pass::{drain, any_full}`;
+- `pdkit::{send, Audit}`;
+- `Meter`, `SourceMeters` (made generic over the key);
+- `Gate`'s secret lifecycle, extracted to `SecretLife` (C5);
+- `wg-core`'s nonce derivation pattern for the CookieReply;
+- `rosenpass_core::crypto::ct_eq`;
+- `run.py`'s `Sniffer`, `wait_absent`, `cookie_totals` and `exported`.
+
+**CI parity:** there is no CI config. `make check` is the single gate, run
+once at the end (memory: risk-tiered-review).
