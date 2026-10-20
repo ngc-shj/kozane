@@ -182,7 +182,7 @@ impl<const MAX_PEERS: usize> Data<MAX_PEERS> {
         let Some(p) = self.peers.get_mut(usize::from(msg.peer)) else {
             return InstallOutcome::PeerOutOfRange;
         };
-        let keys = SessionKeys { send: Key32::from_bytes(*msg.send), recv: Key32::from_bytes(*msg.recv) };
+        let keys = SessionKeys { send: Key32::copy_from(msg.send), recv: Key32::copy_from(msg.recv) };
         p.next = Some(Session::new(keys, msg.local_index, msg.remote_index, now_ns));
         InstallOutcome::Installed
     }

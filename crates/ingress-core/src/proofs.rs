@@ -489,12 +489,15 @@ fn rp_refusals_before_admission_spend_nothing() {
         assert!(gate == before);
     }
     kani::cover!(o == RpOutcome::BadMac);
+    kani::cover!(o == RpOutcome::TypeDropped);
     kani::cover!(o == RpOutcome::RingReserved);
 }
 
 /// A forward went through its type's constructor: it spent exactly one
-/// token of its type's global meter, touched no meter of the other type,
-/// and was counted once as in flight under its type.
+/// token of its type's global meter, went through its type's per-source
+/// table (a spend, or a new slot that is then spent, changes it), touched
+/// no meter of the other type, and was counted once as in flight under its
+/// type.
 #[kani::proof]
 #[kani::unwind(20)]
 fn rp_forward_spends_its_own_meters_once() {
@@ -508,12 +511,14 @@ fn rp_forward_spends_its_own_meters_once() {
     match o {
         RpOutcome::ForwardHello { .. } => {
             assert!(spec_level(&gate.hello_global, now) + RP_HELLO_GLOBAL_INTERVAL_NS == spec_level(&before.hello_global, now));
+            assert!(gate.hello_src != before.hello_src);
             assert!(gate.conf_global == before.conf_global && gate.conf_src == before.conf_src);
             assert!(gate.in_flight.count(RpKind::Hello) == before.in_flight.count(RpKind::Hello) + 1);
             assert!(gate.in_flight.count(RpKind::Conf) == before.in_flight.count(RpKind::Conf));
         }
         RpOutcome::ForwardConf { .. } => {
             assert!(spec_level(&gate.conf_global, now) + RP_CONF_GLOBAL_INTERVAL_NS == spec_level(&before.conf_global, now));
+            assert!(gate.conf_src != before.conf_src);
             assert!(gate.hello_global == before.hello_global && gate.hello_src == before.hello_src);
             assert!(gate.in_flight.count(RpKind::Conf) == before.in_flight.count(RpKind::Conf) + 1);
             assert!(gate.in_flight.count(RpKind::Hello) == before.in_flight.count(RpKind::Hello));

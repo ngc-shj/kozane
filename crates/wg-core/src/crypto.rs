@@ -30,6 +30,14 @@ impl Key32 {
         Self(bytes)
     }
 
+    /// Copies `bytes` straight into the key, so no by-value temporary of
+    /// the secret is left on the stack.
+    pub fn copy_from(bytes: &[u8; KEY_LEN]) -> Self {
+        let mut k = Self::zero();
+        k.0.copy_from_slice(bytes);
+        k
+    }
+
     pub fn as_bytes(&self) -> &[u8; KEY_LEN] {
         &self.0
     }

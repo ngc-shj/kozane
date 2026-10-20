@@ -17,7 +17,7 @@ Rules:
      @/+, and on inline `target: ; -cmd` recipes), no `|| true`, `|| :`,
      `|| exit 0`, `; true`, `set +e`
   P6 policy/waivers.toml parses (tools/waivers.py), and while Cargo.lock
-     locks classic-mceliece-rust 2.0.2 it lists SC23 with status "open"
+     locks classic-mceliece-rust (any version) it lists SC23 with status "open"
      (M3 plan, Packaging)
   P7 no `(?i)psk_?mix` in crates/ (*.rs, Cargo.toml): the static PSK path
      is removed (M3 plan L8, F21)
@@ -26,6 +26,9 @@ Rules:
   P9 no derive(Clone|Copy|Debug) on a type wrapping `Secret<` or
      `Zeroizing<` in rosenpass-core, pqkey-core, pds/pq or pds/pqkey (L12,
      M3 plan S12; pqkey-core holds its secrets in `Zeroizing`)
+  P10 no `from_bytes(*` in the secret crates or in hs-core, key-core,
+     data-core and wg-core: a dereferenced array is a by-value temporary of
+     the secret left on the stack; `copy_from(&..)` copies in place (L12)
 
 Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
 fail until they are removed from PENDING; --enforce-pending makes them fail
@@ -42,10 +45,12 @@ check-propagation case, which runs the real `make check` once per gate with
 that gate made to fail.
 
 P6 is a fail-closed binding check (Cargo.lock against policy/waivers.toml).
-P7-P9 are best-effort tripwires over source text. Known bypasses: a
+P7-P10 are best-effort tripwires over source text. Known bypasses: a
 hand-written `impl Debug`/`impl Clone` or a macro-generated derive (P9), a
 `use ... as` alias or a renamed dependency key (`package = "getrandom"`)
-(P8), and spellings outside the pattern (P7). The adjudicating control for
+(P8), spellings outside the pattern (P7), and any by-value copy not
+spelled `from_bytes(*` (P10; safe Rust cannot observe stack residue, so
+nothing adjudicates it). The adjudicating control for
 L12 is the compiler: `Secret<N>` is not Clone/Copy/Debug, so a derive on a
 type wrapping it does not build; `Zeroizing<[u8; N]>` is Clone, so P9 is
 the only guard for pqkey-core's wrappers. L8's adjudicating control is
@@ -62,7 +67,9 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
-RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9"]
+RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10"]
+# Crates whose secrets must not be copied by value (P10).
+COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core"]
 PENDING: set[str] = set()
 # Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
 SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey"]
@@ -180,15 +187,12 @@ def check_waivers(root: pathlib.Path, out: list):
         out.append(f"P6 policy/waivers.toml: {e}")
         return
     try:
-        lock = tomllib.loads((root / "Cargo.lock").read_text())
-    except (OSError, tomllib.TOMLDecodeError) as e:
+        required = waivers.required_open((root / "Cargo.lock").read_text())
+    except (OSError, waivers.WaiverError) as e:
         out.append(f"P6 Cargo.lock: cannot read: {e}")
         return
-    cmr = any(p.get("name") == "classic-mceliece-rust" and p.get("version") == "2.0.2" for p in lock.get("package", []))
-    sc23 = [w for w in listed if w.id == "SC23"]
-    if cmr and not (sc23 and sc23[0].status == "open"):
-        out.append("P6 Cargo.lock locks classic-mceliece-rust 2.0.2 but policy/waivers.toml "
-                   "does not list SC23 as open")
+    for wid in waivers.unmet(required, listed):
+        out.append(f"P6 Cargo.lock requires waiver {wid} to be open, but policy/waivers.toml does not list it as open")
 
 
 def crate_sources(root: pathlib.Path, rel: str):
@@ -231,6 +235,17 @@ def item_after(text: str, pos: int) -> str:
     return text[m.start():]
 
 
+def check_secret_copies(root: pathlib.Path, out: list):
+    for crate in SECRET_CRATES + COPY_CRATES:
+        for rel, text in crate_sources(root, crate):
+            if not rel.endswith(".rs"):
+                continue
+            code = re.sub(r"//[^\n]*", "", text)
+            for m in re.finditer(r"\bfrom_bytes\(\s*\*", code):
+                n = code.count("\n", 0, m.start()) + 1
+                out.append(f"P10 {rel}:{n}: from_bytes(*..) copies a secret by value; use copy_from(&..)")
+
+
 def check_secret_derives(root: pathlib.Path, out: list):
     for crate in SECRET_CRATES:
         for rel, text in crate_sources(root, crate):
@@ -265,6 +280,7 @@ def main() -> int:
     check_waivers(root, out)
     check_forbidden(root, out)
     check_secret_derives(root, out)
+    check_secret_copies(root, out)
     failing = [l for l in out if l.split()[0] not in pending]
     for line in out:
         print(line if line in failing else f"pending {line}")

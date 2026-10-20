@@ -31,7 +31,7 @@ def copy_tree(dst: pathlib.Path):
     for f in FILES:
         (dst / f).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / f, dst / f)
-    # Sources only: P7-P9 read *.rs and Cargo.toml, P3 reads Cargo.toml.
+    # Sources only: P7-P10 read *.rs and Cargo.toml, P3 reads Cargo.toml.
     for src in (ROOT / "crates").rglob("*"):
         rel = src.relative_to(ROOT)
         if src.is_file() and (src.suffix == ".rs" or src.name == "Cargo.toml") and "target" not in rel.parts:
@@ -143,14 +143,14 @@ CASES = [
     ("P5 ignore prefix", {"P5"},
      lambda t: edit(t / "Makefile", "\trm -rf $(BUILD)", "\t-rm -rf $(BUILD)")),
     ("P5 .IGNORE", {"P5"}, lambda t: edit(t / "Makefile", "clean:\n", ".IGNORE:\nclean:\n")),
-    # P6: SC23 bound to cmr 2.0.2 in Cargo.lock; waivers.toml must parse.
-    ("allow cmr 2.0.2 locked and SC23 open", set(), lambda t: edit(t / "policy/waivers.toml", SC23, SC23)),
-    ("P6 cmr 2.0.2 locked and SC23 absent", {"P6"}, lambda t: edit(t / "policy/waivers.toml", SC23, "")),
-    ("P6 cmr 2.0.2 locked and SC23 closed", {"P6"},
+    # P6: SC23 bound to cmr (any version) in Cargo.lock; waivers.toml must parse.
+    ("allow cmr locked and SC23 open", set(), lambda t: edit(t / "policy/waivers.toml", SC23, SC23)),
+    ("P6 cmr locked and SC23 absent", {"P6"}, lambda t: edit(t / "policy/waivers.toml", SC23, "")),
+    ("P6 cmr locked and SC23 closed", {"P6"},
      lambda t: edit(t / "policy/waivers.toml", SC23, SC23.replace('"open"', '"closed"'))),
-    ("allow neither cmr 2.0.2 nor SC23", set(),
+    ("allow neither cmr nor SC23", set(),
      lambda t: (drop_cmr(t), edit(t / "policy/waivers.toml", SC23, ""))),
-    ("allow cmr at another version and SC23 absent", set(),
+    ("P6 cmr at another version and SC23 absent", {"P6"},
      lambda t: (edit(t / "Cargo.lock", 'name = "classic-mceliece-rust"\nversion = "2.0.2"',
                      'name = "classic-mceliece-rust"\nversion = "2.0.3"'),
                 edit(t / "policy/waivers.toml", SC23, ""))),
@@ -194,6 +194,15 @@ CASES = [
                       "\n#[derive(Clone)]\npub struct Seed(zeroize::Zeroizing<[u8; 32]>);\n")),
     ("P9 derive(Debug) on a Secret wrapper in pds/pqkey", {"P9"},
      lambda t: write(t / "crates/pds/pqkey/src/main.rs", SECRET + "#[derive(Debug)]\nstruct Shk(Secret<32>);\n")),
+    # P10: by-value secret copies.
+    ("P10 from_bytes(*..) in hs-core", {"P10"},
+     lambda t: append(t / "crates/hs-core/src/lib.rs", "\nfn f(k: &[u8; 32]) -> Key32 { Key32::from_bytes(*k) }\n")),
+    ("P10 from_bytes( *..) in rosenpass-core", {"P10"},
+     lambda t: append(t / "crates/rosenpass-core/src/lib.rs", "\nfn f(k: &[u8; 32]) -> Secret<32> { Secret::from_bytes( *k) }\n")),
+    ("allow from_bytes on an owned array", set(),
+     lambda t: append(t / "crates/hs-core/src/lib.rs", "\nfn f() -> Key32 { Key32::from_bytes([0; 32]) }\n")),
+    ("allow from_bytes(*..) outside the secret crates", set(),
+     lambda t: append(t / "crates/wire/src/lib.rs", "\nfn f(k: &[u8; 4]) -> u32 { u32::from_le_bytes(*k) }\nfn g(k: &[u8; 4]) -> X { X::from_bytes(*k) }\n")),
     ("P9 derive(Debug) on Secret itself", {"P9"},
      lambda t: append(t / "crates/rosenpass-core/src/lib.rs", "\n#[derive(Debug)]\npub struct Secret<const N: usize>([u8; N]);\n")),
     ("allow derive(Clone) on a type without a Secret", set(),

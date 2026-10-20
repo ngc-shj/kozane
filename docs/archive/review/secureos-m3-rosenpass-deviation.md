@@ -528,3 +528,110 @@ Implementation decisions not spelled out by plan rev 7, or departing from it.
     refuses to send the replay outside the source interval.
 - **`make check`:** exit 0 (604 s) on the commit that records this entry.
   UNIT-TESTS 646, INTEGRATION-CASES 22, CHECK-PINS-FIXTURES 65.
+
+## C8 McEliece assurance spike
+
+Scope: this section covers only the constant-time review and the dudect smoke test for SC3. It does not cover KATs, liboqs interop, MCE-COST or the stack measurement. The object under review is `classic-mceliece-rust =2.0.2` (cmr), features `mceliece460896` and `zeroize`, round 3, as `crates/pqkey-core/src/lib.rs::decapsulate` calls it. That call is `cmr::decapsulate` → `operations::crypto_kem_dec` → `decrypt::decrypt`.
+
+### 1. Constant-time review
+
+The review was done at two levels:
+
+- **Source:** cmr 2.0.2 from the container's cargo registry. Line numbers below refer to it.
+- **Machine code:** two binaries were disassembled with objdump.
+  - The **real PD binary** `build/pd-pqkey.elf`. It was built 2026-10-20 04:25 at release profile: opt-level `"s"`, overflow-checks, target `aarch64-unknown-none`, `+v8a,+strict-align,+neon`. Its cmr code is the same as at HEAD, because the cmr pin did not change.
+  - A **host opt-level 3 build** of the same crate. This is the binary the dudect run timed.
+
+Secrets in play: the Goppa polynomial `g` and the support `L`, both derived from `sk`; the error vector `e`; the syndrome; and the BM state.
+
+| Step | Source (cmr 2.0.2) | Secret-dep. branch (source) | Secret-dep. index | Variable-time ops | Compiled code (PD ELF / O3 host) |
+|---|---|---|---|---|---|
+| decaps wrapper | `lib.rs:420` → `operations.rs:120-161` (the non-6960119 variant) | no | no | no | thin wrapper |
+| load `g` | `decrypt.rs:40-43`, `util.rs:13` | no | no | no | loop on a constant |
+| support gen (Beneš) | `benes.rs:347-377`, `apply_benes` `:256-345`, `layer_in` `:47-72`, `layer_ex` `:91-132`, `transpose.rs:5-30` | no; `if rev`/`if s == 64` are public | no; the condition bits are applied as AND masks | no | branches only on loop counters, bounds and alias checks; no secret `csel` |
+| syndrome | `synd.rs:9-27`; `eval` at `root.rs:10-18`; `gf_inv`/`gf_frac` at `gf.rs:251`, `:208-221` | no | no; `r[i/8]` and `l[i]` use public `i` | `gf_mul` (`gf.rs:49-68`) multiplies by `t1 & (1<<i)` | `gf_mul` becomes `tst`+`csel` plus `umull`/NEON `mul`, with no branch. `gf_frac` has no branches; its loops are fixed-count. No `udiv`/`sdiv` anywhere on the path |
+| Berlekamp-Massey | `bm.rs:17-73` | no in source: `mne`/`mle` are masks (`:36-45`) and the selects are masked (`:52`, `:55`, `:58`, `:61`) | no in source | no | **finding F1 below** |
+| root finding | `root.rs:22-26` | no | no | as `gf_mul` | loop counters only |
+| error vector and weight | `decrypt.rs:55-60`, `gf_iszero` `gf.rs:7-11` | no | no; the `e[i/8]` index is public | no | branch-free. The overflow check on `w += t` (`b.vs`) is never taken because `w ≤ 4608` |
+| re-encode check (`s` vs `s_cmp`, `w == t`) | `decrypt.rs:62-74` | no; OR-accumulate then `(x-1)>>15` | no | no early exit | branch-free OR reduction |
+| confirm hash and implicit rejection | `operations.rs:137-158`: `ret_confirm` is OR-accumulated (`:140-142`), `m = ((ret_decrypt\|ret_confirm)-1)>>8` (`:144-146`), the select is masked (`:153`) | no | no | no early-exit compare | **branch-free in both binaries.** O3 uses an OR reduction, `neg`/`and`/`sub` for the mask and `bif`/`bsl` for the select. The PD ELF loops only on counters (`0x210294`, `0x2102fc`) and has no `csel` |
+| SHAKE256 | `crypto_hash.rs:8` (`sha3 0.10.9`, `keccak 0.1.6`) | — | — | — | not reviewed |
+
+**F1: the compiler undoes the BM masked select. Secret-dependent machine code.** The source writes `b[i] = (b[i] & !mle) | (t[i] & mle)` at `bm.rs:57-59`. Here `mle` depends on the discrepancy `d` and on `L`, so on the syndrome and therefore on `e` and the key. LLVM proves `mle ∈ {0, 0xFFFF}` and turns the masked select into control flow or an address select:
+
+- **The PD ELF** (`classic_mceliece_rust::bm::bm`, `0x210484`-`0x210490`) does `tst w20,#1; csel x10, &t[i], &b[i], ne; ldrh w10,[x10]`. Each of the 97 loads per iteration takes its address from `t[]` or `b[]` depending on the secret bit. That is **secret-dependent memory indexing**. Both arrays are small and on the stack.
+- **The host O3 build** turns the same lines into a **secret-dependent conditional branch** (`ands w9,w9,w21; tbz w9,#0` at `bm.rs:52-58`). It skips or executes the `b = t` copy, so the branch is taken or not once for each of the 192 iterations.
+- Also present: the overflow check at `bm.rs:55` (`n+1-l`, `b.cc` to `panic_const_sub_overflow` at PD `0x21045c`) compares a secret `l` against public `n`. It is never taken, because `l ≤ n` holds at iteration `n`. I rate it benign, but it is a secret-dependent compare that the source does not show.
+
+What leaks: a per-iteration trace of the BM length-change decisions. That trace is a function of the syndrome sequence. Published timing attacks on McEliece decoders recover `e` or key information from this kind of BM/Patterson control-flow trace. That statement is **from memory**, for example Strenzke et al. (2008) and follow-ups, and was not re-checked here. The magnitude is small: tens of cycles per decapsulation in the O3 variant, against about 27 ms. In the PD variant, both arrays are L1-resident. Exploiting it over RespHello latency would be hard. Still, this is a constant-time violation in the shipped binary, and it shows that cmr's constant-time property depends on the compiler and the flags.
+
+**Comparison with PQClean round-3 mceliece460896** (from memory; I did not open the files and give no line numbers). cmr is a near line-for-line port of the reference/"clean" code: `decrypt.c`, `synd.c`, `root.c`, `bm.c`, `benes.c`, `gf.c`, `operations.c`. "clean" `bm.c` uses the same `B[i] = (B[i] & ~mle) | (T[i] & mle)` idiom, so a C compiler is equally free to booleanize it. "vec" bitslices the field arithmetic: an additive FFT replaces `eval`/`synd`, and BM runs on 64-bit bitsliced words with masks. That makes this specific rewrite less likely but does not guarantee anything. **Porting PQClean without value barriers would not by itself fix F1.**
+
+Not checked:
+
+- whether seL4/Microkit sets `PSTATE.DIT`;
+- whether `umull`/`mul` timing is data-independent on the eventual hardware core (it is on mainstream Cortex-A, from memory);
+- the keccak binary.
+
+### 2. dudect-style smoke test (manual, not in `make check`)
+
+Setup:
+
+- **Source:** a throwaway program, kept in the scratchpad as `c8-dudect/` and not in the repo. It is its own Cargo workspace using the repo's `Cargo.lock`. Dependencies: cmr `=2.0.2` with `mceliece460896`/`zeroize`, and `rand_core =0.6.4`.
+- **Build:** offline, in `/work/build/c8-dudect`, which has since been deleted.
+- **Method:**
+  - One fresh keypair.
+  - All inputs are generated before timing.
+  - Classes are interleaved by a random coin.
+  - Each `cmr::decapsulate` is timed with `isb; mrs cntvct_el0; isb`. `cntfrq` is 1 GHz, so the resolution is 1 ns.
+  - The tests: uncropped Welch t, dudect percentile crops `p = 1 − 0.5^(10(i+1)/100)` for i ∈ {0,4,9,19,29,49,69,99}, and a second-order test (centred-squared, uncropped).
+- **Commands** (inside `secureos-dev`):
+  ```
+  cargo build --release --offline        # profile.release: opt-level 3, debug=1
+  taskset -c 9 ./target/release/c8-dudect 30000 rand    # A vs B
+  taskset -c 7 ./target/release/c8-dudect 30000 valid   # A vs C
+  taskset -c 5 ./target/release/c8-dudect 20000 null    # A vs A (null control)
+  ```
+  The three runs were concurrent, each pinned to its own core. Random interleaving keeps cross-run interference independent of the class.
+- **Host CPU:** NVIDIA GB10-class SoC, Arm Cortex-X925 ×10 (3.9 GHz) + Cortex-A725 ×10, governor `performance`. All runs were pinned to X925 cores. **This is not the target.** The target is aarch64 under QEMU TCG today and unspecified hardware later. The timed binary is the host **opt-level 3** build (the one with the F1 branch), not the PD's opt-level `"s"` build.
+- **Decision rule (dudect convention):** max |t| > 4.5 over first-order crops ⇒ evidence of leakage. |t| < 4.5 ⇒ "no leakage detected at this N". It never means "constant-time".
+
+| Test | N (class0 / class1) | median decaps | sd (ns) | uncropped \|t\| | per-crop \|t\| (i=0,4,9,19,29,49,69,99) | 2nd-order \|t\| | max \|t\| | detectable Δ at \|t\|=4.5 |
+|---|---|---|---|---|---|---|---|---|
+| A fixed-valid vs B random-ct (implicit rejection) | 15118 / 14882 | 27.31 ms | 38462 / 42689 | 0.144 | 1.145, 0.032, 0.451, 0.171, 0.258, 0.222, 0.548, 0.864 | 0.673 | 1.145 | ≈ 2.1 µs (≈ 8000 cycles) |
+| A fixed-valid vs C random-valid | 14930 / 15070 | 27.29 ms | 8462 / 8375 | 0.002 | 2.144, 0.995, 0.828, 0.249, 0.281, 0.593, 0.187, 0.331 | 1.069 | 2.144 | ≈ 0.44 µs (≈ 1700 cycles) |
+| Null control (A vs A) | 9993 / 10007 | 27.29 ms | 11269 / 11412 | 0.939 | 0.692, 0.208, 0.207, 0.393, 0.553, 1.019, 0.954, 0.749 | 0.827 | 1.019 | ≈ 0.72 µs |
+
+Result: **no leakage detected at N ≈ 1.5·10⁴ per class** on this host. This does not contradict F1. The F1 branch is expected to move the timing by tens of cycles, about two orders of magnitude below the effect this N can resolve against a 27 ms operation with about 8-40 µs jitter. Reaching F1's scale (about 10 ns) would take roughly 10⁷-10⁸ samples per class, because the detectable Δ shrinks only as 1/√N. At 27 ms each, that is weeks to years of CPU time. The PD binary and the QEMU TCG target were **not timed**: no QEMU run was allowed, and the PD ELF does not run on the host.
+
+### 3. Recommendation
+
+**Decision rule.** Accept for dev images if two things hold: the compiled implicit-rejection path is branch-free, and every remaining finding is low-magnitude, not observable remotely at the bounded `PQ_DECAPS` rate, and covered by the dev-only gate. Replace (SC23) if any secret-dependent branch or memory address exists in the binary we ship for production.
+
+**Recommendation: accept for dev images; SC23 stays open; replace in M4.**
+
+- Implicit rejection is branch-free in both binaries. No early-exit compare, no division, no secret-indexed table.
+- F1 is a secret-dependent load address in the actual PD ELF, and a secret-dependent branch at O3. The source cannot be called constant-time across compilers.
+- That meets the "replace" condition for production. It is acceptable for dev images because of what the waiver gate already enforces: `tools/package` refuses non-debug kernels while `policy/waivers.toml` lists SC23 `open`, and check-pins and `tools/package` require SC23 to stay `open` while `Cargo.lock` locks any `classic-mceliece-rust`.
+
+**What SC23 (M4) must deliver**, with the axis that decides between the options. A plain PQClean round-3 port or another unaudited crate would carry F1 forward, because the masked-select idiom is the same. Neither option is sufficient without a binary-level check. M4 should take a round-3-compatible implementation, port it or patch cmr, and add:
+
+- (a) optimization barriers on every mask select: `core::hint::black_box`/`subtle`-style, or an inline-asm select;
+- (b) a ctgrind/valgrind-memcheck style host test with `sk` marked secret. **Not run in this spike** because no harness exists yet;
+- (c) a pinned disassembly check of the PD ELF's `bm`/`decrypt` that rejects secret-fed `csel` addresses or conditional branches.
+
+Prefer a bitsliced ("vec"-style) port. Its BM and FFT operate on whole-word masks, which compilers are less prone to booleanize.
+
+Documented residual (per C8): this result is a residual, not a gate.
+
+## Phase 3 Round 1 fixes
+
+The full record is in the code review's Resolution Status. Deviations from the plan introduced there:
+- **pq `PASS_MSGS`:** 4 → 1. Every answer and audit record leaves after its own message.
+- **`Hedged`:** moved from pds/pq into rosenpass-core behind `HedgeHw`.
+- **New check-pins rule P10:** a tripwire for `from_bytes(*`. CHECK-PINS-RULES 9 → 10.
+- **SC23 binding:** now any `classic-mceliece-rust` version. It is also enforced by `tools/package`'s `check_bindings`.
+- **Accepted, with the full Anti-Deferral format in the code review:**
+  - F3: the per-source meter keyed by IP (M3b);
+  - T4: wireguard-go's own use of a rotated PSK.
+- **Reboot red-proof:** none. The PSK table lives in PD RAM, and no code path persists it.

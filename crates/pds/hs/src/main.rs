@@ -151,9 +151,14 @@ impl Hs {
     /// Installs every `PskInstall` queued by `pq`. Each is copied out of the
     /// link (which hands the buffer back), then the copy is zeroed; returns
     /// whether any was taken, so `pq` can reclaim and scrub its buffers.
+    /// At most one link's worth of messages per wakeup: everything `pq` had
+    /// queued when hs woke, but not what a compromised `pq` refills while
+    /// hs runs out of budget, so `poll` below is always reached. The rest
+    /// waits for the next wakeup (pq's notify or the 1 Hz tick).
     fn drain_pq(&mut self) -> bool {
         let mut consumed = false;
-        while let Some(n) = pdkit::recv(&mut self.from_pq, &mut self.psk_input, &mut self.audit) {
+        for _ in 0..layout::NET_BUFFERS {
+            let Some(n) = pdkit::recv(&mut self.from_pq, &mut self.psk_input, &mut self.audit) else { break };
             consumed = true;
             let r = self.psks.install_message(self.psk_input.get(..n).unwrap_or(&[]), cpu::now_ns());
             self.psk_input.fill(0);

@@ -184,3 +184,26 @@ mod pq_blob {
 }
 
 extern crate std;
+
+/// tools/package re-implements both layouts in Python; it is checked here
+/// so either side drifting fails `unit`, not only a packaged boot.
+#[test]
+fn tools_package_mirrors_both_blob_layouts() {
+    let package = include_str!("../../../tools/package");
+    let ascii = |m: &[u8; 8]| std::string::String::from_utf8(m.to_vec()).unwrap();
+    let key = std::format!(
+        "KEY = BlobKind(\"secrets\", b\"{}\", {}, {}, _key_body)",
+        ascii(&crate::MAGIC),
+        crate::VERSION,
+        crate::REGION_SIZE
+    );
+    let pq = std::format!(
+        "PQ = BlobKind(\"pq_secrets\", b\"{}\", {}, {}, lambda _blob: {})",
+        ascii(&crate::pq::MAGIC),
+        crate::pq::VERSION,
+        crate::pq::REGION_SIZE,
+        crate::pq::CHECKSUM_OFFSET
+    );
+    assert!(package.contains(&key), "tools/package does not declare: {key}");
+    assert!(package.contains(&pq), "tools/package does not declare: {pq}");
+}

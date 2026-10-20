@@ -338,3 +338,46 @@ fn mceliece460896_encapsulation_matches_the_liboqs_kat() {
 fn mceliece460896_encapsulation_fails_closed_without_randomness() {
     assert!(matches!(McEliece460896.encaps(SPKT, &mut FailRng), Err(EncapsError::Rng)));
 }
+
+struct FakeHedgeHw {
+    rndr: Option<u64>,
+}
+
+impl crate::HedgeHw for FakeHedgeHw {
+    fn rndr(&mut self) -> Option<u64> {
+        self.rndr
+    }
+
+    fn counter(&mut self) -> u64 {
+        0
+    }
+}
+
+#[test]
+fn hedged_fails_the_draw_without_rndr() {
+    let mut h = crate::Hedged::new(Secret::from_bytes([1; 32]), FakeHedgeHw { rndr: None });
+    assert_eq!(h.fill(&mut [0u8; 40]), Err(RngError));
+}
+
+#[test]
+fn hedged_blocks_differ_with_identical_hardware_inputs() {
+    // Same RNDR and counter every time: only the draw counter separates
+    // the blocks, so they must still differ (and be nonzero).
+    let mut h = crate::Hedged::new(Secret::from_bytes([1; 32]), FakeHedgeHw { rndr: Some(7) });
+    let (mut a, mut b) = ([0u8; 64], [0u8; 64]);
+    h.fill(&mut a).unwrap();
+    h.fill(&mut b).unwrap();
+    assert_ne!(a[..32], a[32..], "two blocks of one draw");
+    assert_ne!(a, b, "two draws");
+    assert_ne!(a, [0u8; 64]);
+}
+
+#[test]
+fn hedged_output_depends_on_the_boot_seed() {
+    let mut x = crate::Hedged::new(Secret::from_bytes([1; 32]), FakeHedgeHw { rndr: Some(7) });
+    let mut y = crate::Hedged::new(Secret::from_bytes([2; 32]), FakeHedgeHw { rndr: Some(7) });
+    let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
+    x.fill(&mut a).unwrap();
+    y.fill(&mut b).unwrap();
+    assert_ne!(a, b);
+}

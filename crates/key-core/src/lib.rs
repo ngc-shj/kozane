@@ -100,7 +100,7 @@ pub fn validate<'a, 'p>(
     peers: impl ExactSizeIterator<Item = &'p [u8; 32]>,
 ) -> Result<Blob<'a>, BootError> {
     let blob = Blob::parse(region, peers.len()).map_err(BootError::Blob)?;
-    let private = Key32::from_bytes(*blob.gateway_private());
+    let private = Key32::copy_from(blob.gateway_private());
     if !crypto::ct_eq(&crypto::public_key(&private), gateway_public) {
         return Err(BootError::GatewayKeyMismatch);
     }
@@ -226,7 +226,7 @@ impl<'a> Oracle<'a> {
 
     fn static_dh(&self, req: &[u64], reply: &mut [u64]) -> Result<usize, u64> {
         let point: [u8; 32] = words_to_bytes(req).ok_or(ERR_BAD_REQUEST)?;
-        let private = Key32::from_bytes(*self.blob.gateway_private());
+        let private = Key32::copy_from(self.blob.gateway_private());
         let shared = crypto::dh(&private, &point).map_err(|e| match e {
             crypto::CryptoError::ZeroDh => ERR_ZERO_DH,
             _ => ERR_CRYPTO,

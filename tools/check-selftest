@@ -63,7 +63,7 @@ KANI_HARNESS = (
 CASES_FOR_GATE = {
     "clean-counts": {"stale-counts", "check-propagation"},
     # pins runs the package checker fixtures; package-release drives the real target.
-    "pins": {"pins", "package-release", "package-waiver"},
+    "pins": {"pins", "package-release", "package-waiver", "package-waiver-removed"},
     "lint": {"lint"},
     "unit": {"unit", "c5-forward-burst", "c5-backlog", "c5-interval", "c5-key-calls",
              "arrival-interval-order", "arrival-burst-order", "late-notify", "unbounded-drain",
@@ -74,7 +74,8 @@ CASES_FOR_GATE = {
     "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire"},
     "laws": {"laws", "laws-timer-ingress", "laws-pq-key", "laws-hs-pqkey", "laws-pq-secrets-writable"},
     "test": {"integration", "integration-count", "integration-residue", "integration-cookie",
-             "integration-pq-residue", "l8-fallback", "integration-rp-src-meter"},
+             "integration-pq-residue", "l8-fallback", "integration-rp-src-meter", "integration-rotation",
+             "integration-expiry"},
     "manifest": {"manifest"},
 }
 
@@ -160,6 +161,18 @@ CASES = {
                                                           "RpKind::Hello => self.hello_src.allow(ip, now_ns) && self.hello_global.allow(now_ns),",
                                                           "RpKind::Hello => self.hello_global.allow(now_ns),"),
                                  "rosenpass bucket: a replay within the source's interval was answered"),
+    # PSK rotation and expiry end to end (M3 plan C7), each broken in hs
+    # alone: a superseding install ignored, and a PSK refused 20 s early.
+    "integration-rotation": (["test"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
+                                                      "        *entry = Entry::Live { osk: Key32::copy_from(osk), installed_at: now_ns };\n",
+                                                      "        if !matches!(entry, Entry::Live { .. }) {\n"
+                                                      "            *entry = Entry::Live { osk: Key32::copy_from(osk), installed_at: now_ns };\n"
+                                                      "        }\n"),
+                             "rotation: the accepted handshake used another key than the restart's first"),
+    "integration-expiry": (["test"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
+                                                    "if now_ns.saturating_sub(*installed_at) < REJECT_AFTER_TIME_NS =>",
+                                                    "if now_ns.saturating_sub(*installed_at) < REJECT_AFTER_TIME_NS - 20_000_000_000 =>"),
+                           "expiry: a handshake 170 s after the install was not accepted"),
     # The same scan over the pq->hs link (M3 plan C7): without pq's reclaim
     # on hs's notify, the PskInstall (an OSK) stays in guest RAM.
     "integration-pq-residue": (["test"], lambda t: edit(t, "crates/pds/pq/src/main.rs",
@@ -324,7 +337,13 @@ CASES = {
                          "PQ_SECRETS=/nonexistent/pq.bin", "OUT=/nonexistent/pkg"],
                         lambda t: None, "kernel config is not debug"),
     # The open-waiver refusal is reported on its own, next to SC20 (M3
-    # plan, Packaging): dropping the waiver check loses this needle.
+    # plan, Packaging); the allow-side twin of package-waiver-removed.
+    # Removing the waiver check from tools/package must fail its fixtures
+    # (run by `pins`) at the case that stubs SC20 out.
+    "package-waiver-removed": (["pins"], lambda t: edit(t, "tools/package",
+                                                        "check_waivers(gen_config, WAIVERS) + check_bindings",
+                                                        "check_bindings"),
+                               "FAIL SC20 stubbed: an open waiver refuses and names itself"),
     "package-waiver": (["package", "MICROKIT_CONFIG=release", "SECRETS=/nonexistent/s.bin",
                         "PQ_SECRETS=/nonexistent/pq.bin", "OUT=/nonexistent/pkg"],
                        lambda t: None, "waiver SC23 (owner M4) is open"),

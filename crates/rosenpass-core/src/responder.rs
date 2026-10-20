@@ -434,7 +434,7 @@ impl<'k, const P: usize> Responder<'k, P> {
         let mut no16 = [0u8; 16];
         no16.get_mut(..BISCUIT_NO_LEN).ok_or(Error::Internal)?.copy_from_slice(no);
         let biscuit_no = u128::from_le_bytes(no16);
-        let mut c = Chain::from_ck(Secret::from_bytes(*ck), &self.d);
+        let mut c = Chain::from_ck(Secret::copy_from(ck), &self.d);
         drop(pt);
         c.mix(&ic.biscuit_ct)?;
         trace("ck.icr1", c.ck().expose());

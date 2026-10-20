@@ -43,6 +43,7 @@ import waivers  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WAIVERS = ROOT / "policy" / "waivers.toml"
+LOCK = ROOT / "Cargo.lock"
 DEBUG_LINE = "#define CONFIG_DEBUG_BUILD  1"
 
 
@@ -96,6 +97,23 @@ def check_waivers(gen_config: str, path: pathlib.Path) -> list:
         return []
     return [f"package: waiver {w.id} (owner {w.owner}) is open; non-debug kernels are refused until it closes"
             for w in waivers.open_waivers(listed)]
+
+
+def check_bindings(lock: pathlib.Path, path: pathlib.Path) -> list:
+    """The waivers Cargo.lock obliges to stay open (waivers.required_open)
+    must be open, for every kernel: check-pins (P6) holds the same rule, but
+    `make package` does not run it. An unreadable lock refuses; an unusable
+    waiver file is check_waivers' refusal, not repeated here."""
+    try:
+        listed = waivers.load(path)
+    except waivers.WaiverError:
+        return []
+    try:
+        required = waivers.required_open(lock.read_text())
+    except (OSError, UnicodeDecodeError, waivers.WaiverError) as e:
+        return [f"package: Cargo.lock unusable, refusing: {e}"]
+    return [f"package: Cargo.lock requires waiver {wid} to be open, but policy/waivers.toml does not list it as open"
+            for wid in waivers.unmet(required, listed)]
 
 
 def check_blob(kind: BlobKind, blob: bytes) -> list:
@@ -272,7 +290,7 @@ def main() -> int:
     out = pathlib.Path(a.out)
     # Both run, so either refusal stays reachable with the other removed.
     gen_config = pathlib.Path(a.gen_config).read_text()
-    errors = require_debug(gen_config) + check_waivers(gen_config, WAIVERS)
+    errors = require_debug(gen_config) + check_waivers(gen_config, WAIVERS) + check_bindings(LOCK, WAIVERS)
     if errors:
         print("\n".join(errors))
         return 1

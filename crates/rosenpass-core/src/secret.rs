@@ -17,6 +17,14 @@ impl<const N: usize> Secret<N> {
         Self([0; N])
     }
 
+    /// Copies `bytes` straight into the container, so no by-value
+    /// temporary of the secret is left on the stack.
+    pub fn copy_from(bytes: &[u8; N]) -> Self {
+        let mut s = Self::zero();
+        s.0.copy_from_slice(bytes);
+        s
+    }
+
     pub fn expose(&self) -> &[u8; N] {
         &self.0
     }

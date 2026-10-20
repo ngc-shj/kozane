@@ -79,9 +79,20 @@ impl Audit {
     }
 
     pub fn record(&mut self, ev: Event) {
+        self.record_delivered(ev);
+    }
+
+    /// `record`, reporting whether a record reached the ring (false when it
+    /// was coalesced away or the ring was full).
+    pub fn record_delivered(&mut self, ev: Event) -> bool {
         let ring = &mut self.ring;
+        let mut delivered = false;
         // Notify on every offer, including a full ring (see Coalescer::record).
-        self.pending |= self.coalescer.record(ev, |r| ring.push(r).is_ok());
+        self.pending |= self.coalescer.record(ev, |r| {
+            delivered = ring.push(r).is_ok();
+            delivered
+        });
+        delivered
     }
 
     pub fn link_error(&mut self, e: LinkError) {

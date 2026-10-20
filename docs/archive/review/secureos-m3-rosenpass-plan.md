@@ -654,8 +654,9 @@ red-proved [T15, R2-T-N11].
 | SC23 | Replacing cmr 2.0.2 (PQClean round-3 port or an audited crate), and lifting the L2 waiver | M4 |
 | SC24 | Protocol V03 | M4 |
 | SC25 | Per-peer Rosenpass pre-shared keys | unscheduled |
-| SC26 | Rosenpass cookie gate under load, its flood and latency cases, an attribution sniffer for the client, and the guest-RAM OSK residue scan | M3b |
-| SC16, SC3 | Closed (SC3 by the spike) | M3a |
+| SC26 | Rosenpass cookie gate under load, its flood and latency cases, an attribution sniffer for the client, and the guest-RAM OSK residue scan. No flood is needed to starve rekeys (code review S-3): one spoofed mac-valid InitHello per 20 s as a peer's source spends its per-source token, and about 0.1 pkt/s takes the global meter, so the gate must engage on Rosenpass meter refusals, not on traffic volume, and InitConf needs a reserved share of the ingress→pq link. Also the per-source meter is keyed by IP, so at most 6 peers behind one address can keep fresh PSKs (code review F3) | M3b |
+| SC16 | Closed | M3a |
+| SC3 | Spike done (deviation log, "C8 McEliece assurance spike"): implicit rejection is branch-free, but the compiler turns cmr's Berlekamp-Massey masked select into a secret-dependent load address in the PD ELF (F1). Carried by SC23 with its M4 requirements: value barriers on every masked select, a ctgrind-style test, and a pinned disassembly check | M3a (spike) / M4 |
 
 ## User operation scenarios
 
@@ -699,5 +700,5 @@ into Phase 2 by design.
 | C6 | config / mksecrets | locked |
 | C7 | integration incl. migration | locked |
 | C8 | McEliece assurance spike | locked |
-| MCE-COST | TCG cost and stack measurement (Phase 2) | pending (by design) |
-| GUARD | Microkit stack guard-page answer (Phase 2) | pending (by design) |
+| MCE-COST | TCG cost and stack measurement (Phase 2) | locked: settled in the deviation log (Batch F, MCE-COST); `make check` green on f667217 (pending by design until then) |
+| GUARD | Microkit stack guard-page answer (Phase 2) | locked: answered in the deviation log (Batch F, GUARD), enforced by laws `check_stack_guard` (pending by design until then) |

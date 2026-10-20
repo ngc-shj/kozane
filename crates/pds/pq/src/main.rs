@@ -14,8 +14,8 @@ use pdkit::{Audit, Buf, Rx, Tx};
 use pqkey_core::{LABEL_PQ_BOOT_SEED, LABEL_PQ_DECAPS, MAX_WORDS, OK, PQ_DECAPS_REQ_WORDS};
 use ring::pass::{any_full, drain, run_passes};
 use rosenpass_core::{
-    Conf, Decaps, DecapsError, Error, KEY_LEN, Kyber512, McEliece460896, Responder, Rng, RngError, SHK_LEN,
-    SPK_LEN, Secret, Seams, crypto,
+    Conf, Decaps, DecapsError, Error, HedgeHw, Hedged, KEY_LEN, Kyber512, McEliece460896, Responder, SHK_LEN,
+    SPK_LEN, Secret, Seams,
 };
 use rosenpass_wire::{INIT_CONF_LEN, INIT_HELLO_LEN, RESP_HELLO_LEN, SCT_LEN};
 use sel4_microkit::{
@@ -39,10 +39,11 @@ const _: () = assert!(PEERS <= config::MAX_PEERS);
 static SPKM: &[u8; SPK_LEN] = config::gateway_rp_public!();
 static SPKTS: [&[u8; SPK_LEN]; PEERS] = config::peer_rp_publics!();
 
-/// Messages taken from `ingress` per pass. Each InitHello costs a
-/// decapsulation and two encapsulations, so passes stay short and every
-/// pass ends by notifying the peers it answered.
-const PASS_MSGS: usize = 4;
+/// Messages taken from `ingress` per pass. One: an InitHello costs seconds
+/// of wall time at pq's budget (MCE-COST: 8.5 s median, 16.1 s max), and
+/// each pass ends by notifying its peers and flushing the audit records, so
+/// every answer, `PskInstall` and record leaves after its own message.
+const PASS_MSGS: usize = 1;
 
 /// One PPC to `pqkey`: `req` (whole words) out, exactly `reply.len()` bytes
 /// back. Returns `pqkey`'s reply label; anything but a full `OK` reply
@@ -91,31 +92,16 @@ impl Decaps for PqKey {
     }
 }
 
-/// The hedged source (hs-core's `HedgedEntropy` pattern): each 32-byte
-/// block is BLAKE2b keyed with the boot seed over a draw counter, CNTPCT
-/// and RNDR, so it stays unpredictable if either the seed or RNDR is
-/// sound, and never repeats within a boot. A failed RNDR read fails the
-/// draw.
-struct Hedged {
-    seed: Secret<KEY_LEN>,
-    draws: u64,
-}
+/// `Hedged`'s hardware: RNDR and CNTPCT.
+struct Cpu;
 
-impl Rng for Hedged {
-    fn fill(&mut self, out: &mut [u8]) -> Result<(), RngError> {
-        for chunk in out.chunks_mut(KEY_LEN) {
-            let rndr = cpu::rndr().ok_or(RngError)?;
-            self.draws = self.draws.checked_add(1).ok_or(RngError)?;
-            let mut block = Secret::<KEY_LEN>::zero();
-            crypto::blake2b(
-                self.seed.expose(),
-                &[&self.draws.to_le_bytes(), &cpu::cntpct().to_le_bytes(), &rndr.to_le_bytes()],
-                block.expose_mut(),
-            )
-            .map_err(|_| RngError)?;
-            chunk.copy_from_slice(block.expose().get(..chunk.len()).ok_or(RngError)?);
-        }
-        Ok(())
+impl HedgeHw for Cpu {
+    fn rndr(&mut self) -> Option<u64> {
+        cpu::rndr()
+    }
+
+    fn counter(&mut self) -> u64 {
+        cpu::cntpct()
     }
 }
 
@@ -169,7 +155,7 @@ struct Pq {
     to_hs: Tx,
     audit: Audit,
     responder: Responder<'static, PEERS>,
-    rng: Hedged,
+    rng: Hedged<Cpu>,
     cost: CostHighWater,
     freq: u64,
     input: Buf,
@@ -224,7 +210,7 @@ fn init() -> Pq {
     if pqkey_call(LABEL_PQ_BOOT_SEED, &[], seed.expose_mut()) != OK {
         halt("no boot seed from pqkey");
     }
-    let mut rng = Hedged { seed, draws: 0 };
+    let mut rng = Hedged::new(seed, Cpu);
     let mut responder = match Responder::new(SPKM, SPKTS, &mut rng) {
         Ok(r) => r,
         Err(Error::Rng) => halt("RNDR unavailable"),
@@ -293,9 +279,7 @@ impl Pq {
                 wake.ingress |= send_rp(to_ingress, scratch, audit, RpDatagram { peer: src, msg: resp_hello.as_slice() });
                 audit.record(Event::RpInitHello);
                 let us = cpu::ticks_to_ns(cpu::cntpct().saturating_sub(start), *freq) / 1000;
-                if let Some(ev) = cost.observe(u32::try_from(us).unwrap_or(u32::MAX)) {
-                    audit.record(ev);
-                }
+                cost.observe_with(u32::try_from(us).unwrap_or(u32::MAX), |ev| audit.record_delivered(ev));
             }
             Err(e) => audit.record(reject_event(e)),
         }

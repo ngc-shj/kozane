@@ -3,7 +3,7 @@
 
 use rosenpass_wire::{ECT_LEN, EPK_LEN, SCT_LEN};
 
-use crate::Secret;
+use crate::{KEY_LEN, Secret};
 
 /// Classic McEliece 460896 (round 3) public key.
 pub const SPK_LEN: usize = 524_160;
@@ -17,6 +17,48 @@ pub struct RngError;
 /// draw aborts the handshake that asked for it.
 pub trait Rng {
     fn fill(&mut self, out: &mut [u8]) -> Result<(), RngError>;
+}
+
+/// What `Hedged` reads from the hardware: RNDR (None when it fails) and a
+/// free-running counter.
+pub trait HedgeHw {
+    fn rndr(&mut self) -> Option<u64>;
+    fn counter(&mut self) -> u64;
+}
+
+/// The hedged source (hs-core's `HedgedEntropy` pattern): each 32-byte
+/// block is BLAKE2b keyed with the boot seed over a draw counter, the
+/// counter and RNDR, so it stays unpredictable if either the seed or RNDR
+/// is sound, and never repeats within a boot. A failed RNDR read, or a
+/// draw counter that would wrap, fails the draw.
+pub struct Hedged<H: HedgeHw> {
+    seed: Secret<KEY_LEN>,
+    draws: u64,
+    hw: H,
+}
+
+impl<H: HedgeHw> Hedged<H> {
+    pub fn new(seed: Secret<KEY_LEN>, hw: H) -> Self {
+        Self { seed, draws: 0, hw }
+    }
+}
+
+impl<H: HedgeHw> Rng for Hedged<H> {
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), RngError> {
+        for chunk in out.chunks_mut(KEY_LEN) {
+            let rndr = self.hw.rndr().ok_or(RngError)?;
+            self.draws = self.draws.checked_add(1).ok_or(RngError)?;
+            let mut block = Secret::<KEY_LEN>::zero();
+            crate::crypto::blake2b(
+                self.seed.expose(),
+                &[&self.draws.to_le_bytes(), &self.hw.counter().to_le_bytes(), &rndr.to_le_bytes()],
+                block.expose_mut(),
+            )
+            .map_err(|_| RngError)?;
+            chunk.copy_from_slice(block.expose().get(..chunk.len()).ok_or(RngError)?);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +167,7 @@ impl Encaps<SPK_LEN, SCT_LEN> for McEliece460896 {
         let mut buf = [0u8; SHK_LEN];
         let (ct, ss) = cmr::encapsulate(&cmr::PublicKey::from(pk), &mut buf, &mut r);
         // cmr's `SharedSecret` zeroizes the borrowed buffer when it drops.
-        let shk = Secret::from_bytes(*ss.as_array());
+        let shk = Secret::copy_from(ss.as_array());
         drop(ss);
         if r.failed {
             return Err(EncapsError::Rng);

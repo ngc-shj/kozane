@@ -610,10 +610,18 @@ fn supersession_replaces_the_psk_and_keeps_no_copy_of_the_old_one() {
     // The old OSK was dropped in place, which zeroizes it (`Key32`); no
     // entry still holds it.
     assert!(psks.entries.iter().all(|e| !matches!(e, Entry::Live { osk, .. } if osk.as_bytes() == &PSK)));
-    let (init, msg) = Initiator::initiation(ts(1));
-    let (out, _, response) = handle_with(&mut handshaker(), &msg, 20, &[peer_pub()], &psks);
-    let Outcome::Accepted { response_len, .. } = out else { panic!("{out:?}") };
-    let resp = msgs::Response::decode(&response[..response_len]).unwrap();
+    // `finish` consumes the initiator: one handshake per side.
+    let respond = || {
+        let (init, msg) = Initiator::initiation(ts(1));
+        let (out, _, response) = handle_with(&mut handshaker(), &msg, 20, &[peer_pub()], &psks);
+        let Outcome::Accepted { response_len, .. } = out else { panic!("{out:?}") };
+        (init, response, response_len)
+    };
+    let (init, response, len) = respond();
+    let resp = msgs::Response::decode(&response[..len]).unwrap();
+    assert!(init.finish(resp.msg, &NEWER).is_some(), "the new PSK keys handshakes");
+    let (init, response, len) = respond();
+    let resp = msgs::Response::decode(&response[..len]).unwrap();
     assert!(init.finish(resp.msg, &PSK).is_none(), "the superseded PSK no longer keys handshakes");
 }
 

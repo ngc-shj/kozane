@@ -71,6 +71,10 @@ WAIVERS_CLOSED = WAIVERS_OPEN.replace('"open"', '"closed"')
 MISSING_WAIVERS = "package: waiver file unusable, refusing: cannot read <d>/waivers.toml: " \
     "[Errno 2] No such file or directory: '<d>/waivers.toml'"
 SC23_OPEN = "package: waiver SC23 (owner M4) is open; non-debug kernels are refused until it closes"
+SC23_BOUND = "package: Cargo.lock requires waiver SC23 to be open, but policy/waivers.toml does not list it as open"
+LOCK_CMR = 'version = 4\n\n[[package]]\nname = "classic-mceliece-rust"\nversion = "2.0.2"\n'
+LOCK_CMR_OTHER = LOCK_CMR.replace('"2.0.2"', '"2.0.3"')
+LOCK_NO_CMR = 'version = 4\n\n[[package]]\nname = "zeroize"\nversion = "1.8.1"\n'
 
 
 def package_system(path="/elsewhere/secrets.bin", pq_path="/elsewhere/pq.bin"):
@@ -100,16 +104,16 @@ def waivers_file(text):
     return run
 
 
-def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, stub_sc20=False):
-    """Runs `main()` with `build` replaced and the waiver file pointed at a
-    scratch one (None: absent). Returns what it printed (the success line
+def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, stub_sc20=False, lock_text=LOCK_CMR):
+    """Runs `main()` with `build` replaced and the waiver file and Cargo.lock
+    pointed at scratch ones (None: absent). Returns what it printed (the success line
     dropped, the scratch dir shown as <d>), plus a note when the outcome disagrees with that output, so
     an accepted run returns [] and a refused one exactly its messages.
     With `stub_sc20` the SC20 predicate passes, so it cannot mask what
     comes after it."""
     def run():
         d = tmp_tree()
-        real = (pkg.build, pkg.require_debug, pkg.WAIVERS, sys.argv)
+        real = (pkg.build, pkg.require_debug, pkg.WAIVERS, pkg.LOCK, sys.argv)
         real_umask = os.umask(0o022)
         os.umask(real_umask)
         real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
@@ -121,6 +125,9 @@ def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, 
             if waivers_text is not None:
                 (d / "waivers.toml").write_text(waivers_text)
             pkg.WAIVERS = d / "waivers.toml"
+            if lock_text is not None:
+                (d / "Cargo.lock").write_text(lock_text)
+            pkg.LOCK = d / "Cargo.lock"
             if stub_sc20:
                 pkg.require_debug = lambda _gen: []
 
@@ -144,7 +151,7 @@ def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, 
                 printed.append(f"refused (status {status}) with built {len(built)}")
             return printed
         finally:
-            pkg.build, pkg.require_debug, pkg.WAIVERS, sys.argv = real
+            pkg.build, pkg.require_debug, pkg.WAIVERS, pkg.LOCK, sys.argv = real
             os.umask(real_umask)
             for s, h in real_handlers.items():
                 signal.signal(s, h)
@@ -705,10 +712,22 @@ CASES = [
      ["package: waiver file unusable, refusing: waiver SC23: status 'maybe' is not one of open, closed"],
      main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_OPEN.replace('"open"', '"maybe"'), stub_sc20=True)),
     ("SC20 stubbed: no open waiver allows", None,
-     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, stub_sc20=True)),
+     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, stub_sc20=True, lock_text=LOCK_NO_CMR)),
+    # SC23 bound to cmr in Cargo.lock, whatever its version and kernel
+    # (M3 plan, Packaging; P6's rule, which `make package` does not run).
+    ("SC23 closed while cmr is locked refuses a debug kernel", [SC23_BOUND],
+     main_checks(waivers_text=WAIVERS_CLOSED)),
+    ("SC23 closed while cmr is locked at another version refuses", [SC23_BOUND],
+     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_CMR_OTHER)),
+    ("an empty waiver file refuses while cmr is locked", [SC23_BOUND], main_checks(waivers_text="")),
+    ("SC23 closed without cmr locked allows a debug kernel", None,
+     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR)),
+    ("a missing Cargo.lock refuses",
+     ["package: Cargo.lock unusable, refusing: [Errno 2] No such file or directory: '<d>/Cargo.lock'"],
+     main_checks(lock_text=None)),
     ("a missing waiver file refuses a debug kernel too", [MISSING_WAIVERS], main_checks(waivers_text=None)),
     ("non-debug kernel with no open waiver: SC20 alone", [SC20],
-     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED)),
+     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR)),
     ("non-debug kernel with an open waiver: both refusals", [SC20, SC23_OPEN], main_checks(gen=GEN_RELEASE)),
     ("secrets path inside the repo", "inside", lambda: pkg.check_secrets_path(ROOT / "build/secrets.bin", ROOT)),
     ("secrets path outside the repo", None, lambda: pkg.check_secrets_path(pathlib.Path("/tmp/s.bin"), ROOT)),

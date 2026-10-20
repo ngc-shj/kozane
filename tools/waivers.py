@@ -10,6 +10,10 @@ tools/ directory:
 a missing or unreadable file, invalid TOML, or anything outside the schema
 (unknown keys, a missing or non-string field, a status other than
 "open"/"closed", a duplicate id). Callers treat `WaiverError` as refuse.
+
+`required_open(lock_text)` names the waivers a Cargo.lock obliges to stay
+open: SC23 while any classic-mceliece-rust is locked, whatever its version
+(a version bump does not make cmr audited).
 """
 
 import pathlib
@@ -17,6 +21,8 @@ import tomllib
 from typing import NamedTuple
 
 STATUSES = ("open", "closed")
+# Locked package name -> the waiver that must stay open while it is locked.
+BOUND = {"classic-mceliece-rust": "SC23"}
 FIELDS = ("id", "owner", "status")
 
 
@@ -65,3 +71,19 @@ def load(path: pathlib.Path) -> list:
 
 def open_waivers(waivers: list) -> list:
     return [w for w in waivers if w.status == "open"]
+
+
+def required_open(lock_text: str) -> set:
+    """Waiver ids that must be open given Cargo.lock's text; raises
+    `WaiverError` if it is not valid TOML."""
+    try:
+        lock = tomllib.loads(lock_text)
+    except tomllib.TOMLDecodeError as e:
+        raise WaiverError(f"Cargo.lock is not valid TOML: {e}") from None
+    names = {p.get("name") for p in lock.get("package", []) if isinstance(p, dict)}
+    return {w for name, w in BOUND.items() if name in names}
+
+
+def unmet(required: set, listed: list) -> list:
+    """The ids in `required` that `listed` does not have open, sorted."""
+    return sorted(required - {w.id for w in open_waivers(listed)})

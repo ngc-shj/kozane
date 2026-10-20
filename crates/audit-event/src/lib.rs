@@ -546,19 +546,31 @@ impl CostHighWater {
         Self { last: None }
     }
 
-    /// The event to record for a handshake that cost `us`, if one is due.
+    /// The event to record for a handshake that cost `us`, if one is due,
+    /// counted as emitted. A producer whose record can be lost uses
+    /// `observe_with`.
     pub fn observe(&mut self, us: u32) -> Option<Event> {
+        let mut ev = None;
+        self.observe_with(us, |e| {
+            ev = Some(e);
+            true
+        });
+        ev
+    }
+
+    /// Offers the due event to `deliver`, and moves the mark only if it
+    /// reports the record delivered: a record lost to a full ring leaves the
+    /// mark where it was, so the next cost at or above it is offered again.
+    pub fn observe_with(&mut self, us: u32, deliver: impl FnOnce(Event) -> bool) {
         let due = match self.last {
             None => true,
             // 8·us ≥ 9·last, i.e. us ≥ last + last/8 without rounding; the
             // strict `>` keeps a run of zeros from firing every time.
             Some(last) => us > last && u64::from(us).saturating_mul(8) >= u64::from(last).saturating_mul(9),
         };
-        if !due {
-            return None;
+        if due && deliver(Event::RpCostHighWater { us }) {
+            self.last = Some(us);
         }
-        self.last = Some(us);
-        Some(Event::RpCostHighWater { us })
     }
 }
 

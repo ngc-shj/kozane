@@ -156,7 +156,7 @@ impl<const MAX_PEERS: usize> PskTable<MAX_PEERS> {
     pub fn install(&mut self, peer: u16, osk: &[u8; 32], now_ns: u64) -> Result<(), InstallError> {
         let entry = self.entries.get_mut(usize::from(peer)).ok_or(InstallError::PeerOutOfRange)?;
         // Assigning drops the old entry in place; `Key32` zeroizes on drop.
-        *entry = Entry::Live { osk: Key32::from_bytes(*osk), installed_at: now_ns };
+        *entry = Entry::Live { osk: Key32::copy_from(osk), installed_at: now_ns };
         Ok(())
     }
 
@@ -173,7 +173,7 @@ impl<const MAX_PEERS: usize> PskTable<MAX_PEERS> {
     pub fn fresh(&self, peer: PeerId, now_ns: u64) -> Result<FreshPsk, PskRefusal> {
         match self.entries.get(usize::from(peer.0)) {
             Some(Entry::Live { osk, installed_at }) if now_ns.saturating_sub(*installed_at) < REJECT_AFTER_TIME_NS => {
-                Ok(FreshPsk(Key32::from_bytes(*osk.as_bytes())))
+                Ok(FreshPsk(Key32::copy_from(osk.as_bytes())))
             }
             Some(Entry::Live { .. } | Entry::Expired { .. }) => Err(PskRefusal::Stale),
             Some(Entry::Absent) | None => Err(PskRefusal::Missing),

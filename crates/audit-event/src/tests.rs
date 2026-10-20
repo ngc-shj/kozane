@@ -342,3 +342,39 @@ fn lower_or_equal_costs_never_emit() {
 fn a_run_of_zero_costs_emits_once() {
     assert_eq!(emitted([0, 0, 0]), [0]);
 }
+
+#[test]
+fn a_lost_cost_record_is_offered_again_at_the_same_cost() {
+    let mut h = CostHighWater::new();
+    let mut offered = Vec::new();
+    h.observe_with(1_000, |e| {
+        offered.push(e);
+        true
+    });
+    // 2 000 is due but the ring is full: the mark must not move.
+    h.observe_with(2_000, |e| {
+        offered.push(e);
+        false
+    });
+    h.observe_with(2_000, |e| {
+        offered.push(e);
+        true
+    });
+    assert_eq!(
+        offered,
+        [Event::RpCostHighWater { us: 1_000 }, Event::RpCostHighWater { us: 2_000 }, Event::RpCostHighWater { us: 2_000 }]
+    );
+}
+
+#[test]
+fn a_delivered_cost_record_moves_the_mark() {
+    let mut h = CostHighWater::new();
+    h.observe_with(2_000, |_| true);
+    let mut offered = 0;
+    // Below 2 000 + 1/8: not due once 2 000 was delivered.
+    h.observe_with(2_249, |_| {
+        offered += 1;
+        true
+    });
+    assert_eq!(offered, 0);
+}

@@ -936,17 +936,24 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         def installed(conf: str, rp: Rosenpass, deadline: float) -> tuple:
             """Handshakes with `rp`'s current key_out until the response
             opens: proof that pq's export reached hs (later exports are not
-            printed). Returns the initiator and the initiation it sent."""
+            printed). Returns the initiator and the initiation it sent; the
+            initiator's `refused_at` is the send time of the last attempt that
+            did not open (None if the first one did), a lower bound on the
+            install, since hs handled that attempt without the PSK."""
+            refused_at = None
             while True:
                 psk = rp.osk()
                 if psk is not None:
                     i = initiator(conf, psk)
                     msg = i.initiation(ts_offset_s=30)
+                    sent = time.monotonic()
                     out.sendto(msg, ("127.0.0.1", hostfwd))
                     r = wait_response(out, i, PSK_RETRY_S)
                     if r is not None and i.consume_response(r):
                         i.psk_used = psk
+                        i.refused_at = refused_at
                         return i, msg
+                    refused_at = sent
                 if time.monotonic() > deadline:
                     raise Fail(f"peer {rp.peer}: no handshake with its key_out was accepted within {RP_EXCHANGE_S:.0f} s")
                 time.sleep(PSK_RETRY_S)
@@ -994,7 +1001,9 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         rps.append(rp1)
         good, _ = installed(peer1, rp1, time.monotonic() + RP_EXCHANGE_S)
         accepted_at = time.monotonic()
-        key_out_at = rp1.written_at()
+        # The install is no earlier than the last refused attempt, nor than
+        # key_out (written on RespHello, before the install).
+        installed_after = max(good.refused_at or 0.0, rp1.written_at())
         osk1 = good.psk_used
         # No rotation for peer 1 from here: the expiry case below.
         rp1.stop()
@@ -1002,9 +1011,9 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         print("\nPASS [L8 pair: peer 1 refused without a PSK while peer 0 works, accepted after Rosenpass]")
 
         # Expiry, concurrently with the cases below [R2-T-N9]: accepted near
-        # REJECT_AFTER_TIME after key_out was written (no later than the
-        # install), refused once that long has passed since the accepted
-        # handshake (no earlier than the install).
+        # REJECT_AFTER_TIME after the install's lower bound, refused once that
+        # long has passed since the accepted handshake (its upper bound). The
+        # bounds are PSK_RETRY_S plus one exchange apart.
         expiry = {}
 
         def expiry_probe():
@@ -1012,7 +1021,7 @@ def test_wireguard(loader: str, deploy: str, passed: list):
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
                 sock.bind(("127.0.0.1", 0))
                 try:
-                    allow_at = key_out_at + reject_s - EXPIRY_ALLOW_S
+                    allow_at = installed_after + reject_s - EXPIRY_ALLOW_S
                     if time.monotonic() > allow_at:
                         raise Fail("expiry: the allow point passed before the probe started")
                     time.sleep(allow_at - time.monotonic())
@@ -1020,7 +1029,7 @@ def test_wireguard(loader: str, deploy: str, passed: list):
                     sock.sendto(i.initiation(ts_offset_s=30), ("127.0.0.1", hostfwd))
                     r = wait_response(sock, i, REPLY_TIMEOUT_S)
                     if r is None or not i.consume_response(r):
-                        raise Fail(f"expiry: a handshake {reject_s - EXPIRY_ALLOW_S:.0f} s after key_out was not accepted")
+                        raise Fail(f"expiry: a handshake {reject_s - EXPIRY_ALLOW_S:.0f} s after the install was not accepted")
                     time.sleep(max(0.0, accepted_at + reject_s + EXPIRY_SLACK_S - time.monotonic()))
                     expiry["mark"] = con.mark()
                     i = initiator(peer1, osk1)
@@ -1118,6 +1127,11 @@ def test_wireguard(loader: str, deploy: str, passed: list):
             raise Fail("expiry: the probe did not finish")
         if "error" in expiry:
             raise expiry["error"]
+        # Coalesced: total=1 prints once per boot, so no earlier stale refusal
+        # may have used it up (e.g. peer 0's prelude PSK during rotation).
+        stale = r"audit: src=hs HandshakePskStale total="
+        if len(con.count(stale)) > len(con.count(stale, since=expiry["mark"])):
+            raise Fail("expiry: a stale refusal before the probe used up the audit line; precondition broken")
         con.wait_for(r"audit: src=hs HandshakePskStale total=1 ", since=expiry["mark"])
         passed.append("PSK expiry")
         print("\nPASS [expiry: accepted before REJECT_AFTER_TIME, HandshakePskStale after]")
@@ -1911,9 +1925,10 @@ def rust_usize(rel: str, name: str) -> int:
 def sniffed_init_hello(sniffer: Sniffer) -> bytes:
     """The first InitHello a client sent to the Rosenpass port."""
     size = rust_usize(INGRESS_CORE, "RP_INIT_HELLO_LEN")
+    kind = rust_usize(ROSENPASS_WIRE, "MSG_INIT_HELLO")
     for _, f, outgoing in sniffer.since(0):
         u = udp_fields(f)
-        if u is not None and outgoing and u[3] == RP_PORT and len(u[4]) == size and u[4][0] == 0x81:
+        if u is not None and outgoing and u[3] == RP_PORT and len(u[4]) == size and u[4][0] == kind:
             return u[4]
     raise Fail("no InitHello from the client was sniffed")
 
@@ -1963,17 +1978,16 @@ def rp_deny_cases(con: Console, hello: bytes, passed: list):
         # mac decides the genuine bytes' fate.
         if resp_hellos(src_interval + 1):
             raise Fail("rosenpass mac pair: the flipped-mac InitHello got a RespHello")
+        # The genuine bytes and, milliseconds later, their replay: both land
+        # inside the source interval the first one opens, by construction
+        # (a replay at exactly that interval would be admitted again).
         s.sendto(hello, (ip_str(GW_IP), RP_PORT))
-        sent = time.monotonic()
+        s.sendto(hello, (ip_str(GW_IP), RP_PORT))
         if not resp_hellos(RP_EXCHANGE_S, first=True):
             raise Fail("rosenpass mac pair: the genuine InitHello got no RespHello")
         passed.append("rosenpass mac deny")
         print("\nPASS [rosenpass mac: one flipped byte refused at ingress, the genuine bytes answered]")
-        # The replay must land inside the source interval that the genuine
-        # send opened, or the per-source meter has refilled.
-        if time.monotonic() - sent >= src_interval:
-            raise Fail("rosenpass bucket: the genuine answer took the whole source interval; no room for the replay")
-        s.sendto(hello, (ip_str(GW_IP), RP_PORT))
+        # A forwarded replay would be answered one decapsulation later.
         if resp_hellos(2 * cost):
             raise Fail("rosenpass bucket: a replay within the source's interval was answered")
         passed.append("rosenpass bucket deny")
