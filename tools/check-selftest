@@ -78,6 +78,7 @@ CASES_FOR_GATE = {
     # pins runs the package checker fixtures; package-release drives the real target.
     "pins": {"pins", "package-release", "package-waiver", "package-waiver-removed"},
     "lint": {"lint"},
+    "audit": {"audit"},
     "lint-pds": {"lint-pds"},
     "unit": {"unit", "c5-forward-burst", "c5-backlog", "c5-interval", "c5-key-calls",
              "arrival-interval-order", "arrival-burst-order", "late-notify", "unbounded-drain",
@@ -165,6 +166,9 @@ CASES = {
     "lint-pds": (["lint-pds"], lambda t: append(t, "crates/pds/timer/src/main.rs",
                                                 "\n#[allow(dead_code)]\nfn selftest_lint_pd(x: u8) -> bool {\n    x == x\n}\n"),
                  "clippy::eq_op"),
+    # A warning whose exception is removed must fail the audit gate.
+    "audit": (["audit"], lambda t: edit(t, "policy/audit-ignore.toml", 'id = "RUSTSEC-2024-0436"', 'id = "RUSTSEC-0000-0000"'),
+              "unmaintained warning RUSTSEC-2024-0436 for paste"),
     "laws": (["laws"], lambda t: edit(t, "system/secureos.system", "</system>", "    <selftest_unknown />\n</system>"), "L4"),
     "pins": (["pins"], lambda t: edit(t, "Makefile", "\trm -rf $(BUILD)", "\t-rm -rf $(BUILD)"), "P5"),
     "integration": (["test"], lambda t: edit(t, "tests/integration/run.py",

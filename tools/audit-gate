@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""RustSec advisory gate over Cargo.lock (M3a external review, item 3).
+
+Usage: audit-gate [--db DIR] [--lock FILE] [--ignore FILE]
+
+Runs `cargo audit --no-fetch` against a pinned advisory-db snapshot (baked
+into the dev image at /opt/advisory-db; docker/Dockerfile pins its commit
+and sha256), so the gate is offline and reproducible. Exit 0 only when:
+  - no vulnerability is reported, whatever policy/audit-ignore.toml says;
+  - every warning (unmaintained, unsound, yanked, ...) is listed in
+    policy/audit-ignore.toml by advisory id and crate;
+  - every listed exception still matches a reported warning (a stale one
+    must be removed, so the list never hides a later advisory);
+  - the database loaded advisories and the lock file listed crates.
+Prints "AUDIT-ADVISORIES <n>" (advisories in the pinned snapshot) for the
+count manifest; a refreshed snapshot changes it on purpose.
+
+Control class: fail-closed over the snapshot it reads. It cannot see an
+advisory published after the pinned commit; refreshing the pin is a
+manual step (record it in the deviation log), and a fresh check is
+`audit-gate --db <a current advisory-db checkout>`.
+"""
+
+import argparse
+import json
+import pathlib
+import subprocess
+import sys
+import tomllib
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+FIELDS = ("id", "crate", "reason", "owner")
+
+
+def load_ignores(path: pathlib.Path) -> dict:
+    data = tomllib.loads(path.read_text())
+    if set(data) - {"ignore"}:
+        raise SystemExit(f"audit-gate: {path}: unknown top-level keys {sorted(set(data) - {'ignore'})}")
+    out = {}
+    for i, e in enumerate(data.get("ignore", [])):
+        if not isinstance(e, dict) or set(e) != set(FIELDS) or not all(isinstance(e[k], str) and e[k] for k in FIELDS):
+            raise SystemExit(f"audit-gate: {path}: entry {i} must have exactly the non-empty string keys {', '.join(FIELDS)}")
+        if e["id"] in out:
+            raise SystemExit(f"audit-gate: {path}: {e['id']} listed twice")
+        out[e["id"]] = e
+    return out
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--db", default="/opt/advisory-db")
+    ap.add_argument("--lock", default=str(ROOT / "Cargo.lock"))
+    ap.add_argument("--ignore", default=str(ROOT / "policy/audit-ignore.toml"))
+    a = ap.parse_args()
+    ignores = load_ignores(pathlib.Path(a.ignore))
+    r = subprocess.run(["cargo", "audit", "--no-fetch", "--db", a.db, "--file", a.lock, "--json"],
+                       capture_output=True, text=True)
+    try:
+        report = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        print(r.stdout + r.stderr)
+        print(f"audit-gate: cargo audit produced no report (exit {r.returncode})")
+        return 1
+    errors = []
+    advisories = report.get("database", {}).get("advisory-count", 0)
+    crates = report.get("lockfile", {}).get("dependency-count", 0)
+    if not advisories or not crates:
+        errors.append(f"audit-gate: examined nothing ({advisories} advisories, {crates} crates)")
+    for v in report.get("vulnerabilities", {}).get("list", []):
+        errors.append(f"audit-gate: vulnerability {v['advisory']['id']} in {v['package']['name']} "
+                      f"{v['package']['version']}: {v['advisory']['title']}")
+    seen = set()
+    for kind, items in report.get("warnings", {}).items():
+        for w in items:
+            adv = w.get("advisory") or {}
+            wid, crate = adv.get("id", f"{kind}:{w['package']['name']}"), w["package"]["name"]
+            e = ignores.get(wid)
+            if e is None or e["crate"] != crate:
+                errors.append(f"audit-gate: {kind} warning {wid} for {crate} {w['package']['version']} "
+                              "is not excepted in policy/audit-ignore.toml")
+            seen.add(wid)
+    for wid in sorted(set(ignores) - seen):
+        errors.append(f"audit-gate: exception {wid} matches no reported warning; remove it")
+    if errors:
+        print("\n".join(errors))
+        return 1
+    print(f"audit-gate: {crates} crates, {len(seen)} excepted warnings")
+    print(f"AUDIT-ADVISORIES {advisories}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

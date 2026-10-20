@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::*;
+use std::os::unix::fs::PermissionsExt;
 
 const TEMPLATE: &str = include_str!("../../../config/gateway.toml");
 
@@ -253,4 +254,67 @@ fn run_writes_both_blobs_the_key_files_and_one_bundle_per_peer() {
     let text = std::fs::read_to_string(out.join("gateway.toml")).unwrap();
     let load = |name: &str| std::fs::read(out.join(name)).map_err(|e| e.to_string());
     assert!(validate::check(&text, validate::MAX_PEERS, &load).is_ok());
+}
+
+fn scratch(tag: &str) -> PathBuf {
+    let d = std::env::temp_dir().join(format!("mksecrets-test-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&d);
+    std::fs::create_dir(&d).unwrap();
+    d
+}
+
+fn leftovers(parent: &Path) -> Vec<String> {
+    std::fs::read_dir(parent).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect()
+}
+
+#[test]
+fn staged_output_is_published_owner_only() {
+    let parent = scratch("ok");
+    let out = parent.join("deploy");
+    stage_and_publish(&out, |s| write_private(&s.join("secrets.bin"), b"k")).unwrap();
+    assert_eq!(leftovers(&parent), ["deploy"], "only the published directory remains");
+    assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o700);
+    assert_eq!(std::fs::read(out.join("secrets.bin")).unwrap(), b"k");
+    std::fs::remove_dir_all(&parent).unwrap();
+}
+
+#[test]
+fn a_failed_write_publishes_nothing_and_leaves_no_staging() {
+    let parent = scratch("fail");
+    let out = parent.join("deploy");
+    let r = stage_and_publish(&out, |s| {
+        write_private(&s.join("secrets.bin"), b"k")?;
+        Err("disk full".into())
+    });
+    assert_eq!(r, Err("disk full".into()));
+    assert!(leftovers(&parent).is_empty(), "left behind: {:?}", leftovers(&parent));
+    std::fs::remove_dir_all(&parent).unwrap();
+}
+
+#[test]
+fn an_output_that_appeared_is_never_replaced() {
+    let parent = scratch("exists");
+    let out = parent.join("deploy");
+    std::fs::create_dir(&out).unwrap();
+    let r = stage_and_publish(&out, |s| write_private(&s.join("secrets.bin"), b"k"));
+    assert!(r.is_err_and(|e| e.starts_with("cannot publish")), "an existing (even empty) output must refuse");
+    assert_eq!(leftovers(&parent), ["deploy"], "no staging left beside it");
+    assert!(leftovers(&out).is_empty(), "the existing output was not touched");
+    std::fs::remove_dir_all(&parent).unwrap();
+}
+
+#[test]
+fn the_signal_mask_is_restored_after_staging() {
+    let parent = scratch("mask");
+    // SAFETY: queries the current mask into a zeroed set.
+    let mask = || unsafe {
+        let mut m: libc::sigset_t = std::mem::zeroed();
+        libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut m);
+        libc::sigismember(&m, libc::SIGTERM)
+    };
+    let before = mask();
+    let r = stage_and_publish(&parent.join("x"), |_| Err("no".into()));
+    assert!(r.is_err());
+    assert_eq!(mask(), before, "SIGTERM left blocked after a failed staging");
+    std::fs::remove_dir_all(&parent).unwrap();
 }

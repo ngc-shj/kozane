@@ -327,8 +327,16 @@ def main() -> int:
             else:
                 # Atomic and never replacing: an OUT created after the check
                 # above makes the rename fail instead of being overwritten.
+                # The rename is the commit point: stop signals are held
+                # across it (one already pending exits before it, publishing
+                # nothing), and once it succeeds they are discarded, so a run
+                # that published OUT always completes as a success.
+                stop = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT}
                 try:
+                    signal.pthread_sigmask(signal.SIG_BLOCK, stop)
                     publish(staging, out)
+                    for s in stop:
+                        signal.signal(s, signal.SIG_IGN)
                     status = 0
                 except OSError as e:
                     print(e if str(e).startswith("package:") else f"package: cannot publish {out}: {e}")

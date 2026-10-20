@@ -27,6 +27,22 @@ RUN set -eux; \
 # crates come from each upstream Cargo.lock (`cargo fetch --locked`; master's
 # one git dependency, rosenpass/uds, is pinned there by commit) and the build
 # itself runs with no network.
+# RustSec advisory-db at a pinned commit, verified by sha256, for the
+# offline `audit` gate (tools/audit-gate). Refreshing it means bumping both
+# ARGs here and AUDIT-ADVISORIES in tests/manifest.txt.
+FROM base AS advisory-db
+RUN apt-get update -q && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+ARG ADVISORY_DB_COMMIT=999ec89d5d3f10f20be14750ec8c2d8b44e0ac9b
+ARG ADVISORY_DB_SHA256=503a3f9e3b3976ce96e976fcaec69f90e0be63ce7ba6ad8a6645afc7ca944fa3
+RUN set -eux; \
+    curl -sSfL -o /tmp/advisory-db.tar.gz "https://github.com/rustsec/advisory-db/archive/${ADVISORY_DB_COMMIT}.tar.gz"; \
+    echo "$ADVISORY_DB_SHA256  /tmp/advisory-db.tar.gz" | sha256sum -c -; \
+    mkdir -p /opt/advisory-db; \
+    tar -xzf /tmp/advisory-db.tar.gz -C /opt/advisory-db --strip-components=1; \
+    rm /tmp/advisory-db.tar.gz; \
+    echo "$ADVISORY_DB_COMMIT" > /opt/advisory-db/SOURCE
+
 FROM base AS rosenpass-oracle
 RUN apt-get update -q && apt-get install -y --no-install-recommends \
     build-essential \
@@ -195,6 +211,7 @@ RUN rustup toolchain install "$PD_TOOLCHAIN" --profile minimal --component rust-
 ARG KANI_VERSION=0.68.0
 ARG KANI_BUNDLE_SHA256=0042d2688bf1550270def4a79c96aaeea138631818cb4ab5480120f2d51a942c
 ARG CARGO_BOLERO_VERSION=0.13.5
+ARG CARGO_AUDIT_VERSION=0.22.2
 # Host tools are built with a pinned stable toolchain (no rust-toolchain.toml at build time).
 ARG TOOLS_RUST=1.97.1
 RUN set -eux; \
@@ -204,9 +221,11 @@ RUN set -eux; \
     echo "$KANI_BUNDLE_SHA256  /tmp/kani.tar.gz" | sha256sum -c -; \
     cargo +"$TOOLS_RUST" kani setup --use-local-bundle /tmp/kani.tar.gz; \
     rm /tmp/kani.tar.gz; \
-    cargo +"$TOOLS_RUST" install --locked cargo-bolero --version "$CARGO_BOLERO_VERSION"
+    cargo +"$TOOLS_RUST" install --locked cargo-bolero --version "$CARGO_BOLERO_VERSION"; \
+    cargo +"$TOOLS_RUST" install --locked cargo-audit --version "$CARGO_AUDIT_VERSION"
 
 COPY --from=rosenpass-oracle /opt/rosenpass-master /opt/rosenpass-master
 COPY --from=rosenpass-oracle /opt/rosenpass-023 /opt/rosenpass-023
+COPY --from=advisory-db /opt/advisory-db /opt/advisory-db
 
 WORKDIR /work

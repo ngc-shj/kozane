@@ -654,3 +654,40 @@ The full record is in the code review's Resolution Status. Deviations from the p
 - **One failure, from a stale needle:** the `manifest` case expected "UNIT-AUDIT-EVENT: 29 < manifest 30", but Phase 3 had added audit-event tests.
   - That needle and the `integration-count` one are now derived from `tests/manifest.txt`, so they follow it.
   - Re-run: `manifest` ok ("32 < manifest 33"). `integration-count` derives the string it already passed with ("21 < manifest 22").
+
+## External review of 9213a0f
+
+Verdict: no Critical, High or Major. M3a stays dev-only until M3b (SC26, cookie gate) and M4 (SC23, McEliece replacement and constant-time verification), and until release kernels are proven (SC20). The review raised three items, all addressed.
+
+1. **mksecrets left a partial secrets directory on failure (Minor) — fixed.**
+   - `stage_and_publish` writes everything into a 0700 staging directory beside OUT. It publishes with `renameat2(RENAME_NOREPLACE)`, so it never replaces an OUT, even an empty one that appeared.
+   - On any error it removes the staging directory and reports both errors if that fails.
+   - SIGTERM, SIGINT and SIGHUP are blocked while secrets are staged.
+     - On success, the rename is the commit point: pending stop signals are discarded, and the run succeeds.
+     - On failure, staging is removed first; then the restored mask delivers the signal, with nothing published.
+   - Adds `libc =0.2.191` (already in Cargo.lock).
+   - Tests: published owner-only; a failed write publishes nothing and leaves no staging; an existing OUT is never replaced; the signal mask is restored.
+   - Red-proved on scratch copies: no cleanup, a replacing rename, and an unrestored mask each fail their test.
+2. **tools/package: a stop signal between the rename and `status = 0` ended a run that had published OUT (Minor) — fixed.**
+   - Stop signals are blocked across `publish`. One already pending exits before the rename, with nothing published.
+   - Once the rename succeeds, they are set to SIG_IGN, so the run completes as a success.
+   - New fixtures: a SIGTERM during the rename and right after it, both expected to succeed with OUT. The existing "SIGTERM during the build" stays the deny side.
+   - Red-proved: without the hold, both new fixtures fail with exit 143. PACKAGE-FIXTURES 95.
+3. **No RustSec advisory check in `make check` (verification gate) — added.**
+   - New gate `audit` (`tools/audit-gate`) runs `cargo audit --no-fetch` against the advisory-db snapshot baked into the dev image.
+     - The snapshot is a pinned commit (`999ec89d`), verified by sha256 in a separate Dockerfile stage; `cargo-audit` is pinned at 0.22.2.
+     - Any vulnerability fails the gate, with no exception possible.
+     - Each warning must be excepted in `policy/audit-ignore.toml`, by id and crate, with a reason and an owning milestone.
+     - A stale exception fails, and a report that examined nothing fails.
+   - Current result: 222 crates, no vulnerabilities. Two warnings are excepted, both build-time-only proc-macros that never reach a PD image (owner M4):
+     - unmaintained `paste` (via rust-sel4), RUSTSEC-2024-0436;
+     - unmaintained `proc-macro-error2` (via libcrux hax-lib-macros), RUSTSEC-2026-0173.
+   - Control class: fail-closed over the pinned snapshot. It cannot see advisories published after the pin; refreshing the pin (both Dockerfile ARGs plus AUDIT-ADVISORIES) is manual.
+   - Fixtures: `tests/tools/test_audit_gate.py`, 9 cases with a fake `cargo` (AUDIT-GATE-FIXTURES 9). Selftest case `audit`: removing an exception fails the gate.
+   - The review's spot checks of libcrux advisories (RUSTSEC-2026-0124, -0212, -0207, RUSTSEC-2025-0133) agree with the locked versions; the gate now checks them mechanically.
+- **Verification:**
+  - **`make check`:** every gate passed, including `audit` (AUDIT-ADVISORIES 1338) and `pins` (AUDIT-GATE-FIXTURES 9, PACKAGE-FIXTURES 95).
+    - The first run (4882 s) failed only at the manifest step: the added tests were not yet counted (UNIT-TESTS 660, UNIT-MKSECRETS 21). The manifest now matches the counts of that run.
+    - Kani recomputed in the new container.
+  - **Selftest case `audit`:** ok.
+  - **Dev image:** rebuilt with `docker build --network host`. The default bridge network timed out on IPv6 downloads during this session. That is a host network issue, so `docker/Makefile` is unchanged.

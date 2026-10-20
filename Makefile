@@ -25,7 +25,7 @@ host_crates := wire ring audit-event ingress-core inner-core layout laws config 
 kani_crates := wire ring ingress-core inner-core wg-wire msgs rosenpass-wire
 
 .PHONY: clean-counts
-.PHONY: all image package run test check check-selftest lint lint-pds unit kani bolero fuzz-long laws pins manifest kernel-config clean
+.PHONY: all image package run test check check-selftest audit lint lint-pds unit kani bolero fuzz-long laws pins manifest kernel-config clean
 all: image
 
 $(counts):
@@ -192,6 +192,12 @@ fuzz-long:
 	cargo metadata --locked --format-version 1 > /dev/null
 	$(foreach t,$(bolero_targets),cargo bolero test -p $(word 1,$(subst /, ,$(t))) $(word 2,$(subst /, ,$(t))) -T 600s;)
 
+# RustSec advisories over Cargo.lock, offline against the image's pinned
+# advisory-db (tools/audit-gate; exceptions in policy/audit-ignore.toml).
+audit: | $(counts)
+	tools/audit-gate > $(counts)/audit.log 2>&1 || { cat $(counts)/audit.log; exit 1; }
+	grep '^AUDIT-ADVISORIES' $(counts)/audit.log > $(counts)/audit
+
 laws: | $(counts)
 	cargo run --locked -q -p laws -- check --system $(system) --policy $(policy) --search-path $(BUILD) --no-elf-check
 	echo "LAWS-SYSTEMS 1" > $(counts)/laws
@@ -203,10 +209,11 @@ pins: | $(counts)
 	python3 tests/tools/test_package.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_config_build.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_check_manifest.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	python3 tests/tools/test_audit_gate.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_harness_signals.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	docker/make-seccomp.py --check >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_seccomp.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES)' $(counts)/pins.log > $(counts)/pins
+	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES)' $(counts)/pins.log > $(counts)/pins
 
 # Builds its own deployment (fresh keys, generated config, package); see run.py.
 test: | $(counts)
@@ -225,7 +232,7 @@ clean-counts:
 
 check:
 	$(MAKE) clean-counts
-	$(MAKE) pins lint lint-pds unit kani bolero laws test
+	$(MAKE) pins audit lint lint-pds unit kani bolero laws test
 	$(MAKE) manifest
 
 # Requires a prior `make check` (the manifest case reuses build/counts).

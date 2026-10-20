@@ -787,6 +787,7 @@ name = "mksecrets"
 version = "0.1.0"
 dependencies = [
  "classic-mceliece-rust",
+ "libc",
  "libcrux-curve25519",
  "rand_core 0.6.4",
  "secret-blob",

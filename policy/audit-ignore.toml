@@ -1,0 +1,24 @@
+# policy/audit-ignore.toml: RustSec warnings excepted by tools/audit-gate.
+#
+# Vulnerabilities are never excepted here. A warning (unmaintained, unsound,
+# yanked, ...) may be listed with its reason and the milestone that owes its
+# removal; an entry that no longer matches a reported warning fails the
+# gate, so the list cannot outlive what it excuses.
+#
+# Schema: [[ignore]] with exactly id, crate, reason, owner.
+
+# Build-time proc-macro only, through rust-sel4's sel4-shared-memory (the
+# virtio driver PDs); no code from it reaches a PD image.
+[[ignore]]
+id = "RUSTSEC-2024-0436"
+crate = "paste"
+reason = "unmaintained; proc-macro used at build time by rust-sel4 sel4-shared-memory, no runtime code"
+owner = "M4"
+
+# Build-time proc-macro only, through libcrux's hax-lib-macros
+# (libcrux-intrinsics); no code from it reaches a PD image.
+[[ignore]]
+id = "RUSTSEC-2026-0173"
+crate = "proc-macro-error2"
+reason = "unmaintained; proc-macro used at build time by libcrux hax-lib-macros, no runtime code"
+owner = "M4"

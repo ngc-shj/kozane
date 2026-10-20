@@ -236,6 +236,9 @@ def run_main(build_result):
                 if build_result == "publish-fails":
                     pkg.publish = failing_publish
                     return 0
+                if build_result in ("signal-during-publish", "signal-after-rename"):
+                    pkg.publish = signalling_publish
+                    return 0
                 if build_result in ("sigterm", "two-signals", "early-second-signal"):
                     os.kill(os.getpid(), signal.SIGTERM)
                 if build_result == "sigint":
@@ -302,6 +305,15 @@ def run_main(build_result):
             real_remove = pkg.remove_staging
             real_publish = pkg.publish
 
+            def signalling_publish(src, dst):
+                # A stop signal at the commit point: during the rename, or
+                # right after it succeeded.
+                if build_result == "signal-during-publish":
+                    os.kill(os.getpid(), signal.SIGTERM)
+                real_publish(src, dst)
+                if build_result == "signal-after-rename":
+                    os.kill(os.getpid(), signal.SIGTERM)
+
             def failing_publish(src, dst):
                 # The real publish, failing (no such parent): its own error
                 # text must reach the operator once, not wrapped again.
@@ -338,7 +350,7 @@ def run_main(build_result):
             if build_result == "out-appears":
                 if status != 1 or list(out.iterdir()):
                     errors.append(f"OUT appearing during the build was not refused (status {status})")
-            elif build_result == 0:
+            elif build_result in (0, "signal-during-publish", "signal-after-rename"):
                 if status != 0 or not (out / "loader.img").exists():
                     errors.append(f"success did not produce OUT (status {status})")
                 elif oct(out.stat().st_mode & 0o777) != "0o700" or oct((out / "loader.img").stat().st_mode & 0o777) != "0o600":
@@ -350,7 +362,7 @@ def run_main(build_result):
             if left_blocked != real_sigmask:
                 errors.append(f"main() left signals blocked: {sorted(left_blocked - real_sigmask)}")
             expected = {1: 1, "raise": "raised", "out-appears": 1, 0: 0, "signal-in-ignore-loop": 1,
-                        "publish-fails": 1}.get(build_result)
+                        "publish-fails": 1, "signal-during-publish": 0, "signal-after-rename": 0}.get(build_result)
             if build_result == "publish-fails" and (captured.getvalue().count("package: cannot publish") != 1
                                                     or "[Errno" in captured.getvalue()):
                 errors.append(f"a failed publish was not reported as one package: message: {captured.getvalue()!r}")
@@ -765,6 +777,8 @@ CASES = [
     ("publishing refuses to replace an OUT that appeared", None, publish_never_replaces(True)),
     ("publishing to a free OUT succeeds", None, publish_never_replaces(False)),
     ("a failed publish is reported and leaves no OUT or staging", None, run_main("publish-fails")),
+    ("a SIGTERM during the publishing rename completes the run as a success", None, run_main("signal-during-publish")),
+    ("a SIGTERM right after the rename completes the run as a success", None, run_main("signal-after-rename")),
     ("output inside build/", "inside", lambda: pkg.check_out_path(ROOT / "build/pkg", ROOT)),
     ("output inside the repo", "inside", lambda: pkg.check_out_path(ROOT / "pkg-out", ROOT)),
     ("output through a symlink into the repo", "inside", out_case(link_into_repo)),

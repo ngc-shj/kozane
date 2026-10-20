@@ -328,6 +328,99 @@ fn generate(template: &str, peers: usize, endpoint: &str, rp_endpoint: Option<&s
     Ok(Deployment { config, blob, pq_blob, gateway_rp_public: gateway_rp.public, peers: bundles })
 }
 
+/// Writes a deployment through `write` into a fresh 0700 staging directory
+/// beside `dir`, then publishes it as `dir` in one rename that never
+/// replaces anything. Stop signals are held while secrets are staged: on
+/// success they are discarded (the rename is the commit point, so a run that
+/// published always succeeds), on failure the staging directory is removed
+/// first and a pending signal then ends the process with nothing published.
+fn stage_and_publish(dir: &Path, write: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
+    let name = dir.file_name().ok_or_else(|| format!("{}: no directory name", dir.display()))?;
+    let parent = dir.parent().ok_or_else(|| format!("{}: no parent", dir.display()))?;
+    let staging = parent.join(format!(".{}.mksecrets-{}", name.to_string_lossy(), std::process::id()));
+    let held = StopSignals::hold()?;
+    let staged = std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(&staging)
+        .map_err(|e| format!("{}: {e}", staging.display()))
+        .and_then(|()| write(&staging))
+        .and_then(|()| rename_noreplace(&staging, dir).map_err(|e| format!("cannot publish {}: {e}", dir.display())));
+    match staged {
+        Ok(()) => {
+            held.discard_pending();
+            Ok(())
+        }
+        Err(e) => {
+            let removed = match std::fs::remove_dir_all(&staging) {
+                Ok(()) => Ok(()),
+                Err(r) if r.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(r) => Err(format!("{e}; and could not remove staging directory {}: {r}", staging.display())),
+            };
+            drop(held);
+            Err(removed.err().unwrap_or(e))
+        }
+    }
+}
+
+/// SIGTERM, SIGINT and SIGHUP blocked for the holder's lifetime; dropping it
+/// restores the previous mask, which delivers anything that arrived.
+struct StopSignals {
+    previous: libc::sigset_t,
+}
+
+impl StopSignals {
+    fn set() -> libc::sigset_t {
+        // SAFETY: sigemptyset/sigaddset initialise and fill a local set.
+        unsafe {
+            let mut set: libc::sigset_t = std::mem::zeroed();
+            libc::sigemptyset(&mut set);
+            for s in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+                libc::sigaddset(&mut set, s);
+            }
+            set
+        }
+    }
+
+    fn hold() -> Result<Self, String> {
+        let set = Self::set();
+        // SAFETY: valid pointers to a filled set and to an output set.
+        let mut previous: libc::sigset_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous) };
+        if rc != 0 {
+            return Err(format!("cannot block stop signals: error {rc}"));
+        }
+        Ok(Self { previous })
+    }
+
+    /// The commit point has passed: stop signals that arrived (or arrive)
+    /// are ignored instead of ending a run that has already published.
+    fn discard_pending(self) {
+        for s in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            // SAFETY: SIG_IGN is a valid disposition for these signals;
+            // ignoring a pending signal discards it.
+            unsafe { libc::signal(s, libc::SIG_IGN) };
+        }
+    }
+}
+
+impl Drop for StopSignals {
+    fn drop(&mut self) {
+        // SAFETY: restores the mask saved by `hold`.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.previous, std::ptr::null_mut()) };
+    }
+}
+
+/// rename(2) that fails if `to` exists (RENAME_NOREPLACE), so an output
+/// created after the checks is never replaced.
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(std::io::Error::other);
+    let (from, to) = (c(from)?, c(to)?);
+    // SAFETY: two valid NUL-terminated paths relative to the cwd.
+    let rc = unsafe { libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE) };
+    if rc == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
     OpenOptions::new()
         .write(true)
@@ -365,17 +458,19 @@ fn run(args: &[String]) -> Result<(), String> {
     let text = std::fs::read_to_string(&template).map_err(|e| format!("{template}: {e}"))?;
     let d = generate(&text, peers, &endpoint, rp_endpoint.as_deref())?;
 
-    std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    write_private(&dir.join("gateway.toml"), d.config.as_bytes())?;
-    write_private(&dir.join(GATEWAY_RP_PUBLIC), &d.gateway_rp_public[..])?;
-    write_private(&dir.join("secrets.bin"), &d.blob[..])?;
-    write_private(&dir.join("pqkey-secrets.bin"), &d.pq_blob[..])?;
-    for (i, p) in d.peers.iter().enumerate() {
-        write_private(&dir.join(format!("peer-{i}.conf")), p.wg_conf.as_bytes())?;
-        write_private(&dir.join(format!("peer-{i}.rosenpass.toml")), p.rp_toml.as_bytes())?;
-        write_private(&dir.join(peer_rp_public(i)), &p.rp_public[..])?;
-        write_private(&dir.join(format!("peer-{i}.rp.sk")), &p.rp_secret[..])?;
-    }
+    stage_and_publish(&dir, |stage| {
+        write_private(&stage.join("gateway.toml"), d.config.as_bytes())?;
+        write_private(&stage.join(GATEWAY_RP_PUBLIC), &d.gateway_rp_public[..])?;
+        write_private(&stage.join("secrets.bin"), &d.blob[..])?;
+        write_private(&stage.join("pqkey-secrets.bin"), &d.pq_blob[..])?;
+        for (i, p) in d.peers.iter().enumerate() {
+            write_private(&stage.join(format!("peer-{i}.conf")), p.wg_conf.as_bytes())?;
+            write_private(&stage.join(format!("peer-{i}.rosenpass.toml")), p.rp_toml.as_bytes())?;
+            write_private(&stage.join(peer_rp_public(i)), &p.rp_public[..])?;
+            write_private(&stage.join(format!("peer-{i}.rp.sk")), &p.rp_secret[..])?;
+        }
+        Ok(())
+    })?;
     println!("mksecrets: wrote {} ({} peers)", dir.display(), peers);
     Ok(())
 }
