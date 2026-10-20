@@ -86,12 +86,9 @@ impl Audit {
     /// was coalesced away or the ring was full).
     pub fn record_delivered(&mut self, ev: Event) -> bool {
         let ring = &mut self.ring;
-        let mut delivered = false;
+        let (offered, delivered) = self.coalescer.record_delivered(ev, |r| ring.push(r).is_ok());
         // Notify on every offer, including a full ring (see Coalescer::record).
-        self.pending |= self.coalescer.record(ev, |r| {
-            delivered = ring.push(r).is_ok();
-            delivered
-        });
+        self.pending |= offered;
         delivered
     }
 

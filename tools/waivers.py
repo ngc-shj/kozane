@@ -13,7 +13,14 @@ a missing or unreadable file, invalid TOML, or anything outside the schema
 
 `required_open(lock_text)` names the waivers a Cargo.lock obliges to stay
 open: SC23 while any classic-mceliece-rust is locked, whatever its version
-(a version bump does not make cmr audited).
+(a version bump does not make cmr audited). A lock that is not a non-empty
+array of `[[package]]` tables with string names raises `WaiverError`, so a
+malformed lock refuses instead of requiring nothing.
+
+Known bypass (declared, not adjudicated): the binding is by crate name in
+Cargo.lock. A McEliece implementation vendored or forked under another name
+would not hold SC23 open; SC23 closes only through M4's disassembly check
+of the pqkey ELF (C8 spike, requirement (c)), not through this rule.
 """
 
 import pathlib
@@ -80,7 +87,12 @@ def required_open(lock_text: str) -> set:
         lock = tomllib.loads(lock_text)
     except tomllib.TOMLDecodeError as e:
         raise WaiverError(f"Cargo.lock is not valid TOML: {e}") from None
-    names = {p.get("name") for p in lock.get("package", []) if isinstance(p, dict)}
+    packages = lock.get("package")
+    if not isinstance(packages, list) or not packages:
+        raise WaiverError("Cargo.lock has no [[package]] tables")
+    if not all(isinstance(p, dict) and isinstance(p.get("name"), str) for p in packages):
+        raise WaiverError("Cargo.lock has a [[package]] entry without a string name")
+    names = {p["name"] for p in packages}
     return {w for name, w in BOUND.items() if name in names}
 
 

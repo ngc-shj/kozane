@@ -635,3 +635,14 @@ The full record is in the code review's Resolution Status. Deviations from the p
   - F3: the per-source meter keyed by IP (M3b);
   - T4: wireguard-go's own use of a rotated PSK.
 - **Reboot red-proof:** none. The PSK table lives in PD RAM, and no code path persists it.
+
+### C8 addendum: the co-resident channel (code review Round 2, S-8)
+- **Gap in the decision rule above:** it weighs only remote observability over RespHello latency. A co-resident observer is far finer.
+  - `pqkey` is passive and runs on pq's scheduling context: 500 µs per 10 ms. Each decapsulation is therefore preempted thousands of times.
+  - The network-facing `eth_in` (priority 150) shares the single core and its L1D (L11), and packet arrivals can make it preempt `pqkey` at chosen moments.
+  - F1's `csel`-selected load from `t[]` or `b[]` is the access pattern an L1D prime+probe recovers. A compromised driver therefore observes it at cache-line granularity.
+- **Why dev-only acceptance still holds:** this channel belongs to the architecture's accepted R3 (single-core shared caches), and the gate stands as before. While SC23 is open:
+  - a non-debug kernel is refused;
+  - SC23 cannot close while any cmr is locked (P6 and `check_bindings`).
+- **What the dudect result says about it:** nothing.
+- **M4 requirement (c) is widened, and (b) likewise:** the disassembly check must reject secret-fed load and store addresses, not only conditional branches. The ctgrind-style test must flag secret-dependent addresses.

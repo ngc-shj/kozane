@@ -1,6 +1,6 @@
 # Code Review: secureos-m3-rosenpass
 Date: 2026-10-20
-Review round: 1
+Review round: 2
 Branch: feature/m3-rosenpass, `5b406c4..ab933ee` (M3 base is the M2.5 tip; `main` is several milestones behind)
 
 ## Changes from Previous Round
@@ -270,7 +270,121 @@ None. Every finding cites a file:line with evidence.
 - **`make check`:** exit 0 in 619 s. UNIT-TESTS 652, CHECK-PINS-RULES 10, CHECK-PINS-FIXTURES 69, PACKAGE-FIXTURES 89, KANI-HARNESSES 48, INTEGRATION-CASES 22.
 - **New and reworked selftest cases:** each fails with its failure-only needle.
   - `integration-rp-src-meter`
-  - `integration-rotation`: its needle is the rotation case's own "used another key than the restart's first". With the mutant, hs keeps the old PSK, which opens.
+  - `integration-rotation`: it went red, but Round 2 (testing N1) showed the explanation recorded here was wrong. The harness tries only the current key_out, never the old PSK. The needle fired only when the 180 s expiry and the 120 s client rekey happened to line up. The case was reworked in Round 2.
   - `integration-expiry`
   - `package-waiver-removed`
   - `rp-mac-always`
+
+# Round 2
+
+## Functionality Findings (Round 2)
+F1-F6, S-1..S-4: resolved; F3/T4 Accepted reasoning sound.
+N1 [Minor] policy/waivers.toml:7-8 and plan Packaging row (plan.md:285) still describe the SC23 binding as cmr 2.0.2 only.
+N2 [Minor] required_open skips malformed package entries (isinstance filter) — Round 1 failed closed via AttributeError; check-pins misses UnicodeDecodeError — tools/waivers.py:83. (overlaps S-5)
+N3 [Adjacent][Minor] by-value secret copies outside P10 (kem.rs:104,106; pds/key/src/main.rs:59). (overlaps S-7)
+N4 [Adjacent][Minor] T3 precondition excludes stale lines only before the mark; a concurrent post-mark stale line still satisfies the needle — run.py:1130-1135.
+```json
+[{"id":"N1","severity":"Minor","title":"waivers.toml and plan Packaging row still say cmr 2.0.2","file":"policy/waivers.toml","line":8,"adjacent":false,"escalate":null},
+{"id":"N2","severity":"Minor","title":"required_open skips malformed lock entries; check-pins misses UnicodeDecodeError","file":"tools/waivers.py","line":83,"adjacent":false,"escalate":null},
+{"id":"N3","severity":"Minor","title":"By-value secret copies outside P10","file":"crates/rosenpass-core/src/kem.rs","line":106,"adjacent":true,"escalate":null},
+{"id":"N4","severity":"Minor","title":"T3 precondition only excludes pre-mark stale lines","file":"tests/integration/run.py","line":1133,"adjacent":true,"escalate":null}]
+```
+
+## Security Findings (Round 2)
+S-1..S-4: resolved. Regressions F4/F5/F6/T1-T3: none. R43: no widening.
+S-5 [Minor] check_bindings/required_open pass on a structurally empty lock (""/"version = 4"/no [[package]] array) and delegate an unusable waiver file to check_waivers — tools/waivers.py:76-84, tools/package:102-116. Fail-open only when tools/package is run directly on prebuilt ELFs (cargo --locked rejects such a lock on the make path).
+S-6 [Minor] SC23 binding is a crate-name deny-list on Cargo.lock, not tied to the packaged ELFs — tools/waivers.py:25.
+S-7 [Minor] Residual by-value secret copies — rosenpass-core/src/kem.rs:105-106 (kyber `*r.expose()`, `Secret::from_bytes(ss)`), pds/key/src/main.rs:59 (`Key32::from_bytes(seed)`, seed not zeroized), hs-core/src/index.rs:34; pds/key, pds/hs, pds/data not in P10's crate list.
+S-8 [Minor] C8 dev-only acceptance omits the co-resident L1D channel amplified by pqkey's MCS budget slicing (R3) — deviation log, C8 §3.
+[Adjacent] P6 does not catch UnicodeDecodeError on Cargo.lock (fails closed via traceback).
+```json
+[{"id":"S-5","severity":"Minor","title":"check_bindings passes on structurally empty lock; delegates unusable waiver file","file":"tools/waivers.py","line":76,"adjacent":false,"escalate":false},
+{"id":"S-6","severity":"Minor","title":"SC23 binding is a crate-name deny-list, not bound to packaged ELFs","file":"tools/waivers.py","line":25,"adjacent":false,"escalate":false},
+{"id":"S-7","severity":"Minor","title":"Residual by-value secret copies outside P10","file":"crates/rosenpass-core/src/kem.rs","line":105,"adjacent":false,"escalate":false},
+{"id":"S-8","severity":"Minor","title":"C8 acceptance omits co-resident L1D channel (R3)","file":"docs/archive/review/secureos-m3-rosenpass-deviation.md","line":null,"adjacent":false,"escalate":false}]
+```
+
+## Testing Findings (Round 2)
+T1, T3, T5, T7–T11, F5, S-1 and S-2 resolved. T2 partial (N3). S-4 partial (N2). T6 rotation continuing (N1).
+N1 [Major] The integration-rotation red-proof depended on timing, and its mechanism was misdescribed — tools/check-selftest:166-173, run.py:1108-1114.
+N2 [Major] The Hedged tests did not pin the RNDR/counter mixing — rosenpass-core/src/tests.rs:342-383.
+N3 [Minor] `refused_at`, judged by a 2 s timeout, was not a proven lower bound; the None case let the expiry mutant survive — run.py:951-956.
+N4 [Minor] The Kani `!=` assertion on the per-source table could be satisfied by inserting a slot without a spend — ingress-core/src/proofs.rs:514.
+N5 [Minor] `pdkit::Audit::record_delivered` was untested — pdkit/src/lib.rs:87.
+N6 [Minor] `check_bindings` had no fixture on a release kernel — test_package.py.
+```json
+[{"id":"N1","severity":"Major","title":"integration-rotation red-proof timing-dependent","file":"tools/check-selftest","line":166,"adjacent":false,"escalate":null},
+{"id":"N2","severity":"Major","title":"Hedged tests do not pin RNDR/counter mixing","file":"crates/rosenpass-core/src/tests.rs","line":342,"adjacent":false,"escalate":null},
+{"id":"N3","severity":"Minor","title":"refused_at not a proven lower bound","file":"tests/integration/run.py","line":951,"adjacent":false,"escalate":null},
+{"id":"N4","severity":"Minor","title":"Kani src != satisfiable without a spend","file":"crates/ingress-core/src/proofs.rs","line":514,"adjacent":false,"escalate":null},
+{"id":"N5","severity":"Minor","title":"record_delivered untested","file":"crates/pdkit/src/lib.rs","line":87,"adjacent":false,"escalate":null},
+{"id":"N6","severity":"Minor","title":"check_bindings lacks a release fixture","file":"tests/tools/test_package.py","line":718,"adjacent":false,"escalate":null}]
+```
+
+## Resolution Status (Round 2)
+
+### Rotation red-proof and Hedged mixing (testing N1, N2 — Major)
+- **N1 — Fixed.**
+  - Precondition: before the restart, a forced handshake with the current key_out must open, so hs holds a Live entry installed within one 120 s client rekey interval.
+  - The rotation then tries only the restart's first key, so it must supersede that Live entry.
+  - Failure messages: "rotation: the current key did not open before the restart" / "rotation: hs did not accept the restart's first key".
+  - check-selftest now accepts a tuple of failure-only needles; `integration-rotation` uses both. Under the mutant one of them fires, depending on whether a rekey happened since the prelude.
+- **N2 — Fixed.** New tests:
+  - `hedged_output_depends_on_rndr`
+  - `hedged_output_depends_on_the_counter`
+  - `hedged_fails_the_whole_draw_when_rndr_fails_on_a_later_block`
+  - Red-proved: dropping RNDR, or the counter, from the hash fails its test.
+
+### Waiver binding (security S-5, S-6; functionality N1, N2; testing N6 — Minor)
+- **S-5 / N2 — Fixed.**
+  - `required_open` raises `WaiverError` unless `package` is a non-empty array of tables with string names, so a malformed lock refuses. This restores Round 1's fail-closed behaviour; the Round 1 `isinstance` filter had failed open.
+  - check-pins P6 also catches `UnicodeDecodeError`.
+  - Fixtures:
+    - package: an empty lock, and `[package]` as a single table, each refuse;
+    - P6: a lock without `[[package]]`.
+  - Red-proved by restoring the lenient filter.
+  - Kept: `check_bindings` still leaves an unusable waiver file to `check_waivers`. The two always run together in `tools/package` main, so the refusal is present; the docstring says so (functionality R2 found this sound).
+- **N6 — Fixed.**
+  - Fixture: SC20 stubbed, a non-debug kernel, SC23 closed with cmr locked → `SC23_BOUND`.
+  - Red-proved by making `check_bindings` debug-only.
+- **S-6 — Fixed (declared).** The crate-name binding's known bypass (a vendored or renamed McEliece) is declared in waivers.py. SC23 closes only through M4's disassembly check, not through this rule.
+- **N1 (functionality) — Fixed.** `policy/waivers.toml` and the plan's Packaging row now describe the binding as any `classic-mceliece-rust`, enforced by P6 and `check_bindings`.
+
+### Remaining by-value copies (security S-7, functionality N3 — Minor) — Fixed
+- **Sites:**
+  - `kem.rs`: Kyber `ss` now uses `copy_from`.
+  - `pds/key`: the boot seed is copied in place and zeroed.
+  - `hs-core/index.rs`: the index key's hash is copied in place and zeroed.
+  - libcrux's by-value randomness argument is documented inline as dependency residue.
+- **P10:** its scope gains pds/key, pds/hs and pds/data. Its declared bypasses include `from_bytes(local)` and dependency-forced copies.
+
+### Co-resident channel in the C8 acceptance (security S-8 — Minor) — Fixed
+- The deviation log's "C8 addendum" covers it:
+  - the L1D prime+probe path through pqkey's MCS budget slicing, under R3;
+  - the dudect result's irrelevance to that path;
+  - M4 requirements (b) and (c) widened to secret-dependent addresses.
+- The plan's SC3 row is updated.
+
+### Test bounds (testing N3, N4, N5; functionality N4 — Minor)
+- **N3 — Fixed.**
+  - `installed()` judges a refusal by `REPLY_TIMEOUT_S`, the suite's reply budget, not the 2 s retry.
+  - The expiry case requires the install window [max(last refused send, key_out mtime), accepted] to be narrower than EXPIRY_ALLOW_S (10 s), and otherwise fails with a named precondition. Failing when the first attempt opened was tried first, but it failed clean runs. Since the Round 1 meters, the install follows key_out within milliseconds, so key_out's mtime is itself a tight lower bound.
+- **N4 (testing) — Fixed.** The Kani harness asserts that the source's own slot level fell by exactly one interval, through `spec_src_level`, where a new source counts as full.
+- **N5 — Fixed.**
+  - `Coalescer::record_delivered` returns (offered, delivered) and is host-tested for a delivered record, a full ring, and an event coalesced away.
+  - pdkit only calls it.
+  - Red-proved: an always-true variant fails the test.
+- **N4 (functionality) — Accepted with reasoning in code.**
+  - Anti-Deferral check: acceptable risk.
+  - Worst case: a stale line from another case after the mark satisfies the needle. The probe's own no-response deny check still holds.
+  - Likelihood: none in the current suite. Only the probe uses peer 1, and peer 0's freshness is shown by the rotation precondition.
+  - Cost to fix: a per-peer stale event, which is not in the audit schema.
+
+### Found while fixing: PD clippy was not gated
+- `cargo clippy -D warnings` on each PD found `wrong_self_convention` in pds/ingress (`to_peer`, `from_*`, partly from M2.5) and in pds/inner (`from_lan`, `from_tunnel`). They were renamed `send_to_peer` / `drain_*`.
+- **New gate `lint-pds`:** clippy on each PD as it is built, one invocation per PD. It is counted as `LINT-PDS 11`, runs in `make check`, and has selftest case `lint-pds`.
+
+### Verification (Round 2 fixes)
+- **`make check`:** exit 0 in 635 s. UNIT-TESTS 656, LINT-PDS 11, CHECK-PINS-FIXTURES 70, PACKAGE-FIXTURES 92, INTEGRATION-CASES 22.
+- **Selftest cases:** `integration-rotation`, `integration-expiry` and `lint-pds` each fail with their failure-only needles.
+- **Scratch red-proofs:** lenient lock, debug-only bindings, Hedged without RNDR or counter, and always-true `record_delivered`. Each fails its own test.

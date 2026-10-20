@@ -52,11 +52,13 @@ fn init() -> Key {
     if !cpu::fill_random(&mut samples) {
         halt("RNDR unavailable");
     }
-    let seed = crypto::hash(&[blob.boot_seed(), &samples, &cpu::cntpct().to_le_bytes()])
+    let mut seed = crypto::hash(&[blob.boot_seed(), &samples, &cpu::cntpct().to_le_bytes()])
         .unwrap_or_else(|_| halt("boot seed derivation failed"));
     samples.fill(0);
+    let seed_key = Key32::copy_from(&seed);
+    seed.fill(0);
     debug_println!("key: secrets valid ({} peers)", blob.peer_count());
-    Key { oracle: Oracle::new(blob, Key32::from_bytes(seed)), bucket: Bucket::new(KEY_BURST, KEY_INTERVAL_NS) }
+    Key { oracle: Oracle::new(blob, seed_key), bucket: Bucket::new(KEY_BURST, KEY_INTERVAL_NS) }
 }
 
 impl Handler for Key {

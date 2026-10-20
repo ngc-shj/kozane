@@ -102,8 +102,10 @@ impl Encaps<EPK_LEN, ECT_LEN> for Kyber512 {
         use libcrux_ml_kem::{kyber512, mlkem512::MlKem512PublicKey};
         let mut r = Secret::<32>::zero();
         rng.fill(r.expose_mut()).map_err(|_| EncapsError::Rng)?;
+        // libcrux takes the randomness by value; that copy is inside its
+        // call (the dependency residue the deviation log records).
         let (ct, mut ss) = kyber512::encapsulate(&MlKem512PublicKey::from(pk), *r.expose());
-        let shk = Secret::from_bytes(ss);
+        let shk = Secret::copy_from(&ss);
         zeroize::Zeroize::zeroize(&mut ss);
         Ok((*ct.as_slice(), shk))
     }

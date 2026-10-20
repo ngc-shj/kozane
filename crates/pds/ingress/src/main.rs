@@ -281,7 +281,7 @@ impl Ingress {
     }
 
     /// Whether the datagram, from our port `sport`, was handed to `eth_out`.
-    fn to_peer(&mut self, sport: u16, dst: Endpoint, payload: &[u8], wake: &mut Wake) -> bool {
+    fn send_to_peer(&mut self, sport: u16, dst: Endpoint, payload: &[u8], wake: &mut Wake) -> bool {
         match emit_udp(&CONFIG, sport, dst, payload, &mut self.reply) {
             Ok(n) => {
                 let frame = self.reply.get(..n).unwrap_or(&[]);
@@ -296,7 +296,7 @@ impl Ingress {
         }
     }
 
-    fn from_outside(&mut self, wake: &mut Wake, max: usize) -> usize {
+    fn drain_outside(&mut self, wake: &mut Wake, max: usize) -> usize {
         drain(max, || self.outside_one(wake))
     }
 
@@ -382,7 +382,7 @@ impl Ingress {
             Outcome::CookieReply { dst, len } => {
                 // Public bytes: the cookie inside is sealed.
                 let cookie = self.cookie;
-                if self.to_peer(CONFIG.port, dst, cookie.get(..len).unwrap_or(&[]), wake) {
+                if self.send_to_peer(CONFIG.port, dst, cookie.get(..len).unwrap_or(&[]), wake) {
                     self.audit.record(Event::WgCookieSent);
                 }
                 None
@@ -440,7 +440,7 @@ impl Ingress {
         true
     }
 
-    fn from_pq(&mut self, wake: &mut Wake, max: usize) -> usize {
+    fn drain_pq(&mut self, wake: &mut Wake, max: usize) -> usize {
         drain(max, || self.pq_one(wake))
     }
 
@@ -474,11 +474,11 @@ impl Ingress {
             self.audit.record(Event::TxNoBuffer);
             return true;
         }
-        self.to_peer(CONFIG.rp_port, dst, payload.get(..plen).unwrap_or(&[]), wake);
+        self.send_to_peer(CONFIG.rp_port, dst, payload.get(..plen).unwrap_or(&[]), wake);
         true
     }
 
-    fn from_hs(&mut self, wake: &mut Wake, max: usize) -> usize {
+    fn drain_hs(&mut self, wake: &mut Wake, max: usize) -> usize {
         drain(max, || self.hs_one(wake))
     }
 
@@ -491,11 +491,11 @@ impl Ingress {
             return true;
         };
         let (dst, payload) = (Endpoint { ip: r.dst.ip, port: r.dst.port }, *r.msg);
-        self.to_peer(CONFIG.port, dst, &payload, wake);
+        self.send_to_peer(CONFIG.port, dst, &payload, wake);
         true
     }
 
-    fn from_data(&mut self, wake: &mut Wake, max: usize) -> usize {
+    fn drain_data(&mut self, wake: &mut Wake, max: usize) -> usize {
         drain(max, || self.data_one(wake))
     }
 
@@ -528,7 +528,7 @@ impl Ingress {
                 return true;
             }
         };
-        self.to_peer(CONFIG.port, dst, payload.get(..plen).unwrap_or(&[]), wake);
+        self.send_to_peer(CONFIG.port, dst, payload.get(..plen).unwrap_or(&[]), wake);
         true
     }
 }
@@ -548,15 +548,15 @@ struct Pass<'a> {
 
 impl PassIo for Pass<'_> {
     fn serve_hs(&mut self, max: usize) -> usize {
-        self.ingress.from_hs(&mut self.wake, max)
+        self.ingress.drain_hs(&mut self.wake, max)
     }
 
     fn serve_pq(&mut self, max: usize) -> usize {
-        self.ingress.from_pq(&mut self.wake, max)
+        self.ingress.drain_pq(&mut self.wake, max)
     }
 
     fn serve_data(&mut self, max: usize) -> usize {
-        self.ingress.from_data(&mut self.wake, max)
+        self.ingress.drain_data(&mut self.wake, max)
     }
 
     fn tick(&mut self) {
@@ -564,7 +564,7 @@ impl PassIo for Pass<'_> {
     }
 
     fn serve_outside(&mut self, max: usize) -> usize {
-        self.ingress.from_outside(&mut self.wake, max)
+        self.ingress.drain_outside(&mut self.wake, max)
     }
 
     fn end_pass(&mut self) {

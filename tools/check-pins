@@ -27,7 +27,7 @@ Rules:
      `Zeroizing<` in rosenpass-core, pqkey-core, pds/pq or pds/pqkey (L12,
      M3 plan S12; pqkey-core holds its secrets in `Zeroizing`)
   P10 no `from_bytes(*` in the secret crates or in hs-core, key-core,
-     data-core and wg-core: a dereferenced array is a by-value temporary of
+     data-core, wg-core and the key, hs and data PDs: a dereferenced array is a by-value temporary of
      the secret left on the stack; `copy_from(&..)` copies in place (L12)
 
 Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
@@ -49,8 +49,10 @@ P7-P10 are best-effort tripwires over source text. Known bypasses: a
 hand-written `impl Debug`/`impl Clone` or a macro-generated derive (P9), a
 `use ... as` alias or a renamed dependency key (`package = "getrandom"`)
 (P8), spellings outside the pattern (P7), and any by-value copy not
-spelled `from_bytes(*` (P10; safe Rust cannot observe stack residue, so
-nothing adjudicates it). The adjudicating control for
+spelled `from_bytes(*` (P10: `from_bytes(local)` of a secret array, or a
+copy a dependency's by-value API forces, such as libcrux's encapsulation
+randomness; safe Rust cannot observe stack residue, so nothing
+adjudicates it). The adjudicating control for
 L12 is the compiler: `Secret<N>` is not Clone/Copy/Debug, so a derive on a
 type wrapping it does not build; `Zeroizing<[u8; N]>` is Clone, so P9 is
 the only guard for pqkey-core's wrappers. L8's adjudicating control is
@@ -69,7 +71,8 @@ import waivers  # noqa: E402
 
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10"]
 # Crates whose secrets must not be copied by value (P10).
-COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core"]
+COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core",
+               "crates/pds/key", "crates/pds/hs", "crates/pds/data"]
 PENDING: set[str] = set()
 # Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
 SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey"]
@@ -188,7 +191,7 @@ def check_waivers(root: pathlib.Path, out: list):
         return
     try:
         required = waivers.required_open((root / "Cargo.lock").read_text())
-    except (OSError, waivers.WaiverError) as e:
+    except (OSError, UnicodeDecodeError, waivers.WaiverError) as e:
         out.append(f"P6 Cargo.lock: cannot read: {e}")
         return
     for wid in waivers.unmet(required, listed):

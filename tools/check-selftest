@@ -65,6 +65,7 @@ CASES_FOR_GATE = {
     # pins runs the package checker fixtures; package-release drives the real target.
     "pins": {"pins", "package-release", "package-waiver", "package-waiver-removed"},
     "lint": {"lint"},
+    "lint-pds": {"lint-pds"},
     "unit": {"unit", "c5-forward-burst", "c5-backlog", "c5-interval", "c5-key-calls",
              "arrival-interval-order", "arrival-burst-order", "late-notify", "unbounded-drain",
              "rotate-before-max-age", "net-buffers-equal", "l8-stale", "l8-expiry-tick", "l8-order",
@@ -113,6 +114,8 @@ def check_gates(text: str = "") -> list:
 # layer -> (make targets, injection, text that must appear in the output)
 # A case passes when make FAILS and prints the needle, unless listed in
 # EXPECT_SUCCESS, where make must SUCCEED, print the needle and not ABSENT.
+# A tuple of needles matches when any one is printed (a mutant that one of
+# several failure-only checks must catch, depending on run timing).
 CASES = {
     "unit": (["unit"], lambda t: append(t, "crates/wire/src/tests.rs", UNIT_TEST), "selftest_injected_failure"),
     # Only ring: the injection invalidates every proof cache entry, and
@@ -143,6 +146,10 @@ CASES = {
     "stale-counts": (["clean-counts", "manifest"], lambda t: None, "missing (gate did not run)"),
     "lint": (["lint"], lambda t: append(t, "crates/wire/src/lib.rs",
                                         "\npub fn selftest_lint(b: &[u8]) -> u8 {\n    b[0]\n}\n"), "indexing"),
+    # A PD-only lint violation (target code host clippy never builds).
+    "lint-pds": (["lint-pds"], lambda t: append(t, "crates/pds/timer/src/main.rs",
+                                                "\nfn selftest_lint_pd(b: &[u8]) -> u8 {\n    b[0]\n}\n"),
+                 "selftest_lint_pd"),
     "laws": (["laws"], lambda t: edit(t, "system/secureos.system", "</system>", "    <selftest_unknown />\n</system>"), "L4"),
     "pins": (["pins"], lambda t: edit(t, "Makefile", "\trm -rf $(BUILD)", "\t-rm -rf $(BUILD)"), "P5"),
     "integration": (["test"], lambda t: edit(t, "tests/integration/run.py",
@@ -168,7 +175,8 @@ CASES = {
                                                       "        if !matches!(entry, Entry::Live { .. }) {\n"
                                                       "            *entry = Entry::Live { osk: Key32::copy_from(osk), installed_at: now_ns };\n"
                                                       "        }\n"),
-                             "rotation: the accepted handshake used another key than the restart's first"),
+                             ("rotation: the current key did not open before the restart",
+                              "rotation: hs did not accept the restart's first key")),
     "integration-expiry": (["test"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                                     "if now_ns.saturating_sub(*installed_at) < REJECT_AFTER_TIME_NS =>",
                                                     "if now_ns.saturating_sub(*installed_at) < REJECT_AFTER_TIME_NS - 20_000_000_000 =>"),
@@ -472,11 +480,12 @@ def run_case(name: str) -> bool:
         # Gates write their tool output to build/counts/*.log.
         for log in sorted((tree / "build/counts").glob("*.log")):
             text += log.read_text(errors="replace")
+    found = any(n in text for n in (needle if isinstance(needle, tuple) else (needle,)))
     if name in EXPECT_SUCCESS:
-        ok = out.returncode == 0 and needle in text and ABSENT[name] not in text
+        ok = out.returncode == 0 and found and ABSENT[name] not in text
     else:
-        ok = out.returncode != 0 and needle in text
-    print(f"{'ok  ' if ok else 'FAIL'} {name}: exit={out.returncode} needle={needle!r} found={needle in text}")
+        ok = out.returncode != 0 and found
+    print(f"{'ok  ' if ok else 'FAIL'} {name}: exit={out.returncode} needle={needle!r} found={found}")
     if not ok:
         print(text[-3000:])
     return ok

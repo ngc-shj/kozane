@@ -341,29 +341,58 @@ fn mceliece460896_encapsulation_fails_closed_without_randomness() {
 
 struct FakeHedgeHw {
     rndr: Option<u64>,
+    counter: u64,
+    /// RNDR reads that succeed before it fails (None: never fails).
+    good_reads: Option<usize>,
+}
+
+impl FakeHedgeHw {
+    fn new(rndr: Option<u64>) -> Self {
+        Self { rndr, counter: 0, good_reads: None }
+    }
 }
 
 impl crate::HedgeHw for FakeHedgeHw {
     fn rndr(&mut self) -> Option<u64> {
-        self.rndr
+        match &mut self.good_reads {
+            Some(0) => None,
+            Some(n) => {
+                *n -= 1;
+                self.rndr
+            }
+            None => self.rndr,
+        }
     }
 
     fn counter(&mut self) -> u64 {
-        0
+        self.counter
     }
+}
+
+fn hedged_block(seed: u8, hw: FakeHedgeHw) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    crate::Hedged::new(Secret::from_bytes([seed; 32]), hw).fill(&mut out).unwrap();
+    out
 }
 
 #[test]
 fn hedged_fails_the_draw_without_rndr() {
-    let mut h = crate::Hedged::new(Secret::from_bytes([1; 32]), FakeHedgeHw { rndr: None });
+    let mut h = crate::Hedged::new(Secret::from_bytes([1; 32]), FakeHedgeHw::new(None));
     assert_eq!(h.fill(&mut [0u8; 40]), Err(RngError));
+}
+
+#[test]
+fn hedged_fails_the_whole_draw_when_rndr_fails_on_a_later_block() {
+    let hw = FakeHedgeHw { good_reads: Some(1), ..FakeHedgeHw::new(Some(7)) };
+    let mut h = crate::Hedged::new(Secret::from_bytes([1; 32]), hw);
+    assert_eq!(h.fill(&mut [0u8; 64]), Err(RngError));
 }
 
 #[test]
 fn hedged_blocks_differ_with_identical_hardware_inputs() {
     // Same RNDR and counter every time: only the draw counter separates
     // the blocks, so they must still differ (and be nonzero).
-    let mut h = crate::Hedged::new(Secret::from_bytes([1; 32]), FakeHedgeHw { rndr: Some(7) });
+    let mut h = crate::Hedged::new(Secret::from_bytes([1; 32]), FakeHedgeHw::new(Some(7)));
     let (mut a, mut b) = ([0u8; 64], [0u8; 64]);
     h.fill(&mut a).unwrap();
     h.fill(&mut b).unwrap();
@@ -374,10 +403,17 @@ fn hedged_blocks_differ_with_identical_hardware_inputs() {
 
 #[test]
 fn hedged_output_depends_on_the_boot_seed() {
-    let mut x = crate::Hedged::new(Secret::from_bytes([1; 32]), FakeHedgeHw { rndr: Some(7) });
-    let mut y = crate::Hedged::new(Secret::from_bytes([2; 32]), FakeHedgeHw { rndr: Some(7) });
-    let (mut a, mut b) = ([0u8; 32], [0u8; 32]);
-    x.fill(&mut a).unwrap();
-    y.fill(&mut b).unwrap();
-    assert_ne!(a, b);
+    assert_ne!(hedged_block(1, FakeHedgeHw::new(Some(7))), hedged_block(2, FakeHedgeHw::new(Some(7))));
+}
+
+#[test]
+fn hedged_output_depends_on_rndr() {
+    // A known seed must not make the output predictable while RNDR is sound.
+    assert_ne!(hedged_block(1, FakeHedgeHw::new(Some(7))), hedged_block(1, FakeHedgeHw::new(Some(8))));
+}
+
+#[test]
+fn hedged_output_depends_on_the_counter() {
+    let late = FakeHedgeHw { counter: 1, ..FakeHedgeHw::new(Some(7)) };
+    assert_ne!(hedged_block(1, FakeHedgeHw::new(Some(7))), hedged_block(1, late));
 }

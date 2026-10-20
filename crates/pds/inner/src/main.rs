@@ -89,7 +89,7 @@ fn lan_config(neighbors: &[([u8; 4], [u8; 6])]) -> Config<'_> {
 
 impl Inner {
 
-    fn from_lan(&mut self, wake: &mut Wake) {
+    fn drain_lan(&mut self, wake: &mut Wake) {
         while let Some(n) = pdkit::recv(&mut self.from_driver, &mut self.buf, &mut self.audit) {
             wake.driver = true;
             let cfg = lan_config(self.neighbors.get(..self.neighbor_count).unwrap_or(&[]));
@@ -114,7 +114,7 @@ impl Inner {
         }
     }
 
-    fn from_tunnel(&mut self, wake: &mut Wake) {
+    fn drain_tunnel(&mut self, wake: &mut Wake) {
         while let Some(n) = pdkit::recv(&mut self.from_data, &mut self.buf, &mut self.audit) {
             wake.data = true;
             let cfg = lan_config(self.neighbors.get(..self.neighbor_count).unwrap_or(&[]));
@@ -137,8 +137,8 @@ impl Handler for Inner {
 
     fn notified(&mut self, _channels: ChannelSet) -> Result<(), Self::Error> {
         let mut wake = Wake::default();
-        self.from_tunnel(&mut wake);
-        self.from_lan(&mut wake);
+        self.drain_tunnel(&mut wake);
+        self.drain_lan(&mut wake);
         if wake.driver {
             ETH_IN.notify();
         }

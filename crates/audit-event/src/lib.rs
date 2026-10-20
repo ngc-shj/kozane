@@ -501,6 +501,19 @@ impl Coalescer {
         true
     }
 
+    /// `record`, also reporting whether a record reached the ring:
+    /// (offered, delivered). Delivered is false when the event was
+    /// coalesced away or `push` failed.
+    #[must_use]
+    pub fn record_delivered(&mut self, ev: Event, push: impl FnOnce(Record) -> bool) -> (bool, bool) {
+        let mut delivered = false;
+        let offered = self.record(ev, |r| {
+            delivered = push(r);
+            delivered
+        });
+        (offered, delivered)
+    }
+
     pub fn overflow(&self) -> u32 {
         self.overflow
     }

@@ -209,6 +209,12 @@ fn spec_level<const B: u64, const I: u64>(m: &Meter<B, I>, now: u64) -> u64 {
     (m.budget_ns as u128 + refill as u128).min((B * I) as u128) as u64
 }
 
+/// The level of `ip`'s slot in a per-source table; a source without a slot
+/// is full (a new slot starts full).
+fn spec_src_level<const N: usize, const B: u64, const I: u64>(t: &SourceMeters<N, B, I>, ip: Ipv4, now: u64) -> u64 {
+    t.slots.iter().flatten().find(|(i, _)| *i == ip).map_or(B * I, |(_, m)| spec_level(m, now))
+}
+
 fn spec_below_half<const B: u64, const I: u64>(m: &Meter<B, I>, now: u64) -> bool {
     2 * spec_level(m, now) < B * I
 }
@@ -494,10 +500,10 @@ fn rp_refusals_before_admission_spend_nothing() {
 }
 
 /// A forward went through its type's constructor: it spent exactly one
-/// token of its type's global meter, went through its type's per-source
-/// table (a spend, or a new slot that is then spent, changes it), touched
-/// no meter of the other type, and was counted once as in flight under its
-/// type.
+/// token of its type's global meter and exactly one of the source's own
+/// slot in its type's per-source table (a new source's slot starts full),
+/// touched no meter of the other type, and was counted once as in flight
+/// under its type.
 #[kani::proof]
 #[kani::unwind(20)]
 fn rp_forward_spends_its_own_meters_once() {
@@ -507,18 +513,23 @@ fn rp_forward_spends_its_own_meters_once() {
     let mut gate = any_rp_gate();
     let before = gate.clone();
     let now: u64 = kani::any();
-    let o = rp_classify(&mut gate, &AnyRpMac::default(), now, Endpoint { ip: kani::any(), port: kani::any() }, msg);
+    let ip: Ipv4 = kani::any();
+    let o = rp_classify(&mut gate, &AnyRpMac::default(), now, Endpoint { ip, port: kani::any() }, msg);
     match o {
         RpOutcome::ForwardHello { .. } => {
             assert!(spec_level(&gate.hello_global, now) + RP_HELLO_GLOBAL_INTERVAL_NS == spec_level(&before.hello_global, now));
-            assert!(gate.hello_src != before.hello_src);
+            assert!(
+                spec_src_level(&gate.hello_src, ip, now) + RP_HELLO_SRC_INTERVAL_NS == spec_src_level(&before.hello_src, ip, now)
+            );
             assert!(gate.conf_global == before.conf_global && gate.conf_src == before.conf_src);
             assert!(gate.in_flight.count(RpKind::Hello) == before.in_flight.count(RpKind::Hello) + 1);
             assert!(gate.in_flight.count(RpKind::Conf) == before.in_flight.count(RpKind::Conf));
         }
         RpOutcome::ForwardConf { .. } => {
             assert!(spec_level(&gate.conf_global, now) + RP_CONF_GLOBAL_INTERVAL_NS == spec_level(&before.conf_global, now));
-            assert!(gate.conf_src != before.conf_src);
+            assert!(
+                spec_src_level(&gate.conf_src, ip, now) + RP_CONF_SRC_INTERVAL_NS == spec_src_level(&before.conf_src, ip, now)
+            );
             assert!(gate.hello_global == before.hello_global && gate.hello_src == before.hello_src);
             assert!(gate.in_flight.count(RpKind::Conf) == before.in_flight.count(RpKind::Conf) + 1);
             assert!(gate.in_flight.count(RpKind::Hello) == before.in_flight.count(RpKind::Hello));

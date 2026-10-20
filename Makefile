@@ -25,7 +25,7 @@ host_crates := wire ring audit-event ingress-core inner-core layout laws config 
 kani_crates := wire ring ingress-core inner-core wg-wire msgs rosenpass-wire
 
 .PHONY: clean-counts
-.PHONY: all image package run test check check-selftest lint unit kani bolero fuzz-long laws pins manifest kernel-config clean
+.PHONY: all image package run test check check-selftest lint lint-pds unit kani bolero fuzz-long laws pins manifest kernel-config clean
 all: image
 
 $(counts):
@@ -117,6 +117,26 @@ lint: | $(counts)
 			        if m.get("reason") == "compiler-artifact"} & ws; print("LINT-CRATES", len(seen))' \
 			$(host_crates) > $(counts)/lint
 
+# PD code only compiles for the target, so host clippy never sees it: lint
+# each PD as it is built (one invocation per PD, as `pds`), counted.
+lint-pds: | $(counts)
+	rm -f $(counts)/lint-pds.log
+	$(foreach pd,$(pds),$(call clippy_pd,$(pd)) >> $(counts)/lint-pds.log 2>&1 \
+		|| { cat $(counts)/lint-pds.log; exit 1; }; echo "LINT-PD-OK $(pd)" >> $(counts)/lint-pds.log;)
+	awk '/^LINT-PD-OK/ { n++ } END { print "LINT-PDS", n + 0 }' $(counts)/lint-pds.log > $(counts)/lint-pds
+
+define clippy_pd
+SEL4_INCLUDE_DIRS=$(abspath $(sdk_config_dir)/include) \
+	RUSTFLAGS=-Zunstable-options \
+	cargo clippy --locked \
+		-Z build-std=core,alloc,compiler_builtins \
+		-Z build-std-features=compiler-builtins-mem \
+		--target $(target) \
+		--release \
+		--target-dir $(BUILD)/target-clippy \
+		-p pd-$(1) $(if $(features_$(1)),--features $(features_$(1))) -- -D warnings
+endef
+
 unit: | $(counts)
 	cargo test --locked $(foreach c,$(host_crates),-p $(c)) > $(counts)/unit.log 2>&1 \
 		|| { cat $(counts)/unit.log; exit 1; }
@@ -205,7 +225,7 @@ clean-counts:
 
 check:
 	$(MAKE) clean-counts
-	$(MAKE) pins lint unit kani bolero laws test
+	$(MAKE) pins lint lint-pds unit kani bolero laws test
 	$(MAKE) manifest
 
 # Requires a prior `make check` (the manifest case reuses build/counts).

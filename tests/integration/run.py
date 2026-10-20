@@ -933,22 +933,25 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         out.bind(("127.0.0.1", 0))
         out.settimeout(REPLY_TIMEOUT_S)
 
-        def installed(conf: str, rp: Rosenpass, deadline: float) -> tuple:
+        def installed(conf: str, rp: Rosenpass, deadline: float, key: bytes = None) -> tuple:
             """Handshakes with `rp`'s current key_out until the response
             opens: proof that pq's export reached hs (later exports are not
             printed). Returns the initiator and the initiation it sent; the
             initiator's `refused_at` is the send time of the last attempt that
             did not open (None if the first one did), a lower bound on the
-            install, since hs handled that attempt without the PSK."""
+            install, since hs handled that attempt without the PSK. With
+            `key`, only that PSK is tried."""
             refused_at = None
             while True:
-                psk = rp.osk()
+                psk = key if key is not None else rp.osk()
                 if psk is not None:
                     i = initiator(conf, psk)
                     msg = i.initiation(ts_offset_s=30)
                     sent = time.monotonic()
                     out.sendto(msg, ("127.0.0.1", hostfwd))
-                    r = wait_response(out, i, PSK_RETRY_S)
+                    # The suite's reply budget, so "no answer" means hs
+                    # refused it, not that the answer was slow.
+                    r = wait_response(out, i, REPLY_TIMEOUT_S)
                     if r is not None and i.consume_response(r):
                         i.psk_used = psk
                         i.refused_at = refused_at
@@ -1004,6 +1007,11 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         # The install is no earlier than the last refused attempt, nor than
         # key_out (written on RespHello, before the install).
         installed_after = max(good.refused_at or 0.0, rp1.written_at())
+        # The install lies in [installed_after, accepted_at]. The allow probe
+        # at installed_after + 170 s discriminates a PSK refused up to 10 s
+        # early only if that window is narrower than EXPIRY_ALLOW_S.
+        if accepted_at - installed_after >= EXPIRY_ALLOW_S:
+            raise Fail(f"expiry: install bound {accepted_at - installed_after:.1f} s wide; precondition broken")
         osk1 = good.psk_used
         # No rotation for peer 1 from here: the expiry case below.
         rp1.stop()
@@ -1105,13 +1113,23 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         pinger = Pinger()
         threads.append(pinger)
         start_without_stop_signals(pinger)
+        # Precondition: hs holds the client's current key, so it was
+        # installed within one client rekey interval (120 s) and is still
+        # Live when the restart's key arrives (within one exchange, < 180 s).
         old = rp0.osk()
+        i = initiator(peer0, old)
+        out.sendto(i.initiation(ts_offset_s=30), ("127.0.0.1", hostfwd))
+        r = wait_response(out, i, REPLY_TIMEOUT_S)
+        if r is None or not i.consume_response(r):
+            raise Fail("rotation: the current key did not open before the restart")
         rp0.start()
         deadline = time.monotonic() + RP_EXCHANGE_S
         new = rp0.wait_key(deadline, other_than=old)
-        forced, _ = installed(peer0, rp0, deadline)
-        if forced.psk_used != new:
-            raise Fail("rotation: the accepted handshake used another key than the restart's first")
+        # Only the restart's first key counts: it must supersede a Live entry.
+        try:
+            installed(peer0, rp0, time.monotonic() + RP_EXCHANGE_S, key=new)
+        except Fail:
+            raise Fail("rotation: hs did not accept the restart's first key") from None
         wg.wait_applied(new)
         pinger.stop = True
         pinger.join()
@@ -1129,6 +1147,9 @@ def test_wireguard(loader: str, deploy: str, passed: list):
             raise expiry["error"]
         # Coalesced: total=1 prints once per boot, so no earlier stale refusal
         # may have used it up (e.g. peer 0's prelude PSK during rotation).
+        # After the mark no other case can draw one: peer 1's only user is
+        # the probe, and peer 0's PSK is kept fresh by its running client
+        # (the rotation precondition shows hs holds its current key).
         stale = r"audit: src=hs HandshakePskStale total="
         if len(con.count(stale)) > len(con.count(stale, since=expiry["mark"])):
             raise Fail("expiry: a stale refusal before the probe used up the audit line; precondition broken")

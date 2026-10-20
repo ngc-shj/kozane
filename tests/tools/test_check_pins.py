@@ -154,6 +154,8 @@ CASES = [
      lambda t: (edit(t / "Cargo.lock", 'name = "classic-mceliece-rust"\nversion = "2.0.2"',
                      'name = "classic-mceliece-rust"\nversion = "2.0.3"'),
                 edit(t / "policy/waivers.toml", SC23, ""))),
+    ("P6 Cargo.lock without [[package]] tables", {"P6"},
+     lambda t: (t / "Cargo.lock").write_text("version = 4\n")),
     ("P6 waivers.toml missing", {"P6"}, lambda t: (t / "policy/waivers.toml").unlink()),
     ("P6 waivers.toml unparsable", {"P6"}, lambda t: edit(t / "policy/waivers.toml", SC23, SC23 + "status = \n")),
     ("P6 waiver status neither open nor closed", {"P6"},

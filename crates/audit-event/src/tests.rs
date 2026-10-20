@@ -378,3 +378,23 @@ fn a_delivered_cost_record_moves_the_mark() {
     });
     assert_eq!(offered, 0);
 }
+
+#[test]
+fn record_delivered_reports_what_reached_the_ring() {
+    let mut c = Coalescer::new();
+    let ev = Event::RpCostHighWater { us: 5 };
+    assert_eq!(c.record_delivered(ev, |_| true), (true, true));
+    assert_eq!(c.record_delivered(ev, |_| false), (true, false), "a full ring is offered, not delivered");
+    // A coalesced event between emissions is neither.
+    let co = Event::RpPskExported;
+    assert_eq!(c.record_delivered(co, |_| true), (true, true));
+    let mut pushed = false;
+    assert_eq!(
+        c.record_delivered(co, |_| {
+            pushed = true;
+            true
+        }),
+        (false, false)
+    );
+    assert!(!pushed, "a coalesced-away event is not offered to the ring");
+}
