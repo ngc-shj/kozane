@@ -33,7 +33,7 @@ impl Indices {
     pub fn new(boot_seed: &Key32) -> Result<Self, CryptoError> {
         let mut hash = crypto::hash(&[LABEL, boot_seed.as_bytes()])?;
         let key = Key32::copy_from(&hash);
-        hash.fill(0);
+        zeroize::Zeroize::zeroize(&mut hash);
         Ok(Self { key, counter: 0, exhausted: false })
     }
 

@@ -11,6 +11,7 @@ key-core = { path = "../key-core" }
 layout = { path = "../layout" }
 msgs = { path = "../msgs" }
 wg-core = { path = "../wg-core" }
+zeroize = { version = "=1.8.1", default-features = false }
 
 [dev-dependencies]
 secret-blob = { path = "../secret-blob" }

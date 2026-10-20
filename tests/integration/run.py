@@ -961,6 +961,40 @@ def test_wireguard(loader: str, deploy: str, passed: list):
                     raise Fail(f"peer {rp.peer}: no handshake with its key_out was accepted within {RP_EXCHANGE_S:.0f} s")
                 time.sleep(PSK_RETRY_S)
 
+        # Rotation without interruption, right after the prelude so that no
+        # other case depends on peer 0's entry first: wireguard-go pings
+        # throughout while peer 0's rosenpass restarts twice. Each restart's
+        # first key must be accepted by hs, superseding the entry, and the
+        # last is applied to wireguard-go. Restart 2's key arrives while
+        # restart 1's is provably Live (precondition below), so an hs that
+        # ignores supersession refuses one of the two, however old the
+        # prelude's entry is.
+        pinger = Pinger()
+        threads.append(pinger)
+        start_without_stop_signals(pinger)
+        old = rp0.wait_key(time.monotonic() + RP_EXCHANGE_S)
+        k1_at = None
+        for n in (1, 2):
+            rp0.start()
+            new = rp0.wait_key(time.monotonic() + RP_EXCHANGE_S, other_than=old)
+            if n == 2 and rp0.written_at() - k1_at >= reject_s - EXPIRY_SLACK_S:
+                # Restart 1's key was installed no earlier than k1_at.
+                raise Fail("rotation: restart 2 came too late to prove restart 1's key Live; precondition broken")
+            try:
+                installed(peer0, rp0, time.monotonic() + RP_EXCHANGE_S, key=new)
+            except Fail:
+                raise Fail(f"rotation: hs did not accept restart {n}'s first key") from None
+            k1_at = k1_at if n == 2 else rp0.written_at()
+            old = new
+        wg.wait_applied(new)
+        pinger.stop = True
+        pinger.join()
+        print(f"\nrotation: {pinger.lost} of {pinger.sent} pings lost", flush=True)
+        if pinger.lost > ROTATION_PING_LOSS or pinger.sent - pinger.lost < 1:
+            raise Fail(f"rotation: {pinger.lost} of {pinger.sent} pings lost, budget {ROTATION_PING_LOSS}")
+        passed.append("rotation without interruption")
+        print("\nPASS [rotation: new OSK accepted and applied, pings kept flowing]")
+
         # Case 2: peer 0's own key with a wrong PSK and a newer timestamp.
         mark = con.mark()
         bad = initiator(peer0, psk=b"\x42" * 32)
@@ -1107,38 +1141,6 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         passed.append("ttl expiry")
         print("\nPASS [TTL 1 dropped, TTL 2 forwarded at the inside hop]")
 
-        # Rotation without interruption: wireguard-go pings throughout while
-        # peer 0's rosenpass restarts; the new key is accepted by hs (a
-        # forced re-handshake with it opens) and applied to wireguard-go.
-        pinger = Pinger()
-        threads.append(pinger)
-        start_without_stop_signals(pinger)
-        # Precondition: hs holds the client's current key, so it was
-        # installed within one client rekey interval (120 s) and is still
-        # Live when the restart's key arrives (within one exchange, < 180 s).
-        old = rp0.osk()
-        i = initiator(peer0, old)
-        out.sendto(i.initiation(ts_offset_s=30), ("127.0.0.1", hostfwd))
-        r = wait_response(out, i, REPLY_TIMEOUT_S)
-        if r is None or not i.consume_response(r):
-            raise Fail("rotation: the current key did not open before the restart")
-        rp0.start()
-        deadline = time.monotonic() + RP_EXCHANGE_S
-        new = rp0.wait_key(deadline, other_than=old)
-        # Only the restart's first key counts: it must supersede a Live entry.
-        try:
-            installed(peer0, rp0, time.monotonic() + RP_EXCHANGE_S, key=new)
-        except Fail:
-            raise Fail("rotation: hs did not accept the restart's first key") from None
-        wg.wait_applied(new)
-        pinger.stop = True
-        pinger.join()
-        print(f"\nrotation: {pinger.lost} of {pinger.sent} pings lost", flush=True)
-        if pinger.lost > ROTATION_PING_LOSS or pinger.sent - pinger.lost < 1:
-            raise Fail(f"rotation: {pinger.lost} of {pinger.sent} pings lost, budget {ROTATION_PING_LOSS}")
-        passed.append("rotation without interruption")
-        print("\nPASS [rotation: new OSK accepted and applied, pings kept flowing]")
-
         probe_thread.join(timeout=max(0.0, accepted_at + reject_s + EXPIRY_SLACK_S + 2 * REPLY_TIMEOUT_S
                                       - time.monotonic()))
         if probe_thread.is_alive():
@@ -1148,8 +1150,8 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         # Coalesced: total=1 prints once per boot, so no earlier stale refusal
         # may have used it up (e.g. peer 0's prelude PSK during rotation).
         # After the mark no other case can draw one: peer 1's only user is
-        # the probe, and peer 0's PSK is kept fresh by its running client
-        # (the rotation precondition shows hs holds its current key).
+        # the probe, and peer 0's running client re-keys every 130 s, well
+        # inside REJECT_AFTER_TIME.
         stale = r"audit: src=hs HandshakePskStale total="
         if len(con.count(stale)) > len(con.count(stale, since=expiry["mark"])):
             raise Fail("expiry: a stale refusal before the probe used up the audit line; precondition broken")

@@ -146,10 +146,12 @@ CASES = {
     "stale-counts": (["clean-counts", "manifest"], lambda t: None, "missing (gate did not run)"),
     "lint": (["lint"], lambda t: append(t, "crates/wire/src/lib.rs",
                                         "\npub fn selftest_lint(b: &[u8]) -> u8 {\n    b[0]\n}\n"), "indexing"),
-    # A PD-only lint violation (target code host clippy never builds).
+    # A clippy-only violation in PD code (target code host clippy never
+    # builds): `eq_op` is deny-by-default in clippy and unknown to rustc, so
+    # only clippy actually running on the PD can catch it.
     "lint-pds": (["lint-pds"], lambda t: append(t, "crates/pds/timer/src/main.rs",
-                                                "\nfn selftest_lint_pd(b: &[u8]) -> u8 {\n    b[0]\n}\n"),
-                 "selftest_lint_pd"),
+                                                "\n#[allow(dead_code)]\nfn selftest_lint_pd(x: u8) -> bool {\n    x == x\n}\n"),
+                 "clippy::eq_op"),
     "laws": (["laws"], lambda t: edit(t, "system/secureos.system", "</system>", "    <selftest_unknown />\n</system>"), "L4"),
     "pins": (["pins"], lambda t: edit(t, "Makefile", "\trm -rf $(BUILD)", "\t-rm -rf $(BUILD)"), "P5"),
     "integration": (["test"], lambda t: edit(t, "tests/integration/run.py",
@@ -175,8 +177,7 @@ CASES = {
                                                       "        if !matches!(entry, Entry::Live { .. }) {\n"
                                                       "            *entry = Entry::Live { osk: Key32::copy_from(osk), installed_at: now_ns };\n"
                                                       "        }\n"),
-                             ("rotation: the current key did not open before the restart",
-                              "rotation: hs did not accept the restart's first key")),
+                             "rotation: hs did not accept restart"),
     "integration-expiry": (["test"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                                     "if now_ns.saturating_sub(*installed_at) < REJECT_AFTER_TIME_NS =>",
                                                     "if now_ns.saturating_sub(*installed_at) < REJECT_AFTER_TIME_NS - 20_000_000_000 =>"),

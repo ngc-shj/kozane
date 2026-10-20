@@ -12,3 +12,4 @@ layout = { path = "../../layout" }
 secret-blob = { path = "../../secret-blob" }
 sel4-microkit = { workspace = true }
 wg-core = { path = "../../wg-core" }
+zeroize = { version = "=1.8.1", default-features = false }

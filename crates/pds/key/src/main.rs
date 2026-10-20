@@ -54,9 +54,9 @@ fn init() -> Key {
     }
     let mut seed = crypto::hash(&[blob.boot_seed(), &samples, &cpu::cntpct().to_le_bytes()])
         .unwrap_or_else(|_| halt("boot seed derivation failed"));
-    samples.fill(0);
+    zeroize::Zeroize::zeroize(&mut samples);
     let seed_key = Key32::copy_from(&seed);
-    seed.fill(0);
+    zeroize::Zeroize::zeroize(&mut seed);
     debug_println!("key: secrets valid ({} peers)", blob.peer_count());
     Key { oracle: Oracle::new(blob, seed_key), bucket: Bucket::new(KEY_BURST, KEY_INTERVAL_NS) }
 }

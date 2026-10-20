@@ -1,6 +1,6 @@
 # Code Review: secureos-m3-rosenpass
 Date: 2026-10-20
-Review round: 2
+Review round: 3
 Branch: feature/m3-rosenpass, `5b406c4..ab933ee` (M3 base is the M2.5 tip; `main` is several milestones behind)
 
 ## Changes from Previous Round
@@ -388,3 +388,64 @@ N6 [Minor] `check_bindings` had no fixture on a release kernel — test_package.
 - **`make check`:** exit 0 in 635 s. UNIT-TESTS 656, LINT-PDS 11, CHECK-PINS-FIXTURES 70, PACKAGE-FIXTURES 92, INTEGRATION-CASES 22.
 - **Selftest cases:** `integration-rotation`, `integration-expiry` and `lint-pds` each fail with their failure-only needles.
 - **Scratch red-proofs:** lenient lock, debug-only bindings, Hedged without RNDR or counter, and always-true `record_delivered`. Each fails its own test.
+
+# Round 3
+
+## Findings (Round 3)
+- **Security:** S-5..S-8 resolved; no R43 widening.
+  - S-9 [Minor][Adjacent]: the `required_open` name clause and P6's `UnicodeDecodeError` catch had no fixture that ran them.
+- **Functionality:** N1..N3 resolved; N4's acceptance holds; no R43 widening.
+  - F1 [Minor]: the rotation precondition's bound was misstated (the client re-keys every 130 s, plus an exchange).
+  - F2 [Minor]: `rp0.osk()` could return None into `initiator()`.
+  - F3 [Minor]: the `required_open` docstring was stale.
+  - F4 [Minor][Adjacent]: `.fill(0)` on dead locals could be elided.
+- **Testing:** N2..N6 resolved; N1 partial.
+  - R3-T1 [Major]: the lint-pds red-proof was caught by rustc's dead_code warning, not by clippy.
+  - R3-T2 [Major]: the integration-rotation mutant could still escape through expiry, or fail earlier cases outside the needles.
+  - R3-T3 [Minor]: the rotation precondition was single-shot.
+  - R3-T4 [Minor]: same as S-9.
+
+```json
+[{"id":"S-9","severity":"Minor","title":"name clause and P6 decode catch lack fixtures","file":"tools/waivers.py","line":94,"adjacent":true,"escalate":false},
+{"id":"F1","severity":"Minor","title":"rotation precondition bound misstated","file":"tests/integration/run.py","line":1116,"adjacent":true,"escalate":null},
+{"id":"F2","severity":"Minor","title":"osk() None into initiator()","file":"tests/integration/run.py","line":1119,"adjacent":false,"escalate":null},
+{"id":"F3","severity":"Minor","title":"required_open docstring stale","file":"tools/waivers.py","line":84,"adjacent":false,"escalate":null},
+{"id":"F4","severity":"Minor","title":"fill(0) on dead locals may be elided","file":"crates/hs-core/src/index.rs","line":36,"adjacent":true,"escalate":null},
+{"id":"R3-T1","severity":"Major","title":"lint-pds red-proof caught by rustc dead_code, not clippy","file":"tools/check-selftest","line":150,"adjacent":false,"escalate":null},
+{"id":"R3-T2","severity":"Major","title":"integration-rotation mutant can still escape","file":"tests/integration/run.py","line":1116,"adjacent":false,"escalate":null},
+{"id":"R3-T3","severity":"Minor","title":"rotation precondition single-shot","file":"tests/integration/run.py","line":1119,"adjacent":false,"escalate":null},
+{"id":"R3-T4","severity":"Minor","title":"same as S-9","file":"tools/waivers.py","line":93,"adjacent":false,"escalate":null}]
+```
+
+## Resolution Status (Round 3)
+
+### R3-T2 / F1 / F2 / R3-T3: rotation red-proof — Fixed (redesigned)
+- **Redesign:** rotation is now the first case after the prelude, and peer 0's rosenpass restarts twice. Each restart's first key must be accepted by hs (`installed(..., key=new)`). Failure message: "rotation: hs did not accept restart N's first key".
+- **Precondition:** before restart 2's key is tried, it must be written less than `REJECT_AFTER_TIME − EXPIRY_SLACK_S` after restart 1's key was written. Restart 1's install is no earlier than that write, so restart 1's entry is provably Live when restart 2's key arrives.
+- **Why the mutant is always caught:** an hs that ignores supersession of a Live entry refuses restart 1's key (the prelude's entry is Live, only seconds after the prelude). Failing that, it refuses restart 2's key. Moving the case first also removes the path where earlier cases fail under the mutant (R3-T2 b).
+- **Removed:** the single-shot "current key" precondition, and with it F2's None path.
+- **Needle:** a single failure-only string, "rotation: hs did not accept restart". The tuple-needle support stays for future use.
+
+### R3-T1: lint-pds red-proof — Fixed
+- **Injection:** `#[allow(dead_code)] fn selftest_lint_pd(x: u8) -> bool { x == x }`.
+  - `clippy::eq_op` is deny-by-default in clippy and unknown to rustc.
+  - The needle is `clippy::eq_op`.
+- **Verified on scratch copies:**
+  - Clippy on: `make lint-pds` exits 2, and the log names `clippy::eq_op`.
+  - Lints off (`-A clippy::all`): it exits 0, so only clippy running on the PD catches it.
+
+### S-9 / R3-T4: fixtures for the new fail-closed clauses — Fixed
+- **package:** a `[[package]]` entry without a name → "...entry without a string name".
+- **P6:** a lock with a non-UTF-8 byte, and a nameless entry.
+- **Red-proofs:** removing either clause makes its fixture runner fail. The package run crashes with a traceback; test_check_pins stops on "exit status disagrees with output". Either way the gate goes red.
+- **Counts:** PACKAGE-FIXTURES 93, CHECK-PINS-FIXTURES 72.
+
+### F3 — Fixed
+The `required_open` docstring now names the structural `WaiverError`.
+
+### F4 — Fixed
+`zeroize::Zeroize::zeroize` (volatile) replaces `.fill(0)` on the dead locals: `pds/key` seed and samples, `hs-core/index.rs` hash. hs-core and pds/key gain the pinned `zeroize =1.8.1`, which was already in Cargo.lock.
+
+### Verification (Round 3 fixes)
+- `make check` exit 0. INTEGRATION-CASES 22, PACKAGE-FIXTURES 93, CHECK-PINS-FIXTURES 72, LINT-PDS 11.
+- Selftest cases `integration-rotation` (needle "rotation: hs did not accept restart"), `integration-expiry` and `lint-pds` each fail with their failure-only needles.

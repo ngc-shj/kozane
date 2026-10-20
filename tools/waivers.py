@@ -82,7 +82,8 @@ def open_waivers(waivers: list) -> list:
 
 def required_open(lock_text: str) -> set:
     """Waiver ids that must be open given Cargo.lock's text; raises
-    `WaiverError` if it is not valid TOML."""
+    `WaiverError` if it is not valid TOML, or not a non-empty array of
+    `[[package]]` tables each with a string name."""
     try:
         lock = tomllib.loads(lock_text)
     except tomllib.TOMLDecodeError as e:
