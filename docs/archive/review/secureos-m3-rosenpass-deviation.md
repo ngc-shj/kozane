@@ -712,3 +712,6 @@ Verdict: no Critical, High or Major. M3a stays dev-only until M3b (SC26, cookie 
    - A signal that arrives after the block took effect, even before the rename, is held and then discarded on success. The comments, the fixture name and this log now say so.
    - The behaviour is unchanged: the safety property — a run that published never ends as a failure — was already right.
 - **Verification:** `make check` exit 0 (673 s; AUDIT-GATE-FIXTURES 17, UNIT-MKSECRETS 22). The selftest case `audit` passes.
+
+## Final full selftest on 68b0cda
+`tools/check-selftest`: exit 0 in 4179 s, 54 layers. That is the 53 of the T11 baseline plus `audit`. Every case fails with its failure-only needle, after the external-review fixes to package, mksecrets and the audit gate.
