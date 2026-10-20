@@ -1007,6 +1007,7 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         threads.append(pinger)
         start_without_stop_signals(pinger)
         old = rp0.wait_key(time.monotonic() + RP_EXCHANGE_S)
+        rotation_mark = con.mark()
         prev_written = None
         for n in range(1, ROTATION_RESTARTS + 1):
             rp0.start()
@@ -1021,6 +1022,11 @@ def test_wireguard(loader: str, deploy: str, passed: list):
             prev_written, old = written, new
         else:
             raise Fail(f"rotation: no two of {ROTATION_RESTARTS} restarts close enough to prove supersession; precondition broken")
+        # A pair beyond REJECT_AFTER_TIME lets peer 0's entry expire between
+        # installs, and a wireguard-go rekey in that window spends the boot's
+        # one coalesced stale line that the expiry case needs: report it here.
+        if con.count(r"audit: src=hs HandshakePskStale total=", since=rotation_mark):
+            raise Fail("rotation: peer 0's entry expired between restarts (slow run); precondition broken")
         wg.wait_applied(new)
         pinger.stop = True
         pinger.join()

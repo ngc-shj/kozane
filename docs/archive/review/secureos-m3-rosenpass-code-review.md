@@ -1,6 +1,6 @@
 # Code Review: secureos-m3-rosenpass
 Date: 2026-10-20
-Review round: 4
+Review round: 5
 Branch: feature/m3-rosenpass, `5b406c4..ab933ee` (M3 base is the M2.5 tip; `main` is several milestones behind)
 
 ## Changes from Previous Round
@@ -483,7 +483,9 @@ The `required_open` docstring now names the structural `WaiverError`.
 - **New precondition:** a restart's key must be accepted less than `REJECT_AFTER_TIME − EXPIRY_SLACK_S` after the previous accepted restart's key was written.
   - The acceptance time is an upper bound on the new install, and the write time is a lower bound on the previous one. So the previous entry is provably Live.
   - The write time is captured right after `wait_key`.
-- **Retries:** if a pair is too far apart, the client restarts again, up to `ROTATION_RESTARTS = 4`. A slow clean run stays green.
+- **Retries:** if a pair is too far apart, the client restarts again, up to `ROTATION_RESTARTS = 4`.
+  - Round 5 (R5-T1) corrected the claim made here: this rescues only a gap of about 175–180 s.
+  - A slower clean run lets peer 0's entry expire between installs. The rotation now fails at once with a named precondition, instead of spending the stale audit line the expiry case relies on.
   - A mutant can only escape by every consecutive gap exceeding the bound. It then ends at the named precondition failure, not the needle, so the selftest goes red loudly.
 - **Verification:**
   - `make test`: 22 cases, 0 of 46 pings lost.
@@ -492,3 +494,26 @@ The `required_open` docstring now names the structural `WaiverError`.
 ### F7 — Fixed
 The comment now gives the actual reason: nothing initiates for peer 0 between the mark and the join.
 - `make check` exit 0 on the commit that records this entry.
+
+# Round 5
+
+## Findings (Round 5)
+- **Security:** No findings.
+- **Functionality:** F5–F7 resolved.
+  - F8 [Minor]: the rotation retry rarely keeps a slow clean run green. A gap of 180 s or more lets peer 0's entry go stale and use up the boot's only `HandshakePskStale` line, so the run fails later, at the expiry precondition.
+- **Testing:** R4-T1 and R4-T2 resolved.
+  - R5-T1 [Minor][Adjacent]: the same as F8.
+
+```json
+[{"id":"F8","severity":"Minor","title":"rotation retry rarely rescues; stale line used up far from its cause","file":"tests/integration/run.py","line":1019,"adjacent":false,"escalate":null},
+{"id":"R5-T1","severity":"Minor","title":"same as F8","file":"tests/integration/run.py","line":1011,"adjacent":true,"escalate":null}]
+```
+
+## Resolution Status (Round 5)
+
+### F8 / R5-T1 — Fixed
+- **Action:** a console mark is taken before restart 1. If a `HandshakePskStale` line appears after it, the rotation fails at once with "rotation: peer 0's entry expired between restarts (slow run); precondition broken".
+  - The mark is taken before restart 1, so it also covers the gap from the prelude to restart 1.
+- **Correction:** the Round 4 claim now states that the retry rescues only a gap of about 175–180 s.
+- **Mutant proof unaffected:** the mutant still dies on "rotation: hs did not accept restart".
+- **Verification:** `make check` exit 0 (645 s, 0 of 50 pings lost); `integration-rotation` ok.
