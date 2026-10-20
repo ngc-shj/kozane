@@ -139,6 +139,21 @@ pub enum Event {
     /// step and stopped relaying for good (M3b plan, `pq_sync_dead`; never
     /// coalesced, raised once).
     RpPqSyncDead,
+    /// The Rosenpass cookie gate engaged: a meter refused an InitHello, or
+    /// the global InitHello meter fell below half (M3b; never coalesced).
+    RpUnderLoad,
+    /// The Rosenpass cookie gate disengaged (never coalesced).
+    RpLoadCleared,
+    /// The Rosenpass cookie secret reached its maximum age (never coalesced).
+    RpCookieSecretExpired,
+    /// No Rosenpass cookie secret: its rotation failed (never coalesced).
+    RpCookieSecretUnavailable,
+    /// A Rosenpass CookieReply went out.
+    RpCookieReplySent,
+    /// An InitHello with a valid cookie passed the gate under load.
+    RpCookieAccepted,
+    /// A Rosenpass CookieReply was due but found no TX room or failed to seal.
+    RpCookieSuppressed,
     /// `pq`'s handshake cost rose to a new high-water mark; `us` travels as
     /// the record's `a` (never coalesced; `CostHighWater` bounds it).
     RpCostHighWater { us: u32 },
@@ -200,6 +215,13 @@ impl Event {
             Event::RpDecapsRateLimited => 0x0047,
             Event::RpPqRecordStuck => 0x0049,
             Event::RpPqSyncDead => 0x004a,
+            Event::RpUnderLoad => 0x004b,
+            Event::RpLoadCleared => 0x004c,
+            Event::RpCookieSecretExpired => 0x004d,
+            Event::RpCookieSecretUnavailable => 0x004e,
+            Event::RpCookieReplySent => 0x004f,
+            Event::RpCookieAccepted => 0x0050,
+            Event::RpCookieSuppressed => 0x0051,
             Event::RpCostHighWater { .. } => COST_HIGH_WATER,
             Event::FrameDropped { reason } => {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
@@ -209,7 +231,7 @@ impl Event {
 
     /// Every variant except the parameterised `FrameDropped` and
     /// `RpCostHighWater`.
-    pub const FIXED: [Event; 53] = [
+    pub const FIXED: [Event; 60] = [
         Event::ArpReplied,
         Event::UdpEchoed,
         Event::RingCorrupt,
@@ -263,6 +285,13 @@ impl Event {
         Event::RpDecapsRateLimited,
         Event::RpPqRecordStuck,
         Event::RpPqSyncDead,
+        Event::RpUnderLoad,
+        Event::RpLoadCleared,
+        Event::RpCookieSecretExpired,
+        Event::RpCookieSecretUnavailable,
+        Event::RpCookieReplySent,
+        Event::RpCookieAccepted,
+        Event::RpCookieSuppressed,
     ];
 
     /// Display name; exhaustive, so a new variant fails to compile here.
@@ -321,6 +350,13 @@ impl Event {
             Event::RpDecapsRateLimited => "RpDecapsRateLimited",
             Event::RpPqRecordStuck => "RpPqRecordStuck",
             Event::RpPqSyncDead => "RpPqSyncDead",
+            Event::RpUnderLoad => "RpUnderLoad",
+            Event::RpLoadCleared => "RpLoadCleared",
+            Event::RpCookieSecretExpired => "RpCookieSecretExpired",
+            Event::RpCookieSecretUnavailable => "RpCookieSecretUnavailable",
+            Event::RpCookieReplySent => "RpCookieReplySent",
+            Event::RpCookieAccepted => "RpCookieAccepted",
+            Event::RpCookieSuppressed => "RpCookieSuppressed",
             Event::RpCostHighWater { .. } => "RpCostHighWater",
             Event::FrameDropped { .. } => "FrameDropped",
         }
@@ -336,6 +372,10 @@ impl Event {
             | Event::CookieSecretUnavailable
             | Event::RpPqRecordStuck
             | Event::RpPqSyncDead
+            | Event::RpUnderLoad
+            | Event::RpLoadCleared
+            | Event::RpCookieSecretExpired
+            | Event::RpCookieSecretUnavailable
             | Event::RpCostHighWater { .. } => false,
             Event::ArpReplied
             | Event::UdpEchoed
@@ -384,7 +424,10 @@ impl Event {
             | Event::RpPskExported
             | Event::RpPskInstallFailed
             | Event::RpRngFailed
-            | Event::RpDecapsRateLimited => true,
+            | Event::RpDecapsRateLimited
+            | Event::RpCookieReplySent
+            | Event::RpCookieAccepted
+            | Event::RpCookieSuppressed => true,
         }
     }
 
@@ -457,6 +500,13 @@ impl Event {
             Event::RpDecapsRateLimited => 50,
             Event::RpPqRecordStuck => 51,
             Event::RpPqSyncDead => 52,
+            Event::RpUnderLoad => 53,
+            Event::RpLoadCleared => 54,
+            Event::RpCookieSecretExpired => 55,
+            Event::RpCookieSecretUnavailable => 56,
+            Event::RpCookieReplySent => 57,
+            Event::RpCookieAccepted => 58,
+            Event::RpCookieSuppressed => 59,
             Event::RpCostHighWater { .. } => COST_HIGH_WATER_SLOT,
             Event::FrameDropped { reason } => {
                 // FIXED_SLOTS..FIXED_SLOTS+64, clamped like `code`.
@@ -467,7 +517,7 @@ impl Event {
     }
 }
 
-const FIXED_SLOTS: usize = 53;
+const FIXED_SLOTS: usize = 60;
 const COST_HIGH_WATER_SLOT: usize = FIXED_SLOTS + MAX_DROP_REASON as usize + 1;
 const SLOTS: usize = COST_HIGH_WATER_SLOT + 1;
 

@@ -11,18 +11,20 @@
 #![no_main]
 
 mod cookie;
+mod rp_cookie;
 mod rp_mac;
 
 use audit_event::Event;
 use cookie::CookieAdapter;
 use ingress_core::{
-    Buckets, Config, Endpoint, Gate, Mac1, Outcome, PassIo, PqSync, RP_RECORD_MAX, RpGate, RpKind, RpMac, RpOutcome,
-    SyncOutcome, emit_udp, respond, rp_classify, rp_reply_allowed, run_passes,
+    Buckets, Config, Endpoint, Gate, Mac1, Outcome, PassIo, PqSync, RP_COOKIE_REPLY_LEN, RP_RECORD_MAX, RpGate, RpKind,
+    RpMac, RpOutcome, SyncOutcome, TxTier, emit_udp, respond, rp_classify, rp_tx_allowed, run_passes,
 };
 use layout::ingress as ch;
 use msgs::ToIngress;
 use pdkit::{Audit, Buf, Rx, Tx};
 use ring::pass::drain;
+use rp_cookie::RpCookieAdapter;
 use rp_mac::RpMacKey;
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, debug_println, memory_region_symbol, protection_domain};
 use wg_core::crypto;
@@ -70,6 +72,12 @@ const _: () = assert!(
 );
 const _: () = assert!(ingress_core::RP_RECORD_MAX <= layout::NET_BUF_SIZE);
 const _: () = assert!(layout::NET_BUFFERS >= ingress_core::RP_IN_FLIGHT);
+// The cookie gate's layout and peer count are rosenpass-wire's, rosenpass-
+// core's and config's, which ingress-core does not depend on (M3b plan C2).
+const _: () = assert!(ingress_core::RP_MAX_PEERS == config::MAX_PEERS);
+const _: () = assert!(ingress_core::RP_SID_AT == rosenpass_wire::HEADER_LEN);
+const _: () = assert!(ingress_core::RP_COOKIE_AT == rosenpass_wire::cookie_offset(rosenpass_wire::INIT_HELLO_LEN));
+const _: () = assert!(ingress_core::RP_COOKIE_REPLY_LEN == rosenpass_core::cookie::COOKIE_REPLY_LEN);
 
 const CONFIG: Config = Config {
     mac: config::OUTSIDE_MAC,
@@ -116,6 +124,9 @@ struct Ingress {
     rp_mac: RpMacKey,
     rp: RpGate<BUCKETS>,
     cookies: CookieAdapter,
+    rp_cookie: RpCookieAdapter,
+    /// Rosenpass CookieReplies, apart from every other buffer.
+    rp_cookie_out: [u8; RP_COOKIE_REPLY_LEN],
     endpoints: [Option<Endpoint>; MAX_PEERS],
     frame: Buf,
     reply: Buf,
@@ -186,11 +197,18 @@ fn init() -> Ingress {
     let key = crypto::hash(&[LABEL_MAC1, &config::GATEWAY_PUBLIC]).unwrap_or_else(|_| panic!("ingress: mac1 key"));
     let mut cookies =
         CookieAdapter::new(&config::GATEWAY_PUBLIC, cpu::fill_random).unwrap_or_else(|_| halt("cookie key derivation failed"));
-    // Only the 32-byte mac key is kept; `spkm` itself is read here once.
-    let rp_mac = RpMacKey::new(config::gateway_rp_public!()).unwrap_or_else(|_| halt("Rosenpass mac key derivation failed"));
+    // Only the 32-byte mac and cookie keys are kept; `spkm` itself is read
+    // here once.
+    let spkm = config::gateway_rp_public!();
+    let rp_mac = RpMacKey::new(spkm).unwrap_or_else(|_| halt("Rosenpass mac key derivation failed"));
+    let mut rp_cookie = RpCookieAdapter::new(spkm, cpu::fill_random);
     let mut gate = Gate::default();
     if !gate.tick_if_due(&mut cookies, cpu::now_ns(), 0).rotated {
         halt("RNDR unavailable; no cookie secret");
+    }
+    let mut rp = RpGate::default();
+    if !rp.tick_if_due(&mut rp_cookie, cpu::now_ns()).rotated {
+        halt("RNDR unavailable; no Rosenpass cookie secret");
     }
     debug_println!("ingress: ready");
     Ingress {
@@ -207,8 +225,10 @@ fn init() -> Ingress {
         buckets: Buckets::default(),
         gate,
         rp_mac,
-        rp: RpGate::default(),
+        rp,
         cookies,
+        rp_cookie,
+        rp_cookie_out: [0; RP_COOKIE_REPLY_LEN],
         endpoints: [None; MAX_PEERS],
         frame: [0; layout::NET_BUF_SIZE],
         reply: [0; layout::NET_BUF_SIZE],
@@ -255,6 +275,16 @@ fn record_edges(gate: &mut Gate, audit: &mut Audit) {
     }
 }
 
+/// The Rosenpass gate's edges (never coalesced), as `record_edges`.
+fn record_rp_edges<const N: usize>(rp: &mut RpGate<N>, audit: &mut Audit) {
+    if rp.take_load_entered() {
+        audit.record(Event::RpUnderLoad);
+    }
+    if rp.take_expired() {
+        audit.record(Event::RpCookieSecretExpired);
+    }
+}
+
 impl Ingress {
     /// `to_hs` buffers `hs` has not returned and free `to_driver` buffers,
     /// each read after a reclaim. A link error counts as under load and as
@@ -287,6 +317,15 @@ impl Ingress {
         }
         if report.left_load {
             self.audit.record(Event::WgLoadCleared);
+        }
+        let rp = self.rp.tick_if_due(&mut self.rp_cookie, cpu::now_ns());
+        // RpUnderLoad before this tick's RpLoadCleared, so the two alternate.
+        record_rp_edges(&mut self.rp, &mut self.audit);
+        if rp.secret_unavailable {
+            self.audit.record(Event::RpCookieSecretUnavailable);
+        }
+        if rp.left_load {
+            self.audit.record(Event::RpLoadCleared);
         }
     }
 
@@ -360,8 +399,22 @@ impl Ingress {
                 Some(Target::Data)
             }
             Outcome::Rosenpass { src, payload } => {
-                let msg = match rp_classify(&mut self.rp, &self.rp_mac, now, src, payload) {
-                    RpOutcome::ForwardHello { src, msg } => {
+                let o = rp_classify(
+                    &mut self.rp,
+                    &self.rp_mac,
+                    &mut self.rp_cookie,
+                    now,
+                    tx_free,
+                    src,
+                    payload,
+                    &mut self.rp_cookie_out,
+                );
+                record_rp_edges(&mut self.rp, &mut self.audit);
+                let msg = match o {
+                    RpOutcome::ForwardHello { src, msg, cookied } => {
+                        if cookied {
+                            self.audit.record(Event::RpCookieAccepted);
+                        }
                         rp_forward = Some((RpKind::Hello, src));
                         msgs::RpDatagram { peer: ep(src), msg }.encode(&mut self.msg)
                     }
@@ -385,6 +438,20 @@ impl Ingress {
                     }
                     // Audited once, when the sync stopped.
                     RpOutcome::PqDown => return true,
+                    RpOutcome::CookieReply { dst } => {
+                        // Public bytes: the cookie value inside is sealed.
+                        let reply = self.rp_cookie_out;
+                        if self.send_to_peer(CONFIG.rp_port, dst, &reply, wake) {
+                            self.audit.record(Event::RpCookieReplySent);
+                        }
+                        return true;
+                    }
+                    // The secret's own edges are audited by the tick and by
+                    // `record_rp_edges`; a refused reply is counted here.
+                    RpOutcome::CookieSuppressed | RpOutcome::NoCookieSecret | RpOutcome::CookieSecretExpired => {
+                        self.audit.record(Event::RpCookieSuppressed);
+                        return true;
+                    }
                 };
                 msg_len = msg;
                 Some(Target::Pq)
@@ -456,7 +523,7 @@ impl Ingress {
     /// side only moves bytes. Returns the replies relayed.
     fn sync_pq(&mut self, wake: &mut Wake) -> usize {
         let mut rp = core::mem::take(&mut self.rp);
-        let outcome = ingress_core::sync_pq(&mut rp, &mut PqLink { ingress: self, wake }, config::PEERS.len());
+        let outcome = ingress_core::sync_pq(&mut rp, &mut PqLink { ingress: self, wake }, config::PEERS.len(), cpu::now_ns());
         self.rp = rp;
         match outcome {
             SyncOutcome::Synced { relayed } => relayed,
@@ -615,7 +682,7 @@ impl PqSync for PqLink<'_> {
                 0
             }
         };
-        if !rp_reply_allowed(tx_free) {
+        if !rp_tx_allowed(TxTier::Answer, tx_free) {
             self.ingress.audit.record(Event::TxNoBuffer);
             return false;
         }

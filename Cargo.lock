@@ -1324,6 +1324,7 @@ name = "rosenpass-core"
 version = "0.1.0"
 dependencies = [
  "classic-mceliece-rust",
+ "ingress-core",
  "libcrux-blake2",
  "libcrux-chacha20poly1305",
  "libcrux-ml-kem",

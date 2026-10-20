@@ -153,7 +153,7 @@ fn arp<'a>(cfg: &Config, eth: &EthAddrs, a: &ArpPacket, tx_free: usize, out: &mu
     }
     // Requests are attacker-paced and cheaper than initiations, so their
     // replies stay out of the reserve too [code review S1].
-    if tx_free <= TX_RESERVE {
+    if !rp_tx_allowed(TxTier::Unsolicited, tx_free) {
         return Outcome::ArpSuppressed;
     }
     // Reply to the frame's sender (equal to sha, checked above), so a
@@ -312,9 +312,33 @@ pub const PASS_FRAMES: usize = NET_BUFFERS;
 /// Minimum spacing of `rotate` calls while no secret is held, so the RNG is
 /// never read at attacker-driven rate [R3-F-F5].
 pub const RETRY_INTERVAL_NS: u64 = 100_000_000;
-/// Cookie and ARP replies may use only the TX buffers above this; the rest
-/// stays for `hs` and `data` [R2-F-F4].
+/// Replies `ingress` makes up itself, and Rosenpass answers, may use only
+/// the TX buffers above this; the rest stays for `hs` and `data` [R2-F-F4].
 const TX_RESERVE: usize = NET_BUFFERS / 2;
+/// Of the buffers above the reserve, the share Rosenpass answers (RespHello,
+/// EmptyData: replies to metered, forwarded work) keep from replies an
+/// attacker can elicit for free (cookie replies of both gates, ARP) (M3b
+/// plan, S2).
+pub const RP_ANSWER_SHARE: usize = 8;
+const _: () = assert!(0 < RP_ANSWER_SHARE && RP_ANSWER_SHARE < NET_BUFFERS - TX_RESERVE, "RP_ANSWER_SHARE out of range");
+
+/// Who may take a TX buffer (M3b plan, "TX tiers").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxTier {
+    /// RespHello and EmptyData.
+    Answer,
+    /// Cookie replies (WireGuard and Rosenpass) and ARP replies.
+    Unsolicited,
+}
+
+/// Whether a reply of `tier` may take a TX buffer with `tx_free` free: an
+/// unsolicited one is never allowed where an answer would be refused (I8).
+pub fn rp_tx_allowed(tier: TxTier, tx_free: usize) -> bool {
+    match tier {
+        TxTier::Answer => tx_free > TX_RESERVE,
+        TxTier::Unsolicited => tx_free > TX_RESERVE + RP_ANSWER_SHARE,
+    }
+}
 
 // Load must begin on arrivals no later than on forwards (plan, "Ordering of
 // the arrival constants").
@@ -360,6 +384,11 @@ impl<const BURST: u64, const INTERVAL_NS: u64> Meter<BURST, INTERVAL_NS> {
 
     pub fn below_half(&self, now_ns: u64) -> bool {
         self.level_ns(now_ns) < Self::HALF_NS
+    }
+
+    /// Whole tokens available at `now_ns`, refilled but not spent.
+    pub fn tokens(&self, now_ns: u64) -> u64 {
+        self.level_ns(now_ns).checked_div(INTERVAL_NS).unwrap_or(0)
     }
 
     /// Spends one token if there is one.
@@ -531,7 +560,7 @@ impl Gate {
                 self.life.note_expired();
                 Outcome::CookieSecretExpired
             }
-            Secret::Usable if tx_free > TX_RESERVE && crypto.seal_reply(src, msg, out) => {
+            Secret::Usable if rp_tx_allowed(TxTier::Unsolicited, tx_free) && crypto.seal_reply(src, msg, out) => {
                 Outcome::CookieReply { dst: src, len: COOKIE_REPLY_LEN }
             }
             Secret::Usable => Outcome::CookieSuppressed,
@@ -599,6 +628,75 @@ pub trait RpMac {
     fn verify(&self, msg: &[u8]) -> bool;
 }
 
+/// The Rosenpass CookieReply's length: the InitHello's, so it never
+/// amplifies.
+pub const RP_COOKIE_REPLY_LEN: usize = RP_INIT_HELLO_LEN;
+/// Where the cookie field starts in an InitHello (the envelope's last 16
+/// bytes).
+pub const RP_COOKIE_AT: usize = RP_INIT_HELLO_LEN - 16;
+/// Where the session ids start in every envelope (after type and reserved):
+/// RespHello `sidr ‖ sidi`, InitConf `sidi ‖ sidr`, EmptyData `sid`.
+pub const RP_SID_AT: usize = 4;
+
+/// The Rosenpass cookie secret's operations (M3b plan C2/C3). The PD's
+/// adapter owns the current and previous secrets; this crate only decides
+/// when each call may happen.
+pub trait RpCookieCheck {
+    /// Whether `msg`'s cookie field is valid for `src` under the current or
+    /// the previous secret (constant time, fail-closed).
+    fn valid(&self, src: Endpoint, msg: &[u8; RP_INIT_HELLO_LEN]) -> bool;
+    /// Writes the CookieReply to `msg` from `src` into `out`.
+    fn seal(&mut self, src: Endpoint, msg: &[u8; RP_INIT_HELLO_LEN], out: &mut [u8; RP_COOKIE_REPLY_LEN]) -> bool;
+    /// Moves the current secret to previous and draws a new one; false if
+    /// the RNG failed.
+    fn rotate(&mut self) -> bool;
+    /// Zeroizes both secrets.
+    fn clear(&mut self);
+}
+
+/// An endpoint that got a RespHello, waiting for the InitConf of that
+/// exchange (M3b plan, "Session binding").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Awaited {
+    ep: Endpoint,
+    sidi: [u8; 4],
+    sidr: [u8; 4],
+    at: u64,
+    /// Matched InitConfs it may still forward.
+    conf_budget: u64,
+    /// A matched InitConf was forwarded.
+    conf_seen: bool,
+}
+
+/// A configured peer's last proven endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Proven {
+    ep: Endpoint,
+    at: u64,
+    credit: Meter<RP_PROVEN_CREDIT_BURST, RP_PROVEN_CREDIT_INTERVAL_NS>,
+}
+
+/// State edges from `RpGate::tick_if_due`, each for one never-coalesced
+/// audit event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RpTickReport {
+    pub rotated: bool,
+    /// `RpCookieSecretUnavailable`: the first failed rotation since a good one.
+    pub secret_unavailable: bool,
+    /// `RpLoadCleared`.
+    pub left_load: bool,
+}
+
+fn sid_pair(msg: &[u8]) -> Option<([u8; 4], [u8; 4])> {
+    let a = *msg.get(RP_SID_AT..)?.first_chunk::<4>()?;
+    let b = *msg.get(RP_SID_AT.checked_add(4)?..)?.first_chunk::<4>()?;
+    Some((a, b))
+}
+
+fn live(at: u64, now_ns: u64, for_ns: u64) -> bool {
+    now_ns.checked_sub(at).is_some_and(|age| age < for_ns)
+}
+
 // Rosenpass meters (plan C4, "Buckets"), sized from the measured cost
 // (deviation log, MCE-COST): an InitHello costs `pq` 8.5 s median, 16.1 s
 // max of wall time at its committed budget under TCG, an InitConf under
@@ -615,6 +713,57 @@ pub const RP_CONF_SRC_BURST: u64 = 3;
 pub const RP_CONF_SRC_INTERVAL_NS: u64 = 1_000_000_000;
 pub const RP_CONF_GLOBAL_BURST: u64 = 8;
 pub const RP_CONF_GLOBAL_INTERVAL_NS: u64 = 50_000_000;
+
+// The Rosenpass cookie gate (M3b plan, "Load state", "Lanes", "Session
+// binding"). Proposed values; the assertions below may not be weakened.
+
+/// `config::MAX_PEERS`, which this crate does not depend on (the PD asserts
+/// the two agree).
+pub const RP_MAX_PEERS: usize = 8;
+/// Load holds this long after its last trigger: three per-source periods,
+/// so a spoofer at one per 20 s never sees the gate drop between spoofs,
+/// even with two of them lost.
+pub const RP_UNDER_LOAD_AFTER_NS: u64 = 60_000_000_000;
+/// The per-IP cap on cookied InitHellos: every configured peer behind one
+/// address, one each per rekey interval (F3).
+pub const RP_HELLO_COOKIED_IP_BURST: u64 = RP_MAX_PEERS as u64;
+pub const RP_HELLO_COOKIED_IP_INTERVAL_NS: u64 = 120_000_000_000 / RP_MAX_PEERS as u64;
+/// Global InitHello tokens only a proven endpoint may take (a floor on the
+/// shared meter, not a quota).
+pub const RP_HELLO_PROVEN_RESERVE: u64 = 4;
+/// How long a completed exchange keeps its endpoint proven.
+pub const RP_PROVEN_NS: u64 = 300_000_000_000;
+/// Each proven peer's own spend below the reserve: a burst of two, one per
+/// rekey interval.
+pub const RP_PROVEN_CREDIT_BURST: u64 = 2;
+pub const RP_PROVEN_CREDIT_INTERVAL_NS: u64 = 120_000_000_000;
+/// How long an endpoint that got a RespHello stays awaited.
+pub const RP_AWAIT_CONF_NS: u64 = 30_000_000_000;
+/// Awaited entries: every RespHello `pq` can make within RP_AWAIT_CONF_NS
+/// (the global meter's burst and refill bound the InitHellos it is sent,
+/// plus those still in flight), so a live entry is never evicted.
+pub const RP_AWAIT_SLOTS: usize = RP_HELLO_GLOBAL_BURST as usize
+    + RP_AWAIT_CONF_NS.div_ceil(RP_HELLO_GLOBAL_INTERVAL_NS) as usize
+    + RP_HELLO_IN_FLIGHT
+    + 1;
+/// InitConf link slots, and conf-global tokens, only a matched InitConf may
+/// take.
+pub const RP_CONF_AWAITED_RESERVED: usize = 4;
+
+const _: () = assert!(RP_UNDER_LOAD_AFTER_NS >= RP_HELLO_SRC_INTERVAL_NS, "load would drop between spoofs");
+const _: () = assert!(
+    0 < RP_HELLO_PROVEN_RESERVE && RP_HELLO_PROVEN_RESERVE < RP_HELLO_GLOBAL_BURST,
+    "RP_HELLO_PROVEN_RESERVE out of range"
+);
+const _: () = assert!(RP_HELLO_COOKIED_IP_BURST >= RP_MAX_PEERS as u64, "peers behind one address");
+// Refill rates, not bursts: every proven slot together never refills faster
+// than the global meter.
+const _: () = assert!(
+    RP_MAX_PEERS as u64 * (120_000_000_000 / RP_PROVEN_CREDIT_INTERVAL_NS) <= 120_000_000_000 / RP_HELLO_GLOBAL_INTERVAL_NS,
+    "proven credit refills faster than the global meter"
+);
+const _: () = assert!(RP_CONF_AWAITED_RESERVED < RP_CONF_IN_FLIGHT, "RP_CONF_AWAITED_RESERVED out of range");
+const _: () = assert!((RP_CONF_AWAITED_RESERVED as u64) < RP_CONF_GLOBAL_BURST, "RP_CONF_AWAITED_RESERVED above the burst");
 /// InitHellos `ingress` lets be unreturned on the `ingress`→`pq` link at
 /// once, the one `pq` is working on included: `pq` returns a buffer only
 /// after its completion record (M3b plan, S14). Each costs `pq` seconds
@@ -639,18 +788,20 @@ const _: () = assert!(RP_CONF_SRC_INTERVAL_NS >= RP_CONF_GLOBAL_INTERVAL_NS, "RP
 /// new source takes a free slot or evicts the least recently used one, so a
 /// spoofed-source flood churns budgets and the global meter bounds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SourceMeters<const N: usize, const BURST: u64, const INTERVAL_NS: u64> {
-    slots: [Option<(Ipv4, Meter<BURST, INTERVAL_NS>)>; N],
+pub struct SourceMeters<const N: usize, const BURST: u64, const INTERVAL_NS: u64, K = Ipv4> {
+    slots: [Option<(K, Meter<BURST, INTERVAL_NS>)>; N],
 }
 
-impl<const N: usize, const BURST: u64, const INTERVAL_NS: u64> Default for SourceMeters<N, BURST, INTERVAL_NS> {
+impl<const N: usize, const BURST: u64, const INTERVAL_NS: u64, K: Copy> Default for SourceMeters<N, BURST, INTERVAL_NS, K> {
     fn default() -> Self {
         Self { slots: [None; N] }
     }
 }
 
-impl<const N: usize, const BURST: u64, const INTERVAL_NS: u64> SourceMeters<N, BURST, INTERVAL_NS> {
-    pub fn allow(&mut self, ip: Ipv4, now_ns: u64) -> bool {
+/// Keyed by IP (the off-load and per-IP cookied tables) or by endpoint (the
+/// cookied per-endpoint table, M3b plan F13).
+impl<const N: usize, const BURST: u64, const INTERVAL_NS: u64, K: Copy + PartialEq> SourceMeters<N, BURST, INTERVAL_NS, K> {
+    pub fn allow(&mut self, ip: K, now_ns: u64) -> bool {
         let slot = match self.slots.iter().position(|s| s.is_some_and(|(i, _)| i == ip)) {
             Some(i) => i,
             None => {
@@ -761,7 +912,12 @@ impl InFlight {
 /// leaves the other's meters untouched.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RpGate<const N: usize> {
+    /// Off load: per IP.
     hello_src: SourceMeters<N, RP_HELLO_SRC_BURST, RP_HELLO_SRC_INTERVAL_NS>,
+    /// Under load, with a valid cookie: per endpoint, then the per-IP cap
+    /// (F13: separate tables; a token in one is not one in another).
+    hello_cookied_ep: SourceMeters<N, RP_HELLO_SRC_BURST, RP_HELLO_SRC_INTERVAL_NS, Endpoint>,
+    hello_cookied_ip: SourceMeters<N, RP_HELLO_COOKIED_IP_BURST, RP_HELLO_COOKIED_IP_INTERVAL_NS>,
     hello_global: Meter<RP_HELLO_GLOBAL_BURST, RP_HELLO_GLOBAL_INTERVAL_NS>,
     conf_src: SourceMeters<N, RP_CONF_SRC_BURST, RP_CONF_SRC_INTERVAL_NS>,
     conf_global: Meter<RP_CONF_GLOBAL_BURST, RP_CONF_GLOBAL_INTERVAL_NS>,
@@ -770,13 +926,25 @@ pub struct RpGate<const N: usize> {
     /// be trusted. Nothing more is forwarded, relayed or retired until
     /// reboot (M3b plan, R4-F2).
     pq_dead: bool,
+    /// Endpoints a RespHello went to, keyed by (endpoint, sidr).
+    awaited: [Option<Awaited>; RP_AWAIT_SLOTS],
+    /// Per configured peer (S7): only that peer's EmptyData changes its slot.
+    proven: [Option<Proven>; RP_MAX_PEERS],
+    /// Load holds while `now` is before this.
+    under_load_until_ns: u64,
+    /// Load as last announced, so `RpUnderLoad` and `RpLoadCleared` alternate.
+    in_load: bool,
+    /// Load entered and not yet taken by the PD.
+    entered_load: bool,
+    life: SecretLife,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RpOutcome<'a> {
     /// The only outcomes the PD sends to `pq`, each built by one
     /// constructor (`rp_forward_hello`, `rp_forward_conf`).
-    ForwardHello { src: Endpoint, msg: &'a [u8; RP_INIT_HELLO_LEN] },
+    /// `cookied`: it passed the cookie gate under load (`RpCookieAccepted`).
+    ForwardHello { src: Endpoint, msg: &'a [u8; RP_INIT_HELLO_LEN], cookied: bool },
     ForwardConf { src: Endpoint, msg: &'a [u8; RP_INIT_CONF_LEN] },
     /// Not an InitHello or InitConf of its exact length.
     TypeDropped,
@@ -787,17 +955,33 @@ pub enum RpOutcome<'a> {
     RingReserved,
     /// The `pq` path stopped for good (`pq_sync_dead`); nothing is sent.
     PqDown,
+    /// Under load without a valid cookie: a CookieReply for `dst` is in the
+    /// cookie buffer.
+    CookieReply { dst: Endpoint },
+    /// A CookieReply was due but TX had no room for it, or sealing failed.
+    CookieSuppressed,
+    /// A CookieReply was due but no secret is held (RNG failure).
+    NoCookieSecret,
+    /// A CookieReply was due but the secret is at or past its maximum age.
+    CookieSecretExpired,
 }
 
 /// Rosenpass checks on a datagram addressed to the Rosenpass port, in
 /// order: type and exact length, then the mac, then the forward
 /// constructor of its type. Nothing spends a meter before the mac passed.
-pub fn rp_classify<'a, M: RpMac, const N: usize>(
+///
+/// Under load an InitHello needs a valid cookie; without one it spends
+/// nothing and gets a CookieReply in `out` (M3b plan, "Lanes").
+#[allow(clippy::too_many_arguments)] // each argument is an independent input the PD reads per datagram (state, crypto, levels, datagram); bundling them would only rename the list
+pub fn rp_classify<'a, M: RpMac, K: RpCookieCheck, const N: usize>(
     gate: &mut RpGate<N>,
     mac: &M,
+    cookie: &mut K,
     now_ns: u64,
+    tx_free: usize,
     src: Endpoint,
     payload: &'a [u8],
+    out: &mut [u8; RP_COOKIE_REPLY_LEN],
 ) -> RpOutcome<'a> {
     match payload.first() {
         Some(&RP_MSG_INIT_HELLO) => {
@@ -807,7 +991,7 @@ pub fn rp_classify<'a, M: RpMac, const N: usize>(
             if !mac.verify(msg) {
                 return RpOutcome::BadMac;
             }
-            gate.rp_forward_hello(now_ns, src, msg)
+            gate.rp_hello(cookie, now_ns, tx_free, src, msg, out)
         }
         Some(&RP_MSG_INIT_CONF) => {
             let Ok(msg) = <&[u8; RP_INIT_CONF_LEN]>::try_from(payload) else {
@@ -822,35 +1006,98 @@ pub fn rp_classify<'a, M: RpMac, const N: usize>(
     }
 }
 
-/// Whether a Rosenpass reply (RespHello, EmptyData) may take a TX buffer.
-/// Each answers a mac-valid initiator message, which proves nothing about
-/// its sender, so it stays out of the reserve as cookie replies do.
-pub fn rp_reply_allowed(tx_free: usize) -> bool {
-    tx_free > TX_RESERVE
-}
 
 impl<const N: usize> RpGate<N> {
-    /// The single constructor of `ForwardHello`.
-    fn rp_forward_hello<'a>(&mut self, now_ns: u64, src: Endpoint, msg: &'a [u8; RP_INIT_HELLO_LEN]) -> RpOutcome<'a> {
-        match self.admit(RpKind::Hello, now_ns, src.ip) {
-            Ok(()) => RpOutcome::ForwardHello { src, msg },
+    /// Whether load holds at `now_ns`: the global InitHello meter below half
+    /// is a trigger by itself; refusals refresh it through `refresh_load`.
+    fn observe_load(&mut self, now_ns: u64) -> bool {
+        if self.hello_global.below_half(now_ns) {
+            self.refresh_load(now_ns);
+        }
+        now_ns < self.under_load_until_ns
+    }
+
+    /// A trigger held: load holds until RP_UNDER_LOAD_AFTER_NS from now.
+    fn refresh_load(&mut self, now_ns: u64) {
+        self.under_load_until_ns = self.under_load_until_ns.max(now_ns.saturating_add(RP_UNDER_LOAD_AFTER_NS));
+        if !self.in_load {
+            self.in_load = true;
+            self.entered_load = true;
+        }
+    }
+
+    /// An InitHello after its mac passed (M3b plan, "Load state", "Lanes").
+    fn rp_hello<'a, K: RpCookieCheck>(
+        &mut self,
+        cookie: &mut K,
+        now_ns: u64,
+        tx_free: usize,
+        src: Endpoint,
+        msg: &'a [u8; RP_INIT_HELLO_LEN],
+        out: &mut [u8; RP_COOKIE_REPLY_LEN],
+    ) -> RpOutcome<'a> {
+        if self.pq_dead {
+            return RpOutcome::PqDown;
+        }
+        if !self.observe_load(now_ns) {
+            // I2: off load the cookie is never computed.
+            let o = self.rp_forward_hello(now_ns, src, msg, false);
+            if matches!(o, RpOutcome::RateLimited | RpOutcome::RingReserved) {
+                self.refresh_load(now_ns);
+            }
+            return o;
+        }
+        // An all-zero cookie field is invalid by definition; skip its hash.
+        let field_zero = msg.get(RP_COOKIE_AT..).is_none_or(|c| c.iter().all(|&b| b == 0));
+        let secret = self.life.secret(now_ns);
+        if !field_zero && secret == Secret::Usable && cookie.valid(src, msg) {
+            let o = self.rp_forward_hello(now_ns, src, msg, true);
+            if matches!(o, RpOutcome::RateLimited | RpOutcome::RingReserved) {
+                self.refresh_load(now_ns);
+            }
+            return o;
+        }
+        // I1: no meter, nothing in flight; the spoofing keeps the gate up.
+        self.refresh_load(now_ns);
+        match secret {
+            Secret::Missing => RpOutcome::NoCookieSecret,
+            Secret::Expired => {
+                self.life.note_expired();
+                RpOutcome::CookieSecretExpired
+            }
+            Secret::Usable if rp_tx_allowed(TxTier::Unsolicited, tx_free) && cookie.seal(src, msg, out) => {
+                RpOutcome::CookieReply { dst: src }
+            }
+            Secret::Usable => RpOutcome::CookieSuppressed,
+        }
+    }
+
+    /// The single constructor of `ForwardHello`. `cookied` is the lane: a
+    /// valid cookie under load.
+    fn rp_forward_hello<'a>(
+        &mut self,
+        now_ns: u64,
+        src: Endpoint,
+        msg: &'a [u8; RP_INIT_HELLO_LEN],
+        cookied: bool,
+    ) -> RpOutcome<'a> {
+        match self.admit_hello(cookied, now_ns, src) {
+            Ok(()) => RpOutcome::ForwardHello { src, msg, cookied },
             Err(refused) => refused,
         }
     }
 
     /// The single constructor of `ForwardConf`.
     fn rp_forward_conf<'a>(&mut self, now_ns: u64, src: Endpoint, msg: &'a [u8; RP_INIT_CONF_LEN]) -> RpOutcome<'a> {
-        match self.admit(RpKind::Conf, now_ns, src.ip) {
+        match self.admit_conf(now_ns, src, msg) {
             Ok(()) => RpOutcome::ForwardConf { src, msg },
             Err(refused) => refused,
         }
     }
 
-    /// The `pq` path first, then room on the link, so a refusal there
-    /// spends nothing; then the source's meter, then the global one (spent
-    /// only if the source had a token). Nothing is counted here: the PD
-    /// calls `sent` once the forward is on the link.
-    fn admit(&mut self, kind: RpKind, now_ns: u64, ip: Ipv4) -> Result<(), RpOutcome<'static>> {
+    /// The `pq` path, then room on the link (a refusal there spends
+    /// nothing), as for both kinds.
+    fn room(&self, kind: RpKind) -> Result<(), RpOutcome<'static>> {
         if self.pq_dead {
             return Err(RpOutcome::PqDown);
         }
@@ -861,14 +1108,141 @@ impl<const N: usize> RpGate<N> {
         if self.in_flight.len >= RP_IN_FLIGHT || self.in_flight.count(kind) >= cap {
             return Err(RpOutcome::RingReserved);
         }
-        let allowed = match kind {
-            RpKind::Hello => self.hello_src.allow(ip, now_ns) && self.hello_global.allow(now_ns),
-            RpKind::Conf => self.conf_src.allow(ip, now_ns) && self.conf_global.allow(now_ns),
+        Ok(())
+    }
+
+    /// Room, then the source's meters, then the global one, spent only if
+    /// the source had a token; nothing is counted (the PD calls `sent`).
+    /// An endpoint that is no live proven slot's never takes the global
+    /// meter to the reserve (I3); a proven one may, within its credit, and
+    /// only on the cookied lane, where the cookie proves the endpoint.
+    fn admit_hello(&mut self, cookied: bool, now_ns: u64, src: Endpoint) -> Result<(), RpOutcome<'static>> {
+        self.room(RpKind::Hello)?;
+        let source_ok = if cookied {
+            self.hello_cookied_ep.allow(src, now_ns) && self.hello_cookied_ip.allow(src.ip, now_ns)
+        } else {
+            self.hello_src.allow(src.ip, now_ns)
         };
-        if !allowed {
+        if !source_ok {
             return Err(RpOutcome::RateLimited);
         }
+        let proven = if cookied { self.proven_slot(src, now_ns) } else { None };
+        let credit = proven.and_then(|i| self.proven.get(i).copied().flatten()).is_some_and(|p| p.credit.tokens(now_ns) > 0);
+        let tokens = self.hello_global.tokens(now_ns);
+        let floor = if credit { 0 } else { RP_HELLO_PROVEN_RESERVE };
+        if tokens <= floor || !self.hello_global.allow(now_ns) {
+            return Err(RpOutcome::RateLimited);
+        }
+        if credit
+            && let Some(Some(p)) = proven.and_then(|i| self.proven.get_mut(i))
+        {
+            p.credit.allow(now_ns);
+        }
         Ok(())
+    }
+
+    /// Room, with the awaited reserve: of the InitConf slots and conf-global
+    /// tokens, RP_CONF_AWAITED_RESERVED are only for an InitConf matching a
+    /// live awaited entry of its endpoint (I5), one such slot per endpoint.
+    fn admit_conf(&mut self, now_ns: u64, src: Endpoint, msg: &[u8; RP_INIT_CONF_LEN]) -> Result<(), RpOutcome<'static>> {
+        self.room(RpKind::Conf)?;
+        let matched = sid_pair(msg).and_then(|(sidi, sidr)| {
+            self.awaited.iter().position(|a| {
+                a.is_some_and(|a| {
+                    a.ep == src && a.sidi == sidi && a.sidr == sidr && a.conf_budget > 0 && live(a.at, now_ns, RP_AWAIT_CONF_NS)
+                })
+            })
+        });
+        let unreserved = self.in_flight.count(RpKind::Conf) < RP_CONF_IN_FLIGHT - RP_CONF_AWAITED_RESERVED;
+        let own_reserved =
+            (0..self.in_flight.len).any(|i| self.in_flight.get(i).is_some_and(|e| e.kind == RpKind::Conf && e.src == src));
+        let slot_ok = unreserved || (matched.is_some() && !own_reserved);
+        if !slot_ok {
+            return Err(RpOutcome::RingReserved);
+        }
+        if !self.conf_src.allow(src.ip, now_ns) {
+            return Err(RpOutcome::RateLimited);
+        }
+        let floor = if matched.is_some() { 0 } else { RP_CONF_AWAITED_RESERVED as u64 };
+        if self.conf_global.tokens(now_ns) <= floor || !self.conf_global.allow(now_ns) {
+            return Err(RpOutcome::RateLimited);
+        }
+        if let Some(Some(a)) = matched.and_then(|i| self.awaited.get_mut(i)) {
+            a.conf_budget = a.conf_budget.saturating_sub(1);
+            a.conf_seen = true;
+        }
+        Ok(())
+    }
+
+    /// The live proven slot whose endpoint is `src`.
+    fn proven_slot(&self, src: Endpoint, now_ns: u64) -> Option<usize> {
+        self.proven.iter().position(|p| p.is_some_and(|p| p.ep == src && live(p.at, now_ns, RP_PROVEN_NS)))
+    }
+
+    /// The endpoint-state feed (M3b plan, "Session binding"), for a reply
+    /// `sync_pq` handed to the driver: a RespHello makes its destination
+    /// awaited under the reply's session ids; an EmptyData proves its
+    /// destination for the configured peer `peer`, only if a matched
+    /// InitConf of that exchange was forwarded (I6). `dst` is always the
+    /// forward's stored source.
+    fn replied(&mut self, kind: RpKind, dst: Endpoint, peer: Option<u8>, msg: &[u8], now_ns: u64) {
+        match kind {
+            RpKind::Hello => {
+                // RespHello: sidr ‖ sidi.
+                let Some((sidr, sidi)) = sid_pair(msg) else { return };
+                let slot = self
+                    .awaited
+                    .iter()
+                    .position(|a| a.is_some_and(|a| a.ep == dst && a.sidr == sidr))
+                    .or_else(|| self.awaited.iter().position(|a| a.is_none_or(|a| !live(a.at, now_ns, RP_AWAIT_CONF_NS))));
+                // A full table of live entries records nothing; it never
+                // evicts one (RP_AWAIT_SLOTS bounds the live ones).
+                if let Some(a) = slot.and_then(|i| self.awaited.get_mut(i)) {
+                    *a = Some(Awaited { ep: dst, sidi, sidr, at: now_ns, conf_budget: RP_CONF_SRC_BURST, conf_seen: false });
+                }
+            }
+            RpKind::Conf => {
+                let (Some(peer), Some(sid)) = (peer, msg.get(RP_SID_AT..).and_then(|m| m.first_chunk::<4>())) else {
+                    return;
+                };
+                let Some(i) = self.awaited.iter().position(|a| a.is_some_and(|a| a.ep == dst && a.conf_seen && a.sidi == *sid))
+                else {
+                    return;
+                };
+                let Some(slot) = self.proven.get_mut(usize::from(peer)) else { return };
+                let credit = slot.filter(|p| p.ep == dst).map_or(Meter::full_at(now_ns), |p| p.credit);
+                *slot = Some(Proven { ep: dst, at: now_ns, credit });
+                if let Some(a) = self.awaited.get_mut(i) {
+                    *a = None;
+                }
+            }
+        }
+    }
+
+    /// Runs on every handler-loop pass and on the timer tick: rotates the
+    /// Rosenpass cookie secret when due (`SecretLife`), and notices load
+    /// leaving with no InitHello arriving.
+    pub fn tick_if_due<K: RpCookieCheck>(&mut self, cookie: &mut K, now_ns: u64) -> RpTickReport {
+        let mut report = RpTickReport::default();
+        let cookie = core::cell::RefCell::new(cookie);
+        (report.rotated, report.secret_unavailable) =
+            self.life.tick(now_ns, || cookie.borrow_mut().rotate(), || cookie.borrow_mut().clear());
+        if !self.observe_load(now_ns) && self.in_load {
+            self.in_load = false;
+            report.left_load = true;
+        }
+        report
+    }
+
+    /// Whether load was entered since the last call (`RpUnderLoad`).
+    pub fn take_load_entered(&mut self) -> bool {
+        core::mem::take(&mut self.entered_load)
+    }
+
+    /// Whether the expiry backstop fired for the first time since a valid
+    /// secret (`RpCookieSecretExpired`).
+    pub fn take_expired(&mut self) -> bool {
+        self.life.take_expired()
     }
 
     /// Forwards of `kind` whose return has not been seen.
@@ -1001,7 +1375,7 @@ pub enum SyncOutcome {
 /// `pq` sends a forward's record before returning its buffer, so every
 /// return counted in step 1 has its record visible in step 2. A return
 /// after the snapshot waits for the next sync.
-pub fn sync_pq<T: PqSync, const N: usize>(gate: &mut RpGate<N>, io: &mut T, peers: usize) -> SyncOutcome {
+pub fn sync_pq<T: PqSync, const N: usize>(gate: &mut RpGate<N>, io: &mut T, peers: usize, now_ns: u64) -> SyncOutcome {
     if gate.pq_dead {
         return SyncOutcome::Dead;
     }
@@ -1023,9 +1397,12 @@ pub fn sync_pq<T: PqSync, const N: usize>(gate: &mut RpGate<N>, io: &mut T, peer
             return SyncOutcome::DiedNow;
         };
         match gate.complete(record, peers) {
-            Ok(Completion::Reply { dst, msg, .. }) => {
+            Ok(Completion::Reply { dst, kind, peer, msg }) => {
+                // Only a reply that went out feeds the endpoint state, and
+                // always with the stored source (T19, R4-F1).
                 if io.transmit(dst, msg) {
                     relayed = relayed.saturating_add(1);
+                    gate.replied(kind, dst, peer, msg, now_ns);
                 }
             }
             Ok(Completion::NoReply) => {}

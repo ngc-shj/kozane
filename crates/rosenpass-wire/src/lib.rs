@@ -44,7 +44,9 @@ pub const RESP_HELLO_LEN: usize = 1132;
 pub const INIT_CONF_LEN: usize = 176;
 pub const EMPTY_DATA_LEN: usize = 64;
 
-const ENVELOPE_LEN: usize = 4 + MAC_LEN + COOKIE_LEN;
+/// `type ‖ reserved[3]`: every payload, its session ids first, starts here.
+pub const HEADER_LEN: usize = 4;
+const ENVELOPE_LEN: usize = HEADER_LEN + MAC_LEN + COOKIE_LEN;
 const _: () = assert!(INIT_HELLO_LEN == ENVELOPE_LEN + SID_LEN + EPK_LEN + SCT_LEN + PIDI_CT_LEN + TAG_LEN);
 const _: () = assert!(RESP_HELLO_LEN == ENVELOPE_LEN + 2 * SID_LEN + ECT_LEN + SCT_LEN + TAG_LEN + BISCUIT_CT_LEN);
 const _: () = assert!(INIT_CONF_LEN == ENVELOPE_LEN + 2 * SID_LEN + BISCUIT_CT_LEN + TAG_LEN);

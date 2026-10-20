@@ -47,8 +47,8 @@ fn respond_is_total_and_bounded() {
     );
     if let Outcome::ArpReplied(n) = o {
         assert!(n <= out.len());
-        // (e) The TX reserve.
-        assert!(tx_free > NET_BUFFERS / 2);
+        // (e) The TX reserve and the Rosenpass answer share (M3b S2).
+        assert!(tx_free > NET_BUFFERS / 2 + RP_ANSWER_SHARE);
     }
     kani::cover!(matches!(o, Outcome::ArpReplied(_)));
     kani::cover!(o == Outcome::ArpSuppressed);
@@ -274,8 +274,8 @@ fn classify_gate_invariants() {
     if !spec_secret_usable(&before, now) {
         assert!(stub.mac2_calls.get() == 0 && stub.seals == 0);
     }
-    // (e) The TX reserve.
-    if tx_free <= NET_BUFFERS / 2 {
+    // (e) The TX reserve and the Rosenpass answer share (M3b S2).
+    if tx_free <= NET_BUFFERS / 2 + RP_ANSWER_SHARE {
         assert!(stub.seals == 0);
     }
     // (a) Under load only a valid mac2 is forwarded; outside it is ignored.
@@ -447,6 +447,71 @@ fn any_sources<const B: u64, const I: u64>() -> SourceMeters<2, B, I> {
     SourceMeters { slots: [slot(), slot()] }
 }
 
+fn any_endpoint() -> Endpoint {
+    Endpoint { ip: kani::any(), port: kani::any() }
+}
+
+fn any_endpoint_sources<const B: u64, const I: u64>() -> SourceMeters<2, B, I, Endpoint> {
+    let slot = || if kani::any() { Some((any_endpoint(), any_meter::<B, I>())) } else { None };
+    SourceMeters { slots: [slot(), slot()] }
+}
+
+/// One arbitrary awaited entry in slot 0, the rest empty (bounded state).
+fn any_awaited() -> [Option<Awaited>; RP_AWAIT_SLOTS] {
+    let mut a = [None; RP_AWAIT_SLOTS];
+    if kani::any() {
+        a[0] = Some(Awaited {
+            ep: any_endpoint(),
+            sidi: kani::any(),
+            sidr: kani::any(),
+            at: kani::any(),
+            conf_budget: kani::any(),
+            conf_seen: kani::any(),
+        });
+    }
+    a
+}
+
+/// One arbitrary proven slot (peer 0), the rest empty.
+fn any_proven() -> [Option<Proven>; RP_MAX_PEERS] {
+    let mut p = [None; RP_MAX_PEERS];
+    if kani::any() {
+        p[0] = Some(Proven { ep: any_endpoint(), at: kani::any(), credit: any_meter() });
+    }
+    p
+}
+
+/// A Rosenpass cookie secret answering anything, counting what it was
+/// asked.
+#[derive(Default)]
+struct AnyRpCookie {
+    valid_calls: Cell<u32>,
+    seals: u32,
+}
+
+impl RpCookieCheck for AnyRpCookie {
+    fn valid(&self, _: Endpoint, _: &[u8; RP_INIT_HELLO_LEN]) -> bool {
+        self.valid_calls.set(self.valid_calls.get() + 1);
+        kani::any()
+    }
+
+    fn seal(&mut self, _: Endpoint, _: &[u8; RP_INIT_HELLO_LEN], _: &mut [u8; RP_COOKIE_REPLY_LEN]) -> bool {
+        self.seals += 1;
+        kani::any()
+    }
+
+    fn rotate(&mut self) -> bool {
+        kani::any()
+    }
+
+    fn clear(&mut self) {}
+}
+
+/// `rp_classify` with any cookie answers, any TX level and a fresh buffer.
+fn classify_any<'a>(gate: &mut RpGate<2>, mac: &AnyRpMac, cookie: &mut AnyRpCookie, now: u64, src: Endpoint, msg: &'a [u8]) -> RpOutcome<'a> {
+    rp_classify(gate, mac, cookie, now, kani::any(), src, msg, &mut [0u8; RP_COOKIE_REPLY_LEN])
+}
+
 /// Any state: meters at any level within capacity, any source table, any
 /// FIFO within its bounds and either `pq` state. Each kind within its slots
 /// is the invariant the harnesses below show is kept.
@@ -460,6 +525,20 @@ fn any_rp_gate() -> RpGate<2> {
         conf_global: any_meter(),
         in_flight,
         pq_dead: kani::any(),
+        hello_cookied_ep: any_endpoint_sources(),
+        hello_cookied_ip: any_sources(),
+        awaited: any_awaited(),
+        proven: any_proven(),
+        under_load_until_ns: kani::any(),
+        in_load: kani::any(),
+        entered_load: kani::any(),
+        life: SecretLife {
+            born_ns: kani::any(),
+            last_retry_ns: kani::any(),
+            expired_reported: kani::any(),
+            unavailable_reported: kani::any(),
+            expired_edge: kani::any(),
+        },
     }
 }
 
@@ -475,7 +554,7 @@ fn rp_classify_is_total_and_typed() {
     let msg = payload.get(..len).unwrap_or(&[]);
     let mut gate = any_rp_gate();
     let mac = AnyRpMac::default();
-    let o = rp_classify(&mut gate, &mac, kani::any(), Endpoint { ip: kani::any(), port: kani::any() }, msg);
+    let o = classify_any(&mut gate, &mac, &mut AnyRpCookie::default(), kani::any(), Endpoint { ip: kani::any(), port: kani::any() }, msg);
     let typed = (len == RP_INIT_HELLO_LEN && payload[0] == RP_MSG_INIT_HELLO)
         || (len == RP_INIT_CONF_LEN && payload[0] == RP_MSG_INIT_CONF);
     match o {
@@ -502,7 +581,7 @@ fn rp_refusals_before_admission_spend_nothing() {
     kani::assume(len == RP_INIT_HELLO_LEN || len == RP_INIT_CONF_LEN || len < 4);
     let mut gate = any_rp_gate();
     let before = gate.clone();
-    let o = rp_classify(&mut gate, &AnyRpMac::default(), kani::any(), Endpoint { ip: kani::any(), port: kani::any() }, payload.get(..len).unwrap_or(&[]));
+    let o = classify_any(&mut gate, &AnyRpMac::default(), &mut AnyRpCookie::default(), kani::any(), Endpoint { ip: kani::any(), port: kani::any() }, payload.get(..len).unwrap_or(&[]));
     if matches!(o, RpOutcome::BadMac | RpOutcome::TypeDropped | RpOutcome::RingReserved) {
         assert!(gate == before);
     }
@@ -526,7 +605,7 @@ fn rp_forward_spends_its_own_meters_once() {
     let before = gate.clone();
     let now: u64 = kani::any();
     let ip: Ipv4 = kani::any();
-    let o = rp_classify(&mut gate, &AnyRpMac::default(), now, Endpoint { ip, port: kani::any() }, msg);
+    let o = classify_any(&mut gate, &AnyRpMac::default(), &mut AnyRpCookie::default(), now, Endpoint { ip, port: kani::any() }, msg);
     match o {
         RpOutcome::ForwardHello { .. } => {
             assert!(spec_level(&gate.hello_global, now) + RP_HELLO_GLOBAL_INTERVAL_NS == spec_level(&before.hello_global, now));
@@ -571,7 +650,7 @@ fn rp_shares_stay_disjoint_and_bounded() {
         let _ = gate.retire(kani::any());
         None
     } else {
-        let o = rp_classify(&mut gate, &AnyRpMac::default(), kani::any(), src, msg);
+        let o = classify_any(&mut gate, &AnyRpMac::default(), &mut AnyRpCookie::default(), kani::any(), src, msg);
         if matches!(o, RpOutcome::ForwardHello { .. } | RpOutcome::ForwardConf { .. }) {
             gate.sent(kind, src);
         }
@@ -599,7 +678,7 @@ fn rp_sync_relays_only_to_stored_sources_in_order() {
     let before = gate.clone();
     let mut pq = AnyPq { outstanding: kani::any(), left: kani::any(), sent: [None; 3], n_sent: 0, n_ok: 0 };
     kani::assume(pq.left <= 3);
-    let o = sync_pq(&mut gate, &mut pq, 2);
+    let o = sync_pq(&mut gate, &mut pq, 2, kani::any());
     // Each reply went to the source of a distinct entry, oldest first.
     let mut cursor = 0usize;
     for dst in pq.sent.iter().take(pq.n_sent).flatten() {
@@ -667,4 +746,135 @@ impl PqSync for AnyPq {
         self.n_ok += usize::from(ok);
         ok
     }
+}
+
+/// The tokens a meter holds, from the plan rather than the code.
+fn spec_tokens<const B: u64, const I: u64>(m: &Meter<B, I>, now: u64) -> u64 {
+    spec_level(m, now) / I
+}
+
+/// I1: under load, an InitHello without a valid cookie (any outcome but a
+/// forward, after the mac passed) spends no meter and records nothing: only
+/// the load deadline and its edge, and the expiry edge, may change.
+/// I2: off load the cookie is never asked.
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_cookie_lane_spends_nothing_and_is_never_asked_off_load() {
+    let payload: [u8; RP_INIT_HELLO_LEN] = kani::any();
+    let mut gate = any_rp_gate();
+    let before = gate.clone();
+    let now: u64 = kani::any();
+    let mut cookie = AnyRpCookie::default();
+    let o = classify_any(&mut gate, &AnyRpMac::default(), &mut cookie, now, any_endpoint(), &payload);
+    let loaded_before = spec_below_half(&before.hello_global, now) || now < before.under_load_until_ns;
+    if !loaded_before {
+        assert!(cookie.valid_calls.get() == 0);
+    }
+    if matches!(
+        o,
+        RpOutcome::CookieReply { .. } | RpOutcome::CookieSuppressed | RpOutcome::NoCookieSecret | RpOutcome::CookieSecretExpired
+    ) {
+        assert!(loaded_before);
+        assert!(gate.hello_src == before.hello_src && gate.hello_cookied_ep == before.hello_cookied_ep);
+        assert!(gate.hello_cookied_ip == before.hello_cookied_ip && gate.hello_global == before.hello_global);
+        assert!(gate.conf_src == before.conf_src && gate.conf_global == before.conf_global);
+        assert!(gate.in_flight == before.in_flight && gate.awaited == before.awaited && gate.proven == before.proven);
+    }
+    kani::cover!(matches!(o, RpOutcome::CookieReply { .. }));
+    kani::cover!(matches!(o, RpOutcome::ForwardHello { .. }) && cookie.valid_calls.get() == 1);
+}
+
+/// I3: an InitHello forwarded for an endpoint that held no live proven
+/// slot found more than RP_HELLO_PROVEN_RESERVE global tokens; any forward
+/// spent exactly one (I7, which keeps the C2 key-bucket assertion).
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_unproven_never_takes_the_proven_reserve() {
+    let payload: [u8; RP_INIT_HELLO_LEN] = kani::any();
+    let mut gate = any_rp_gate();
+    let before = gate.clone();
+    let now: u64 = kani::any();
+    let src = any_endpoint();
+    let o = classify_any(&mut gate, &AnyRpMac::default(), &mut AnyRpCookie::default(), now, src, &payload);
+    if matches!(o, RpOutcome::ForwardHello { .. }) {
+        assert!(spec_level(&gate.hello_global, now) + RP_HELLO_GLOBAL_INTERVAL_NS == spec_level(&before.hello_global, now));
+        let proven = before.proven.iter().flatten().any(|p| p.ep == src && now >= p.at && now - p.at < RP_PROVEN_NS);
+        if !proven {
+            assert!(spec_tokens(&before.hello_global, now) > RP_HELLO_PROVEN_RESERVE);
+        }
+    }
+    kani::cover!(matches!(o, RpOutcome::ForwardHello { .. }) && spec_tokens(&before.hello_global, now) <= RP_HELLO_PROVEN_RESERVE);
+}
+
+/// I5: an InitConf forwarded while the open share of InitConf slots was
+/// full matched a live awaited entry of its endpoint, whose budget it
+/// spent; and an unmatched one found more than the reserved conf tokens.
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_only_a_matched_init_conf_takes_the_awaited_reserve() {
+    let payload: [u8; RP_INIT_CONF_LEN] = kani::any();
+    let mut gate = any_rp_gate();
+    kani::assume(gate.in_flight.count(RpKind::Conf) <= RP_CONF_IN_FLIGHT);
+    let before = gate.clone();
+    let now: u64 = kani::any();
+    let src = any_endpoint();
+    let o = classify_any(&mut gate, &AnyRpMac::default(), &mut AnyRpCookie::default(), now, src, &payload);
+    if matches!(o, RpOutcome::ForwardConf { .. }) {
+        let matched = before.awaited[0].is_some_and(|a| {
+            a.ep == src
+                && payload[4..8] == a.sidi
+                && payload[8..12] == a.sidr
+                && a.conf_budget > 0
+                && now >= a.at
+                && now - a.at < RP_AWAIT_CONF_NS
+        });
+        if before.in_flight.count(RpKind::Conf) >= RP_CONF_IN_FLIGHT - RP_CONF_AWAITED_RESERVED {
+            assert!(matched);
+        }
+        if !matched {
+            assert!(spec_tokens(&before.conf_global, now) > RP_CONF_AWAITED_RESERVED as u64);
+        } else {
+            assert!(gate.awaited[0].is_some_and(|a| a.conf_seen && a.conf_budget + 1 == before.awaited[0].map_or(0, |b| b.conf_budget)));
+        }
+    }
+    kani::cover!(matches!(o, RpOutcome::ForwardConf { .. }) && before.in_flight.count(RpKind::Conf) == RP_CONF_IN_FLIGHT - 1);
+}
+
+/// I6: a proven slot changes only on an EmptyData to an endpoint with a
+/// `conf_seen` awaited entry whose sidi is the EmptyData's sid, and only the
+/// named peer's slot, with an index below RP_MAX_PEERS.
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_proven_changes_only_through_the_session_ids() {
+    let mut gate = any_rp_gate();
+    let before = gate.clone();
+    let msg: [u8; 12] = kani::any();
+    let dst = any_endpoint();
+    let peer: Option<u8> = kani::any();
+    let kind = any_kind();
+    gate.replied(kind, dst, peer, &msg, kani::any());
+    if gate.proven != before.proven {
+        assert!(kind == RpKind::Conf);
+        let a = before.awaited[0].unwrap();
+        assert!(a.ep == dst && a.conf_seen && msg[4..8] == a.sidi);
+        let i = usize::from(peer.unwrap());
+        assert!(i < RP_MAX_PEERS);
+        for j in 0..RP_MAX_PEERS {
+            if j != i {
+                assert!(gate.proven[j] == before.proven[j]);
+            }
+        }
+        assert!(gate.proven[i].is_some_and(|p| p.ep == dst));
+    }
+    kani::cover!(gate.proven != before.proven);
+}
+
+/// I8: an unsolicited reply is never allowed where an answer is refused.
+#[kani::proof]
+fn rp_tx_tiers_are_ordered() {
+    let free: usize = kani::any();
+    if rp_tx_allowed(TxTier::Unsolicited, free) {
+        assert!(rp_tx_allowed(TxTier::Answer, free));
+    }
+    kani::cover!(rp_tx_allowed(TxTier::Answer, free) && !rp_tx_allowed(TxTier::Unsolicited, free));
 }

@@ -15,3 +15,7 @@ rand_core = { version = "=0.6.4", default-features = false }
 # Keyed SHAKE256 for the cookie tree (M3b plan C1); already locked through
 # classic-mceliece-rust.
 sha3 = { version = "=0.10.9", default-features = false }
+
+[dev-dependencies]
+# The ingress PD's cookie adapter is tested here by path (M3b plan C3).
+ingress-core = { path = "../ingress-core" }

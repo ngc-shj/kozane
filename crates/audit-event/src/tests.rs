@@ -172,11 +172,18 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::RpRngFailed
         | Event::RpDecapsRateLimited
         | Event::RpPqRecordStuck
-        | Event::RpPqSyncDead => true,
+        | Event::RpPqSyncDead
+        | Event::RpUnderLoad
+        | Event::RpLoadCleared
+        | Event::RpCookieSecretExpired
+        | Event::RpCookieSecretUnavailable
+        | Event::RpCookieReplySent
+        | Event::RpCookieAccepted
+        | Event::RpCookieSuppressed => true,
         Event::FrameDropped { .. } | Event::RpCostHighWater { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
-    assert_eq!(Event::FIXED.len(), 53);
+    assert_eq!(Event::FIXED.len(), 60);
 }
 
 #[test]
@@ -219,6 +226,10 @@ fn only_state_edge_kinds_are_never_coalesced() {
             Event::CookieSecretUnavailable,
             Event::RpPqRecordStuck,
             Event::RpPqSyncDead,
+            Event::RpUnderLoad,
+            Event::RpLoadCleared,
+            Event::RpCookieSecretExpired,
+            Event::RpCookieSecretUnavailable,
         ]
     );
     assert!(Event::FrameDropped { reason: 0 }.is_coalesced());
@@ -248,7 +259,8 @@ fn decode_classifies_fixed_dropped_and_unknown_codes() {
     assert_eq!(decode(0x0019), Decoded::Unknown);
     assert_eq!(decode(0x0049), Decoded::Fixed(Event::RpPqRecordStuck));
     assert_eq!(decode(0x004a), Decoded::Fixed(Event::RpPqSyncDead));
-    assert_eq!(decode(0x004b), Decoded::Unknown);
+    assert_eq!(decode(0x0051), Decoded::Fixed(Event::RpCookieSuppressed));
+    assert_eq!(decode(0x0052), Decoded::Unknown);
 }
 
 #[test]

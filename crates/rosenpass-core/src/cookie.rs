@@ -145,6 +145,18 @@ pub fn seal_cookie_reply(
     crypto::xaead_seal(&Secret::copy_from(key), nonce, mac, value.expose(), sealed)
 }
 
+/// The CookieReply nonce for the `counter`-th reply under `secret`: never
+/// repeated under one secret, and unpredictable without it. Local to the
+/// responder (upstream draws a random one), so it carries a secureos label.
+pub fn reply_nonce(secret: &Secret<COOKIE_SECRET_LEN>, counter: u64) -> [u8; XNONCE_LEN] {
+    let full = Shake::root().mix(b"secureos cookie reply nonce").mix(secret.expose()).mix(&counter.to_le_bytes()).0;
+    let mut n = [0u8; XNONCE_LEN];
+    if let Some(head) = full.first_chunk::<XNONCE_LEN>() {
+        n = *head;
+    }
+    n
+}
+
 /// Encodes a sender's endpoint as `host_info`.
 pub fn host_info(ip: [u8; 4], port: u16) -> [u8; HOST_INFO_LEN] {
     let mut h = [0u8; HOST_INFO_LEN];

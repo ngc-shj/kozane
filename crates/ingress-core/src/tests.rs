@@ -272,15 +272,16 @@ fn answers_broadcast_arp_request_for_our_ip() {
 }
 
 #[test]
-fn the_tx_reserve_refuses_an_arp_reply_at_exactly_half() {
+fn the_tx_reserve_refuses_an_arp_reply_at_the_unsolicited_tier() {
+    // M3b S2: ARP replies are unsolicited, below the Rosenpass answer share.
     let req = arp(ArpOp::Request, [0xff; 6], CFG.ipv4);
-    assert_eq!(run_tx(&req, NET_BUFFERS / 2), Outcome::ArpSuppressed, "ARP reply must not use the TX reserve");
+    assert_eq!(run_tx(&req, NET_BUFFERS / 2 + RP_ANSWER_SHARE), Outcome::ArpSuppressed, "ARP reply must not use the TX reserve or the answer share");
 }
 
 #[test]
-fn an_arp_reply_is_sent_one_buffer_above_the_tx_reserve() {
+fn an_arp_reply_is_sent_one_buffer_above_the_unsolicited_tier() {
     let req = arp(ArpOp::Request, [0xff; 6], CFG.ipv4);
-    assert!(matches!(run_tx(&req, NET_BUFFERS / 2 + 1), Outcome::ArpReplied(_)));
+    assert!(matches!(run_tx(&req, NET_BUFFERS / 2 + RP_ANSWER_SHARE + 1), Outcome::ArpReplied(_)));
 }
 
 #[test]
@@ -646,12 +647,12 @@ fn a_zero_mac2_skips_its_check_but_still_draws_a_reply() {
 }
 
 #[test]
-fn the_tx_reserve_refuses_at_exactly_half() {
+fn the_tx_reserve_refuses_a_cookie_reply_at_the_unsolicited_tier() {
     let mut r = Rig::idle();
     let m = init_mac2(Mac2::Zero);
-    assert_eq!(r.send(SEC, LOADED, NET_BUFFERS / 2, SRC, &m), Outcome::CookieSuppressed);
+    assert_eq!(r.send(SEC, LOADED, NET_BUFFERS / 2 + RP_ANSWER_SHARE, SRC, &m), Outcome::CookieSuppressed);
     assert_eq!(r.crypto.seals, 0);
-    assert_eq!(r.send(SEC, LOADED, NET_BUFFERS / 2 + 1, SRC, &m), REPLY);
+    assert_eq!(r.send(SEC, LOADED, NET_BUFFERS / 2 + RP_ANSWER_SHARE + 1, SRC, &m), REPLY);
 }
 
 #[test]
@@ -866,12 +867,78 @@ fn src(n: u8) -> Endpoint {
     Endpoint { ip: [10, 0, 3, n], port: 40000 }
 }
 
+/// The Rosenpass cookie secret, scripted: whether a cookie is valid (and
+/// how often that was asked), whether sealing and rotation succeed.
+struct FakeCookie {
+    valid: bool,
+    valid_calls: Cell<usize>,
+    seals: usize,
+    rotate_ok: bool,
+    clears: usize,
+}
+
+impl FakeCookie {
+    fn invalid() -> Self {
+        Self { valid: false, valid_calls: Cell::new(0), seals: 0, rotate_ok: true, clears: 0 }
+    }
+
+    fn valid() -> Self {
+        Self { valid: true, ..Self::invalid() }
+    }
+}
+
+impl RpCookieCheck for FakeCookie {
+    fn valid(&self, _src: Endpoint, _msg: &[u8; RP_INIT_HELLO_LEN]) -> bool {
+        self.valid_calls.set(self.valid_calls.get() + 1);
+        self.valid
+    }
+
+    fn seal(&mut self, _src: Endpoint, _msg: &[u8; RP_INIT_HELLO_LEN], out: &mut [u8; RP_COOKIE_REPLY_LEN]) -> bool {
+        self.seals += 1;
+        out[0] = 0x86;
+        true
+    }
+
+    fn rotate(&mut self) -> bool {
+        self.rotate_ok
+    }
+
+    fn clear(&mut self) {
+        self.clears += 1;
+    }
+}
+
+/// A gate whose cookie secret was born at time 0.
+fn armed() -> RpGate<8> {
+    let mut g = RpGate::default();
+    assert!(g.tick_if_due(&mut FakeCookie::valid(), 0).rotated);
+    g
+}
+
+fn rp_with<'a>(g: &mut RpGate<8>, cookie: &mut FakeCookie, now: u64, tx_free: usize, from: Endpoint, payload: &'a [u8]) -> RpOutcome<'a> {
+    rp_classify(g, &FakeRpMac::default(), cookie, now, tx_free, from, payload, &mut [0u8; RP_COOKIE_REPLY_LEN])
+}
+
+/// Classifies `payload` with a cookie that never validates and room on TX.
 fn rp<'a>(gate: &mut RpGate<8>, now: u64, from: Endpoint, payload: &'a [u8]) -> RpOutcome<'a> {
-    rp_classify(gate, &FakeRpMac::default(), now, from, payload)
+    rp_with(gate, &mut FakeCookie::invalid(), now, TX_FREE, from, payload)
+}
+
+/// With a cookie that validates.
+fn rp_cookied<'a>(gate: &mut RpGate<8>, now: u64, from: Endpoint, payload: &'a [u8]) -> RpOutcome<'a> {
+    rp_with(gate, &mut FakeCookie::valid(), now, TX_FREE, from, payload)
 }
 
 fn forwarded(o: RpOutcome<'_>) -> bool {
     matches!(o, RpOutcome::ForwardHello { .. } | RpOutcome::ForwardConf { .. })
+}
+
+/// An InitHello with a nonzero cookie field (the all-zero field is invalid
+/// without hashing).
+fn hello_with_cookie() -> Vec<u8> {
+    let mut m = hello();
+    m[RP_COOKIE_AT] = 0xc0;
+    m
 }
 
 #[test]
@@ -895,9 +962,9 @@ fn emit_udp_goes_from_the_given_port() {
 
 #[test]
 fn init_hello_and_init_conf_of_exact_length_are_forwarded() {
-    let mut g = RpGate::default();
+    let mut g = armed();
     let (h, c) = (hello(), conf());
-    let RpOutcome::ForwardHello { src: s, msg } = rp(&mut g, 0, SRC, &h) else { panic!("hello not forwarded") };
+    let RpOutcome::ForwardHello { src: s, msg, cookied: false } = rp(&mut g, 0, SRC, &h) else { panic!("hello not forwarded") };
     assert_eq!((s, &msg[..]), (SRC, &h[..]));
     let RpOutcome::ForwardConf { src: s, msg } = rp(&mut g, 0, SRC, &c) else { panic!("conf not forwarded") };
     assert_eq!((s, &msg[..]), (SRC, &c[..]));
@@ -919,23 +986,26 @@ fn every_other_type_or_length_is_dropped_before_the_mac() {
         rp_msg(RP_MSG_INIT_CONF, RP_INIT_HELLO_LEN, true),
         std::vec![],
     ];
-    let mut g = RpGate::<8>::default();
+    let mut g = armed();
+    let before = g.clone();
     let mac = FakeRpMac::default();
     for m in &cases {
-        assert_eq!(rp_classify(&mut g, &mac, 0, SRC, m), RpOutcome::TypeDropped, "len {}", m.len());
+        let o = rp_classify(&mut g, &mac, &mut FakeCookie::valid(), 0, TX_FREE, SRC, m, &mut [0u8; RP_COOKIE_REPLY_LEN]);
+        assert_eq!(o, RpOutcome::TypeDropped, "len {}", m.len());
     }
     assert_eq!(mac.calls.get(), 0);
-    assert_eq!(g, RpGate::default());
+    assert_eq!(g, before);
 }
 
 #[test]
 fn a_bad_mac_is_refused_and_spends_nothing() {
-    let mut g = RpGate::default();
+    let mut g = armed();
+    let before = g.clone();
     for _ in 0..100 {
         assert_eq!(rp(&mut g, 0, SRC, &rp_msg(RP_MSG_INIT_HELLO, RP_INIT_HELLO_LEN, false)), RpOutcome::BadMac);
         assert_eq!(rp(&mut g, 0, SRC, &rp_msg(RP_MSG_INIT_CONF, RP_INIT_CONF_LEN, false)), RpOutcome::BadMac);
     }
-    assert_eq!(g, RpGate::default());
+    assert_eq!(g, before);
     assert!(forwarded(rp(&mut g, 0, SRC, &hello())));
 }
 
@@ -945,50 +1015,74 @@ fn rp_drained<'a>(g: &mut RpGate<8>, now: u64, from: Endpoint, msg: &'a [u8]) ->
     rp(g, now, from, msg)
 }
 
+// -- the off-load lane (M3a's meters) and the load trigger --
+
 #[test]
-fn a_source_over_its_hello_burst_is_rate_limited_then_refills() {
-    let mut g = RpGate::default();
+fn a_source_over_its_hello_burst_is_refused_and_that_engages_the_gate() {
+    // S-3: the victim's own InitHello finds its per-IP token spent.
+    let mut g = armed();
     let h = hello();
     for _ in 0..RP_HELLO_SRC_BURST {
         assert!(forwarded(rp_drained(&mut g, 0, SRC, &h)));
     }
+    assert!(!g.take_load_entered(), "a forward is no trigger");
     assert_eq!(rp_drained(&mut g, 0, SRC, &h), RpOutcome::RateLimited);
-    // The global meter still had tokens: another source passes.
-    assert!(forwarded(rp_drained(&mut g, 0, src(9), &h)));
-    assert!(forwarded(rp_drained(&mut g, RP_HELLO_SRC_INTERVAL_NS, SRC, &h)));
+    assert!(g.take_load_entered(), "the refusal engages the gate");
+    // Now another source needs a cookie too.
+    assert!(matches!(rp_drained(&mut g, 0, src(9), &h), RpOutcome::CookieReply { .. }));
 }
 
 #[test]
-fn hellos_over_the_global_burst_are_rate_limited_then_refill() {
-    let mut g = RpGate::default();
+fn draining_the_global_hello_meter_engages_the_gate() {
+    // From distinct sources (no per-IP refusal): off load the unproven
+    // floor is reached at half the burst, and that refusal is the trigger.
+    let mut g = armed();
     let h = hello();
-    for i in 0..RP_HELLO_GLOBAL_BURST as u8 {
-        assert!(forwarded(rp_drained(&mut g, 0, src(i), &h)));
+    for i in 0..(RP_HELLO_GLOBAL_BURST - RP_HELLO_PROVEN_RESERVE) as u8 {
+        assert!(forwarded(rp_drained(&mut g, 0, src(i), &h)), "source {i}");
     }
+    assert!(!g.take_load_entered());
     assert_eq!(rp_drained(&mut g, 0, src(100), &h), RpOutcome::RateLimited);
-    assert!(forwarded(rp_drained(&mut g, RP_HELLO_GLOBAL_INTERVAL_NS, src(101), &h)));
+    assert!(g.take_load_entered());
+    assert!(matches!(rp_drained(&mut g, 0, src(101), &h), RpOutcome::CookieReply { .. }));
 }
 
 #[test]
-fn a_source_refusal_does_not_spend_the_global_hello_meter() {
-    let mut g = RpGate::default();
+fn the_global_hello_meter_below_half_holds_the_gate_on_its_own() {
+    // Past the hold deadline, a meter below half still holds the gate at
+    // the tick; once it has refilled to half and the hold has run out, the
+    // gate clears.
+    let mut g = loaded();
+    let e = Endpoint { ip: [203, 0, 113, 5], port: 7000 };
+    prove(&mut g, e, 0, 1);
+    drain_global_to(&mut g, 1, RP_HELLO_PROVEN_RESERVE);
+    assert!(forwarded(rp_cookied(&mut g, 1, e, &hello_with_cookie())), "a proven spend below the reserve");
+    assert!(g.hello_global.below_half(1));
+    g.under_load_until_ns = 0;
+    assert!(!g.tick_if_due(&mut FakeCookie::valid(), 1).left_load, "below half holds");
+    // Refilled to half by `refilled`, and the hold renewed at 1 runs out.
+    let refilled = 1 + RP_HELLO_GLOBAL_INTERVAL_NS;
+    let clear = (1 + RP_UNDER_LOAD_AFTER_NS).max(refilled);
+    assert!(!g.hello_global.below_half(clear));
+    assert!(g.tick_if_due(&mut FakeCookie::valid(), clear).left_load);
+}
+
+#[test]
+fn load_holds_for_rp_under_load_after_ns_after_its_last_trigger() {
+    let mut g = armed();
     let h = hello();
-    for _ in 0..RP_HELLO_SRC_BURST {
-        assert!(forwarded(rp_drained(&mut g, 0, SRC, &h)));
-    }
-    for _ in 0..50 {
-        assert_eq!(rp_drained(&mut g, 0, SRC, &h), RpOutcome::RateLimited);
-    }
-    let left = RP_HELLO_GLOBAL_BURST - RP_HELLO_SRC_BURST;
-    for i in 0..left as u8 {
-        assert!(forwarded(rp_drained(&mut g, 0, src(i), &h)));
-    }
-    assert_eq!(rp_drained(&mut g, 0, src(200), &h), RpOutcome::RateLimited);
+    rp_drained(&mut g, 0, SRC, &h);
+    assert_eq!(rp_drained(&mut g, 0, SRC, &h), RpOutcome::RateLimited); // trigger at 0
+    let t = RP_UNDER_LOAD_AFTER_NS;
+    assert!(!g.tick_if_due(&mut FakeCookie::valid(), t - 1).left_load);
+    let r = g.tick_if_due(&mut FakeCookie::valid(), t);
+    assert!(r.left_load, "load clears at exactly the hold");
+    assert!(forwarded(rp_drained(&mut g, t, src(7), &h)), "off load again: no cookie needed");
 }
 
 #[test]
 fn a_source_over_its_conf_burst_is_rate_limited_then_refills() {
-    let mut g = RpGate::default();
+    let mut g = armed();
     let c = conf();
     for _ in 0..RP_CONF_SRC_BURST {
         assert!(forwarded(rp_drained(&mut g, 0, SRC, &c)));
@@ -999,24 +1093,25 @@ fn a_source_over_its_conf_burst_is_rate_limited_then_refills() {
 }
 
 #[test]
-fn confs_over_the_global_burst_are_rate_limited_then_refill() {
-    let mut g = RpGate::default();
+fn unmatched_confs_stop_at_the_awaited_reserve_of_the_global_meter() {
+    let mut g = armed();
     let c = conf();
-    for i in 0..RP_CONF_GLOBAL_BURST as u8 {
-        assert!(forwarded(rp_drained(&mut g, 0, src(i), &c)));
+    let open = RP_CONF_GLOBAL_BURST - RP_CONF_AWAITED_RESERVED as u64;
+    for i in 0..open as u8 {
+        assert!(forwarded(rp_drained(&mut g, 0, src(i), &c)), "source {i}");
     }
-    assert_eq!(rp_drained(&mut g, 0, src(100), &c), RpOutcome::RateLimited);
+    assert_eq!(rp_drained(&mut g, 0, src(100), &c), RpOutcome::RateLimited, "the reserve");
     assert!(forwarded(rp_drained(&mut g, RP_CONF_GLOBAL_INTERVAL_NS, src(101), &c)));
 }
 
 #[test]
 fn hello_and_conf_meters_are_separate() {
-    let mut g = RpGate::default();
-    let (h, c) = (hello(), conf());
+    let mut g = armed();
+    let c = conf();
     for i in 0..=RP_HELLO_GLOBAL_BURST as u8 {
-        rp_drained(&mut g, 0, src(i), &h);
+        rp_cookied(&mut g, 0, src(i), &hello_with_cookie());
     }
-    assert_eq!(rp_drained(&mut g, 0, src(50), &h), RpOutcome::RateLimited);
+    assert!(rp_cookied(&mut g, 0, src(50), &hello_with_cookie()) == RpOutcome::RateLimited);
     assert!(forwarded(rp_drained(&mut g, 0, src(0), &c)), "an exhausted hello meter refused a conf");
 }
 
@@ -1030,6 +1125,358 @@ fn a_full_source_table_evicts_the_least_recently_used_source() {
     assert!(m.allow([2, 2, 2, 2], 20));
     assert!(m.allow([3, 3, 3, 3], 30));
     assert!(m.allow([1, 1, 1, 1], 40), "the evicted source starts fresh");
+}
+
+/// A gate under load (engaged by a per-IP refusal at time 0).
+fn loaded() -> RpGate<8> {
+    let mut g = armed();
+    rp_drained(&mut g, 0, src(200), &hello());
+    assert_eq!(rp_drained(&mut g, 0, src(200), &hello()), RpOutcome::RateLimited);
+    g
+}
+
+// -- I1, I2: the cookie under load, and never off load --
+
+#[test]
+fn under_load_an_init_hello_without_a_valid_cookie_spends_nothing() {
+    let mut g = loaded();
+    let before = g.clone();
+    let mut cookie = FakeCookie::invalid();
+    let m = hello_with_cookie();
+    for i in 0..50u8 {
+        let o = rp_with(&mut g, &mut cookie, 1, TX_FREE, src(i), &m);
+        assert_eq!(o, RpOutcome::CookieReply { dst: src(i) });
+    }
+    assert_eq!(cookie.seals, 50);
+    // Only the load deadline moved: no meter, nothing in flight.
+    let mut after = g.clone();
+    after.under_load_until_ns = before.under_load_until_ns;
+    assert_eq!(after, before);
+    // The allow side: a valid cookie is forwarded.
+    assert!(forwarded(rp_cookied(&mut g, 1, src(9), &hello_with_cookie())));
+}
+
+#[test]
+fn off_load_the_cookie_is_never_asked() {
+    let mut g = armed();
+    let cookie = FakeCookie::valid();
+    let mut cookie = cookie;
+    assert!(forwarded(rp_with(&mut g, &mut cookie, 0, TX_FREE, SRC, &hello_with_cookie())));
+    assert_eq!(cookie.valid_calls.get(), 0);
+    // Under load it is asked exactly once.
+    let mut g = loaded();
+    let mut cookie = FakeCookie::valid();
+    assert!(forwarded(rp_with(&mut g, &mut cookie, 1, TX_FREE, SRC, &hello_with_cookie())));
+    assert_eq!(cookie.valid_calls.get(), 1);
+}
+
+#[test]
+fn an_all_zero_cookie_field_is_invalid_without_asking() {
+    let mut g = loaded();
+    let mut cookie = FakeCookie::valid();
+    assert!(matches!(rp_with(&mut g, &mut cookie, 1, TX_FREE, SRC, &hello()), RpOutcome::CookieReply { .. }));
+    assert_eq!(cookie.valid_calls.get(), 0);
+}
+
+#[test]
+fn without_a_secret_or_past_its_age_no_cookie_is_valid_or_sent() {
+    // T17: missing secret.
+    let mut g = RpGate::<8>::default();
+    rp_drained(&mut g, 0, src(200), &hello());
+    rp_drained(&mut g, 0, src(200), &hello());
+    let mut cookie = FakeCookie::valid();
+    assert_eq!(rp_with(&mut g, &mut cookie, 1, TX_FREE, SRC, &hello_with_cookie()), RpOutcome::NoCookieSecret);
+    assert_eq!(cookie.valid_calls.get(), 0);
+    // Expired: the backstop, its edge raised once.
+    let mut g = loaded();
+    let at = COOKIE_SECRET_MAX_AGE_NS;
+    g.refresh_load(at);
+    assert_eq!(rp_with(&mut g, &mut FakeCookie::valid(), at, TX_FREE, SRC, &hello_with_cookie()), RpOutcome::CookieSecretExpired);
+    assert!(g.take_expired());
+    assert_eq!(rp_with(&mut g, &mut FakeCookie::valid(), at, TX_FREE, SRC, &hello_with_cookie()), RpOutcome::CookieSecretExpired);
+    assert!(!g.take_expired(), "the edge is raised once");
+    // The allow side: one ns before the age, a valid cookie forwards.
+    let mut g = loaded();
+    assert!(forwarded(rp_cookied(&mut g, at - 1, SRC, &hello_with_cookie())));
+}
+
+#[test]
+fn a_cookie_reply_takes_only_an_unsolicited_tx_buffer() {
+    let mut g = loaded();
+    let edge = NET_BUFFERS / 2 + RP_ANSWER_SHARE;
+    assert_eq!(rp_with(&mut g, &mut FakeCookie::invalid(), 1, edge, SRC, &hello_with_cookie()), RpOutcome::CookieSuppressed);
+    assert!(matches!(rp_with(&mut g, &mut FakeCookie::invalid(), 1, edge + 1, SRC, &hello_with_cookie()), RpOutcome::CookieReply { .. }));
+}
+
+// -- F3: peers behind one address --
+
+#[test]
+fn every_peer_behind_one_address_gets_through_with_its_cookie() {
+    // All at once, as after a reboot: the per-IP cap admits every
+    // configured peer behind one address and refuses one more. The global
+    // meter is refilled before each try so only the cap decides.
+    let mut g = loaded();
+    for port in 0..RP_MAX_PEERS as u16 {
+        let ep = Endpoint { ip: [192, 0, 2, 7], port: 50000 + port };
+        g.hello_global = Meter::full_at(1);
+        assert!(forwarded(rp_cookied(&mut g, 1, ep, &hello_with_cookie())), "peer {port}");
+    }
+    g.hello_global = Meter::full_at(1);
+    let one_more = Endpoint { ip: [192, 0, 2, 7], port: 50100 };
+    assert_eq!(rp_cookied(&mut g, 1, one_more, &hello_with_cookie()), RpOutcome::RateLimited, "the per-IP cap");
+    // Another address is not affected.
+    assert!(forwarded(rp_cookied(&mut g, 1, src(9), &hello_with_cookie())));
+}
+
+#[test]
+fn the_cookied_lane_does_not_share_the_off_load_per_ip_token() {
+    // The off-load token of the address is spent, yet a cookied endpoint
+    // behind it starts with its own per-endpoint meter (F13).
+    let mut g = loaded();
+    assert!(forwarded(rp_cookied(&mut g, 1, src(200), &hello_with_cookie())));
+}
+
+// -- I3: the proven reserve --
+
+/// Drains the global meter with cookied InitHellos from distinct addresses
+/// until `left` tokens remain.
+fn drain_global_to(g: &mut RpGate<8>, now: u64, left: u64) {
+    let mut i = 0u8;
+    while g.hello_global.tokens(now) > left {
+        assert!(forwarded(rp_cookied(g, now, Endpoint { ip: [198, 51, 100, i], port: 1 }, &hello_with_cookie())));
+        i += 1;
+    }
+}
+
+fn prove(g: &mut RpGate<8>, ep: Endpoint, peer: u8, now: u64) {
+    let sidi = [1, 2, 3, peer];
+    let sidr = [9, 9, 9, peer];
+    let mut resp = std::vec![0x82u8; RP_RESP_HELLO_LEN];
+    resp[4..8].copy_from_slice(&sidr);
+    resp[8..12].copy_from_slice(&sidi);
+    g.replied(RpKind::Hello, ep, None, &resp, now);
+    let mut c = conf();
+    c[4..8].copy_from_slice(&sidi);
+    c[8..12].copy_from_slice(&sidr);
+    assert!(forwarded(rp(g, now, ep, &c)), "the matched InitConf");
+    let mut empty = std::vec![0x84u8; RP_EMPTY_DATA_LEN];
+    empty[4..8].copy_from_slice(&sidi);
+    g.replied(RpKind::Conf, ep, Some(peer), &empty, now);
+    assert!(g.proven_slot(ep, now).is_some(), "proven");
+}
+
+#[test]
+fn an_unproven_endpoint_stops_at_the_reserve_and_a_proven_one_goes_on() {
+    let mut g = loaded();
+    let e = Endpoint { ip: [203, 0, 113, 5], port: 7000 };
+    prove(&mut g, e, 0, 1);
+    drain_global_to(&mut g, 1, RP_HELLO_PROVEN_RESERVE + 1);
+    // At 5 tokens an unproven endpoint still passes (the boundary + 1)...
+    assert!(forwarded(rp_cookied(&mut g, 1, src(1), &hello_with_cookie())));
+    // ...at exactly the reserve it is refused.
+    assert_eq!(rp_cookied(&mut g, 1, src(2), &hello_with_cookie()), RpOutcome::RateLimited);
+    // The proven endpoint takes a reserved token, within its credit.
+    assert!(forwarded(rp_cookied(&mut g, 1, e, &hello_with_cookie())));
+}
+
+#[test]
+fn a_proven_endpoint_stops_at_the_reserve_once_its_credit_is_spent() {
+    let mut g = loaded();
+    let e = Endpoint { ip: [203, 0, 113, 5], port: 7000 };
+    prove(&mut g, e, 0, 1);
+    let mut t = 1;
+    for _ in 0..RP_PROVEN_CREDIT_BURST {
+        drain_global_to(&mut g, t, RP_HELLO_PROVEN_RESERVE);
+        assert!(forwarded(rp_cookied(&mut g, t, e, &hello_with_cookie())));
+        // Past the per-endpoint interval, so only the credit decides.
+        t += RP_HELLO_SRC_INTERVAL_NS;
+    }
+    drain_global_to(&mut g, t, RP_HELLO_PROVEN_RESERVE);
+    assert_eq!(rp_cookied(&mut g, t, e, &hello_with_cookie()), RpOutcome::RateLimited, "credit spent");
+}
+
+#[test]
+fn proven_priority_needs_the_cookie() {
+    // Off load (no cookie) a proven endpoint is treated as unproven: the
+    // endpoint alone proves nothing.
+    let mut g = armed();
+    let e = Endpoint { ip: [203, 0, 113, 5], port: 7000 };
+    prove(&mut g, e, 0, 0);
+    assert!(g.admit_hello(false, 0, e).is_ok());
+    let mut g2 = armed();
+    prove(&mut g2, e, 0, 0);
+    g2.hello_global = Meter::full_at(0);
+    for _ in 0..(RP_HELLO_GLOBAL_BURST - RP_HELLO_PROVEN_RESERVE) {
+        g2.hello_global.allow(0);
+    }
+    assert_eq!(g2.admit_hello(false, 0, e), Err(RpOutcome::RateLimited));
+}
+
+// -- I6: proven only through the session ids --
+
+#[test]
+fn a_replayed_init_conf_from_a_spoofed_endpoint_proves_nobody() {
+    let mut g = loaded();
+    let e = Endpoint { ip: [203, 0, 113, 5], port: 7000 };
+    let x = Endpoint { ip: [198, 18, 0, 1], port: 666 };
+    prove(&mut g, e, 0, 1);
+    // `pq`'s cache answers the replay from X with the same EmptyData.
+    let mut empty = std::vec![0x84u8; RP_EMPTY_DATA_LEN];
+    empty[4..8].copy_from_slice(&[1, 2, 3, 0]);
+    g.replied(RpKind::Conf, x, Some(0), &empty, 2);
+    assert!(g.proven_slot(x, 2).is_none(), "X has no awaited entry with E's ids");
+    assert!(g.proven_slot(e, 2).is_some(), "E stays proven");
+}
+
+#[test]
+fn an_empty_data_after_a_suppressed_one_still_proves() {
+    // The matched InitConf was forwarded; the first EmptyData never went
+    // out (no `replied`), the retransmission's did.
+    let mut g = loaded();
+    let e = Endpoint { ip: [203, 0, 113, 5], port: 7000 };
+    let mut resp = std::vec![0x82u8; RP_RESP_HELLO_LEN];
+    resp[4..8].copy_from_slice(&[9; 4]);
+    resp[8..12].copy_from_slice(&[1; 4]);
+    g.replied(RpKind::Hello, e, None, &resp, 1);
+    let mut c = conf();
+    c[4..8].copy_from_slice(&[1; 4]);
+    c[8..12].copy_from_slice(&[9; 4]);
+    assert!(forwarded(rp(&mut g, 1, e, &c)));
+    assert!(forwarded(rp(&mut g, 1 + RP_CONF_SRC_INTERVAL_NS, e, &c)), "the retransmission");
+    let mut empty = std::vec![0x84u8; RP_EMPTY_DATA_LEN];
+    empty[4..8].copy_from_slice(&[1; 4]);
+    g.replied(RpKind::Conf, e, Some(3), &empty, 2);
+    assert!(g.proven_slot(e, 2).is_some());
+}
+
+#[test]
+fn an_index_out_of_range_or_another_peer_changes_no_slot() {
+    let mut g = loaded();
+    let e0 = Endpoint { ip: [203, 0, 113, 5], port: 7000 };
+    let e1 = Endpoint { ip: [203, 0, 113, 6], port: 7000 };
+    prove(&mut g, e0, 0, 1);
+    let mut resp = std::vec![0x82u8; RP_RESP_HELLO_LEN];
+    resp[4..8].copy_from_slice(&[8; 4]);
+    resp[8..12].copy_from_slice(&[7; 4]);
+    g.replied(RpKind::Hello, e1, None, &resp, 1);
+    let mut c = conf();
+    c[4..8].copy_from_slice(&[7; 4]);
+    c[8..12].copy_from_slice(&[8; 4]);
+    assert!(forwarded(rp(&mut g, 1, e1, &c)));
+    let mut empty = std::vec![0x84u8; RP_EMPTY_DATA_LEN];
+    empty[4..8].copy_from_slice(&[7; 4]);
+    let before = g.proven;
+    g.replied(RpKind::Conf, e1, Some(RP_MAX_PEERS as u8), &empty, 2);
+    assert_eq!(g.proven, before, "index out of range");
+    // Peer 1's EmptyData lands in slot 1 only; slot 0 keeps e0.
+    g.replied(RpKind::Conf, e1, Some(1), &empty, 2);
+    assert_eq!(g.proven[0].map(|p| p.ep), Some(e0));
+    assert_eq!(g.proven[1].map(|p| p.ep), Some(e1));
+}
+
+#[test]
+fn a_full_awaited_table_records_nothing_and_never_evicts_a_live_entry() {
+    let mut g = loaded();
+    let mut resp = std::vec![0x82u8; RP_RESP_HELLO_LEN];
+    for i in 0..RP_AWAIT_SLOTS as u8 {
+        resp[4..8].copy_from_slice(&[i; 4]);
+        g.replied(RpKind::Hello, src(i), None, &resp, 1);
+    }
+    let before = g.awaited;
+    resp[4..8].copy_from_slice(&[0xee; 4]);
+    g.replied(RpKind::Hello, src(0xee), None, &resp, 1);
+    assert_eq!(g.awaited, before);
+    // Once the entries age out, a slot is free again.
+    g.replied(RpKind::Hello, src(0xee), None, &resp, 1 + RP_AWAIT_CONF_NS);
+    assert!(g.awaited.iter().any(|a| a.is_some_and(|a| a.ep == src(0xee))));
+}
+
+// -- I5: the awaited reserve on the link --
+
+#[test]
+fn only_a_matched_init_conf_takes_a_reserved_slot_one_per_endpoint() {
+    let mut g = armed();
+    let mut t = 0;
+    let open = RP_CONF_IN_FLIGHT - RP_CONF_AWAITED_RESERVED;
+    for i in 0..open as u8 {
+        t += METERS_REFILLED;
+        assert!(forwarded(rp(&mut g, t, src(i), &conf())));
+        g.sent(RpKind::Conf, src(i));
+    }
+    t += METERS_REFILLED;
+    assert_eq!(rp(&mut g, t, src(50), &conf()), RpOutcome::RingReserved, "unmatched: the reserve");
+    // A matched one takes a reserved slot...
+    let e = Endpoint { ip: [203, 0, 113, 5], port: 7000 };
+    let mut resp = std::vec![0x82u8; RP_RESP_HELLO_LEN];
+    resp[4..8].copy_from_slice(&[9; 4]);
+    resp[8..12].copy_from_slice(&[1; 4]);
+    g.replied(RpKind::Hello, e, None, &resp, t);
+    let mut c = conf();
+    c[4..8].copy_from_slice(&[1; 4]);
+    c[8..12].copy_from_slice(&[9; 4]);
+    assert!(forwarded(rp(&mut g, t, e, &c)));
+    g.sent(RpKind::Conf, e);
+    // ...but not a second one while its first is in flight.
+    t += METERS_REFILLED;
+    assert_eq!(rp(&mut g, t, e, &c), RpOutcome::RingReserved);
+    // A wrong sidr does not match.
+    let mut wrong = c.clone();
+    wrong[8] ^= 1;
+    let f = Endpoint { ip: [203, 0, 113, 6], port: 7000 };
+    assert_eq!(rp(&mut g, t, f, &wrong), RpOutcome::RingReserved);
+}
+
+#[test]
+fn a_matched_entry_forwards_at_most_its_budget() {
+    let mut g = armed();
+    let e = Endpoint { ip: [203, 0, 113, 5], port: 7000 };
+    let mut resp = std::vec![0x82u8; RP_RESP_HELLO_LEN];
+    resp[4..8].copy_from_slice(&[9; 4]);
+    resp[8..12].copy_from_slice(&[1; 4]);
+    g.replied(RpKind::Hello, e, None, &resp, 0);
+    let i = g.awaited.iter().position(|a| a.is_some_and(|a| a.ep == e)).unwrap();
+    let mut c = conf();
+    c[4..8].copy_from_slice(&[1; 4]);
+    c[8..12].copy_from_slice(&[9; 4]);
+    let mut t = 0;
+    for _ in 0..RP_CONF_SRC_BURST {
+        // Within the awaited window; the per-source meter refills.
+        t += RP_CONF_SRC_INTERVAL_NS;
+        assert!(forwarded(rp(&mut g, t, e, &c)));
+    }
+    assert_eq!(g.awaited[i].unwrap().conf_budget, 0);
+    // The budget spent, the next one is unmatched and takes only open slots.
+    t += RP_CONF_SRC_INTERVAL_NS;
+    assert!(forwarded(rp(&mut g, t, e, &c)));
+    assert_eq!(g.awaited[i].unwrap().conf_budget, 0);
+}
+
+// -- I8: TX tiers --
+
+#[test]
+fn an_answer_is_allowed_wherever_an_unsolicited_reply_is() {
+    let reserve = NET_BUFFERS / 2;
+    assert!(!rp_tx_allowed(TxTier::Answer, reserve));
+    assert!(rp_tx_allowed(TxTier::Answer, reserve + 1));
+    assert!(!rp_tx_allowed(TxTier::Unsolicited, reserve + RP_ANSWER_SHARE));
+    assert!(rp_tx_allowed(TxTier::Unsolicited, reserve + RP_ANSWER_SHARE + 1));
+    for free in 0..=NET_BUFFERS {
+        assert!(!rp_tx_allowed(TxTier::Unsolicited, free) || rp_tx_allowed(TxTier::Answer, free));
+    }
+}
+
+#[test]
+fn a_failed_rotation_clears_both_secrets_and_reports_once() {
+    let mut g = RpGate::<8>::default();
+    let mut c = FakeCookie::valid();
+    c.rotate_ok = false;
+    let r = g.tick_if_due(&mut c, 0);
+    assert!(r.secret_unavailable && !r.rotated);
+    assert_eq!(c.clears, 1);
+    let r = g.tick_if_due(&mut c, RETRY_INTERVAL_NS);
+    assert!(!r.secret_unavailable, "reported once");
+    c.rotate_ok = true;
+    assert!(g.tick_if_due(&mut c, 2 * RETRY_INTERVAL_NS).rotated);
 }
 
 /// Forwards `n` messages of one kind from `from`, spaced so every meter has
@@ -1051,6 +1498,25 @@ fn fill(g: &mut RpGate<8>, t: &mut u64, msg: &[u8], n: usize) {
     fill_from(g, t, SRC, msg, n);
 }
 
+/// Fills every InitConf slot: the open share with unmatched InitConfs from
+/// one source, the reserve with matched ones from distinct awaited
+/// endpoints (one reserved slot each).
+fn fill_confs(g: &mut RpGate<8>, t: &mut u64) {
+    fill(g, t, &conf(), RP_CONF_IN_FLIGHT - RP_CONF_AWAITED_RESERVED);
+    for i in 0..RP_CONF_AWAITED_RESERVED as u8 {
+        let ep = Endpoint { ip: [203, 0, 113, i], port: 7000 };
+        let mut resp = std::vec![0x82u8; RP_RESP_HELLO_LEN];
+        resp[4..8].copy_from_slice(&[0x90 + i; 4]);
+        resp[8..12].copy_from_slice(&[0x10 + i; 4]);
+        *t += METERS_REFILLED;
+        g.replied(RpKind::Hello, ep, None, &resp, *t);
+        let mut c = conf();
+        c[4..8].copy_from_slice(&[0x10 + i; 4]);
+        c[8..12].copy_from_slice(&[0x90 + i; 4]);
+        fill_from(g, t, ep, &c, 1);
+    }
+}
+
 /// Longer than every Rosenpass meter's refill interval.
 const METERS_REFILLED: u64 = RP_HELLO_SRC_INTERVAL_NS;
 const _: () = assert!(
@@ -1063,7 +1529,7 @@ const _: () = assert!(
 fn init_conf_cannot_take_init_hello_slots() {
     let mut g = RpGate::default();
     let mut t = 0;
-    fill(&mut g, &mut t, &conf(), RP_CONF_IN_FLIGHT);
+    fill_confs(&mut g, &mut t);
     t += METERS_REFILLED;
     assert_eq!(rp(&mut g, t, SRC, &conf()), RpOutcome::RingReserved, "conf past its slots");
     fill(&mut g, &mut t, &hello(), RP_HELLO_IN_FLIGHT);
@@ -1076,7 +1542,7 @@ fn an_init_hello_flood_leaves_the_init_conf_slots_free() {
     fill(&mut g, &mut t, &hello(), RP_HELLO_IN_FLIGHT);
     t += METERS_REFILLED;
     assert_eq!(rp(&mut g, t, SRC, &hello()), RpOutcome::RingReserved, "hello past its slots");
-    fill(&mut g, &mut t, &conf(), RP_CONF_IN_FLIGHT);
+    fill_confs(&mut g, &mut t);
 }
 
 #[test]
@@ -1097,7 +1563,7 @@ fn the_link_holds_rp_in_flight_and_no_more() {
     let mut g = RpGate::default();
     let mut t = 0;
     fill(&mut g, &mut t, &hello(), RP_HELLO_IN_FLIGHT);
-    fill(&mut g, &mut t, &conf(), RP_CONF_IN_FLIGHT);
+    fill_confs(&mut g, &mut t);
     assert_eq!(g.in_flight(RpKind::Hello) + g.in_flight(RpKind::Conf), RP_IN_FLIGHT);
     t += METERS_REFILLED;
     assert_eq!(rp(&mut g, t, SRC, &hello()), RpOutcome::RingReserved);
@@ -1110,9 +1576,9 @@ fn the_link_holds_rp_in_flight_and_no_more() {
 
 #[test]
 fn a_ring_refusal_spends_no_meter() {
-    let mut g = RpGate::default();
+    let mut g = armed();
     let mut t = 0;
-    fill(&mut g, &mut t, &conf(), RP_CONF_IN_FLIGHT);
+    fill_confs(&mut g, &mut t);
     let before = g.clone();
     assert_eq!(rp(&mut g, t, src(77), &conf()), RpOutcome::RingReserved);
     assert_eq!(g, before);
@@ -1209,7 +1675,7 @@ fn records_drained_in_one_sync_are_paired_in_order() {
     // F16: `pq` answered two forwards before `ingress` synced once.
     let mut g = gate_with(&[(RpKind::Hello, E1), (RpKind::Hello, E2)]);
     let mut pq = FakePq::new(0, vec![resp_hello_record(1), resp_hello_record(2)]);
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { relayed: 2 });
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::Synced { relayed: 2 });
     assert_eq!(pq.sent_to(), [E1, E2]);
     assert_eq!((pq.sent[0].1[0], pq.sent[1].1[0]), (1, 2));
     assert_eq!(g.in_flight(RpKind::Hello), 0);
@@ -1221,7 +1687,7 @@ fn a_refused_request_does_not_take_the_next_reply() {
     // goes to E2, never to E1.
     let mut g = gate_with(&[(RpKind::Hello, E1), (RpKind::Hello, E2)]);
     let mut pq = FakePq::new(0, vec![no_reply_record(), resp_hello_record(2)]);
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { relayed: 1 });
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::Synced { relayed: 1 });
     assert_eq!(pq.sent_to(), [E2]);
 }
 
@@ -1233,7 +1699,7 @@ fn a_reply_goes_to_the_stored_source_and_nowhere_else() {
     assert_ne!(peer_1_wireguard, E2);
     let mut g = gate_with(&[(RpKind::Conf, E2)]);
     let mut pq = FakePq::new(0, vec![empty_data_record(1)]);
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { relayed: 1 });
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::Synced { relayed: 1 });
     assert_eq!(pq.sent_to(), [E2]);
 }
 
@@ -1243,10 +1709,10 @@ fn a_record_seen_before_its_return_is_retired_by_the_next_sync() {
     // relays it and retires nothing, the next one retires it.
     let mut g = gate_with(&[(RpKind::Hello, E1)]);
     let mut pq = FakePq::new(1, vec![resp_hello_record(1)]);
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { relayed: 1 });
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::Synced { relayed: 1 });
     assert_eq!(g.in_flight(RpKind::Hello), 1);
     pq.outstanding = Some(0);
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { relayed: 0 });
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::Synced { relayed: 0 });
     assert_eq!(g.in_flight(RpKind::Hello), 0);
     assert_eq!(pq.sent_to(), [E1]);
 }
@@ -1267,10 +1733,10 @@ fn every_order_of_record_and_return_completes_the_forward() {
                 pq.outstanding = Some(0);
             }
             if step == sync_after {
-                assert!(matches!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { .. }), "sync after step {step}");
+                assert!(matches!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::Synced { .. }), "sync after step {step}");
             }
         }
-        assert!(matches!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { .. }));
+        assert!(matches!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::Synced { .. }));
         assert_eq!(pq.sent_to(), [E1], "sync after step {sync_after}");
         assert_eq!(g.in_flight(RpKind::Hello), 0);
     }
@@ -1280,7 +1746,7 @@ fn every_order_of_record_and_return_completes_the_forward() {
 fn a_return_without_its_record_stops_the_path() {
     let mut g = gate_with(&[(RpKind::Hello, E1)]);
     let mut pq = FakePq::new(0, vec![]);
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::DiedNow);
     assert!(g.pq_dead());
     // Nothing was guessed: the entry is still there.
     assert_eq!(g.in_flight(RpKind::Hello), 1);
@@ -1289,10 +1755,10 @@ fn a_return_without_its_record_stops_the_path() {
 #[test]
 fn an_extra_or_duplicate_record_stops_the_path() {
     let mut g = RpGate::<8>::default();
-    assert_eq!(sync_pq(&mut g, &mut FakePq::new(0, vec![no_reply_record()]), PEERS), SyncOutcome::DiedNow);
+    assert_eq!(sync_pq(&mut g, &mut FakePq::new(0, vec![no_reply_record()]), PEERS, 0), SyncOutcome::DiedNow);
     let mut g = gate_with(&[(RpKind::Hello, E1)]);
     let mut pq = FakePq::new(0, vec![resp_hello_record(1), resp_hello_record(1)]);
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::DiedNow);
     assert_eq!(pq.sent_to(), [E1], "the duplicate was not relayed");
 }
 
@@ -1300,11 +1766,11 @@ fn an_extra_or_duplicate_record_stops_the_path() {
 fn a_reply_of_the_other_kind_stops_the_path() {
     let mut g = gate_with(&[(RpKind::Conf, E1)]);
     let mut pq = FakePq::new(0, vec![resp_hello_record(1)]);
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::DiedNow);
     assert!(pq.sent.is_empty());
     let mut g = gate_with(&[(RpKind::Hello, E1)]);
     let mut pq = FakePq::new(0, vec![empty_data_record(0)]);
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::DiedNow);
     assert!(pq.sent.is_empty());
 }
 
@@ -1322,33 +1788,33 @@ fn a_malformed_record_or_a_bad_index_stops_the_path() {
         let mut g = gate_with(&[(kind, E1)]);
         let mut pq = FakePq::new(0, vec![]);
         pq.records.push_back(r.clone());
-        assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow, "{kind:?} {r:?}");
+        assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::DiedNow, "{kind:?} {r:?}");
         assert!(pq.sent.is_empty());
     }
     // The allow side: the last configured peer's EmptyData is accepted.
     let mut g = gate_with(&[(RpKind::Conf, E1)]);
     let mut pq = FakePq::new(0, vec![empty_data_record(PEERS as u8 - 1)]);
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { relayed: 1 });
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::Synced { relayed: 1 });
 }
 
 #[test]
 fn a_snapshot_above_the_fifo_or_a_link_error_stops_the_path() {
     let mut g = gate_with(&[(RpKind::Hello, E1)]);
-    assert_eq!(sync_pq(&mut g, &mut FakePq::new(2, vec![]), PEERS), SyncOutcome::DiedNow);
+    assert_eq!(sync_pq(&mut g, &mut FakePq::new(2, vec![]), PEERS, 0), SyncOutcome::DiedNow);
     let mut g = gate_with(&[(RpKind::Hello, E1)]);
     let mut pq = FakePq::new(0, vec![]);
     pq.outstanding = None;
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::DiedNow);
     // The boundary: outstanding == len retires nothing and is fine.
     let mut g = gate_with(&[(RpKind::Hello, E1)]);
-    assert_eq!(sync_pq(&mut g, &mut FakePq::new(1, vec![]), PEERS), SyncOutcome::Synced { relayed: 0 });
+    assert_eq!(sync_pq(&mut g, &mut FakePq::new(1, vec![]), PEERS, 0), SyncOutcome::Synced { relayed: 0 });
 }
 
 #[test]
 fn an_endless_record_stream_stops_the_path_within_the_drain_cap() {
     let mut g = gate_with(&[(RpKind::Hello, E1)]);
     let mut pq = FakePq::new(0, (0..200).map(|_| no_reply_record()).collect());
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::DiedNow);
     assert!(pq.reads <= PASS_FRAMES + 1);
 }
 
@@ -1358,22 +1824,22 @@ fn a_reply_tx_refuses_still_spends_its_credit() {
     let mut pq = FakePq::new(1, vec![resp_hello_record(1)]);
     pq.tx_ok = false;
     // Not a protocol violation: the record is consumed and nothing resent.
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Synced { relayed: 0 });
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::Synced { relayed: 0 });
     assert!(!g.pq_dead());
     // A resent copy finds no waiting entry.
     pq.tx_ok = true;
     pq.records.push_back(Some(resp_hello_record(1)));
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::DiedNow);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::DiedNow);
     assert!(pq.sent.is_empty());
 }
 
 #[test]
 fn a_dead_path_forwards_relays_and_retires_nothing() {
     let mut g = gate_with(&[(RpKind::Hello, E1)]);
-    assert_eq!(sync_pq(&mut g, &mut FakePq::new(0, vec![]), PEERS), SyncOutcome::DiedNow);
+    assert_eq!(sync_pq(&mut g, &mut FakePq::new(0, vec![]), PEERS, 0), SyncOutcome::DiedNow);
     // Sticky: an honest record later is not relayed, nothing is retired.
     let mut pq = FakePq::new(0, vec![resp_hello_record(1)]);
-    assert_eq!(sync_pq(&mut g, &mut pq, PEERS), SyncOutcome::Dead);
+    assert_eq!(sync_pq(&mut g, &mut pq, PEERS, 0), SyncOutcome::Dead);
     assert!(pq.sent.is_empty() && pq.reads == 0);
     assert_eq!(g.in_flight(RpKind::Hello), 1);
     assert_eq!(rp(&mut g, METERS_REFILLED, src(5), &conf()), RpOutcome::PqDown);
@@ -1402,8 +1868,8 @@ fn a_rosenpass_flood_leaves_the_wireguard_meters_untouched() {
 
 #[test]
 fn a_rosenpass_reply_may_not_use_the_tx_reserve() {
-    assert!(!rp_reply_allowed(NET_BUFFERS / 2));
-    assert!(rp_reply_allowed(NET_BUFFERS / 2 + 1));
+    assert!(!rp_tx_allowed(TxTier::Answer, NET_BUFFERS / 2));
+    assert!(rp_tx_allowed(TxTier::Answer, NET_BUFFERS / 2 + 1));
 }
 
 #[test]
