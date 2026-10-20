@@ -32,6 +32,17 @@ toolchain from the same apt snapshot:
     docker run --rm -v "$PWD":/work -w /work/tools/rp-vectors secureos-rp-oracle \
         sh -c 'cargo +1.93.1 run --locked --release -- /work'
 
+The cookie vectors (`crates/rosenpass-core/tests/vectors/cookie.txt`, M3b plan
+C1) are a separate mode. It reads the committed `spkm.bin` and InitHello seed,
+so it does not touch `v02.txt` or the keys:
+
+    docker run --rm -v "$PWD":/work -w /work/tools/rp-vectors secureos-rp-oracle \
+        sh -c 'cargo +1.93.1 run --locked --release -- /work --cookie'
+
+`v02.txt` still lists `domain.cookie*` from before M3b. Those are the V02
+(BLAKE2b) tree's cookie labels, which upstream's cookie code never uses, so
+rosenpass-core no longer pins them; the next full regeneration drops them.
+
 Upstream quirk the driver accounts for: `handle_msg` first tries every
 InitHello as V03 (SHAKE256). That attempt records IHR4 and IHR5 (including a
 McEliece decapsulation) before failing at IHR6, and only then runs the V02

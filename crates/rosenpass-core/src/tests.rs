@@ -183,12 +183,9 @@ fn root_string_keeps_the_blake2s_quirk() {
 #[test]
 fn every_hash_domain_matches_upstream() {
     let d = Domains::v02().unwrap();
-    let cases: [(&str, &[u8; 32]); 16] = [
+    let cases: [(&str, &[u8; 32]); 13] = [
         ("domain.protocol", &d.protocol),
         ("domain.mac", &d.mac),
-        ("domain.cookie", &d.cookie),
-        ("domain.cookie_value", &d.cookie_value),
-        ("domain.cookie_key", &d.cookie_key),
         ("domain.peerid", &d.peerid),
         ("domain.biscuit_ad", &d.biscuit_ad),
         ("domain.ckinit", &d.ckinit),
@@ -416,4 +413,103 @@ fn hedged_output_depends_on_rndr() {
 fn hedged_output_depends_on_the_counter() {
     let late = FakeHedgeHw { counter: 1, ..FakeHedgeHw::new(Some(7)) };
     assert_ne!(hedged_block(1, FakeHedgeHw::new(Some(7))), hedged_block(1, late));
+}
+
+// ---- the cookie tree (M3b plan C1, VE11) ----
+
+const COOKIE: &str = include_str!("../tests/vectors/cookie.txt");
+
+fn cv(name: &str) -> Vec<u8> {
+    for line in COOKIE.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
+        let (k, hex) = line.split_once(' ').unwrap();
+        if k == name {
+            return (0..hex.len()).step_by(2).map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap()).collect();
+        }
+    }
+    panic!("no cookie vector {name}")
+}
+
+fn cookie_secret() -> Secret<16> {
+    Secret::from_bytes(cv("cookie.secret").try_into().unwrap())
+}
+
+fn cookie_host() -> [u8; 18] {
+    cv("cookie.host").try_into().unwrap()
+}
+
+#[test]
+fn the_cookie_tree_is_rooted_at_the_shake256_protocol_string() {
+    // The root alone pins the keyed SHAKE256 and the protocol string.
+    let root = cookie::cookie_key_root_for_test();
+    assert_eq!(root.to_vec(), cv("cookie.domain.protocol"));
+    assert_ne!(root.to_vec(), v("domain.protocol"), "the cookie tree must not be the V02 tree");
+}
+
+#[test]
+fn cookie_key_value_and_field_match_upstream() {
+    assert_eq!(cookie::cookie_key(SPKM).to_vec(), cv("cookie.key"));
+    assert_eq!(cookie::host_info([10, 0, 3, 1], 41001).to_vec(), cv("cookie.host"));
+    let value = cookie::cookie_value(&cookie_secret(), &cookie_host());
+    assert_eq!(value.expose().to_vec(), cv("cookie.value"));
+    let msg = cv("cookie.msg");
+    let field = cookie::cookie_field(&value, &msg[..msg.len() - 16]);
+    assert_eq!(field.to_vec(), cv("cookie.field"));
+}
+
+#[test]
+fn a_cookie_reply_seals_like_upstream_and_pads_to_the_init_hello() {
+    let key: [u8; 32] = cv("cookie.key").try_into().unwrap();
+    let msg = cv("cookie.msg");
+    let mac: [u8; 16] = msg[msg.len() - 32..msg.len() - 16].try_into().unwrap();
+    let sidi: [u8; 4] = cv("cookie.sidi").try_into().unwrap();
+    let nonce: [u8; 24] = cv("cookie.nonce").try_into().unwrap();
+    let value = cookie::cookie_value(&cookie_secret(), &cookie_host());
+    let mut out = [0xaa; cookie::COOKIE_REPLY_LEN];
+    cookie::seal_cookie_reply(&key, sidi, &nonce, &value, &mac, &mut out).unwrap();
+    assert_eq!(out.len(), INIT_HELLO_LEN);
+    assert_eq!(out[0], rosenpass_wire::MSG_COOKIE_REPLY);
+    assert_eq!(&out[1..4], &[0, 0, 0]);
+    assert_eq!(&out[4..8], &sidi);
+    assert_eq!(out[8..64].to_vec(), cv("cookie.sealed"));
+    assert!(out[64..].iter().all(|b| *b == 0), "padding is zeroed");
+}
+
+fn with_cookie(secret: &Secret<16>, host: &[u8; 18]) -> Vec<u8> {
+    let mut msg = cv("cookie.msg");
+    let cut = msg.len() - 16;
+    let field = cookie::cookie_field(&cookie::cookie_value(secret, host), &msg[..cut]);
+    msg[cut..].copy_from_slice(&field);
+    msg
+}
+
+#[test]
+fn a_cookie_is_valid_under_the_current_or_the_previous_secret_only() {
+    let host = cookie_host();
+    let (current, previous, older) = (cookie_secret(), Secret::from_bytes([0x33; 16]), Secret::from_bytes([0x44; 16]));
+    let both = [Some(&current), Some(&previous)];
+    assert!(cookie::cookie_valid(both, &host, &with_cookie(&current, &host)));
+    assert!(cookie::cookie_valid(both, &host, &with_cookie(&previous, &host)));
+    // A secret two rotations old is gone.
+    assert!(!cookie::cookie_valid(both, &host, &with_cookie(&older, &host)));
+    // The previous secret alone, once the current one is missing.
+    assert!(cookie::cookie_valid([None, Some(&previous)], &host, &with_cookie(&previous, &host)));
+    assert!(!cookie::cookie_valid([None, None], &host, &with_cookie(&current, &host)));
+}
+
+#[test]
+fn a_cookie_is_bound_to_its_host_and_to_every_bit() {
+    let host = cookie_host();
+    let current = cookie_secret();
+    let both = [Some(&current), None];
+    let good = with_cookie(&current, &host);
+    // Another port of the same address.
+    let other = cookie::host_info([10, 0, 3, 1], 41002);
+    assert!(!cookie::cookie_valid(both, &other, &good));
+    let mut flipped = good.clone();
+    *flipped.last_mut().unwrap() ^= 1;
+    assert!(!cookie::cookie_valid(both, &host, &flipped));
+    let mut body = good.clone();
+    body[100] ^= 1;
+    assert!(!cookie::cookie_valid(both, &host, &body), "the field covers the message");
+    assert!(!cookie::cookie_valid(both, &host, &good[..15]));
 }

@@ -83,14 +83,13 @@ pub fn kh_public(key: &[u8; KEY_LEN], data: &[u8]) -> Result<[u8; KEY_LEN], Cryp
 }
 
 /// The V02 hash-domain tree (upstream `hash_domains.rs`). Every value is a
-/// 32-byte public key for KH, derived from the protocol string down.
+/// 32-byte public key for KH, derived from the protocol string down. The
+/// cookie labels are not here: upstream's cookie code always hashes with
+/// SHAKE256, on a tree of its own (`crate::cookie`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Domains {
     pub protocol: [u8; KEY_LEN],
     pub mac: [u8; KEY_LEN],
-    pub cookie: [u8; KEY_LEN],
-    pub cookie_value: [u8; KEY_LEN],
-    pub cookie_key: [u8; KEY_LEN],
     pub peerid: [u8; KEY_LEN],
     pub biscuit_ad: [u8; KEY_LEN],
     pub ckinit: [u8; KEY_LEN],
@@ -113,9 +112,6 @@ impl Domains {
         let cke_user_rosenpass = kh_public(&cke_user, b"rosenpass.eu")?;
         Ok(Self {
             mac: kh_public(&protocol, b"mac")?,
-            cookie: kh_public(&protocol, b"cookie")?,
-            cookie_value: kh_public(&protocol, b"cookie-value")?,
-            cookie_key: kh_public(&protocol, b"cookie-key")?,
             peerid: kh_public(&protocol, b"peer id")?,
             biscuit_ad: kh_public(&protocol, b"biscuit additional data")?,
             ckinit: kh_public(&protocol, b"chaining key init")?,

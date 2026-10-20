@@ -4,7 +4,8 @@
 //! Interoperates with upstream rosenpass `9e72f1eb` (and 0.2.3) in V02:
 //! Classic McEliece 460896 round 3, Kyber-512 round 3, the "incorrect HMAC"
 //! over keyed BLAKE2b, ChaCha20-Poly1305 and XChaCha20-Poly1305. Responder
-//! only (SC22), no PSK (SC25), no cookie gate (SC26). The golden vectors in
+//! only (SC22), no PSK (SC25). The cookie mechanism's crypto is `cookie`
+//! (M3b, SC26); the gate that uses it is `ingress`'s. The golden vectors in
 //! `tests/vectors` come from upstream through `tools/rp-vectors`.
 //!
 //! The McEliece secret never enters this crate: decapsulation is the
@@ -22,6 +23,7 @@
 )]
 
 mod chain;
+pub mod cookie;
 pub mod crypto;
 pub mod kem;
 mod responder;

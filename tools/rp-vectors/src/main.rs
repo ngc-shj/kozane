@@ -17,8 +17,8 @@ use anyhow::{bail, ensure, Context};
 use assert_tv::{finalize_tv_case, initialize_tv_case_from_file, TestMode, TestVectorActive, TestVectorFileFormat};
 use base64::Engine;
 use rosenpass::hash_domains as hd;
-use rosenpass::internal::cipher_traits::primitives::{Kem, KeyedHashInstance};
-use rosenpass::internal::ciphers::{EphemeralKem, KeyedHash, StaticKem};
+use rosenpass::internal::cipher_traits::primitives::{AeadWithNonceInCiphertext, Kem, KeyedHashInstance};
+use rosenpass::internal::ciphers::{EphemeralKem, KeyedHash, StaticKem, XAead};
 use rosenpass::internal::secret_memory::policy::secret_policy_use_only_malloc_secrets;
 use rosenpass::protocol::basic_types::{MsgBuf, SPk, SSk, SessionId};
 use rosenpass::protocol::osk_domain_separator::OskDomainSeparator;
@@ -147,11 +147,79 @@ fn recorded(path: &Path, out: &mut Out) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The cookie tree's vectors (M3b plan C1, VE11), from upstream's own
+/// functions with the SHAKE256 keyed hash its cookie code always uses.
+/// Reads the committed `spkm.bin` and InitHello seed instead of making new
+/// keys, so `v02.txt` and the keys stay as they are.
+fn cookie_vectors(vec_dir: &Path, seed_dir: &Path) -> anyhow::Result<()> {
+    let ks = KeyedHash::keyed_shake256();
+    let ek = EphemeralKem::Kyber512Round3;
+    let spkm = std::fs::read(vec_dir.join("spkm.bin"))?;
+    let ih = std::fs::read(seed_dir.join("seed-init-hello"))?;
+    ensure!(ih.len() == 1092, "seed-init-hello is not an InitHello");
+    let mut out = Out(BTreeMap::new());
+
+    let mut kh_out = [0u8; 32];
+    let kh_key: [u8; 32] = std::array::from_fn(|i| i as u8);
+    ks.keyed_hash(&kh_key, b"secureos rosenpass-core keyed shake256 KAT", &mut kh_out)?;
+    out.put("shake.key", &kh_key)?;
+    out.put("shake.data", b"secureos rosenpass-core keyed shake256 KAT")?;
+    out.put("shake.out", &kh_out)?;
+    out.put("cookie.domain.protocol", &hd::protocol(ks.clone(), ek)?.into_value())?;
+
+    let cookie_key = hd::cookie_key(ks.clone(), ek)?.mix(&spkm)?.into_value();
+    out.put("cookie.key", &cookie_key)?;
+
+    let secret = [0x11u8; 16];
+    // ::ffff:10.0.3.1 port 41001, as `rosenpass_core::cookie::host_info`.
+    let mut host = [0u8; 18];
+    host[10..16].copy_from_slice(&[0xff, 0xff, 10, 0, 3, 1]);
+    host[16..18].copy_from_slice(&41001u16.to_be_bytes());
+    let value = hd::cookie_value(ks.clone(), ek)?.mix(&secret)?.mix(&host)?.into_value();
+    out.put("cookie.secret", &secret)?;
+    out.put("cookie.host", &host)?;
+    out.put("cookie.value", &value[..16])?;
+
+    // The field an initiator writes into this InitHello once it holds the
+    // value: over every byte before the cookie field.
+    let before = &ih[..1092 - 16];
+    let field = hd::cookie(ks.clone(), ek)?.mix(&value[..16])?.mix(before)?.into_value();
+    out.put("cookie.msg", &ih)?;
+    out.put("cookie.field", &field[..16])?;
+
+    // The sealed part of a CookieReply to this InitHello: XAEAD under the
+    // cookie key, nonce prepended, the InitHello's mac as associated data.
+    let nonce = [0x22u8; 24];
+    let mac = &ih[1092 - 32..1092 - 16];
+    let mut sealed = [0u8; 24 + 16 + 16];
+    XAead.encrypt_with_nonce_in_ctxt(&mut sealed, &cookie_key, &nonce, mac, &value[..16])?;
+    out.put("cookie.nonce", &nonce)?;
+    out.put("cookie.sidi", &ih[4..8])?;
+    out.put("cookie.sealed", &sealed)?;
+
+    let mut text = String::new();
+    writeln!(text, "# Rosenpass cookie golden vectors for crates/rosenpass-core (M3b plan C1, VE11).")?;
+    writeln!(text, "# upstream: https://github.com/rosenpass/rosenpass rev {UPSTREAM_REV}")?;
+    writeln!(text, "# keyed hash: keyed_shake256; ekem: Kyber512Round3 (as upstream's cookie code)")?;
+    writeln!(text, "# inputs: spkm.bin and the InitHello seed of the V02 vectors")?;
+    writeln!(text, "# regenerate: tools/rp-vectors/README.md, with --cookie")?;
+    for (k, v) in &out.0 {
+        let hex: String = v.iter().map(|b| format!("{b:02x}")).collect();
+        writeln!(text, "{k} {hex}")?;
+    }
+    std::fs::write(vec_dir.join("cookie.txt"), text)?;
+    println!("rp-vectors: wrote {} cookie vectors to {}", out.0.len(), vec_dir.display());
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
-    let repo: PathBuf = std::env::args().nth(1).context("usage: rp-vectors <secureos repo root>")?.into();
+    let repo: PathBuf = std::env::args().nth(1).context("usage: rp-vectors <secureos repo root> [--cookie]")?.into();
     let vec_dir = repo.join("crates/rosenpass-core/tests/vectors");
     let seed_dir = repo.join("crates/rosenpass-wire/src/__fuzz__/tests__parsers_never_panic_and_round_trip/corpus");
     ensure!(vec_dir.is_dir() && seed_dir.is_dir(), "run from a secureos checkout: {repo:?}");
+    if std::env::args().nth(2).as_deref() == Some("--cookie") {
+        return cookie_vectors(&vec_dir, &seed_dir);
+    }
 
     secret_policy_use_only_malloc_secrets();
     let kh = KeyedHash::incorrect_hmac_blake2b();
@@ -170,9 +238,6 @@ fn main() -> anyhow::Result<()> {
     // Every hash-domain label of the V02 tree.
     out.put("domain.protocol", &hd::protocol(kh.clone(), ek)?.into_value())?;
     out.put("domain.mac", &hd::mac(kh.clone(), ek)?.into_value())?;
-    out.put("domain.cookie", &hd::cookie(kh.clone(), ek)?.into_value())?;
-    out.put("domain.cookie_value", &hd::cookie_value(kh.clone(), ek)?.into_value())?;
-    out.put("domain.cookie_key", &hd::cookie_key(kh.clone(), ek)?.into_value())?;
     out.put("domain.peerid", &hd::peerid(kh.clone(), ek)?.into_value())?;
     out.put("domain.biscuit_ad", &hd::biscuit_ad(kh.clone(), ek)?.into_value())?;
     out.put("domain.ckinit", &hd::ckinit(kh.clone(), ek)?.into_value())?;
