@@ -13,10 +13,13 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools/check-pins"
-FILES = ["docker/Dockerfile", "Makefile", "rust-toolchain.toml", "Cargo.toml", "Cargo.lock", "policy/waivers.toml"]
+FILES = ["docker/Dockerfile", "Makefile", "rust-toolchain.toml", "Cargo.toml", "Cargo.lock", "policy/waivers.toml",
+         "policy/verus-trusted.toml"]
 # P7's cases run on a tree whose crates/ is replaced by a synthetic one.
-# --enforce-pending is kept so they stay meaningful if P7 is ever pending.
-ENFORCE = ["--enforce-pending"]
+# P7 is enforced, so they need no --enforce-pending; passing it would also
+# enforce P13, which stays pending (and fires on the locked cmr) until the M4
+# cut-over.
+ENFORCE: list = []
 
 
 def rules_fired(tree: pathlib.Path, args=()) -> set:
@@ -233,6 +236,29 @@ CASES = [
      lambda t: append(t / "crates/rosenpass-core/src/lib.rs", SECRET + "// no #[derive(Clone)]: L12\npub struct Osk(Secret<32>);\n")),
     ("P11 a cookie compare inside a comment, and ct_eq", set(),
      lambda t: append(t / "crates/rosenpass-core/src/cookie.rs", "\n// cookie == want would be wrong here\npub fn ok(a: &[u8], cookie: &[u8]) -> bool {\n    crypto::ct_eq(a, cookie)\n}\n")),
+    # P12 (M4 C1, C11): a trusted Verus construct not on the allowlist, in
+    # the cfg_attr spelling; the allowlisted one (msgs' chunk_ref) and
+    # Kani's own `kani::assume` stay silent.
+    ("P12 unlisted external_body via cfg_attr in wg-wire", {"P12"},
+     lambda t: edit(t / "crates/wg-wire/src/replay.rs", "#[inline]\nfn below_window(",
+                    "#[inline]\n#[cfg_attr(verus_keep_ghost, verifier::external_body)]\nfn below_window(")),
+    ("P12 kani::assume outside verus! is not Verus's assume", set(),
+     lambda t: append(t / "crates/wg-wire/src/replay.rs", "\n#[cfg(kani)]\nfn h() { kani::assume(true); }\n")),
+    # P14 (M4 C7): unsafe only in the barrier module.
+    ("P14 unsafe in mce460896 outside barrier.rs", {"P14"},
+     lambda t: append(t / "crates/mce460896/src/vec.rs", "\npub fn f(p: *const u8) -> u8 { unsafe { *p } }\n")),
+    ("P14 unsafe in barrier.rs", set(),
+     lambda t: append(t / "crates/mce460896/src/barrier.rs", "\n#[allow(unsafe_code)]\npub fn g(p: *const u8) -> u8 { unsafe { *p } }\n")),
+    # P15 (M4 C9): valgrind client requests only in the harness's vg.rs.
+    ("P15 a client-request preamble in a crate", {"P15"},
+     lambda t: append(t / "crates/wire/src/lib.rs", '\n// asm!("ror x12, x12, #3")\n')),
+    ("P15 the preamble in tools/ct-harness/src/vg.rs", set(),
+     lambda t: write(t / "tools/ct-harness/src/vg.rs", '// asm!("ror x12, x12, #3")\n')),
+    # P16 (M4 C7): mce460896 depends on sha3 and zeroize only.
+    ("P16 an extra dependency in mce460896", {"P16"},
+     lambda t: edit(t / "crates/mce460896/Cargo.toml", "[dependencies]\n", '[dependencies]\nlibc = "=0.2.177"\n')),
+    ("P16 a dev-dependency in mce460896", set(),
+     lambda t: append(t / "crates/mce460896/Cargo.toml", '\n[dev-dependencies]\nzeroize = "=1.8.1"\n')),
     ("P9 a CookieSecret holder without the derive", set(),
      lambda t: append(t / "crates/pds/ingress/src/cookie.rs", "\npub struct Held {\n    secret: CookieSecret,\n}\n")),
 ]

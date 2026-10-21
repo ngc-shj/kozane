@@ -30,6 +30,18 @@ Rules:
      data-core, wg-core and the key, hs and data PDs: a dereferenced array is a by-value temporary of
      the secret left on the stack; `copy_from(&..)` copies in place (L12)
 
+  P12 in every crate of the Makefile's verus_crates, the Verus trusted
+     constructs (tools/verus_trusted.py, shared with the Verus gate) equal
+     policy/verus-trusted.toml (M4 plan C1, C11)
+  P13 no classic-mceliece-rust as a dependency key in any tracked
+     Cargo.toml or Cargo.lock, nor as a Rust use/extern crate/path in crates/
+     or tools/ (M4 plan C11; pending until the cut-over)
+  P14 no `unsafe` in crates/mce460896 outside src/barrier.rs (M4 plan C7)
+  P15 no valgrind client-request preamble (`ror x12, x12, #3`) in crates/
+     or tools/ outside tools/ct-harness/src/vg.rs (M4 plan C9)
+  P16 crates/mce460896's [dependencies] are exactly sha3 and zeroize, with
+     no build-, target- or other dependency tables (M4 plan C7)
+
 Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
 fail until they are removed from PENDING; --enforce-pending makes them fail
 now (the fixtures use it). None is pending: P7 became enforced once
@@ -69,11 +81,11 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
-RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11"]
+RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core",
                "crates/pds/key", "crates/pds/hs", "crates/pds/data"]
-PENDING: set[str] = set()
+PENDING: set[str] = {"P13"}
 # Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
 SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/ingress"]
 # Types that hold a secret under a name of their own, not as Secret<..> (P9,
@@ -285,6 +297,86 @@ def check_cookie_compares(root: pathlib.Path, out: list):
             out.append(f"P11 {rel}:{n}: a cookie compared with == or !=; use ct_eq")
 
 
+def strip_rust_comments(text: str) -> str:
+    text = re.sub(r"/\*.*?\*/", lambda m: re.sub(r"[^\n]", " ", m.group(0)), text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", text)
+
+
+def check_verus_trusted(root: pathlib.Path, out: list):
+    import verus_trusted
+    m = re.search(r"^verus_crates :=(.*)$", (root / "Makefile").read_text(), re.M)
+    crates = m.group(1).split() if m else []
+    policy = root / "policy/verus-trusted.toml"
+    allowed = {(e.get("crate"), e.get("file"), e.get("construct"))
+               for e in tomllib.loads(policy.read_text()).get("trusted", [])} if policy.is_file() else set()
+    for crate in crates:
+        base = root / "crates" / crate
+        for f in sorted((base / "src").rglob("*.rs")) if base.is_dir() else []:
+            rel = str(f.relative_to(base))
+            for line, construct in verus_trusted.trusted_in(f):
+                if (crate, rel, construct) not in allowed:
+                    out.append(f"P12 crates/{crate}/{rel}:{line}: Verus trusted construct `{construct}` not in policy/verus-trusted.toml")
+
+
+def check_cmr_gone(root: pathlib.Path, out: list):
+    for p in sorted(root.glob("**/Cargo.toml")) + sorted(root.glob("**/Cargo.lock")):
+        rel = p.relative_to(root)
+        if any(part in ("target", "build") for part in rel.parts):
+            continue
+        # An unreadable lock is P6's to report; read what is there.
+        for n, line in enumerate(p.read_text(errors="replace").splitlines(), 1):
+            if re.match(r'\s*(name\s*=\s*"classic-mceliece-rust"|classic-mceliece-rust\s*=|"classic-mceliece-rust["\s])', line):
+                out.append(f"P13 {rel}:{n}: classic-mceliece-rust is a dependency")
+    for top in ("crates", "tools"):
+        for p in sorted((root / top).rglob("*.rs")) if (root / top).is_dir() else []:
+            rel = p.relative_to(root)
+            if any(part in ("target", "build") for part in rel.parts):
+                continue
+            code = strip_rust_comments(p.read_text())
+            for m in re.finditer(r"\b(use\s+|extern\s+crate\s+)?classic_mceliece_rust\b", code):
+                if m.group(1) or code[m.end():m.end() + 2] == "::":
+                    n = code.count("\n", 0, m.start()) + 1
+                    out.append(f"P13 {rel}:{n}: classic_mceliece_rust used")
+
+
+def check_mce_unsafe(root: pathlib.Path, out: list):
+    base = root / "crates/mce460896/src"
+    for p in sorted(base.rglob("*.rs")) if base.is_dir() else []:
+        if p.name == "barrier.rs" and p.parent == base:
+            continue
+        code = strip_rust_comments(p.read_text())
+        for m in re.finditer(r"\bunsafe\b", code):
+            if code[max(0, m.start() - 12):m.start()].endswith("deny("):
+                continue
+            n = code.count("\n", 0, m.start()) + 1
+            out.append(f"P14 {p.relative_to(root)}:{n}: unsafe outside barrier.rs")
+
+
+def check_client_requests(root: pathlib.Path, out: list):
+    allowed = root / "tools/ct-harness/src/vg.rs"
+    for top in ("crates", "tools"):
+        for p in sorted((root / top).rglob("*.rs")) if (root / top).is_dir() else []:
+            rel = p.relative_to(root)
+            if p == allowed or any(part in ("target", "build") for part in rel.parts):
+                continue
+            for n, line in enumerate(p.read_text().splitlines(), 1):
+                if re.search(r"ror\s+x12\s*,\s*x12\s*,\s*#\s*3\b", line):
+                    out.append(f"P15 {rel}:{n}: valgrind client request outside tools/ct-harness/src/vg.rs")
+
+
+def check_mce_deps(root: pathlib.Path, out: list):
+    path = root / "crates/mce460896/Cargo.toml"
+    if not path.is_file():
+        return
+    data = tomllib.loads(path.read_text())
+    deps = set(data.get("dependencies", {}))
+    if deps != {"sha3", "zeroize"}:
+        out.append(f"P16 crates/mce460896/Cargo.toml: dependencies {sorted(deps)}, want exactly ['sha3', 'zeroize']")
+    for table in ("build-dependencies", "target"):
+        if table in data:
+            out.append(f"P16 crates/mce460896/Cargo.toml: [{table}] is not allowed")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
@@ -306,6 +398,11 @@ def main() -> int:
     check_secret_derives(root, out)
     check_secret_copies(root, out)
     check_cookie_compares(root, out)
+    check_verus_trusted(root, out)
+    check_cmr_gone(root, out)
+    check_mce_unsafe(root, out)
+    check_client_requests(root, out)
+    check_mce_deps(root, out)
     failing = [l for l in out if l.split()[0] not in pending]
     for line in out:
         print(line if line in failing else f"pending {line}")

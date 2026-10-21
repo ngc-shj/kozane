@@ -100,7 +100,12 @@ RUN --network=none set -eux; \
 # the pinned release binary, so Verus's own download script is not used.
 FROM base AS verus
 RUN apt-get update -q && apt-get install -y --no-install-recommends \
-    build-essential ca-certificates curl git pkg-config unzip \
+    build-essential \
+    ca-certificates \
+    curl \
+    git \
+    pkg-config \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 ARG RUSTUP_VERSION
 ARG RUSTUP_SHA256
