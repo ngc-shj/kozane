@@ -199,6 +199,18 @@ CASES = [
                       "\n#[derive(Clone)]\npub struct Seed(zeroize::Zeroizing<[u8; 32]>);\n")),
     ("P9 derive(Debug) on a Secret wrapper in pds/pqkey", {"P9"},
      lambda t: write(t / "crates/pds/pqkey/src/main.rs", SECRET + "#[derive(Debug)]\nstruct Shk(Secret<32>);\n")),
+    # P9, M3b: pds/ingress joins, and a named secret type counts (A1).
+    ("P9 derive(Clone) on a CookieSecret holder in pds/ingress", {"P9"},
+     lambda t: append(t / "crates/pds/ingress/src/cookie.rs", "\n#[derive(Clone)]\npub struct Held {\n    secret: CookieSecret,\n}\n")),
+    ("P9 derive(Debug) on an Option<Secret<..>> holder in pds/ingress", {"P9"},
+     lambda t: append(t / "crates/pds/ingress/src/rp_cookie.rs", "\n#[derive(Debug)]\npub struct Pair {\n    current: Option<Secret<16>>,\n}\n")),
+    # P11: cookie values compared without ct_eq (S3).
+    ("P11 == on a cookie in rosenpass-core", {"P11"},
+     lambda t: append(t / "crates/rosenpass-core/src/cookie.rs", "\npub fn bad(want: [u8; 16], cookie: [u8; 16]) -> bool {\n    cookie == want\n}\n")),
+    ("P11 != against a cookie field in pds/ingress", {"P11"},
+     lambda t: append(t / "crates/pds/ingress/src/rp_cookie.rs", "\nfn bad(want: [u8; 16], got: [u8; 16]) -> bool {\n    want != cookie_field(got)\n}\n")),
+    ("P11 the cookie adapter removed", {"P11"},
+     lambda t: (t / "crates/pds/ingress/src/rp_cookie.rs").unlink()),
     # P10: by-value secret copies.
     ("P10 from_bytes(*..) in hs-core", {"P10"},
      lambda t: append(t / "crates/hs-core/src/lib.rs", "\nfn f(k: &[u8; 32]) -> Key32 { Key32::from_bytes(*k) }\n")),
@@ -219,6 +231,10 @@ CASES = [
      lambda t: append(t / "crates/wg-core/src/lib.rs", SECRET + "#[derive(Debug)]\npub struct Osk(Secret<32>);\n")),
     ("allow derive(Clone) in a comment", set(),
      lambda t: append(t / "crates/rosenpass-core/src/lib.rs", SECRET + "// no #[derive(Clone)]: L12\npub struct Osk(Secret<32>);\n")),
+    ("P11 a cookie compare inside a comment, and ct_eq", set(),
+     lambda t: append(t / "crates/rosenpass-core/src/cookie.rs", "\n// cookie == want would be wrong here\npub fn ok(a: &[u8], cookie: &[u8]) -> bool {\n    crypto::ct_eq(a, cookie)\n}\n")),
+    ("P9 a CookieSecret holder without the derive", set(),
+     lambda t: append(t / "crates/pds/ingress/src/cookie.rs", "\npub struct Held {\n    secret: CookieSecret,\n}\n")),
 ]
 
 

@@ -69,13 +69,19 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
-RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10"]
+RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core",
                "crates/pds/key", "crates/pds/hs", "crates/pds/data"]
 PENDING: set[str] = set()
 # Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
-SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey"]
+SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/ingress"]
+# Types that hold a secret under a name of their own, not as Secret<..> (P9,
+# M3b plan A1): the WireGuard cookie secret.
+SECRET_TYPES = ("Secret<", "Zeroizing<", "CookieSecret")
+# Files that compare cookie values; every compare goes through ct_eq (P11,
+# M3b plan S3). A tripwire over names: a value not named *cookie* escapes it.
+COOKIE_FILES = ["crates/rosenpass-core/src/cookie.rs", "crates/pds/ingress/src/rp_cookie.rs"]
 
 
 def run_blocks(dockerfile: str):
@@ -258,10 +264,25 @@ def check_secret_derives(root: pathlib.Path, out: list):
             for m in re.finditer(r"\bderive\(([^)]*)\)", code):
                 if not re.search(r"\b(Clone|Copy|Debug)\b", m.group(1)):
                     continue
-                wrapped = next((w for w in ("Secret<", "Zeroizing<") if w in item_after(code, m.end())), None)
+                wrapped = next((w for w in SECRET_TYPES if w in item_after(code, m.end())), None)
                 if wrapped:
                     n = code.count("\n", 0, m.start()) + 1
                     out.append(f"P9 {rel}:{n}: derive({m.group(1)}) on a type wrapping {wrapped}")
+
+
+def check_cookie_compares(root: pathlib.Path, out: list):
+    for rel in COOKIE_FILES:
+        path = root / rel
+        if not path.is_file():
+            # A crate that exists without its cookie file has lost what this
+            # rule checks; a tree without the crate (the P7 fixtures') has not.
+            if (root / rel).parents[1].is_dir():
+                out.append(f"P11 {rel}: missing; the cookie compare tripwire has nothing to check")
+            continue
+        code = re.sub(r"//[^\n]*", "", path.read_text())
+        for m in re.finditer(r"\b\w*cookie\w*\b[\])]*\s*[!=]=(?!=)|[!=]=\s*[&*]?\w*cookie\w*\b", code):
+            n = code.count("\n", 0, m.start()) + 1
+            out.append(f"P11 {rel}:{n}: a cookie compared with == or !=; use ct_eq")
 
 
 def main() -> int:
@@ -284,6 +305,7 @@ def main() -> int:
     check_forbidden(root, out)
     check_secret_derives(root, out)
     check_secret_copies(root, out)
+    check_cookie_compares(root, out)
     failing = [l for l in out if l.split()[0] not in pending]
     for line in out:
         print(line if line in failing else f"pending {line}")
