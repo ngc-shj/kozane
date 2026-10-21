@@ -182,3 +182,99 @@ differs per build. The C10 normaliser must mask that hash.
   matches across builds because both build `core` from the same source with
   the same flags. Whether `-Z share-generics=no` is still needed is decided
   in M2, on the real closure.
+
+## M1 — port source
+
+- **Source: libmceliece 20260622 `crypto_kem/460896pc/vec`.** The tarball's
+  sha256 is `a30b93fcc51281881a31007c0b82cdfaff532a9d2dba87c7f99760f1f83266b7`.
+  - The `pc` ("plaintext confirmation") variant is libmceliece's round-3
+    framing: `C1 = H(2,e)`, `K = H(1, e, C0‖C1)`, a 188-byte ciphertext
+    (`348864pc/avx/kem_enc.c`).
+  - The plan's round-1 refinement had combined libmceliece's core with a
+    round-3 framing source from elsewhere. Since libmceliece itself ships
+    the round-3 framing, the core and the framing both come from it, as
+    the owner originally decided. The I3 mapping table maps libmceliece's
+    `crypto_int*`/`crypto_uint*` sites throughout.
+- **Reference and oracle:** PQClean's round-3 `mceliece460896_vec`, as
+  vendored by liboqs 0.8 (`oqs-sys-0.8.0/liboqs/src/kem/classic_mceliece/pqclean_mceliece460896_vec`).
+  The C8 vectors come from it. Where libmceliece's encaps sampler consumes
+  the stream differently, the port follows liboqs, as C8 requires, and
+  the difference is recorded below.
+
+- **liboqs 0.8's keygen is round 2.** The port found this; the
+  orchestrator decided the response.
+  - **What liboqs does:** oqs-sys 0.8.0's `pqclean_mceliece460896_vec` is
+    byte-identical (md5) to the PQClean source. Its keygen is round 2:
+    - AES-256-CTR seed expansion;
+    - the round-2 field polynomial `y^96+714y^11+5296y^5+728y^4+5881`;
+    - a 13568-byte sk with round-2 control bits.
+    
+    Its KEM framing is round 3, and the peers' decapsulation interoperates
+    with round-3/4 keys (the C8 decaps classes all match).
+  - **Decision:** the gateway generates its own static key (`mksecrets`),
+    so its keygen need not match the peers'. The port uses libmceliece's
+    own round-3/4 keygen: SHAKE-based, δ stored, no AES in the crate. That
+    is the plan's "round 3 keygen", and it matches the deployed cmr keys.
+  - **Vector roles:**
+    - keygen is checked against the frozen cmr bridge (`cmr.i.kp_seed` →
+      `pk_sha3`, `sk`);
+    - encaps and decaps are checked against liboqs. liboqs's pk is
+      rebuilt from `sk_oqs` and checked against `pk_sha3`.
+- **Encaps sampling follows liboqs's round-3 `gen_e`.** libmceliece's
+  sampler (filter, sort, declassify branch) consumes the stream
+  differently. The port implements liboqs's semantics without branches or
+  secret addresses, and it matches all three liboqs entries, including
+  their 1, 3 and 4 attempts.
+
+### M1 result (C7, C8)
+
+- **`crates/mce460896`:** libmceliece 20260622 `460896pc/vec`, ported to
+  no_std Rust.
+  - Dependencies: `sha3 =0.10.9` and `zeroize =1.8.1` only.
+  - `unsafe` appears only in `barrier.rs`.
+  - Unit tests: 5 unit, 5 rng, 2 stack and 5 vectors, in dev and in
+    `--release`; `clippy --all-targets -D warnings` is clean.
+- **Equivalence:**
+  - Keygen matches cmr 2.0.2 byte for byte (pk SHA3-256 and the 13608-byte
+    sk, for all three bridge seeds). Both draw one 32-byte δ, expand it
+    with SHAKE256(64‖δ), and use the field polynomial
+    `y^96+y^10+y^9+y^6+1`.
+  - Encaps matches liboqs (ct and ss) for all three entries, with 1, 3 and
+    4 sampling attempts.
+  - Decaps matches liboqs and cmr in all four classes.
+  - The liboqs pk is rebuilt from `sk_oqs` by `pk_from_sk` and checked
+    against `pk_sha3`.
+- **Red check (orchestrator, scratch copy):** one flipped nibble in
+  `mce.1.dec.c1.ss` fails `liboqs_decaps_matches_in_every_class`.
+- **Constants:**
+  - `ENCAPS_RAND_LEN` is 384.
+  - `SCRUB_DEPTH` is 96 KiB. The measured peaks, by stack-exhaustion
+    bisection, are: `decaps_core` 64 KiB; `encaps_attempt_core` 20 KiB in
+    dev and 4 KiB in release. A unit test asserts depth ≥ peak + 16 KiB.
+  - decaps' root therefore uses about 96 KiB of pqkey's 128 KiB stack.
+- **`BARRIERS.md`:** 55 port-side barrier calls for 61 source sites
+  (L 31, R 12, K 18). 30 of them are in the C9/C10 identity set; keygen and
+  the keygen-only `gf.rs` sites are mapped out.
+
+### M1 deviations
+
+- **No-std check:** `cargo build --target aarch64-unknown-none` needs
+  `-Zbuild-std=core,compiler_builtins`, because the image does not install
+  that target's std. The PD build uses build-std anyway.
+- **Lints:**
+  - `clippy::indexing_slicing` is allowed per module in the core and
+    keygen, because every index is a public loop variable over a
+    fixed-size array (I4, adjudicated by C9 and C10).
+  - `arithmetic_side_effects` is allowed only in the modules whose `+ - *`
+    touch public indices: vec, transpose, util, benes, fft, fft_tr and
+    keygen. lib, bm, decrypt, encrypt, gf, stages and barrier stay `deny`
+    and use `wrapping_*` (I7).
+- **Visibility:** `decaps_core`, `encaps_attempt_core` and `pk_from_sk` are
+  `#[doc(hidden)] pub`, for the stack and vector tests.
+- **The shim's other branch:** besides the accept bit, the shim branches on
+  the RNG's `Err`, which is public.
+- **Keygen** is host-only. It needs about 1.1 MB of stack for pk_gen's
+  matrix, and its rejection branches on public data, as libmceliece does.
+- **Still open, before Phase 2 completes:** C8's NIST round-3 KAT, the
+  first three entries of `kat_kem.rsp`. It needs the NIST AES-CTR DRBG in
+  test code.

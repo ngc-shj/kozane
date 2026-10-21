@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/audit-event", "crates/config", "crates/cpu", "crates/data-core", "crates/hs-core", "crates/ingress-core", "crates/key-core", "crates/inner-core", "crates/layout", "crates/msgs", "crates/netdrv", "crates/pdkit", "crates/pds/audit", "crates/pds/data", "crates/pds/eth-in", "crates/pds/eth-out", "crates/pds/hello", "crates/pds/hs", "crates/pds/ingress", "crates/pds/inner", "crates/pds/key", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/timer", "crates/pqkey-core", "crates/ring", "crates/rosenpass-core", "crates/rosenpass-wire", "crates/secret-blob", "crates/wg-core", "crates/wg-wire", "crates/wire", "tools/laws", "tools/mksecrets"]
+members = ["crates/audit-event", "crates/config", "crates/cpu", "crates/data-core", "crates/hs-core", "crates/ingress-core", "crates/key-core", "crates/inner-core", "crates/layout", "crates/mce460896", "crates/msgs", "crates/netdrv", "crates/pdkit", "crates/pds/audit", "crates/pds/data", "crates/pds/eth-in", "crates/pds/eth-out", "crates/pds/hello", "crates/pds/hs", "crates/pds/ingress", "crates/pds/inner", "crates/pds/key", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/timer", "crates/pqkey-core", "crates/ring", "crates/rosenpass-core", "crates/rosenpass-wire", "crates/secret-blob", "crates/wg-core", "crates/wg-wire", "crates/wire", "tools/laws", "tools/mksecrets"]
 
 [workspace.package]
 edition = "2024"
@@ -32,4 +32,7 @@ codegen-units = 1
 opt-level = 3
 
 [profile.dev.package.libcrux-ml-kem]
+opt-level = 3
+
+[profile.dev.package.mce460896]
 opt-level = 3
