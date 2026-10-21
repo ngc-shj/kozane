@@ -133,3 +133,52 @@ at the pinned commit carries (V0 probe), so the pairing is confirmed.
     sites is unchanged in all three (124, 210, 163). The refactor added no
     panic path.
   - This is a reviewed code-shape change, as the plan allows.
+
+## M-1 — identity probe (C10, before the port)
+
+### Result: identity is reachable
+
+The probe compared `keccak` (which `pd-pq` already ships) and a probe
+function between a harness build and the PD build.
+
+| Harness build | `keccak::keccak_p::<u64>` normalised diff |
+|---|---|
+| `aarch64-unknown-linux-gnu`, PD flags (`opt-level s`, overflow checks, panic=abort, static relocation, `+v8a,+strict-align,+neon`) | 387 lines |
+| … plus `-C force-frame-pointers=no` | 387 lines: the linux target's `frame-pointer: non-leaf` overrides the flag |
+| `aarch64-ct-harness.json` (below), `-Z build-std=std,panic_abort`, linked by cc | 12 lines: `adrp+add` against lld's relaxed `nop; adr` |
+| … linked by rust-lld (`-Clinker-flavor=gnu-lld-cc -Clink-self-contained=+linker`) | **0 lines** |
+
+The harness target, `aarch64-ct-harness.json`, is the linux-gnu spec with
+the codegen-relevant fields of `support/targets/aarch64-sel4-microkit.json`:
+
+- `frame-pointer` removed;
+- `disable-redzone: true`;
+- `features: +v8a,+strict-align,+neon`;
+- `panic-strategy: abort`;
+- `relocation-model: static`;
+- `position-independent-executables: false` and
+  `static-position-independent-executables: false`;
+- `stack-probes: inline`;
+- `default-uwtable: true`.
+
+It keeps `llvm-target` `aarch64-unknown-linux-gnu`, so it links against
+glibc for valgrind.
+
+**The probe function** (`copy_from_slice`, a bounds-checked index and an
+overflow-checked add) was compiled for both targets as a `no_std`
+staticlib. With build-std `core` on both, the pre-link disassembly
+matches except for `core`'s v0-mangling crate hash (`Cs<hash>_`), which
+differs per build. The C10 normaliser must mask that hash.
+
+### Consequences for C9/C10 (recorded before M2)
+
+- **Harness build:** the harness is built for `aarch64-ct-harness.json`
+  with `-Zjson-target-spec -Z build-std=std,panic_abort`, linked by
+  rust-lld. That replaces C9's `-C relocation-model=static` and
+  frame-pointer flags. The JSON is committed under `support/targets/` in
+  M2.
+- **Generic instantiations:** `core::slice::copy_from_slice_impl` is called
+  out of line, as a `core` generic. The C10 closure follows it, and it
+  matches across builds because both build `core` from the same source with
+  the same flags. Whether `-Z share-generics=no` is still needed is decided
+  in M2, on the real closure.
