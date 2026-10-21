@@ -767,6 +767,9 @@ fixed locally, stop and ask the owner.
   no C9/C10 gate and no residue test. Owner: unscheduled (SC31). It is a
   one-time offline operation.
 - **R-M6:** C9 sees only the paths its inputs reach.
+- **R-M8:** C8 has no direct NIST round-3 KAT, because the submission
+  ships no response file (deviation log, M1). Keygen equivalence rests on
+  cmr 2.0.2, itself KAT-checked upstream, and the KEM's on liboqs.
 - **R-M7:** secret values left in registers after return (general-purpose
   and NEON, bitsliced data included) are not scrubbed. Only the same PD and
   the kernel, which saves the registers on a context switch, can reach

@@ -87,9 +87,10 @@ CASES_FOR_GATE = {
              "c2-boot-kat", "c4-hello-src", "c4-hello-global", "c4-conf-src", "c4-conf-global", "c4-type-filter",
              "rp-cookie-domain", "rp-legacy-probe", "rp-conf-share", "rp-awaited", "rp-proven-reserve", "rp-sid-binding", "rp-nat",
              "rp-cookie-offload", "rp-tx-tier", "rp-reply-fifo", "rp-reply-order", "rp-reply-dst", "rp-sync-sticky"},
-    "kani": {"kani", "kani-cache"},
+    "kani": {"kani", "kani-cache", "kani-chunk-ref"},
     "verus": {"verus-cache", "verus-trusted", "verus-required", "verus-wg-wire-window",
-              "verus-wg-wire-roundtrip"},
+              "verus-wg-wire-roundtrip", "verus-rp-wire-roundtrip",
+              "verus-msgs-exact"},
     "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire"},
     "laws": {"laws", "laws-timer-ingress", "laws-pq-key", "laws-hs-pqkey", "laws-pq-secrets-writable"},
     "test": {"integration", "integration-count", "integration-residue", "integration-cookie",
@@ -176,6 +177,15 @@ CASES = {
                                                "        if r0 != 0 || r1 != 0 || r2 != 0 {\n            return Err(WireError::ReservedNonZero);\n        }\n",
                                                "        if t != MSG_INITIATION {\n            return Err(WireError::WrongType);\n        }\n"),
                                 "r is Ok <==> (bytes@.len() == INITIATION_LEN as int"),
+    # C4: an InitConf field emitted one byte late breaks its round trip.
+    "verus-rp-wire-roundtrip": (["verus", "verus_crates=rosenpass-wire"],
+                                lambda t: edit(t, "crates/rosenpass-wire/src/lib.rs",
+                                               "write_at(out, 144, &self.mac)?;", "write_at(out, 145, &self.mac)?;"),
+                                "=~= spec_emit_init_conf("),
+    # C3: an initiation with trailing bytes accepted.
+    "verus-msgs-exact": (["verus", "verus_crates=msgs"],
+                         lambda t: edit(t, "crates/msgs/src/lib.rs", "exact(b, INITIATION_MSG_LEN)?;", ""),
+                         "r is Ok <==> b@.len() == INITIATION_MSG_LEN as int"),
     # An unlisted trusted construct, in the cfg_attr spelling the scanner
     # must still see.
     "verus-trusted": (["verus", "verus_crates=wg-wire"],
@@ -190,6 +200,13 @@ CASES = {
                                       "use vstd::prelude::*;\n\nverus! {\n",
                                       "use vstd::prelude::*;\n\n"),
                        "required function `below_window` is not defined inside verus!"),
+    # msgs' one trusted Verus function (M4 plan C3): its contract is Kani's
+    # to check, so a body that borrows one byte late must fail there.
+    "kani-chunk-ref": (["kani", "kani_crates=msgs"],
+                       lambda t: edit(t, "crates/msgs/src/lib.rs",
+                                      "    let end = at.checked_add(N)?;\n    b.get(at..end)?.try_into().ok()",
+                                      "    let end = at.checked_add(N)?.checked_add(1)?;\n    b.get(at + 1..end)?.try_into().ok()"),
+                       "core::ptr::eq(c.as_ptr(), b.as_ptr().wrapping_add(at))"),
     # End to end through the real `check` rule, once per gate: see
     # run_propagation(). The tuple is only a placeholder for the case table.
     "check-propagation": ([], lambda t: None, ""),

@@ -159,7 +159,7 @@ kani: | $(counts)
 		$(counts)/kani.log > $(counts)/kani
 
 # Verus (M4 plan C1): one gate run per crate, serial, under kani-gate's lock.
-verus_crates := wg-wire
+verus_crates := wg-wire rosenpass-wire msgs
 verus: | $(counts)
 	rm -f $(counts)/verus.log
 	$(foreach c,$(verus_crates),echo "VERUS-CRATE $(c)" >> $(counts)/verus.log; \

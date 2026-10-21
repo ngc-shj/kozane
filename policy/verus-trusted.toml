@@ -9,4 +9,8 @@
 # construct = "external_body"
 # deviation = "secureos-m4-verus-mceliece-deviation.md: <heading>"
 
-trusted = []
+[[trusted]]
+crate = "msgs"
+file = "src/lib.rs"
+construct = "external_body"
+deviation = "secureos-m4-verus-mceliece-deviation.md: V2, msgs chunk_ref"

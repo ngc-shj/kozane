@@ -275,6 +275,96 @@ differs per build. The C10 normaliser must mask that hash.
   the RNG's `Err`, which is public.
 - **Keygen** is host-only. It needs about 1.1 MB of stack for pk_gen's
   matrix, and its rejection branches on public data, as libmceliece does.
-- **Still open, before Phase 2 completes:** C8's NIST round-3 KAT, the
-  first three entries of `kat_kem.rsp`. It needs the NIST AES-CTR DRBG in
-  test code.
+- **C8's NIST round-3 KAT is not added (R-M8).** The round-3 submission
+  (`mceliece-20201010.tar.gz`, sha256
+  `1b8aca59430ca7a0569e4e918e1c0c165f67dd0ccde44760f314eaa40f75dafe`)
+  contains no `kat_kem.rsp` and no hash of one, only the generator
+  `nist/kat_kem.c` and the reference implementation. Its DRBG needs
+  OpenSSL's AES. Producing the file would mean building the C reference
+  as a third oracle.
+  - **What covers the KAT's purpose:** keygen is byte-identical to cmr
+    2.0.2, a port of that same round-3 reference whose upstream tests check
+    the NIST KAT. Encaps and decaps match liboqs, which the peers run.
+  - **Residual:** no direct comparison with the NIST reference's own
+    output. Recorded as R-M8.
+
+## V2 — msgs (C3) and rosenpass-wire (C4)
+
+### Result
+
+- **`make verus`** over wg-wire, rosenpass-wire and msgs:
+
+  | Key | Value |
+  |---|---|
+  | `VERUS-MSGS` | 70 |
+  | `VERUS-ENSURES-MSGS` | 43 |
+  | `VERUS-ROSENPASS-WIRE` | 49 |
+  | `VERUS-ENSURES-ROSENPASS-WIRE` | 23 |
+  | `VERUS-FUNCTIONS` | 181 |
+  | `VERUS-TRUSTED-CHECKED` | 3 |
+
+- **Coverage:** all 8 `pub fn decode` sites of msgs are verified, as are all
+  4 parse/emit pairs of rosenpass-wire, `peek_type`, and the round-trip
+  lemmas.
+- **check-selftest:** `verus-msgs-exact` (needle
+  `r is Ok <==> b@.len() == INITIATION_MSG_LEN as int`) and
+  `verus-rp-wire-roundtrip` (needle `=~= spec_emit_init_conf(`) are red
+  under their mutations.
+
+### Deviations
+
+- **msgs chunk_ref: the one trusted construct (owner-approved,
+  2026-10-22).**
+  - **Why it exists:** `Initiation`, `Response`, `Install` and `PskInstall`
+    borrow `&'a [u8; N]` from the middle of the input on purpose. Zero copy
+    means no secret copy (`send`, `recv`, `osk`). vstd has no spec for
+    `TryFrom<&[u8]> for &[u8; N]`, and its error type would need
+    `external_type_specification`.
+  - **Who added it:** the sub-agent's attempt to add an `external_body`
+    was denied by the permission system ("Security Weaken"). The owner then
+    chose option 1, a single Kani-checked trusted helper, and the
+    orchestrator added it.
+  - **What it is:** `chunk_ref::<N>(b, at) -> Option<&[u8; N]>` is
+    `#[verifier::external_body]`. Its ensures says it returns `Some` iff
+    `at + N <= len`, and that the bytes are `b@.subrange(at, at + N)`. It
+    is listed in `policy/verus-trusted.toml` and in msgs' required list.
+  - **How the contract is checked:** Kani harnesses `chunk_ref_initiation`
+    (148), `chunk_ref_response` (92) and `chunk_ref_key` (32) check it for
+    every `N` the decoders borrow, over any input up to `N + 8` bytes and
+    any offset. They check that it is `Some` exactly when in range, and
+    that the result points at `b[at]`. The content equality follows from
+    the aliasing. An explicit byte compare made cbmc unroll `memcmp` per
+    byte, past the unwind bound.
+- **Refactors:**
+  - **Both crates:** like wg-wire, they use local `read_array`/`write_at`
+    and LE helpers instead of `split_first_chunk`, `split_at_mut_checked`,
+    `mem::take`, `from_le_bytes` and array patterns.
+  - **rosenpass-wire:** `(r0 | r1 | r2) != 0` became `r0 != 0 || r1 != 0 ||
+    r2 != 0`, because Verus's integer theory does not relate a byte OR to
+    "not all zero". `peek_type` reads through `read_array::<1>`.
+  - **msgs:** `EP_LEN` and the four tag constants became `pub`, because a
+    public spec cannot name a private const. The legacy
+    `put`/`take`/`put_ep`/`take_ep` are removed. The whole crate is one
+    `verus!` block.
+- **The `.text` record for V2:**
+  - **Method:** normalised and sorted disassembly against a V1 worktree
+    (`317cda7`). The control PDs audit, timer, eth-in and inner differ by
+    0 lines, so the path-independent comparison is valid.
+  - **Changed:** the users of msgs and rosenpass-wire. Instruction counts
+    went from V1 to V2 as follows:
+
+    | PD | Instructions |
+    |---|---|
+    | data | 10605→10613 |
+    | hs | 19598→19595 |
+    | ingress | 22812→22881 |
+    | pq | 28484→28843 |
+    | pqkey | 6 lines reordered |
+
+  - **Panic paths:** the `core::panicking`/`slice::index` call-site counts
+    are unchanged in all five PDs (124, 210, 163, 237, 116).
+- **Kani:**
+  - msgs now has 7 harnesses (4 + the 3 `chunk_ref` contracts) and
+    rosenpass-wire has 10, all passing.
+  - Selftest `kani-chunk-ref` (a body that borrows one byte late) fails at
+    the pointer assertion.

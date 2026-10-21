@@ -111,3 +111,35 @@ fn rp_reply_decode_is_total() {
         }
     }
 }
+
+/// `chunk_ref`'s contract, the one trusted function under Verus (M4 plan C1,
+/// C3): for every `N` the decoders borrow, and any input up to `N + 8`
+/// bytes and any offset, it is `Some` exactly when the `N` bytes at `at` are
+/// in range, and then it is those bytes, borrowed from `b` itself.
+macro_rules! chunk_ref_contract {
+    ($name:ident, $n:expr) => {
+        #[kani::proof]
+        #[kani::unwind(10)]
+        fn $name() {
+            const N: usize = $n;
+            let buf: [u8; N + 8] = kani::any();
+            let len: usize = kani::any();
+            kani::assume(len <= buf.len());
+            let b = buf.get(..len).unwrap_or(&[]);
+            let at: usize = kani::any();
+            let r = chunk_ref::<N>(b, at);
+            let in_range = at.checked_add(N).is_some_and(|end| end <= b.len());
+            assert!(r.is_some() == in_range);
+            // Borrowed in place: the result starts at `b[at]`, so its `N`
+            // bytes are `b[at..at + N]` (a byte compare would only re-read
+            // the same memory, and costs an unwind per byte).
+            if let Some(c) = r {
+                assert!(core::ptr::eq(c.as_ptr(), b.as_ptr().wrapping_add(at)));
+            }
+        }
+    };
+}
+
+chunk_ref_contract!(chunk_ref_initiation, INITIATION_LEN);
+chunk_ref_contract!(chunk_ref_response, RESPONSE_LEN);
+chunk_ref_contract!(chunk_ref_key, 32);

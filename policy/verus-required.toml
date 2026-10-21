@@ -15,3 +15,31 @@ functions = [
     "lemma_spec_emit_cookie_reply_parses", "lemma_spec_emit_cookie_reply_inverse",
     "lemma_spec_emit_transport_header_parses", "lemma_spec_emit_transport_header_inverse",
 ]
+
+[crates.rosenpass-wire]
+functions = [
+    # C4: the codecs, peek_type, and the round trips.
+    "parse", "emit", "peek_type", "lemma_peek_type_agrees",
+    "lemma_spec_emit_init_hello_parses", "lemma_spec_emit_init_hello_inverse",
+    "lemma_spec_emit_resp_hello_parses", "lemma_spec_emit_resp_hello_inverse",
+    "lemma_spec_emit_init_conf_parses", "lemma_spec_emit_init_conf_inverse",
+    "lemma_spec_emit_empty_data_parses", "lemma_spec_emit_empty_data_inverse",
+]
+
+[crates.msgs]
+functions = [
+    # C3: every `pub fn decode` site, its encode, and the round trips.
+    "decode", "encode",
+    "lemma_spec_encode_initiation_decodes", "lemma_spec_encode_initiation_inverse",
+    "lemma_spec_encode_response_decodes", "lemma_spec_encode_response_inverse",
+    "lemma_spec_encode_install_decodes", "lemma_spec_encode_install_inverse",
+    "lemma_spec_encode_psk_install_decodes", "lemma_spec_encode_psk_install_inverse",
+    "lemma_spec_encode_transport_decodes", "lemma_spec_encode_transport_inverse",
+    "lemma_spec_encode_rp_datagram_decodes", "lemma_spec_encode_rp_datagram_inverse",
+    "lemma_spec_encode_rp_reply_reply_decodes", "lemma_spec_encode_rp_reply_reply_inverse",
+    "lemma_spec_encode_rp_reply_no_reply_decodes",
+    "lemma_spec_encode_to_ingress_outbound_decodes", "lemma_spec_encode_to_ingress_outbound_inverse",
+    "lemma_spec_encode_to_ingress_endpoint_decodes", "lemma_spec_encode_to_ingress_endpoint_inverse",
+    # The trusted helper keeps its contract (checked by Kani).
+    "chunk_ref",
+]

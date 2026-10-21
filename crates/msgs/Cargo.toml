@@ -6,6 +6,12 @@ license.workspace = true
 
 [dependencies]
 wg-wire = { path = "../wg-wire" }
+# Verus's spec library (M4 plan C1): ghost code is erased in the normal
+# build. The version pairs with the Verus commit the dev image builds.
+vstd = { version = "=0.0.0-2026-10-04-0306", default-features = false }
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)", "cfg(verus_keep_ghost)", "cfg(verus_keep_ghost_body)", "cfg(verus_verify_core)"] }
+
+[package.metadata.verus]
+verify = true
