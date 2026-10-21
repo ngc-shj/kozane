@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Prints the sha256 of each PD ELF's .text section (M4 plan, Requirements:
+# Verus's effect on the shipped PDs is measured, not assumed). Run it before
+# and after a slice and diff the outputs; a changed line is reviewed.
+# Usage: tools/pd-text-hashes [build-dir]   (default: build)
+set -euo pipefail
+dir=${1:-build}
+shopt -s nullglob
+elfs=("$dir"/pd-*.elf)
+if [ ${#elfs[@]} -eq 0 ]; then
+    echo "pd-text-hashes: no PD ELFs under $dir" >&2
+    exit 1
+fi
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+for elf in "${elfs[@]}"; do
+    aarch64-none-elf-objcopy -O binary --only-section=.text "$elf" "$tmp"
+    [ -s "$tmp" ] || { echo "pd-text-hashes: empty .text in $elf" >&2; exit 1; }
+    printf '%s %s\n' "$(sha256sum < "$tmp" | cut -d' ' -f1)" "$(basename "$elf")"
+done

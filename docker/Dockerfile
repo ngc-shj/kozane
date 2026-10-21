@@ -95,6 +95,57 @@ RUN --network=none set -eux; \
     echo "$RP_MASTER_COMMIT" > /opt/rosenpass-master/SOURCE; \
     echo "$RP_023_COMMIT" > /opt/rosenpass-023/SOURCE
 
+# Verus (M4 plan C1): built from a sha256-checked source tarball, offline
+# after `cargo fetch --locked`. No aarch64-linux release binary exists. Z3 is
+# the pinned release binary, so Verus's own download script is not used.
+FROM base AS verus
+RUN apt-get update -q && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates curl git pkg-config unzip \
+    && rm -rf /var/lib/apt/lists/*
+ARG RUSTUP_VERSION
+ARG RUSTUP_SHA256
+ARG VERUS_COMMIT=426d8b01e7ffb910a36c15e1f870ff985bb61eef
+ARG VERUS_SHA256=40be6fb66e457ca71210cb85b3febf3f43fce106df8db3caf3c18df349ab0b93
+ARG Z3_SHA256=87fcd963d3eecb0f12cf1c3ef0ad74e84a3a7bd3caed5d94445645ef94ae6274
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN set -eux; \
+    curl -sSfL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/aarch64-unknown-linux-gnu/rustup-init"; \
+    echo "$RUSTUP_SHA256  /tmp/rustup-init" | sha256sum -c -; \
+    chmod +x /tmp/rustup-init; \
+    /tmp/rustup-init -y --no-modify-path --default-toolchain none --profile minimal; \
+    rm /tmp/rustup-init; \
+    curl -sSfL -o /tmp/verus.tar.gz "https://github.com/verus-lang/verus/archive/${VERUS_COMMIT}.tar.gz"; \
+    echo "$VERUS_SHA256  /tmp/verus.tar.gz" | sha256sum -c -; \
+    mkdir -p /src/verus; \
+    tar -xzf /tmp/verus.tar.gz -C /src/verus --strip-components=1; \
+    rm /tmp/verus.tar.gz; \
+    # Verus's build scripts read git HEAD. A throwaway repo over the
+    # sha256-checked tree satisfies them; the version and commit are passed
+    # explicitly (VARGO_BUILD_*), so the binary reports the real pin.
+    (cd /src/verus && git init -q && git add -A \
+        && git -c user.name=build -c user.email=build@localhost commit -q -m "verus ${VERUS_COMMIT}"); \
+    # The toolchain and components come from Verus's rust-toolchain.toml.
+    (cd /src/verus && rustup toolchain install); \
+    (cd /src/verus/tools/vargo && cargo fetch --locked); \
+    (cd /src/verus/source && cargo fetch --locked); \
+    curl -sSfL -o /tmp/z3.zip https://github.com/Z3Prover/z3/releases/download/z3-4.16.0/z3-4.16.0-arm64-glibc-2.38.zip; \
+    echo "$Z3_SHA256  /tmp/z3.zip" | sha256sum -c -; \
+    unzip -q /tmp/z3.zip -d /tmp/z3; \
+    install -m 0755 /tmp/z3/z3-4.16.0-arm64-glibc-2.38/bin/z3 /src/verus/source/z3; \
+    rm -rf /tmp/z3 /tmp/z3.zip
+RUN --network=none set -eux; \
+    (cd /src/verus/tools/vargo && cargo build --release --locked --offline); \
+    cd /src/verus/source; \
+    CARGO_NET_OFFLINE=true VARGO_BUILD_VERSION=0.2026.10.04.426d8b0 VARGO_BUILD_SHA="$VERUS_COMMIT" \
+        PATH=/src/verus/tools/vargo/target/release:$PATH vargo build --release; \
+    rel=/src/verus/source/target-verus/release; \
+    mkdir -p /opt/verus; \
+    cp -a "$rel"/verus "$rel"/cargo-verus "$rel"/rust_verify "$rel"/z3 "$rel"/verus-root \
+        "$rel"/version.txt "$rel"/vstd.vir "$rel"/libvstd.rlib "$rel"/libverus_builtin.rlib \
+        "$rel"/libverus_builtin_macros.so "$rel"/libverus_state_machines_macros.so \
+        "$rel"/builtin "$rel"/builtin_macros "$rel"/state_machines_macros "$rel"/vstd /opt/verus/; \
+    echo "$VERUS_COMMIT" > /opt/verus/SOURCE
+
 FROM base
 RUN apt-get update -q && apt-get install -y --no-install-recommends \
     build-essential \
@@ -227,5 +278,12 @@ RUN set -eux; \
 COPY --from=rosenpass-oracle /opt/rosenpass-master /opt/rosenpass-master
 COPY --from=rosenpass-oracle /opt/rosenpass-023 /opt/rosenpass-023
 COPY --from=advisory-db /opt/advisory-db /opt/advisory-db
+
+# Verus runs with its own pinned stable toolchain (plus rustc-dev and
+# llvm-tools), selected per call with RUSTUP_TOOLCHAIN; the project's
+# rust-toolchain.toml stays on the PD nightly.
+ARG VERUS_RUST=1.98.1
+RUN rustup toolchain install "$VERUS_RUST" --profile minimal --component rustc-dev,llvm-tools
+COPY --from=verus /opt/verus /opt/verus
 
 WORKDIR /work

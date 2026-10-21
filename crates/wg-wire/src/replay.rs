@@ -8,6 +8,22 @@
 //! per slot and clears slot by slot, so the window is `BITS - 1`.
 
 use crate::REJECT_AFTER_MESSAGES;
+use vstd::prelude::*;
+
+verus! {
+
+/// Whether a counter `c` (plus one) lies more than `window` below `top`:
+/// the saturating sum never wraps, so this is the comparison over the
+/// integers.
+#[inline]
+fn below_window(c: u64, window: u64, top: u64) -> (r: bool)
+    ensures
+        r == (c + window < top),
+{
+    c.saturating_add(window) < top
+}
+
+} // verus!
 
 pub struct ReplayWindow<const BITS: usize> {
     /// Highest accepted counter plus one; 0 before the first accept.
@@ -38,7 +54,7 @@ impl<const BITS: usize> ReplayWindow<BITS> {
         let Some(c) = counter.checked_add(1) else {
             return false;
         };
-        if c.saturating_add(Self::WINDOW) < self.top {
+        if below_window(c, Self::WINDOW, self.top) {
             return false;
         }
         if c > self.top {

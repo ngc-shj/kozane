@@ -812,3 +812,36 @@ fixed locally, stop and ask the owner.
 | C9 | dynamic CT gate | locked |
 | C10 | identity and shape of shipped code | locked |
 | C11 | cut-over, waiver close, L2 amendment | locked |
+
+## Implementation Checklist
+
+Files to modify are listed in "Files to update". Each slice adds the files
+it touches to its commit.
+
+### Shared utilities to reuse (no reimplementation)
+
+| Utility | Location | Reused for |
+|---|---|---|
+| Cache key, flock and count line | `tools/kani-gate.sh` | the `verus-gate.sh` pattern; the lock file itself (`build/kani.lock`) is shared |
+| Count comparison | `tools/check-manifest` | every new count goes through it; there is no second comparator |
+| Selftest cases | `tools/check-selftest`: `edit()`, `copy_repo`, `run_case`, `EXPECT_SUCCESS`/`ABSENT`, `CASES_FOR_GATE` | all new selftest cases |
+| Deterministic liboqs RNG | `tools/rp-vectors/src/main.rs`, `OQS_randombytes_custom_algorithm` | the `--mce` mode |
+| Blob sizes and layout | `crates/secret-blob/src/pq.rs` | asserted against `mce460896`; not duplicated |
+| Constant-time compare | `crates/pqkey-core` `ct_eq` | unchanged; the port's internal compares go through `barrier` |
+| `Secret` and the RNG trait | `crates/rosenpass-core` `Secret`, `Rng` | the kem.rs adapter wraps the port's caller buffers |
+| Stack painting | the M3 deviation log's method, `tests/integration` | C8's stack peaks |
+| Shared lists for the secret-crate rules | `tools/check-pins` P9/P10 | extended, not forked |
+
+### Patterns to follow consistently
+
+- Every downloaded artifact is pinned by sha256 in `docker/Dockerfile`, and
+  each build stage runs offline after `cargo fetch --locked`.
+- Every gate prints a non-zero count line into `build/counts`, and the
+  manifest lists that count.
+- Every selftest needle is failure-only (memory: `selftest-red-proof-pitfalls`).
+- Kani and Verus runs are serialised through `build/kani.lock`.
+
+### CI gate parity
+
+There is no CI configuration (E4). `make check` is the only aggregate
+gate, so there is no parity gap.
