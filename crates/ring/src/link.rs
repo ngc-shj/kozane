@@ -5,8 +5,12 @@
 //! caller has finished with the message (`take_into` / `release`, M3b plan
 //! C3), so the sender can count the message in progress as in flight.
 
+use vstd::prelude::*;
+
 use crate::shmem::Region;
 use crate::{Consumer, Desc, DescError, Pool, Producer, RingError, SharedAccess};
+
+verus! {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LinkError {
@@ -21,6 +25,40 @@ pub enum LinkError {
     /// sees it.
     Held,
 }
+
+/// Whether a new `take_into` may begin: only when nothing is currently held
+/// (`Receiver::held`). Mirrors `take_into`'s own guard (M4 plan C6).
+#[inline]
+fn begin_take(held: Option<usize>) -> (r: Result<(), LinkError>)
+    ensures
+        r is Ok <==> held is None,
+        r is Err ==> r == Err(LinkError::Held),
+{
+    if held.is_some() {
+        Err(LinkError::Held)
+    } else {
+        Ok(())
+    }
+}
+
+/// What `release` returns: the held buffer's index, taking the hold so a
+/// second `release` (or one with nothing held) is refused — a held receive
+/// is released exactly once (M4 plan C6). Mirrors `release`'s own
+/// `held.take()` guard.
+#[inline]
+fn end_release(held: Option<usize>) -> (r: Result<usize, LinkError>)
+    ensures
+        r is Ok <==> held is Some,
+        r is Ok ==> held == Some(r->Ok_0),
+        r is Err ==> r == Err(LinkError::NoBuffer),
+{
+    match held {
+        Some(idx) => Ok(idx),
+        None => Err(LinkError::NoBuffer),
+    }
+}
+
+} // verus!
 
 /// A message taken by `take_into`; its buffer stays held until `release`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,9 +237,7 @@ where
         if self.dead {
             return Err(LinkError::Corrupt);
         }
-        if self.held.is_some() {
-            return Err(LinkError::Held);
-        }
+        begin_take(self.held)?;
         let Some(d) = self.used.pop().inspect_err(|_| self.dead = true)? else {
             return Ok(None);
         };
@@ -221,9 +257,8 @@ where
         if self.dead {
             return Err(LinkError::Corrupt);
         }
-        let Some(idx) = self.held.take() else {
-            return Err(LinkError::NoBuffer);
-        };
+        let idx = end_release(self.held)?;
+        self.held = None;
         let Some(back) = self.pool.give(idx, 0) else {
             self.dead = true;
             return Err(LinkError::Corrupt);

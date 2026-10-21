@@ -368,3 +368,52 @@ differs per build. The C10 normaliser must mask that hash.
     rosenpass-wire has 10, all passing.
   - Selftest `kani-chunk-ref` (a body that borrows one byte late) fails at
     the pointer assertion.
+
+## V4 — ring, pure logic (C6)
+
+### Result
+
+- **Verus:** `VERUS-RING 15`, `VERUS-ENSURES-RING 12`, with no trusted
+  construct. Kani ring 11/11 still passes, and so do the 37 unit tests.
+- **Selftest:** `verus-ring-mask` (mask with N) is red. Needle:
+  `r == (idx & ((N - 1) as u32)) as usize`.
+- **Coverage:**
+  - `slot` and `ring_len` hold for any `0 < N <= 65536`.
+  - `Pool::{accept, give, first_mine, mine_count}` hold for any `M`/`BUF`.
+    `accept` flips only an unowned slot and `give` only an owned one; every
+    other slot is unchanged.
+  - The held receive goes through the verified `begin_take`/`end_release`.
+    A second take is refused while one is held, and the release succeeds
+    exactly once per hold.
+
+### Deviations
+
+- **Without a trusted model of SharedAccess/Region.**
+  - The plan modelled both as spec-only traits on the allowlist. Adding any
+    trusted construct needs the owner, so C6 was done without one instead.
+  - The pure logic is factored into functions that take the values read
+    from shared memory as parameters. The `SharedAccess`/`shmem` calls
+    stay outside `verus!`, unchanged.
+- **"No buffer owned by both sides" is proved per Pool only.**
+  - What is proved: an accept never takes an owned slot, and a give never
+    gives an unowned one.
+  - What is not: the two-sided invariant would need the Sender's and the
+    Receiver's Pools modelled jointly, which is a larger proof. The Kani
+    harness `pool_accept_stays_in_region` and the link tests keep covering
+    it end to end. It is recorded under SC30.
+- **Refactors (behaviour unchanged; tests.rs unedited):**
+  - **The compile-time check of `N`:** `Mask::<N>::VALUE` is now read in
+    `Producer::new`/`Consumer::new`; `slot`/`ring_len` compute the mask
+    themselves. Verus cannot evaluate the `assert!`-guarded const. Every
+    instantiated N is still checked at compile time, because the fields are
+    private and `new` is the only constructor.
+  - **Moved inside `verus!`:** `Desc` and `LinkError`, because verified
+    ensures name them.
+  - **Rewritten loops:** `first_mine` and `mine_count` are indexed loops,
+    replacing `iter().position`/`filter().count()`.
+  - **Rewritten error handling:** `accept`'s `map_err`/`ok_or` chains are
+    now `match`.
+  - **One un-collapsed `if let`:** Verus rejects let-chains, so it is kept
+    with `#[allow(clippy::collapsible_if)]`.
+- **The `.text` record** for V4 is taken together with V3, after the wire
+  slice.

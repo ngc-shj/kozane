@@ -43,3 +43,11 @@ functions = [
     # The trusted helper keeps its contract (checked by Kani).
     "chunk_ref",
 ]
+
+[crates.ring]
+functions = [
+    # C6: index arithmetic, the pool's ownership transitions, and the held
+    # receive.
+    "slot", "ring_len", "accept", "give", "first_mine", "mine_count",
+    "begin_take", "end_release",
+]
