@@ -720,10 +720,17 @@ pub const RP_CONF_GLOBAL_INTERVAL_NS: u64 = 50_000_000;
 /// `config::MAX_PEERS`, which this crate does not depend on (the PD asserts
 /// the two agree).
 pub const RP_MAX_PEERS: usize = 8;
-/// Load holds this long after its last trigger: three per-source periods,
-/// so a spoofer at one per 20 s never sees the gate drop between spoofs,
-/// even with two of them lost.
+/// Load holds this long after its last trigger: three per-source periods.
+/// An uncookied InitHello under load is not a trigger (rosenpass 0.2.3
+/// would never get through), so load clears under a sustained spoof; the
+/// first uncookied InitHello forwarded within RP_LEGACY_PROBE_NS after that
+/// is the one legacy probe, and it re-arms load at once. A spoofer, at any
+/// rate, so gets at most one uncookied InitHello to `pq` per clearance:
+/// one per RP_UNDER_LOAD_AFTER_NS.
 pub const RP_UNDER_LOAD_AFTER_NS: u64 = 60_000_000_000;
+/// After load clears, how long the next uncookied forward re-arms it (the
+/// integration suite reads this literal).
+pub const RP_LEGACY_PROBE_NS: u64 = 60_000_000_000;
 /// The per-IP cap on cookied InitHellos: every configured peer behind one
 /// address, one each per rekey interval (F3).
 pub const RP_HELLO_COOKIED_IP_BURST: u64 = RP_MAX_PEERS as u64;
@@ -750,7 +757,10 @@ pub const RP_AWAIT_SLOTS: usize = RP_HELLO_GLOBAL_BURST as usize
 /// take.
 pub const RP_CONF_AWAITED_RESERVED: usize = 4;
 
-const _: () = assert!(RP_UNDER_LOAD_AFTER_NS >= RP_HELLO_SRC_INTERVAL_NS, "load would drop between spoofs");
+// A spoofer at the per-source rate always lands in the probe window, so it
+// re-arms load instead of escaping it.
+const _: () = assert!(RP_LEGACY_PROBE_NS >= RP_HELLO_SRC_INTERVAL_NS, "a per-source spoofer would escape the probe window");
+const _: () = assert!(RP_UNDER_LOAD_AFTER_NS >= RP_HELLO_SRC_INTERVAL_NS, "load would clear within one source period");
 const _: () = assert!(
     0 < RP_HELLO_PROVEN_RESERVE && RP_HELLO_PROVEN_RESERVE < RP_HELLO_GLOBAL_BURST,
     "RP_HELLO_PROVEN_RESERVE out of range"
@@ -1017,6 +1027,12 @@ impl<const N: usize> RpGate<N> {
         now_ns < self.under_load_until_ns
     }
 
+    /// Off load, whether load ended less than RP_LEGACY_PROBE_NS ago (never
+    /// before the first load: the deadline starts at zero).
+    fn in_probe_window(&self, now_ns: u64) -> bool {
+        self.under_load_until_ns != 0 && now_ns < self.under_load_until_ns.saturating_add(RP_LEGACY_PROBE_NS)
+    }
+
     /// A trigger held: load holds until RP_UNDER_LOAD_AFTER_NS from now.
     fn refresh_load(&mut self, now_ns: u64) {
         self.under_load_until_ns = self.under_load_until_ns.max(now_ns.saturating_add(RP_UNDER_LOAD_AFTER_NS));
@@ -1057,8 +1073,9 @@ impl<const N: usize> RpGate<N> {
             }
             return o;
         }
-        // I1: no meter, nothing in flight; the spoofing keeps the gate up.
-        self.refresh_load(now_ns);
+        // I1: no meter, nothing in flight, and no load refresh: rosenpass
+        // 0.2.3 cannot answer a CookieReply and retransmits, so a refresh
+        // here would hold the gate for as long as an old client retries.
         match secret {
             Secret::Missing => RpOutcome::NoCookieSecret,
             Secret::Expired => {
@@ -1082,7 +1099,13 @@ impl<const N: usize> RpGate<N> {
         cookied: bool,
     ) -> RpOutcome<'a> {
         match self.admit_hello(cookied, now_ns, src) {
-            Ok(()) => RpOutcome::ForwardHello { src, msg, cookied },
+            Ok(()) => {
+                // Off load (the only uncookied lane): the legacy probe.
+                if !cookied && self.in_probe_window(now_ns) {
+                    self.refresh_load(now_ns);
+                }
+                RpOutcome::ForwardHello { src, msg, cookied }
+            }
             Err(refused) => refused,
         }
     }

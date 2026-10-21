@@ -213,8 +213,8 @@ fn spec_level<const B: u64, const I: u64>(m: &Meter<B, I>, now: u64) -> u64 {
 
 /// The level of `ip`'s slot in a per-source table; a source without a slot
 /// is full (a new slot starts full).
-fn spec_src_level<const N: usize, const B: u64, const I: u64>(t: &SourceMeters<N, B, I>, ip: Ipv4, now: u64) -> u64 {
-    t.slots.iter().flatten().find(|(i, _)| *i == ip).map_or(B * I, |(_, m)| spec_level(m, now))
+fn spec_src_level<const N: usize, const B: u64, const I: u64, K: PartialEq>(t: &SourceMeters<N, B, I, K>, key: K, now: u64) -> u64 {
+    t.slots.iter().flatten().find(|(k, _)| *k == key).map_or(B * I, |(_, m)| spec_level(m, now))
 }
 
 fn spec_below_half<const B: u64, const I: u64>(m: &Meter<B, I>, now: u64) -> bool {
@@ -571,8 +571,9 @@ fn rp_classify_is_total_and_typed() {
     kani::cover!(o == RpOutcome::RingReserved);
 }
 
-/// A failed mac, or a type that is dropped, leaves every meter and the
-/// ring accounting exactly as they were.
+/// A failed mac, or a type that is dropped, leaves the gate exactly as it
+/// was; a refusal for the ring is a load trigger, so it changes only the
+/// load state.
 #[kani::proof]
 #[kani::unwind(20)]
 fn rp_refusals_before_admission_spend_nothing() {
@@ -582,8 +583,15 @@ fn rp_refusals_before_admission_spend_nothing() {
     let mut gate = any_rp_gate();
     let before = gate.clone();
     let o = classify_any(&mut gate, &AnyRpMac::default(), &mut AnyRpCookie::default(), kani::any(), Endpoint { ip: kani::any(), port: kani::any() }, payload.get(..len).unwrap_or(&[]));
-    if matches!(o, RpOutcome::BadMac | RpOutcome::TypeDropped | RpOutcome::RingReserved) {
+    if matches!(o, RpOutcome::BadMac | RpOutcome::TypeDropped) {
         assert!(gate == before);
+    }
+    if o == RpOutcome::RingReserved {
+        let mut after = gate.clone();
+        after.under_load_until_ns = before.under_load_until_ns;
+        after.in_load = before.in_load;
+        after.entered_load = before.entered_load;
+        assert!(after == before);
     }
     kani::cover!(o == RpOutcome::BadMac);
     kani::cover!(o == RpOutcome::TypeDropped);
@@ -592,7 +600,8 @@ fn rp_refusals_before_admission_spend_nothing() {
 
 /// A forward went through its type's constructor: it spent exactly one
 /// token of its type's global meter and exactly one of the source's own
-/// slot in its type's per-source table (a new source's slot starts full),
+/// slot in its lane's per-source tables (a new source's slot starts full;
+/// the cookied lane meters the endpoint and the address, not `hello_src`),
 /// touched no meter of the other type, and recorded nothing in flight
 /// (only `sent` does, after the PD's send succeeded).
 #[kani::proof]
@@ -605,13 +614,32 @@ fn rp_forward_spends_its_own_meters_once() {
     let before = gate.clone();
     let now: u64 = kani::any();
     let ip: Ipv4 = kani::any();
-    let o = classify_any(&mut gate, &AnyRpMac::default(), &mut AnyRpCookie::default(), now, Endpoint { ip, port: kani::any() }, msg);
+    let src = Endpoint { ip, port: kani::any() };
+    let o = classify_any(&mut gate, &AnyRpMac::default(), &mut AnyRpCookie::default(), now, src, msg);
     match o {
-        RpOutcome::ForwardHello { .. } => {
+        RpOutcome::ForwardHello { cookied, .. } => {
             assert!(spec_level(&gate.hello_global, now) + RP_HELLO_GLOBAL_INTERVAL_NS == spec_level(&before.hello_global, now));
-            assert!(
-                spec_src_level(&gate.hello_src, ip, now) + RP_HELLO_SRC_INTERVAL_NS == spec_src_level(&before.hello_src, ip, now)
-            );
+            if cookied {
+                assert!(gate.hello_src == before.hello_src);
+                assert!(
+                    spec_src_level(&gate.hello_cookied_ep, src, now) + RP_HELLO_SRC_INTERVAL_NS
+                        == spec_src_level(&before.hello_cookied_ep, src, now)
+                );
+                assert!(
+                    spec_src_level(&gate.hello_cookied_ip, ip, now) + RP_HELLO_COOKIED_IP_INTERVAL_NS
+                        == spec_src_level(&before.hello_cookied_ip, ip, now)
+                );
+            } else {
+                assert!(gate.hello_cookied_ep == before.hello_cookied_ep && gate.hello_cookied_ip == before.hello_cookied_ip);
+                // The legacy probe: an uncookied forward within the window
+                // after a load re-arms load at once.
+                if before.under_load_until_ns != 0 && now < before.under_load_until_ns.saturating_add(RP_LEGACY_PROBE_NS) {
+                    assert!(gate.under_load_until_ns >= now.saturating_add(RP_UNDER_LOAD_AFTER_NS));
+                }
+                assert!(
+                    spec_src_level(&gate.hello_src, ip, now) + RP_HELLO_SRC_INTERVAL_NS == spec_src_level(&before.hello_src, ip, now)
+                );
+            }
             assert!(gate.conf_global == before.conf_global && gate.conf_src == before.conf_src);
         }
         RpOutcome::ForwardConf { .. } => {
@@ -624,7 +652,8 @@ fn rp_forward_spends_its_own_meters_once() {
         _ => {}
     }
     assert!(gate.in_flight == before.in_flight && gate.pq_dead == before.pq_dead);
-    kani::cover!(matches!(o, RpOutcome::ForwardHello { .. }));
+    kani::cover!(matches!(o, RpOutcome::ForwardHello { cookied: false, .. }));
+    kani::cover!(matches!(o, RpOutcome::ForwardHello { cookied: true, .. }));
     kani::cover!(matches!(o, RpOutcome::ForwardConf { .. }));
 }
 
@@ -642,8 +671,10 @@ fn rp_shares_stay_disjoint_and_bounded() {
     let payload: [u8; RP_INIT_HELLO_LEN] = kani::any();
     let hello: bool = kani::any();
     let kind = if hello { RpKind::Hello } else { RpKind::Conf };
-    let cap = if hello { RP_HELLO_IN_FLIGHT } else { RP_CONF_IN_FLIGHT };
-    let room = !gate.pq_dead && gate.in_flight.count(kind) < cap;
+    // An unmatched InitConf has only the share outside the awaited reserve;
+    // the reserve itself is `rp_only_a_matched_init_conf_takes_the_awaited_reserve`'s.
+    let open = if hello { RP_HELLO_IN_FLIGHT } else { RP_CONF_IN_FLIGHT - RP_CONF_AWAITED_RESERVED };
+    let room = !gate.pq_dead && gate.in_flight.count(kind) < open;
     let msg = if hello { &payload[..] } else { &payload[..RP_INIT_CONF_LEN] };
     let src = Endpoint { ip: kani::any(), port: kani::any() };
     let o = if kani::any() {
@@ -667,31 +698,56 @@ fn rp_shares_stay_disjoint_and_bounded() {
 }
 
 /// The completion protocol (I9a-I9c) against any FIFO, any snapshot and any
-/// sequence of up to three records of any shape: every reply goes to the
-/// stored source of the entry it was paired with, in FIFO order; no entry
-/// takes two records; a sync that did not die retired exactly the observed
-/// returns, each completed; and a dead path does nothing at all.
+/// sequence of records of any shape: every reply goes to the stored source
+/// of the entry it was paired with, in FIFO order; no entry takes two
+/// records; a sync that did not die retired exactly the observed returns,
+/// each completed; and a dead path does nothing at all.
+///
+/// Split in two to stay under the container's 40 GiB: two records with
+/// every send refused (pairing and order; `replied` never runs), and one
+/// record with any send result (the endpoint state fed by a sent reply).
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(20)]
 fn rp_sync_relays_only_to_stored_sources_in_order() {
+    let (o, n_sent) = check_sync(2, false);
+    kani::cover!(n_sent == 2 && matches!(o, SyncOutcome::Synced { .. }));
+}
+
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_sync_counts_only_sent_replies() {
+    let (o, _) = check_sync(1, true);
+    kani::cover!(matches!(o, SyncOutcome::Synced { relayed: 1 }));
+}
+
+/// The I9 assertions; returns the outcome and the number of sends.
+fn check_sync(records: u8, may_send: bool) -> (SyncOutcome, usize) {
     let mut gate = any_rp_gate();
     let before = gate.clone();
-    let mut pq = AnyPq { outstanding: kani::any(), left: kani::any(), sent: [None; 3], n_sent: 0, n_ok: 0 };
-    kani::assume(pq.left <= 3);
+    let mut pq = AnyPq { outstanding: kani::any(), left: records, produced: 0, sent: [None; 2], n_sent: 0, n_ok: 0, may_send };
     let o = sync_pq(&mut gate, &mut pq, 2, kani::any());
-    // Each reply went to the source of a distinct entry, oldest first.
-    let mut cursor = 0usize;
-    for dst in pq.sent.iter().take(pq.n_sent).flatten() {
-        let mut found = false;
-        while cursor < before.in_flight.len {
-            let e = before.in_flight.get(cursor);
-            cursor += 1;
-            if e.is_some_and(|e| e.src == *dst && e.state == EntryState::AwaitingRecord) {
-                found = true;
-                break;
+    // I9a: the reply to the j-th record went to the source of the j-th
+    // entry that was awaiting its record, in FIFO order. (Index loops: an
+    // iterator form of this check failed in cbmc although every one of its
+    // counterexamples passed on concrete playback.)
+    let mut k = 0usize;
+    while k < pq.n_sent.min(pq.sent.len()) {
+        let Some((dst, record)) = pq.sent[k] else { panic!("a send without its record") };
+        let mut awaiting = 0usize;
+        let mut paired = None;
+        let mut i = 0usize;
+        while i < before.in_flight.len {
+            if let Some(e) = before.in_flight.get(i).filter(|e| e.state == EntryState::AwaitingRecord) {
+                if awaiting == usize::from(record) {
+                    paired = Some(e.src);
+                    break;
+                }
+                awaiting += 1;
             }
+            i += 1;
         }
-        assert!(found);
+        assert!(paired == Some(dst));
+        k += 1;
     }
     match o {
         SyncOutcome::Dead => assert!(before.pq_dead && gate == before && pq.n_sent == 0),
@@ -702,19 +758,26 @@ fn rp_sync_relays_only_to_stored_sources_in_order() {
             assert!(gate.in_flight.len == before.in_flight.len - r);
         }
     }
-    kani::cover!(matches!(o, SyncOutcome::Synced { relayed: 2 }));
     kani::cover!(o == SyncOutcome::DiedNow);
+    (o, pq.n_sent)
 }
 
-/// A scripted `pq`: any snapshot, then `left` records, each a NoReply, a
-/// RespHello or an EmptyData for any index, or unreadable.
+/// A scripted `pq`: any snapshot, then up to `left` records, each a
+/// NoReply, a RespHello or an EmptyData for any index, or unreadable.
+/// `left` is concrete on every path and the early end nondeterministic, so
+/// cbmc unrolls the drain only `left` times, not to the unwind bound.
 struct AnyPq {
     outstanding: Option<usize>,
     left: u8,
-    sent: [Option<Endpoint>; 3],
+    /// Records handed out so far.
+    produced: u8,
+    /// Each send's destination and the record (0-based) it answered.
+    sent: [Option<(Endpoint, u8)>; 2],
     n_sent: usize,
     /// Sends that went out (`transmit` returned true).
     n_ok: usize,
+    /// Whether a send may go out at all.
+    may_send: bool,
 }
 
 impl PqSync for AnyPq {
@@ -726,7 +789,12 @@ impl PqSync for AnyPq {
         if self.left == 0 {
             return None;
         }
+        // Decremented on both branches, so `left` stays concrete.
         self.left -= 1;
+        if kani::any() {
+            return None;
+        }
+        self.produced += 1;
         let index: u8 = kani::any();
         let r = match kani::any::<u8>() % 4 {
             0 => msgs::RpReply::NoReply,
@@ -739,10 +807,10 @@ impl PqSync for AnyPq {
 
     fn transmit(&mut self, dst: Endpoint, _reply: &[u8]) -> bool {
         if let Some(s) = self.sent.get_mut(self.n_sent) {
-            *s = Some(dst);
+            *s = Some((dst, self.produced - 1));
         }
         self.n_sent += 1;
-        let ok: bool = kani::any();
+        let ok = self.may_send && kani::any::<bool>();
         self.n_ok += usize::from(ok);
         ok
     }
@@ -779,6 +847,11 @@ fn rp_cookie_lane_spends_nothing_and_is_never_asked_off_load() {
         assert!(gate.hello_cookied_ip == before.hello_cookied_ip && gate.hello_global == before.hello_global);
         assert!(gate.conf_src == before.conf_src && gate.conf_global == before.conf_global);
         assert!(gate.in_flight == before.in_flight && gate.awaited == before.awaited && gate.proven == before.proven);
+        // Only the below-half trigger can move the deadline here: an
+        // uncookied InitHello under load is not one (VE13).
+        if !spec_below_half(&before.hello_global, now) {
+            assert!(gate.under_load_until_ns == before.under_load_until_ns);
+        }
     }
     kani::cover!(matches!(o, RpOutcome::CookieReply { .. }));
     kani::cover!(matches!(o, RpOutcome::ForwardHello { .. }) && cookie.valid_calls.get() == 1);

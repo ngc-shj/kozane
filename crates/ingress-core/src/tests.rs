@@ -1100,7 +1100,11 @@ fn unmatched_confs_stop_at_the_awaited_reserve_of_the_global_meter() {
     for i in 0..open as u8 {
         assert!(forwarded(rp_drained(&mut g, 0, src(i), &c)), "source {i}");
     }
+    // The last unmatched forward above found RESERVED + 1 tokens; this one
+    // finds RESERVED and is refused without spending.
+    assert_eq!(g.conf_global.tokens(0), RP_CONF_AWAITED_RESERVED as u64);
     assert_eq!(rp_drained(&mut g, 0, src(100), &c), RpOutcome::RateLimited, "the reserve");
+    assert_eq!(g.conf_global.tokens(0), RP_CONF_AWAITED_RESERVED as u64);
     assert!(forwarded(rp_drained(&mut g, RP_CONF_GLOBAL_INTERVAL_NS, src(101), &c)));
 }
 
@@ -1148,12 +1152,66 @@ fn under_load_an_init_hello_without_a_valid_cookie_spends_nothing() {
         assert_eq!(o, RpOutcome::CookieReply { dst: src(i) });
     }
     assert_eq!(cookie.seals, 50);
-    // Only the load deadline moved: no meter, nothing in flight.
-    let mut after = g.clone();
-    after.under_load_until_ns = before.under_load_until_ns;
-    assert_eq!(after, before);
+    // No meter, nothing in flight, and the load deadline unmoved.
+    assert_eq!(g, before);
     // The allow side: a valid cookie is forwarded.
     assert!(forwarded(rp_cookied(&mut g, 1, src(9), &hello_with_cookie())));
+}
+
+#[test]
+fn an_old_clients_uncookied_retransmits_do_not_hold_the_gate() {
+    let mut g = loaded();
+    let mut cookie = FakeCookie::invalid();
+    let m = hello();
+    let last = RP_UNDER_LOAD_AFTER_NS - 1;
+    assert!(matches!(rp_with(&mut g, &mut cookie, last, TX_FREE, SRC, &m), RpOutcome::CookieReply { .. }));
+    let o = rp_with(&mut g, &mut cookie, RP_UNDER_LOAD_AFTER_NS, TX_FREE, SRC, &m);
+    assert!(forwarded(o), "load did not clear: {o:?}");
+}
+
+#[test]
+fn a_spoofer_at_the_source_rate_gets_one_init_hello_to_pq_per_clearance() {
+    // Load engaged at 0; one uncookied InitHello per 20 s for 10 minutes.
+    let mut g = loaded();
+    let m = hello();
+    let span = 600_000_000_000;
+    let mut forwards = Vec::new();
+    let mut at = RP_HELLO_SRC_INTERVAL_NS;
+    while at <= span {
+        if forwarded(rp(&mut g, at, SRC, &m)) {
+            forwards.push(at);
+        }
+        at += RP_HELLO_SRC_INTERVAL_NS;
+    }
+    // Without the probe re-arming load, every spoof from 60 s on would be
+    // forwarded (one per source period).
+    assert!(forwards.len() as u64 <= span / RP_UNDER_LOAD_AFTER_NS, "{forwards:?}");
+    assert!(forwards.windows(2).all(|w| w[1] - w[0] >= RP_UNDER_LOAD_AFTER_NS), "{forwards:?}");
+    // The allow side: each clearance still lets one through (VE13).
+    assert!(!forwards.is_empty());
+}
+
+#[test]
+fn before_any_load_an_uncookied_forward_does_not_arm_the_gate() {
+    let mut g = armed();
+    assert!(forwarded(rp(&mut g, 1, SRC, &hello())));
+    assert!(!g.take_load_entered());
+}
+
+#[test]
+fn an_uncookied_forward_past_the_probe_window_does_not_rearm_the_gate() {
+    let mut g = loaded();
+    let past = RP_UNDER_LOAD_AFTER_NS + RP_LEGACY_PROBE_NS;
+    assert!(g.take_load_entered());
+    g.tick_if_due(&mut FakeCookie::invalid(), past);
+    assert!(forwarded(rp(&mut g, past, SRC, &hello())));
+    assert!(!g.take_load_entered(), "re-armed past the window");
+    // One ns earlier it would have.
+    let mut g = loaded();
+    g.take_load_entered();
+    g.tick_if_due(&mut FakeCookie::invalid(), past - 1);
+    assert!(forwarded(rp(&mut g, past - 1, SRC, &hello())));
+    assert!(g.take_load_entered(), "the probe did not re-arm");
 }
 
 #[test]
@@ -1319,6 +1377,24 @@ fn a_replayed_init_conf_from_a_spoofed_endpoint_proves_nobody() {
     let mut g = loaded();
     let e = Endpoint { ip: [203, 0, 113, 5], port: 7000 };
     let x = Endpoint { ip: [198, 18, 0, 1], port: 666 };
+    // While E's own EmptyData is still owed, its awaited entry is live and
+    // seen: only the endpoint check keeps X's EmptyData from claiming it.
+    let mut resp = std::vec![0x82u8; RP_RESP_HELLO_LEN];
+    resp[4..8].copy_from_slice(&[9; 4]);
+    resp[8..12].copy_from_slice(&[1; 4]);
+    g.replied(RpKind::Hello, e, None, &resp, 1);
+    let mut c = conf();
+    c[4..8].copy_from_slice(&[1; 4]);
+    c[8..12].copy_from_slice(&[9; 4]);
+    assert!(forwarded(rp(&mut g, 1, e, &c)));
+    let mut owed = std::vec![0x84u8; RP_EMPTY_DATA_LEN];
+    owed[4..8].copy_from_slice(&[1; 4]);
+    g.replied(RpKind::Conf, x, Some(1), &owed, 2);
+    assert!(g.proven_slot(x, 2).is_none(), "X claimed E's awaited entry");
+    g.replied(RpKind::Conf, e, Some(1), &owed, 2);
+    assert!(g.proven_slot(e, 2).is_some(), "E's own EmptyData no longer proves it");
+    // After E is proven, a cache replay to X proves nobody either.
+    let mut g = loaded();
     prove(&mut g, e, 0, 1);
     // `pq`'s cache answers the replay from X with the same EmptyData.
     let mut empty = std::vec![0x84u8; RP_EMPTY_DATA_LEN];
