@@ -25,8 +25,9 @@ owner = "M4"
 status = "open"
 
 # Rosenpass cookie gate under load, its flood and latency cases, and the
-# guest-RAM OSK residue scan.
+# guest-RAM OSK residue scan. Closed by M3b: C6 and C7 pass in the solo
+# make check at 8c2ab7e (deviation log, secureos-m3b-cookie-gate).
 [[waivers]]
 id = "SC26"
 owner = "M3b"
-status = "open"
+status = "closed"

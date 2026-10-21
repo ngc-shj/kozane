@@ -242,10 +242,11 @@ Each new or changed harness was run alone first (`cargo kani --harness
     engaged. The spoof case adds `RP_HELLO_IN_FLIGHT` for spoofs already
     forwarded when load engaged.
 - **Residual risks (R6 / SC26):**
-  - **Legacy clients are serialised.** Once a load has happened, every
-    0.2.3 client's InitHello within the window re-arms load. Several
-    0.2.3 clients therefore get about one exchange per 60 s between them
-    until the window lapses with none arriving. Master clients are
+  - **Legacy clients are serialised.** While 0.2.3 clients keep sending
+    within each clearance's probe window, each window's first InitHello
+    re-arms load, so between them they get about one exchange per 60 s.
+    A window that lapses with none arriving returns the gate to plain
+    off-load. Master clients are
     unaffected (cookie lane).
   - **The probe cadence.** A spoofer that pauses for longer than the
     window after a clearance finds the gate fully off. That is the same as

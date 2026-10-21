@@ -724,9 +724,11 @@ pub const RP_MAX_PEERS: usize = 8;
 /// An uncookied InitHello under load is not a trigger (rosenpass 0.2.3
 /// would never get through), so load clears under a sustained spoof; the
 /// first uncookied InitHello forwarded within RP_LEGACY_PROBE_NS after that
-/// is the one legacy probe, and it re-arms load at once. A spoofer, at any
-/// rate, so gets at most one uncookied InitHello to `pq` per clearance:
-/// one per RP_UNDER_LOAD_AFTER_NS.
+/// is the one legacy probe, and it re-arms load at once. While a spoofer
+/// keeps sending within each clearance's probe window, it so gets at most
+/// one uncookied InitHello to `pq` per clearance: one per
+/// RP_UNDER_LOAD_AFTER_NS. A window that lapses with nothing forwarded
+/// ends the cycle: the gate is off until a trigger engages it again.
 pub const RP_UNDER_LOAD_AFTER_NS: u64 = 60_000_000_000;
 /// After load clears, how long the next uncookied forward re-arms it (the
 /// integration suite reads this literal).
