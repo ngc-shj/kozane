@@ -53,3 +53,22 @@ and never writes the cookie field, so on the wire that field carries bytes 48..6
 of whatever the buffer held before (the previous RespHello in a long-running
 responder). The driver hands the responder a zeroed buffer for that message, so
 the captured EmptyData has the all-zero cookie the secureos responder sends.
+
+The McEliece vectors for `crates/mce460896` (M4 plan C8) are two more modes.
+Neither touches the files above.
+
+- `--mce` writes `crates/mce460896/tests/vectors/liboqs.txt`, from liboqs
+  0.8's round-3 mceliece460896, the code the peers run. For each of three
+  keys it records:
+  - the SplitMix64 keygen seed;
+  - SHA3-256 of the public key;
+  - the secret key in liboqs's layout;
+  - one encapsulation;
+  - decapsulations in four classes: valid, C0 corrupt, C1 corrupt, both.
+- `--cmr` writes `crates/mce460896/tests/vectors/cmr-2.0.2.txt`, the same
+  shape from classic-mceliece-rust 2.0.2 (the blob's layout). This is the
+  frozen bridge: the mode and its cmr dependency are deleted in M4 C11, and
+  the file is never regenerated.
+
+    docker run --rm -v "$PWD":/work -w /work/tools/rp-vectors secureos-rp-oracle \
+        sh -c 'cargo +1.93.1 run --locked --release -- /work --mce'

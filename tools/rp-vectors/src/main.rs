@@ -212,8 +212,161 @@ fn cookie_vectors(vec_dir: &Path, seed_dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// McEliece vectors for crates/mce460896 (M4 plan C8): liboqs 0.8's round-3
+/// mceliece460896, the code the 0.2.3 and master clients run, driven by the
+/// SplitMix64 stream. Per key: the keygen seed, SHA3-256 of the public key
+/// (524160 bytes), the secret key in liboqs's layout, one encapsulation and
+/// decapsulations in four classes (valid, C0 corrupt, C1 corrupt, both).
+const MCE_KEYS: u64 = 3;
+const MCE_PK: usize = 524_160;
+const MCE_SK_OQS: usize = 13_568;
+const MCE_CT: usize = 188;
+const MCE_C0: usize = 156;
+
+fn sha3_256(b: &[u8]) -> [u8; 32] {
+    use sha3::Digest;
+    sha3::Sha3_256::digest(b).into()
+}
+
+fn mce_classes(ct: &[u8; MCE_CT]) -> [(&'static str, [u8; MCE_CT]); 4] {
+    let flip = |mut c: [u8; MCE_CT], at: usize| {
+        c[at] ^= 0x01;
+        c
+    };
+    [
+        ("valid", *ct),
+        ("c0", flip(*ct, 7)),
+        ("c1", flip(*ct, MCE_C0 + 5)),
+        ("both", flip(flip(*ct, 7), MCE_C0 + 5)),
+    ]
+}
+
+fn write_vectors(path: &Path, header: &[&str], out: &Out) -> anyhow::Result<()> {
+    let mut text = String::new();
+    for h in header {
+        writeln!(text, "# {h}")?;
+    }
+    for (k, v) in &out.0 {
+        let hex: String = v.iter().map(|b| format!("{b:02x}")).collect();
+        writeln!(text, "{k} {hex}")?;
+    }
+    std::fs::create_dir_all(path.parent().context("vector path has a parent")?)?;
+    std::fs::write(path, text)?;
+    println!("rp-vectors: wrote {} vectors to {}", out.0.len(), path.display());
+    Ok(())
+}
+
+fn mce_vectors(repo: &Path) -> anyhow::Result<()> {
+    use oqs_sys::kem::{
+        OQS_KEM_classic_mceliece_460896_decaps as decaps, OQS_KEM_classic_mceliece_460896_encaps as encaps,
+        OQS_KEM_classic_mceliece_460896_keypair as keypair, OQS_STATUS::OQS_SUCCESS,
+    };
+    let mut out = Out(BTreeMap::new());
+    for i in 0..MCE_KEYS {
+        let kp_seed = 0x5eed_0000_6d63_0000 + i;
+        let (mut pk, mut sk) = (vec![0u8; MCE_PK], vec![0u8; MCE_SK_OQS]);
+        with_stream(kp_seed, || assert_eq!(unsafe { keypair(pk.as_mut_ptr(), sk.as_mut_ptr()) }, OQS_SUCCESS));
+        let enc_seed = 0x5eed_0000_6563_0000 + i;
+        let (mut ct, mut ss) = ([0u8; MCE_CT], [0u8; 32]);
+        with_stream(enc_seed, || {
+            assert_eq!(unsafe { encaps(ct.as_mut_ptr(), ss.as_mut_ptr(), pk.as_ptr()) }, OQS_SUCCESS)
+        });
+        out.put(&format!("mce.{i}.kp_seed"), &kp_seed.to_le_bytes())?;
+        out.put(&format!("mce.{i}.pk_sha3"), &sha3_256(&pk))?;
+        out.put(&format!("mce.{i}.sk_oqs"), &sk)?;
+        out.put(&format!("mce.{i}.enc_seed"), &enc_seed.to_le_bytes())?;
+        out.put(&format!("mce.{i}.ct"), &ct)?;
+        out.put(&format!("mce.{i}.ss"), &ss)?;
+        for (class, c) in mce_classes(&ct) {
+            let mut k = [0u8; 32];
+            assert_eq!(unsafe { decaps(k.as_mut_ptr(), c.as_ptr(), sk.as_ptr()) }, OQS_SUCCESS);
+            out.put(&format!("mce.{i}.dec.{class}.ct"), &c)?;
+            out.put(&format!("mce.{i}.dec.{class}.ss"), &k)?;
+        }
+    }
+    write_vectors(
+        &repo.join("crates/mce460896/tests/vectors/liboqs.txt"),
+        &[
+            "Classic McEliece 460896 round 3 vectors for crates/mce460896 (M4 plan C8).",
+            "oracle: liboqs via oqs-sys 0.8.0 (the peers' code), SplitMix64 randombytes",
+            "pk_sha3: SHA3-256 of the public key; sk_oqs: liboqs's secret-key layout",
+            "dec classes: valid; c0 = byte 7 flipped; c1 = byte 161 flipped; both",
+            "regenerate: tools/rp-vectors/README.md, with --mce",
+        ],
+        &out,
+    )
+}
+
+/// The cmr bridge (M4 plan C8, slice M0): the same keys and ciphertexts as
+/// cmr 2.0.2 makes them, frozen before cmr leaves the tree, so the port is
+/// shown to decapsulate cmr-era keys (the dev secrets blob) identically.
+fn cmr_vectors(repo: &Path) -> anyhow::Result<()> {
+    use classic_mceliece_rust as cmr;
+    struct Stream(SplitMix);
+    impl rand_core::RngCore for Stream {
+        fn next_u32(&mut self) -> u32 {
+            u32::from_le_bytes(std::array::from_fn(|_| self.0.byte()))
+        }
+        fn next_u64(&mut self) -> u64 {
+            u64::from_le_bytes(std::array::from_fn(|_| self.0.byte()))
+        }
+        fn fill_bytes(&mut self, dest: &mut [u8]) {
+            dest.iter_mut().for_each(|b| *b = self.0.byte());
+        }
+        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+            self.fill_bytes(dest);
+            Ok(())
+        }
+    }
+    impl rand_core::CryptoRng for Stream {}
+
+    let mut out = Out(BTreeMap::new());
+    for i in 0..MCE_KEYS {
+        let kp_seed = 0x5eed_0000_636d_0000 + i;
+        let mut pk_buf = vec![0u8; cmr::CRYPTO_PUBLICKEYBYTES];
+        let mut sk_buf = vec![0u8; cmr::CRYPTO_SECRETKEYBYTES];
+        let pk_arr: &mut [u8; cmr::CRYPTO_PUBLICKEYBYTES] = pk_buf.as_mut_slice().try_into()?;
+        let sk_arr: &mut [u8; cmr::CRYPTO_SECRETKEYBYTES] = sk_buf.as_mut_slice().try_into()?;
+        let (pk, sk) = cmr::keypair(pk_arr, sk_arr, &mut Stream(SplitMix::new(kp_seed)));
+        let enc_seed = 0x5eed_0000_6365_0000 + i;
+        let mut ss_buf = [0u8; cmr::CRYPTO_BYTES];
+        let (ct, ss) = cmr::encapsulate(&pk, &mut ss_buf, &mut Stream(SplitMix::new(enc_seed)));
+        let ct: [u8; MCE_CT] = *ct.as_array();
+        out.put(&format!("cmr.{i}.kp_seed"), &kp_seed.to_le_bytes())?;
+        out.put(&format!("cmr.{i}.pk_sha3"), &sha3_256(pk.as_array()))?;
+        out.put(&format!("cmr.{i}.sk"), sk.as_array())?;
+        out.put(&format!("cmr.{i}.enc_seed"), &enc_seed.to_le_bytes())?;
+        out.put(&format!("cmr.{i}.ct"), &ct)?;
+        out.put(&format!("cmr.{i}.ss"), ss.as_array())?;
+        drop(ss);
+        for (class, c) in mce_classes(&ct) {
+            let mut k = [0u8; cmr::CRYPTO_BYTES];
+            let ss = cmr::decapsulate(&cmr::Ciphertext::from(c), &sk, &mut k);
+            out.put(&format!("cmr.{i}.dec.{class}.ct"), &c)?;
+            out.put(&format!("cmr.{i}.dec.{class}.ss"), ss.as_array())?;
+        }
+    }
+    write_vectors(
+        &repo.join("crates/mce460896/tests/vectors/cmr-2.0.2.txt"),
+        &[
+            "cmr bridge vectors for crates/mce460896 (M4 plan C8, slice M0): FROZEN.",
+            "producer: classic-mceliece-rust 2.0.2 (mceliece460896), SplitMix64 stream,",
+            "via tools/rp-vectors --cmr at the commit that adds this file. The mode and",
+            "its cmr dependency are deleted in C11; this file is never regenerated.",
+            "sk: cmr's layout (the blob's); dec classes as in liboqs.txt",
+        ],
+        &out,
+    )
+}
+
 fn main() -> anyhow::Result<()> {
-    let repo: PathBuf = std::env::args().nth(1).context("usage: rp-vectors <secureos repo root> [--cookie]")?.into();
+    let repo: PathBuf =
+        std::env::args().nth(1).context("usage: rp-vectors <secureos repo root> [--cookie|--mce|--cmr]")?.into();
+    match std::env::args().nth(2).as_deref() {
+        Some("--mce") => return mce_vectors(&repo),
+        Some("--cmr") => return cmr_vectors(&repo),
+        _ => {}
+    }
     let vec_dir = repo.join("crates/rosenpass-core/tests/vectors");
     let seed_dir = repo.join("crates/rosenpass-wire/src/__fuzz__/tests__parsers_never_panic_and_round_trip/corpus");
     ensure!(vec_dir.is_dir() && seed_dir.is_dir(), "run from a secureos checkout: {repo:?}");
