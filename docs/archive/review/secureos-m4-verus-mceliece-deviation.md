@@ -417,3 +417,56 @@ differs per build. The C10 normaliser must mask that hash.
     with `#[allow(clippy::collapsible_if)]`.
 - **The `.text` record** for V4 is taken together with V3, after the wire
   slice.
+
+## V3 — wire (C5), and the `.text` record for V3 + V4
+
+### Result
+
+- **Verus:** `VERUS-WIRE 82`, `VERUS-ENSURES-WIRE 53`, with no trusted
+  construct.
+- **Other checks:** Kani wire 5/5, bolero wire, 32 unit tests and
+  `clippy -D warnings` all pass.
+- **Selftest:** `verus-wire-ipv4` (the TTL ≤ 1 refusal removed) is red.
+  Needle: `r is Ok <==> (ipv4_header_ok(packet@) && packet@[8] > 1`.
+- **Proved, for any frame up to the MTU:**
+  - `parse_frame`, `parse_frame_ip` and `parse_ipv4_packet` accept exactly
+    their predicates: version 4, no options, no fragments, a checksum that
+    folds to 0, a valid source, and `IPV4_HDR <= total_len <= len`.
+  - `forward_ipv4` refuses TTL ≤ 1, and its output is the specified
+    decremented packet with a recomputed checksum.
+  - `emit` produces the specified bytes for each body, including the UDP
+    pseudo-header checksum with RFC 768's 0 → 0xffff.
+  - The Internet checksum equals its spec. A number-theory proof shows
+    that embedding it validates.
+
+### Deviations
+
+- **`check_into` and `check_ip_into` are not Verus-checked.** Both are
+  `#[cfg(any(test, kani))]` test helpers that ship in no PD. Verus's pass
+  does not compile them, so an `ensures` on them would never be checked.
+  With `verus_keep_ghost` forced on, their internal `assert!`/`panic!`
+  needed runtime `PartialEq` on `Option<Result<Frame, _>>` related to spec
+  equality, which did not close. The helpers are unchanged, and unit and
+  bolero tests exercise them. The plan's C5 entry-point list is narrowed to
+  the five that ship.
+- **Refactors (behaviour unchanged; tests.rs and proofs.rs unedited):**
+  - `csum_add`/`csum_fold` use a `read_array` loop and two unrolled folds,
+    which are always sufficient for a `u32`.
+  - `Writer` is replaced by fixed-offset `write_at`.
+  - The `drop_reasons!` macro is a hand-written enum, with `ALL` kept
+    outside `verus!`.
+  - Three constants are now `pub`.
+  - `emit`'s `Body::Ipv4` precondition compares field by field.
+  - A few `saturating_*` replace `+`/`-` for `arithmetic_side_effects`.
+- **The `.text` record for V3 + V4**, normalised and sorted, against
+  `851dbdd`:
+  - **Unchanged:** audit, timer and key (ring's index code inlines as
+    before).
+  - **Changed** (the users of wire's parsers and checksum):
+    - inner: 7022→7238
+    - ingress: 22881→23104
+    - data: 10613→10730
+  - **Layout-level only:** eth-in, eth-out, hs, pq and pqkey differ by
+    9–18 lines.
+  - **Panic paths:** no PD gained a `core::panicking`/`slice::index` call
+    site; ingress went from 163 to 161.

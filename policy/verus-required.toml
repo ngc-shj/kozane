@@ -51,3 +51,13 @@ functions = [
     "slot", "ring_len", "accept", "give", "first_mine", "mine_count",
     "begin_take", "end_release",
 ]
+
+[crates.wire]
+functions = [
+    # C5: the entry points that ship (check_into/check_ip_into are
+    # cfg(test, kani) helpers; deviation log, V3).
+    "parse_frame", "parse_frame_ip", "parse_ipv4_packet", "forward_ipv4", "emit",
+    # The Internet checksum against its spec, and its embedding.
+    "csum_add", "csum_fold", "lemma_checksum_embed", "lemma_fold_embeds_to_0xffff",
+    "lemma_spec_emit_arp_parses", "lemma_spec_emit_ip_udp_parses",
+]

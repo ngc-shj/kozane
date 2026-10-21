@@ -90,7 +90,7 @@ CASES_FOR_GATE = {
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
     "verus": {"verus-cache", "verus-trusted", "verus-required", "verus-wg-wire-window",
               "verus-wg-wire-roundtrip", "verus-rp-wire-roundtrip",
-              "verus-msgs-exact", "verus-ring-mask"},
+              "verus-msgs-exact", "verus-ring-mask", "verus-wire-ipv4"},
     "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire"},
     "laws": {"laws", "laws-timer-ingress", "laws-pq-key", "laws-hs-pqkey", "laws-pq-secrets-writable"},
     "test": {"integration", "integration-count", "integration-residue", "integration-cookie",
@@ -191,6 +191,11 @@ CASES = {
                         lambda t: edit(t, "crates/ring/src/lib.rs",
                                        "let mask: u32 = (N as u32).wrapping_sub(1);", "let mask: u32 = N as u32;"),
                         "r == (idx & ((N - 1) as u32)) as usize"),
+    # C5: a packet with TTL 1 forwarded.
+    "verus-wire-ipv4": (["verus", "verus_crates=wire"],
+                        lambda t: edit(t, "crates/wire/src/lib.rs",
+                                       "    if ttl <= 1 {\n        return Err(DropReason::TtlExpired);\n    }\n", ""),
+                        "r is Ok <==> (ipv4_header_ok(packet@) && packet@[8] > 1"),
     # An unlisted trusted construct, in the cfg_attr spelling the scanner
     # must still see.
     "verus-trusted": (["verus", "verus_crates=wg-wire"],
