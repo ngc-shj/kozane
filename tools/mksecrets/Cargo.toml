@@ -6,10 +6,9 @@ license.workspace = true
 
 [dependencies]
 secret-blob = { path = "../../crates/secret-blob" }
-classic-mceliece-rust = { version = "=2.0.2", default-features = false, features = ["mceliece460896", "zeroize"] }
 libc = "=0.2.191"
 libcrux-curve25519 = { version = "=0.0.9", default-features = false }
-rand_core = { version = "=0.6.4", default-features = false }
+mce460896 = { path = "../../crates/mce460896" }
 serde = { version = "=1.0.229", features = ["derive"] }
 toml = "=0.9.8"
 

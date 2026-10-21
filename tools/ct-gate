@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+# The dynamic constant-time gate and residue scan (M4 plan C9), run by
+# `make ct`: the same harness binary in CT mode under memcheck, then in
+# residue mode natively, both judged by the harness's own verdict modes.
+# Only when both pass does it write the pass record and the counts.
+#
+#   tools/ct-gate <harness> [<valgrind>] [<residue wrapper>]
+#
+# <valgrind> (default `valgrind`) and <residue wrapper> (default none) are
+# the Makefile's ct_valgrind and ct_residue_wrap; check-selftest's scratch
+# Makefile changes them to run CT mode without valgrind and residue mode
+# under it. Memcheck always runs with no suppressions.
+set -euo pipefail
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+harness=$(realpath "${1:?usage: tools/ct-gate <harness> [<valgrind>] [<residue wrapper>]}")
+valgrind=${2-valgrind}
+wrap=${3-}
+policy=$root/policy/ct-declassify.toml
+out=$root/build/ct
+counts=$root/build/counts
+
+mkdir -p "$out" "$counts"
+rm -f "$out"/pass-* "$counts/ct" "$out"/memcheck.log "$out"/ct.out "$out"/residue.out
+cd "$out"
+
+fail() {
+	echo "ct-gate: $*"
+	exit 1
+}
+
+# CT mode. Memcheck's exit status is 97 whenever it saw an error, so the
+# verdict also requires the harness's CT-DONE line and the canary alone.
+status=0
+if [ -n "$valgrind" ]; then
+	"$valgrind" --tool=memcheck --error-exitcode=97 --log-file=memcheck.log \
+		"$harness" --policy "$policy" > ct.out 2> ct.err || status=$?
+else
+	"$harness" --policy "$policy" > ct.out 2> ct.err || status=$?
+	: > memcheck.log
+fi
+if [ "$status" -eq 3 ]; then
+	cat ct.out
+	fail "CT mode exited 3: the harness was not running under valgrind"
+fi
+"$harness" --verdict-ct "$status" memcheck.log ct.out "$policy" > ct.verdict || {
+	cat ct.out ct.err ct.verdict
+	fail "CT mode failed (memcheck log: build/ct/memcheck.log)"
+}
+
+# Residue mode, natively.
+status=0
+# shellcheck disable=SC2086 # the wrapper is a command line, split on purpose
+$wrap "$harness" --residue > residue.out 2> residue.err || status=$?
+if [ "$status" -eq 4 ]; then
+	cat residue.out
+	fail "residue mode exited 4: it was run under valgrind"
+fi
+"$harness" --verdict-residue "$status" residue.out > residue.verdict || {
+	grep -v '^RESIDUE-DEPTH ' residue.out || true
+	cat residue.err residue.verdict
+	fail "residue mode failed"
+}
+
+cat ct.verdict residue.verdict
+key=$(python3 "$root/tools/ct_record.py" key --root "$root" --harness "$harness" --valgrind "${valgrind:-valgrind}")
+{
+	grep -E '^(CT-CASES|CT-MARKED-BYTES|CT-DECLASSIFY) ' ct.out
+	grep -E '^RESIDUE-CASES ' residue.out
+} > counts.tmp
+[ "$(wc -l < counts.tmp)" -eq 4 ] || fail "expected four count lines, got: $(cat counts.tmp)"
+cp counts.tmp "$counts/ct"
+mv counts.tmp "pass-$key"
+echo "ct-gate: pass, record build/ct/pass-$key"
+cat "$counts/ct"

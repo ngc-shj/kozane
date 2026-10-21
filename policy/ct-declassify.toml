@@ -1,0 +1,27 @@
+# M4 plan C9: the only places tools/ct-harness may declassify a value that
+# memcheck tracks as secret. `make ct` requires the sites the harness used
+# to equal this list exactly; the harness refuses any other id, and any
+# buffer that is not exactly the site's width.
+#
+# kind = "predicate": a 1-byte public bit (0 or 1).
+# kind = "output": a whole KEM output buffer at the harness boundary,
+#   declassified only to compare it with its expected value (CT_LEN 188,
+#   SS_LEN 32).
+
+[[site]]
+id = "encaps-accept"
+kind = "predicate"
+width = 1
+why = "encaps_attempt's returned accept bit, the one datum C7 lets leave as public"
+
+[[site]]
+id = "ct-out"
+kind = "output"
+width = 188
+why = "encaps_attempt's ciphertext, before the vector compare"
+
+[[site]]
+id = "ss-out"
+kind = "output"
+width = 32
+why = "the shared secret of decaps and encaps_attempt, before the vector compare"

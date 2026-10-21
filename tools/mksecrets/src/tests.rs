@@ -43,10 +43,9 @@ fn checked(d: &Deployment) -> validate::Checked {
 }
 
 fn decapsulate(sk: &[u8; pq::SK_LEN], ct: &[u8; pq::CT_LEN]) -> [u8; 32] {
-    let mut copy = Box::new(*sk);
     let mut shk = [0u8; 32];
-    let key = cmr::SecretKey::from(&mut *copy);
-    *cmr::decapsulate(&cmr::Ciphertext::from(*ct), &key, &mut shk).as_array()
+    mce460896::decaps(sk, ct, &mut shk);
+    shk
 }
 
 #[test]
@@ -72,7 +71,8 @@ fn pqkey_blob_binds_the_configured_gateway_key_and_its_kat_decapsulates() {
     assert_eq!(*blob.spkm_hash(), checked.gateway_rp.hash);
     assert_eq!(checked.gateway_rp.hash, secret_blob::blake2s(&[&d.gateway_rp_public[..]]));
     // The KAT was encapsulated to the configured key and the stored secret
-    // key survived keygen (cmr zeroizes what it wraps).
+    // key survived keygen (mce460896 writes into caller buffers and zeroes
+    // nothing on its own; the copy mksecrets keeps is the only one taken).
     assert!(blob.secret_key().iter().any(|b| *b != 0));
     let shk = decapsulate(blob.secret_key(), blob.kat_ct());
     assert_eq!(secret_blob::blake2s(&[&shk]), *blob.kat_shk_hash());
@@ -86,11 +86,12 @@ fn client_mceliece_key_is_exported_in_the_liboqs_layout() {
     let mut rng = Urandom::open().unwrap();
     for (bundle, peer) in d.peers.iter().zip(&checked.peers) {
         assert_eq!(peer.rp.hash, secret_blob::blake2s(&[&bundle.rp_public[..]]));
-        let mut shk = [0u8; 32];
-        let (ct, shared) = cmr::encapsulate(&cmr::PublicKey::from(&*bundle.rp_public), &mut shk, &mut rng);
-        let mut cmr_sk = Box::new([0u8; pq::SK_LEN]);
-        pq::cmr_sk_from_liboqs(&mut cmr_sk, &bundle.rp_secret);
-        assert_eq!(decapsulate(&cmr_sk, ct.as_array()), *shared.as_array());
+        let mut ct = [0u8; pq::CT_LEN];
+        let mut shared = [0u8; 32];
+        mce460896::encaps(&bundle.rp_public, &mut |out| rng.fill(out), &mut ct, &mut shared).unwrap();
+        let mut sk = Box::new([0u8; pq::SK_LEN]);
+        pq::cmr_sk_from_liboqs(&mut sk, &bundle.rp_secret);
+        assert_eq!(decapsulate(&sk, &ct), shared);
     }
 }
 

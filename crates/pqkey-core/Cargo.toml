@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-classic-mceliece-rust = { version = "=2.0.2", default-features = false, features = ["mceliece460896", "zeroize"] }
 ingress-core = { path = "../ingress-core" }
+mce460896 = { path = "../mce460896" }
 secret-blob = { path = "../secret-blob" }
 zeroize = { version = "=1.8.1", default-features = false }

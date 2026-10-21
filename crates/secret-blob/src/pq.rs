@@ -4,7 +4,7 @@
 //!
 //! Layout, version 1 (little-endian), at the offsets named below:
 //!   magic[8] = "SOSPQKY1" | version u32 = 1
-//!   secret_key[13608]      cmr layout (classic-mceliece-rust 2.0.2)
+//!   secret_key[13608]      round-3 spec layout (`mce460896`'s; classic-mceliece-rust 2.0.2's too)
 //!   spkm_hash[32]          BLAKE2s-256(gateway McEliece public key)
 //!   kat_ct[188]            a ciphertext encapsulated to that public key
 //!   kat_shk_hash[32]       BLAKE2s-256(its shared key)
@@ -28,11 +28,12 @@ pub const SHK_LEN: usize = 32;
 /// The secret key as liboqs 0.8 (upstream rosenpass's `pqsk`) stores it.
 pub const LIBOQS_SK_LEN: usize = 13_568;
 
-/// cmr's leading bytes, which liboqs omits and decapsulation never reads.
+/// The round-3 spec layout's leading bytes, which liboqs omits and
+/// decapsulation never reads.
 const CMR_PREFIX_LEN: usize = SK_LEN - LIBOQS_SK_LEN;
-/// The trailing part of a cmr key, which liboqs stores first:
-/// `cmr = [0; 40] ‖ oqs[576..] ‖ oqs[..576]` (verified both ways against
-/// liboqs in the feasibility study).
+/// The trailing part of a round-3 spec layout key, which liboqs stores
+/// first: `cmr = [0; 40] ‖ oqs[576..] ‖ oqs[..576]` (verified both ways
+/// against liboqs in the feasibility study).
 const MOVED_LEN: usize = 576;
 
 pub const SK_OFFSET: usize = 8 + 4;
@@ -67,8 +68,8 @@ impl<'a> Blob<'a> {
         Ok(Self { bytes })
     }
 
-    /// The McEliece secret key, cmr layout. Callers copy it per use: cmr
-    /// zeroizes the buffer it wraps on drop.
+    /// The McEliece secret key, round-3 spec layout. Callers copy it per
+    /// use and zeroize their copy themselves: this borrow is read-only.
     pub fn secret_key(&self) -> &[u8; SK_LEN] {
         field::<SK_LEN>(self.bytes, SK_OFFSET).unwrap_or(&[0; SK_LEN])
     }
@@ -114,7 +115,7 @@ pub fn write(out: &mut [u8; REGION_SIZE], f: &Fields<'_>) -> Option<usize> {
 }
 
 /// Converts a liboqs-layout secret key (upstream `rp genkey`'s `pqsk`) to
-/// the cmr layout. The 40-byte prefix is left zero.
+/// the round-3 spec layout. The 40-byte prefix is left zero.
 pub fn cmr_sk_from_liboqs(out: &mut [u8; SK_LEN], oqs: &[u8; LIBOQS_SK_LEN]) {
     let (moved, rest) = oqs.split_at(MOVED_LEN);
     let (prefix, body) = out.split_at_mut(CMR_PREFIX_LEN);
@@ -124,8 +125,8 @@ pub fn cmr_sk_from_liboqs(out: &mut [u8; SK_LEN], oqs: &[u8; LIBOQS_SK_LEN]) {
     tail.copy_from_slice(moved);
 }
 
-/// Converts a cmr-layout secret key to the liboqs layout that upstream
-/// rosenpass reads (M3 plan F19). The cmr prefix is dropped.
+/// Converts a round-3 spec layout secret key to the liboqs layout that
+/// upstream rosenpass reads (M3 plan F19). The leading prefix is dropped.
 pub fn liboqs_sk_from_cmr(out: &mut [u8; LIBOQS_SK_LEN], cmr: &[u8; SK_LEN]) {
     let (_, body) = cmr.split_at(CMR_PREFIX_LEN);
     let (rest, moved) = body.split_at(body.len().saturating_sub(MOVED_LEN));

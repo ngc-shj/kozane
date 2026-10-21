@@ -23,7 +23,6 @@ use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use classic_mceliece_rust as cmr;
 use secret_blob::pq;
 
 // Shared with the config build script; only the parsers and `check` are used here.
@@ -74,66 +73,27 @@ fn keypair() -> Result<KeyPair, String> {
     Ok(KeyPair { private, public })
 }
 
-/// /dev/urandom as the McEliece keygen and encapsulation RNG. `fill_bytes`
-/// cannot report failure, so a failed read is recorded (and the output
-/// zeroed) and `check` turns it into an error once the operation is done.
-struct Urandom {
-    file: std::fs::File,
-    failed: bool,
-    filler: u64,
-}
+/// /dev/urandom as the McEliece keygen and encapsulation RNG. Unlike
+/// `rand_core::RngCore::fill_bytes`, `mce460896`'s closures can report a
+/// failed read, so a short read surfaces as an immediate `RngError`.
+struct Urandom(std::fs::File);
 
 impl Urandom {
     fn open() -> Result<Self, String> {
-        let file = std::fs::File::open("/dev/urandom").map_err(|e| format!("/dev/urandom: {e}"))?;
-        Ok(Urandom { file, failed: false, filler: 0 })
+        std::fs::File::open("/dev/urandom").map(Urandom).map_err(|e| format!("/dev/urandom: {e}"))
     }
 
-    fn check(&self) -> Result<(), String> {
-        if self.failed { Err("/dev/urandom: read failed".into()) } else { Ok(()) }
-    }
-}
-
-impl rand_core::RngCore for Urandom {
-    fn next_u32(&mut self) -> u32 {
-        let mut b = [0u8; 4];
-        self.fill_bytes(&mut b);
-        u32::from_le_bytes(b)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut b = [0u8; 8];
-        self.fill_bytes(&mut b);
-        u64::from_le_bytes(b)
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        if self.file.read_exact(dest).is_err() {
-            self.failed = true;
-            // Discarded output (`check` refuses it); varying bytes end cmr's
-            // rejection sampling, which a zero fill would loop forever in.
-            for b in dest.iter_mut() {
-                self.filler = self.filler.wrapping_mul(0x5851_f42d_4c95_7f2d).wrapping_add(1);
-                let [top, ..] = self.filler.to_be_bytes();
-                *b = top;
-            }
-        }
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.fill_bytes(dest);
-        Ok(())
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), mce460896::RngError> {
+        self.0.read_exact(out).map_err(|_| mce460896::RngError)
     }
 }
-
-impl rand_core::CryptoRng for Urandom {}
 
 /// A zeroed heap array, never built on the stack (McEliece keys are large).
 fn zeroed<const N: usize>() -> Result<Box<[u8; N]>, String> {
     vec![0u8; N].into_boxed_slice().try_into().map_err(|_| "allocation size mismatch".to_string())
 }
 
-/// A Classic McEliece 460896 keypair; the secret key in cmr layout.
+/// A Classic McEliece 460896 keypair; the secret key in round-3 spec layout.
 struct McEliece {
     public: Box<[u8; pq::PK_LEN]>,
     secret: Box<[u8; pq::SK_LEN]>,
@@ -141,24 +101,20 @@ struct McEliece {
 
 fn mceliece_keypair(rng: &mut Urandom) -> Result<McEliece, String> {
     let mut public = zeroed::<{ pq::PK_LEN }>()?;
-    let mut wrapped = zeroed::<{ pq::SK_LEN }>()?;
     let mut secret = zeroed::<{ pq::SK_LEN }>()?;
-    {
-        let (_, sk) = cmr::keypair(&mut public, &mut wrapped, rng);
-        // cmr zeroizes the buffer it wraps when `sk` drops: copy it out first.
-        secret.copy_from_slice(sk.as_array());
-    }
-    rng.check()?;
+    mce460896::keypair(&mut |out| rng.fill(out), &mut public, &mut secret)
+        .map_err(|_| "/dev/urandom: read failed".to_string())?;
     Ok(McEliece { public, secret })
 }
 
 /// The boot KAT pair for `public`: a ciphertext and BLAKE2s(shared key).
 fn mceliece_kat(public: &[u8; pq::PK_LEN], rng: &mut Urandom) -> Result<([u8; pq::CT_LEN], [u8; 32]), String> {
+    let mut ct = [0u8; pq::CT_LEN];
     let mut shk = [0u8; pq::SHK_LEN];
-    let (ct, shared) = cmr::encapsulate(&cmr::PublicKey::from(public), &mut shk, rng);
-    let hash = secret_blob::blake2s(&[shared.as_array()]);
-    rng.check()?;
-    Ok((*ct.as_array(), hash))
+    mce460896::encaps(public, &mut |out| rng.fill(out), &mut ct, &mut shk)
+        .map_err(|_| "/dev/urandom: read failed".to_string())?;
+    let hash = secret_blob::blake2s(&[&shk]);
+    Ok((ct, hash))
 }
 
 /// Refuses an output directory inside any of `forbidden` (all canonical).

@@ -1,0 +1,450 @@
+//! Residue mode (M4 plan C9, invariant I5): runs natively. Each KEM call
+//! runs on a painted stack the harness owns (`stack.rs`); after the join
+//! the stack is searched for every stored form of every secret the call
+//! handled. The needles are computed on the main thread into the heap,
+//! from the port's own `pub` stage, pack and transpose functions.
+
+use std::collections::{HashMap, HashSet};
+use std::hint::black_box;
+
+use mce460896::stages::{self, Vec13};
+use mce460896::{
+    CT_LEN, ENCAPS_RAND_LEN, PK_LEN, RngError, SCRUB_DEPTH, SK_LEN, SS_LEN, decaps, encaps,
+    encaps_attempt,
+};
+
+use crate::stack::OwnedStack;
+use crate::vectors::{self, CLASSES, ENTRIES, SYND_BYTES, SYS_N, Vectors, boxed, h32};
+use crate::vg;
+
+/// The needle forms; a hit line names one.
+const FORMS: [&str; 10] = [
+    "rand",
+    "e-bytes",
+    "ind",
+    "e-bitsliced",
+    "g",
+    "support",
+    "syndrome",
+    "bm",
+    "keccak",
+    "ss",
+];
+#[derive(Clone, Copy)]
+enum Form {
+    Rand,
+    EBytes,
+    Ind,
+    EBitsliced,
+    G,
+    Support,
+    Syndrome,
+    Bm,
+    Keccak,
+    Ss,
+}
+
+/// The stack each call runs on, and the padding frame between the
+/// thread's entry and the call: glibc's thread exit runs above the pad, so
+/// it cannot overwrite what the call left.
+const STACK: usize = 1 << 20;
+const PAD: usize = 64 * 1024;
+const PAINT: u8 = 0x5c;
+/// The painted-depth floors: every call must have disturbed at least this
+/// much stack below the pad, so that the scanned region holds its frames.
+/// About half of each `_core` stage's own peak on this build (decaps_core
+/// 63 KiB, encaps_attempt_core 4 KiB), so that they hold with or without
+/// the scrub; with it, every call reaches `SCRUB_DEPTH`.
+const FLOOR_DECAPS: usize = 32 * 1024;
+const FLOOR_ENCAPS: usize = 2 * 1024;
+const _: () = assert!(
+    SCRUB_DEPTH >= FLOOR_DECAPS && SCRUB_DEPTH >= FLOOR_ENCAPS,
+    "the scrub must cover the painted-depth floor"
+);
+
+/// Decapsulations (the four classes per entry), encapsulation attempts
+/// (every draw of each stream, the two crafted rejections), and the
+/// generic shim once per entry.
+const CASES: usize = ENTRIES * CLASSES.len() + (1 + 3 + 4) + 2 + ENTRIES;
+
+/// 8-byte windows of the secret forms, at every byte offset.
+struct Needles {
+    windows: HashMap<u64, u16>,
+    public: HashSet<u64>,
+}
+
+impl Needles {
+    fn new() -> Self {
+        Self {
+            windows: HashMap::new(),
+            public: HashSet::new(),
+        }
+    }
+
+    /// A window counts if it could not be stack filler: three or more
+    /// nonzero bytes, not all equal (the paint is one repeated byte).
+    fn distinctive(w: &[u8]) -> bool {
+        w.iter().filter(|&&b| b != 0).count() >= 3 && w.iter().any(|&b| b != w[0])
+    }
+
+    fn add(&mut self, form: Form, bytes: &[u8]) {
+        for w in bytes.windows(8).filter(|w| Self::distinctive(w)) {
+            *self
+                .windows
+                .entry(u64::from_le_bytes(w.try_into().expect("8")))
+                .or_insert(0) |= 1 << form as u16;
+        }
+    }
+
+    /// Public data the call may legitimately leave (the ciphertext): its
+    /// windows are not needles.
+    fn public(&mut self, bytes: &[u8]) {
+        self.public.extend(
+            bytes
+                .windows(8)
+                .map(|w| u64::from_le_bytes(w.try_into().expect("8"))),
+        );
+    }
+
+    fn add_words(&mut self, form: Form, words: &[u64]) {
+        self.add(form, &words_to_bytes(words));
+    }
+
+    fn add_vec13(&mut self, form: Form, v: &[Vec13]) {
+        let words: Vec<u64> = v.iter().flatten().copied().collect();
+        self.add_words(form, &words);
+    }
+
+    /// Per form: the number of matching offsets and the depth (from the
+    /// top of the stack) of the deepest one.
+    fn scan(&self, stack: &[u8], from: usize) -> Vec<(usize, usize, usize)> {
+        let mut per = [(0usize, 0usize); FORMS.len()];
+        for (o, w) in stack[from..].windows(8).enumerate() {
+            let w = u64::from_le_bytes(w.try_into().expect("8"));
+            if let Some(&mask) = self.windows.get(&w) {
+                if self.public.contains(&w) {
+                    continue;
+                }
+                for (f, p) in per.iter_mut().enumerate() {
+                    if mask & (1 << f) != 0 {
+                        if p.0 == 0 {
+                            p.1 = stack.len() - (from + o);
+                        }
+                        p.0 += 1;
+                    }
+                }
+            }
+        }
+        per.iter()
+            .enumerate()
+            .filter(|(_, p)| p.0 > 0)
+            .map(|(f, p)| (f, p.0, p.1))
+            .collect()
+    }
+}
+
+fn words_to_bytes(words: &[u64]) -> Vec<u8> {
+    words.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// SHAKE256's absorbed states for `msg`: each block's state before and
+/// after `keccak::f1600`. Checked against `sha3`: the last state's first
+/// 32 bytes are the digest.
+fn shake256_states(msg: &[u8]) -> Vec<[u64; 25]> {
+    const RATE: usize = 136;
+    let mut padded = msg.to_vec();
+    padded.push(0x1f);
+    while !padded.len().is_multiple_of(RATE) {
+        padded.push(0);
+    }
+    *padded.last_mut().expect("block") |= 0x80;
+    let mut st = [0u64; 25];
+    let mut out = Vec::new();
+    for block in padded.chunks(RATE) {
+        for (lane, c) in st.iter_mut().zip(block.chunks(8)) {
+            *lane ^= u64::from_le_bytes(c.try_into().expect("8"));
+        }
+        out.push(st);
+        keccak::f1600(&mut st);
+        out.push(st);
+    }
+    assert_eq!(
+        words_to_bytes(&st)[..32],
+        h32(&[msg]),
+        "sponge model differs from sha3"
+    );
+    out
+}
+
+/// The keccak needles of one `hash_32b` call: the secret part of its
+/// preimage, and every absorbed state.
+fn add_hash(n: &mut Needles, secret_prefix: &[u8], public_suffix: &[u8]) {
+    n.add(Form::Keccak, secret_prefix);
+    let msg = [secret_prefix, public_suffix].concat();
+    for st in shake256_states(&msg) {
+        n.add_words(Form::Keccak, &st);
+    }
+}
+
+/// `benes`'s last horizontal form of the 128 words `r`: the halves
+/// de-interleaved and transposed, as it holds them before writing back.
+fn benes_transposed(r: &[u64; 128]) -> Vec<u64> {
+    let mut v = [[0u64; 64]; 2];
+    for i in 0..64 {
+        v[0][i] = r[i * 2];
+        v[1][i] = r[i * 2 + 1];
+    }
+    stages::transpose_64x64(&mut v[0]);
+    stages::transpose_64x64(&mut v[1]);
+    v.iter().flatten().copied().collect()
+}
+
+fn e_words(e: &[u8; SYS_N / 8]) -> [u64; 128] {
+    let mut r = [0u64; 128];
+    for (w, c) in r.iter_mut().zip(e.chunks(8)) {
+        *w = u64::from_le_bytes(c.try_into().expect("8"));
+    }
+    r
+}
+
+/// Offsets into the secret key (`lib.rs`).
+const SK_IRR: usize = 40;
+const SK_COND: usize = SK_IRR + 192;
+const SK_S: usize = SK_LEN - SYS_N / 8;
+
+fn decaps_needles(sk: &[u8; SK_LEN], ct: &[u8; CT_LEN], want: &[u8]) -> Needles {
+    let mut n = Needles::new();
+    n.public(ct);
+    let d = stages::decode(sk, ct);
+
+    n.add(Form::EBytes, &d.e);
+    n.add_words(Form::EBitsliced, &benes_transposed(&e_words(&d.e)));
+
+    let g = stages::g_bitsliced(sk);
+    n.add_vec13(Form::G, &g);
+    n.add(Form::G, &sk[SK_IRR..SK_COND]);
+
+    n.add_vec13(Form::Support, &d.inv);
+    n.add_words(Form::Support, &d.recv);
+    n.add_words(Form::Support, &benes_transposed(&d.recv));
+    n.add(Form::Support, &sk[SK_COND..SK_S]);
+
+    let syn = stages::syndrome(sk, ct);
+    assert!(syn == d.syndrome, "syndrome stage");
+    n.add_vec13(Form::Syndrome, &syn);
+
+    let loc = stages::bm(&syn);
+    assert!(loc == d.locator, "bm stage");
+    n.add_vec13(Form::Bm, &loc);
+    // BM's last `C(x)` high half, which `bm` shifts into its output.
+    let c_high: Vec<u64> = (0..13)
+        .map(|i| (loc[1][i] << 31) | (loc[0][i] >> 33))
+        .collect();
+    n.add_words(Form::Bm, &c_high);
+
+    let conf = h32(&[&[2], &d.e]);
+    add_hash(&mut n, &[&[2u8][..], &d.e].concat(), &[]);
+    let ok = d.fail == 0 && conf[..] == ct[SYND_BYTES..];
+    let sel: &[u8] = if ok { &d.e } else { &sk[SK_S..] };
+    let prefix = [&[u8::from(ok)][..], sel].concat();
+    add_hash(&mut n, &prefix, ct);
+    assert_eq!(h32(&[&prefix, ct]), want, "decaps needle derivation");
+    n.add(Form::Ss, want);
+    n
+}
+
+/// One attempt's needles. Returns the attempt's shared secret (the
+/// output if it accepts).
+fn attempt_needles(
+    n: &mut Needles,
+    pk: &[u8; PK_LEN],
+    rand: &[u8; ENCAPS_RAND_LEN],
+) -> (bool, [u8; CT_LEN], [u8; SS_LEN]) {
+    n.add(Form::Rand, rand);
+    let nums: Vec<u8> = rand
+        .chunks(2)
+        .flat_map(|c| (u16::from_le_bytes([c[0], c[1]]) & 0x1fff).to_le_bytes())
+        .collect();
+    n.add(Form::Rand, &nums);
+
+    let s = stages::sample(rand);
+    let accept = s.accept == 0xffff;
+    n.add(Form::Ind, &stages::pack_ind(&s.ind));
+    n.add(Form::EBytes, &s.e);
+    n.add_words(Form::EBitsliced, &s.e_words);
+
+    let c0 = stages::encrypt_syndrome(pk, &s.e);
+    let c1 = h32(&[&[2], &s.e]);
+    let mut ct = [0u8; CT_LEN];
+    ct[..SYND_BYTES].copy_from_slice(&c0);
+    ct[SYND_BYTES..].copy_from_slice(&c1);
+    if accept {
+        n.public(&ct);
+    } else {
+        n.add(Form::Syndrome, &c0);
+    }
+    add_hash(n, &[&[2u8][..], &s.e].concat(), &[]);
+    add_hash(n, &[&[1u8][..], &s.e].concat(), &ct);
+    let ss = h32(&[&[1], &s.e, &ct]);
+    n.add(Form::Ss, &ss);
+    (accept, ct, ss)
+}
+
+#[inline(never)]
+fn padded(f: impl FnOnce()) {
+    let mut pad = [0u8; PAD];
+    black_box(&mut pad);
+    f();
+    black_box(&pad);
+}
+
+struct Scan {
+    stack: OwnedStack,
+    base: usize,
+    cases: usize,
+    failed: bool,
+}
+
+impl Scan {
+    /// Paints the stack, runs `f` on it, and returns how deep (from the
+    /// top) the paint was disturbed.
+    fn run(&mut self, f: impl FnOnce() + Send) -> usize {
+        self.stack.bytes_mut().fill(PAINT);
+        self.stack.run(|| padded(f));
+        let low = self
+            .stack
+            .bytes()
+            .iter()
+            .position(|&b| b != PAINT)
+            .unwrap_or(STACK);
+        STACK - low
+    }
+
+    fn case(&mut self, name: &str, floor: usize, needles: &Needles, f: impl FnOnce() + Send) {
+        let depth = self.run(f);
+        let used = depth.saturating_sub(self.base);
+        println!("RESIDUE-DEPTH {name} {used}");
+        if used < floor {
+            println!("RESIDUE-SHALLOW {name}: {used} bytes below the pad, floor {floor}");
+            self.failed = true;
+        }
+        for (f, count, at) in needles.scan(self.stack.bytes(), STACK - depth) {
+            println!(
+                "RESIDUE-HIT {} case={name} windows={count} depth={at}",
+                FORMS[f]
+            );
+            self.failed = true;
+        }
+        self.cases += 1;
+    }
+
+    fn check(&mut self, what: &str, ok: bool) {
+        if !ok {
+            println!("RESIDUE-FAIL {what}");
+            self.failed = true;
+        }
+    }
+}
+
+pub fn run() -> ! {
+    if vg::running_on_valgrind() {
+        println!("RESIDUE-UNDER-VALGRIND residue mode must run natively, not under valgrind");
+        std::process::exit(4);
+    }
+    println!("RESIDUE-CASES {CASES}");
+
+    let mut scan = Scan {
+        stack: OwnedStack::new(STACK),
+        base: 0,
+        cases: 0,
+        failed: false,
+    };
+    scan.base = scan.run(|| {});
+
+    let v = Vectors::load();
+    let mut shim_rejected = false;
+    for i in 0..ENTRIES {
+        let sk = v.sk(i);
+        let pk = v.pk(&sk);
+
+        for class in CLASSES {
+            let ct: Box<[u8; CT_LEN]> = Box::new(v.array(&format!("mce.{i}.dec.{class}.ct")));
+            let want = v.get(&format!("mce.{i}.dec.{class}.ss"));
+            let needles = decaps_needles(&sk, &ct, want);
+            let mut ss = boxed::<SS_LEN>();
+            scan.case(
+                &format!("decaps.{i}.{class}"),
+                FLOOR_DECAPS,
+                &needles,
+                || decaps(&sk, &ct, &mut ss),
+            );
+            scan.check(&format!("decaps.{i}.{class} output"), ss[..] == *want);
+        }
+
+        let attempts = v.attempts(i);
+        let mut rands: Vec<(String, Box<[u8; ENCAPS_RAND_LEN]>)> = attempts
+            .iter()
+            .enumerate()
+            .map(|(k, r)| (format!("encaps.{i}.attempt{k}"), r.clone()))
+            .collect();
+        if i == 0 {
+            rands.push(("encaps.short".into(), Box::new(vectors::SHORT)));
+            rands.push(("encaps.repeated".into(), Box::new(vectors::REPEATED)));
+        }
+        for (name, rand) in &rands {
+            let mut needles = Needles::new();
+            let (accept, ct, ss) = attempt_needles(&mut needles, &pk, rand);
+            let (mut ct_out, mut ss_out) = (boxed::<CT_LEN>(), boxed::<SS_LEN>());
+            let mut bit = Box::new(0u8);
+            scan.case(name, FLOOR_ENCAPS, &needles, || {
+                *bit = encaps_attempt(&pk, rand, &mut ct_out, &mut ss_out)
+            });
+            let ok = if accept {
+                *bit == 1 && ct_out[..] == ct && ss_out[..] == ss
+            } else {
+                *bit == 0 && ct_out.iter().chain(ss_out.iter()).all(|&b| b == 0)
+            };
+            scan.check(&format!("{name} output"), ok);
+        }
+
+        // The generic shim, driven by a FnMut RNG that replays the entry's
+        // stream from the heap.
+        let stream: Vec<u8> = attempts.iter().flat_map(|r| r.iter().copied()).collect();
+        let mut needles = Needles::new();
+        for rand in &attempts {
+            attempt_needles(&mut needles, &pk, rand);
+        }
+        let (mut ct_out, mut ss_out) = (boxed::<CT_LEN>(), boxed::<SS_LEN>());
+        let mut drawn = Box::new(0usize);
+        let mut result = Box::new(Err(RngError));
+        scan.case(&format!("encaps-shim.{i}"), FLOOR_ENCAPS, &needles, || {
+            let mut rng = |b: &mut [u8]| {
+                let src = stream.get(*drawn..*drawn + b.len()).ok_or(RngError)?;
+                b.copy_from_slice(src);
+                *drawn += b.len();
+                Ok(())
+            };
+            *result = encaps(&pk, &mut rng, &mut ct_out, &mut ss_out);
+        });
+        scan.check(
+            &format!("encaps-shim.{i} output"),
+            result.is_ok()
+                && *drawn == stream.len()
+                && ct_out[..] == *v.get(&format!("mce.{i}.ct"))
+                && ss_out[..] == *v.get(&format!("mce.{i}.ss")),
+        );
+        shim_rejected |= attempts.len() > 1;
+    }
+    scan.check("the shim saw no rejected attempt", shim_rejected);
+    scan.check(
+        &format!("{} cases run, {CASES} planned", scan.cases),
+        scan.cases == CASES,
+    );
+
+    if scan.failed {
+        println!("RESIDUE-FAILED");
+        std::process::exit(1);
+    }
+    println!("RESIDUE-DONE {}", scan.cases);
+    std::process::exit(0);
+}

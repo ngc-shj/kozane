@@ -88,6 +88,8 @@ CASES_FOR_GATE = {
              "rp-cookie-domain", "rp-legacy-probe", "rp-conf-share", "rp-awaited", "rp-proven-reserve", "rp-sid-binding", "rp-nat",
              "rp-cookie-offload", "rp-tx-tier", "rp-reply-fifo", "rp-reply-order", "rp-reply-dst", "rp-sync-sticky"},
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
+    "ct": {"ct-barrier", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
+           "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub"},
     "verus": {"verus-cache", "verus-trusted", "verus-required", "verus-wg-wire-window",
               "verus-wg-wire-roundtrip", "verus-rp-wire-roundtrip",
               "verus-msgs-exact", "verus-ring-mask", "verus-wire-ipv4"},
@@ -217,6 +219,52 @@ CASES = {
                                       "    let end = at.checked_add(N)?;\n    b.get(at..end)?.try_into().ok()",
                                       "    let end = at.checked_add(N)?.checked_add(1)?;\n    b.get(at + 1..end)?.try_into().ok()"),
                        "core::ptr::eq(c.as_ptr(), b.as_ptr().wrapping_add(at))"),
+    # The constant-time gate (M4 plan C9). One Berlekamp-Massey select made
+    # a plain branch on its secret mask: memcheck sees the branch.
+    "ct-barrier": (["ct"], lambda t: edit(t, "crates/mce460896/src/bm.rs",
+                                          "        vec_cmov(&mut b_poly[0], &c_poly[0], mask);\n        vec_cmov(&mut b_poly[1], &c_poly[1], mask);\n",
+                                          "        if mask != 0 {\n            b_poly[0] = c_poly[0];\n            b_poly[1] = c_poly[1];\n        }\n"),
+                   "Conditional jump or move depends on uninitialised value(s) at"),
+    # Without the canary, a run that checked nothing could look clean.
+    "ct-canary": (["ct"], lambda t: edit(t, "tools/ct-harness/src/ct.rs", "    black_box(canary(&secret));\n", ""),
+                  "want 1 errors (the canary)"),
+    # A harness that stops after the canary has exactly one report.
+    "ct-early-exit": (["ct"], lambda t: edit(t, "tools/ct-harness/src/ct.rs", "    black_box(canary(&secret));\n",
+                                             "    black_box(canary(&secret));\n    std::process::exit(0);\n"),
+                      "want CT-DONE <cases>"),
+    # A declassification the policy does not list.
+    "ct-declassify": (["ct"], lambda t: edit(t, "tools/ct-harness/src/ct.rs",
+                                             '        vg::declassify("ct-out", &mut ct[..]);\n        vg::declassify("ss-out", &mut ss[..]);\n',
+                                             '        vg::declassify("ct-out", &mut ct[..]);\n        vg::declassify("ss-out", &mut ss[..]);\n'
+                                             '        vg::declassify("e-out", &mut rand[..]);\n'),
+                      "e-out: not in the policy"),
+    # A value array declassified as the one-byte accept predicate.
+    "ct-declassify-width": (["ct"], lambda t: edit(t, "tools/ct-harness/src/ct.rs",
+                                                   '        vg::declassify("encaps-accept", &mut accept);\n',
+                                                   '        vg::declassify("encaps-accept", &mut rand[..]);\n'),
+                            "encaps-accept: 384 bytes, the site's width is 1"),
+    # CT mode outside valgrind: the harness refuses to report a clean run.
+    "ct-not-valgrind": (["ct", "ct_valgrind="], lambda t: None,
+                        "CT mode exited 3: the harness was not running under valgrind"),
+    # Residue mode under valgrind: memcheck's view of the stack is not the
+    # machine's, so it refuses.
+    "residue-under-valgrind": (["ct", "ct_residue_wrap=valgrind -q"], lambda t: None,
+                               "residue mode exited 4: it was run under valgrind"),
+    # The shim's draw left unwiped after an attempt (I5, I8).
+    # (Zeroizing would still wipe on drop, so the wrapper goes too.)
+    "mce-residue-rand": (["ct"], lambda t: (
+        edit(t, "crates/mce460896/src/lib.rs", "    let mut rand = Zeroizing::new([0u8; ENCAPS_RAND_LEN]);\n",
+             "    let mut rand = [0u8; ENCAPS_RAND_LEN];\n"),
+        edit(t, "crates/mce460896/src/lib.rs",
+             "        let accept = encaps_attempt(pk, &rand, ct_out, ss_out);\n        rand.zeroize();\n",
+             "        let accept = encaps_attempt(pk, &rand, ct_out, ss_out);\n")),
+                         "RESIDUE-HIT rand"),
+    # The stack scrub removed: keccak's state and ss stay in dead frames.
+    "mce-residue-scrub": (["ct"], lambda t: (
+        edit(t, "crates/mce460896/src/lib.rs", "    decaps_core(sk, ct, ss_out);\n    scrub_stack();\n", "    decaps_core(sk, ct, ss_out);\n"),
+        edit(t, "crates/mce460896/src/lib.rs", "    let accept = encaps_attempt_core(pk, rand, ct_out, ss_out);\n    scrub_stack();\n",
+             "    let accept = encaps_attempt_core(pk, rand, ct_out, ss_out);\n")),
+                          "RESIDUE-HIT keccak"),
     # End to end through the real `check` rule, once per gate: see
     # run_propagation(). The tuple is only a placeholder for the case table.
     "check-propagation": ([], lambda t: None, ""),

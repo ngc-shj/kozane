@@ -470,3 +470,104 @@ differs per build. The C10 normaliser must mask that hash.
     9–18 lines.
   - **Panic paths:** no PD gained a `core::panicking`/`slice::index` call
     site; ingress went from 163 to 161.
+
+## M2a — the constant-time gate (C9)
+
+### Result
+
+- **`make ct`** passes in about 3.5 s:
+
+  | Key | Value |
+  |---|---|
+  | `CT-CASES` | 28 |
+  | `CT-MARKED-BYTES` | 289609, confirmed undefined by `VALGRIND_GET_VBITS` |
+  | `CT-DECLASSIFY` | 3 |
+  | `RESIDUE-CASES` | 25 |
+  | `UNIT-CT-HARNESS` | 11 |
+
+  Memcheck reports only the canary's error. **mce460896 shows no
+  constant-time violation on the executed paths.**
+- **CT cases:**
+  - decaps in four classes for 3 keys, plus 6 boundary weights;
+  - encaps_attempt on every draw of the vector streams, plus a short and a
+    repeated draw.
+- **Residue cases:** 12 decaps, 10 attempts, and 3 runs of the real generic
+  `encaps` shim, some with rejections. The painted depth is about 98 KB.
+- **The F1 record (the one-time red-proof against cmr 2.0.2).** A scratch
+  harness ran cmr's `decapsulate` under the same profile:
+
+  ```
+  Use of uninitialised value of size 8
+     at classic_mceliece_rust::bm::bm (bm.rs:58)   <- b[i] = (b[i] & !mle) | (t[i] & mle)
+     by classic_mceliece_rust::decrypt::decrypt (decrypt.rs:49)
+  Conditional jump or move depends on uninitialised value(s)
+     at classic_mceliece_rust::bm::bm (bm.rs:55)   <- the overflow check on secret l
+  Conditional jump or move depends on uninitialised value(s)
+     at classic_mceliece_rust::decrypt::decrypt (decrypt.rs:59)
+  ERROR SUMMARY: 421615 errors from 4 contexts (one is the canary)
+  ```
+
+  This reproduces the C8 spike's F1 dynamically, and adds the
+  overflow-check branch the spike rated benign.
+- **check-selftest `ct` cases**, each red for its named reason:
+  - `ct-barrier`: BM's two `vec_cmov`s made a branch. The report kind
+    names `bm.rs`.
+  - `ct-canary`, `ct-early-exit`.
+  - `ct-declassify`: an unlisted site.
+  - `ct-declassify-width`: `rand` declassified as the accept predicate.
+  - `ct-not-valgrind` (exit 3) and `residue-under-valgrind` (exit 4).
+  - `mce-residue-rand` and `mce-residue-scrub`.
+
+### Deviations
+
+- **Harness build:** `tools/ct-harness` is its own workspace with its own
+  lock. Its dependencies are mce460896 (path), sha3, keccak and libc; all
+  versions equal the root lock's.
+  - Its unit tests run inside `make ct` and are counted as
+    `UNIT-CT-HARNESS`, because `make unit`/`make lint` do not see it.
+  - It holds two `unsafe` modules: `vg.rs` for the client requests, and
+    `stack.rs` for an mmap'd stack with a guard page via
+    `pthread_attr_setstack`.
+- **The verdict:** it lives in the harness (`--verdict-ct`,
+  `--verdict-residue`), so that its parser has unit tests. Under memcheck a
+  harness failure is masked to exit 97, so the verdict also requires
+  `CT-DONE` as the last line and no `CT-FAIL` line.
+- **Residue red-proofs:**
+  - `scrub_stack` covers a removed local wipe, so a per-form mutation needs
+    the wipe and the scrub both removed.
+  - Red-proved forms:
+    - `rand` (the shim's wipe);
+    - keccak, ss, support and syndrome (scrub removed);
+    - e-bytes (wipe and scrub removed).
+  - Not red-proved individually: g, bm, ind and e-bitsliced. Their needles
+    are derived from pub stage outputs, and the scrub covers them.
+- **One mask computation stayed branch-free when written as a branch.**
+  The mask in L3 (`u64_nonzero_mask`), rewritten as `if`, stayed green: LLVM
+  lowered it branch-free. `ct-barrier` therefore mutates the cmov site.
+- **Painted-depth floors:** decaps 32 KiB and encaps 2 KiB, asserted ≤
+  `SCRUB_DEPTH`. The floors themselves are not red-proved.
+- **Record key:** computed by `tools/ct_record.py` over the harness, the
+  policy, `crates/mce460896/tests/vectors/*.txt` and `valgrind --version`.
+  Its six fixtures run in `make pins`.
+
+## M3a — cut-over (C11, part 1)
+
+- **What switched:** pqkey-core, rosenpass-core and mksecrets use
+  mce460896. `classic-mceliece-rust`, `rand 0.8.8` and `rand_core 0.6.4`
+  are gone from the root lock and from rp-vectors' lock. The rp-vectors
+  `--cmr` mode is deleted; the frozen bridge file stays.
+- **Tests:** unit counts are unchanged (pqkey-core 20, rosenpass-core 39,
+  mksecrets 22, secret-blob 13). rosenpass-core's liboqs KAT and its
+  fails-closed-without-randomness test pass unchanged against mce460896.
+- **RNG failure handling:** the filler-RNG workarounds (`CmrRng`, and
+  mksecrets' `failed` flag) are gone, because mce460896 fails the draw
+  directly.
+- **mksecrets' shared-key buffer:** its KAT path no longer gets cmr's
+  automatic zeroize of the shared-key buffer it hashes and drops. This is a
+  host-only, short-lived CLI that zeroes none of its other buffers either;
+  recorded, not changed.
+- **P13 is enforced.** The P6 fixtures inject a locked cmr (`lock_cmr`),
+  because the live tree no longer has one. They expect P13 alongside P6,
+  and three P13 fixtures are added: `CHECK-PINS-FIXTURES` 90 and
+  `CHECK-PINS-RULES` 16.
+- **Still to do:** C10, the package binding and SC23's close.

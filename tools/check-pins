@@ -35,7 +35,7 @@ Rules:
      policy/verus-trusted.toml (M4 plan C1, C11)
   P13 no classic-mceliece-rust as a dependency key in any tracked
      Cargo.toml or Cargo.lock, nor as a Rust use/extern crate/path in crates/
-     or tools/ (M4 plan C11; pending until the cut-over)
+     or tools/ (M4 plan C11)
   P14 no `unsafe` in crates/mce460896 outside src/barrier.rs (M4 plan C7)
   P15 no valgrind client-request preamble (`ror x12, x12, #3`) in crates/
      or tools/ outside tools/ct-harness/src/vg.rs (M4 plan C9)
@@ -85,7 +85,7 @@ RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P1
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core",
                "crates/pds/key", "crates/pds/hs", "crates/pds/data"]
-PENDING: set[str] = {"P13"}
+PENDING: set[str] = set()
 # Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
 SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/ingress"]
 # Types that hold a secret under a name of their own, not as Secret<..> (P9,

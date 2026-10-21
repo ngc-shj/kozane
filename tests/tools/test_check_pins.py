@@ -16,9 +16,7 @@ TOOL = ROOT / "tools/check-pins"
 FILES = ["docker/Dockerfile", "Makefile", "rust-toolchain.toml", "Cargo.toml", "Cargo.lock", "policy/waivers.toml",
          "policy/verus-trusted.toml"]
 # P7's cases run on a tree whose crates/ is replaced by a synthetic one.
-# P7 is enforced, so they need no --enforce-pending; passing it would also
-# enforce P13, which stays pending (and fires on the locked cmr) until the M4
-# cut-over.
+# P7 is enforced, so they need no --enforce-pending.
 ENFORCE: list = []
 
 
@@ -59,9 +57,10 @@ def synthetic_crates(t: pathlib.Path, lib: str = "pub fn f() {}\n"):
     write(t / "crates/demo/src/lib.rs", lib)
 
 
-def drop_cmr(t: pathlib.Path):
-    edit(t / "Cargo.lock", '[[package]]\nname = "classic-mceliece-rust"\nversion = "2.0.2"\n',
-         '[[package]]\nname = "classic-mceliece-rust-was"\nversion = "2.0.2"\n')
+def lock_cmr(t: pathlib.Path, version: str = "2.0.2"):
+    """Locks cmr again (the live tree no longer does, after the M4 cut-over)."""
+    append(t / "Cargo.lock", f'\n[[package]]\nname = "classic-mceliece-rust"\nversion = "{version}"\n'
+                             'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
 
 
 SC23 = '[[waivers]]\nid = "SC23"\nowner = "M4"\nstatus = "open"\n'
@@ -147,16 +146,25 @@ CASES = [
      lambda t: edit(t / "Makefile", "\trm -rf $(BUILD)", "\t-rm -rf $(BUILD)")),
     ("P5 .IGNORE", {"P5"}, lambda t: edit(t / "Makefile", "clean:\n", ".IGNORE:\nclean:\n")),
     # P6: SC23 bound to cmr (any version) in Cargo.lock; waivers.toml must parse.
-    ("allow cmr locked and SC23 open", set(), lambda t: edit(t / "policy/waivers.toml", SC23, SC23)),
-    ("P6 cmr locked and SC23 absent", {"P6"}, lambda t: edit(t / "policy/waivers.toml", SC23, "")),
-    ("P6 cmr locked and SC23 closed", {"P6"},
-     lambda t: edit(t / "policy/waivers.toml", SC23, SC23.replace('"open"', '"closed"'))),
-    ("allow neither cmr nor SC23", set(),
-     lambda t: (drop_cmr(t), edit(t / "policy/waivers.toml", SC23, ""))),
-    ("P6 cmr at another version and SC23 absent", {"P6"},
-     lambda t: (edit(t / "Cargo.lock", 'name = "classic-mceliece-rust"\nversion = "2.0.2"',
-                     'name = "classic-mceliece-rust"\nversion = "2.0.3"'),
-                edit(t / "policy/waivers.toml", SC23, ""))),
+    # The live tree no longer locks cmr (M4 cut-over), so the locked cases
+    # inject it, and P13 (cmr is gone) fires on each of them too.
+    ("cmr locked and SC23 open: only P13", {"P13"},
+     lambda t: (lock_cmr(t), edit(t / "policy/waivers.toml", SC23, SC23))),
+    ("P6 cmr locked and SC23 absent", {"P6", "P13"},
+     lambda t: (lock_cmr(t), edit(t / "policy/waivers.toml", SC23, ""))),
+    ("P6 cmr locked and SC23 closed", {"P6", "P13"},
+     lambda t: (lock_cmr(t), edit(t / "policy/waivers.toml", SC23, SC23.replace('"open"', '"closed"')))),
+    ("allow neither cmr nor SC23", set(), lambda t: edit(t / "policy/waivers.toml", SC23, "")),
+    ("P6 cmr at another version and SC23 absent", {"P6", "P13"},
+     lambda t: (lock_cmr(t, "2.0.3"), edit(t / "policy/waivers.toml", SC23, ""))),
+    # P13 on its own: a dependency key and a `use`.
+    ("P13 cmr as a dependency key", {"P13"},
+     lambda t: edit(t / "crates/pqkey-core/Cargo.toml", "[dependencies]\n",
+                    '[dependencies]\nclassic-mceliece-rust = "=2.0.2"\n')),
+    ("P13 use classic_mceliece_rust", {"P13"},
+     lambda t: append(t / "crates/pqkey-core/src/lib.rs", "\nuse classic_mceliece_rust as cmr;\n")),
+    ("allow classic_mceliece_rust in a comment", set(),
+     lambda t: append(t / "crates/pqkey-core/src/lib.rs", "\n// once classic_mceliece_rust::decapsulate\n")),
     ("P6 Cargo.lock without [[package]] tables", {"P6"},
      lambda t: (t / "Cargo.lock").write_text("version = 4\n")),
     ("P6 Cargo.lock not UTF-8", {"P6"}, lambda t: (t / "Cargo.lock").write_bytes(b"version = 4\n\xff\n")),

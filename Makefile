@@ -25,7 +25,7 @@ host_crates := wire ring audit-event ingress-core inner-core layout laws config 
 kani_crates := wire ring ingress-core inner-core wg-wire msgs rosenpass-wire
 
 .PHONY: clean-counts
-.PHONY: all image package run test check check-selftest audit lint lint-pds unit kani verus bolero fuzz-long laws pins manifest kernel-config clean
+.PHONY: all image package run test check check-selftest audit lint lint-pds unit kani verus ct ct-harness bolero fuzz-long laws pins manifest kernel-config clean
 all: image
 
 $(counts):
@@ -171,6 +171,32 @@ verus: | $(counts)
 		for (k in per) { print "VERUS-" k, per[k]; print "VERUS-ENSURES-" k, ens[k] } }' \
 		$(counts)/verus.log > $(counts)/verus
 
+# The C9 harness (M4 plan C9, deviation M-1): the PD's codegen on a linux
+# target (support/targets/aarch64-ct-harness.json), build-std, linked by
+# rust-lld so that C10 can compare its code with the PDs'. Its own lock.
+ct_harness := $(BUILD)/ct/target/aarch64-ct-harness/release/ct-harness
+ct-harness:
+	RUSTFLAGS="-Zunstable-options -Clinker-flavor=gnu-lld-cc -Clink-self-contained=+linker" \
+	cargo build --locked --release \
+		--manifest-path tools/ct-harness/Cargo.toml \
+		-Zjson-target-spec -Z build-std=std,panic_abort \
+		--target support/targets/aarch64-ct-harness.json \
+		--target-dir $(BUILD)/ct/target
+
+# CT mode under memcheck, then residue mode natively (tools/ct-gate);
+# writes build/ct/pass-<key> (tools/ct_record.py) only when both pass.
+# check-selftest's scratch copy changes these two to inject its cases.
+ct_valgrind := valgrind
+ct_residue_wrap :=
+ct: ct-harness | $(counts)
+	tools/ct-gate $(ct_harness) "$(ct_valgrind)" "$(ct_residue_wrap)" > $(counts)/ct.log 2>&1 \
+		|| { cat $(counts)/ct.log; exit 1; }
+	# The harness's own unit tests (its report parser), on the host: it is
+	# its own workspace, so `make unit` does not see it.
+	cargo test --locked --manifest-path tools/ct-harness/Cargo.toml --target-dir $(BUILD)/ct/target-host \
+		> $(counts)/ct-unit.log 2>&1 || { cat $(counts)/ct-unit.log; exit 1; }
+	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-CT-HARNESS", n + 0 }' $(counts)/ct-unit.log >> $(counts)/ct
+
 bolero_targets := wire/tests::fuzz_parse_never_panics_and_round_trips \
 	wg-wire/tests::fuzz_parsers_never_panic_and_round_trip \
 	rosenpass-wire/tests::fuzz_parsers_never_panic_and_round_trip
@@ -227,7 +253,8 @@ pins: | $(counts)
 	docker/make-seccomp.py --check >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_seccomp.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_rp_cookie_twin.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES)' $(counts)/pins.log > $(counts)/pins
+	python3 tests/tools/test_ct_record.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES)' $(counts)/pins.log > $(counts)/pins
 
 # Builds its own deployment (fresh keys, generated config, package); see run.py.
 test: | $(counts)
@@ -246,7 +273,7 @@ clean-counts:
 
 check:
 	$(MAKE) clean-counts
-	$(MAKE) pins audit lint lint-pds unit kani verus bolero laws test
+	$(MAKE) pins audit lint lint-pds unit kani verus ct bolero laws test
 	$(MAKE) manifest
 
 # Requires a prior `make check` (the manifest case reuses build/counts).

@@ -297,74 +297,11 @@ fn mce_vectors(repo: &Path) -> anyhow::Result<()> {
     )
 }
 
-/// The cmr bridge (M4 plan C8, slice M0): the same keys and ciphertexts as
-/// cmr 2.0.2 makes them, frozen before cmr leaves the tree, so the port is
-/// shown to decapsulate cmr-era keys (the dev secrets blob) identically.
-fn cmr_vectors(repo: &Path) -> anyhow::Result<()> {
-    use classic_mceliece_rust as cmr;
-    struct Stream(SplitMix);
-    impl rand_core::RngCore for Stream {
-        fn next_u32(&mut self) -> u32 {
-            u32::from_le_bytes(std::array::from_fn(|_| self.0.byte()))
-        }
-        fn next_u64(&mut self) -> u64 {
-            u64::from_le_bytes(std::array::from_fn(|_| self.0.byte()))
-        }
-        fn fill_bytes(&mut self, dest: &mut [u8]) {
-            dest.iter_mut().for_each(|b| *b = self.0.byte());
-        }
-        fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-            self.fill_bytes(dest);
-            Ok(())
-        }
-    }
-    impl rand_core::CryptoRng for Stream {}
-
-    let mut out = Out(BTreeMap::new());
-    for i in 0..MCE_KEYS {
-        let kp_seed = 0x5eed_0000_636d_0000 + i;
-        let mut pk_buf = vec![0u8; cmr::CRYPTO_PUBLICKEYBYTES];
-        let mut sk_buf = vec![0u8; cmr::CRYPTO_SECRETKEYBYTES];
-        let pk_arr: &mut [u8; cmr::CRYPTO_PUBLICKEYBYTES] = pk_buf.as_mut_slice().try_into()?;
-        let sk_arr: &mut [u8; cmr::CRYPTO_SECRETKEYBYTES] = sk_buf.as_mut_slice().try_into()?;
-        let (pk, sk) = cmr::keypair(pk_arr, sk_arr, &mut Stream(SplitMix::new(kp_seed)));
-        let enc_seed = 0x5eed_0000_6365_0000 + i;
-        let mut ss_buf = [0u8; cmr::CRYPTO_BYTES];
-        let (ct, ss) = cmr::encapsulate(&pk, &mut ss_buf, &mut Stream(SplitMix::new(enc_seed)));
-        let ct: [u8; MCE_CT] = *ct.as_array();
-        out.put(&format!("cmr.{i}.kp_seed"), &kp_seed.to_le_bytes())?;
-        out.put(&format!("cmr.{i}.pk_sha3"), &sha3_256(pk.as_array()))?;
-        out.put(&format!("cmr.{i}.sk"), sk.as_array())?;
-        out.put(&format!("cmr.{i}.enc_seed"), &enc_seed.to_le_bytes())?;
-        out.put(&format!("cmr.{i}.ct"), &ct)?;
-        out.put(&format!("cmr.{i}.ss"), ss.as_array())?;
-        drop(ss);
-        for (class, c) in mce_classes(&ct) {
-            let mut k = [0u8; cmr::CRYPTO_BYTES];
-            let ss = cmr::decapsulate(&cmr::Ciphertext::from(c), &sk, &mut k);
-            out.put(&format!("cmr.{i}.dec.{class}.ct"), &c)?;
-            out.put(&format!("cmr.{i}.dec.{class}.ss"), ss.as_array())?;
-        }
-    }
-    write_vectors(
-        &repo.join("crates/mce460896/tests/vectors/cmr-2.0.2.txt"),
-        &[
-            "cmr bridge vectors for crates/mce460896 (M4 plan C8, slice M0): FROZEN.",
-            "producer: classic-mceliece-rust 2.0.2 (mceliece460896), SplitMix64 stream,",
-            "via tools/rp-vectors --cmr at the commit that adds this file. The mode and",
-            "its cmr dependency are deleted in C11; this file is never regenerated.",
-            "sk: cmr's layout (the blob's); dec classes as in liboqs.txt",
-        ],
-        &out,
-    )
-}
-
 fn main() -> anyhow::Result<()> {
     let repo: PathBuf =
-        std::env::args().nth(1).context("usage: rp-vectors <secureos repo root> [--cookie|--mce|--cmr]")?.into();
+        std::env::args().nth(1).context("usage: rp-vectors <secureos repo root> [--cookie|--mce]")?.into();
     match std::env::args().nth(2).as_deref() {
         Some("--mce") => return mce_vectors(&repo),
-        Some("--cmr") => return cmr_vectors(&repo),
         _ => {}
     }
     let vec_dir = repo.join("crates/rosenpass-core/tests/vectors");

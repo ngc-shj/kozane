@@ -209,17 +209,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "classic-mceliece-rust"
-version = "2.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45ce62f72a15a9071f83c5084bdf0af4e8cbf31431e79eb4a5509a2f7fe7fe5d"
-dependencies = [
- "rand 0.8.8",
- "sha3",
- "zeroize",
-]
-
-[[package]]
 name = "config"
 version = "0.1.0"
 dependencies = [
@@ -801,10 +790,9 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 name = "mksecrets"
 version = "0.1.0"
 dependencies = [
- "classic-mceliece-rust",
  "libc",
  "libcrux-curve25519",
- "rand_core 0.6.4",
+ "mce460896",
  "secret-blob",
  "serde",
  "toml",
@@ -1122,8 +1110,8 @@ dependencies = [
 name = "pqkey-core"
 version = "0.1.0"
 dependencies = [
- "classic-mceliece-rust",
  "ingress-core",
+ "mce460896",
  "secret-blob",
  "zeroize",
 ]
@@ -1233,15 +1221,6 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rand"
-version = "0.8.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e058c7de0b26af77780c769414d6257830bb240f3c38477dbc2c16e5f54d6d4c"
-dependencies = [
- "rand_core 0.6.4",
-]
-
-[[package]]
-name = "rand"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9ef1d0d795eb7d84685bca4f72f3649f064e6641543d3a8c415898726a57b41"
@@ -1270,12 +1249,6 @@ dependencies = [
  "ppv-lite86",
  "rand_core 0.9.5",
 ]
-
-[[package]]
-name = "rand_core"
-version = "0.6.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec0be4795e2f6a28069bec0b5ff3e2ac9bafc99e6a9a7dc3547996c5c816922c"
 
 [[package]]
 name = "rand_core"
@@ -1341,12 +1314,11 @@ dependencies = [
 name = "rosenpass-core"
 version = "0.1.0"
 dependencies = [
- "classic-mceliece-rust",
  "ingress-core",
  "libcrux-blake2",
  "libcrux-chacha20poly1305",
  "libcrux-ml-kem",
- "rand_core 0.6.4",
+ "mce460896",
  "rosenpass-wire",
  "sha3",
  "zeroize",

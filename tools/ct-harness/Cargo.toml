@@ -1,0 +1,27 @@
+[package]
+name = "ct-harness"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+publish = false
+
+# Not a member of the secureos workspace (M4 plan C9): `make ct` builds it
+# for support/targets/aarch64-ct-harness.json with build-std, under its own
+# lock, so that its codegen is the PD's and C10 can compare the two.
+[workspace]
+
+[dependencies]
+mce460896 = { path = "../../crates/mce460896" }
+# The same versions mce460896 resolves to in the root lock: the expected
+# values (sha3) and the residue scan's keccak-state needles (keccak).
+sha3 = { version = "=0.10.9", default-features = false }
+keccak = "=0.1.6"
+libc = "=0.2.191"
+
+# The PD's codegen (M4 plan C9 "Build"); line tables only, so that memcheck
+# reports name file:line.
+[profile.release]
+panic = "abort"
+opt-level = "s"
+overflow-checks = true
+debug = "line-tables-only"

@@ -27,7 +27,6 @@
     clippy::arithmetic_side_effects
 )]
 
-use classic_mceliece_rust as cmr;
 use secret_blob::pq::{self, Blob};
 use secret_blob::{BlobError, blake2s};
 use zeroize::{Zeroize, Zeroizing};
@@ -52,10 +51,10 @@ const DECAPS_REQ_BYTES: usize = PQ_DECAPS_REQ_WORDS * 8;
 // The ciphertext fills all but the last 4 bytes of the request (M3 plan F13).
 const _: () = assert!(DECAPS_REQ_BYTES - pq::CT_LEN == 4);
 // The blob layout's sizes are the crate's (round 3, 460896).
-const _: () = assert!(pq::SK_LEN == cmr::CRYPTO_SECRETKEYBYTES);
-const _: () = assert!(pq::PK_LEN == cmr::CRYPTO_PUBLICKEYBYTES);
-const _: () = assert!(pq::CT_LEN == cmr::CRYPTO_CIPHERTEXTBYTES);
-const _: () = assert!(pq::SHK_LEN == cmr::CRYPTO_BYTES);
+const _: () = assert!(pq::SK_LEN == mce460896::SK_LEN);
+const _: () = assert!(pq::PK_LEN == mce460896::PK_LEN);
+const _: () = assert!(pq::CT_LEN == mce460896::CT_LEN);
+const _: () = assert!(pq::SHK_LEN == mce460896::SS_LEN);
 
 /// `pq`'s call budget: `PQ_KEY_BURST` calls, refilled at one per
 /// `PQ_KEY_INTERVAL_NS` (M3 plan C2). Asserted below, at build time, so
@@ -141,19 +140,12 @@ fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
 }
 
 /// Decapsulates `ct` with a per-call copy of `sk` in `scratch`, which is
-/// zero on return. cmr wraps (and zeroizes on drop) the buffer it is given,
-/// so the read-only blob itself is never handed to it.
+/// zero on return. `mce460896::decaps` neither owns nor zeroizes its
+/// buffers, so `scratch` is wiped here instead.
 fn decapsulate(scratch: &mut [u8; pq::SK_LEN], sk: &[u8; pq::SK_LEN], ct: &[u8; pq::CT_LEN], out: &mut [u8; pq::SHK_LEN]) {
     scratch.copy_from_slice(sk);
-    let mut shk = [0u8; pq::SHK_LEN];
-    {
-        let key = cmr::SecretKey::from(&mut *scratch);
-        let shared = cmr::decapsulate(&cmr::Ciphertext::from(*ct), &key, &mut shk);
-        out.copy_from_slice(shared.as_array());
-    }
-    // Both were zeroized when the cmr wrappers dropped; this does not rely on it.
+    mce460896::decaps(scratch, ct, out);
     scratch.zeroize();
-    shk.zeroize();
 }
 
 /// Checks the region: format, `H(spkm)` against the configured value, then

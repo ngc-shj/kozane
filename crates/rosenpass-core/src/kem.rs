@@ -111,52 +111,11 @@ impl Encaps<EPK_LEN, ECT_LEN> for Kyber512 {
     }
 }
 
-/// Classic McEliece 460896 round 3 (classic-mceliece-rust 2.0.2), the
-/// static KEM for RHR5. cmr asks its RNG through `fill_bytes`, which cannot
-/// fail, so a failed draw is remembered and the whole result discarded.
-/// cmr rejection-samples the error vector until the bytes are usable, so
-/// after a failure the adapter must still hand out varied filler, or the
-/// encapsulation would never return.
+/// Classic McEliece 460896 round 3 (`mce460896`), the static KEM for RHR5.
+/// The shim draws its randomness through a closure over `Rng`, so a failed
+/// draw surfaces directly as `EncapsError::Rng`, with no filler bytes
+/// needed to keep a rejection-sampling loop moving.
 pub struct McEliece460896;
-
-struct CmrRng<'a, R: Rng> {
-    rng: &'a mut R,
-    failed: bool,
-    filler: u64,
-}
-
-impl<R: Rng> rand_core::RngCore for CmrRng<'_, R> {
-    fn next_u32(&mut self) -> u32 {
-        let mut b = [0u8; 4];
-        self.fill_bytes(&mut b);
-        u32::from_le_bytes(b)
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        let mut b = [0u8; 8];
-        self.fill_bytes(&mut b);
-        u64::from_le_bytes(b)
-    }
-
-    fn fill_bytes(&mut self, dest: &mut [u8]) {
-        if self.failed || self.rng.fill(dest).is_err() {
-            self.failed = true;
-            // Discarded output; an LCG only has to end cmr's sampling loop.
-            for b in dest.iter_mut() {
-                self.filler = self.filler.wrapping_mul(0x5851_f42d_4c95_7f2d).wrapping_add(1);
-                let [top, ..] = self.filler.to_be_bytes();
-                *b = top;
-            }
-        }
-    }
-
-    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
-        self.fill_bytes(dest);
-        Ok(())
-    }
-}
-
-impl<R: Rng> rand_core::CryptoRng for CmrRng<'_, R> {}
 
 impl Encaps<SPK_LEN, SCT_LEN> for McEliece460896 {
     fn encaps<R: Rng>(
@@ -164,16 +123,12 @@ impl Encaps<SPK_LEN, SCT_LEN> for McEliece460896 {
         pk: &[u8; SPK_LEN],
         rng: &mut R,
     ) -> Result<([u8; SCT_LEN], Secret<SHK_LEN>), EncapsError> {
-        use classic_mceliece_rust as cmr;
-        let mut r = CmrRng { rng, failed: false, filler: 0x9e37_79b9_7f4a_7c15 };
-        let mut buf = [0u8; SHK_LEN];
-        let (ct, ss) = cmr::encapsulate(&cmr::PublicKey::from(pk), &mut buf, &mut r);
-        // cmr's `SharedSecret` zeroizes the borrowed buffer when it drops.
-        let shk = Secret::copy_from(ss.as_array());
-        drop(ss);
-        if r.failed {
-            return Err(EncapsError::Rng);
-        }
-        Ok((*ct.as_array(), shk))
+        let mut ct = [0u8; SCT_LEN];
+        let mut ss = [0u8; SHK_LEN];
+        mce460896::encaps(pk, &mut |out| rng.fill(out).map_err(|_| mce460896::RngError), &mut ct, &mut ss)
+            .map_err(|_| EncapsError::Rng)?;
+        let shk = Secret::copy_from(&ss);
+        zeroize::Zeroize::zeroize(&mut ss);
+        Ok((ct, shk))
     }
 }

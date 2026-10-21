@@ -18,6 +18,3 @@ base64 = "0.23"
 serde_json = "1"
 # M4 plan C8: SHA3-256 of the McEliece public keys in the vectors.
 sha3 = "=0.10.9"
-# The cmr bridge (M4 plan C8, slice M0); removed with the --cmr mode in C11.
-classic-mceliece-rust = { version = "=2.0.2", default-features = false, features = ["mceliece460896", "zeroize"] }
-rand_core = "=0.6.4"
