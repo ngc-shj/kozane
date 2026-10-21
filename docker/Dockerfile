@@ -181,6 +181,8 @@ RUN apt-get update -q && apt-get install -y --no-install-recommends \
     python3-cryptography \
     # M3 interop: rosenpass 0.2.3 (oracle stage) links it
     libsodium23 \
+    # M4 C9: the constant-time gate runs the harness under memcheck
+    valgrind \
     && rm -rf /var/lib/apt/lists/*
 
 ARG ARM_GNU_URL=https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-aarch64-aarch64-none-elf.tar.xz
