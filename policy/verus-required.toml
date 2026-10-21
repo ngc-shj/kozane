@@ -1,0 +1,17 @@
+# Functions each verified crate must keep inside verus! with an ensures
+# (M4 plan C1). Removing a spec, or moving a function out of verus!, fails
+# the Verus gate even when everything left still verifies.
+
+[crates.wg-wire]
+functions = [
+    # C2: the replay window.
+    "below_window", "check_and_update",
+    # C2: the codecs and their round trips.
+    "parse", "emit", "emit_transport_header",
+    "lemma_u32_le_roundtrip", "lemma_u32_le_inverse",
+    "lemma_u64_le_roundtrip", "lemma_u64_le_inverse",
+    "lemma_spec_emit_initiation_parses", "lemma_spec_emit_initiation_inverse",
+    "lemma_spec_emit_response_parses", "lemma_spec_emit_response_inverse",
+    "lemma_spec_emit_cookie_reply_parses", "lemma_spec_emit_cookie_reply_inverse",
+    "lemma_spec_emit_transport_header_parses", "lemma_spec_emit_transport_header_inverse",
+]

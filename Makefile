@@ -25,7 +25,7 @@ host_crates := wire ring audit-event ingress-core inner-core layout laws config 
 kani_crates := wire ring ingress-core inner-core wg-wire msgs rosenpass-wire
 
 .PHONY: clean-counts
-.PHONY: all image package run test check check-selftest audit lint lint-pds unit kani bolero fuzz-long laws pins manifest kernel-config clean
+.PHONY: all image package run test check check-selftest audit lint lint-pds unit kani verus bolero fuzz-long laws pins manifest kernel-config clean
 all: image
 
 $(counts):
@@ -158,6 +158,19 @@ kani: | $(counts)
 		END { print "KANI-HARNESSES", n; for (k in per) print "KANI-" k, per[k] }' \
 		$(counts)/kani.log > $(counts)/kani
 
+# Verus (M4 plan C1): one gate run per crate, serial, under kani-gate's lock.
+verus_crates := wg-wire
+verus: | $(counts)
+	rm -f $(counts)/verus.log
+	$(foreach c,$(verus_crates),echo "VERUS-CRATE $(c)" >> $(counts)/verus.log; \
+		tools/verus-gate.sh -p $(c) >> $(counts)/verus.log \
+		|| { cat $(counts)/verus.log; exit 1; };)
+	awk '/^VERUS-CRATE / { c = toupper($$2); n++ } /^VERUS-VERIFIED/ { v += $$2; per[c] = $$2 } \
+		/^VERUS-ENSURES/ { ens[c] = $$2 } \
+		END { print "VERUS-FUNCTIONS", v; print "VERUS-TRUSTED-CHECKED", n; \
+		for (k in per) { print "VERUS-" k, per[k]; print "VERUS-ENSURES-" k, ens[k] } }' \
+		$(counts)/verus.log > $(counts)/verus
+
 bolero_targets := wire/tests::fuzz_parse_never_panics_and_round_trips \
 	wg-wire/tests::fuzz_parsers_never_panic_and_round_trip \
 	rosenpass-wire/tests::fuzz_parsers_never_panic_and_round_trip
@@ -233,7 +246,7 @@ clean-counts:
 
 check:
 	$(MAKE) clean-counts
-	$(MAKE) pins audit lint lint-pds unit kani bolero laws test
+	$(MAKE) pins audit lint lint-pds unit kani verus bolero laws test
 	$(MAKE) manifest
 
 # Requires a prior `make check` (the manifest case reuses build/counts).

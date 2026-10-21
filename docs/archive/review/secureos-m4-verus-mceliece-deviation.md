@@ -67,3 +67,69 @@ at the pinned commit carries (V0 probe), so the pairing is confirmed.
     differs by 0. The instruction streams are otherwise identical.
   - **Rule kept for later slices:** a function inside `verus!` that was
     inlined before is marked `#[inline]`, so its code shape is unchanged.
+
+## V1 — the Verus gate (C1) and wg-wire (C2)
+
+### Result
+
+- **`make verus`:** `VERUS-WG-WIRE 62`, `VERUS-ENSURES-WG-WIRE 47`,
+  `VERUS-FUNCTIONS 62`, `VERUS-TRUSTED-CHECKED 1`. The second run is a
+  cached pass.
+- **Trusted constructs:** none in wg-wire. `policy/verus-trusted.toml` is
+  empty.
+- **check-selftest:** all five cases fail for their named reason:
+
+  | Case | Needle |
+  |---|---|
+  | `verus-cache` | both sides checked |
+  | `verus-trusted` | the cfg_attr spelling |
+  | `verus-required` | — |
+  | `verus-wg-wire-window` | `r == (c + window < top)` |
+  | `verus-wg-wire-roundtrip` | `r is Ok <==> (bytes@.len() == INITIATION_LEN as int` |
+
+- **Other checks:**
+  - unit 716 (wg-wire 13), unchanged;
+  - Kani wg-wire 5/5;
+  - bolero wg-wire;
+  - `cargo clippy -p wg-wire -D warnings`.
+
+### Deviations
+
+- **Codec refactor (C2, plan: refactor to forms vstd specifies).**
+  - `Reader`/`Writer` used `split_first_chunk`, `split_at_mut_checked` and
+    `core::mem::take`, and vstd has no specs for them. They are replaced by
+    `read_array::<N>` and `write_at`, using `get`/`get_mut` over literal
+    ranges and `checked_add`, plus shift/mask LE conversions.
+  - Array-pattern destructuring is not supported by Verus, so literal
+    indexing into fixed arrays is used instead. Clippy's `indexing_slicing`
+    does not flag that.
+  - Behaviour is unchanged. The unit tests, Kani and bolero pass
+    unmodified.
+- **The round trip is a pair of spec lemmas per type.** For each type,
+  `lemma_spec_emit_*_parses` and `lemma_spec_emit_*_inverse` relate a
+  field-level `spec_emit_*` to `parse`'s field formulas. Each emitter's
+  `ensures` is `final(out)@.subrange(0, LEN) == spec_emit_*(…)`.
+  - The lemmas take field values, not a struct, because spec code cannot
+    construct `[u8; N]` from a `Seq`.
+  - The LE lemmas extract bytes before `by (bit_vector)`, which rejects
+    `Seq` indexing.
+- **ReplayWindow:**
+  - It gains a `Ghost<Set<int>>` field `accepted`, of zero size.
+  - `WINDOW` is computed without `saturating_sub`, which Verus cannot call
+    in a const; the value is unchanged.
+  - `new()` is no longer a `const fn`, because a ghost field cannot be
+    initialised in one. No const caller exists: wg-core calls it from
+    `Session::new`.
+  - `well_formed`, `top_value` and `has_accepted` are `closed` spec fns,
+    because the fields are private.
+  - The invariant adds `(BITS as u64) < u64::MAX`, so that the clearing
+    loop's step counter cannot wrap.
+- **The `.text` record for V1:**
+  - **Unchanged (normalised):** key, pq, pqkey and audit.
+  - **Changed:** data, hs and ingress, the users of the wg-wire codecs.
+    Their instruction counts went 10601→10605, 19471→19598 and
+    22683→22812: per-field bounds checks.
+  - **Panic paths:** the count of `core::panicking`/`slice::index` call
+    sites is unchanged in all three (124, 210, 163). The refactor added no
+    panic path.
+  - This is a reviewed code-shape change, as the plan allows.

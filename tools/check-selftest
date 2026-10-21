@@ -88,6 +88,8 @@ CASES_FOR_GATE = {
              "rp-cookie-domain", "rp-legacy-probe", "rp-conf-share", "rp-awaited", "rp-proven-reserve", "rp-sid-binding", "rp-nat",
              "rp-cookie-offload", "rp-tx-tier", "rp-reply-fifo", "rp-reply-order", "rp-reply-dst", "rp-sync-sticky"},
     "kani": {"kani", "kani-cache"},
+    "verus": {"verus-cache", "verus-trusted", "verus-required", "verus-wg-wire-window",
+              "verus-wg-wire-roundtrip"},
     "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire"},
     "laws": {"laws", "laws-timer-ingress", "laws-pq-key", "laws-hs-pqkey", "laws-pq-secrets-writable"},
     "test": {"integration", "integration-count", "integration-residue", "integration-cookie",
@@ -155,6 +157,39 @@ CASES = {
     "kani-cache": (["kani", "kani_crates=ingress-core"],
                    lambda t: append(t, "crates/wire/src/lib.rs", "\n// selftest: cache key input\n"),
                    "Checking harness"),
+    # The Verus gate (M4 plan C1). The cache: an edit to the verified crate
+    # re-verifies it rather than serving the copied pass.
+    "verus-cache": (["verus", "verus_crates=wg-wire"],
+                    lambda t: append(t, "crates/wg-wire/src/replay.rs", "\n// selftest: cache key input\n"),
+                    "VERUS-VERIFIED"),
+    # C2: each mutation is caught by the clause it breaks (Verus prints the
+    # failing ensures' source span). The window: a legal counter exactly
+    # WINDOW below the top rejected.
+    "verus-wg-wire-window": (["verus", "verus_crates=wg-wire"],
+                             lambda t: edit(t, "crates/wg-wire/src/replay.rs",
+                                            "c.saturating_add(window) < top", "c.saturating_add(window) <= top"),
+                             "r == (c + window < top)"),
+    # The codec: an initiation with non-zero reserved bytes accepted.
+    "verus-wg-wire-roundtrip": (["verus", "verus_crates=wg-wire"],
+                                lambda t: edit(t, "crates/wg-wire/src/lib.rs",
+                                               "        if t != MSG_INITIATION {\n            return Err(WireError::WrongType);\n        }\n"
+                                               "        if r0 != 0 || r1 != 0 || r2 != 0 {\n            return Err(WireError::ReservedNonZero);\n        }\n",
+                                               "        if t != MSG_INITIATION {\n            return Err(WireError::WrongType);\n        }\n"),
+                                "r is Ok <==> (bytes@.len() == INITIATION_LEN as int"),
+    # An unlisted trusted construct, in the cfg_attr spelling the scanner
+    # must still see.
+    "verus-trusted": (["verus", "verus_crates=wg-wire"],
+                      lambda t: edit(t, "crates/wg-wire/src/replay.rs",
+                                     "#[inline]\nfn below_window(",
+                                     "#[inline]\n#[cfg_attr(verus_keep_ghost, verifier::external_body)]\nfn below_window("),
+                      "trusted construct `external_body` not in the allowlist"),
+    # A required function moved out of verus!: it still compiles, nothing
+    # left fails verification, but the spec is gone.
+    "verus-required": (["verus", "verus_crates=wg-wire"],
+                       lambda t: edit(t, "crates/wg-wire/src/replay.rs",
+                                      "use vstd::prelude::*;\n\nverus! {\n",
+                                      "use vstd::prelude::*;\n\n"),
+                       "required function `below_window` is not defined inside verus!"),
     # End to end through the real `check` rule, once per gate: see
     # run_propagation(). The tuple is only a placeholder for the case table.
     "check-propagation": ([], lambda t: None, ""),
@@ -463,8 +498,8 @@ def copy_repo(dst: pathlib.Path):
             shutil.copy2(item, dst / item.name)
 
 
-EXPECT_SUCCESS = {"kani-cache"}
-ABSENT = {"kani-cache": "cached pass"}
+EXPECT_SUCCESS = {"kani-cache", "verus-cache"}
+ABSENT = {"kani-cache": "cached pass", "verus-cache": "cached pass"}
 
 
 def rule_prerequisites(text: str) -> dict:
@@ -553,13 +588,14 @@ def run_case(name: str) -> bool:
             shutil.copytree(ROOT / "build/counts", tree / "build/counts")
         # Start from the real proof cache, so an injection is detected only
         # if it changes the cache key.
-        if "kani" in targets and (ROOT / "build/kani-cache").is_dir():
-            shutil.copytree(ROOT / "build/kani-cache", tree / "build/kani-cache")
-        if name == "kani-cache":
+        for gate in ("kani", "verus"):
+            if gate in targets and (ROOT / f"build/{gate}-cache").is_dir():
+                shutil.copytree(ROOT / f"build/{gate}-cache", tree / f"build/{gate}-cache")
+        if name in ("kani-cache", "verus-cache"):
             # Allow side first: the uninjected copy must hit the cache, or
             # the injected run below would prove nothing about the key.
             pre = subprocess.run(["make", "-C", str(tree), *targets], capture_output=True, text=True, env=MAKE_ENV)
-            pre_path = tree / "build/counts/kani.log"
+            pre_path = tree / f"build/counts/{name.split('-')[0]}.log"
             pre_log = pre_path.read_text(errors="replace") if pre_path.exists() else ""
             if pre.returncode != 0 or "cached pass" not in pre_log:
                 print(f"FAIL {name}: uninjected copy did not hit the proof cache")
