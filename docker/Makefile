@@ -3,7 +3,8 @@ container := secureos-dev
 repo := $(abspath ..)
 # Hard cap (swap included) so a runaway cbmc is OOM-killed inside the
 # container instead of thrashing the host; one Kani proof peaks near 28 GB.
-memory ?= 64g
+# 64g still froze the host (121 GB, ~38 GB held by other services) in M3b.
+memory ?= 40g
 
 .PHONY: build
 build:
