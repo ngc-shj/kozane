@@ -368,17 +368,22 @@ class Monitor:
             os.unlink(path)
         except FileNotFoundError:
             pass
-        self.sock.sendall(f"pmemsave {addr:#x} {size:#x} {json.dumps(path)}\n".encode())
-        reply = self._read_until(b"(qemu) ")
-        if not os.path.exists(path):
-            detail = reply.decode(errors="replace").strip()
-            raise Fail(f"pmemsave did not create {path}: {detail}")
+        # The dump holds guest RAM, secrets region included: it is removed on
+        # every path, the monitor I/O's failures too (M3b plan T4).
+        # A full-RAM dump takes longer than a monitor line.
+        self.sock.settimeout(max(LINE_TIMEOUT_S, size >> 26))
         try:
+            self.sock.sendall(f"pmemsave {addr:#x} {size:#x} {json.dumps(path)}\n".encode())
+            reply = self._read_until(b"(qemu) ")
+            if not os.path.exists(path):
+                detail = reply.decode(errors="replace").strip()
+                raise Fail(f"pmemsave did not create {path}: {detail}")
             with open(path, "rb") as f:
                 data = f.read()
         finally:
-            # The dump holds guest RAM, secrets region included.
-            os.unlink(path)
+            self.sock.settimeout(LINE_TIMEOUT_S)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
         if len(data) != size:
             raise Fail(f"pmemsave returned {len(data)} of {size} bytes")
         return data
@@ -409,6 +414,32 @@ def wait_absent(mon: Monitor, needle: bytes, control: bytes, scratch: str, timeo
         if time.monotonic() > deadline:
             raise Fail(f"{what} still in guest RAM at {base + at:#x}")
         time.sleep(0.2)
+
+
+# All of guest RAM (`-m size=2G` from the virt machine's RAM base), for the
+# OSK residue scan (M3b plan C7, VE12).
+GUEST_RAM = (0x4000_0000, 0x8000_0000)
+
+
+def scan_absent(mon: Monitor, needle: bytes, control: bytes, scratch: str, what: str, control_what: str):
+    """`needle` occurs nowhere in all of guest RAM while `control` does, in
+    one snapshot; one retry after hs's 1 Hz tick. Prints how often the
+    control occurs (recorded, not asserted: a copy outside hs's table is a
+    finding to fix, M3b T7)."""
+    base, size = GUEST_RAM
+    for attempt in range(2):
+        ram = mon.pmem(base, size, scratch)
+        copies = ram.count(control)
+        if copies == 0:
+            raise Fail(f"guest RAM scan: {control_what} not found; the scan proves nothing")
+        at = ram.find(needle)
+        del ram
+        if at < 0:
+            print(f"\nguest RAM scan: {control_what} occurs {copies} time(s)", flush=True)
+            return
+        if attempt == 0:
+            time.sleep(1.5)
+    raise Fail(f"{what} still in guest RAM at {base + at:#x}")
 
 
 def install_len_from_rust() -> int:
@@ -747,13 +778,21 @@ class Rosenpass:
     mksecrets wrote, aimed at `endpoint`. A start removes the old key_out,
     so every key read afterwards comes from this run."""
 
-    def __init__(self, deploy: str, peer: int, endpoint: str, binary: str = RP_MASTER):
+    def __init__(self, deploy: str, peer: int, endpoint: str, binary: str = RP_MASTER, listen_port: int = 0):
         self.deploy, self.peer, self.binary = deploy, peer, binary
+        self.listen_port = listen_port
         self.key_out = os.path.join(deploy, f"peer-{peer}.osk")
         text = open(os.path.join(deploy, f"peer-{peer}.rosenpass.toml")).read()
         text, n = re.subn(r'^endpoint = ".*"$', f'endpoint = "{endpoint}"', text, flags=re.M)
         if n != 1:
             raise Fail(f"peer-{peer}.rosenpass.toml: expected one endpoint line, found {n}")
+        if listen_port:
+            # A fixed source port, so the gateway sees one endpoint for this
+            # client across restarts (the cookie and proven state are per
+            # endpoint, M3b).
+            text, n = re.subn(r"^listen = \[\]$", f'listen = ["{ip_str(PEER_IP)}:{listen_port}"]', text, flags=re.M)
+            if n != 1:
+                raise Fail(f"peer-{peer}.rosenpass.toml: expected one empty listen line, found {n}")
         self.conf = os.path.join(deploy, f"rp-{peer}.toml")
         with open(os.open(self.conf, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w") as f:
             f.write(text)
@@ -1035,6 +1074,11 @@ def test_wireguard(loader: str, deploy: str, passed: list):
             raise Fail(f"rotation: {pinger.lost} of {pinger.sent} pings lost, budget {ROTATION_PING_LOSS}")
         passed.append("rotation without interruption")
         print("\nPASS [rotation: new OSK accepted and applied, pings kept flowing]")
+        # C7: the superseded OSK is gone from all of guest RAM; the new one,
+        # accepted just above, is the control.
+        scan_absent(mon, old, new, scratch, "superseded OSK", "peer 0's current OSK")
+        passed.append("superseded OSK gone from guest RAM")
+        print("\nPASS [guest RAM: the superseded OSK occurs nowhere]")
 
         # L8 pair [T3]: peer 1 has run no Rosenpass, so hs has no PSK for it
         # and refuses (an absent PSK is never a zero one); meanwhile peer 0
@@ -1170,6 +1214,13 @@ def test_wireguard(loader: str, deploy: str, passed: list):
         con.wait_for(r"audit: src=hs HandshakePskStale total=1 ", since=expiry["mark"])
         passed.append("PSK expiry")
         print("\nPASS [expiry: accepted before REJECT_AFTER_TIME, HandshakePskStale after]")
+        # C7: peer 1's expired OSK is gone from all of guest RAM; peer 0's
+        # key, accepted just before the scan, is the control.
+        live0 = rp0.wait_key(time.monotonic() + RP_EXCHANGE_S)
+        installed(peer0, rp0, time.monotonic() + RP_EXCHANGE_S, key=live0)
+        scan_absent(mon, osk1, live0, scratch, "expired OSK", "peer 0's live OSK")
+        passed.append("expired OSK gone from guest RAM")
+        print("\nPASS [guest RAM: peer 1's expired OSK occurs nowhere]")
 
         # Reboot [S11]: an initiation that drew an opening response before a
         # system_reset is refused with HandshakePskMissing after it, before
@@ -1968,6 +2019,33 @@ def sniffed_init_hello(sniffer: Sniffer) -> bytes:
     raise Fail("no InitHello from the client was sniffed")
 
 
+def wait_rp_load_clear(con: Console, timeout: float = 0.0):
+    """Until the Rosenpass cookie gate is off: as many RpLoadCleared as
+    RpUnderLoad lines (both never coalesced, so their totals count every
+    edge). Bounded by the hold plus a margin."""
+    hold = rust_usize(INGRESS_CORE, "RP_UNDER_LOAD_AFTER_NS") / 1e9
+    deadline = time.monotonic() + (timeout or hold + LINE_TIMEOUT_S)
+    while True:
+        entered = [int(n) for n in con.count(r"audit: src=ingress RpUnderLoad total=(\d+) ")]
+        cleared = [int(n) for n in con.count(r"audit: src=ingress RpLoadCleared total=(\d+) ")]
+        if max(entered, default=0) == max(cleared, default=0):
+            return
+        if time.monotonic() > deadline:
+            raise Fail("the Rosenpass cookie gate did not clear within its hold")
+        time.sleep(0.2)
+
+
+def wait_rp_gate_off(con: Console):
+    """Off load and past the legacy probe window (M3b deviation, trigger
+    4), so an uncookied InitHello is neither cookied nor re-arms load and
+    only the off-load meters decide it. The window ends at most
+    RP_LEGACY_PROBE_NS after the clearance line, so after a load this waits
+    that long from the clearance, plus a second."""
+    wait_rp_load_clear(con)
+    if con.count(r"audit: src=ingress RpLoadCleared total=\d+ "):
+        time.sleep(rust_usize(INGRESS_CORE, "RP_LEGACY_PROBE_NS") / 1e9 + 1)
+
+
 def rp_deny_cases(con: Console, hello: bytes, passed: list):
     """ingress's Rosenpass gates, paired [C4]: a genuine InitHello (sniffed
     from a client) with one mac byte flipped is refused as RpBadMac and
@@ -1979,11 +2057,13 @@ def rp_deny_cases(con: Console, hello: bytes, passed: list):
     mac_at = len(hello) - rust_usize(ROSENPASS_WIRE, "COOKIE_LEN") - rust_usize(ROSENPASS_WIRE, "MAC_LEN")
     src_interval = rust_usize(INGRESS_CORE, "RP_HELLO_SRC_INTERVAL_NS") / 1e9
     global_interval = rust_usize(INGRESS_CORE, "RP_HELLO_GLOBAL_INTERVAL_NS") / 1e9
+    reserve = rust_usize(INGRESS_CORE, "RP_HELLO_PROVEN_RESERVE")
     cost = rust_usize(PQKEY_CORE, "PQ_HANDSHAKE_COST_NS") / 1e9
-    # Waiting out the source meter must refill the global one by at least
-    # two tokens: one for the genuine bytes, one left for the replay.
-    if src_interval + 1 < 2 * global_interval:
-        raise Fail("rosenpass bucket: the source wait no longer refills the global meter twice")
+    # The genuine bytes travel off load as an unproven source (M3b): the
+    # global meter must hold more than the proven reserve for them, plus one
+    # token for the replay so only the per-source meter can refuse it. From
+    # empty that is (reserve + 2) refill intervals.
+    refill_wait = max(src_interval + 1, (reserve + 2) * global_interval)
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
     def resp_hellos(window: float, first: bool = False) -> int:
@@ -2009,10 +2089,15 @@ def rp_deny_cases(con: Console, hello: bytes, passed: list):
         s.sendto(bytes(bad), (ip_str(GW_IP), RP_PORT))
         con.wait_for(r"audit: src=ingress RpBadMac total=1 ", since=mark)
         # The client's own InitHellos came from this source: wait out its
-        # meter (watching for any answer to the flipped bytes), so only the
-        # mac decides the genuine bytes' fate.
-        if resp_hellos(src_interval + 1):
+        # meter and refill the global one (watching for any answer to the
+        # flipped bytes), so only the mac decides the genuine bytes' fate.
+        if resp_hellos(refill_wait):
             raise Fail("rosenpass mac pair: the flipped-mac InitHello got a RespHello")
+        # And off load, past the probe window: the client exchanges before
+        # may have engaged the cookie gate, under which these cookie-less
+        # bytes would only draw a CookieReply, and inside the window the
+        # genuine bytes would re-arm it before their replay arrives.
+        wait_rp_gate_off(con)
         # The genuine bytes and, milliseconds later, their replay: both land
         # inside the source interval the first one opens, by construction
         # (a replay at exactly that interval would be admitted again).
@@ -2029,6 +2114,424 @@ def rp_deny_cases(con: Console, hello: bytes, passed: list):
         print("\nPASS [rosenpass bucket: a replay inside the source interval drew no RespHello]")
     finally:
         s.close()
+
+
+# ---------------------------------------------------------------- the Rosenpass cookie gate (M3b plan C6)
+
+RP_HELLO, RP_RESP_HELLO, RP_CONF, RP_EMPTY, RP_COOKIE_REPLY = 0x81, 0x82, 0x83, 0x84, 0x86
+# The MCE-COST spread between the maximum and the median handshake
+# (16.1 - 8.5 = 7.6 s) plus pq's and hs's 1 Hz ticks, rounded up [T15].
+RP_SLACK_S = 10.0
+RP_BACKOFF_CAP_S = 10.0        # upstream's retransmission cap (constants.rs)
+RP_MCE_MAX_S = 16.1            # MCE-COST maximum InitHello cost at pq's budget
+# Fixed client ports, so each client is one endpoint to the gateway.
+RP_CLIENT_PORTS = (42001, 42002, 42003)
+RP_SPOOF_PORT = 42999          # the per-IP spoofer's port at the victim's address
+RP_SPOOF_RATE = 1.0            # per second: keeps the victim's per-IP token at zero [T3]
+
+
+def rp_frames(sniffer: Sniffer, i0: int, *, outgoing=None, sport=None, dport=None, kind=None, src=None, dst=None):
+    """Sniffed Rosenpass datagrams since `i0`: (time, payload, src ip, sport,
+    dst ip, dport). `outgoing` is the tap's view: True for frames sent to
+    the gateway."""
+    out = []
+    for when, f, og in sniffer.since(i0):
+        u = udp_fields(f)
+        if u is None:
+            continue
+        sip, sp, dip, dp, p = u
+        if ((outgoing is not None and og != outgoing) or (sport is not None and sp != sport)
+                or (dport is not None and dp != dport) or (kind is not None and (not p or p[0] != kind))
+                or (src is not None and sip != src) or (dst is not None and dip != dst)):
+            continue
+        out.append((when, p, sip, sp, dip, dp))
+    return out
+
+
+def rp_attribute_cookie(sniffer: Sniffer, i0: int, port: int, spkm: bytes, what: str):
+    """The cookie path end to end for the client at `port` [T8]: a
+    CookieReply to its port opens with the public cookie key and the mac of
+    one of its InitHellos; a later InitHello from it carries the cookie
+    field for that value; a RespHello to its port follows that InitHello.
+    (RpCookieAccepted is coalesced, so within a boot only its first line is
+    printed; the RespHello is the per-client proof.)"""
+    hellos = rp_frames(sniffer, i0, outgoing=True, sport=port, dport=RP_PORT, kind=RP_HELLO)
+    replies = rp_frames(sniffer, i0, outgoing=False, sport=RP_PORT, dport=port, kind=RP_COOKIE_REPLY)
+    if not replies:
+        raise Fail(f"{what}: no CookieReply reached the client's port")
+    for rt, reply, *_ in replies:
+        for _, hello, *_ in hellos:
+            try:
+                value = rp_cookie.open_cookie_reply(spkm, reply, hello)
+            except Exception:
+                continue
+            for ht, h2, *_ in hellos:
+                if ht > rt and rp_cookie.cookie_ok(h2, value):
+                    # The RespHello names the initiator's sidi (sidr ||
+                    # sidi after the header), so it answers this InitHello
+                    # and not another initiation from the same port.
+                    answered = rp_frames(sniffer, i0, outgoing=False, sport=RP_PORT, dport=port, kind=RP_RESP_HELLO)
+                    if any(at > ht and r[8:12] == h2[4:8] for at, r, *_ in answered):
+                        return
+                    raise Fail(f"{what}: the cookied InitHello got no RespHello naming its sidi")
+            raise Fail(f"{what}: the client never resent with the cookie it was given")
+    raise Fail(f"{what}: no CookieReply to the client opens for one of its InitHellos")
+
+
+class RpSpoof:
+    """Datagrams to the Rosenpass port from (ip, port) sources, at `rate`
+    per second, cycling payloads and sources, on the tap by a helper thread
+    (the shape of `Flood`). A case that relies on the attack calls
+    `verify` at its judgment point: an attack that stopped or fell short
+    fails the case instead of passing it vacuously."""
+
+    # Delivered datagrams below this share of the scheduled ones fail
+    # `verify`.
+    MIN_DELIVERED = 0.9
+
+    def __init__(self, tap: Tap, payloads: list, sources: list, rate: float):
+        self.frames = [ipv4_udp(ip, GW_IP, port, RP_PORT, payloads[i % len(payloads)])
+                       for i, (ip, port) in enumerate(sources)]
+        self.tap, self.rate = tap, rate
+        # `due` counts scheduled sends, `sent` only those the tap took.
+        self.due, self.sent, self.dropped = 0, 0, 0
+        self.t0 = time.monotonic()
+        self.stopped = False
+        self.error = None
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        start_without_stop_signals(self.thread)
+
+    def _run(self):
+        try:
+            while not self.stopped:
+                due = int((time.monotonic() - self.t0) * self.rate) - self.due
+                for _ in range(min(due, 256)):
+                    try:
+                        self.tap.send(self.frames[self.due % len(self.frames)])
+                        self.sent += 1
+                    except OSError as e:
+                        if e.errno != errno.ENOBUFS:
+                            raise
+                        self.dropped += 1
+                    self.due += 1
+                time.sleep(0.005)
+        except BaseException as e:
+            self.error = e
+
+    def verify(self, what: str):
+        """The attack is still running and delivered at its rate so far."""
+        if self.error is not None:
+            raise Fail(f"{what}: the spoofer failed: {self.error!r}")
+        if not self.thread.is_alive():
+            raise Fail(f"{what}: the spoofer stopped before the judgment")
+        scheduled = int((time.monotonic() - self.t0) * self.rate)
+        if scheduled == 0 or self.sent < self.MIN_DELIVERED * scheduled:
+            raise Fail(f"{what}: the spoofer delivered {self.sent} of {scheduled} datagrams "
+                       f"({self.dropped} dropped)")
+
+    def close(self):
+        # Teardown also calls this: it never raises (verify reports).
+        self.stopped = True
+        self.thread.join(timeout=5)
+
+
+def spoof_ips(n: int) -> list:
+    return [(bytes([172, 17, i // 250, 1 + i % 250]), 30000 + i) for i in range(n)]
+
+
+def spoof_answers_bounded(con: Console, sniffer: Sniffer, i0: int, mark, spoofed, what: str, pending: int = 0):
+    """Under load a spoofed InitHello reaches `pq` only as the one legacy
+    probe after each clearance (M3b deviation, "trigger 4"), so the
+    RespHellos to spoofed sources (`spoofed(ip, port)`), each one InitHello
+    `pq` processed for a spoofer, are at most the RpLoadCleared lines since
+    `mark` (never coalesced) plus `pending`, the spoofs already forwarded
+    when load engaged. Returns the CookieReplies to spoofed sources."""
+    answers = [f for f in rp_frames(sniffer, i0, outgoing=False, sport=RP_PORT) if spoofed(f[4], f[5])]
+    resp = sum(1 for f in answers if f[1][0] == RP_RESP_HELLO)
+    cleared = len(con.count(r"audit: src=ingress RpLoadCleared total=\d+ ", since=mark))
+    if resp > cleared + pending:
+        raise Fail(f"{what}: {resp} RespHellos to spoofed sources under load, {cleared} clearances")
+    return sum(1 for f in answers if f[1][0] == RP_COOKIE_REPLY)
+
+
+def no_sync_death(con: Console, what: str):
+    """I9 at the integration level [T14]: the pq completion protocol never
+    broke for an honest pq."""
+    for line in ("RpPqSyncDead", "RpPqRecordStuck"):
+        if con.count(rf"audit: src=(?:ingress|pq) {line} "):
+            raise Fail(f"{what}: {line} logged with an honest pq")
+
+
+def rp_exchange(rp: Rosenpass, budget: float, what: str) -> bytes:
+    try:
+        return rp.wait_key(time.monotonic() + budget)
+    except Fail as e:
+        raise Fail(f"{what}: {e}") from e
+
+
+def rp_spoof_case(con, tap, sniffer, deploy, spkm, endpoint, hello, rps):
+    """S-3 [T3, T10]: one victim's address spoofed once per second with a
+    replay of its own InitHello. The per-IP token stays at zero, so the
+    victim's next exchange needs the cookie path. Deny side: selftest
+    rp-cookie-gate, the gate never holding."""
+    wait_rp_load_clear(con)
+    mark = con.mark()
+    spoof = RpSpoof(tap, [hello], [(PEER_IP, RP_SPOOF_PORT)], RP_SPOOF_RATE)
+    rps.append(spoof)
+    try:
+        con.wait_for(r"audit: src=ingress RpUnderLoad total=\d+ ", since=mark, timeout=10 * RP_SPOOF_RATE + LINE_TIMEOUT_S)
+        engaged = con.mark()
+        i0 = len(sniffer.since(0))
+        victim = Rosenpass(deploy, 0, endpoint, listen_port=RP_CLIENT_PORTS[0])
+        rps.append(victim)
+        try:
+            victim.wait_key(time.monotonic() + RP_EXCHANGE_S + RP_BACKOFF_CAP_S)
+        except Fail as e:
+            raise Fail("rp spoof: the victim's exchange did not complete under the spoof") from e
+        spoof.verify("rp spoof")
+        rp_attribute_cookie(sniffer, i0, RP_CLIENT_PORTS[0], spkm, "rp spoof")
+        # The spoofs forwarded before load engaged may still be answered.
+        pending = rust_usize(INGRESS_CORE, "RP_HELLO_IN_FLIGHT")
+        if not spoof_answers_bounded(con, sniffer, i0, engaged, lambda ip, port: (ip, port) == (PEER_IP, RP_SPOOF_PORT),
+                                     "rp spoof", pending):
+            raise Fail("rp spoof: the spoofed endpoint got no CookieReply under load")
+        victim.stop()
+    finally:
+        spoof.close()
+
+
+def rp_nat_case(con, sniffer, deploy, spkm, endpoint, rps):
+    """F3: two clients behind one address start together; both export, the
+    second through the cookie path."""
+    wait_rp_load_clear(con)
+    i0 = len(sniffer.since(0))
+    clients = [Rosenpass(deploy, p, endpoint, listen_port=RP_CLIENT_PORTS[p]) for p in (0, 1)]
+    rps.extend(clients)
+    deadline = time.monotonic() + RP_EXCHANGE_S + RP_BACKOFF_CAP_S
+    for c in clients:
+        try:
+            c.wait_key(deadline)
+        except Fail as e:
+            raise Fail(f"rp nat: client {c.peer} behind the shared address did not export") from e
+    cookied = [p for p in (0, 1) if rp_frames(sniffer, i0, outgoing=False, dport=RP_CLIENT_PORTS[p], kind=RP_COOKIE_REPLY)]
+    if not cookied:
+        raise Fail("rp nat: neither client took the cookie path; the per-IP refusal never engaged the gate")
+    for p in cookied:
+        rp_attribute_cookie(sniffer, i0, RP_CLIENT_PORTS[p], spkm, f"rp nat client {p}")
+    for c in clients:
+        c.stop()
+
+
+def rp_fan_in_case(con, deploy, endpoint, rps):
+    """F1, T8: three clients start together; one InitHello exceeds the cap of
+    two in flight and is resent on upstream's backoff. All complete within
+    three maximal handshakes, one backoff and the slack (T12). The 8-peer
+    bound is derived (I4), not measured."""
+    wait_rp_load_clear(con)
+    start = time.monotonic()
+    clients = [Rosenpass(deploy, p, endpoint, listen_port=RP_CLIENT_PORTS[p]) for p in (0, 1, 2)]
+    rps.extend(clients)
+    budget = 3 * RP_MCE_MAX_S + RP_BACKOFF_CAP_S + RP_SLACK_S
+    for c in clients:
+        try:
+            c.wait_key(start + budget)
+        except Fail as e:
+            raise Fail(f"rp fan-in: client {c.peer} not done within {budget:.0f} s") from e
+    for c in clients:
+        c.stop()
+
+
+def rp_global_drain_case(con, tap, sniffer, deploy, endpoint, hello, rps):
+    """Spoofed InitHellos from rotating addresses at 0.2/s while a client
+    exchanges, under load (engaged first by a per-IP spoof): `pq` sees no
+    spoof but the legacy probe after each clearance (`RpInitHello` rises
+    only by the client's exchanges and those probes, observed as
+    RespHellos to spoofed addresses), the spoofs get CookieReplies, and the
+    client completes."""
+    wait_rp_load_clear(con)
+    mark = con.mark()
+    engage = RpSpoof(tap, [hello], [(PEER_IP, RP_SPOOF_PORT)], 10.0)
+    rps.append(engage)
+    try:
+        con.wait_for(r"audit: src=ingress RpUnderLoad total=\d+ ", since=mark)
+    finally:
+        engage.close()
+    engaged = con.mark()
+    i0 = len(sniffer.since(0))
+    sources = spoof_ips(64)
+    spoof = RpSpoof(tap, [hello], sources, 0.2)
+    rps.append(spoof)
+    try:
+        client = Rosenpass(deploy, 0, endpoint, listen_port=RP_CLIENT_PORTS[0])
+        rps.append(client)
+        rp_exchange(client, RP_EXCHANGE_S + RP_BACKOFF_CAP_S, "rp global drain")
+        spoof.verify("rp global drain")
+        client.stop()
+    finally:
+        spoof.close()
+    spoofed = {ip for ip, _ in sources}
+    if not spoof_answers_bounded(con, sniffer, i0, engaged, lambda ip, _: ip in spoofed, "rp global drain"):
+        raise Fail("rp global drain: no spoofed source got a CookieReply")
+
+
+def rp_conf_share_case(con, tap, deploy, endpoint, hello, conf, rps):
+    """S-3, I5: a spoofed InitConf flood at the conf-global rate plus an
+    InitHello flood while a client exchanges; its InitConf still lands (a
+    fresh key_out opens a handshake)."""
+    wait_rp_load_clear(con)
+    sources = spoof_ips(128)
+    confs = RpSpoof(tap, [conf], sources, 1e9 / rust_usize(INGRESS_CORE, "RP_CONF_GLOBAL_INTERVAL_NS"))
+    hellos = RpSpoof(tap, [hello], sources[::-1], 2.0)
+    rps.extend([confs, hellos])
+    try:
+        client = Rosenpass(deploy, 0, endpoint, listen_port=RP_CLIENT_PORTS[0])
+        rps.append(client)
+        rp_exchange(client, RP_EXCHANGE_S + RP_BACKOFF_CAP_S, "rp conf share")
+        confs.verify("rp conf share: InitConf flood")
+        hellos.verify("rp conf share: InitHello flood")
+        client.stop()
+    finally:
+        confs.close()
+        hellos.close()
+
+
+def rp_combined_flood_case(con, tap, gw_pub, deploy, endpoint, hello, rps):
+    """S2: the WireGuard band flood plus spoofed InitHellos at a high rate
+    under load; a master client still completes. Tier-2 suppressions are
+    printed for the deviation log."""
+    wait_rp_load_clear(con)
+    mark = con.mark()
+    flood = Flood(tap, gw_pub)
+    rps.append(flood)
+    flood.set_rate(BAND_RATE * arrival_refill())
+    spoof = RpSpoof(tap, [hello], spoof_ips(256), 200.0)
+    rps.append(spoof)
+    try:
+        client = Rosenpass(deploy, 0, endpoint, listen_port=RP_CLIENT_PORTS[0])
+        rps.append(client)
+        rp_exchange(client, RP_EXCHANGE_S + RP_BACKOFF_CAP_S, "rp combined flood")
+        spoof.verify("rp combined flood")
+        client.stop()
+    finally:
+        spoof.close()
+        flood.close()
+    suppressed = [int(n) for n in con.count(r"audit: src=ingress RpCookieSuppressed total=(\d+) ", since=mark)]
+    print(f"\nrp combined flood: RpCookieSuppressed total up to {max(suppressed, default=0)} (coalesced)", flush=True)
+
+
+def rp_latency_case(con, tap, gw_pub, deploy, endpoint, hello, rps):
+    """Both directions: a WireGuard handshake under a Rosenpass flood, and a
+    Rosenpass exchange under the WireGuard band flood, each in its budget."""
+    wait_rp_load_clear(con)
+    client = Rosenpass(deploy, 0, endpoint, listen_port=RP_CLIENT_PORTS[0])
+    rps.append(client)
+    rp_exchange(client, RP_EXCHANGE_S, "rp latency setup")
+    spoof = RpSpoof(tap, [hello], spoof_ips(256), 200.0)
+    rps.append(spoof)
+    try:
+        conf0 = open(os.path.join(deploy, "peer-0.conf")).read()
+        budget = 3 * REKEY_ATTEMPT_S + HANDSHAKE_SLACK_S
+        start = time.monotonic()
+        peer = py_installed(conf0, gw_pub, client, start + budget)
+        peer.close()
+        spoof.verify("rp latency")
+    except Fail as e:
+        raise Fail(f"rp latency: no WireGuard handshake within {budget:.0f} s under a Rosenpass flood") from e
+    finally:
+        spoof.close()
+        client.stop()
+    wait_rp_load_clear(con)
+    flood = Flood(tap, gw_pub)
+    rps.append(flood)
+    flood.set_rate(BAND_RATE * arrival_refill())
+    try:
+        client.start()
+        rp_exchange(client, RP_EXCHANGE_S, "rp latency: a Rosenpass exchange under the WireGuard band flood")
+        client.stop()
+    finally:
+        flood.close()
+
+
+def rp_old_client_case(con, tap, deploy, endpoint, hello, rps):
+    """VE13 [T11]: with load held (engaged by a per-IP spoof), a 0.2.3 client
+    gets no RespHello; once the gate clears (RpLoadCleared since the mark)
+    it completes."""
+    wait_rp_load_clear(con)
+    mark = con.mark()
+    spoof = RpSpoof(tap, [hello], [(PEER_IP, RP_SPOOF_PORT)], 10.0)
+    rps.append(spoof)
+    con.wait_for(r"audit: src=ingress RpUnderLoad total=\d+ ", since=mark)
+    spoof.close()
+    old = Rosenpass(deploy, 2, endpoint, RP_023, listen_port=RP_CLIENT_PORTS[2])
+    rps.append(old)
+    hold = rust_usize(INGRESS_CORE, "RP_UNDER_LOAD_AFTER_NS") / 1e9
+    con.wait_for(r"audit: src=ingress RpLoadCleared total=\d+ ", since=mark, timeout=hold + RP_SLACK_S + LINE_TIMEOUT_S)
+    if old.osk() is not None:
+        raise Fail("rp 0.2.3: the old client exported while the gate held")
+    rp_exchange(old, RP_EXCHANGE_S, "rp 0.2.3 after load")
+    old.stop()
+
+
+def test_rp_gate(loader: str, deploy: str, passed: list):
+    """Boot "rp gate" (M3b plan C6): the Rosenpass cookie gate under its
+    attacks, each case after the previous one's load has cleared."""
+    tap = Tap()
+    inside = Wire()
+    host = InsideHost(inside)
+    try:
+        child, con = boot(loader, tap.netdev("n0"), inside.netdev("n1"))
+    except BaseException:
+        tap.close()
+        raise
+    sniffer = None
+    rps = []
+    try:
+        start_without_stop_signals(host)
+        sniffer = Sniffer(RP_PORT)
+        wait_tap_ready(tap, con)
+        cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
+        gw_pub = b64(cfg["gateway"]["public_key"])
+        spkm = open(os.path.join(deploy, cfg["gateway"]["rp_pub_path"]), "rb").read()
+        endpoint = f"{ip_str(GW_IP)}:{RP_PORT}"
+        con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        # Prelude: one clean exchange, whose InitHello and InitConf the
+        # spoofers replay (mac-valid; the mac key is public).
+        prelude = Rosenpass(deploy, 0, endpoint, listen_port=RP_CLIENT_PORTS[0])
+        rps.append(prelude)
+        rp_exchange(prelude, RP_EXCHANGE_S, "rp gate prelude")
+        prelude.stop()
+        port0 = RP_CLIENT_PORTS[0]
+        hello = rp_frames(sniffer, 0, outgoing=True, sport=port0, dport=RP_PORT, kind=RP_HELLO)[0][1]
+        conf = rp_frames(sniffer, 0, outgoing=True, sport=port0, dport=RP_PORT, kind=RP_CONF)[0][1]
+        cases = [
+            ("rp spoof (S-3)", lambda: rp_spoof_case(con, tap, sniffer, deploy, spkm, endpoint, hello, rps)),
+            ("rp nat (F3)", lambda: rp_nat_case(con, sniffer, deploy, spkm, endpoint, rps)),
+            ("rp fan-in", lambda: rp_fan_in_case(con, deploy, endpoint, rps)),
+            ("rp global drain", lambda: rp_global_drain_case(con, tap, sniffer, deploy, endpoint, hello, rps)),
+            ("rp conf share", lambda: rp_conf_share_case(con, tap, deploy, endpoint, hello, conf, rps)),
+            ("rp combined flood", lambda: rp_combined_flood_case(con, tap, gw_pub, deploy, endpoint, hello, rps)),
+            ("rp latency", lambda: rp_latency_case(con, tap, gw_pub, deploy, endpoint, hello, rps)),
+            ("rp 0.2.3 after load", lambda: rp_old_client_case(con, tap, deploy, endpoint, hello, rps)),
+        ]
+        for name, fn in cases:
+            fn()
+            sniffer.check_drops()
+            no_sync_death(con, name)
+            passed.append(name)
+            print(f"\nPASS [{name}]", flush=True)
+    finally:
+        try:
+            with signals_held():
+                host.stop = True
+                close_all(sniffer, *rps)
+                kill(child)
+                tap.close()
+        except SystemExit:
+            host.stop = True
+            close_all(sniffer, *rps)
+            kill(child)
+            tap.close()
+            raise
 
 
 def test_cookie_a(loader: str, deploy: str, passed: list):
@@ -2482,6 +2985,7 @@ def in_netns(good: str, mismatched: str, binding: str, deploy: str) -> int:
              ("wireguard", lambda: test_wireguard(good, deploy, passed)),
              ("cookie boot a", lambda: test_cookie_a(good, deploy, passed)),
              ("cookie boot b", lambda: test_cookie_b(good, deploy, passed)),
+             ("rp gate boot", lambda: test_rp_gate(good, deploy, passed)),
              ("peer binding", lambda: test_peer_binding(binding, os.path.join(os.path.dirname(deploy), "c"), passed)),
              ("mismatched blob halts key", single("mismatched blob", lambda: test_mismatched_blob(mismatched)))]
     for name, fn in cases:
@@ -2636,6 +3140,7 @@ def final_teardown(tmp: str):
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import wg as wg_mod  # noqa: E402
+import rp_cookie  # noqa: E402  (the cookie twin, checked by tests/tools/test_rp_cookie_twin.py)
 
 if __name__ == "__main__":
     sys.exit(main())
