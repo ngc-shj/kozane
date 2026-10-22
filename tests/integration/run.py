@@ -489,7 +489,10 @@ def psk_install_bytes(peer: int, osk: bytes) -> bytes:
     """The `msgs::PskInstall` pq sent hs for `peer`: the peer index, then the
     OSK (the client's key_out)."""
     src = open(os.path.join(ROOT, "crates/msgs/src/lib.rs")).read()
-    if "put(out, &mut at, &self.peer.to_le_bytes())?;\n        put(out, &mut at, self.osk)?;" not in src:
+    # Since M4 (C3) encode is verified against this spec function, so the
+    # spec's body is the layout to compare with.
+    if "pub open spec fn spec_encode_psk_install(peer: u16, osk: Seq<u8>) -> Seq<u8>\n" \
+            "    recommends\n        osk.len() == 32,\n{\n    u16_to_le(peer) + osk\n}" not in src:
         raise Fail("PskInstall::encode in crates/msgs/src/lib.rs no longer writes peer then osk")
     m = re.search(r"pub const PSK_INSTALL_LEN: usize = ([0-9 +]+);", src)
     b = struct.pack("<H", peer) + osk
