@@ -46,8 +46,9 @@ Rules:
      name the packages sha3 and zeroize (by `package`, not key), from the
      registry, with default features off and no features named, and it has
      no build- or target-specific dependency table; the workspace has no
-     [patch] or [replace], nor .cargo/config.toml a [patch] or [source]
-     replacement; and the lock's closure of
+     [patch] or [replace], nor .cargo/config(.toml) a [patch] or [source]
+     replacement, nor mce460896 a [features] table, nor any other member a
+     sha3/zeroize with features (they unify); and the lock's closure of
      the two is exactly MCE_CLOSURE (M4 plan C7). The lock stands for
      `cargo metadata`: every gate builds --locked, and the fixtures' partial
      trees could not be resolved by cargo.
@@ -422,23 +423,48 @@ def check_mce_deps(root: pathlib.Path, out: list):
         out.append(f"P16 crates/mce460896/Cargo.toml: dependencies resolve to {sorted(names)}, "
                    "want exactly ['sha3', 'zeroize']")
     for table in sorted(data):
-        if table == "target" or table.replace("_", "-") == "build-dependencies":
+        if table in ("target", "features") or table.replace("_", "-") == "build-dependencies":
             out.append(f"P16 crates/mce460896/Cargo.toml: [{table}] is not allowed")
+    # Features unify across the workspace: every member's sha3/zeroize must
+    # be featureless too, or it turns them on for mce460896 as well. (The
+    # tool workspaces, rp-vectors and ct-harness, build on their own.)
+    try:
+        ws_doc = tomllib.loads((root / "Cargo.toml").read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        ws_doc = {}
+    members = [root / "Cargo.toml"] + [root / m / "Cargo.toml" for m in ws_doc.get("workspace", {}).get("members", [])]
+    for member in members:
+        rel = member.relative_to(root)
+        if rel == pathlib.Path("crates/mce460896/Cargo.toml") or not member.is_file():
+            continue
+        try:
+            doc = tomllib.loads(member.read_text())
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            continue  # P3/P6 report unreadable manifests
+        tables = [doc.get("dependencies", {}), doc.get("workspace", {}).get("dependencies", {})]
+        for deps in tables:
+            for key, spec in deps.items():
+                spec = spec if isinstance(spec, dict) else {"version": spec}
+                if spec.get("package", key) in ("sha3", "zeroize") and (
+                        spec.get("features") or spec.get("default-features", True) is not False):
+                    out.append(f"P16 {rel}: {key} with features or default features unifies them into mce460896")
     ws = tomllib.loads((root / "Cargo.toml").read_text())
     for table in ("patch", "replace"):
         if table in ws:
             out.append(f"P16 Cargo.toml: [{table}] can redirect mce460896's dependencies")
     # A config [patch] would show in the lock; source replacement would not.
-    config = root / ".cargo/config.toml"
-    if config.is_file():
+    for config in (root / ".cargo/config.toml", root / ".cargo/config"):
+        if not config.is_file():
+            continue
+        name = config.relative_to(root)
         try:
             cfg = tomllib.loads(config.read_text())
         except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
-            out.append(f"P16 .cargo/config.toml: unreadable ({e})")
+            out.append(f"P16 {name}: unreadable ({e})")
             cfg = {}
         for table in ("patch", "source"):
             if table in cfg:
-                out.append(f"P16 .cargo/config.toml: [{table}] can redirect mce460896's dependencies")
+                out.append(f"P16 {name}: [{table}] can redirect mce460896's dependencies")
     try:
         lock = tomllib.loads((root / "Cargo.lock").read_text())
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
@@ -474,6 +500,8 @@ def check_mce_deps(root: pathlib.Path, out: list):
         closure.add(key)
         if p.get("source") != REGISTRY:
             out.append(f"P16 Cargo.lock: {key} is not from the crates.io registry")
+        elif not p.get("checksum"):
+            out.append(f"P16 Cargo.lock: {key} has no checksum")
         todo += p.get("dependencies", [])
     for key in sorted(closure - MCE_CLOSURE):
         out.append(f"P16 Cargo.lock: {key} entered mce460896's dependency closure")

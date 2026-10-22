@@ -144,11 +144,17 @@ unit: | $(counts)
 	cargo test --locked $(foreach c,$(host_crates),-p $(c)) > $(counts)/unit.log 2>&1 \
 		|| { cat $(counts)/unit.log; exit 1; }
 	# Per-crate counts too (M2 plan T12): a crate whose tests stop running
-	# fails the manifest even if the total still clears its minimum.
-	awk '/^ *Running / { c = $$NF; sub(/\)$$/, "", c); sub(/.*\//, "", c); sub(/-[0-9a-f]+$$/, "", c) } \
+	# fails the manifest even if the total still clears its minimum. Test
+	# binaries of two crates with one stem (tests/vectors.rs in both) would
+	# share a key and sum silently, so they report a collision key, which no
+	# manifest line allows. (A crate's lib and bin share theirs legitimately.)
+	awk '/^ *Running / { c = $$NF; sub(/\)$$/, "", c); sub(/.*\//, "", c); sub(/-[0-9a-f]+$$/, "", c); \
+			owner = $$NF; sub(/^.*\/build\//, "", owner); sub(/\/.*$$/, "", owner); \
+			if ((c in crate) && crate[c] != owner) clash[c] = 1; crate[c] = owner } \
 		/Doc-tests / { c = $$2 } \
 		/^test result: ok\./ { n += $$4; per[c] += $$4 } \
-		END { print "UNIT-TESTS", n; for (k in per) { u = toupper(k); gsub(/_/, "-", u); print "UNIT-" u, per[k] } }' \
+		END { print "UNIT-TESTS", n; for (k in per) { u = toupper(k); gsub(/_/, "-", u); print "UNIT-" u, per[k] } \
+		      for (k in clash) { u = toupper(k); gsub(/_/, "-", u); print "UNIT-KEY-COLLISION-" u, 1 } }' \
 		$(counts)/unit.log > $(counts)/unit
 
 kani: | $(counts)
@@ -271,7 +277,8 @@ pins: | $(counts)
 	python3 tests/tools/test_rp_cookie_twin.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_ct_record.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_ct_shape.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES)' $(counts)/pins.log > $(counts)/pins
+	python3 tests/tools/test_stack_headroom.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES)' $(counts)/pins.log > $(counts)/pins
 
 # Builds its own deployment (fresh keys, generated config, package); see run.py.
 test: | $(counts)

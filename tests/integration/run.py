@@ -2412,20 +2412,40 @@ def system_stack_size(pd: str) -> int:
     return int(m.group(1).replace("_", ""), 16)
 
 
-def stack_headroom_case(con):
+def mce_const(name: str) -> int:
+    """`pub const <name>: usize = <a> * 1024;` from mce460896."""
+    text = open(os.path.join(ROOT, "crates/mce460896/src/lib.rs")).read()
+    m = re.search(rf"pub const {name}: usize = (\d+) \* 1024;", text)
+    if not m:
+        raise Fail(f"{name} not found in crates/mce460896/src/lib.rs")
+    return int(m.group(1)) * 1024
+
+
+def stack_headroom_case(con, sizes=None, floors=None):
     """C8: pq and pqkey paint their free stack at init and print the deepest
-    byte used whenever it moves deeper (cpu::StackProbe); after the boot KAT
+    word used whenever it moves deeper (cpu::StackProbe); after the boot KAT
     and every exchange so far, each must leave STACK_HEADROOM_MIN free, at
-    the stack_size the system file gives it."""
+    the stack_size the system file gives it.
+
+    The probe must also have seen its own PD's scrub (pqkey's decaps,
+    pq's encaps): a mark shallower than that means it is not measuring, and
+    the headroom it reports is too good. Every printed line must parse: a
+    line garbled by another PD's output would lose the deepest figure."""
     for pd in ("pq", "pqkey"):
+        printed = con.count(rf"\b{pd}: stack high-water")
         lines = con.count(rf"\b{pd}: stack high-water (0x[0-9a-f]+) of (0x[0-9a-f]+)")
         if not lines:
             raise Fail(f"{pd}: no stack high-water line; the probe reported nothing")
-        size = system_stack_size(pd)
-        printed = {int(n, 16) for _, n in lines}
-        if printed != {size}:
-            raise Fail(f"{pd}: probe painted {sorted(printed)} bytes, the system file gives {size}")
+        if len(printed) != len(lines):
+            raise Fail(f"{pd}: {len(printed) - len(lines)} of {len(printed)} stack high-water lines garbled")
+        size = (sizes or {}).get(pd) or system_stack_size(pd)
+        painted = {int(n, 16) for _, n in lines}
+        if painted != {size}:
+            raise Fail(f"{pd}: probe painted {sorted(painted)} bytes, the system file gives {size}")
         hw = max(int(h, 16) for h, _ in lines)
+        floor = (floors or {}).get(pd) or mce_const("SCRUB_DEPTH" if pd == "pqkey" else "SCRUB_DEPTH_ENCAPS")
+        if hw < floor:
+            raise Fail(f"{pd}: stack high-water {hw} B is below its own scrub depth {floor}; the probe is not measuring")
         print(f"\n{pd}: stack high-water {hw} B of {size} B, {size - hw} B free", flush=True)
         if size - hw < STACK_HEADROOM_MIN:
             raise Fail(f"{pd}: {size - hw} B of stack free, want at least {STACK_HEADROOM_MIN}")
@@ -2441,6 +2461,10 @@ def rp_conf_share_case(con, tap, deploy, endpoint, hello, conf, rps):
     hellos = RpSpoof(tap, [hello], sources[::-1], 2.0)
     rps.extend([confs, hellos])
     try:
+        # Both floods under way before the client starts, or a fast
+        # exchange overlaps nothing (the 2/s one, as in rp global drain).
+        confs.wait_delivered(1, "rp conf share: InitConf flood")
+        hellos.wait_delivered(1, "rp conf share: InitHello flood")
         client = Rosenpass(deploy, 0, endpoint, listen_port=RP_CLIENT_PORTS[0])
         rps.append(client)
         rp_exchange(client, RP_EXCHANGE_S + RP_BACKOFF_CAP_S, "rp conf share")

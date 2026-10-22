@@ -126,14 +126,14 @@ def check_bindings(lock: pathlib.Path, path: pathlib.Path) -> list:
             for wid in waivers.unmet(required, listed)]
 
 
-def run_ct_shape(harness: pathlib.Path, search_path: str) -> list:
+def run_ct_shape(harness: pathlib.Path, search_path: str, system: str) -> list:
     """C10 (a), (b) and the shape baseline on the ELFs this package ships,
     against the harness C9 ran: the baseline is the static tripwire over
     paths C9's inputs never reach (R-M6). Each line tools/ct-shape refused
     with, or its output when it failed without one."""
     try:
         r = subprocess.run([str(CT_SHAPE), "--harness", str(harness), "--search-path", search_path,
-                            "--policy", str(CT_POLICY), "--checks", "identity,forbidden,shape"],
+                            "--policy", str(CT_POLICY), "--system", system, "--checks", "identity,forbidden,shape"],
                            capture_output=True, text=True)
     except OSError as e:
         return [f"package: cannot run tools/ct-shape: {e}"]
@@ -156,12 +156,12 @@ def check_c9_record(harness: pathlib.Path) -> list:
     return [f"package: {w}; a non-debug kernel needs `make ct` to have passed (C9)" for w in why]
 
 
-def check_ct(gen_config: str, harness: pathlib.Path, search_path: str) -> list:
+def check_ct(gen_config: str, harness: pathlib.Path, search_path: str, system: str) -> list:
     """The C11 binding, for every kernel: identity and forbidden (C10) on
     the packaged ELFs; for a non-debug kernel, also C9's pass record."""
     if not harness.is_file():
         return [f"package: the C9 harness {harness} is missing; `make ct-harness` builds it"]
-    errors = run_ct_shape(harness, search_path)
+    errors = run_ct_shape(harness, search_path, system)
     if not is_debug(gen_config):
         errors += check_c9_record(harness)
     return errors
@@ -343,7 +343,7 @@ def main() -> int:
     # All run, so each refusal stays reachable with the others removed.
     gen_config = pathlib.Path(a.gen_config).read_text()
     errors = require_debug(gen_config) + check_waivers(gen_config, WAIVERS) + check_bindings(LOCK, WAIVERS)
-    errors += check_ct(gen_config, pathlib.Path(a.harness), a.search_path)
+    errors += check_ct(gen_config, pathlib.Path(a.harness), a.search_path, a.system)
     if errors:
         print("\n".join(errors))
         return 1

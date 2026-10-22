@@ -52,16 +52,32 @@ TRUSTED = (
     "assume_termination",
     "exec_allows_no_decreases_clause",
 )
-ATTR_TOKEN = re.compile(r"verifier\s*(?:::\s*|\(\s*)(" + "|".join(TRUSTED) + r")\b")
+# A TRUSTED name anywhere in an attribute that names `verifier` or
+# `verus_verify` (the attribute macro that rewrites to `verifier::<x>`), or
+# a macro metavariable in that position.
+ATTR_TRUSTED = re.compile(r"\b(" + "|".join(TRUSTED) + r")\b")
+ATTR_VERUS = re.compile(r"\b(verifier|verus_verify)\b")
+ATTR_META = re.compile(r"\bverifier\s*(?:::|\()\s*\$")
 INTERNAL_TOKEN = re.compile(r"\bverus\s*::\s*internal\b")
-# `assume(` expands to `verus_builtin::assume_(`; `Tracked::assume_new()`
-# makes a tracked value from nothing. A qualifier does not exempt a call,
-# except Kani's own `kani::assume(` (its proof harnesses sit outside verus!).
-CALL_TOKEN = re.compile(r"(?<![A-Za-z0-9_.])((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*)"
-                        r"(assume_new_fallback|assume_new|assume_|assume|admit)\s*\(")
+# The builtins that assume, as identifiers wherever they occur (a call, a
+# `use .. as`, an ident handed to a macro): `admit`, `assume_` (what
+# `assume(` expands to), `assume_new(_fallback)`. `assume(` itself is
+# flagged everywhere except Kani's own `kani::assume(` outside verus!.
+ASSUME_IDENT = re.compile(r"(?<![A-Za-z0-9_])(admit|assume_|assume_new|assume_new_fallback)(?![A-Za-z0-9_])")
+ASSUME_CALL = re.compile(r"(?<![A-Za-z0-9_.])((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*)assume\s*\(")
+# Something else named `kani` would make `kani::assume(` mean anything.
+KANI_SHADOW = re.compile(r"\bmod\s+kani\b|\bas\s+kani\b")
 ITEM_TOKEN = re.compile(r"(?<![A-Za-z0-9_])assume_specification\b")
-VERUS_CFG = re.compile(r"\bverus_[A-Za-z0-9_]+")
-CFG_MACRO = re.compile(r"\bcfg!\s*\(")
+# cfg predicates: only these names are allowed (the Verus build and the PD
+# build agree on them); anything else (`verus_*`, `debug_assertions`,
+# `target_*`, features) can make the shipped body differ from the verified.
+CFG_ALLOWED = {"test", "kani", "not", "all", "any"}
+CFG_ATTR = re.compile(r"\s*(cfg|cfg_attr)\s*\(")
+CFG_MACRO = re.compile(r"\bcfg!\s*[\(\[\{]")
+# The one exempt cfg: an outer `#[cfg(verus_keep_ghost)]` on a `use vstd::..`
+# (the lemma imports the verified code needs).
+VSTD_USE = re.compile(r"\s*(?:#\[[^\]]*\]\s*)*use\s+(?:vstd|verus_builtin|verus_builtin_macros)::")
+PATH_ATTR = re.compile(r"\bpath\s*=")
 # `include_bytes!`/`include_str!` bring in data, not code.
 INCLUDE = re.compile(r"\binclude!\s*[\(\[\{]")
 VERUS_BLOCK = re.compile(r"\bverus!\s*([\{\(\[])")
@@ -113,13 +129,14 @@ def strip_comments(text: str) -> str:
 
 
 def attributes(code: str):
-    """(offset, token stream) of every `#[...]` / `#![...]` attribute."""
-    for m in re.finditer(r"#!?\[", code):
+    """(offset, end, token stream, inner) of every `#[...]` / `#![...]`
+    attribute."""
+    for m in re.finditer(r"#(!?)\[", code):
         depth, j = 1, m.end()
         while j < len(code) and depth:
             depth += {"[": 1, "]": -1}.get(code[j], 0)
             j += 1
-        yield m.start(), j, code[m.end():j - 1]
+        yield m.start(), j, code[m.end():j - 1], bool(m.group(1))
 
 
 def line_of(code: str, offset: int) -> int:
@@ -224,8 +241,8 @@ def ensures_conjuncts(header: str) -> int:
 
 
 def definitions(code: str):
-    """(qualified name, offset, inside verus!, ensures conjuncts) of every
-    fn definition."""
+    """(qualified name, offset, inside verus!, ensures conjuncts, body end)
+    of every fn definition."""
     blocks = list(verus_blocks(code))
     impls = impl_spans(code)
     out = []
@@ -234,50 +251,116 @@ def definitions(code: str):
         owner = [t for s, e, t in impls if s < at < e]
         name = f"{owner[-1]}::{m.group(1)}" if owner else m.group(1)
         inside = any(s <= at < e for s, e in blocks)
-        out.append((name, at, inside, ensures_conjuncts(spec_header(code, at)) if inside else 0))
+        header = spec_header(code, at)
+        body = at + len(header)
+        stop = balanced(code, body) if body < len(code) and code[body] == "{" else body
+        out.append((name, at, inside, ensures_conjuncts(header) if inside else 0, stop))
     return out
 
 
-def item_after(code: str, offset: int) -> str:
+def item_after(code: str, offset: int, impls) -> str:
+    """The item an outer attribute at `offset` decorates: its name, `use`, or
+    `impl <Type>`. Qualifiers (`const fn`, `unsafe fn`, `pub(crate)`) are
+    skipped to the item keyword."""
     m = ITEM.search(code, offset)
+    while m and m.group(1) in ("const", "static") and re.match(r"\s*(?:unsafe\s+|extern\s+)?fn\b", code[m.end(1):]):
+        m = ITEM.search(code, m.end(1))
     if not m:
         return "?"
-    return m.group(1) if m.group(1) in ("use", "impl") else (m.group(2) or m.group(1))
+    if m.group(1) == "impl":
+        owner = [t for s, e, t in impls if s > m.start()]
+        return f"impl {owner[0]}" if owner else "impl"
+    return "use" if m.group(1) == "use" else (m.group(2) or m.group(1))
 
 
 def enclosing_fn(defs, offset: int) -> str:
-    before = [d for d in defs if d[1] < offset]
-    return before[-1][0] if before else "<file>"
+    """The innermost fn whose definition spans `offset`."""
+    spans = [d for d in defs if d[1] <= offset < d[4]]
+    return spans[-1][0] if spans else "<file>"
+
+
+def cfg_names(predicate: str) -> set:
+    return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", predicate)) - CFG_ALLOWED
 
 
 def trusted_in(path: pathlib.Path):
-    """(line, construct, item) of every trusted construct in `path`."""
+    """(line, construct, item) of every trusted construct in `path`, one per
+    occurrence (two on one line are two)."""
     code = strip_comments(path.read_text())
     defs = definitions(code)
-    found = set()
-    for off, end, body in attributes(code):
-        item = item_after(code, end)
-        for t in ATTR_TOKEN.finditer(body):
-            found.add((line_of(code, off), t.group(1), item))
+    impls = impl_spans(code)
+    blocks = list(verus_blocks(code))
+    found = {}
+
+    def add(offset: int, construct: str, item: str):
+        found[(offset, construct)] = (line_of(code, offset), construct, item)
+
+    for off, end, body, inner in attributes(code):
+        item = enclosing_fn(defs, off) if inner else item_after(code, end, impls)
+        if ATTR_VERUS.search(body):
+            for t in ATTR_TRUSTED.finditer(body):
+                add(off + t.start(), t.group(1), item)
+        if ATTR_META.search(body):
+            add(off, "verifier::$meta", item)
         if INTERNAL_TOKEN.search(body):
-            found.add((line_of(code, off), "verus::internal", item))
-        if re.match(r"\s*(cfg|cfg_attr)\b", body) and VERUS_CFG.search(body) and item != "use":
-            found.add((line_of(code, off), "cfg(verus_*)", item))
-        if re.match(r"\s*path\s*=", body):
-            found.add((line_of(code, off), "path", item))
+            add(off, "verus::internal", item)
+        m = CFG_ATTR.match(body)
+        if m:
+            pred = body[m.end():] if m.group(1) == "cfg" else body[m.end():]
+            if m.group(1) == "cfg_attr":
+                # Only the predicate, up to the top-level comma.
+                depth, k = 0, 0
+                for k, c in enumerate(pred):
+                    depth += {"(": 1, ")": -1}.get(c, 0)
+                    if c == "," and depth == 0:
+                        break
+                pred = pred[:k]
+            names = cfg_names(pred)
+            exempt = (not inner and re.fullmatch(r"\s*cfg\s*\(\s*verus_keep_ghost\s*\)\s*", body)
+                      and VSTD_USE.match(code, end))
+            if names and not exempt:
+                add(off, f"cfg({' '.join(sorted(names))})", item)
+        if PATH_ATTR.search(body):
+            add(off, "path", item)
     for m in CFG_MACRO.finditer(code):
-        if VERUS_CFG.search(code, m.end(), balanced(code, m.end() - 1)):
-            found.add((line_of(code, m.start()), "cfg(verus_*)", enclosing_fn(defs, m.start())))
-    for m in CALL_TOKEN.finditer(code):
-        path = re.sub(r"\s", "", m.group(1))
-        if (path, m.group(2)) == ("kani::", "assume"):
+        names = cfg_names(code[m.end():balanced(code, m.end() - 1) - 1])
+        if names:
+            add(m.start(), f"cfg({' '.join(sorted(names))})", enclosing_fn(defs, m.start()))
+    for m in ASSUME_IDENT.finditer(code):
+        add(m.start(), m.group(1) + "(", enclosing_fn(defs, m.start()))
+    for m in ASSUME_CALL.finditer(code):
+        at = m.start()
+        inside = any(s <= at < e for s, e in blocks)
+        if re.sub(r"\s", "", m.group(1)) == "kani::" and not inside:
             continue
-        found.add((line_of(code, m.start()), m.group(2) + "(", enclosing_fn(defs, m.start())))
+        add(at, "assume(", enclosing_fn(defs, at))
+    for m in KANI_SHADOW.finditer(code):
+        add(m.start(), "kani shadowed", enclosing_fn(defs, m.start()))
     for m in ITEM_TOKEN.finditer(code):
-        found.add((line_of(code, m.start()), "assume_specification", item_after(code, m.end())))
+        add(m.start(), "assume_specification", item_after(code, m.end(), impls))
     for m in INCLUDE.finditer(code):
-        found.add((line_of(code, m.start()), "include!", enclosing_fn(defs, m.start())))
-    return sorted(found)
+        add(m.start(), "include!", enclosing_fn(defs, m.start()))
+    return sorted(found.values())
+
+
+def manifest_problems(crate_dir: pathlib.Path) -> list:
+    """What would make cargo compile sources this scan does not read: a
+    `[lib] path`, a build script."""
+    out = []
+    path = crate_dir / "Cargo.toml"
+    try:
+        doc = tomllib.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        return [f"Cargo.toml: unreadable ({e}); cannot tell what cargo compiles"]
+    if "path" in doc.get("lib", {}):
+        out.append("Cargo.toml: [lib] path moves the compiled sources out of src/")
+    if "build" in doc.get("package", {}) or (crate_dir / "build.rs").exists():
+        out.append("Cargo.toml: a build script can emit cfgs and code the scan does not read")
+    for table in ("bin", "example", "test", "bench"):
+        for t in doc.get(table, []):
+            if "path" in t and not str(t["path"]).startswith(("src/", "tests/", "examples/", "benches/")):
+                out.append(f"Cargo.toml: [[{table}]] path {t['path']} is outside the crate's source dirs")
+    return out
 
 
 def rs_files(crate_dir: pathlib.Path):
@@ -298,6 +381,7 @@ def trusted_mismatches(crate: str, crate_dir: pathlib.Path, entries: list) -> li
             errors.append(f"{e.get('file')}: allowlist entry {e} needs an item and a deviation-log reference")
             continue
         allowed[(e["file"], e["construct"], e["item"])] += int(e.get("count", 1))
+    errors += manifest_problems(crate_dir)
     seen = collections.Counter()
     lines = collections.defaultdict(list)
     blocks = 0
@@ -327,7 +411,7 @@ def check(crate: str, crate_dir: pathlib.Path, trusted_toml: pathlib.Path, requi
     for f in rs_files(crate_dir):
         rel = str(f.relative_to(crate_dir))
         code = strip_comments(f.read_text())
-        defs += [(rel, line_of(code, at), *d) for d, at in ((d, d[1]) for d in definitions(code))]
+        defs += [(rel, line_of(code, d[1]), *d[:4]) for d in definitions(code)]
     ensures = sum(d[5] for d in defs)
     required = tomllib.loads(required_toml.read_text()).get("crates", {}).get(crate, {}).get("functions", [])
     if not required:

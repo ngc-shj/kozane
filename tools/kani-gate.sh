@@ -54,11 +54,11 @@ fi
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
 
-# One proof at a time per checkout: a single cbmc can exceed 28 GB RSS, and
-# two concurrent runs (parallel agents) once exhausted the host's memory and
-# froze it. The lock is released when this script exits.
-mkdir -p "$root/build"
-exec 9>"$root/build/kani.lock"
+# One proof at a time on this machine: a single cbmc can exceed 28 GB RSS,
+# and two concurrent runs (parallel agents) once exhausted the host's memory
+# and froze it. One lock for every checkout and copy (the selftest's tree
+# too), not one per tree. It is released when this script exits.
+exec 9>"${SECUREOS_PROOF_LOCK:-/tmp/secureos-proof.lock}"
 flock 9
 
 if ! cargo kani "$@" >"$log" 2>&1; then

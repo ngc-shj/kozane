@@ -77,6 +77,9 @@ MCE_FORMS = ("rand", "e-bytes", "ind", "e-bitsliced", "g", "support", "syndrome"
 # mce-fresh-draw did, in mksecrets' tests). The whole process group is
 # killed, with SIGKILL since mksecrets blocks SIGTERM while it writes.
 CASE_TIMEOUT_S = 4 * 3600
+# A timed-out case fails whatever its partial output held (a needle in it
+# does not make an unfinished gate a red-proof).
+TIMED_OUT = 124
 
 
 def run_make(tree: pathlib.Path, *targets: str) -> subprocess.CompletedProcess:
@@ -87,7 +90,7 @@ def run_make(tree: pathlib.Path, *targets: str) -> subprocess.CompletedProcess:
     except subprocess.TimeoutExpired:
         os.killpg(proc.pid, signal.SIGKILL)
         stdout, stderr = proc.communicate()
-        return subprocess.CompletedProcess(proc.args, 124, stdout,
+        return subprocess.CompletedProcess(proc.args, TIMED_OUT, stdout,
                                            stderr + f"\nselftest: timed out after {CASE_TIMEOUT_S} s\n")
     return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
 
@@ -133,8 +136,9 @@ CASES_FOR_GATE = {
              "rp-cookie-offload", "rp-tx-tier", "rp-reply-fifo", "rp-reply-order", "rp-reply-dst", "rp-sync-sticky",
              "mce-fresh-draw"},
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
-    "ct": {"ct-barrier", "ct-c1-barrier", "ct-harness-unit", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
-           "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms"},
+    "ct": {"ct-barrier", "ct-c1-barrier", "ct-harness-unit", "ct-harness-lint", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
+           "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms",
+           "mce-residue-encaps-scrub", "mce-residue-encaps-depth", "mce-residue-bm"},
     "ct-shape": {"ct-shape", "ct-identity", "verus-erasure"},
     "verus": {"verus-cache", "verus-trusted", "verus-trusted-item", "verus-required", "verus-required-site",
               "verus-required-member", "verus-wg-wire-window",
@@ -324,6 +328,12 @@ CASES = {
                                                "mod tests {\n    #[test]\n    fn selftest_injected_failure() {\n"
                                                "        let v = [1u8];\n        assert!(v.is_empty());\n    }\n\n"),
                         "selftest_injected_failure ... FAILED"),
+    # ... and its clippy (T12): a lint in the report parser fails `make ct`
+    # before ct-gate runs.
+    "ct-harness-lint": (["ct"], lambda t: edit(t, "tools/ct-harness/src/report.rs", "#[cfg(test)]\nmod tests {\n",
+                                               "pub fn selftest_lint() -> usize {\n    let v = vec![1u8];\n    v.len()\n}\n\n"
+                                               "#[cfg(test)]\nmod tests {\n"),
+                        "useless use of `vec!`"),
     # Without the canary, a run that checked nothing could look clean.
     "ct-canary": (["ct"], lambda t: edit(t, "tools/ct-harness/src/ct.rs", "    black_box(canary(&secret));\n", ""),
                   "want 1 errors (the canary)"),
@@ -367,6 +377,26 @@ CASES = {
     "mce-residue-forms": (["ct"], strip_mce_wipes,
                           re.compile("(?s)" + "".join(rf"(?=.*RESIDUE-HIT {re.escape(f)} )"
                                                       for f in MCE_FORMS if f not in ("bm", "g")))),
+    # The encaps root's own scrub (Phase 3 round 2, S15): removed alone, or
+    # cut to the painted floor (2 KiB, below encaps_attempt_core's peak),
+    # an encaps case must leave residue; decaps' scrub stays in place.
+    "mce-residue-encaps-scrub": (["ct"], lambda t: edit(
+        t, "crates/mce460896/src/lib.rs",
+        "    let accept = encaps_attempt_core(pk, rand, ct_out, ss_out);\n    scrub_stack_encaps();\n",
+        "    let accept = encaps_attempt_core(pk, rand, ct_out, ss_out);\n"),
+                                 re.compile(r"RESIDUE-HIT \S+ case=encaps")),
+    "mce-residue-encaps-depth": (["ct"], lambda t: edit(
+        t, "crates/mce460896/src/lib.rs", "pub const SCRUB_DEPTH_ENCAPS: usize = 40 * 1024;",
+        "pub const SCRUB_DEPTH_ENCAPS: usize = 2 * 1024;"),
+                                 re.compile(r"RESIDUE-HIT \S+ case=encaps")),
+    # bm's needle (T14): the fft right after BM rewrites the locator, so a
+    # copy is kept alive with black_box in the decoder's frame, every wipe
+    # and scrub removed.
+    "mce-residue-bm": (["ct"], lambda t: (
+        strip_mce_wipes(t),
+        edit(t, "crates/mce460896/src/decrypt.rs", "    bm(&mut w.locator, &w.s_priv);\n",
+             "    bm(&mut w.locator, &w.s_priv);\n    let keep = w.locator;\n    core::hint::black_box(&keep);\n")),
+                       "RESIDUE-HIT bm "),
     # The stack scrub removed: keccak's state and ss stay in dead frames.
     "mce-residue-scrub": (["ct"], lambda t: (
         edit(t, "crates/mce460896/src/lib.rs", "    decaps_core(sk, ct, ss_out);\n    scrub_stack();\n", "    decaps_core(sk, ct, ss_out);\n"),
@@ -725,7 +755,9 @@ def copy_repo(dst: pathlib.Path):
 # (`sync_tree`: by content, so a file a previous case mutated is rewritten
 # with a fresh mtime and cargo rebuilds it). Everything else under build/
 # (counts, caches, records, images) is removed.
-WORK = ROOT / "build/selftest-work"
+# Outside the checkout, so cargo does not merge the checkout's
+# .cargo/config.toml into the copy's as a parent directory's.
+WORK = pathlib.Path(tempfile.gettempdir()) / "secureos-selftest"
 KEEP_BUILD = re.compile(r"^target")
 
 
@@ -768,6 +800,12 @@ def warm_tree() -> pathlib.Path:
     tree = WORK / "tree"
     tree.mkdir(parents=True, exist_ok=True)
     sync_tree(ROOT, tree)
+    # SKIP names survive sync_tree at any depth; bolero's crash inputs must
+    # not, or an old crash could make the bolero case pass.
+    for top, dirs, _ in os.walk(tree):
+        if "crashes" in dirs:
+            shutil.rmtree(pathlib.Path(top) / "crashes")
+        dirs[:] = [d for d in dirs if d not in SKIP]
     build = tree / "build"
     for item in build.iterdir() if build.is_dir() else []:
         if item.is_dir() and item.name == "ct":
@@ -892,7 +930,9 @@ def run_case(name: str) -> bool:
         found = needle.search(text) is not None
     else:
         found = any(n in text for n in (needle if isinstance(needle, tuple) else (needle,)))
-    if name in EXPECT_SUCCESS:
+    if out.returncode == TIMED_OUT:
+        ok = False
+    elif name in EXPECT_SUCCESS:
         ok = out.returncode == 0 and found and ABSENT[name] not in text
     else:
         ok = out.returncode != 0 and found

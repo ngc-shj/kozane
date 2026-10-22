@@ -420,26 +420,41 @@ def check_contained(binary: Binary, root: str, nodes: dict) -> list:
     return errors
 
 
-def check_no_mce_elsewhere(search: pathlib.Path) -> list:
+def system_images(system: pathlib.Path) -> list:
+    """Every `program_image` path the system file names, in order."""
+    try:
+        text = system.read_text()
+    except OSError as e:
+        raise Fail(f"system file {system}: {e.strerror}")
+    images = re.findall(r'<program_image\s+path="([^"]+)"', text)
+    if not images:
+        raise Fail(f"system file {system}: no program_image")
+    return images
+
+
+def check_no_mce_elsewhere(search: pathlib.Path, images: list) -> list:
     """No PD other than the two roots' links McEliece code: a third PD would
     ship it with no identity, forbidden-instruction or C9 binding (C10, SC23;
-    Phase 3 S4). Every `pd-*.elf` on the search path is read, the way
-    `microkit` will find them."""
+    Phase 3 S4). The PDs are the system file's program images, as
+    `microkit` takes them, each of which must be on the search path. (Code
+    inlined into another PD carries no mce460896 symbol; that stays a
+    residual.)"""
     errors = []
-    for path in sorted(search.glob("pd-*.elf")):
-        if path.name in ROOTS:
+    for name in images:
+        if name in ROOTS:
             continue
+        path = search / name
         try:
             syms = elf_symbols(path.read_bytes())
         except OSError as e:
-            errors.append(f"{path.name}: identity: cannot read {path}: {e.strerror}")
+            errors.append(f"{name}: identity: cannot read {path}: {e.strerror}")
             continue
         except (Fail, struct.error, ValueError, IndexError) as e:
-            errors.append(f"{path.name}: identity: {e}")
+            errors.append(f"{name}: identity: {e}")
             continue
         names = demangle_all(s.name for s in syms)
         for n in sorted({n for n in names.values() if MCE_NAME.match(n)}):
-            errors.append(f"{path.name}: identity: {n} is McEliece code in a PD outside {', '.join(ROOTS)}")
+            errors.append(f"{name}: identity: {n} is McEliece code in a PD outside {', '.join(ROOTS)}")
     return errors
 
 
@@ -616,6 +631,7 @@ def main() -> int:
     ap.add_argument("--search-path", required=True, type=pathlib.Path)
     ap.add_argument("--checks", default=",".join(CHECKS))
     ap.add_argument("--policy", type=pathlib.Path, default=POLICY)
+    ap.add_argument("--system", type=pathlib.Path, default=ROOT / "system/secureos.system")
     ap.add_argument("--print-baseline", action="store_true")
     ap.add_argument("elfs", nargs="*", type=pathlib.Path)
     a = ap.parse_args()
@@ -646,7 +662,11 @@ def main() -> int:
             symbols += len(nodes)
             print(f"CT-SHAPE-CLOSURE {label} {root}: {len(nodes)} functions, {len(stops)} stops")
         if "identity" in checks:
-            errors += check_no_mce_elsewhere(a.search_path)
+            images = system_images(a.system)
+            missing = sorted(set(ROOTS) - set(images))
+            if missing:
+                raise Fail(f"system file {a.system}: no program_image {', '.join(missing)}")
+            errors += check_no_mce_elsewhere(a.search_path, images)
         if "shape" in checks:
             errors += check_shape(binaries, a.policy)
         if "erasure" in checks:

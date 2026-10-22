@@ -851,3 +851,81 @@ record what changed in the plan's mechanisms.
   fresh mtime, so cargo rebuilds it, and unchanged files keep theirs. Only
   `build/target*` and `build/ct/target*` survive between cases. A lock
   keeps two selftests off the tree. A unit case now takes 26–33 s.
+
+## Phase 3 round 2 fixes
+
+- **Verus scanner (S2/N1, S3, S6, S12/N3, S13/N2):**
+  - **cfg predicates:** a predicate in a verified crate may name only
+    `test` and `kani` (with `not`/`all`/`any`). The one exemption is an
+    outer `#[cfg(verus_keep_ghost)]` directly on a `use vstd::`,
+    `verus_builtin::` or `verus_builtin_macros::` item. Inner attributes are
+    never exempt. `cfg!` is read with any delimiter.
+  - **Builtins that assume:** `admit`, `assume_`, `assume_new` and
+    `assume_new_fallback` are flagged as identifiers wherever they occur,
+    so aliases and macro-ident passing count. `assume(` is flagged
+    everywhere, except Kani's `kani::assume(` outside verus!, which
+    restores round 1's boundary. A `mod kani`/`as kani` is flagged.
+  - **Attributes:** a TRUSTED name anywhere in an attribute that names
+    `verifier` or `verus_verify` counts. The pinned
+    `verus_builtin_macros` has `#[verus_verify(external_body)]`, which was
+    checked in the registry. So does a `verifier::$meta` in a macro, and
+    a `path =` anywhere in an attribute (`cfg_attr` included).
+  - **What cargo compiles:** a verified crate may not have `[lib] path`,
+    a build script, or a target path outside its source dirs.
+  - **Counting:** constructs count per occurrence, so two on one line are
+    two. They bind to the item they decorate (`impl <Type>` for an impl,
+    through `const fn`), or to the fn whose body encloses the call.
+  - **Fixtures:** 15 new P12 fixtures. Each is red under the round 1
+    scanner.
+- **C8 (T15, T16, S14):** the probe reports to the word, not the byte (S14).
+  - **Two new refusals in `stack_headroom_case`:**
+    - a mark shallower than the PD's own scrub (the probe is not
+      measuring);
+    - a garbled high-water line.
+  - **Fixtures:** `tests/tools/test_stack_headroom.py` (8 fixtures, in
+    `make pins`) checks each clause, the boundary (16,384 B free passes,
+    16,383 B fails) and the measured figures.
+- **C10 (S16/N5, T20, T21):**
+  - **Which PDs are checked:** ct-shape takes them from the system file's
+    `program_image` list, not a glob, and refuses a listed image missing
+    from the search path. package passes its `--system`.
+  - **Fixtures:** the CLI is shown refusing a third PD with McEliece
+    symbols, and an aliased memcpy is shown to be a stop.
+  - **Residual:** McEliece code inlined into another PD carries no
+    `mce460896::` symbol, and stays outside this check.
+- **P16 (S7/N6/T25):** P16 now also reads the legacy `.cargo/config`, and
+  refuses mce460896's own `[features]`. Every root workspace member's
+  sha3/zeroize must be featureless, since features unify (the tool
+  workspaces build on their own). Every closure package needs a checksum.
+- **Selftest:**
+  - **Proof lock (T26):** the Kani/Verus lock is one file for the machine
+    (`/tmp/secureos-proof.lock`), not one per checkout. Before, the warm
+    tree and the real tree would each take their own.
+  - **Timeouts (T19):** a timed-out case fails whatever its output held.
+  - **The warm tree (T17):** it now lives outside the checkout (no parent
+    `.cargo/config.toml`), and bolero's `crashes/` dirs are cleared each
+    case. What survives between cases: every SKIP-named dir (`target/`
+    at any depth, `build/target*`, `build/ct/target*`).
+  - **`sync_tree` fixtures (T18):** six fixtures, in
+    `test_check_selftest.py`. A restored file is newer than the sync start
+    (red with `copy2`), an unchanged one keeps its mtime, and adds,
+    deletes, modes and type changes are synced.
+  - **New cases:**
+    - `mce-residue-encaps-scrub` and `mce-residue-encaps-depth` (S15) show
+      the encaps scrub and its depth matter on their own;
+    - `mce-residue-bm` (T14) keeps BM's output alive with `black_box`
+      against the fft's in-place rewrite;
+    - `ct-harness-lint` (T12).
+- **Fixtures (T22, T23, T24, F11):**
+  - **P9:** a P9 case shows the `RngError` exception is by exact name.
+  - **C9 record:** a case for a manifest missing a key the record needs.
+  - **P15:** a deny fixture in another tool.
+  - **Unit keys:** two crates' test binaries with one stem now report
+    `UNIT-KEY-COLLISION-<stem>`, which the manifest refuses.
+- **Integration (`rp conf share`):** the second test-timing failure of the
+  same class. Its 2/s InitHello flood had not sent anything when the faster
+  exchange ended, so both floods are now waited for before the client
+  starts.
+- **Residual:** `g`'s needle stays without a red-proof. Its stored forms
+  live in `syndrome`'s frame and in the caller's sk, and nothing short of
+  planting the sk bytes, which would only be circular, exposes them.

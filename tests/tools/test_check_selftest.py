@@ -3,8 +3,12 @@
 Usage: python3 tests/tools/test_check_selftest.py
 """
 
+import os
 import pathlib
+import shutil
 import sys
+import tempfile
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SRC = ROOT / "tools/check-selftest"
@@ -43,6 +47,55 @@ def main() -> int:
     expect("error-ignore prefix on a gate line", "check:\n\t-$(MAKE) a\n", "error")
     expect("error-ignore after @", "check:\n\t@-$(MAKE) a\n", "error")
     expect("allowed @ prefix", "check:\n\t@$(MAKE) a\n", ["a"])
+    # sync_tree (the warm selftest tree): every case must start from the
+    # real tree's sources, and cargo must see what changed.
+    sync = g["sync_tree"]
+
+    def synced(name, setup, check):
+        nonlocal failures, ran
+        ran += 1
+        with tempfile.TemporaryDirectory() as d:
+            src, dst = pathlib.Path(d) / "src", pathlib.Path(d) / "dst"
+            src.mkdir()
+            (src / "a.rs").write_text("a\n")
+            (src / "dir").mkdir()
+            (src / "dir/b.rs").write_text("b\n")
+            sync(src, dst)
+            old = os.stat(dst / "a.rs").st_mtime_ns
+            os.utime(dst / "a.rs", ns=(old - 10**9, old - 10**9))
+            setup(src, dst)
+            # The copy's last build ran after the mutation: a restored file
+            # must be newer than that, not carry the source's older time.
+            os.utime(src / "a.rs", ns=(old - 10**9, old - 10**9))
+            before = time.time_ns()
+            sync(src, dst)
+            why = check(src, dst, old - 10**9, before)
+        failures += bool(why)
+        print(f"{'ok  ' if not why else 'FAIL'} sync_tree: {name}{': ' + why if why else ''}")
+
+    def same(src, dst):
+        names = lambda r: sorted(str(p.relative_to(r)) for p in r.rglob("*") if "target" not in p.parts)
+        if names(src) != names(dst):
+            return f"trees differ: {names(src)} vs {names(dst)}"
+        for f in src.rglob("*"):
+            if f.is_file() and (f.read_bytes() != (dst / f.relative_to(src)).read_bytes()):
+                return f"{f.name} differs"
+        return ""
+
+    synced("a mutated file is restored with a fresh mtime",
+           lambda s, d: (d / "a.rs").write_text("mutated\n"),
+           lambda s, d, t, now: same(s, d) or ("" if os.stat(d / "a.rs").st_mtime_ns >= now - 10**7
+                                               else "mtime not refreshed"))
+    synced("an unchanged file keeps its mtime", lambda s, d: None,
+           lambda s, d, t, now: same(s, d) or ("" if os.stat(d / "a.rs").st_mtime_ns == t else "mtime changed"))
+    synced("a file a case added is deleted", lambda s, d: (d / "dir/new.rs").write_text("x\n"), lambda s, d, t, now: same(s, d))
+    synced("a SKIP dir in the copy is kept",
+           lambda s, d: ((d / "target").mkdir(), (d / "target/obj").write_text("o\n")),
+           lambda s, d, t, now: "" if (d / "target/obj").exists() else "target removed")
+    synced("a mode change is synced", lambda s, d: (s / "a.rs").chmod(0o755),
+           lambda s, d, t, now: "" if os.stat(d / "a.rs").st_mode & 0o777 == 0o755 else "mode not synced")
+    synced("a dir replaced by a file is replaced",
+           lambda s, d: (shutil.rmtree(s / "dir"), (s / "dir").write_text("now a file\n")), lambda s, d, t, now: same(s, d))
     print(f"CHECK-SELFTEST-FIXTURES {ran}")
     return 1 if failures else 0
 

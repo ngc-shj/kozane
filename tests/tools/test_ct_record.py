@@ -62,6 +62,9 @@ CASES = [
      "CT-CASES 28, tests/manifest.txt pins 29"),
     ("missing manifest refused", lambda root: (root / ct_record.MANIFEST).unlink(), VG,
      "tests/manifest.txt: unreadable"),
+    ("a manifest without a key the record needs refused",
+     lambda root: (root / ct_record.MANIFEST).write_text("CT-CASES 28\nCT-MARKED-BYTES 1\n"), VG,
+     "tests/manifest.txt: no RESIDUE-CASES line to check the record against"),
 ]
 
 

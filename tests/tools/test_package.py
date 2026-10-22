@@ -197,6 +197,8 @@ def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, 
             (d / "secrets.bin").write_bytes(key)
             (d / "pq.bin").write_bytes(pq)
             (d / "gen_config.h").write_text(gen)
+            (d / "secureos.system").write_text(
+                '<program_image path="pd-pqkey.elf" />\n<program_image path="pd-pq.elf" />\n')
             if waivers_text is not None:
                 (d / "waivers.toml").write_text(waivers_text)
             pkg.WAIVERS = d / "waivers.toml"
@@ -212,7 +214,7 @@ def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, 
                 return 0
             pkg.build = fake_build
             sys.argv = ["package", "--secrets", str(d / "secrets.bin"), "--pq-secrets", str(d / "pq.bin"),
-                        "--out", str(d / "pkg"), "--system", "x", "--policy", "x", "--image", "x",
+                        "--out", str(d / "pkg"), "--system", str(d / "secureos.system"), "--policy", "x", "--image", "x",
                         "--gen-config", str(d / "gen_config.h"), "--search-path", str(search), "--board", "x",
                         "--config", "x", "--microkit", "x", "--harness", str(harness_path)]
             captured = io.StringIO()

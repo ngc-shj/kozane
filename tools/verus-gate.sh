@@ -66,10 +66,10 @@ ensures=$(printf '%s\n' "$scan" | sed -nE 's/^VERUS-ENSURES ([0-9]+)$/\1/p')
 
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
-# One SMT or cbmc run at a time per checkout, shared with kani-gate: the
-# host has frozen under two concurrent proof runs.
-mkdir -p "$root/build"
-exec 9>"$root/build/kani.lock"
+# One SMT or cbmc run at a time on this machine, shared with kani-gate (the
+# same lock file for every checkout and copy): the host has frozen under two
+# concurrent proof runs.
+exec 9>"${SECUREOS_PROOF_LOCK:-/tmp/secureos-proof.lock}"
 flock 9
 
 # Cargo skips a crate it considers fresh, and then no summary is printed:

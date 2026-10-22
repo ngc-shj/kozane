@@ -110,8 +110,10 @@ impl StackProbe {
         Self { size, reported: 0 }
     }
 
-    /// Bytes below the stack top ever used: the paint is read a word at a
-    /// time up to the first word that differs, then to the byte.
+    /// Bytes below the stack top ever used, to the word: the paint is read
+    /// a word at a time up to the first word that differs. (Not to the
+    /// byte: which bytes of that word still hold the paint is stack
+    /// content, and would show in the printed figure.)
     pub fn high_water(&self) -> usize {
         const WORD: u64 = u64::from_ne_bytes([STACK_PAINT; 8]);
         let mut at = STACK_TOP.saturating_sub(self.size);
@@ -119,10 +121,6 @@ impl StackProbe {
         // and `at` stays 8-aligned (STACK_TOP and the stack size are).
         while at < STACK_TOP && unsafe { core::ptr::read_volatile(at as *const u64) } == WORD {
             at = at.saturating_add(8);
-        }
-        // SAFETY: as above, byte by byte within the first differing word.
-        while at < STACK_TOP && unsafe { core::ptr::read_volatile(at as *const u8) } == STACK_PAINT {
-            at = at.saturating_add(1);
         }
         STACK_TOP.saturating_sub(at)
     }

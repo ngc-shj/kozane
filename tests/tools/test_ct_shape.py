@@ -74,12 +74,22 @@ def third_pd(with_mce: bool):
     def run(search, _harness, _d):
         source = elf.program("a1", "pd_ingress") if with_mce else ".text\n.globl _start\n_start:\nb .\n"
         elf.build(search, "pd-ingress.elf", source, 0x200000)
-        errors = cts.check_no_mce_elsewhere(search)
+        errors = cts.check_no_mce_elsewhere(search, ["pd-pq.elf", "pd-pqkey.elf", "pd-ingress.elf"])
         if not with_mce:
             return errors
         want = "pd-ingress.elf: identity: mce460896::decaps is McEliece code in a PD outside"
         return [] if any(e.startswith(want) for e in errors) else [f"no refusal naming decaps: {errors}"]
     return run
+
+
+def listed_image_missing():
+    @with_tree()
+    def run(search, _harness, _d):
+        return cts.check_no_mce_elsewhere(search, ["pd-pq.elf", "pd-pqkey.elf", "pd-gone.elf"])
+    return run
+
+
+SYSTEM_TWO = '<program_image path="pd-pqkey.elf" />\n<program_image path="pd-pq.elf" />\n'
 
 
 def bm_with(old: str, new: str) -> list:
@@ -140,6 +150,18 @@ def aliased_memcmp():
     syms = [cts.Sym(n, a if a != 0x300 else 0x200, 8 if a == 0x100 else 4, "func") for a, n in names.items()]
     b = cts.Binary("t", syms, {n: n for n in names.values()}, insns, {})
     return cts.check_forbidden(b, {"mce460896::f": 0x100}, {})
+
+
+def aliased_memcpy_stop():
+    """A memcpy that also carries another name is a closure stop (merged
+    aliases are joined as `a = b`), not a function compared or scanned."""
+    names = {0x100: "mce460896::decaps", 0x200: "compiler_builtins::mem::memcpy", 0x300: "memcpy"}
+    insns = {0x100: ("bl", "200 <x>"), 0x104: ("ret", ""), 0x200: ("ret", "")}
+    syms = [cts.Sym(n, a if a != 0x300 else 0x200, 8 if a == 0x100 else 4, "func") for a, n in names.items()]
+    b = cts.Binary("t", syms, {n: n for n in names.values()}, insns, {})
+    nodes, stops, _ = cts.closure(b, "mce460896::decaps")
+    return [] if set(nodes) == {"mce460896::decaps"} and stops == {"compiler_builtins::mem::memcpy = memcpy"} \
+        else [f"nodes {sorted(nodes)}, stops {sorted(stops)}"]
 
 
 def hash_noise_and_instantiating_crate():
@@ -203,20 +225,30 @@ def cli(**kw):
     """tools/ct-shape end to end, all four checks, against a policy made from
     the unmutated tree: (exit status, the ct-shape: lines, the count)."""
     mutated = kw.pop("mutated", False)
+    third = kw.pop("third", False)
 
     def run():
         d = pathlib.Path(tempfile.mkdtemp(prefix="test-ct-shape-"))
         try:
             search, harness = elf.tree(d, **kw)
             shape_policy(search, harness, d)
+            system = d / "secureos.system"
+            system.write_text(SYSTEM_TWO + ('<program_image path="pd-ingress.elf" />\n' if third else ""))
+            if third:
+                elf.build(search, "pd-ingress.elf", elf.program("a1", "pd_ingress"), 0x200000)
             if mutated:
                 (d / "m").mkdir()
                 search, _ = elf.tree(d / "m", pd_bm=bm_with("csel x0, x9, x1, eq", "csel x0, x9, x2, eq"))
             r = subprocess.run([sys.executable, str(ROOT / "tools/ct-shape"), "--harness", str(harness),
                                 "--search-path", str(search), "--policy", str(d / "ct-shape.toml"),
+                                "--system", str(system),
                                 str(search / "pd-pq.elf"), str(search / "pd-pqkey.elf")],
                                capture_output=True, text=True)
             lines = [line for line in r.stdout.splitlines() if line.startswith(("ct-shape: ", "CT-SHAPE-SYMBOLS"))]
+            if third:
+                want = "ct-shape: pd-ingress.elf: identity: mce460896::decaps is McEliece code in a PD outside"
+                return [] if r.returncode == 1 and any(l.startswith(want) for l in lines) \
+                    else [f"exit {r.returncode}: {lines}"]
             return [] if (r.returncode, lines) == ((1, lines) if mutated else (0, ["CT-SHAPE-SYMBOLS 6"])) \
                 and (not mutated or len(lines) == 2) else [f"exit {r.returncode}: {lines}"]
         finally:
@@ -280,6 +312,7 @@ CASES = [
     ("a blr is forbidden", [f"pd-pqkey.elf: forbidden: {BM}+0x24: blr x3"], forbidden(["blr x3"])),
     ("a call to memcmp is forbidden", [f"pd-pqkey.elf: forbidden: {BM}+0x24: a call to memcmp"],
      forbidden(["bl memcmp"])),
+    ("an aliased memcpy is a closure stop", None, aliased_memcpy_stop),
     ("a call to an aliased memcmp is forbidden",
      ["t: forbidden: mce460896::f+0x0: a call to compiler_builtins::mem::memcmp = memcmp"], aliased_memcmp),
     ("the valgrind client-request preamble is forbidden",
@@ -308,6 +341,10 @@ CASES = [
       "sel4_microkit::entry::run_main<_, pd_other::init>"], erasure_control_fails),
     ("the CLI passes the unmutated tree", None, cli()),
     ("the CLI refuses a mutated ELF", None, cli(mutated=True)),
+    ("the CLI refuses McEliece code in a third PD the system file lists", None, cli(third=True)),
+    ("a PD the system file lists but the search path lacks fails",
+     ["pd-gone.elf: identity: cannot read <search>/pd-gone.elf: No such file or directory"],
+     lambda: [e.replace(e[e.index("read ") + 5:e.index("/pd-gone")], "<search>") for e in listed_image_missing()()]),
     ("no make target writes the baseline", None, make_never_writes_the_baseline),
 ]
 
