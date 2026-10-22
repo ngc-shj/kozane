@@ -929,3 +929,14 @@ record what changed in the plan's mechanisms.
 - **Residual:** `g`'s needle stays without a red-proof. Its stored forms
   live in `syndrome`'s frame and in the caller's sk, and nothing short of
   planting the sk bytes, which would only be circular, exposes them.
+- **Selftest: one boot per test-layer case.** Every test-layer case used
+  to run all seven integration boots, about 35 minutes each.
+  - **The filter:** `SECUREOS_IT_BOOTS` (`make test it_boots=<boot>`) runs
+    only the named boots. A filtered run prints
+    `INTEGRATION-CASES-PARTIAL`, which `make test`'s grep does not take,
+    so it can never pass the manifest.
+  - **The assignments:** each case gets the boot whose function raises its
+    needle (traced in run.py): wireguard for seven cases, cookie boot a for
+    two, rp gate boot for one. `integration-count` stays unfiltered,
+    because it needs the full count.
+  - **Unknown names:** an unknown boot name fails the run.

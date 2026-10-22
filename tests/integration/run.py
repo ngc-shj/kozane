@@ -3071,6 +3071,16 @@ def in_netns(good: str, mismatched: str, binding: str, deploy: str) -> int:
              ("rp gate boot", lambda: test_rp_gate(good, deploy, passed)),
              ("peer binding", lambda: test_peer_binding(binding, os.path.join(os.path.dirname(deploy), "c"), passed)),
              ("mismatched blob halts key", single("mismatched blob", lambda: test_mismatched_blob(mismatched)))]
+    # check-selftest's red-proofs need only the boot their injection breaks:
+    # SECUREOS_IT_BOOTS names those (comma-separated). A filtered run never
+    # prints INTEGRATION-CASES, so it can never pass `make check`'s manifest.
+    only = [b for b in os.environ.get("SECUREOS_IT_BOOTS", "").split(",") if b]
+    if only:
+        unknown = sorted(set(only) - {name for name, _ in cases})
+        if unknown:
+            print(f"\nFAIL [setup]: SECUREOS_IT_BOOTS names no boot: {unknown}", file=sys.stderr)
+            return 1
+        cases = [c for c in cases if c[0] in only]
     for name, fn in cases:
         try:
             fn()
@@ -3078,7 +3088,7 @@ def in_netns(good: str, mismatched: str, binding: str, deploy: str) -> int:
             print(f"\nFAIL [{name}]: {type(e).__name__}: {e}", file=sys.stderr)
             return 1
         print(f"\nPASS [{name}]")
-    print(f"INTEGRATION-CASES {len(passed)}")
+    print(f"INTEGRATION-CASES{'-PARTIAL' if only else ''} {len(passed)}")
     return 0
 
 

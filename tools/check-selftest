@@ -440,25 +440,25 @@ CASES = {
               "unmaintained warning RUSTSEC-2024-0436 for paste"),
     "laws": (["laws"], lambda t: edit(t, "system/secureos.system", "</system>", "    <selftest_unknown />\n</system>"), "L4"),
     "pins": (["pins"], lambda t: edit(t, "Makefile", "\trm -rf $(BUILD)", "\t-rm -rf $(BUILD)"), "P5"),
-    "integration": (["test"], lambda t: edit(t, "tests/integration/run.py",
+    "integration": (["test", "it_boots=wireguard"], lambda t: edit(t, "tests/integration/run.py",
                                               "        if bad.consume_response(resp):",
                                               "        if not bad.consume_response(resp):"), "response opened with a wrong PSK"),
     # The residue scan must catch keys left in the hs->data link: without the
     # reclaim on wakeup the install stays in guest RAM (the scan's red-proof,
     # re-run here so it cannot silently go vacuous).
-    "integration-residue": (["test"], lambda t: edit(t, "crates/pds/hs/src/main.rs",
+    "integration-residue": (["test", "it_boots=wireguard"], lambda t: edit(t, "crates/pds/hs/src/main.rs",
                                                      "        if let Err(e) = self.to_data.reclaim() {\n",
                                                      "        if let Err(e) = Ok::<(), _>(()) {\n"),
                             "install message still in guest RAM"),
     # The integration bucket pair (M3 plan C4): without the per-source
     # InitHello meter, a replay inside the source interval is answered.
-    "integration-rp-src-meter": (["test"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+    "integration-rp-src-meter": (["test", "it_boots=cookie boot a"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
                                                           "            self.hello_src.allow(src.ip, now_ns)\n        };",
                                                           "            true\n        };"),
                                  "rosenpass bucket: a replay within the source's interval was answered"),
     # PSK rotation and expiry end to end (M3 plan C7), each broken in hs
     # alone: a superseding install ignored, and a PSK refused 20 s early.
-    "integration-rotation": (["test"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
+    "integration-rotation": (["test", "it_boots=wireguard"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                                       "        *entry = Entry::Live { osk: Key32::copy_from(osk), installed_at: now_ns };\n",
                                                       "        if !matches!(entry, Entry::Live { .. }) {\n"
                                                       "            *entry = Entry::Live { osk: Key32::copy_from(osk), installed_at: now_ns };\n"
@@ -467,14 +467,14 @@ CASES = {
     # The cookie gate end to end (M3b plan C6 case 1): with load never
     # holding, the spoofed InitHellos are metered with the victim's, and its
     # exchange starves.
-    "rp-cookie-gate": (["test"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+    "rp-cookie-gate": (["test", "it_boots=rp gate boot"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
                                                 "            self.refresh_load(now_ns);\n        }\n        now_ns < self.under_load_until_ns\n",
                                                 "            self.refresh_load(now_ns);\n        }\n        false\n"),
                        "rp spoof: the victim's exchange did not complete under the spoof"),
     # The full guest-RAM scan (M3b plan C7) red on its own: with the expiry
     # tick leaving the entry Live, `fresh` still refuses the stale PSK (the
     # expiry case passes), but the OSK stays in hs's table.
-    "integration-expiry-residue": (["test"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
+    "integration-expiry-residue": (["test", "it_boots=wireguard"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                                             "                *entry = Entry::Expired { installed_at };\n",
                                                             "                let _ = installed_at;\n"),
                                    "expired OSK still in guest RAM"),
@@ -484,13 +484,13 @@ CASES = {
                                                  "                if !cookied && self.in_probe_window(now_ns) {\n",
                                                  "                if false && !cookied && self.in_probe_window(now_ns) {\n"),
                         "---- tests::a_spoofer_at_the_source_rate_gets_one_init_hello_to_pq_per_clearance stdout ----"),
-    "integration-expiry": (["test"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
+    "integration-expiry": (["test", "it_boots=wireguard"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                                     "if now_ns.saturating_sub(*installed_at) < REJECT_AFTER_TIME_NS =>",
                                                     "if now_ns.saturating_sub(*installed_at) < REJECT_AFTER_TIME_NS - 20_000_000_000 =>"),
                            "expiry: a handshake 170 s after the install was not accepted"),
     # The same scan over the pq->hs link (M3 plan C7): without pq's reclaim
     # on hs's notify, the PskInstall (an OSK) stays in guest RAM.
-    "integration-pq-residue": (["test"], lambda t: edit(t, "crates/pds/pq/src/main.rs",
+    "integration-pq-residue": (["test", "it_boots=wireguard"], lambda t: edit(t, "crates/pds/pq/src/main.rs",
                                                         "        // buffer back now, which zeroes it (law L12).\n"
                                                         "        if let Err(e) = self.pq.to_hs.reclaim() {\n",
                                                         "        // buffer back now, which zeroes it (law L12).\n"
@@ -498,7 +498,7 @@ CASES = {
                                "PskInstall message still in guest RAM"),
     # L8 end to end: an absent PSK treated as an all-zero one must let a peer
     # without a Rosenpass exchange get a response.
-    "l8-fallback": (["test"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
+    "l8-fallback": (["test", "it_boots=wireguard"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                              "            Some(Entry::Absent) | None => Err(PskRefusal::Missing),",
                                              "            Some(Entry::Absent) | None => Ok(FreshPsk(Key32::from_bytes([0; 32]))),"),
                     "L8: peer 1 got a handshake response without a Rosenpass PSK"),
@@ -509,7 +509,7 @@ CASES = {
     # Under load an initiation without a valid mac2 must not reach hs (M2.5
     # plan C6): forwarding regardless of mac2 must fail the paired case at
     # port A, whose initiation without mac2 then draws a handshake response.
-    "integration-cookie": (["test"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+    "integration-cookie": (["test", "it_boots=cookie boot a"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
                                                     "        if !self.observe_load(now_ns, backlog) {\n",
                                                     "        if !self.observe_load(now_ns, backlog) || true {\n"),
                            "cookie attribution failed: an initiation without mac2 under load got a handshake response"),

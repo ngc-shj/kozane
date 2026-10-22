@@ -281,10 +281,13 @@ pins: | $(counts)
 	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES)' $(counts)/pins.log > $(counts)/pins
 
 # Builds its own deployment (fresh keys, generated config, package); see run.py.
+# it_boots (check-selftest only) runs a subset of the boots; such a run
+# prints INTEGRATION-CASES-PARTIAL, which this grep does not take.
+it_boots :=
 test: | $(counts)
-	python3 tests/integration/run.py > $(counts)/test.log 2>&1 \
+	SECUREOS_IT_BOOTS="$(it_boots)" python3 tests/integration/run.py > $(counts)/test.log 2>&1 \
 		|| { tail -40 $(counts)/test.log; exit 1; }
-	grep '^INTEGRATION-CASES' $(counts)/test.log > $(counts)/test
+	grep '^INTEGRATION-CASES ' $(counts)/test.log > $(counts)/test
 
 manifest:
 	tools/check-manifest tests/manifest.txt $(counts)
