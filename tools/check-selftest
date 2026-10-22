@@ -471,7 +471,12 @@ CASES = {
     "rp-cookie-gate": (["test", "it_boots=rp gate boot"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
                                                 "            self.refresh_load(now_ns);\n        }\n        now_ns < self.under_load_until_ns\n",
                                                 "            self.refresh_load(now_ns);\n        }\n        false\n"),
-                       "rp spoof: the victim's exchange did not complete under the spoof"),
+                       # With the gate never on, a slow host fails the victim's
+                       # exchange; a fast one (z1mn) completes it without the
+                       # cookie path, and the cookie attribution fails. Both
+                       # are this gate's failure, and print only on failure.
+                       ("rp spoof: the victim's exchange did not complete under the spoof",
+                        "rp spoof: no CookieReply reached the client's port")),
     # The full guest-RAM scan (M3b plan C7) red on its own: with the expiry
     # tick leaving the entry Live, `fresh` still refuses the stale PSK (the
     # expiry case passes), but the OSK stays in hs's table.
