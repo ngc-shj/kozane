@@ -631,3 +631,33 @@ differs per build. The C10 normaliser must mask that hash.
 - **package-waiver** now opens a waiver (`SC99`) in its own copy, because
   none is open in the tree.
 - **The check-pins P6 fixtures** are re-based on SC23 closed.
+
+## C11 member set
+
+The member set was derived by `git grep -n -E 'SC23|classic.mceliece|\bcmr\b|CmrRng|rand_core|constant.time|\bL2\b|waiver' -- ':!docs/archive'`,
+run at `cec0ce2`.
+
+- **Updated:**
+  - `policy/waivers.toml` (SC23 closed, comments);
+  - `tools/waivers.py` (docstring);
+  - `tools/check-pins` (P6 and P13);
+  - `tools/package` (the ct binding);
+  - `tests/tools/test_check_pins.py` and `test_package.py` (re-based);
+  - `tools/check-selftest` (`package-waiver`);
+  - pqkey-core, rosenpass-core, mksecrets and rp-vectors (the cut-over);
+  - the L2 rows of the architecture plan and the M3 plan.
+- **Historical or provenance, kept:**
+  - the cmr references in mce460896's doc comments, `BARRIERS.md` and the
+    frozen bridge vectors;
+  - secret-blob's `cmr_sk_from_liboqs`/`liboqs_sk_from_cmr`. The names are
+    kept to avoid an API ripple, and the docs now say "round-3 spec
+    layout".
+  - pqkey-core's test comment;
+  - rp-vectors' README note on the removed mode;
+  - liboqs's own `OQS_KEM_classic_mceliece_*` symbol names.
+- **Unrelated to SC23, matching only `\bL2\b`, `constant.time` or
+  `rand_core`:**
+  - the laws checker's L2 (`tools/laws`, `policy/laws.toml`,
+    `system/secureos.system`);
+  - key-core's constant-time notes;
+  - other crates' `rand_core` lock entries.
