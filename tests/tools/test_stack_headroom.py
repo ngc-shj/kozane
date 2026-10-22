@@ -59,18 +59,30 @@ CASES = [
 ]
 
 
+def patched_size(text: str):
+    """The case with pq's STACK_SIZE reading other than the system file's."""
+    saved = run.pd_stack_const
+    run.pd_stack_const = lambda pd: 0x1c000 if pd == "pq" else saved(pd)
+    try:
+        run.stack_headroom_case(Console(text))
+    finally:
+        run.pd_stack_const = saved
+
+
 def main() -> int:
     failures = 0
-    for name, text, want in CASES:
+    cases = CASES + [("a STACK_SIZE other than the system file's fails", MEASURED,
+                      "pq: STACK_SIZE 114688 paints other than the system file's 131072", patched_size)]
+    for name, text, want, *how in cases:
         try:
-            run.stack_headroom_case(Console(text))
+            (how[0] if how else lambda t: run.stack_headroom_case(Console(t)))(text)
             got = None
         except run.Fail as e:
             got = str(e)
         ok = (got is None) if want is None else (got is not None and want in got)
         failures += not ok
         print(f"{'ok  ' if ok else 'FAIL'} {name}: {got or 'accepted'}")
-    print(f"STACK-HEADROOM-FIXTURES {len(CASES)}")
+    print(f"STACK-HEADROOM-FIXTURES {len(cases)}")
     return 1 if failures else 0
 
 

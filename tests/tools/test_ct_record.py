@@ -9,6 +9,8 @@ import pathlib
 import sys
 import tempfile
 
+ROOT = pathlib.Path(__file__).resolve().parents[2]
+
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "tools"))
 import ct_record  # noqa: E402
 
@@ -95,20 +97,34 @@ def main() -> int:
             if not any(f"no {key} line" in w for w in why):
                 failures += 1
                 print(f"FAIL record without {key} refused: {why}")
-    # promote: the one pending record becomes the pass record; none or two
-    # pending is refused (an interrupted `make ct` leaves only pending).
-    for count, ok_wanted in ((1, True), (0, False), (2, False)):
+    # promote: the one pending record becomes the pass record check_record
+    # accepts; none or two pending is refused by name, leaving no pass
+    # record (an interrupted `make ct` leaves only pending).
+    for count in (1, 0, 2):
         with tempfile.TemporaryDirectory() as d:
             root = tree(pathlib.Path(d))
+            key = ct_record.record_key(root, root / "harness", VG)
             (root / "build/ct").mkdir(parents=True)
-            for i in range(count):
-                (root / f"build/ct/pending-{i:064x}").write_text(RECORD)
+            names = [f"pending-{key}"] if count == 1 else [f"pending-{i:064x}" for i in range(count)]
+            for name in names:
+                (root / "build/ct" / name).write_text(RECORD)
             why = ct_record.promote(root)
             passes = list((root / "build/ct").glob("pass-*"))
             n += 1
-            if (not why and len(passes) == 1) != ok_wanted:
+            ok = (not why and len(passes) == 1 and not ct_record.check_record(root, root / "harness", VG)) \
+                if count == 1 else \
+                (any("expected one pending C9 record" in w for w in why) and not passes)
+            if not ok:
                 failures += 1
                 print(f"FAIL promote with {count} pending: {why}, {len(passes)} pass records")
+    # make ct promotes last, after the harness clippy and tests.
+    n += 1
+    recipe = (ROOT / "Makefile").read_text().split("\nct: ", 1)[1].split("\n\n", 1)[0].splitlines()
+    commands = [l.strip() for l in recipe[1:] if l.startswith("\t") and not l.strip().startswith("#")]
+    if not commands or "ct_record.py promote" not in commands[-1] or \
+            not any("cargo clippy" in c for c in commands) or not any("cargo test" in c for c in commands):
+        failures += 1
+        print(f"FAIL make ct promotes last: {commands[-1:] }")
     print(f"CT-RECORD-FIXTURES {n}")
     return 1 if failures else 0
 

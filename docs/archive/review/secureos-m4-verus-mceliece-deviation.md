@@ -1071,3 +1071,66 @@ is closed at its primitive instead, per the R42 convergence rule.
   - **Residual:** pqkey's later decapsulations, on pq's calls, ran 688 B
     deeper in the previous measurement (100,096 B). The integration check
     reads the boot mark, and the 16 KiB minimum covers that margin.
+
+## Phase 3 round 4 fixes, and where the source scan stops
+
+- **The scan (F-R4-1, N1, N2, N3, N4):**
+  - **Spaced tokens:** `#`, `!` and `[` may be spaced or comment-separated
+    (`# [`, `#/**/[`, `cfg ! (..)`, `include ! (..)`).
+  - **`cfg`, `cfg_attr` and `include` outside an attribute:** flagged as
+    identifiers (aliases, macro idents), except an allowed `cfg!(..)`.
+  - **Build-environment reads:** `option_env!`/`env!` are refused outside
+    test-only modules. Cargo sets `CARGO_PRIMARY_PACKAGE` under `-p`, not
+    for a PD's dependency, so such a read splits the builds as a cfg does.
+  - **The lexer:** it takes `_` in `\u{..}` and drops a shebang line as
+    rustc does.
+  - **Macro definitions:** a trusted construct inside one is refused, since
+    it is counted once but expands per invocation.
+  - **Allowlist counts:** an entry's count must be an integer >= 1.
+  - **The `--no-cheating` decision:** the gate takes it from
+    `verus_trusted.py allowed`, the same parse.
+  - **Fixtures:** 15, each red under `0f8f0b7`.
+- **P16 (T34, F-R4-3, N5, T35):** a `workspace = true` sha3/zeroize that
+  adds features is refused. `[features]` values are matched against the
+  member's keys that resolve to sha3/zeroize (renamed ones included).
+  Fixtures for target rustflags and a missing member are added.
+- **C8 (F-R4-2, T36, T39):** a StackHighWater mark is counted reported
+  only once audit delivered it, as `CostHighWater` does; a lost one is
+  offered again (`StackProbe::offer`, host-tested). The event is fixtured
+  through the Coalescer, and so is the STACK_SIZE mismatch.
+- **Tests (T37, T38, T41):**
+  - **promote:** its fixtures check the refusal message, the absence of a
+    pass record, and that the promoted record is one `check_record`
+    accepts. A fixture pins promote as `make ct`'s last line.
+  - **run_make:** its timeout conversion is fixtured with a stub make.
+  - **ct-shape:** a malformed system file and a path-less program_image
+    are fixtured.
+- **Where the source scan stops (accepted, R42 convergence):**
+  - **What the mechanical gate guarantees:**
+    - For the four `--no-cheating` crates, Verus refuses
+      assume/admit/external_body/assume_specification in what it
+      compiled.
+    - For all five crates, the scan refuses every trusted construct,
+      cfg split and build-environment read spelled in the ways rustc
+      accepts that the four review rounds found.
+  - **What it does not claim:** completeness against source deliberately
+    written to evade a text scan. Each round found a new spelling (13 by
+    round 4: cfg_attr nesting, macro idents, five lexer desyncs, spaced
+    tokens, env reads, macro-body expansion, ...). Rust's macros, cfgs and
+    build environment make that class open-ended. A committer able to write
+    such code can equally edit `tools/verus_trusted.py`, the policies or
+    the manifest, which the gate cannot defend against either.
+  - **Who covers it:** review of every diff to a verified crate. That
+    diff is small and named by `verus_crates`.
+  - **Worst case:**
+    - In msgs, the decoders' proofs could rest on an unproved
+      `ensures`.
+    - In any crate, an evading cfg or env split could ship a body
+      Verus never saw.
+    - In both cases the bounded Kani harnesses and the unit, bolero and
+      integration tests still run on the shipped code.
+  - **Likelihood:** low for honest or careless edits, which the scan
+    catches. The rest needs intent.
+  - **Cost to close:** compare the compiled MIR of the verified build
+    with the shipped one. That is a project of its own; it is recorded for
+    M5's reproducible-build work, which builds both.

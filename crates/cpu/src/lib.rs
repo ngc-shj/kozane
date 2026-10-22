@@ -128,18 +128,56 @@ impl StackProbe {
     /// The high-water mark and the stack size, when the mark is deeper
     /// than last reported.
     pub fn deeper(&mut self) -> Option<(usize, usize)> {
+        let mut out = None;
+        self.deeper_with(|hw, size| {
+            out = Some((hw, size));
+            true
+        });
+        out
+    }
+
+    /// Offers a deeper mark to `report`, and counts it reported only if
+    /// `report` returns true: a mark lost on the way (a full audit ring) is
+    /// offered again next time, as `CostHighWater` does.
+    pub fn deeper_with(&mut self, report: impl FnOnce(usize, usize) -> bool) {
         let hw = self.high_water();
-        if hw <= self.reported {
-            return None;
+        self.offer(hw, report);
+    }
+
+    fn offer(&mut self, hw: usize, report: impl FnOnce(usize, usize) -> bool) {
+        if hw > self.reported && report(hw, self.size) {
+            self.reported = hw;
         }
-        self.reported = hw;
-        Some((hw, self.size))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lost_stack_mark_is_offered_again_and_a_delivered_one_once() {
+        extern crate std;
+        let mut probe = StackProbe { size: 0x20_000, reported: 0 };
+        let mut offered = std::vec::Vec::new();
+        probe.offer(0x1000, |hw, _| {
+            offered.push(hw);
+            false
+        });
+        probe.offer(0x1000, |hw, _| {
+            offered.push(hw);
+            true
+        });
+        probe.offer(0x1000, |hw, _| {
+            offered.push(hw);
+            true
+        });
+        probe.offer(0x1100, |hw, _| {
+            offered.push(hw);
+            true
+        });
+        assert_eq!(offered, [0x1000, 0x1000, 0x1100]);
+    }
 
     #[test]
     fn ticks_to_ns_is_exact_at_one_gigahertz() {

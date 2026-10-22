@@ -447,10 +447,11 @@ impl Handler for Pq {
         // Once a second: the scan costs pq budget it needs under load. The
         // mark goes out as an audit record, not a console line, which would
         // interleave with `audit`'s own lines and break the ones awaited.
-        if channels.contains(TIMER)
-            && let Some((hw, _)) = self.stack.deeper()
-        {
-            self.audit.record(Event::StackHighWater { bytes: u32::try_from(hw).unwrap_or(u32::MAX) });
+        if channels.contains(TIMER) {
+            let audit = &mut self.audit;
+            self.stack.deeper_with(|hw, _| {
+                audit.record_delivered(Event::StackHighWater { bytes: u32::try_from(hw).unwrap_or(u32::MAX) })
+            });
             self.audit.flush();
         }
         Ok(())

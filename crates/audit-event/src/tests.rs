@@ -323,6 +323,21 @@ fn cost_high_water_does_not_share_a_counter_with_fixed_kinds() {
     assert_eq!(got, [(Event::RpInitHello.code(), 1), (COST_HIGH_WATER, 9), (FRAME_DROPPED_BASE | 0x3f, 1)]);
 }
 
+#[test]
+fn stack_high_water_is_never_coalesced_and_keeps_its_own_slot() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::StackHighWater { bytes: 61_696 }, 65, &mut out);
+    assert_eq!(out.len(), 65);
+    assert!(out.iter().all(|r| r.code == STACK_HIGH_WATER && r.a == 61_696));
+    let mut out = Vec::new();
+    run(&mut c, Event::RpCostHighWater { us: 9 }, 1, &mut out);
+    run(&mut c, Event::StackHighWater { bytes: 4 }, 1, &mut out);
+    run(&mut c, Event::RpInitHello, 1, &mut out);
+    let got: Vec<_> = out.iter().map(|r| (r.code, r.a)).collect();
+    assert_eq!(got, [(COST_HIGH_WATER, 9), (STACK_HIGH_WATER, 4), (Event::RpInitHello.code(), 1)]);
+}
+
 fn emitted(costs: impl IntoIterator<Item = u32>) -> Vec<u32> {
     let mut hw = CostHighWater::new();
     costs.into_iter().filter_map(|us| hw.observe(us)).map(|e| e.value().unwrap()).collect()

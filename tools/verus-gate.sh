@@ -72,9 +72,8 @@ flock 9
 # actually compiled, whatever spelling the source used (Phase 3 round 3).
 # Only a crate with an allowlisted construct (msgs' chunk_ref) relies on
 # the source checks alone.
-entries=$(python3 -c 'import sys, tomllib
-print(sum(e.get("crate") == sys.argv[1] for e in tomllib.load(open("policy/verus-trusted.toml", "rb")).get("trusted", [])))' \
-    "$crate") || { echo "verus-gate: cannot read policy/verus-trusted.toml" >&2; exit 1; }
+entries=$(python3 tools/verus_trusted.py allowed "$crate" policy/verus-trusted.toml) \
+    || { echo "verus-gate: cannot read policy/verus-trusted.toml" >&2; exit 1; }
 no_cheating=()
 if [ "$entries" = 0 ]; then
     no_cheating=(--fwd-verus-args-to roots -- --no-cheating)

@@ -122,6 +122,29 @@ def main() -> int:
     timed("a timed-out case fails though its needle printed", g["TIMED_OUT"], False)
     timed("an ordinary failure with the needle passes", 2, True)
 
+    # run_make itself: a make that never ends is killed with its group and
+    # reported as TIMED_OUT; one that fails keeps its own code.
+    def stub_make(name, body, want_code, want_err):
+        nonlocal failures, ran
+        ran += 1
+        with tempfile.TemporaryDirectory() as d:
+            stub = pathlib.Path(d) / "make"
+            stub.write_text(f"#!/bin/sh\n{body}\n")
+            stub.chmod(0o755)
+            saved = (g["CASE_TIMEOUT_S"], g["MAKE_ENV"])
+            g["CASE_TIMEOUT_S"] = 1
+            g["MAKE_ENV"] = {**saved[1], "PATH": f"{d}:{saved[1].get('PATH', '')}"}
+            try:
+                out = g["run_make"](pathlib.Path(d))
+            finally:
+                g["CASE_TIMEOUT_S"], g["MAKE_ENV"] = saved
+        ok = out.returncode == want_code and want_err in out.stderr
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} run_make: {name}: code {out.returncode}")
+
+    stub_make("a make that never ends times out", "exec tail -f /dev/null", g["TIMED_OUT"], "timed out")
+    stub_make("a failing make keeps its code", "exit 2", 2, "")
+
     # bolero's crash inputs are cleared at any depth, but not inside a SKIP
     # dir (a target dir is the build's own).
     ran += 1

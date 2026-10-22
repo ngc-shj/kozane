@@ -477,17 +477,27 @@ def check_mce_deps(root: pathlib.Path, out: list):
         for scope in [doc] + list(doc.get("target", {}).values()):
             for kind in ("dependencies", "dev-dependencies", "build-dependencies"):
                 tables.append(scope.get(kind, {}))
+        # Dependency keys that name sha3 or zeroize, by key or by `package`.
+        guarded = set()
         for deps in tables:
             for key, spec in deps.items():
                 spec = spec if isinstance(spec, dict) else {"version": spec}
+                if spec.get("package", key) not in ("sha3", "zeroize"):
+                    continue
+                guarded.add(key)
                 if spec.get("workspace") is True:
-                    continue  # judged where [workspace.dependencies] declares it
-                if spec.get("package", key) in ("sha3", "zeroize") and (
-                        spec.get("features") or spec.get("default-features", True) is not False):
+                    # Inherited: its declaration is judged in
+                    # [workspace.dependencies], but cargo adds the member's
+                    # own features on top.
+                    if spec.get("features") or "default-features" in spec:
+                        out.append(f"P16 {rel}: {key} inherits from the workspace but adds features")
+                    continue
+                if spec.get("features") or spec.get("default-features", True) is not False:
                     out.append(f"P16 {rel}: {key} with features or default features unifies them into mce460896")
         for feature, enables in doc.get("features", {}).items():
             for e in enables:
-                if re.match(r"(?:dep:)?(sha3|zeroize)\??/", str(e)):
+                m = re.match(r"(?:dep:)?([A-Za-z0-9_-]+)\??/", str(e))
+                if m and (m.group(1) in guarded or m.group(1) in ("sha3", "zeroize")):
                     out.append(f"P16 {rel}: feature {feature} turns on {e}, which unifies into mce460896")
     ws = tomllib.loads((root / "Cargo.toml").read_text())
     for table in ("patch", "replace"):

@@ -73,7 +73,13 @@ ITEM_TOKEN = re.compile(r"(?<![A-Za-z0-9_])assume_specification\b")
 # `target_*`, features) can make the shipped body differ from the verified.
 CFG_ALLOWED = {"test", "kani", "not", "all", "any"}
 CFG_ATTR = re.compile(r"\s*(cfg|cfg_attr)\s*\(")
-CFG_MACRO = re.compile(r"\bcfg!\s*[\(\[\{]")
+# `#`, `!` and `[` are separate tokens to rustc, with whitespace (or a
+# comment, blanked to spaces) allowed between them.
+CFG_MACRO = re.compile(r"\bcfg\s*!\s*[\(\[\{]")
+# Outside an attribute, `cfg`, `cfg_attr` and `include` may appear only as
+# an allowed `cfg!(..)`: any other use (a `use core::cfg as k` alias, an
+# `include ! (..)`) is flagged.
+CFG_OR_INCLUDE = re.compile(r"\b(cfg_attr|cfg|include)\b")
 # The one exempt cfg: an outer `#[cfg(verus_keep_ghost)]` on a `use vstd::..`
 # (the lemma imports the verified code needs).
 # ... importing only proof lemmas (`lemma_*`/`group_*`, which exec code
@@ -88,11 +94,12 @@ VERUS_VERIFY = re.compile(r"\bverus_verify\b")
 EXTERNAL = re.compile(r"\bexternal\b")
 PATH_ATTR = re.compile(r"\bpath\s*=")
 # `include_bytes!`/`include_str!` bring in data, not code.
-INCLUDE = re.compile(r"\binclude!\s*[\(\[\{]")
+INCLUDE = re.compile(r"\binclude\s*!\s*[\(\[\{]")
 VERUS_BLOCK = re.compile(r"\bverus\s*!\s*([\{\(\[])")
 CLOSER = {"{": "}", "(": ")", "[": "]"}
 RAW_STRING = re.compile(r"(?<![A-Za-z0-9_])[bc]?r(#*)\"")
-CHAR_LITERAL = re.compile(r"b?'(?:\\u\{[0-9a-fA-F]{1,6}\}|\\x[0-9a-fA-F]{2}|\\.|[^\\'\n])'")
+# rustc skips `_` inside `\u{..}`.
+CHAR_LITERAL = re.compile(r"b?'(?:\\u\{[0-9a-fA-F_]{1,12}\}|\\x[0-9a-fA-F]{2}|\\.|[^\\'\n])'")
 FN_DEF = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)")
 ITEM = re.compile(r"\b(fn|struct|enum|union|trait|type|const|static|mod|use|impl|assume_specification)\b"
                   r"(?:\s*<[^>]*>)?\s*([A-Za-z_][A-Za-z0-9_]*)?")
@@ -111,6 +118,16 @@ def strip_comments(text: str) -> str:
     any number of `#`. An unterminated one becomes UNTERMINATED."""
     out = []
     i, n = 0, len(text)
+    # rustc drops a first line `#!..` (after an optional BOM) that does not
+    # open an inner attribute: blank it too, or a quote in it would desync.
+    start = 1 if text.startswith("\ufeff") else 0
+    if text.startswith("#!", start):
+        rest = re.sub(r"/\*.*?\*/|//[^\n]*", lambda m: " " * len(m.group(0)), text[start + 2:], flags=re.S)
+        if not rest.lstrip().startswith("["):
+            j = text.find("\n")
+            j = n if j < 0 else j
+            out.append(" " * j)
+            i = j
 
     def blank(a: int, b: int, closed: bool):
         piece = re.sub(r"[^\n]", " ", text[a:b])
@@ -161,7 +178,7 @@ def strip_comments(text: str) -> str:
 def attributes(code: str):
     """(offset, end, token stream, inner) of every `#[...]` / `#![...]`
     attribute."""
-    for m in re.finditer(r"#(!?)\[", code):
+    for m in re.finditer(r"#\s*(!?)\s*\[", code):
         depth, j = 1, m.end()
         while j < len(code) and depth:
             depth += {"[": 1, "]": -1}.get(code[j], 0)
@@ -295,7 +312,7 @@ def item_after(code: str, offset: int, impls) -> str:
     is "?" (still counted, so it cannot hide a construct)."""
     at = offset
     while True:
-        m = re.match(r"\s*#!?\[", code[at:])
+        m = re.match(r"\s*#\s*!?\s*\[", code[at:])
         if not m:
             break
         at = balanced(code, at + m.end() - 1)
@@ -345,9 +362,10 @@ def cfg_problems(body: str) -> set:
     return names
 
 
-def trusted_in(path: pathlib.Path):
+def trusted_in(path: pathlib.Path, test_only: bool = False):
     """(line, construct, item) of every trusted construct in `path`, one per
-    occurrence (two on one line are two)."""
+    occurrence (two on one line are two). `test_only`: the file is reached
+    only through a `#[cfg(test)]` module declaration."""
     code = strip_comments(path.read_text())
     defs = definitions(code)
     impls = impl_spans(code)
@@ -395,11 +413,34 @@ def trusted_in(path: pathlib.Path):
             add(m.start(), "verus_verify outside an attribute", owner_of(m.start()))
     for m in re.finditer(rf"\b{UNTERMINATED}\b", code):
         add(m.start(), "unterminated literal or comment", owner_of(m.start()))
+    macros = set()
     for m in CFG_MACRO.finditer(code):
+        macros.add(m.start())
         close = balanced(code, m.end() - 1)
         names = cfg_names(code[m.end():close - 1]) if close <= len(code) else {"<unparsable>"}
         if names:
             add(m.start(), f"cfg({' '.join(sorted(names))})", enclosing_fn(defs, m.start()))
+    # A trusted construct inside a macro definition is counted once but
+    # expands as often as the macro is invoked: refuse it there (N3).
+    bodies = []
+    for m in re.finditer(r"\bmacro_rules\s*!\s*[A-Za-z_][A-Za-z0-9_]*\s*([\{\(\[])|\bmacro\s+[A-Za-z_][A-Za-z0-9_]*", code):
+        open_at = m.start(1) if m.group(1) else code.find("{", m.end())
+        if open_at >= 0:
+            bodies.append((open_at, balanced(code, open_at)))
+    for (offset, construct), (line, _, item) in list(found.items()):
+        if construct in TRUSTED or construct in ("assume_specification", "verifier::$meta"):
+            if any(a <= offset < b for a, b in bodies):
+                add(offset, f"{construct} inside a macro definition", item)
+    # Build-environment reads split the two builds as a cfg does (Cargo sets
+    # CARGO_PRIMARY_PACKAGE under `-p`, not for a PD's dependency): refused
+    # outside test-only files.
+    for m in re.finditer(r"\b(option_env|env)\s*!", code):
+        if not test_only:
+            add(m.start(), f"{m.group(1)}! outside test code", owner_of(m.start()))
+    for m in CFG_OR_INCLUDE.finditer(code):
+        if any(a <= m.start() < b for a, b, _ in spans) or m.start() in macros:
+            continue
+        add(m.start(), f"{m.group(1)} outside an attribute", owner_of(m.start()))
     for m in ASSUME_IDENT.finditer(code):
         add(m.start(), m.group(1) + "(", owner_of(m.start()))
     for m in ASSUME_CALL.finditer(code):
@@ -445,6 +486,22 @@ def rs_files(crate_dir: pathlib.Path):
     return sorted(p for p in (crate_dir / "src").rglob("*.rs"))
 
 
+def test_only_files(crate_dir: pathlib.Path) -> set:
+    """The files of modules the crate root declares only under
+    `#[cfg(test)]` (`#[cfg(test)] mod tests;`)."""
+    out = set()
+    for root in ("src/lib.rs", "src/main.rs"):
+        path = crate_dir / root
+        if not path.is_file():
+            continue
+        code = strip_comments(path.read_text())
+        for m in re.finditer(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", code):
+            for cand in (crate_dir / "src" / f"{m.group(1)}.rs", crate_dir / "src" / m.group(1) / "mod.rs"):
+                if cand.is_file():
+                    out.add(cand)
+    return out
+
+
 def trusted_mismatches(crate: str, crate_dir: pathlib.Path, entries: list) -> list:
     """The one comparison both callers make: the crate's trusted constructs,
     as a multiset of (file, construct, item), against its allowlist entries
@@ -458,15 +515,20 @@ def trusted_mismatches(crate: str, crate_dir: pathlib.Path, entries: list) -> li
         if not e.get("deviation") or not e.get("item"):
             errors.append(f"{e.get('file')}: allowlist entry {e} needs an item and a deviation-log reference")
             continue
-        allowed[(e["file"], e["construct"], e["item"])] += int(e.get("count", 1))
+        count = e.get("count", 1)
+        if not isinstance(count, int) or isinstance(count, bool) or count < 1:
+            errors.append(f"{e.get('file')}: allowlist entry {e} has count {count!r}; it must be an integer >= 1")
+            continue
+        allowed[(e["file"], e["construct"], e["item"])] += count
     errors += manifest_problems(crate_dir)
     seen = collections.Counter()
     lines = collections.defaultdict(list)
     blocks = 0
+    tests = test_only_files(crate_dir)
     for f in rs_files(crate_dir):
         rel = str(f.relative_to(crate_dir))
         blocks += len(list(verus_blocks(strip_comments(f.read_text()))))
-        for line, construct, item in trusted_in(f):
+        for line, construct, item in trusted_in(f, f in tests):
             seen[(rel, construct, item)] += 1
             lines[(rel, construct, item)].append(line)
     if blocks == 0:
@@ -522,6 +584,13 @@ def main(argv) -> int:
                 print(f"{p}:{line}: {construct} {item}")
                 hits += 1
         return 0 if hits == 0 else 1
+    if len(argv) == 4 and argv[1] == "allowed":
+        # How many constructs the policy allows the crate (the gate's
+        # --no-cheating decision: 0 means the flag), by the same parse.
+        entries = tomllib.loads(pathlib.Path(argv[3]).read_text()).get("trusted", [])
+        print(sum(e.get("count", 1) for e in entries if e.get("crate") == argv[2]
+                  and isinstance(e.get("count", 1), int) and e.get("count", 1) >= 1))
+        return 0
     if len(argv) == 6 and argv[1] == "check":
         return check(argv[2], pathlib.Path(argv[3]), pathlib.Path(argv[4]), pathlib.Path(argv[5]))
     print(__doc__, file=sys.stderr)
