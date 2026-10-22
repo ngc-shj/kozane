@@ -353,7 +353,7 @@ CASES = [
     ("the CLI reads a single-quoted program_image too", None, cli(third="single")),
     ("an unreadable system file fails", None, cli(system_text=False, want="secureos.system: No such file")),
     ("a system file without program_image fails", None, cli(system_text="", want="no program_image")),
-    ("a system file that does not parse fails", None, cli(system_text="<program_image", want="secureos.system:")),
+    ("a system file that does not parse fails", None, cli(system_text="<program_image", want="not well-formed")),
     ("a program_image without a path fails", None,
      cli(system_text="<program_image />\n", want="a program_image without a path")),
     ("a system file without a root's image fails", None,

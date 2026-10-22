@@ -412,6 +412,11 @@ CASES = [
      lambda t: append(t / "crates/msgs/src/lib.rs", '\ninclude ! ("../../x.rs");\n')),
     ("P12 a spaced #[path] in msgs", {"P12"},
      lambda t: append(t / "crates/msgs/src/lib.rs", '\n# [path = "../x.rs"]\nmod x;\n')),
+    # The spaced macro form must be recognised as cfg! (not caught as a
+    # stray `cfg` identifier): an allowed predicate passes.
+    ("allow a spaced cfg ! (test) branch", set(),
+     lambda t: edit(t / "crates/wg-wire/src/replay.rs", "#[inline]\nfn below_window(",
+                    "fn t7() -> bool { cfg ! (test) }\n#[inline]\nfn below_window(")),
     ("allow a cfg!(test) branch", set(), lambda t: edit(t / "crates/wg-wire/src/replay.rs", "#[inline]\nfn below_window(", "fn t6() -> bool { cfg!(test) }\n" + "#[inline]\nfn below_window(")),
     # P12, round 4 security: lexer edge cases rustc accepts, a trusted
     # construct inside a macro definition, build-environment reads, and a
@@ -436,6 +441,25 @@ CASES = [
      lambda t: append(t / "policy/verus-trusted.toml",
                       '\n[[trusted]]\ncrate = "wg-wire"\nfile = "src/replay.rs"\nconstruct = "external_body"\n'
                       'item = "below_window"\ncount = 0\ndeviation = "x"\n')),
+    # P12, round 5: env reads by alias, shebangs, long escapes, a test
+    # module also declared for non-test builds, raw macro names, and a
+    # trusted construct handed to a macro.
+    ("P12 option_env aliased by use", {"P12"},
+     lambda t: append(t / "crates/wg-wire/src/replay.rs", "\nuse core::option_env as oe;\n")),
+    ("P12 a shebang line", {"P12"},
+     lambda t: (t / "crates/wg-wire/src/replay.rs").write_text("#!/usr/bin/env x\n" + (t / "crates/wg-wire/src/replay.rs").read_text())),
+    ("P12 external_body after a long underscored escape", {"P12"},
+     lambda t: append(t / "crates/msgs/src/lib.rs",
+                      "\nconst Q: [char; 2] = ['\\u{4___________1}','\"'];\n#[verifier::external_body]\nfn evil() {}\n// \"\n")),
+    ("P12 env! in a test module also declared for other builds", {"P12"},
+     lambda t: edit(t / "crates/rosenpass-wire/src/lib.rs", "#[cfg(test)]\nmod tests;", "#[cfg(test)]\nmod tests;\n#[cfg(not(test))]\nmod tests;")),
+    ("P12 the allowlisted external_body inside a raw-named macro", {"P12"},
+     lambda t: (edit(t / "crates/msgs/src/lib.rs", "#[verifier::external_body]\n#[inline]", "#[inline]"),
+                append(t / "crates/msgs/src/lib.rs",
+                       "\nmacro_rules! r#m { () => { verus! { #[verifier::external_body] fn chunk_ref() {} } } }\n"))),
+    ("P12 the allowlisted external_body handed to a macro", {"P12"},
+     lambda t: (edit(t / "crates/msgs/src/lib.rs", "#[verifier::external_body]\n#[inline]", "#[inline]"),
+                append(t / "crates/msgs/src/lib.rs", "\ntwice! { #[verifier::external_body] fn chunk_ref() {} }\n"))),
     ("P12 kani::assume outside verus! is not Verus's assume", set(),
      lambda t: append(t / "crates/wg-wire/src/replay.rs", "\n#[cfg(kani)]\nfn h() { kani::assume(true); }\n")),
     # P14 (M4 C7): unsafe only in the barrier module.
@@ -501,6 +525,16 @@ CASES = [
                      '[workspace.dependencies]\nsha3 = { version = "=0.10.9", default-features = false }\n'),
                 edit(t / "crates/rosenpass-core/Cargo.toml", 'sha3 = { version = "=0.10.9", default-features = false }',
                      'sha3 = { workspace = true, features = ["asm"] }'))),
+    ("P16 an inherited renamed sha3 with member features", {"P16"},
+     lambda t: (edit(t / "Cargo.toml", "[workspace.dependencies]\n",
+                     '[workspace.dependencies]\nh = { package = "sha3", version = "=0.10.9", default-features = false }\n'),
+                edit(t / "crates/rosenpass-core/Cargo.toml", 'sha3 = { version = "=0.10.9", default-features = false }',
+                     'h = { workspace = true, features = ["asm"] }'))),
+    ("allow an inherited sha3 restating default-features = false", set(),
+     lambda t: (edit(t / "Cargo.toml", "[workspace.dependencies]\n",
+                     '[workspace.dependencies]\nsha3 = { version = "=0.10.9", default-features = false }\n'),
+                edit(t / "crates/rosenpass-core/Cargo.toml", 'sha3 = { version = "=0.10.9", default-features = false }',
+                     'sha3 = { workspace = true, default-features = false }'))),
     ("allow an inherited sha3 without features", set(),
      lambda t: (edit(t / "Cargo.toml", "[workspace.dependencies]\n",
                      '[workspace.dependencies]\nsha3 = { version = "=0.10.9", default-features = false }\n'),

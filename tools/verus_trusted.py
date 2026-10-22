@@ -80,6 +80,9 @@ CFG_MACRO = re.compile(r"\bcfg\s*!\s*[\(\[\{]")
 # an allowed `cfg!(..)`: any other use (a `use core::cfg as k` alias, an
 # `include ! (..)`) is flagged.
 CFG_OR_INCLUDE = re.compile(r"\b(cfg_attr|cfg|include)\b")
+# Build-environment reads, as identifiers (`use core::option_env as oe`,
+# `m!(env)`) as much as calls.
+ENV_IDENT = re.compile(r"\b(option_env|env)\b")
 # The one exempt cfg: an outer `#[cfg(verus_keep_ghost)]` on a `use vstd::..`
 # (the lemma imports the verified code needs).
 # ... importing only proof lemmas (`lemma_*`/`group_*`, which exec code
@@ -99,7 +102,7 @@ VERUS_BLOCK = re.compile(r"\bverus\s*!\s*([\{\(\[])")
 CLOSER = {"{": "}", "(": ")", "[": "]"}
 RAW_STRING = re.compile(r"(?<![A-Za-z0-9_])[bc]?r(#*)\"")
 # rustc skips `_` inside `\u{..}`.
-CHAR_LITERAL = re.compile(r"b?'(?:\\u\{[0-9a-fA-F_]{1,12}\}|\\x[0-9a-fA-F]{2}|\\.|[^\\'\n])'")
+CHAR_LITERAL = re.compile(r"b?'(?:\\u\{[0-9a-fA-F_]+\}|\\x[0-9a-fA-F]{2}|\\.|[^\\'\n])'")
 FN_DEF = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)")
 ITEM = re.compile(r"\b(fn|struct|enum|union|trait|type|const|static|mod|use|impl|assume_specification)\b"
                   r"(?:\s*<[^>]*>)?\s*([A-Za-z_][A-Za-z0-9_]*)?")
@@ -423,7 +426,7 @@ def trusted_in(path: pathlib.Path, test_only: bool = False):
     # A trusted construct inside a macro definition is counted once but
     # expands as often as the macro is invoked: refuse it there (N3).
     bodies = []
-    for m in re.finditer(r"\bmacro_rules\s*!\s*[A-Za-z_][A-Za-z0-9_]*\s*([\{\(\[])|\bmacro\s+[A-Za-z_][A-Za-z0-9_]*", code):
+    for m in re.finditer(r"\bmacro_rules\s*!\s*(?:r#)?[A-Za-z_][A-Za-z0-9_]*\s*([\{\(\[])|\bmacro\s+(?:r#)?[A-Za-z_][A-Za-z0-9_]*", code):
         open_at = m.start(1) if m.group(1) else code.find("{", m.end())
         if open_at >= 0:
             bodies.append((open_at, balanced(code, open_at)))
@@ -434,9 +437,22 @@ def trusted_in(path: pathlib.Path, test_only: bool = False):
     # Build-environment reads split the two builds as a cfg does (Cargo sets
     # CARGO_PRIMARY_PACKAGE under `-p`, not for a PD's dependency): refused
     # outside test-only files.
-    for m in re.finditer(r"\b(option_env|env)\s*!", code):
+    for m in ENV_IDENT.finditer(code):
         if not test_only:
-            add(m.start(), f"{m.group(1)}! outside test code", owner_of(m.start()))
+            add(m.start(), f"{m.group(1)} outside test code", owner_of(m.start()))
+    # A verified library has no use for a shebang; rustc's rule for one
+    # (nested comments, doc comments) is not worth mirroring.
+    if re.match(r"\ufeff?#!(?!\s*\[)", path.read_text()):
+        add(0, "shebang line", "<file>")
+    # A trusted construct may sit in a verus! body, not in another macro's
+    # arguments, which the macro may repeat.
+    for m in re.finditer(r"\b((?:r#)?[A-Za-z_][A-Za-z0-9_]*)\s*!\s*([\(\[\{])", code):
+        if m.group(1) in ("verus", "macro_rules"):
+            continue
+        a, b = m.end() - 1, balanced(code, m.end() - 1)
+        for (offset, construct), (line, _, item) in list(found.items()):
+            if a <= offset < b and (construct in TRUSTED or construct == "assume_specification"):
+                add(offset, f"{construct} inside a {m.group(1)}! invocation", item)
     for m in CFG_OR_INCLUDE.finditer(code):
         if any(a <= m.start() < b for a, b, _ in spans) or m.start() in macros:
             continue
@@ -495,8 +511,14 @@ def test_only_files(crate_dir: pathlib.Path) -> set:
         if not path.is_file():
             continue
         code = strip_comments(path.read_text())
-        for m in re.finditer(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", code):
-            for cand in (crate_dir / "src" / f"{m.group(1)}.rs", crate_dir / "src" / m.group(1) / "mod.rs"):
+        tested = set(re.findall(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", code))
+        every = re.findall(r"\bmod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", code)
+        for name in tested:
+            # Only when every declaration of it is the cfg(test) one: a
+            # `#[cfg(not(test))] mod tests;` beside it would ship the file.
+            if every.count(name) != 1:
+                continue
+            for cand in (crate_dir / "src" / f"{name}.rs", crate_dir / "src" / name / "mod.rs"):
                 if cand.is_file():
                     out.add(cand)
     return out

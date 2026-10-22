@@ -479,17 +479,24 @@ def check_mce_deps(root: pathlib.Path, out: list):
                 tables.append(scope.get(kind, {}))
         # Dependency keys that name sha3 or zeroize, by key or by `package`.
         guarded = set()
+        ws_deps = ws_doc.get("workspace", {}).get("dependencies", {})
         for deps in tables:
             for key, spec in deps.items():
                 spec = spec if isinstance(spec, dict) else {"version": spec}
-                if spec.get("package", key) not in ("sha3", "zeroize"):
+                package = spec.get("package", key)
+                if spec.get("workspace") is True:
+                    # An inherited entry names its package in the workspace
+                    # declaration, under the same key.
+                    declared = ws_deps.get(key, {})
+                    package = declared.get("package", key) if isinstance(declared, dict) else key
+                if package not in ("sha3", "zeroize"):
                     continue
                 guarded.add(key)
                 if spec.get("workspace") is True:
                     # Inherited: its declaration is judged in
                     # [workspace.dependencies], but cargo adds the member's
                     # own features on top.
-                    if spec.get("features") or "default-features" in spec:
+                    if spec.get("features") or spec.get("default-features", False) is not False:
                         out.append(f"P16 {rel}: {key} inherits from the workspace but adds features")
                     continue
                 if spec.get("features") or spec.get("default-features", True) is not False:

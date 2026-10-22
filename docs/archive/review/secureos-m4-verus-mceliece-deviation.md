@@ -1080,7 +1080,8 @@ is closed at its primitive instead, per the R42 convergence rule.
   - **`cfg`, `cfg_attr` and `include` outside an attribute:** flagged as
     identifiers (aliases, macro idents), except an allowed `cfg!(..)`.
   - **Build-environment reads:** `option_env!`/`env!` are refused outside
-    test-only modules. Cargo sets `CARGO_PRIMARY_PACKAGE` under `-p`, not
+    test-only files (a file a crate root declares only as
+    `#[cfg(test)] mod x;`; an inline test module is still refused). Cargo sets `CARGO_PRIMARY_PACKAGE` under `-p`, not
     for a PD's dependency, so such a read splits the builds as a cfg does.
   - **The lexer:** it takes `_` in `\u{..}` and drops a shebang line as
     rustc does.
@@ -1089,7 +1090,9 @@ is closed at its primitive instead, per the R42 convergence rule.
   - **Allowlist counts:** an entry's count must be an integer >= 1.
   - **The `--no-cheating` decision:** the gate takes it from
     `verus_trusted.py allowed`, the same parse.
-  - **Fixtures:** 15, each red under `0f8f0b7`.
+  - **Fixtures:** 14: 13 deny fixtures, each red under `0f8f0b7`, and 1
+    allow fixture, red with the cfg! exclusion removed. Round 5 adds a
+    spaced `cfg ! (test)` allow case, which pins the spaced macro form.
 - **P16 (T34, F-R4-3, N5, T35):** a `workspace = true` sha3/zeroize that
   adds features is refused. `[features]` values are matched against the
   member's keys that resolve to sha3/zeroize (renamed ones included).
@@ -1111,8 +1114,10 @@ is closed at its primitive instead, per the R42 convergence rule.
       assume/admit/external_body/assume_specification in what it
       compiled.
     - For all five crates, the scan refuses every trusted construct,
-      cfg split and build-environment read spelled in the ways rustc
-      accepts that the four review rounds found.
+      cfg split and build-environment read in each spelling the five
+      review rounds found: aliases of `cfg`/`include`/`env`/`option_env`
+      included, and a trusted construct inside a macro definition or a
+      macro's arguments.
   - **What it does not claim:** completeness against source deliberately
     written to evade a text scan. Each round found a new spelling (13 by
     round 4: cfg_attr nesting, macro idents, five lexer desyncs, spaced
@@ -1127,10 +1132,38 @@ is closed at its primitive instead, per the R42 convergence rule.
       `ensures`.
     - In any crate, an evading cfg or env split could ship a body
       Verus never saw.
-    - In both cases the bounded Kani harnesses and the unit, bolero and
-      integration tests still run on the shipped code.
+    - For a cfg split, Kani, unit and bolero build the same side Verus
+      saw. For a split on `CARGO_PRIMARY_PACKAGE`, they build it as the
+      primary package too, so only the PD build, and with it the
+      integration run, exercises the shipped side.
   - **Likelihood:** low for honest or careless edits, which the scan
     catches. The rest needs intent.
   - **Cost to close:** compare the compiled MIR of the verified build
     with the shipped one. That is a project of its own; it is recorded for
     M5's reproducible-build work, which builds both.
+- **Round 5 (T34 continuing, T42–T45):**
+  - **P16:** it resolves an inherited `workspace = true` key to the package
+    its workspace declaration names, so a renamed inherited sha3 that adds
+    features is refused.
+  - **Selftest fixtures:**
+    - the spaced `cfg ! (test)` allow fixture pins CFG_MACRO's spacing (a
+      regression would flag it as a stray identifier);
+    - stub_make checks that make's own child dies with the group, and the
+      short timeout applies to the never-ending case only;
+    - the parse-failure needle names expat's "not well-formed".
+- **Round 5 (F-R5-1 to F-R5-8, R5-S1, R5-S2):**
+  - **The scan:**
+    - `env`/`option_env` are identifiers refused outside test-only
+      files, aliases included;
+    - a shebang line is refused outright in a verified crate (rustc's
+      rule for it nests comments and skips doc comments, which is not
+      worth mirroring);
+    - `\u{..}` takes any number of `_`;
+    - a test-only file must have no other `mod` declaration;
+    - raw macro names count as macro definitions;
+    - a trusted construct in any macro invocation other than `verus!` is
+      refused.
+  - **P16:** it accepts an inherited dependency restating
+    `default-features = false`.
+  - **Fixtures:** 7 P12/P16 cases, each red under `ce76726`. The one allow
+    case was wrongly refused there.

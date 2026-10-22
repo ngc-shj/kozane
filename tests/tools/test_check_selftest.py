@@ -124,26 +124,36 @@ def main() -> int:
 
     # run_make itself: a make that never ends is killed with its group and
     # reported as TIMED_OUT; one that fails keeps its own code.
-    def stub_make(name, body, want_code, want_err):
+    def stub_make(name, body, timeout, want_code, want_err, child_dead=False):
         nonlocal failures, ran
         ran += 1
         with tempfile.TemporaryDirectory() as d:
             stub = pathlib.Path(d) / "make"
-            stub.write_text(f"#!/bin/sh\n{body}\n")
+            stub.write_text(f"#!/bin/sh\n{body.replace('@DIR@', d)}\n")
             stub.chmod(0o755)
             saved = (g["CASE_TIMEOUT_S"], g["MAKE_ENV"])
-            g["CASE_TIMEOUT_S"] = 1
+            g["CASE_TIMEOUT_S"] = timeout
             g["MAKE_ENV"] = {**saved[1], "PATH": f"{d}:{saved[1].get('PATH', '')}"}
             try:
                 out = g["run_make"](pathlib.Path(d))
             finally:
                 g["CASE_TIMEOUT_S"], g["MAKE_ENV"] = saved
-        ok = out.returncode == want_code and want_err in out.stderr
+            dead = True
+            if child_dead:
+                # The grandchild (make's own child) must die with the group.
+                pid = int((pathlib.Path(d) / "child.pid").read_text())
+                try:
+                    os.kill(pid, 0)
+                    dead = pathlib.Path(f"/proc/{pid}/stat").read_text().split()[2] == "Z"
+                except ProcessLookupError:
+                    dead = True
+        ok = out.returncode == want_code and want_err in out.stderr and dead
         failures += not ok
-        print(f"{'ok  ' if ok else 'FAIL'} run_make: {name}: code {out.returncode}")
+        print(f"{'ok  ' if ok else 'FAIL'} run_make: {name}: code {out.returncode}, child dead {dead}")
 
-    stub_make("a make that never ends times out", "exec tail -f /dev/null", g["TIMED_OUT"], "timed out")
-    stub_make("a failing make keeps its code", "exit 2", 2, "")
+    stub_make("a make that never ends times out, its children killed with it",
+              "tail -f /dev/null &\necho $! > @DIR@/child.pid\nwait", 1, g["TIMED_OUT"], "timed out", child_dead=True)
+    stub_make("a failing make keeps its code", "exit 2", 600, 2, "")
 
     # bolero's crash inputs are cleared at any depth, but not inside a SKIP
     # dir (a target dir is the build's own).
