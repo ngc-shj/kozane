@@ -388,6 +388,38 @@ def check_identity(elf: Binary, harness: Binary, root: str) -> list:
     return errors
 
 
+MCE_NAME = re.compile(r"^<?mce460896::")
+
+
+def check_contained(binary: Binary, root: str, nodes: dict) -> list:
+    """Nothing reaches McEliece code except through the root (C10): every
+    mce460896 function in the ELF is in the root's closure (or is the shim
+    or its carrier), and no function outside the closure branches to an
+    mce460896 function in it other than the root. (The closure's shared
+    core helpers, `copy_from_slice` say, have callers of their own.) A direct `decaps_core` call would skip the
+    root's stack scrub; a call to some other entry point (`keypair`,
+    `stages::*`) would ship code that neither identity nor the forbidden
+    instructions check."""
+    inside = set(nodes.values())
+    root_addr = nodes[root]
+    shims = {a for n, addrs in binary.by_name.items() if SHIM_NAME.match(n) or SHIM_CARRIER.match(n) for a in addrs}
+    errors = []
+    for addr, name in sorted(binary.funcs.items()):
+        if addr in inside:
+            continue
+        if addr not in shims and any(MCE_NAME.match(n) for n in name.split(" = ")):
+            errors.append(f"{binary.label}: identity: {name} is McEliece code outside the closure of {root}")
+        # A sizeless symbol (an assembly entry label) has no body to scan;
+        # what it falls into is a sized function, scanned on its own.
+        for a, mnemonic, ops in binary.body(addr) if binary.sizes.get(addr, 0) > 0 else []:
+            target = branch_target(mnemonic, ops)
+            if target is not None and target in inside and target != root_addr \
+                    and any(MCE_NAME.match(n) for n in binary.funcs[target].split(" = ")):
+                errors.append(f"{binary.label}: identity: {name}+{a - addr:#x} enters the closure of {root} "
+                              f"at {binary.funcs[target]}, not at the root")
+    return errors
+
+
 def first_diff(a: list, b: list) -> str:
     for i in range(max(len(a), len(b))):
         x, y = (f"'{v[i]}'" if i < len(v) else "no instruction" for v in (a, b))
@@ -583,6 +615,7 @@ def main() -> int:
             nodes, stops, _ = closure(binaries[label], root)
             if "identity" in checks:
                 errors += check_identity(binaries[label], harness, root)
+                errors += check_contained(binaries[label], root, nodes)
             if "forbidden" in checks:
                 errors += check_forbidden(binaries[label], nodes, divides)
             symbols += len(nodes)

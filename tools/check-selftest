@@ -86,7 +86,8 @@ CASES_FOR_GATE = {
              "rp-domain-label", "rp-mac-always", "c2-hello-burst", "c2-hello-interval", "c2-boot-spkm",
              "c2-boot-kat", "c4-hello-src", "c4-hello-global", "c4-conf-src", "c4-conf-global", "c4-type-filter",
              "rp-cookie-domain", "rp-legacy-probe", "rp-conf-share", "rp-awaited", "rp-proven-reserve", "rp-sid-binding", "rp-nat",
-             "rp-cookie-offload", "rp-tx-tier", "rp-reply-fifo", "rp-reply-order", "rp-reply-dst", "rp-sync-sticky"},
+             "rp-cookie-offload", "rp-tx-tier", "rp-reply-fifo", "rp-reply-order", "rp-reply-dst", "rp-sync-sticky",
+             "mce-fresh-draw"},
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
     "ct": {"ct-barrier", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub"},
@@ -206,12 +207,18 @@ CASES = {
                                      "#[inline]\nfn below_window(",
                                      "#[inline]\n#[cfg_attr(verus_keep_ghost, verifier::external_body)]\nfn below_window("),
                       "trusted construct `external_body` not in the allowlist"),
-    # A required function moved out of verus!: it still compiles, nothing
-    # left fails verification, but the spec is gone.
+    # A required function moved below the verus! block, as plain Rust
+    # without its ensures: the file still builds as Rust, and the source
+    # check rejects it before Verus runs (Verus would also refuse the call
+    # into unverified code, but the gate must not lean on that).
     "verus-required": (["verus", "verus_crates=wg-wire"],
-                       lambda t: edit(t, "crates/wg-wire/src/replay.rs",
-                                      "use vstd::prelude::*;\n\nverus! {\n",
-                                      "use vstd::prelude::*;\n\n"),
+                       lambda t: (edit(t, "crates/wg-wire/src/replay.rs",
+                                       "#[inline]\nfn below_window(c: u64, window: u64, top: u64) -> (r: bool)\n"
+                                       "    ensures\n        r == (c + window < top),\n{\n"
+                                       "    c.saturating_add(window) < top\n}\n", ""),
+                                  edit(t, "crates/wg-wire/src/replay.rs", "} // verus!\n\nimpl<const BITS: usize> Default",
+                                       "} // verus!\n\n#[inline]\nfn below_window(c: u64, window: u64, top: u64) -> bool {\n"
+                                       "    c.saturating_add(window) < top\n}\n\nimpl<const BITS: usize> Default")),
                        "required function `below_window` is not defined inside verus!"),
     # msgs' one trusted Verus function (M4 plan C3): its contract is Kani's
     # to check, so a body that borrows one byte late must fail there.
@@ -415,6 +422,21 @@ CASES = {
                                           "        let psk = psks.fresh(peer, now_ns).map_err(Reject::Psk)?;\n"),
                  "---- tests::psk_refusal_leaves_the_timestamp_and_flood_state_unchanged stdout ----"),
     # One Rosenpass domain label changed must break the upstream vectors.
+    # The encaps shim (M4 plan C7 I8, the precondition for keeping it out of
+    # C10's identity): the attempt after the first rejection asks the RNG for
+    # the second half only and reuses the first half of the rejected draw.
+    # Only that once: a shim that kept the half for good could reject
+    # forever, and the other crates' encaps tests would never end.
+    "mce-fresh-draw": (["unit"], lambda t: (
+        edit(t, "crates/mce460896/src/lib.rs",
+             "    loop {\n        if let Err(err) = rng(rand.as_mut_slice()) {\n",
+             "    let mut tries = 0;\n    loop {\n        let from = if tries == 1 { ENCAPS_RAND_LEN / 2 } else { 0 };\n"
+             "        tries += 1;\n        if let Err(err) = rng(&mut rand[from..]) {\n"),
+        edit(t, "crates/mce460896/src/lib.rs",
+             "        let accept = encaps_attempt(pk, &rand, ct_out, ss_out);\n        rand.zeroize();\n",
+             "        let accept = encaps_attempt(pk, &rand, ct_out, ss_out);\n"
+             "        rand[if tries == 1 { ENCAPS_RAND_LEN / 2 } else { 0 }..].zeroize();\n")),
+                       "one attempt's length per request"),
     "rp-domain-label": (["unit"], lambda t: edit(t, "crates/rosenpass-core/src/crypto.rs",
                                                  'mix: kh_public(&ckextract, b"mix")?', 'mix: kh_public(&ckextract, b"miy")?'),
                         "---- tests::resp_hello_and_its_ck_chain_match_upstream_byte_for_byte stdout ----"),

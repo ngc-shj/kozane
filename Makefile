@@ -21,7 +21,7 @@ loader := $(BUILD)/loader.img
 counts := $(BUILD)/counts
 
 pds := eth-out eth-in ingress audit timer key hs inner data pq pqkey
-host_crates := wire ring audit-event ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core
+host_crates := wire ring audit-event ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896
 kani_crates := wire ring ingress-core inner-core wg-wire msgs rosenpass-wire
 
 .PHONY: clean-counts
@@ -194,8 +194,11 @@ ct_residue_wrap :=
 ct: ct-harness | $(counts)
 	tools/ct-gate $(ct_harness) "$(ct_valgrind)" "$(ct_residue_wrap)" > $(counts)/ct.log 2>&1 \
 		|| { cat $(counts)/ct.log; exit 1; }
-	# The harness's own unit tests (its report parser), on the host: it is
-	# its own workspace, so `make unit` does not see it.
+	# The harness's own clippy and unit tests (its report parser), on the
+	# host: it is its own workspace, so `make lint` and `make unit` do not
+	# see it.
+	cargo clippy --locked --manifest-path tools/ct-harness/Cargo.toml --target-dir $(BUILD)/ct/target-host \
+		--all-targets -- -D warnings > $(counts)/ct-lint.log 2>&1 || { cat $(counts)/ct-lint.log; exit 1; }
 	cargo test --locked --manifest-path tools/ct-harness/Cargo.toml --target-dir $(BUILD)/ct/target-host \
 		> $(counts)/ct-unit.log 2>&1 || { cat $(counts)/ct-unit.log; exit 1; }
 	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-CT-HARNESS", n + 0 }' $(counts)/ct-unit.log >> $(counts)/ct

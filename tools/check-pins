@@ -24,8 +24,9 @@ Rules:
   P8 no `getrandom|thread_rng|OsRng` in crates/ (*.rs, Cargo.toml):
      randomness comes only through `cpu` and the hedged source
   P9 no derive(Clone|Copy|Debug) on a type wrapping `Secret<` or
-     `Zeroizing<` in rosenpass-core, pqkey-core, pds/pq or pds/pqkey (L12,
-     M3 plan S12; pqkey-core holds its secrets in `Zeroizing`)
+     `Zeroizing<` in rosenpass-core, pqkey-core, pds/pq, pds/pqkey,
+     pds/ingress or mce460896 (L12, M3 plan S12, M4 plan C11; pqkey-core
+     holds its secrets in `Zeroizing`)
   P10 no `from_bytes(*` in the secret crates or in hs-core, key-core,
      data-core, wg-core and the key, hs and data PDs: a dereferenced array is a by-value temporary of
      the secret left on the stack; `copy_from(&..)` copies in place (L12)
@@ -39,8 +40,13 @@ Rules:
   P14 no `unsafe` in crates/mce460896 outside src/barrier.rs (M4 plan C7)
   P15 no valgrind client-request preamble (`ror x12, x12, #3`) in crates/
      or tools/ outside tools/ct-harness/src/vg.rs (M4 plan C9)
-  P16 crates/mce460896's [dependencies] are exactly sha3 and zeroize, with
-     no build-, target- or other dependency tables (M4 plan C7)
+  P16 crates/mce460896's dependencies, as resolved: its [dependencies]
+     name the packages sha3 and zeroize (by `package`, not key), from the
+     registry, and it has no build- or target-specific dependency table;
+     the workspace has no [patch] or [replace]; and the lock's closure of
+     the two is exactly MCE_CLOSURE (M4 plan C7). The lock stands for
+     `cargo metadata`: every gate builds --locked, and the fixtures' partial
+     trees could not be resolved by cargo.
 
 Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
 fail until they are removed from PENDING; --enforce-pending makes them fail
@@ -72,6 +78,7 @@ the only guard for pqkey-core's wrappers. L8's adjudicating control is
 """
 
 import argparse
+import collections
 import pathlib
 import re
 import sys
@@ -87,7 +94,8 @@ COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/
                "crates/pds/key", "crates/pds/hs", "crates/pds/data"]
 PENDING: set[str] = set()
 # Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
-SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/ingress"]
+SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/ingress",
+                 "crates/mce460896"]
 # Types that hold a secret under a name of their own, not as Secret<..> (P9,
 # M3b plan A1): the WireGuard cookie secret.
 SECRET_TYPES = ("Secret<", "Zeroizing<", "CookieSecret")
@@ -306,12 +314,22 @@ def check_verus_trusted(root: pathlib.Path, out: list):
     import verus_trusted
     m = re.search(r"^verus_crates :=(.*)$", (root / "Makefile").read_text(), re.M)
     crates = m.group(1).split() if m else []
+    if not crates:
+        out.append("P12 Makefile: no `verus_crates :=` list; nothing to check")
     policy = root / "policy/verus-trusted.toml"
     allowed = {(e.get("crate"), e.get("file"), e.get("construct"))
                for e in tomllib.loads(policy.read_text()).get("trusted", [])} if policy.is_file() else set()
     for crate in crates:
         base = root / "crates" / crate
-        for f in sorted((base / "src").rglob("*.rs")) if base.is_dir() else []:
+        # As P11: a crate that exists without its sources has lost what this
+        # rule checks; a tree without the crate (the P7 fixtures') has not,
+        # and the Verus gate fails on a listed crate that is gone.
+        if not base.is_dir():
+            continue
+        if not (base / "src").is_dir():
+            out.append(f"P12 crates/{crate}: listed in verus_crates but has no src/")
+            continue
+        for f in sorted((base / "src").rglob("*.rs")):
             rel = str(f.relative_to(base))
             for line, construct in verus_trusted.trusted_in(f):
                 if (crate, rel, construct) not in allowed:
@@ -364,17 +382,80 @@ def check_client_requests(root: pathlib.Path, out: list):
                     out.append(f"P15 {rel}:{n}: valgrind client request outside tools/ct-harness/src/vg.rs")
 
 
+# The lock's closure of mce460896's two dependencies (P16): a change to it
+# is a change to what the McEliece code links, and is reviewed here. The
+# lock does not record edge kinds, so build dependencies (version_check) and
+# target-specific ones (libc, for cpufeatures) are in it.
+MCE_CLOSURE = {"block-buffer@0.10.4", "cpufeatures@0.2.17", "crypto-common@0.1.7", "digest@0.10.7",
+               "generic-array@0.14.7", "keccak@0.1.6", "libc@0.2.191", "sha3@0.10.9", "typenum@1.20.1",
+               "version_check@0.9.5", "zeroize@1.8.1"}
+REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+
+
 def check_mce_deps(root: pathlib.Path, out: list):
     path = root / "crates/mce460896/Cargo.toml"
     if not path.is_file():
         return
     data = tomllib.loads(path.read_text())
-    deps = set(data.get("dependencies", {}))
-    if deps != {"sha3", "zeroize"}:
-        out.append(f"P16 crates/mce460896/Cargo.toml: dependencies {sorted(deps)}, want exactly ['sha3', 'zeroize']")
-    for table in ("build-dependencies", "target"):
-        if table in data:
+    deps = data.get("dependencies", {})
+    names = set()
+    for key, spec in deps.items():
+        spec = spec if isinstance(spec, dict) else {"version": spec}
+        names.add(spec.get("package", key))
+        extra = set(spec) - {"version", "default-features", "features"}
+        if extra:
+            out.append(f"P16 crates/mce460896/Cargo.toml: dependency {key} has {sorted(extra)}; "
+                       "a registry version only")
+    if names != {"sha3", "zeroize"}:
+        out.append(f"P16 crates/mce460896/Cargo.toml: dependencies resolve to {sorted(names)}, "
+                   "want exactly ['sha3', 'zeroize']")
+    for table in sorted(data):
+        if table == "target" or table.replace("_", "-") == "build-dependencies":
             out.append(f"P16 crates/mce460896/Cargo.toml: [{table}] is not allowed")
+    ws = tomllib.loads((root / "Cargo.toml").read_text())
+    for table in ("patch", "replace"):
+        if table in ws:
+            out.append(f"P16 Cargo.toml: [{table}] can redirect mce460896's dependencies")
+    try:
+        lock = tomllib.loads((root / "Cargo.lock").read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        out.append(f"P16 Cargo.lock: unreadable ({e}); the closure cannot be checked")
+        return
+    packages = collections.defaultdict(list)
+    for p in lock.get("package", []):
+        packages[p.get("name")].append(p)
+
+    def resolve(dep: str):
+        name, *version = dep.split()
+        found = [p for p in packages[name] if not version or p.get("version") == version[0]]
+        return found[0] if len(found) == 1 else None
+
+    mine = [p for p in packages["mce460896"] if "source" not in p]
+    if len(mine) != 1:
+        out.append(f"P16 Cargo.lock: mce460896 locked {len(mine)} times")
+        return
+    todo = [d for d in mine[0].get("dependencies", []) if d.split()[0] in names]
+    if sorted(d.split()[0] for d in todo) != sorted(names):
+        out.append(f"P16 Cargo.lock: mce460896 locks {sorted(mine[0].get('dependencies', []))}, "
+                   f"not its dependencies {sorted(names)}")
+    closure = set()
+    while todo:
+        dep = todo.pop()
+        p = resolve(dep)
+        if p is None:
+            out.append(f"P16 Cargo.lock: {dep} does not resolve to one package")
+            continue
+        key = f"{p['name']}@{p['version']}"
+        if key in closure:
+            continue
+        closure.add(key)
+        if p.get("source") != REGISTRY:
+            out.append(f"P16 Cargo.lock: {key} is not from the crates.io registry")
+        todo += p.get("dependencies", [])
+    for key in sorted(closure - MCE_CLOSURE):
+        out.append(f"P16 Cargo.lock: {key} entered mce460896's dependency closure")
+    for key in sorted(MCE_CLOSURE - closure):
+        out.append(f"P16 Cargo.lock: {key} left mce460896's dependency closure")
 
 
 def main() -> int:

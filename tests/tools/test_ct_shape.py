@@ -59,6 +59,15 @@ def identity(**kw):
     return run
 
 
+def contained(**kw):
+    @with_tree(**kw)
+    def run(search, harness, _d):
+        binaries, _ = load(search, harness)
+        nodes, _, _ = cts.closure(binaries["pd-pqkey.elf"], "mce460896::decaps")
+        return cts.check_contained(binaries["pd-pqkey.elf"], "mce460896::decaps", nodes)
+    return run
+
+
 def bm_with(old: str, new: str) -> list:
     assert old in elf.BM, old
     return [new if line == old else line for line in elf.BM]
@@ -222,6 +231,15 @@ CASES = [
      ["pd-pqkey.elf: identity: stop core::slice::index::slice_index_fail is reached from mce460896::decaps "
       "only in the harness", differs(0x24, None, "bl <core::slice::index::slice_index_fail>")[0]],
      identity(harness_extra=["bl {fail}"])),
+    ("McEliece code is reached only through the root", None, contained()),
+    ("an mce460896 function outside the root's closure is caught",
+     ["pd-pqkey.elf: identity: mce460896::vec::mul is McEliece code outside the closure of mce460896::decaps"],
+     contained(pd_mul=True)),
+    ("a call into the closure past the root is caught",
+     ["pd-pqkey.elf: identity: sel4_microkit::entry::run_main::<pd_pqkey::PqK, pd_pqkey::init>+0x0 enters the "
+      f"closure of mce460896::decaps at {BM}, not at the root"],
+     contained(pd_entry=("bl {bm}", "ret"))),
+    ("a call to one of the closure's stops is not an entry", None, contained(pd_entry=("bl memcpy", "ret"))),
     ("panic entries stop the closure by property", None, stops_by_property),
     ("crate hashes are masked, the instantiating crate is kept", None, hash_noise_and_instantiating_crate),
     ("a udiv is forbidden", [f"pd-pqkey.elf: forbidden: {BM}+0x24: udiv x0, x1, x2"], forbidden(["udiv x0, x1, x2"])),

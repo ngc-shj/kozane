@@ -661,3 +661,86 @@ run at `cec0ce2`.
     `system/secureos.system`);
   - key-core's constant-time notes;
   - other crates' `rand_core` lock entries.
+
+## Phase 2 self-check (step 2-5)
+
+Three experts checked `be5d54a..d1a93cb` against R1–R57, RS1–RS6 and
+RT1–RT11. The first solo `make check` at `d1a93cb` also failed, in `test`.
+
+- **`make check` failure:** `run.py`'s reason-list check looked for the
+  `drop_reasons!` macro, which C5 replaced with a plain enum. The macro had
+  also made "every variant is in `DropReason::ALL`" true by construction.
+  The check now parses the enum and `ALL`, and requires both to equal its
+  list. The `ALL` comparison was red-proved by dropping one entry.
+- **P9/P10 (Major):** plan C11 adds mce460896 to the secret-crate lists; it
+  had not been added. It is now in `SECRET_CRATES`, so P10 covers it too,
+  with one deny fixture each.
+- **P16 (Major):** P16 compared the key names of `[dependencies]`, so a
+  `package =` rename, a `[patch]`, or a change below sha3 passed. It now
+  judges the resolved set. Each dependency must name sha3 or zeroize by
+  `package`, as a registry version only. The workspace may have no
+  `[patch]`/`[replace]`, and the lock's closure of the two must be exactly
+  `MCE_CLOSURE` (11 name@version pairs), all from crates.io.
+  - **Deviation from the plan:** P16 reads Cargo.lock instead of running
+    `cargo metadata`. The check-pins fixtures run on partial trees that
+    cargo cannot resolve, and every gate builds `--locked`, so the lock is
+    the resolution. The lock does not record edge kinds, so `MCE_CLOSURE`
+    also holds generic-array's build dependency and cpufeatures' libc.
+  - Every refusal branch has its own fixture (8 cases).
+- **P12 (Major):** P12 now fails when the Makefile has no `verus_crates :=`
+  list, and when a listed crate exists without `src/`. Following P11's
+  precedent, a tree without the crate at all is skipped; the Verus gate
+  fails on a listed crate that is gone.
+- **Verus scanner (Major):** `tools/verus_trusted.py` missed these, and now
+  catches each, all inside `verus!`:
+  - `assume_specification`, which is item syntax (vstd itself writes
+    `pub assume_specification<T>[ .. ]`), not an attribute;
+  - path-qualified `admit(` and `assume(`, and the expanded `assume_(`;
+  - trusted constructs hidden behind a char literal `'"'` or a raw string,
+    which desynced the comment and string stripper.
+
+  Five P12 fixtures cover these. Each is red under the previous scanner
+  and green under the new one.
+- **ct-shape containment (Major):** the identity check now also fails in
+  two cases.
+  - Any `mce460896::` function in a PD lies outside the root's closure
+    (other than the shim or its carrier). This covers `keypair`,
+    `stages::*` and `pk_from_sk`.
+  - A function outside the closure branches to an mce460896 function inside
+    it other than the root. An example is a direct `decaps_core` call, which
+    skips the scrub.
+
+  Branches into the closure's shared core helpers are allowed: they have
+  callers of their own (`copy_from_slice`, from msgs and the TLS setup).
+  The synthetic ELFs now link only their own root. Four fixtures cover the
+  check, and the live PDs pass.
+- **`mce-fresh-draw` (Major):** the selftest case required by plan C7 was
+  missing; it is added.
+  - The mutated shim reuses the first half of the first rejected draw for
+    one attempt.
+  - The first version reused the half for good. In mksecrets' tests that
+    never accepted, and the run hung; the selftest has no timeout.
+- **mce460896 tests never ran (Critical; found by the `mce-fresh-draw`
+  red-proof, missed by all three experts):** the plan's `host_crates gains
+  mce460896 and ct-harness` was not done. So `make unit` and `make lint`
+  never ran mce460896's 17 tests, including the liboqs and cmr equivalence
+  vectors and I8. The first `mce-fresh-draw` run stayed green for that
+  reason.
+  - mce460896 is now in `host_crates`. Its tests pass, and clippy is clean.
+  - ct-harness is its own workspace and cannot join `host_crates`, so `ct`
+    now runs its clippy next to its unit tests.
+  - The manifest gains `UNIT-MCE460896 5`, plus `UNIT-RNG 5`,
+    `UNIT-STACK 2` and `UNIT-VECTORS 5` (integration-test binaries are
+    counted by name). `UNIT-TESTS` is 733 and `LINT-CRATES` 21.
+  - The M4 equivalence claims (sections M1 result and M3a) rest on manual
+    runs of these tests, not on `make check`, until this commit.
+- **`verus-required` (Major, R29):** the old mutant (removing `verus! {`)
+  did not compile, contrary to its comment. It now moves `below_window`
+  below the block as plain Rust without its ensures.
+- **test_package (Major, RT11):** the scratch dir and the `ct_stubs`
+  globals are now released in `finally` even when the setup raises, and
+  `ct_stubs` undoes a partial setup.
+- **Accepted (Minor, R39):** mksecrets' KAT shared key is not zeroised.
+  mksecrets wipes none of its secrets, including the long-term McEliece
+  secret key it writes, so wiping only the KAT key would add nothing. This
+  is a residual of the host tool.

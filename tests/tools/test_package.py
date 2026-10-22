@@ -108,16 +108,20 @@ class ct_stubs:
     def __init__(self, d: pathlib.Path, harness: pathlib.Path, green: bool = True, record: bool = True,
                  real: bool = False):
         self.saved = (pkg.CT_SHAPE, pkg.CT_POLICY, pkg.CT_ROOT, pkg.valgrind_version)
-        if not real:
-            fake = d / "fake-ct-shape"
-            fake.write_text(FAKE_CT_SHAPE[green])
-            fake.chmod(0o755)
-            pkg.CT_SHAPE = fake
-        (d / "ct-shape.toml").write_text("")
-        pkg.CT_POLICY = d / "ct-shape.toml"
-        pkg.CT_ROOT = d
-        pkg.valgrind_version = lambda: VG
-        ct_tree(d, harness, record)
+        try:
+            if not real:
+                fake = d / "fake-ct-shape"
+                fake.write_text(FAKE_CT_SHAPE[green])
+                fake.chmod(0o755)
+                pkg.CT_SHAPE = fake
+            (d / "ct-shape.toml").write_text("")
+            pkg.CT_POLICY = d / "ct-shape.toml"
+            pkg.CT_ROOT = d
+            pkg.valgrind_version = lambda: VG
+            ct_tree(d, harness, record)
+        except BaseException:
+            self.restore()
+            raise
 
     def restore(self):
         pkg.CT_SHAPE, pkg.CT_POLICY, pkg.CT_ROOT, pkg.valgrind_version = self.saved
@@ -163,19 +167,21 @@ def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, 
     builds ct_shape_elf's synthetic ELFs (its arguments to tree()) and runs
     the real tools/ct-shape on them."""
     def run():
-        d = tmp_tree()
         real = (pkg.build, pkg.require_debug, pkg.WAIVERS, pkg.LOCK, sys.argv)
-        search, harness_path = ("x", d / "ct-harness")
-        if real_ct is not None:
-            search, harness_path = ct_shape_elf.tree(d, **real_ct)
-        elif harness:
-            harness_path.write_bytes(b"\x7fELF harness")
-        stubs = ct_stubs(d, harness_path, green=ct_green, record=record, real=real_ct is not None)
         real_umask = os.umask(0o022)
         os.umask(real_umask)
         real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
-        built = []
+        built, stubs = [], None
+        d = tmp_tree()
+        # Everything acquired from here (the scratch dir, the stubbed module
+        # globals) is undone in `finally`, even when the setup itself raises.
         try:
+            search, harness_path = ("x", d / "ct-harness")
+            if real_ct is not None:
+                search, harness_path = ct_shape_elf.tree(d, **real_ct)
+            elif harness:
+                harness_path.write_bytes(b"\x7fELF harness")
+            stubs = ct_stubs(d, harness_path, green=ct_green, record=record, real=real_ct is not None)
             (d / "secrets.bin").write_bytes(key)
             (d / "pq.bin").write_bytes(pq)
             (d / "gen_config.h").write_text(gen)
@@ -209,7 +215,8 @@ def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, 
             return printed
         finally:
             pkg.build, pkg.require_debug, pkg.WAIVERS, pkg.LOCK, sys.argv = real
-            stubs.restore()
+            if stubs is not None:
+                stubs.restore()
             os.umask(real_umask)
             for s, h in real_handlers.items():
                 signal.signal(s, h)

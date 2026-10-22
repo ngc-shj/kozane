@@ -178,11 +178,19 @@ FORWARD_ONLY = ["TtlExpired"]
 
 def check_reason_list_matches_rust():
     src = open(os.path.join(os.path.dirname(__file__), "../../crates/wire/src/lib.rs")).read()
-    block = src[src.index("drop_reasons! {"):]
+    block = src[src.index("pub enum DropReason {"):]
     block = block[: block.index("}")]
     rust = re.findall(r"^\s+(\w+) = \d+,", block, re.M)
     if rust != DROP_REASONS + FORWARD_ONLY:
         raise Fail(f"DROP_REASONS out of sync with wire: {rust}")
+    # The enum and DropReason::ALL are two lists since M4 (C5) took away the
+    # macro that declared both; a variant missing from ALL is invisible to
+    # the audit PD's decoder.
+    all_block = src[src.index("pub const ALL: &'static [DropReason] = &["):]
+    all_block = all_block[: all_block.index("];")]
+    listed = re.findall(r"DropReason::(\w+),", all_block)
+    if listed != rust:
+        raise Fail(f"DropReason::ALL out of sync with the enum: {listed}")
 
 
 # ---------------------------------------------------------------- harness

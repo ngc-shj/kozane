@@ -6,7 +6,8 @@ trusted construct is (R2: T-N11):
 
 - trusted constructs: a `verifier::<x>` or `verifier(<x>)` token for one of
   TRUSTED anywhere in an attribute's token stream (so `cfg_attr(...)`
-  spellings count), plus `assume(` and `admit(` calls;
+  spellings count); inside verus!, the `assume_specification` item and
+  `assume(`, `assume_(` and `admit(` calls, path-qualified or not;
 - `verus!{}` block spans;
 - `ensures` conjuncts inside those blocks (top-level comma-separated
   clauses up to the function body);
@@ -34,9 +35,14 @@ TRUSTED = (
     "exec_allows_no_decreases_clause",
 )
 ATTR_TOKEN = re.compile(r"verifier\s*(?:::\s*|\(\s*)(" + "|".join(TRUSTED) + r")\b")
-# Verus's own `assume(`/`admit(`, inside verus! only; a path-qualified call
-# such as Kani's `kani::assume(` is a different function.
-CALL_TOKEN = re.compile(r"(?<![A-Za-z0-9_:])(assume|admit)\s*\(")
+# Inside verus! only. `assume(` expands to `verus_builtin::assume_(`, and
+# either may be written path-qualified, so a qualifier does not exempt a
+# call; `assume_specification` is item syntax there, not an attribute. Kani's
+# `kani::assume(` lives outside verus! and is not seen.
+CALL_TOKEN = re.compile(r"(?<![A-Za-z0-9_.])(assume_|assume|admit)\s*\(")
+ITEM_TOKEN = re.compile(r"(?<![A-Za-z0-9_])assume_specification\b")
+RAW_STRING = re.compile(r"(?<![A-Za-z0-9_])b?r(#*)\"")
+CHAR_LITERAL = re.compile(r"b?'(?:\\u\{[0-9a-fA-F]{1,6}\}|\\x[0-9a-fA-F]{2}|\\.|[^\\'\n])'")
 FN_DEF = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)")
 
 
@@ -56,6 +62,15 @@ def strip_comments(text: str) -> str:
             j = n if j < 0 else j + 2
             out.append(re.sub(r"[^\n]", " ", text[i:j]))
             i = j
+        elif (m := RAW_STRING.match(text, i)) and (i == 0 or not re.match(r"[A-Za-z0-9_]", text[i - 1])):
+            close = '"' + m.group(1)
+            j = text.find(close, m.end())
+            j = n if j < 0 else j + len(close)
+            out.append(re.sub(r"[^\n]", " ", text[i:j]))
+            i = j
+        elif (m := CHAR_LITERAL.match(text, i)) and (i == 0 or not re.match(r"[A-Za-z0-9_]", text[i - 1])):
+            out.append(" " * (m.end() - i))
+            i = m.end()
         elif text[i] == '"':
             j = i + 1
             while j < n and text[j] != '"':
@@ -92,7 +107,9 @@ def trusted_in(path: pathlib.Path):
     for s, e in verus_blocks(code):
         for m in CALL_TOKEN.finditer(code, s, e):
             found.append((line_of(code, m.start()), m.group(1) + "("))
-    return sorted(found)
+        for m in ITEM_TOKEN.finditer(code, s, e):
+            found.append((line_of(code, m.start()), "assume_specification"))
+    return sorted(set(found))
 
 
 def verus_blocks(code: str):

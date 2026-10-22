@@ -55,7 +55,10 @@ BM = [
 ]
 
 
-def program(h: str, crate: str, filler: int = 0, bm=None, extra=(), vstd: bool = False, mul: bool = False) -> str:
+def program(h: str, crate: str, filler: int = 0, bm=None, extra=(), vstd: bool = False, mul: bool = False,
+            only_root=None, entry_body=("ret",)) -> str:
+    """`only_root`: keep one of the two roots ("decaps" or "attempt"), as
+    each PD links only its own. `entry_body`: the PD entry's instructions."""
     s = syms(h)
     funcs = [
         ("decaps", ["stp x29, x30, [sp, #-16]!", "bl {bm}", "ldp x29, x30, [sp], #16", "b {scrub}"]),
@@ -69,7 +72,9 @@ def program(h: str, crate: str, filler: int = 0, bm=None, extra=(), vstd: bool =
     out = [".text", ".globl _start", "_start:", "b ."]
     out += ["nop"] * filler
     names = {k: v for k, v in s.items()}
-    named = [(s[k], body) for k, body in funcs] + [("memcpy", ["ret"]), ("memcmp", ["ret"]), (entry(crate, h), ["ret"]),
+    other = {"decaps": "attempt", "attempt": "decaps"}.get(only_root)
+    named = [(s[k], body) for k, body in funcs if k != other]
+    named += [("memcpy", ["ret"]), ("memcmp", ["ret"]), (entry(crate, h), list(entry_body)),
                                                    (s["shim"], ["cbnz w0, 1f", "1: ret"])]
     if mul:
         named.append((s["mul"], ["ret"]))
@@ -96,13 +101,15 @@ def build(d: pathlib.Path, name: str, source: str, base: int) -> pathlib.Path:
 
 
 def tree(d: pathlib.Path, pd_bm=None, pd_extra=(), harness_bm=None, harness_extra=(), vstd: bool = False,
-         harness_mul: bool = False):
-    """A search path with pd-pq.elf and pd-pqkey.elf, and a harness built at
-    other addresses with other crate hashes. Returns (search path, harness)."""
+         harness_mul: bool = False, pd_mul: bool = False, pd_entry=("ret",)):
+    """A search path with pd-pq.elf and pd-pqkey.elf, each with its own root
+    only, and a harness (with both) built at other addresses with other
+    crate hashes. Returns (search path, harness)."""
     search = d / "search"
     search.mkdir()
-    for label, crate in (("pd-pq.elf", "pd_pq"), ("pd-pqkey.elf", "pd_pqkey")):
-        build(search, label, program("a1", crate, bm=pd_bm, extra=pd_extra, vstd=vstd), 0x200000)
+    for label, crate, root in (("pd-pq.elf", "pd_pq", "attempt"), ("pd-pqkey.elf", "pd_pqkey", "decaps")):
+        build(search, label, program("a1", crate, bm=pd_bm, extra=pd_extra, vstd=vstd, mul=pd_mul, only_root=root,
+                                     entry_body=pd_entry), 0x200000)
     harness = build(d, "ct-harness", program("b7", "ct_harness", filler=37, bm=harness_bm, extra=harness_extra,
                                                      mul=harness_mul),
                     0x412340)
