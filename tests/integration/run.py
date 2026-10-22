@@ -602,7 +602,9 @@ def flood(w: Wire, con: Console, reason: str, k: int):
             w.send(frame)
         arp_roundtrip(w)
     want = list(range(65, k + 2, 64))
-    con.wait_for(rf"FrameDropped\({reason}\) total={want[-1]} ", since=mark)
+    # The whole last line: audit prints a character at a time, so waiting
+    # only for "total=N " could count it before its "lost=" arrived.
+    con.wait_for(rf"FrameDropped\({reason}\) total={want[-1]} lost=\d+\r?\n", since=mark)
     got = con.count(rf"audit: src=ingress FrameDropped\({reason}\) total=(\d+) lost=(\d+)", since=mark)
     if [int(t) for t, _ in got] != want or any(int(l) for _, l in got):
         raise Fail(f"flood lines {got}, want totals {want} lost=0")

@@ -1171,3 +1171,9 @@ is closed at its primitive instead, per the R42 convergence rule.
   `mod r#x;` declarations. A macro defined as, or an item imported as,
   `verus` is refused, like KANI_SHADOW for `kani`. Three fixtures, each red
   under `0b68f4f`.
+- **A race in the raw-frames flood check (pre-existing since M2, surfaced
+  at `0b68f4f`):** `flood` waited for `total=<last> ` and then counted lines
+  in full (`lost=..`). Audit prints a character at a time, so the last line
+  could be counted before its `lost=` arrived. pq's new StackHighWater
+  record, printed at that moment, made the window wider. The wait now takes
+  the whole line. No other wait in run.py is followed by such a recount.
