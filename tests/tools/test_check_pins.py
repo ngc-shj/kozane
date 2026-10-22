@@ -460,6 +460,14 @@ CASES = [
     ("P12 the allowlisted external_body handed to a macro", {"P12"},
      lambda t: (edit(t / "crates/msgs/src/lib.rs", "#[verifier::external_body]\n#[inline]", "#[inline]"),
                 append(t / "crates/msgs/src/lib.rs", "\ntwice! { #[verifier::external_body] fn chunk_ref() {} }\n"))),
+    # Round 6: raw names in test-module declarations, and a shadowed verus.
+    ("P12 env! in a test module also declared under a raw name", {"P12"},
+     lambda t: edit(t / "crates/rosenpass-wire/src/lib.rs", "#[cfg(test)]\nmod tests;",
+                    "#[cfg(test)]\nmod tests;\n#[cfg(not(test))]\nmod r#tests;")),
+    ("P12 a macro named verus", {"P12"},
+     lambda t: append(t / "crates/msgs/src/lib.rs", "\nmacro_rules! verus { ($($t:tt)*) => { $($t)* } }\n")),
+    ("P12 something used as verus", {"P12"},
+     lambda t: append(t / "crates/msgs/src/lib.rs", "\nuse crate::twice as verus;\n")),
     ("P12 kani::assume outside verus! is not Verus's assume", set(),
      lambda t: append(t / "crates/wg-wire/src/replay.rs", "\n#[cfg(kani)]\nfn h() { kani::assume(true); }\n")),
     # P14 (M4 C7): unsafe only in the barrier module.

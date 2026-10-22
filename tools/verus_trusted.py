@@ -67,6 +67,9 @@ ASSUME_IDENT = re.compile(r"(?<![A-Za-z0-9_])(admit|assume_|assume_new|assume_ne
 ASSUME_CALL = re.compile(r"(?<![A-Za-z0-9_.])((?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*)assume\s*\(")
 # Something else named `kani` would make `kani::assume(` mean anything.
 KANI_SHADOW = re.compile(r"\bmod\s+kani\b|\bas\s+kani\b")
+# ... and something else named `verus`, which the macro-invocation rule and
+# the verus! block detection trust.
+VERUS_SHADOW = re.compile(r"\bmacro_rules\s*!\s*(?:r#)?verus\b|\bmacro\s+(?:r#)?verus\b|\bas\s+(?:r#)?verus\b")
 ITEM_TOKEN = re.compile(r"(?<![A-Za-z0-9_])assume_specification\b")
 # cfg predicates: only these names are allowed (the Verus build and the PD
 # build agree on them); anything else (`verus_*`, `debug_assertions`,
@@ -467,6 +470,8 @@ def trusted_in(path: pathlib.Path, test_only: bool = False):
         add(at, "assume(", owner_of(at))
     for m in KANI_SHADOW.finditer(code):
         add(m.start(), "kani shadowed", owner_of(m.start()))
+    for m in VERUS_SHADOW.finditer(code):
+        add(m.start(), "verus shadowed", owner_of(m.start()))
     for m in ITEM_TOKEN.finditer(code):
         add(m.start(), "assume_specification", item_after(code, m.end(), impls))
     for m in INCLUDE.finditer(code):
@@ -511,8 +516,8 @@ def test_only_files(crate_dir: pathlib.Path) -> set:
         if not path.is_file():
             continue
         code = strip_comments(path.read_text())
-        tested = set(re.findall(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", code))
-        every = re.findall(r"\bmod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;", code)
+        tested = set(re.findall(r"#\s*\[\s*cfg\s*\(\s*test\s*\)\s*\]\s*mod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;", code))
+        every = re.findall(r"\bmod\s+(?:r#)?([A-Za-z_][A-Za-z0-9_]*)\s*;", code)
         for name in tested:
             # Only when every declaration of it is the cfg(test) one: a
             # `#[cfg(not(test))] mod tests;` beside it would ship the file.

@@ -1167,3 +1167,7 @@ is closed at its primitive instead, per the R42 convergence rule.
     `default-features = false`.
   - **Fixtures:** 7 P12/P16 cases, each red under `ce76726`. The one allow
     case was wrongly refused there.
+- **Round 6 (F-R6-1, F-R6-2, Minor):** the test-only check counts raw-named
+  `mod r#x;` declarations. A macro defined as, or an item imported as,
+  `verus` is refused, like KANI_SHADOW for `kani`. Three fixtures, each red
+  under `0b68f4f`.
