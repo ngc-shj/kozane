@@ -157,6 +157,11 @@ pub enum Event {
     /// `pq`'s handshake cost rose to a new high-water mark; `us` travels as
     /// the record's `a` (never coalesced; `CostHighWater` bounds it).
     RpCostHighWater { us: u32 },
+    /// A PD's stack reached a new high-water mark; `bytes` (used below the
+    /// stack top) travels as the record's `a` (never coalesced; raised only
+    /// when deeper). `pq` reports it this way rather than printing, so its
+    /// line cannot interleave with `audit`'s on the console (M4 plan C8).
+    StackHighWater { bytes: u32 },
 }
 
 impl Event {
@@ -223,14 +228,15 @@ impl Event {
             Event::RpCookieAccepted => 0x0050,
             Event::RpCookieSuppressed => 0x0051,
             Event::RpCostHighWater { .. } => COST_HIGH_WATER,
+            Event::StackHighWater { .. } => STACK_HIGH_WATER,
             Event::FrameDropped { reason } => {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
             }
         }
     }
 
-    /// Every variant except the parameterised `FrameDropped` and
-    /// `RpCostHighWater`.
+    /// Every variant except the parameterised `FrameDropped`,
+    /// `RpCostHighWater` and `StackHighWater`.
     pub const FIXED: [Event; 60] = [
         Event::ArpReplied,
         Event::UdpEchoed,
@@ -358,6 +364,7 @@ impl Event {
             Event::RpCookieAccepted => "RpCookieAccepted",
             Event::RpCookieSuppressed => "RpCookieSuppressed",
             Event::RpCostHighWater { .. } => "RpCostHighWater",
+            Event::StackHighWater { .. } => "StackHighWater",
             Event::FrameDropped { .. } => "FrameDropped",
         }
     }
@@ -376,7 +383,8 @@ impl Event {
             | Event::RpLoadCleared
             | Event::RpCookieSecretExpired
             | Event::RpCookieSecretUnavailable
-            | Event::RpCostHighWater { .. } => false,
+            | Event::RpCostHighWater { .. }
+            | Event::StackHighWater { .. } => false,
             Event::ArpReplied
             | Event::UdpEchoed
             | Event::FrameDropped { .. }
@@ -435,6 +443,7 @@ impl Event {
     pub const fn value(self) -> Option<u32> {
         match self {
             Event::RpCostHighWater { us } => Some(us),
+            Event::StackHighWater { bytes } => Some(bytes),
             _ => None,
         }
     }
@@ -508,6 +517,7 @@ impl Event {
             Event::RpCookieAccepted => 58,
             Event::RpCookieSuppressed => 59,
             Event::RpCostHighWater { .. } => COST_HIGH_WATER_SLOT,
+            Event::StackHighWater { .. } => STACK_HIGH_WATER_SLOT,
             Event::FrameDropped { reason } => {
                 // FIXED_SLOTS..FIXED_SLOTS+64, clamped like `code`.
                 let r = if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason };
@@ -519,10 +529,13 @@ impl Event {
 
 const FIXED_SLOTS: usize = 60;
 const COST_HIGH_WATER_SLOT: usize = FIXED_SLOTS + MAX_DROP_REASON as usize + 1;
-const SLOTS: usize = COST_HIGH_WATER_SLOT + 1;
+const STACK_HIGH_WATER_SLOT: usize = COST_HIGH_WATER_SLOT + 1;
+const SLOTS: usize = STACK_HIGH_WATER_SLOT + 1;
 
 /// `RpCostHighWater`'s code, the first after the fixed range.
 pub const COST_HIGH_WATER: u16 = 0x0048;
+/// `StackHighWater`'s code, after the fixed range's last.
+pub const STACK_HIGH_WATER: u16 = 0x0052;
 
 /// Per-producer coalescing state.
 pub struct Coalescer {
@@ -595,6 +608,8 @@ pub enum Decoded {
     FrameDropped(u16),
     /// `RpCostHighWater`: the record's `a` is the cost in µs.
     CostHighWater,
+    /// `StackHighWater`: the record's `a` is the bytes used.
+    StackHighWater,
     Unknown,
 }
 
@@ -604,6 +619,9 @@ pub fn decode(code: u16) -> Decoded {
     }
     if code == COST_HIGH_WATER {
         return Decoded::CostHighWater;
+    }
+    if code == STACK_HIGH_WATER {
+        return Decoded::StackHighWater;
     }
     match code.checked_sub(FRAME_DROPPED_BASE) {
         Some(r) if r <= MAX_DROP_REASON => Decoded::FrameDropped(r),

@@ -1,7 +1,7 @@
 # Executed counts per gate (plan C2). `make check` fails if a gate reports
 # zero, fewer than listed, or more than listed: raise a number when you add
 # tests, never lower it to make a failure go away.
-UNIT-TESTS 732
+UNIT-TESTS 733
 KANI-HARNESSES 60
 CHECK-PINS-RULES 16
 CHECK-PINS-FIXTURES 178
@@ -20,7 +20,7 @@ CHECK-SELFTEST-FIXTURES 19
 PACKAGE-FIXTURES 104
 SECCOMP-FIXTURES 7
 # Per crate (M2 plan T12).
-UNIT-AUDIT-EVENT 33
+UNIT-AUDIT-EVENT 34
 UNIT-CONFIG 43
 UNIT-DATA-CORE 51
 UNIT-FIXTURES-TEST 96

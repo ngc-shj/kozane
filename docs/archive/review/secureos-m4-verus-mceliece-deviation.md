@@ -1051,3 +1051,23 @@ is closed at its primitive instead, per the R42 convergence rule.
     `tools/unit-counts`. It produces the same output on the real log, and
     an unreadable owner is refused (4 fixtures).
   - **T24:** P15 has a deny fixture in a second tool.
+- **The C8 probe broke the integration run (found by the round 3 make
+  check):**
+  - **Cause:** pq printed its high-water line on the console while `audit`
+    printed. PD debug output goes out a character per syscall, so the two
+    interleaved, and the awaited `audit: src=pq RpPskExported` line no
+    longer matched (the wireguard prelude timed out). The two
+    `prelude: timed out` failures of the first warm-tree selftest had the
+    same cause.
+  - **pq:** it now reports through audit: a new value-carrying event,
+    `StackHighWater { bytes }` (code 0x0052, never coalesced), printed by
+    `audit` alone.
+  - **pqkey:** it has no audit ring, so it prints its mark once, after the
+    boot KAT, as it already printed "secrets valid".
+  - **The size check:** the probe's size is checked by the PDs'
+    `STACK_SIZE` constants against the system file.
+  - **Measured:** pq 61,696 B (69,376 B free); pqkey at boot 99,408 B
+    (31,664 B free).
+  - **Residual:** pqkey's later decapsulations, on pq's calls, ran 688 B
+    deeper in the previous measurement (100,096 B). The integration check
+    reads the boot mark, and the 16 KiB minimum covers that margin.

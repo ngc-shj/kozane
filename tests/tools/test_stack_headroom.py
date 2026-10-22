@@ -28,9 +28,9 @@ class Console:
         return re.findall(pattern, self.text[since:])
 
 
-def lines(pq: int, pqkey: int, size_pq: int = SIZE, size_pqkey: int = SIZE) -> str:
-    return (f"pqkey: stack high-water {pqkey:#x} of {size_pqkey:#x}\n"
-            f"pq: stack high-water {pq:#x} of {size_pq:#x}\n")
+def lines(pq: int, pqkey: int) -> str:
+    return (f"pqkey: stack high-water {pqkey:#x} of {SIZE:#x}\n"
+            f"audit: src=pq StackHighWater bytes={pq} lost=0\n")
 
 
 # The measured run (M4 Phase 3): pq 61,808 B, pqkey 100,096 B.
@@ -42,21 +42,20 @@ CASES = [
     ("exactly the minimum free passes", lines(61808, SIZE - run.STACK_HEADROOM_MIN), None),
     ("one byte under the minimum free fails", lines(61808, SIZE - run.STACK_HEADROOM_MIN + 1),
      "pqkey: 16383 B of stack free, want at least 16384"),
-    ("no line from a PD fails", "pqkey: stack high-water 0x18700 of 0x20000\n",
-     "pq: no stack high-water line"),
-    ("a painted size other than the system file's fails", lines(61808, 100096, size_pq=0x1c000),
-     "pq: probe painted [114688] bytes, the system file gives 131072"),
+    ("no report from pq fails", "pqkey: stack high-water 0x18700 of 0x20000\n", "pq: no stack high-water report"),
+    ("no report from pqkey fails", "audit: src=pq StackHighWater bytes=61808 lost=0\n",
+     "pqkey: no stack high-water report"),
     ("a mark shallower than the PD's own scrub fails", lines(61808, 90 * KIB),
      "pqkey: stack high-water 92160 B is below its own scrub depth 98304"),
-    ("a garbled line fails", MEASURED + "pq: stack high-water 0x1audit: x\n",
-     "1 of 3 stack high-water lines garbled"),
-    ("a line with a garbled PD prefix fails", MEASURED + "auditpq: stack high-water 0x1f000 of 0x20000\n",
-     "1 of 3 stack high-water lines garbled"),
     ("pq's mark shallower than its encaps scrub fails", lines(39 * KIB, 100096),
      "pq: stack high-water 39936 B is below its own scrub depth 40960"),
     ("a mark exactly at the scrub depth passes", lines(40 * KIB, 96 * KIB), None),
-    ("the deepest of several lines counts", MEASURED + "pqkey: stack high-water 0x1f000 of 0x20000\n",
-     "pqkey: 4096 B of stack free"),
+    ("a garbled pq report fails", MEASURED + "audit: src=pq StackHighWater bytes=6audit: x\n",
+     "pq: 1 of 2 stack high-water reports garbled"),
+    ("a pqkey line with a garbled prefix fails", MEASURED + "auditpqkey: stack high-water 0x1f000 of 0x20000\n",
+     "pqkey: 1 of 2 stack high-water reports garbled"),
+    ("the deepest of several reports counts", MEASURED + "audit: src=pq StackHighWater bytes=126976 lost=0\n",
+     "pq: 4096 B of stack free"),
 ]
 
 

@@ -71,6 +71,10 @@ impl Audit {
                 debug_println!("audit: src={} RpCostHighWater us={} lost={}", src, r.a, r.b);
                 true
             }
+            Decoded::StackHighWater => {
+                debug_println!("audit: src={} StackHighWater bytes={} lost={}", src, r.a, r.b);
+                true
+            }
             Decoded::Unknown => false,
         };
         if !named && let Some(total) = self.unknown.record() {

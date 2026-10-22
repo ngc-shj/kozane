@@ -129,8 +129,9 @@
 
     <!-- Passive: decapsulation runs on pq's scheduling context; this
          budget only covers init (the boot KAT, 3.4 s under TCG). Stack:
-         100,096 B measured peak, the 96 KiB decaps scrub included (M4
-         deviation log, Phase 3; checked in tests/integration). -->
+         100,096 B measured peak, the 96 KiB decaps scrub included; the
+         integration check reads the boot KAT's mark, 688 B shallower (M4
+         deviation log, Phase 3). -->
     <protection_domain name="pqkey" priority="130" budget="1_000" period="10_000" passive="true" stack_size="0x20_000">
         <program_image path="pd-pqkey.elf" />
         <map mr="pq_secrets" vaddr="0x2_000_000" perms="r" setvar_vaddr="pq_secrets" />

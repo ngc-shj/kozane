@@ -39,18 +39,12 @@ impl BootEntropy for Hw {
 struct PqKey {
     oracle: Oracle<'static>,
     bucket: Bucket,
-    stack: cpu::StackProbe,
 }
 
 /// `stack_size` of `pqkey` in system/secureos.system (the integration
-/// suite checks that the printed size matches it).
+/// suite checks that this constant matches it).
 const STACK_SIZE: usize = 0x20_000;
 
-fn report_stack(stack: &mut cpu::StackProbe) {
-    if let Some((hw, size)) = stack.deeper() {
-        debug_println!("pqkey: stack high-water {hw:#x} of {size:#x}");
-    }
-}
 
 fn halt(msg: &str) -> ! {
     debug_println!("pqkey: {msg}");
@@ -71,9 +65,14 @@ fn init() -> PqKey {
     let oracle =
         Oracle::boot(region(), &config::GATEWAY_RP_HASH, &mut Hw).unwrap_or_else(|e| halt(e.message()));
     debug_println!("pqkey: secrets valid");
-    // The boot KAT has run one decapsulation.
-    report_stack(&mut stack);
-    PqKey { oracle, bucket: Bucket::new(PQ_KEY_BURST, PQ_KEY_INTERVAL_NS), stack }
+    // Once, after the boot KAT's decapsulation: pqkey has no audit ring, and
+    // a console line printed while `pq` handshakes could interleave with
+    // `audit`'s. Later decapsulations (from `pq`'s calls) run a slightly
+    // deeper chain; the 16 KiB headroom covers it (deviation log, C8).
+    if let Some((hw, size)) = stack.deeper() {
+        debug_println!("pqkey: stack high-water {hw:#x} of {size:#x}");
+    }
+    PqKey { oracle, bucket: Bucket::new(PQ_KEY_BURST, PQ_KEY_INTERVAL_NS) }
 }
 
 impl Handler for PqKey {
@@ -111,7 +110,6 @@ impl Handler for PqKey {
         });
         reply.fill(0);
         req.fill(0);
-        report_stack(&mut self.stack);
         Ok(MessageInfo::new(label, n))
     }
 }

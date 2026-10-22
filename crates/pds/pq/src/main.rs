@@ -175,14 +175,9 @@ struct Pq {
 }
 
 /// `stack_size` of `pq` in system/secureos.system (the integration suite
-/// checks that the printed size matches it).
+/// checks that this constant matches it).
 const STACK_SIZE: usize = 0x20_000;
 
-fn report_stack(stack: &mut cpu::StackProbe) {
-    if let Some((hw, size)) = stack.deeper() {
-        debug_println!("pq: stack high-water {hw:#x} of {size:#x}");
-    }
-}
 
 fn halt(msg: &str) -> ! {
     debug_println!("pq: {msg}");
@@ -449,9 +444,14 @@ impl Handler for Pq {
             }
         }
         run_passes(&mut Pass { pq: self, wake: Wake::default() });
-        // Once a second: the scan costs pq budget it needs under load.
-        if channels.contains(TIMER) {
-            report_stack(&mut self.stack);
+        // Once a second: the scan costs pq budget it needs under load. The
+        // mark goes out as an audit record, not a console line, which would
+        // interleave with `audit`'s own lines and break the ones awaited.
+        if channels.contains(TIMER)
+            && let Some((hw, _)) = self.stack.deeper()
+        {
+            self.audit.record(Event::StackHighWater { bytes: u32::try_from(hw).unwrap_or(u32::MAX) });
+            self.audit.flush();
         }
         Ok(())
     }

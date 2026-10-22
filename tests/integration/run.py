@@ -2423,32 +2423,42 @@ def mce_const(name: str) -> int:
     return int(m.group(1)) * 1024
 
 
-def stack_headroom_case(con):
-    """C8: pq and pqkey paint their free stack at init and print the deepest
-    word used whenever it moves deeper (cpu::StackProbe); after the boot KAT
-    and every exchange so far, each must leave STACK_HEADROOM_MIN free, at
-    the stack_size the system file gives it.
+def pd_stack_const(pd: str) -> int:
+    """`const STACK_SIZE` in the PD's main.rs, the size its probe paints."""
+    text = open(os.path.join(ROOT, f"crates/pds/{pd}/src/main.rs")).read()
+    m = re.search(r"^const STACK_SIZE: usize = (0x[0-9a-f_]+);", text, re.M)
+    if not m:
+        raise Fail(f"no STACK_SIZE in crates/pds/{pd}/src/main.rs")
+    return int(m.group(1).replace("_", ""), 16)
 
-    The probe must also have seen its own PD's scrub (pqkey's decaps,
-    pq's encaps): a mark shallower than that means it is not measuring, and
-    the headroom it reports is too good. Every printed line must parse: a
-    line garbled by another PD's output would lose the deepest figure."""
-    # Every line, whatever ran into its PD prefix, must belong to pq or pqkey
-    # and parse: a garbled one would drop the deepest figure unseen.
-    every = len(con.count(r"stack high-water"))
-    attributed = sum(len(con.count(rf"\b{pd}: stack high-water (0x[0-9a-f]+) of (0x[0-9a-f]+)"))
-                     for pd in ("pq", "pqkey"))
-    if every != attributed:
-        raise Fail(f"{every - attributed} of {every} stack high-water lines garbled")
-    for pd in ("pq", "pqkey"):
-        lines = con.count(rf"\b{pd}: stack high-water (0x[0-9a-f]+) of (0x[0-9a-f]+)")
-        if not lines:
-            raise Fail(f"{pd}: no stack high-water line; the probe reported nothing")
+
+def stack_headroom_case(con):
+    """C8: pq and pqkey paint their free stack at init (cpu::StackProbe).
+    pq reports each deeper mark as an audit record, `StackHighWater
+    bytes=N` (a console line of its own would interleave with audit's);
+    pqkey, which has no audit ring, prints its mark once after the boot
+    KAT. Each must leave STACK_HEADROOM_MIN free at the stack_size the
+    system file gives it, which its STACK_SIZE (the size it paints) must
+    equal.
+
+    The mark must also reach the PD's own scrub (pqkey's decaps, pq's
+    encaps): a shallower one means the probe is not measuring. Every
+    report must parse: a garbled one would drop the deepest figure."""
+    reports = {
+        "pq": (r"StackHighWater", r"audit: src=pq StackHighWater bytes=(\d+) ", 10),
+        "pqkey": (r"stack high-water", r"\bpqkey: stack high-water (0x[0-9a-f]+) of 0x[0-9a-f]+", 16),
+    }
+    for pd, (any_line, line, base) in reports.items():
+        every = len(con.count(any_line))
+        marks = [int(h, base) for h in con.count(line)]
+        if not marks:
+            raise Fail(f"{pd}: no stack high-water report; the probe reported nothing")
+        if every != len(marks):
+            raise Fail(f"{pd}: {every - len(marks)} of {every} stack high-water reports garbled")
         size = system_stack_size(pd)
-        painted = {int(n, 16) for _, n in lines}
-        if painted != {size}:
-            raise Fail(f"{pd}: probe painted {sorted(painted)} bytes, the system file gives {size}")
-        hw = max(int(h, 16) for h, _ in lines)
+        if pd_stack_const(pd) != size:
+            raise Fail(f"{pd}: STACK_SIZE {pd_stack_const(pd)} paints other than the system file's {size}")
+        hw = max(marks)
         floor = mce_const("SCRUB_DEPTH" if pd == "pqkey" else "SCRUB_DEPTH_ENCAPS")
         if hw < floor:
             raise Fail(f"{pd}: stack high-water {hw} B is below its own scrub depth {floor}; the probe is not measuring")

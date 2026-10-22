@@ -180,7 +180,7 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::RpCookieReplySent
         | Event::RpCookieAccepted
         | Event::RpCookieSuppressed => true,
-        Event::FrameDropped { .. } | Event::RpCostHighWater { .. } => false,
+        Event::FrameDropped { .. } | Event::RpCostHighWater { .. } | Event::StackHighWater { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
     assert_eq!(Event::FIXED.len(), 60);
@@ -260,7 +260,17 @@ fn decode_classifies_fixed_dropped_and_unknown_codes() {
     assert_eq!(decode(0x0049), Decoded::Fixed(Event::RpPqRecordStuck));
     assert_eq!(decode(0x004a), Decoded::Fixed(Event::RpPqSyncDead));
     assert_eq!(decode(0x0051), Decoded::Fixed(Event::RpCookieSuppressed));
-    assert_eq!(decode(0x0052), Decoded::Unknown);
+    assert_eq!(decode(0x0052), Decoded::StackHighWater);
+    assert_eq!(decode(0x0053), Decoded::Unknown);
+}
+
+#[test]
+fn stack_high_water_carries_its_bytes_and_is_never_coalesced() {
+    let ev = Event::StackHighWater { bytes: 61_808 };
+    assert_eq!(ev.code(), STACK_HIGH_WATER);
+    assert_eq!(ev.value(), Some(61_808));
+    assert!(!ev.is_coalesced());
+    assert_eq!(decode(ev.code()), Decoded::StackHighWater);
 }
 
 #[test]
