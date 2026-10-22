@@ -2229,6 +2229,16 @@ class RpSpoof:
         except BaseException as e:
             self.error = e
 
+    def wait_delivered(self, n: int, what: str):
+        """Blocks until `n` datagrams went out (or the spoofer failed), so a
+        slow-rate attack is under way before what it is meant to overlap
+        starts. Bounded by the time `n` sends take at the rate."""
+        deadline = time.monotonic() + n / self.rate + LINE_TIMEOUT_S
+        while self.sent < n:
+            if self.error is not None or not self.thread.is_alive() or time.monotonic() > deadline:
+                raise Fail(f"{what}: the spoofer delivered {self.sent} of the first {n} datagrams")
+            time.sleep(0.05)
+
     def verify(self, what: str):
         """The attack is still running and delivered at its rate so far."""
         if self.error is not None:
@@ -2373,6 +2383,10 @@ def rp_global_drain_case(con, tap, sniffer, deploy, endpoint, hello, rps):
     spoof = RpSpoof(tap, [hello], sources, 0.2)
     rps.append(spoof)
     try:
+        # At 0.2/s the first spoof is due after 5 s, and an exchange can
+        # finish sooner (it does with mce460896): start the client once the
+        # attack is under way, or it overlaps nothing.
+        spoof.wait_delivered(1, "rp global drain")
         client = Rosenpass(deploy, 0, endpoint, listen_port=RP_CLIENT_PORTS[0])
         rps.append(client)
         rp_exchange(client, RP_EXCHANGE_S + RP_BACKOFF_CAP_S, "rp global drain")
@@ -2383,6 +2397,38 @@ def rp_global_drain_case(con, tap, sniffer, deploy, endpoint, hello, rps):
     spoofed = {ip for ip, _ in sources}
     if not spoof_answers_bounded(con, sniffer, i0, engaged, lambda ip, _: ip in spoofed, "rp global drain"):
         raise Fail("rp global drain: no spoofed source got a CookieReply")
+
+
+# Free stack required below each McEliece PD's deepest use (M4 plan C8):
+# the scrub writes SCRUB_DEPTH below its root wherever the root is called.
+STACK_HEADROOM_MIN = 16 * 1024
+
+
+def system_stack_size(pd: str) -> int:
+    text = open(os.path.join(ROOT, "system/secureos.system")).read()
+    m = re.search(rf'<protection_domain name="{pd}"[^>]*stack_size="(0x[0-9a-f_]+)"', text)
+    if not m:
+        raise Fail(f"no stack_size for {pd} in system/secureos.system")
+    return int(m.group(1).replace("_", ""), 16)
+
+
+def stack_headroom_case(con):
+    """C8: pq and pqkey paint their free stack at init and print the deepest
+    byte used whenever it moves deeper (cpu::StackProbe); after the boot KAT
+    and every exchange so far, each must leave STACK_HEADROOM_MIN free, at
+    the stack_size the system file gives it."""
+    for pd in ("pq", "pqkey"):
+        lines = con.count(rf"\b{pd}: stack high-water (0x[0-9a-f]+) of (0x[0-9a-f]+)")
+        if not lines:
+            raise Fail(f"{pd}: no stack high-water line; the probe reported nothing")
+        size = system_stack_size(pd)
+        printed = {int(n, 16) for _, n in lines}
+        if printed != {size}:
+            raise Fail(f"{pd}: probe painted {sorted(printed)} bytes, the system file gives {size}")
+        hw = max(int(h, 16) for h, _ in lines)
+        print(f"\n{pd}: stack high-water {hw} B of {size} B, {size - hw} B free", flush=True)
+        if size - hw < STACK_HEADROOM_MIN:
+            raise Fail(f"{pd}: {size - hw} B of stack free, want at least {STACK_HEADROOM_MIN}")
 
 
 def rp_conf_share_case(con, tap, deploy, endpoint, hello, conf, rps):
@@ -2523,6 +2569,8 @@ def test_rp_gate(loader: str, deploy: str, passed: list):
             ("rp combined flood", lambda: rp_combined_flood_case(con, tap, gw_pub, deploy, endpoint, hello, rps)),
             ("rp latency", lambda: rp_latency_case(con, tap, gw_pub, deploy, endpoint, hello, rps)),
             ("rp 0.2.3 after load", lambda: rp_old_client_case(con, tap, deploy, endpoint, hello, rps)),
+            # Last: the mark covers the boot KAT and every exchange above.
+            ("stack headroom (C8)", lambda: stack_headroom_case(con)),
         ]
         for name, fn in cases:
             fn()

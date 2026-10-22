@@ -192,15 +192,16 @@ ct-harness:
 ct_valgrind := valgrind
 ct_residue_wrap :=
 ct: ct-harness | $(counts)
-	tools/ct-gate $(ct_harness) "$(ct_valgrind)" "$(ct_residue_wrap)" > $(counts)/ct.log 2>&1 \
-		|| { cat $(counts)/ct.log; exit 1; }
 	# The harness's own clippy and unit tests (its report parser), on the
 	# host: it is its own workspace, so `make lint` and `make unit` do not
-	# see it.
+	# see it. They run before ct-gate, which writes the C9 pass record that
+	# tools/package accepts: a failure here must not leave one behind.
 	cargo clippy --locked --manifest-path tools/ct-harness/Cargo.toml --target-dir $(BUILD)/ct/target-host \
 		--all-targets -- -D warnings > $(counts)/ct-lint.log 2>&1 || { cat $(counts)/ct-lint.log; exit 1; }
 	cargo test --locked --manifest-path tools/ct-harness/Cargo.toml --target-dir $(BUILD)/ct/target-host \
 		> $(counts)/ct-unit.log 2>&1 || { cat $(counts)/ct-unit.log; exit 1; }
+	tools/ct-gate $(ct_harness) "$(ct_valgrind)" "$(ct_residue_wrap)" > $(counts)/ct.log 2>&1 \
+		|| { cat $(counts)/ct.log; exit 1; }
 	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-CT-HARNESS", n + 0 }' $(counts)/ct-unit.log >> $(counts)/ct
 
 # C10 (tools/ct-shape): the mce460896 closures in pd-pqkey and pd-pq equal

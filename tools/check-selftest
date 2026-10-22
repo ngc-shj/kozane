@@ -9,10 +9,12 @@ injected item. Run inside the dev container.
 Usage: check-selftest [layer ...]
 """
 
+import fcntl
 import os
 import pathlib
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -46,6 +48,48 @@ def edit(tree: pathlib.Path, rel: str, old: str, new: str):
     if text.count(old) != 1:
         raise SystemExit(f"selftest: injection anchor in {rel} matched {text.count(old)} times: {old!r}")
     p.write_text(text.replace(old, new))
+
+
+def strip_mce_wipes(tree: pathlib.Path):
+    """Every local `.zeroize();` in mce460896, both stack scrubs and the
+    shim's Zeroizing removed: nothing wipes any McEliece intermediate."""
+    removed = 0
+    for p in sorted((tree / "crates/mce460896/src").glob("*.rs")):
+        text = p.read_text()
+        new = re.sub(r"(?m)^[ \t]*[A-Za-z_][A-Za-z0-9_.]*\.zeroize\(\);\n", "", text)
+        removed += text.count(".zeroize();") - new.count(".zeroize();")
+        p.write_text(new)
+    if removed < 40:
+        raise SystemExit(f"selftest: only {removed} wipes found in mce460896")
+    edit(tree, "crates/mce460896/src/lib.rs", "    decaps_core(sk, ct, ss_out);\n    scrub_stack();\n",
+         "    decaps_core(sk, ct, ss_out);\n")
+    edit(tree, "crates/mce460896/src/lib.rs", "    let accept = encaps_attempt_core(pk, rand, ct_out, ss_out);\n    scrub_stack_encaps();\n",
+         "    let accept = encaps_attempt_core(pk, rand, ct_out, ss_out);\n")
+    edit(tree, "crates/mce460896/src/lib.rs", "    let mut rand = Zeroizing::new([0u8; ENCAPS_RAND_LEN]);\n",
+         "    let mut rand = [0u8; ENCAPS_RAND_LEN];\n")
+
+
+# Every residue form the harness derives a needle for (residue.rs FORMS).
+MCE_FORMS = ("rand", "e-bytes", "ind", "e-bitsliced", "g", "support", "syndrome", "bm", "keccak", "ss")
+
+
+# One case's make run, bounded: a mutant can loop for ever (the first
+# mce-fresh-draw did, in mksecrets' tests). The whole process group is
+# killed, with SIGKILL since mksecrets blocks SIGTERM while it writes.
+CASE_TIMEOUT_S = 4 * 3600
+
+
+def run_make(tree: pathlib.Path, *targets: str) -> subprocess.CompletedProcess:
+    proc = subprocess.Popen(["make", "-C", str(tree), *targets], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, env=MAKE_ENV, start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=CASE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        stdout, stderr = proc.communicate()
+        return subprocess.CompletedProcess(proc.args, 124, stdout,
+                                           stderr + f"\nselftest: timed out after {CASE_TIMEOUT_S} s\n")
+    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
 
 
 def append(tree: pathlib.Path, rel: str, text: str):
@@ -89,10 +133,11 @@ CASES_FOR_GATE = {
              "rp-cookie-offload", "rp-tx-tier", "rp-reply-fifo", "rp-reply-order", "rp-reply-dst", "rp-sync-sticky",
              "mce-fresh-draw"},
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
-    "ct": {"ct-barrier", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
-           "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub"},
+    "ct": {"ct-barrier", "ct-c1-barrier", "ct-harness-unit", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
+           "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms"},
     "ct-shape": {"ct-shape", "ct-identity", "verus-erasure"},
-    "verus": {"verus-cache", "verus-trusted", "verus-required", "verus-wg-wire-window",
+    "verus": {"verus-cache", "verus-trusted", "verus-trusted-item", "verus-required", "verus-required-site",
+              "verus-required-member", "verus-wg-wire-window",
               "verus-wg-wire-roundtrip", "verus-rp-wire-roundtrip",
               "verus-msgs-exact", "verus-ring-mask", "verus-wire-ipv4"},
     "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire"},
@@ -143,7 +188,10 @@ CASES = {
     "unit": (["unit"], lambda t: append(t, "crates/wire/src/tests.rs", UNIT_TEST), "selftest_injected_failure"),
     # Only ring: the injection invalidates every proof cache entry, and
     # re-proving wire takes ~40 minutes.
-    "kani": (["kani", "kani_crates=ring"], lambda t: append(t, "crates/ring/src/proofs.rs", KANI_HARNESS), "selftest_unsatisfiable_cover"),
+    # The harness name is printed whether or not it fails; the needle is the
+    # count only an unsatisfied cover prints (the injected one is the only).
+    "kani": (["kani", "kani_crates=ring"], lambda t: append(t, "crates/ring/src/proofs.rs", KANI_HARNESS),
+             "** 0 of 1 cover properties satisfied"),
     "bolero": (["bolero"], lambda t: edit(t, "crates/wire/src/tests.rs",
                                           "for_each(|bytes: &[u8]| check(bytes))",
                                           "for_each(|bytes: &[u8]| if bytes.len() >= 20 { std::eprintln!(\"selftest-bolero-injected\"); panic!() })"),
@@ -220,19 +268,62 @@ CASES = {
                                        "} // verus!\n\n#[inline]\nfn below_window(c: u64, window: u64, top: u64) -> bool {\n"
                                        "    c.saturating_add(window) < top\n}\n\nimpl<const BITS: usize> Default")),
                        "required function `below_window` is not defined inside verus!"),
+    # The allowlist covers chunk_ref, not its file: a second external_body
+    # in msgs/src/lib.rs is unlisted (Phase 3, F2/S1).
+    "verus-trusted-item": (["verus", "verus_crates=msgs"],
+                           lambda t: edit(t, "crates/msgs/src/lib.rs",
+                                          "/// The `N` bytes of `b` at `at`, borrowed in place",
+                                          "#[verifier::external_body]\nfn extra() {}\n\n"
+                                          "/// The `N` bytes of `b` at `at`, borrowed in place"),
+                           "trusted construct `external_body` on `extra` not in the allowlist"),
+    # One of eight decoders loses its ensures while the other seven keep
+    # theirs: required functions are judged per definition (F1/T4/S5).
+    "verus-required-site": (["verus", "verus_crates=msgs"],
+                            lambda t: edit(t, "crates/msgs/src/lib.rs",
+                                           "-> (r: Result<Self, Malformed>)\n        ensures\n"
+                                           "            r is Ok <==> b@.len() == PSK_INSTALL_LEN as int,",
+                                           "-> (r: Result<Self, Malformed>)\n        requires\n"
+                                           "            r is Ok <==> b@.len() == PSK_INSTALL_LEN as int,"),
+                            "required function `*::decode` has no ensures"),
+    # A new decoder outside verus! joins `*::decode` without a list edit.
+    "verus-required-member": (["verus", "verus_crates=msgs"],
+                              lambda t: append(t, "crates/msgs/src/lib.rs",
+                                               "\npub struct Extra;\n\nimpl Extra {\n    pub fn decode() {}\n}\n"),
+                              "required function `*::decode` is not defined inside verus!"),
     # msgs' one trusted Verus function (M4 plan C3): its contract is Kani's
     # to check, so a body that borrows one byte late must fail there.
     "kani-chunk-ref": (["kani", "kani_crates=msgs"],
+                       # In range exactly when the original is (so only the
+                       # pointer assertion can fail), but borrowed from the
+                       # start of `b`. Kani prints every check's description,
+                       # passing ones too, so the needle is the failure summary.
                        lambda t: edit(t, "crates/msgs/src/lib.rs",
                                       "    let end = at.checked_add(N)?;\n    b.get(at..end)?.try_into().ok()",
-                                      "    let end = at.checked_add(N)?.checked_add(1)?;\n    b.get(at + 1..end)?.try_into().ok()"),
-                       "core::ptr::eq(c.as_ptr(), b.as_ptr().wrapping_add(at))"),
+                                      "    let end = at.checked_add(N)?;\n    b.get(at..end)?;\n    b.get(..N)?.try_into().ok()"),
+                       "Failed Checks: assertion failed: core::ptr::eq(c.as_ptr(), b.as_ptr().wrapping_add(at))"),
     # The constant-time gate (M4 plan C9). One Berlekamp-Massey select made
     # a plain branch on its secret mask: memcheck sees the branch.
     "ct-barrier": (["ct"], lambda t: edit(t, "crates/mce460896/src/bm.rs",
                                           "        vec_cmov(&mut b_poly[0], &c_poly[0], mask);\n        vec_cmov(&mut b_poly[1], &c_poly[1], mask);\n",
                                           "        if mask != 0 {\n            b_poly[0] = c_poly[0];\n            b_poly[1] = c_poly[1];\n        }\n"),
-                   "Conditional jump or move depends on uninitialised value(s) at"),
+                   re.compile(r"memcheck: Conditional jump or move depends on uninitialised value\(s\) at "
+                              r"[^\n]*\(bm\.rs:\d+\)")),
+    # The confirmation compare (C1, BARRIERS.md R1) made an early exit on the
+    # first differing byte: only the "C0 valid, C1 corrupt" class reaches
+    # it, and memcheck sees the branch on the secret `conf`.
+    "ct-c1-barrier": (["ct"], lambda t: edit(t, "crates/mce460896/src/lib.rs",
+                                             "    for (a, b) in conf.iter().zip(c1) {\n"
+                                             "        fail = barrier::u8_or(fail, a ^ b);\n    }\n",
+                                             "    for (a, b) in conf.iter().zip(c1) {\n        if a != b {\n"
+                                             "            fail = 1;\n            break;\n        }\n    }\n"),
+                      re.compile(r"memcheck: Conditional jump or move depends on uninitialised value\(s\) at "
+                                 r"[^\n]*\(lib\.rs:\d+\)")),
+    # The harness's own unit tests, run by `make ct` (they are its own
+    # workspace, so `make unit` never sees them).
+    "ct-harness-unit": (["ct"], lambda t: edit(t, "tools/ct-harness/src/report.rs", "mod tests {\n",
+                                               "mod tests {\n    #[test]\n    fn selftest_injected_failure() {\n"
+                                               "        let v = [1u8];\n        assert!(v.is_empty());\n    }\n\n"),
+                        "selftest_injected_failure ... FAILED"),
     # Without the canary, a run that checked nothing could look clean.
     "ct-canary": (["ct"], lambda t: edit(t, "tools/ct-harness/src/ct.rs", "    black_box(canary(&secret));\n", ""),
                   "want 1 errors (the canary)"),
@@ -267,10 +358,19 @@ CASES = {
              "        let accept = encaps_attempt(pk, &rand, ct_out, ss_out);\n        rand.zeroize();\n",
              "        let accept = encaps_attempt(pk, &rand, ct_out, ss_out);\n")),
                          "RESIDUE-HIT rand"),
+    # Nothing wiped: each form's needle must match its own residue, or a
+    # wrongly derived needle would report "no hit" for ever (Phase 3,
+    # F4/T2). bm and g are not required: the fft right after BM transforms
+    # the locator in place and reuses BM's frame, and g's copies are
+    # overwritten the same way, so no wipe removal leaves them (measured;
+    # deviation log, Phase 3). Their needles are the stages' own outputs.
+    "mce-residue-forms": (["ct"], strip_mce_wipes,
+                          re.compile("(?s)" + "".join(rf"(?=.*RESIDUE-HIT {re.escape(f)} )"
+                                                      for f in MCE_FORMS if f not in ("bm", "g")))),
     # The stack scrub removed: keccak's state and ss stay in dead frames.
     "mce-residue-scrub": (["ct"], lambda t: (
         edit(t, "crates/mce460896/src/lib.rs", "    decaps_core(sk, ct, ss_out);\n    scrub_stack();\n", "    decaps_core(sk, ct, ss_out);\n"),
-        edit(t, "crates/mce460896/src/lib.rs", "    let accept = encaps_attempt_core(pk, rand, ct_out, ss_out);\n    scrub_stack();\n",
+        edit(t, "crates/mce460896/src/lib.rs", "    let accept = encaps_attempt_core(pk, rand, ct_out, ss_out);\n    scrub_stack_encaps();\n",
              "    let accept = encaps_attempt_core(pk, rand, ct_out, ss_out);\n")),
                           "RESIDUE-HIT keccak"),
     # The identity and shape gate (M4 plan C10). The ct-barrier mutation
@@ -619,6 +719,66 @@ def copy_repo(dst: pathlib.Path):
             shutil.copy2(item, dst / item.name)
 
 
+# The injected copy lives at one fixed path, reused across cases, so its
+# cargo target dirs stay warm and a case rebuilds only what its injection
+# touched. Each case first puts the sources back exactly as the real tree's
+# (`sync_tree`: by content, so a file a previous case mutated is rewritten
+# with a fresh mtime and cargo rebuilds it). Everything else under build/
+# (counts, caches, records, images) is removed.
+WORK = ROOT / "build/selftest-work"
+KEEP_BUILD = re.compile(r"^target")
+
+
+def sync_tree(src: pathlib.Path, dst: pathlib.Path):
+    """`dst` made equal to `src`, SKIP names (at any depth) excluded on both
+    sides and left alone in `dst`. A file is rewritten only if its bytes or
+    mode differ, so unchanged files keep their mtime."""
+    dst.mkdir(exist_ok=True)
+    wanted = {e.name for e in src.iterdir() if e.name not in SKIP}
+    for e in dst.iterdir():
+        if e.name in SKIP or e.name in wanted:
+            continue
+        shutil.rmtree(e) if e.is_dir() and not e.is_symlink() else e.unlink()
+    for name in sorted(wanted):
+        s, d = src / name, dst / name
+        if s.is_symlink():
+            if not d.is_symlink() or os.readlink(d) != os.readlink(s):
+                if d.is_dir() and not d.is_symlink():
+                    shutil.rmtree(d)
+                elif d.exists() or d.is_symlink():
+                    d.unlink()
+                os.symlink(os.readlink(s), d)
+        elif s.is_dir():
+            if d.exists() and (d.is_symlink() or not d.is_dir()):
+                d.unlink()
+            sync_tree(s, d)
+        else:
+            if d.is_dir() and not d.is_symlink():
+                shutil.rmtree(d)
+            if d.is_symlink() or not d.exists() or d.stat().st_size != s.stat().st_size \
+                    or d.read_bytes() != s.read_bytes():
+                if d.is_symlink():
+                    d.unlink()
+                shutil.copyfile(s, d)
+            if (d.stat().st_mode & 0o7777) != (s.stat().st_mode & 0o7777):
+                shutil.copymode(s, d)
+
+
+def warm_tree() -> pathlib.Path:
+    tree = WORK / "tree"
+    tree.mkdir(parents=True, exist_ok=True)
+    sync_tree(ROOT, tree)
+    build = tree / "build"
+    for item in build.iterdir() if build.is_dir() else []:
+        if item.is_dir() and item.name == "ct":
+            for sub in item.iterdir():
+                if not (sub.is_dir() and KEEP_BUILD.match(sub.name)):
+                    shutil.rmtree(sub) if sub.is_dir() else sub.unlink()
+        elif not (item.is_dir() and KEEP_BUILD.match(item.name)):
+            shutil.rmtree(item) if item.is_dir() and not item.is_symlink() else item.unlink()
+    return tree
+
+
 EXPECT_SUCCESS = {"kani-cache", "verus-cache"}
 ABSENT = {"kani-cache": "cached pass", "verus-cache": "cached pass"}
 
@@ -682,7 +842,7 @@ def run_propagation(gates: list) -> bool:
                 body = f"@echo selftest-gate-{g}; exit 1" if g == target else "@true"
                 overrides += f"{g}:\n\t{body}\n"
             (tree / "Makefile").write_text(makefile + overrides)
-            out = subprocess.run(["make", "-C", str(tree), "check"], capture_output=True, text=True, env=MAKE_ENV)
+            out = run_make(tree, "check")
             text = out.stdout + out.stderr
         needle = f"selftest-gate-{target}"
         # make's own failure line names the rule that failed, so the
@@ -700,35 +860,38 @@ def run_case(name: str) -> bool:
     if name == "check-propagation":
         return run_propagation(check_gates())
     targets, inject, needle = CASES[name]
-    with tempfile.TemporaryDirectory(prefix=f"selftest-{name}-") as d:
-        tree = pathlib.Path(d)
-        copy_repo(tree)
-        # Populate counts the manifest needs from the real tree, except the
-        # layer under test, so only the injected layer can fail.
-        if "manifest" in targets:
-            shutil.copytree(ROOT / "build/counts", tree / "build/counts")
-        # Start from the real proof cache, so an injection is detected only
-        # if it changes the cache key.
-        for gate in ("kani", "verus"):
-            if gate in targets and (ROOT / f"build/{gate}-cache").is_dir():
-                shutil.copytree(ROOT / f"build/{gate}-cache", tree / f"build/{gate}-cache")
-        if name in ("kani-cache", "verus-cache"):
-            # Allow side first: the uninjected copy must hit the cache, or
-            # the injected run below would prove nothing about the key.
-            pre = subprocess.run(["make", "-C", str(tree), *targets], capture_output=True, text=True, env=MAKE_ENV)
-            pre_path = tree / f"build/counts/{name.split('-')[0]}.log"
-            pre_log = pre_path.read_text(errors="replace") if pre_path.exists() else ""
-            if pre.returncode != 0 or "cached pass" not in pre_log:
-                print(f"FAIL {name}: uninjected copy did not hit the proof cache")
-                print((pre.stdout + pre.stderr)[-2000:])
-                return False
-        inject(tree)
-        out = subprocess.run(["make", "-C", str(tree), *targets], capture_output=True, text=True, env=MAKE_ENV)
-        text = out.stdout + out.stderr
-        # Gates write their tool output to build/counts/*.log.
-        for log in sorted((tree / "build/counts").glob("*.log")):
-            text += log.read_text(errors="replace")
-    found = any(n in text for n in (needle if isinstance(needle, tuple) else (needle,)))
+    tree = warm_tree()
+    # Populate counts the manifest needs from the real tree, except the
+    # layer under test, so only the injected layer can fail.
+    if "manifest" in targets:
+        shutil.copytree(ROOT / "build/counts", tree / "build/counts")
+    # Start from the real proof cache, so an injection is detected only
+    # if it changes the cache key.
+    for gate in ("kani", "verus"):
+        if gate in targets and (ROOT / f"build/{gate}-cache").is_dir():
+            shutil.copytree(ROOT / f"build/{gate}-cache", tree / f"build/{gate}-cache")
+    if name in ("kani-cache", "verus-cache"):
+        # Allow side first: the uninjected copy must hit the cache, or
+        # the injected run below would prove nothing about the key.
+        pre = run_make(tree, *targets)
+        pre_path = tree / f"build/counts/{name.split('-')[0]}.log"
+        pre_log = pre_path.read_text(errors="replace") if pre_path.exists() else ""
+        if pre.returncode != 0 or "cached pass" not in pre_log:
+            print(f"FAIL {name}: uninjected copy did not hit the proof cache")
+            print((pre.stdout + pre.stderr)[-2000:])
+            return False
+    inject(tree)
+    out = run_make(tree, *targets)
+    text = out.stdout + out.stderr
+    # Gates write their tool output to build/counts/*.log.
+    for log in sorted((tree / "build/counts").glob("*.log")):
+        text += log.read_text(errors="replace")
+    # A needle is a string, a tuple of alternatives, or a compiled pattern
+    # (for a report whose varying part, an address, sits mid-line).
+    if isinstance(needle, re.Pattern):
+        found = needle.search(text) is not None
+    else:
+        found = any(n in text for n in (needle if isinstance(needle, tuple) else (needle,)))
     if name in EXPECT_SUCCESS:
         ok = out.returncode == 0 and found and ABSENT[name] not in text
     else:
@@ -755,6 +918,14 @@ def main() -> int:
         print(f"selftest: `check` must run clean-counts first, runs {gates}")
         return 1
     names = sys.argv[1:] or list(CASES)
+    # One selftest at a time: the cases share the warm tree.
+    WORK.mkdir(parents=True, exist_ok=True)
+    lock = open(WORK / ".lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(f"selftest: another selftest holds {WORK}/.lock")
+        return 1
     results = [run_case(n) for n in names]
     print(f"SELFTEST-LAYERS {sum(results)}")
     return 0 if all(results) else 1

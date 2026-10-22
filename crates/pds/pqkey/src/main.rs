@@ -39,6 +39,17 @@ impl BootEntropy for Hw {
 struct PqKey {
     oracle: Oracle<'static>,
     bucket: Bucket,
+    stack: cpu::StackProbe,
+}
+
+/// `stack_size` of `pqkey` in system/secureos.system (the integration
+/// suite checks that the printed size matches it).
+const STACK_SIZE: usize = 0x20_000;
+
+fn report_stack(stack: &mut cpu::StackProbe) {
+    if let Some((hw, size)) = stack.deeper() {
+        debug_println!("pqkey: stack high-water {hw:#x} of {size:#x}");
+    }
 }
 
 fn halt(msg: &str) -> ! {
@@ -55,10 +66,14 @@ fn region() -> &'static [u8] {
 
 #[protection_domain]
 fn init() -> PqKey {
+    // SAFETY: first thing in init, with STACK_SIZE this PD's stack_size.
+    let mut stack = unsafe { cpu::StackProbe::paint(STACK_SIZE) };
     let oracle =
         Oracle::boot(region(), &config::GATEWAY_RP_HASH, &mut Hw).unwrap_or_else(|e| halt(e.message()));
     debug_println!("pqkey: secrets valid");
-    PqKey { oracle, bucket: Bucket::new(PQ_KEY_BURST, PQ_KEY_INTERVAL_NS) }
+    // The boot KAT has run one decapsulation.
+    report_stack(&mut stack);
+    PqKey { oracle, bucket: Bucket::new(PQ_KEY_BURST, PQ_KEY_INTERVAL_NS), stack }
 }
 
 impl Handler for PqKey {
@@ -96,6 +111,7 @@ impl Handler for PqKey {
         });
         reply.fill(0);
         req.fill(0);
+        report_stack(&mut self.stack);
         Ok(MessageInfo::new(label, n))
     }
 }

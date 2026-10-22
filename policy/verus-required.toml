@@ -1,13 +1,15 @@
 # Functions each verified crate must keep inside verus! with an ensures
 # (M4 plan C1). Removing a spec, or moving a function out of verus!, fails
-# the Verus gate even when everything left still verifies.
+# the Verus gate even when everything left still verifies. A method is
+# named `Type::fn`; `*::fn` covers every fn of that name in the crate, and
+# every one of them must comply.
 
 [crates.wg-wire]
 functions = [
     # C2: the replay window.
-    "below_window", "check_and_update",
+    "below_window", "ReplayWindow::check_and_update",
     # C2: the codecs and their round trips.
-    "parse", "emit", "emit_transport_header",
+    "*::parse", "*::emit", "emit_transport_header",
     "lemma_u32_le_roundtrip", "lemma_u32_le_inverse",
     "lemma_u64_le_roundtrip", "lemma_u64_le_inverse",
     "lemma_spec_emit_initiation_parses", "lemma_spec_emit_initiation_inverse",
@@ -19,7 +21,7 @@ functions = [
 [crates.rosenpass-wire]
 functions = [
     # C4: the codecs, peek_type, and the round trips.
-    "parse", "emit", "peek_type", "lemma_peek_type_agrees",
+    "*::parse", "*::emit", "peek_type", "lemma_peek_type_agrees",
     "lemma_spec_emit_init_hello_parses", "lemma_spec_emit_init_hello_inverse",
     "lemma_spec_emit_resp_hello_parses", "lemma_spec_emit_resp_hello_inverse",
     "lemma_spec_emit_init_conf_parses", "lemma_spec_emit_init_conf_inverse",
@@ -29,7 +31,7 @@ functions = [
 [crates.msgs]
 functions = [
     # C3: every `pub fn decode` site, its encode, and the round trips.
-    "decode", "encode",
+    "*::decode", "*::encode",
     "lemma_spec_encode_initiation_decodes", "lemma_spec_encode_initiation_inverse",
     "lemma_spec_encode_response_decodes", "lemma_spec_encode_response_inverse",
     "lemma_spec_encode_install_decodes", "lemma_spec_encode_install_inverse",
@@ -48,7 +50,7 @@ functions = [
 functions = [
     # C6: index arithmetic, the pool's ownership transitions, and the held
     # receive.
-    "slot", "ring_len", "accept", "give", "first_mine", "mine_count",
+    "slot", "ring_len", "Pool::accept", "Pool::give", "Pool::first_mine", "Pool::mine_count",
     "begin_take", "end_release",
 ]
 

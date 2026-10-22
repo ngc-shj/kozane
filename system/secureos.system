@@ -129,7 +129,8 @@
 
     <!-- Passive: decapsulation runs on pq's scheduling context; this
          budget only covers init (the boot KAT, 3.4 s under TCG). Stack:
-         53,872 B measured peak (deviation log, MCE-COST). -->
+         100,096 B measured peak, the 96 KiB decaps scrub included (M4
+         deviation log, Phase 3; checked in tests/integration). -->
     <protection_domain name="pqkey" priority="130" budget="1_000" period="10_000" passive="true" stack_size="0x20_000">
         <program_image path="pd-pqkey.elf" />
         <map mr="pq_secrets" vaddr="0x2_000_000" perms="r" setvar_vaddr="pq_secrets" />
@@ -153,7 +154,8 @@
     </protection_domain>
 
     <!-- 0.05 covers 8 peers' rekeys every 120 s (about 2.9% measured).
-         Stack: 37,360 B measured peak (deviation log, MCE-COST). -->
+         Stack: 61,808 B measured peak, the 40 KiB encaps scrub included
+         (M4 deviation log, Phase 3; checked in tests/integration). -->
     <protection_domain name="pq" priority="105" budget="500" period="10_000" stack_size="0x20_000">
         <program_image path="pd-pq.elf" />
         <map mr="ipq_used" vaddr="0x6_000_000" perms="rw" setvar_vaddr="ipq_used" />

@@ -14,6 +14,7 @@ import os
 import pathlib
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import tomllib
@@ -94,6 +95,8 @@ def ct_tree(d: pathlib.Path, harness: pathlib.Path, record: bool):
     (d / pkg.ct_record.POLICY).write_text('[[site]]\nid = "ss-out"\n')
     (d / pkg.ct_record.VECTORS).mkdir(parents=True)
     (d / pkg.ct_record.VECTORS / "liboqs.txt").write_text("mce.0.ss 00\n")
+    (d / "tests").mkdir(exist_ok=True)
+    (d / pkg.ct_record.MANIFEST).write_text("CT-CASES 28\nCT-MARKED-BYTES 1\nRESIDUE-CASES 25\n")
     if record and harness.is_file():
         path = pkg.ct_record.record_path(d, pkg.ct_record.record_key(d, harness, VG))
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -107,6 +110,8 @@ class ct_stubs:
 
     def __init__(self, d: pathlib.Path, harness: pathlib.Path, green: bool = True, record: bool = True,
                  real: bool = False):
+        """With `real`, the policy is the shape baseline of an unmutated
+        synthetic tree, its justifications filled in."""
         self.saved = (pkg.CT_SHAPE, pkg.CT_POLICY, pkg.CT_ROOT, pkg.valgrind_version)
         try:
             if not real:
@@ -115,6 +120,13 @@ class ct_stubs:
                 fake.chmod(0o755)
                 pkg.CT_SHAPE = fake
             (d / "ct-shape.toml").write_text("")
+            if real:
+                (d / "base").mkdir()
+                base_search, base_harness = ct_shape_elf.tree(d / "base")
+                printed = subprocess.run([sys.executable, str(ROOT / "tools/ct-shape"), "--harness", str(base_harness),
+                                          "--search-path", str(base_search), "--policy", str(d / "ct-shape.toml"),
+                                          "--print-baseline"], capture_output=True, text=True, check=True).stdout
+                (d / "ct-shape.toml").write_text(printed.replace('justification = ""', 'justification = "fixture"'))
             pkg.CT_POLICY = d / "ct-shape.toml"
             pkg.CT_ROOT = d
             pkg.valgrind_version = lambda: VG
@@ -843,6 +855,11 @@ CASES = [
       for label in ("pd-pqkey.elf", "pd-pq.elf")],
      main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR,
                  real_ct={"pd_bm": [line.replace("x1, eq", "x2, eq") for line in ct_shape_elf.BM]})),
+    ("the real ct-shape refuses a shape change through package",
+     [f"package: ct-shape refuses the packaged ELFs: {label}: shape: mce460896::bm::bm: 'csel eq' 2 in the binary, "
+      "1 in ct-shape.toml" for label in ("pd-pq.elf", "pd-pqkey.elf")],
+     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR,
+                 real_ct={"pd_extra": ["csel x1, x1, x2, eq"], "harness_extra": ["csel x1, x1, x2, eq"]})),
     ("secrets path inside the repo", "inside", lambda: pkg.check_secrets_path(ROOT / "build/secrets.bin", ROOT)),
     ("secrets path outside the repo", None, lambda: pkg.check_secrets_path(pathlib.Path("/tmp/s.bin"), ROOT)),
     ("secrets path inside the cargo home", "inside", secrets_in_cargo_home),

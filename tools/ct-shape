@@ -350,7 +350,7 @@ def closure(binary: Binary, root: str):
         if name is None:
             problems.append(f"a branch to {addr:#x}, which starts no function")
             continue
-        if addr in binary.plt or name in MEM_STOPS or is_panic_entry(binary, addr):
+        if addr in binary.plt or any(n in MEM_STOPS for n in name.split(" = ")) or is_panic_entry(binary, addr):
             stops.add(name)
             continue
         if SHIM_NAME.match(name):
@@ -420,6 +420,29 @@ def check_contained(binary: Binary, root: str, nodes: dict) -> list:
     return errors
 
 
+def check_no_mce_elsewhere(search: pathlib.Path) -> list:
+    """No PD other than the two roots' links McEliece code: a third PD would
+    ship it with no identity, forbidden-instruction or C9 binding (C10, SC23;
+    Phase 3 S4). Every `pd-*.elf` on the search path is read, the way
+    `microkit` will find them."""
+    errors = []
+    for path in sorted(search.glob("pd-*.elf")):
+        if path.name in ROOTS:
+            continue
+        try:
+            syms = elf_symbols(path.read_bytes())
+        except OSError as e:
+            errors.append(f"{path.name}: identity: cannot read {path}: {e.strerror}")
+            continue
+        except (Fail, struct.error, ValueError, IndexError) as e:
+            errors.append(f"{path.name}: identity: {e}")
+            continue
+        names = demangle_all(s.name for s in syms)
+        for n in sorted({n for n in names.values() if MCE_NAME.match(n)}):
+            errors.append(f"{path.name}: identity: {n} is McEliece code in a PD outside {', '.join(ROOTS)}")
+    return errors
+
+
 def first_diff(a: list, b: list) -> str:
     for i in range(max(len(a), len(b))):
         x, y = (f"'{v[i]}'" if i < len(v) else "no instruction" for v in (a, b))
@@ -446,8 +469,10 @@ def check_forbidden(binary: Binary, nodes: dict, divides: dict) -> list:
             if tuple(text[i:i + len(VALGRIND_PREAMBLE)]) == VALGRIND_PREAMBLE:
                 errors.append(f"{where}: the valgrind client-request preamble ({'; '.join(VALGRIND_PREAMBLE)})")
             target = branch_target(mnemonic, ops)
-            if target is not None and binary.function_name(target) in FORBIDDEN_CALLS:
-                errors.append(f"{where}: a call to {binary.function_name(target)}")
+            callee = binary.function_name(target) if target is not None else None
+            # Merged aliases are joined as `a = b`; any one forbidden name counts.
+            if callee is not None and any(n in FORBIDDEN_CALLS for n in callee.split(" = ")):
+                errors.append(f"{where}: a call to {callee}")
     for key in sorted(k for k in divides if k[0] == binary.label and k not in used):
         errors.append(f"{binary.label}: forbidden: [[divide]] {key[1]}: '{key[2]}' matches no instruction")
     return errors
@@ -620,6 +645,8 @@ def main() -> int:
                 errors += check_forbidden(binaries[label], nodes, divides)
             symbols += len(nodes)
             print(f"CT-SHAPE-CLOSURE {label} {root}: {len(nodes)} functions, {len(stops)} stops")
+        if "identity" in checks:
+            errors += check_no_mce_elsewhere(a.search_path)
         if "shape" in checks:
             errors += check_shape(binaries, a.policy)
         if "erasure" in checks:

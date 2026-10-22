@@ -217,15 +217,13 @@ fn ciphertext_for_another_key_yields_a_different_key_not_an_error() {
 }
 
 #[test]
-fn per_call_key_copy_is_zeroed_and_the_blob_left_intact() {
+fn decapsulation_reads_the_key_in_place_and_leaves_the_blob_intact() {
     let r = region_a();
     let snapshot = r.clone();
     let blob = Blob::parse(&r[..]).unwrap();
-    let mut scratch = Box::new([0xa5u8; pq::SK_LEN]);
     let mut shk = [0u8; 32];
-    decapsulate(&mut scratch, blob.secret_key(), CT_A, &mut shk);
+    decapsulate(blob.secret_key(), CT_A, &mut shk);
     assert_eq!(shk, *SHK_A);
-    assert!(scratch.iter().all(|b| *b == 0));
     assert_eq!(r, snapshot);
 }
 

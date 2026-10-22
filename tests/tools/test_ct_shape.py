@@ -68,6 +68,20 @@ def contained(**kw):
     return run
 
 
+def third_pd(with_mce: bool):
+    """A third PD on the search path, with McEliece code or without."""
+    @with_tree()
+    def run(search, _harness, _d):
+        source = elf.program("a1", "pd_ingress") if with_mce else ".text\n.globl _start\n_start:\nb .\n"
+        elf.build(search, "pd-ingress.elf", source, 0x200000)
+        errors = cts.check_no_mce_elsewhere(search)
+        if not with_mce:
+            return errors
+        want = "pd-ingress.elf: identity: mce460896::decaps is McEliece code in a PD outside"
+        return [] if any(e.startswith(want) for e in errors) else [f"no refusal naming decaps: {errors}"]
+    return run
+
+
 def bm_with(old: str, new: str) -> list:
     assert old in elf.BM, old
     return [new if line == old else line for line in elf.BM]
@@ -116,6 +130,16 @@ def stops_by_property():
     got = {names[a] for a in names if cts.is_panic_entry(b, a)}
     want = {names[0x100], names[0x200], names[0x300], names[0x400]}
     return [] if got == want else [f"stops {sorted(got)}"]
+
+
+def aliased_memcmp():
+    """A call to `memcmp` that also carries another name is still a call to
+    memcmp (merged aliases are joined as `a = b`)."""
+    names = {0x100: "mce460896::f", 0x200: "compiler_builtins::mem::memcmp", 0x300: "memcmp"}
+    insns = {0x100: ("bl", "200 <x>"), 0x104: ("ret", ""), 0x200: ("ret", "")}
+    syms = [cts.Sym(n, a if a != 0x300 else 0x200, 8 if a == 0x100 else 4, "func") for a, n in names.items()]
+    b = cts.Binary("t", syms, {n: n for n in names.values()}, insns, {})
+    return cts.check_forbidden(b, {"mce460896::f": 0x100}, {})
 
 
 def hash_noise_and_instantiating_crate():
@@ -240,6 +264,8 @@ CASES = [
       f"closure of mce460896::decaps at {BM}, not at the root"],
      contained(pd_entry=("bl {bm}", "ret"))),
     ("a call to one of the closure's stops is not an entry", None, contained(pd_entry=("bl memcpy", "ret"))),
+    ("a third PD without McEliece code passes", None, third_pd(False)),
+    ("McEliece code in a third PD is caught", None, third_pd(True)),
     ("panic entries stop the closure by property", None, stops_by_property),
     ("crate hashes are masked, the instantiating crate is kept", None, hash_noise_and_instantiating_crate),
     ("a udiv is forbidden", [f"pd-pqkey.elf: forbidden: {BM}+0x24: udiv x0, x1, x2"], forbidden(["udiv x0, x1, x2"])),
@@ -254,6 +280,8 @@ CASES = [
     ("a blr is forbidden", [f"pd-pqkey.elf: forbidden: {BM}+0x24: blr x3"], forbidden(["blr x3"])),
     ("a call to memcmp is forbidden", [f"pd-pqkey.elf: forbidden: {BM}+0x24: a call to memcmp"],
      forbidden(["bl memcmp"])),
+    ("a call to an aliased memcmp is forbidden",
+     ["t: forbidden: mce460896::f+0x0: a call to compiler_builtins::mem::memcmp = memcmp"], aliased_memcmp),
     ("the valgrind client-request preamble is forbidden",
      [f"pd-pqkey.elf: forbidden: {BM}+0x24: the valgrind client-request preamble (ror x12, x12, #3; "
       "ror x12, x12, #13; ror x12, x12, #51; ror x12, x12, #61)"],

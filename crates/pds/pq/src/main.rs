@@ -171,6 +171,17 @@ struct Pq {
     /// A completion record could not be sent, so the input is still held
     /// and the Rosenpass path is stopped for good (M3b plan C3).
     stuck: bool,
+    stack: cpu::StackProbe,
+}
+
+/// `stack_size` of `pq` in system/secureos.system (the integration suite
+/// checks that the printed size matches it).
+const STACK_SIZE: usize = 0x20_000;
+
+fn report_stack(stack: &mut cpu::StackProbe) {
+    if let Some((hw, size)) = stack.deeper() {
+        debug_println!("pq: stack high-water {hw:#x} of {size:#x}");
+    }
 }
 
 fn halt(msg: &str) -> ! {
@@ -180,6 +191,8 @@ fn halt(msg: &str) -> ! {
 
 #[protection_domain]
 fn init() -> Pq {
+    // SAFETY: first thing in init, with STACK_SIZE this PD's stack_size.
+    let stack = unsafe { cpu::StackProbe::paint(STACK_SIZE) };
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout` (checked by tools/laws and layout tests).
     let (from_ingress, to_ingress, to_hs, audit) = unsafe {
@@ -245,6 +258,7 @@ fn init() -> Pq {
         resp_hello: [0; RESP_HELLO_LEN],
         scratch: [0; layout::NET_BUF_SIZE],
         stuck: false,
+        stack,
     }
 }
 
@@ -435,6 +449,10 @@ impl Handler for Pq {
             }
         }
         run_passes(&mut Pass { pq: self, wake: Wake::default() });
+        // Once a second: the scan costs pq budget it needs under load.
+        if channels.contains(TIMER) {
+            report_stack(&mut self.stack);
+        }
         Ok(())
     }
 }

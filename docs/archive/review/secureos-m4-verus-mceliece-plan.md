@@ -790,7 +790,7 @@ fixed locally, stop and ask the owner.
 | SC24 | Rosenpass V03 alongside V02, configured per peer, with the version identified by envelope mac before decapsulation | the first upstream release containing V03 |
 | SC28 | A dedicated InitConf ring, if needed | M7 measurement |
 | SC29 | Vest-generated parsers | unscheduled |
-| SC30 | Verus proofs of ring's unsafe accessors and of ingress-core's gate state machines | unscheduled; Kani keeps them bounded |
+| SC30 | Verus proofs of ring's unsafe accessors, of the two-sided "no buffer owned by both sides" invariant (the Sender's and Receiver's Pools jointly; V4 proved it per Pool only), and of ingress-core's gate state machines | unscheduled; Kani (`pool_accept_stays_in_region`) and the link tests keep them bounded |
 | SC31 | A constant-time gate for McEliece keygen (R-M5) | unscheduled |
 
 ## User operation scenarios

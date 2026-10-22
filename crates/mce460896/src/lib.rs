@@ -70,10 +70,15 @@ const SK_IRR: usize = 40;
 const SK_COND: usize = SK_IRR + IRR_BYTES;
 const SK_S: usize = SK_COND + COND_BYTES;
 
-/// Bytes of stack [`scrub_stack`] zeroes. At least the measured stack peak
-/// of `decaps_core` and `encaps_attempt_core` plus a margin
-/// (`tests/stack.rs` measures it and holds this to it).
+/// Bytes of stack [`scrub_stack`] zeroes after `decaps_core`: at least its
+/// measured stack peak plus a margin (`tests/mce_stack.rs` measures it and
+/// holds this to it).
 pub const SCRUB_DEPTH: usize = 96 * 1024;
+
+/// The same for [`scrub_stack_encaps`] after `encaps_attempt_core`, whose
+/// peak is far smaller: scrubbing decaps' depth there cost `pq` most of its
+/// stack headroom (M4 Phase 3, C8 measurement).
+pub const SCRUB_DEPTH_ENCAPS: usize = 40 * 1024;
 
 /// The caller's random source failed. No output of the failed call is
 /// valid; the output buffers are zeroed.
@@ -157,7 +162,7 @@ pub fn encaps_attempt(
     ss_out: &mut [u8; SS_LEN],
 ) -> u8 {
     let accept = encaps_attempt_core(pk, rand, ct_out, ss_out);
-    scrub_stack();
+    scrub_stack_encaps();
     accept
 }
 
@@ -260,5 +265,12 @@ pub fn pk_from_sk(sk: &[u8; SK_LEN], pk_out: &mut [u8; PK_LEN]) -> bool {
 #[inline(never)]
 pub fn scrub_stack() {
     let mut area = [0u64; SCRUB_DEPTH / 8];
+    area.zeroize();
+}
+
+/// [`scrub_stack`] to [`SCRUB_DEPTH_ENCAPS`], after `encaps_attempt_core`.
+#[inline(never)]
+pub fn scrub_stack_encaps() {
+    let mut area = [0u64; SCRUB_DEPTH_ENCAPS / 8];
     area.zeroize();
 }

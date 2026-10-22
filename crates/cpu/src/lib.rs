@@ -1,6 +1,7 @@
 //! EL0-readable aarch64 counters and the RNDR random number register.
 //! CNTPCT/CNTFRQ are exported to user level by the kernel config
 //! (CONFIG_EXPORT_PCNT_USER); RNDR needs FEAT_RNG (plan VE8, L9).
+//! Also the stack high-water probe the McEliece PDs print (M4 plan C8).
 
 #![no_std]
 
@@ -71,6 +72,71 @@ pub fn fill_random(out: &mut [u8]) -> bool {
         chunk.copy_from_slice(bytes.get(..chunk.len()).unwrap_or(&[]));
     }
     true
+}
+
+/// Microkit maps every PD's stack to end here (tools/laws checks maps
+/// against the same value).
+const STACK_TOP: usize = 0xff_ffff_e000;
+const STACK_PAINT: u8 = 0xa5;
+
+/// The stack high-water mark (M4 plan C8): the free stack is painted once
+/// at init, and `report` prints the deepest byte no longer holding the
+/// paint each time it moves deeper, for the PD to print. The McEliece
+/// stack scrub writes zeros, so the scrubbed depth counts as used.
+/// `tests/integration` reads the lines and checks the headroom against the
+/// `stack_size` in the system file.
+pub struct StackProbe {
+    size: usize,
+    reported: usize,
+}
+
+impl StackProbe {
+    /// # Safety
+    /// `size` must be this PD's `stack_size`, and nothing may be live below
+    /// the caller's frame (call it first thing in `init`).
+    pub unsafe fn paint(size: usize) -> Self {
+        let sp: usize;
+        // SAFETY: reads the stack pointer only.
+        unsafe { asm!("mov {}, sp", out(reg) sp, options(nomem, nostack, preserves_flags)) };
+        // A margin below this frame for the calls made while painting.
+        let end = sp.saturating_sub(1024);
+        let mut at = STACK_TOP.saturating_sub(size);
+        while at < end {
+            // SAFETY: [STACK_TOP - size, end) is this PD's own mapped stack,
+            // below every live frame (the caller's contract).
+            unsafe { core::ptr::write_volatile(at as *mut u8, STACK_PAINT) };
+            at = at.saturating_add(1);
+        }
+        Self { size, reported: 0 }
+    }
+
+    /// Bytes below the stack top ever used: the paint is read a word at a
+    /// time up to the first word that differs, then to the byte.
+    pub fn high_water(&self) -> usize {
+        const WORD: u64 = u64::from_ne_bytes([STACK_PAINT; 8]);
+        let mut at = STACK_TOP.saturating_sub(self.size);
+        // SAFETY: as in `paint`; the stack is mapped for the PD's lifetime,
+        // and `at` stays 8-aligned (STACK_TOP and the stack size are).
+        while at < STACK_TOP && unsafe { core::ptr::read_volatile(at as *const u64) } == WORD {
+            at = at.saturating_add(8);
+        }
+        // SAFETY: as above, byte by byte within the first differing word.
+        while at < STACK_TOP && unsafe { core::ptr::read_volatile(at as *const u8) } == STACK_PAINT {
+            at = at.saturating_add(1);
+        }
+        STACK_TOP.saturating_sub(at)
+    }
+
+    /// The high-water mark and the stack size, when the mark is deeper
+    /// than last reported.
+    pub fn deeper(&mut self) -> Option<(usize, usize)> {
+        let hw = self.high_water();
+        if hw <= self.reported {
+            return None;
+        }
+        self.reported = hw;
+        Some((hw, self.size))
+    }
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@
 
 use secret_blob::pq::{self, Blob};
 use secret_blob::{BlobError, blake2s};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 pub const LABEL_PQ_DECAPS: u64 = 1;
 pub const LABEL_PQ_BOOT_SEED: u64 = 2;
@@ -139,13 +139,11 @@ fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     core::hint::black_box(diff) == 0
 }
 
-/// Decapsulates `ct` with a per-call copy of `sk` in `scratch`, which is
-/// zero on return. `mce460896::decaps` neither owns nor zeroizes its
-/// buffers, so `scratch` is wiped here instead.
-fn decapsulate(scratch: &mut [u8; pq::SK_LEN], sk: &[u8; pq::SK_LEN], ct: &[u8; pq::CT_LEN], out: &mut [u8; pq::SHK_LEN]) {
-    scratch.copy_from_slice(sk);
-    mce460896::decaps(scratch, ct, out);
-    scratch.zeroize();
+/// Decapsulates `ct` with `sk` read in place: `mce460896::decaps` takes the
+/// key by shared reference, so no copy of it is made (cmr needed a mutable
+/// one, which this used to wipe).
+fn decapsulate(sk: &[u8; pq::SK_LEN], ct: &[u8; pq::CT_LEN], out: &mut [u8; pq::SHK_LEN]) {
+    mce460896::decaps(sk, ct, out);
 }
 
 /// Checks the region: format, `H(spkm)` against the configured value, then
@@ -156,9 +154,8 @@ pub fn validate<'a>(region: &'a [u8], spkm_hash: &[u8; 32]) -> Result<Blob<'a>, 
     if !ct_eq(blob.spkm_hash(), spkm_hash) {
         return Err(BootError::SpkmMismatch);
     }
-    let mut scratch = Zeroizing::new([0u8; pq::SK_LEN]);
     let mut shk = Zeroizing::new([0u8; pq::SHK_LEN]);
-    decapsulate(&mut scratch, blob.secret_key(), blob.kat_ct(), &mut shk);
+    decapsulate(blob.secret_key(), blob.kat_ct(), &mut shk);
     if !ct_eq(&blake2s(&[&shk[..]]), blob.kat_shk_hash()) {
         return Err(BootError::KatMismatch);
     }
@@ -279,9 +276,8 @@ impl<'a> Oracle<'a> {
         }
         let written = match ct {
             Some(ct) => {
-                let mut scratch = Zeroizing::new([0u8; pq::SK_LEN]);
                 let mut shk = Zeroizing::new([0u8; pq::SHK_LEN]);
-                decapsulate(&mut scratch, self.blob.secret_key(), &ct, &mut shk);
+                decapsulate(self.blob.secret_key(), &ct, &mut shk);
                 put_bytes(reply, &shk[..])
             }
             None => put_bytes(reply, &self.boot_seed[..]),

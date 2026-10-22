@@ -14,7 +14,7 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools/check-pins"
 FILES = ["docker/Dockerfile", "Makefile", "rust-toolchain.toml", "Cargo.toml", "Cargo.lock", "policy/waivers.toml",
-         "policy/verus-trusted.toml"]
+         "policy/verus-trusted.toml", ".cargo/config.toml"]
 # P7's cases run on a tree whose crates/ is replaced by a synthetic one.
 # P7 is enforced, so they need no --enforce-pending.
 ENFORCE: list = []
@@ -32,12 +32,15 @@ def copy_tree(dst: pathlib.Path):
     for f in FILES:
         (dst / f).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / f, dst / f)
-    # Sources only: P7-P10 read *.rs and Cargo.toml, P3 reads Cargo.toml.
-    for src in (ROOT / "crates").rglob("*"):
-        rel = src.relative_to(ROOT)
-        if src.is_file() and (src.suffix == ".rs" or src.name == "Cargo.toml") and "target" not in rel.parts:
-            (dst / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy(src, dst / rel)
+    # Sources only: P7-P10 read *.rs and Cargo.toml, P3 reads Cargo.toml;
+    # P13 and P15 also read tools/ (its *.rs and the tool workspaces' locks).
+    for top in ("crates", "tools"):
+        for src in (ROOT / top).rglob("*"):
+            rel = src.relative_to(ROOT)
+            wanted = src.suffix == ".rs" or src.name == "Cargo.toml" or (top == "tools" and src.name == "Cargo.lock")
+            if src.is_file() and wanted and "target" not in rel.parts:
+                (dst / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(src, dst / rel)
 
 
 def write(path: pathlib.Path, text: str):
@@ -59,8 +62,12 @@ def synthetic_crates(t: pathlib.Path, lib: str = "pub fn f() {}\n"):
 
 def lock_cmr(t: pathlib.Path, version: str = "2.0.2"):
     """Locks cmr again (the live tree no longer does, after the M4 cut-over)."""
-    append(t / "Cargo.lock", f'\n[[package]]\nname = "classic-mceliece-rust"\nversion = "{version}"\n'
-                             'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
+    lock_cmr_at(t / "Cargo.lock", version)
+
+
+def lock_cmr_at(lock: pathlib.Path, version: str = "2.0.2"):
+    append(lock, f'\n[[package]]\nname = "classic-mceliece-rust"\nversion = "{version}"\n'
+                 'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
 
 
 # SC23 as the live policy lists it (closed since M4).
@@ -166,6 +173,14 @@ CASES = [
      lambda t: append(t / "crates/pqkey-core/src/lib.rs", "\nuse classic_mceliece_rust as cmr;\n")),
     ("allow classic_mceliece_rust in a comment", set(),
      lambda t: append(t / "crates/pqkey-core/src/lib.rs", "\n// once classic_mceliece_rust::decapsulate\n")),
+    # P13 reaches tools/ too (M4 plan C11): rp-vectors' own lock, and code.
+    ("P13 cmr in rp-vectors' lock", {"P13"}, lambda t: lock_cmr_at(t / "tools/rp-vectors/Cargo.lock")),
+    ("P13 extern crate classic_mceliece_rust in a tool", {"P13"},
+     lambda t: append(t / "tools/rp-vectors/src/main.rs", "\nextern crate classic_mceliece_rust;\n")),
+    ("P13 a classic_mceliece_rust:: path in a tool", {"P13"},
+     lambda t: append(t / "tools/mksecrets/src/main.rs", "\nfn f() { classic_mceliece_rust::x(); }\n")),
+    ("allow classic_mceliece_rust in a tool's comment", set(),
+     lambda t: append(t / "tools/mksecrets/src/main.rs", "\n// replaced classic_mceliece_rust::decapsulate in M4\n")),
     ("P6 Cargo.lock without [[package]] tables", {"P6", "P16"},
      lambda t: (t / "Cargo.lock").write_text("version = 4\n")),
     ("P6 Cargo.lock not UTF-8", {"P6", "P16"}, lambda t: (t / "Cargo.lock").write_bytes(b"version = 4\n\xff\n")),
@@ -267,6 +282,35 @@ CASES = [
     ("P12 external_body after a raw string holding a quote", {"P12"},
      lambda t: edit(t / "crates/wg-wire/src/replay.rs", "#[inline]\nfn below_window(",
                     "const R: &str = r#\"a\"b\"#;\n#[inline]\n#[verifier::external_body]\nfn below_window(")),
+    # P12 after Phase 3 (M4): constructs counted per item, cfg splits, the
+    # whole file, and code the scan cannot read.
+    ("P12 a second external_body in the allowlisted msgs file", {"P12"},
+     lambda t: edit(t / "crates/msgs/src/lib.rs", "/// The `N` bytes of `b` at `at`, borrowed in place",
+                    "#[verifier::external_body]\nfn extra() {}\n\n/// The `N` bytes of `b` at `at`, borrowed in place")),
+    ("P12 the allowlist entry bound to another item", {"P12"},
+     lambda t: edit(t / "policy/verus-trusted.toml", 'item = "chunk_ref"', 'item = "decode"')),
+    ("P12 a cfg(verus_keep_ghost) fn", {"P12"},
+     lambda t: edit(t / "crates/wg-wire/src/replay.rs", "#[inline]\nfn below_window(", "#[cfg(verus_keep_ghost)]\nfn ghost_only() {}\n" + "#[inline]\nfn below_window(")),
+    ("P12 a cfg!(verus_keep_ghost) branch", {"P12"},
+     lambda t: edit(t / "crates/wg-wire/src/replay.rs", "#[inline]\nfn below_window(", "fn split() -> bool { cfg!(verus_keep_ghost) }\n" + "#[inline]\nfn below_window(")),
+    ("allow a cfg(verus_keep_ghost) use", set(),
+     lambda t: edit(t / "crates/wg-wire/src/replay.rs", "#[inline]\nfn below_window(", "#[cfg(verus_keep_ghost)]\nuse vstd::seq::Seq;\n" + "#[inline]\nfn below_window(")),
+    ("P12 admit in a macro_rules outside verus!", {"P12"},
+     lambda t: append(t / "crates/wg-wire/src/replay.rs", "\nmacro_rules! m { () => { admit() } }\n")),
+    ("P12 a #[path] module", {"P12"},
+     lambda t: append(t / "crates/wg-wire/src/replay.rs", '\n#[path = "../../x.rs"]\nmod x;\n')),
+    ("P12 an include!", {"P12"},
+     lambda t: append(t / "crates/wg-wire/src/replay.rs", '\ninclude!("../../x.rs");\n')),
+    ("allow an include_bytes!", set(),
+     lambda t: append(t / "crates/wg-wire/src/replay.rs", '\n#[cfg(test)]\nconst B: &[u8] = include_bytes!("lib.rs");\n')),
+    ("P12 an external_trait_specification", {"P12"},
+     lambda t: edit(t / "crates/wg-wire/src/replay.rs", "#[inline]\nfn below_window(", "#[verifier::external_trait_specification]\npub trait ExT {}\n" + "#[inline]\nfn below_window(")),
+    ("P12 a Tracked::assume_new", {"P12"},
+     lambda t: edit(t / "crates/wg-wire/src/replay.rs", "#[inline]\nfn below_window(", "proof fn t() { let x = Tracked::<u8>::assume_new(); }\n" + "#[inline]\nfn below_window(")),
+    ("P12 a hand-written verus::internal attribute", {"P12"},
+     lambda t: edit(t / "crates/wg-wire/src/replay.rs", "#[inline]\nfn below_window(", "#[verus::internal(verus_macro)]\nfn hidden() {}\n" + "#[inline]\nfn below_window(")),
+    ("P12 a verus crate without a verus! block", {"P12"},
+     lambda t: [f.write_text(f.read_text().replace("verus!", "not_verus!")) for f in (t / "crates/ring/src").rglob("*.rs")]),
     ("P12 kani::assume outside verus! is not Verus's assume", set(),
      lambda t: append(t / "crates/wg-wire/src/replay.rs", "\n#[cfg(kani)]\nfn h() { kani::assume(true); }\n")),
     # P14 (M4 C7): unsafe only in the barrier module.
@@ -296,6 +340,16 @@ CASES = [
      lambda t: append(t / "crates/mce460896/Cargo.toml", '\n[build-dependencies]\ncc = "=1.0.0"\n')),
     ("P16 a target-specific dependency in mce460896", {"P16"},
      lambda t: append(t / "crates/mce460896/Cargo.toml", "\n[target.'cfg(unix)'.dependencies]\nlibc = \"=0.2.191\"\n")),
+    ("P16 a feature on sha3", {"P16"},
+     lambda t: edit(t / "crates/mce460896/Cargo.toml", 'sha3 = { version = "=0.10.9", default-features = false }',
+                    'sha3 = { version = "=0.10.9", default-features = false, features = ["asm"] }')),
+    ("P16 default features on zeroize", {"P16"},
+     lambda t: edit(t / "crates/mce460896/Cargo.toml", 'zeroize = { version = "=1.8.1", default-features = false }',
+                    'zeroize = { version = "=1.8.1" }')),
+    ("P16 a source replacement in .cargo/config.toml", {"P16"},
+     lambda t: append(t / ".cargo/config.toml", '\n[source.crates-io]\nreplace-with = "vendored"\n')),
+    ("P16 a [patch] in .cargo/config.toml", {"P16"},
+     lambda t: append(t / ".cargo/config.toml", '\n[patch.crates-io]\nsha3 = { path = "x" }\n')),
     ("P16 a [patch] in the workspace", {"P16"},
      lambda t: append(t / "Cargo.toml", '\n[patch.crates-io]\nsha3 = { path = "vendor/sha3" }\n')),
     ("P16 a new package in the closure", {"P16"},
@@ -309,6 +363,9 @@ CASES = [
     # P9/P10 (M4 C11): mce460896 joins the secret crates.
     ("P9 derive(Clone) on a Zeroizing holder in mce460896", {"P9"},
      lambda t: append(t / "crates/mce460896/src/lib.rs", "\n#[derive(Clone)]\npub struct Seed(Zeroizing<[u8; 32]>);\n")),
+    ("P9 derive(Debug) on a plain-array state struct in mce460896", {"P9"},
+     lambda t: append(t / "crates/mce460896/src/encrypt.rs", "\n#[derive(Debug)]\nstruct Leak {\n    e: [u8; 8],\n}\n")),
+    ("allow the derive on mce460896's RngError", set(), lambda t: None),
     ("P10 from_bytes(*..) in mce460896", {"P10"},
      lambda t: append(t / "crates/mce460896/src/lib.rs", "\nfn f(k: &[u8; 32]) -> S { S::from_bytes(*k) }\n")),
     # P12 fails closed when it cannot find what to check (R50).

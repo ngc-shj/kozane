@@ -744,3 +744,110 @@ RT1–RT11. The first solo `make check` at `d1a93cb` also failed, in `test`.
   mksecrets wipes none of its secrets, including the long-term McEliece
   secret key it writes, so wiping only the KAT key would add nothing. This
   is a residual of the host tool.
+
+## Phase 3 round 1 fixes
+
+The findings are in `secureos-m4-verus-mceliece-code-review.md`. These
+record what changed in the plan's mechanisms.
+
+- **Verus scanner (F1/F2, S1–S6, T4):**
+  - **Required functions:** named `Type::fn`, or `*::fn` for every fn of
+    that name in the crate (`*::decode`, `*::parse`, `*::emit`). Each
+    definition must be inside `verus!` with an ensures, and a definition
+    outside fails.
+  - **Ensures count:** `VERUS-ENSURES-<CRATE>` now counts every definition.
+    The old count took the max per name. wg-wire goes from 47 to 57, msgs
+    from 43 to 67 and rosenpass-wire from 23 to 35.
+  - **Trusted constructs:** each is bound to its item and compared as a
+    multiset by one function, which P12 and the gate share. The scan covers
+    the whole file and treats every `verus!` delimiter the same.
+  - **What counts as trusted:** the scan now also flags:
+    - `cfg`/`cfg!` naming a `verus_*` cfg, except on a `use` item;
+    - `#[path]` and `include!`;
+    - `assume_new(`/`assume_new_fallback(`;
+    - `verus::internal`;
+    - `external_trait_specification`, `external_trait_extension` and
+      `assume_termination`.
+
+    The last three come from enumerating `verifier::` attributes in the
+    pinned vstd and verus_builtin sources (S6).
+  - **Empty crates:** a crate with no `verus!` block fails.
+- **C10 (S4):** ct-shape's identity check refuses McEliece symbols in any
+  `pd-*.elf` other than the two roots'. It reads the search path, so
+  package gets it too.
+- **C8 stack measurement (F5, S10):**
+  - **The probe:** `cpu::StackProbe` paints pq's and pqkey's free stack at
+    init and prints the high-water mark whenever it deepens. The
+    integration case `stack headroom (C8)` requires 16 KiB free at the
+    system file's `stack_size`.
+  - **First measurement:** pqkey peaked at 113,760 B and pq at 119,152 B of
+    131,072. pq had only 11.9 KB free: `encaps_attempt` scrubbed decaps'
+    96 KiB.
+  - **The fix:** `SCRUB_DEPTH_ENCAPS` is 40 KiB (host peak 20 KiB plus the
+    16 KiB margin, asserted by `mce_stack.rs`), with its own
+    `scrub_stack_encaps`. pqkey-core no longer copies the 13.6 KB secret key
+    onto the stack (F6/S9).
+  - **Second measurement:** with these, after the full rp gate boot, pq
+    peaks at 61,808 B (69,264 B free) and pqkey at 100,096 B (30,976 B
+    free). The `.system` comments carry these figures.
+  - **Probe cost:** the first probe scanned the stack byte by byte after
+    every pq pass. Under load that cost pq the budget it needed, and
+    `rp spoof` failed. The probe now scans a word at a time, and pq reports
+    only on its 1 Hz timer.
+- **Residue forms (F4/T2):** the plan's per-form cases are consolidated
+  into one, `mce-residue-forms`. It strips every local wipe, both scrubs and
+  the shim's `Zeroizing`, and requires a `RESIDUE-HIT` for all ten forms.
+  This proves eight needle derivations can match in one valgrind run
+  instead of ten. Which wipe protects which form stays covered by the scrub
+  and by `mce-residue-rand`/`-scrub`.
+  - **bm and g never hit, even with every wipe and both scrubs removed**
+    (measured). The fft right after BM converts the locator in place and
+    reuses BM's frame. A copy for the fft made `g` vanish too: the layout
+    moved, and LLVM elided the copy. So no mutation exposes them.
+  - **Their needles are the implementation's own outputs:**
+    `stages::bm`'s, asserted equal to the decoder's locator, and the sk's g
+    bytes. They stay in the scan as tripwires, without a red-proof
+    (residual).
+- **Selftest:**
+  - **`ct-c1-barrier`:** added (F3/T1).
+  - **`ct-harness-unit`:** added (T12).
+  - **Kani needles:** failure-only (T3).
+  - **Regex needles:** a needle may now be a regex; `ct-barrier` and
+    `ct-c1-barrier` name the file (T7).
+  - **Timeout:** each case's make runs in its own process group, killed
+    with SIGKILL after 4 h (T11).
+- **check-pins:**
+  - **P13:** fixtures reach `tools/` (T5).
+  - **P16:**
+    - refuses features and default features on sha3 and zeroize;
+    - refuses `.cargo/config.toml` `[patch]`/`[source]` (S7).
+  - **P9:** in mce460896, P9 covers every type but `RngError` (F10).
+- **C9 record:** the record's counts must equal `tests/manifest.txt`'s
+  (T13).
+  - The record fixtures list their keys explicitly (T6).
+  - `make ct` runs the harness's clippy and tests before ct-gate, so a
+    failure there cannot leave a fresh record (F7).
+- **package (S8):** package binds the shape baseline as well.
+- **Unit keys (F11/T9):** the mce460896 integration tests are
+  `mce_{rng,stack,vectors}.rs`. The stack probe's child is `#[ignore]`d, so
+  UNIT-MCE-STACK is 1.
+- **Accepted, with residuals:**
+  - **T8 (ct-identity has no allow-side run):** the allow side is the
+    gate's own green run in `make check`. Cost to add: a second full PD
+    build per selftest. The worst case is a case that is red for a reason
+    other than the opt-level change; the needle names the identity diff,
+    which bounds this.
+  - **T10 (verus-gate's own-summary clause is not red-proved):** no
+    mutation outside the gate makes Verus exit 0 without the crate's
+    summary. The VERUS-<CRATE> manifest count is the backstop.
+  - **S11 (macro pairing by version only):** comparing the crates.io
+    `verus_builtin_macros`/`vstd` sources with the tarball's needs an image
+    rebuild. It is recorded for M5's reproducible-build work, where the
+    image is rebuilt anyway; R-M3 already accepts unaudited macro output.
+- **Selftest speed:** every case used to copy the repo, without `build/`
+  or `target/`, into a fresh temp dir and build cold. The cases now share
+  one warm tree at `build/selftest-work/tree`. `sync_tree` restores each
+  file by content: a file the previous case mutated is rewritten with a
+  fresh mtime, so cargo rebuilds it, and unchanged files keep theirs. Only
+  `build/target*` and `build/ct/target*` survive between cases. A lock
+  keeps two selftests off the tree. A unit case now takes 26–33 s.

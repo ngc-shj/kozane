@@ -127,12 +127,13 @@ def check_bindings(lock: pathlib.Path, path: pathlib.Path) -> list:
 
 
 def run_ct_shape(harness: pathlib.Path, search_path: str) -> list:
-    """C10 (a) and (b) on the ELFs this package ships, against the harness
-    C9 ran: each line tools/ct-shape refused with, or its output when it
-    failed without one."""
+    """C10 (a), (b) and the shape baseline on the ELFs this package ships,
+    against the harness C9 ran: the baseline is the static tripwire over
+    paths C9's inputs never reach (R-M6). Each line tools/ct-shape refused
+    with, or its output when it failed without one."""
     try:
         r = subprocess.run([str(CT_SHAPE), "--harness", str(harness), "--search-path", search_path,
-                            "--policy", str(CT_POLICY), "--checks", "identity,forbidden"],
+                            "--policy", str(CT_POLICY), "--checks", "identity,forbidden,shape"],
                            capture_output=True, text=True)
     except OSError as e:
         return [f"package: cannot run tools/ct-shape: {e}"]

@@ -138,7 +138,7 @@ shape = {}
 [[function]]
 elf = "pd-pq.elf"
 name = "mce460896::encaps_attempt"
-justification = "Thin root (C7 I5): calls encaps_attempt_core, tail-calls scrub_stack; no conditional instruction."
+justification = "Thin root (C7 I5): calls encaps_attempt_core, tail-calls scrub_stack_encaps; no conditional instruction."
 shape = {}
 
 [[function]]
@@ -167,8 +167,8 @@ shape = { "b.cc" = 2, "b.cs" = 3, "b.ne" = 3, "cbz" = 3, "csel cc" = 2, "ldr [x,
 
 [[function]]
 elf = "pd-pq.elf"
-name = "mce460896::scrub_stack"
-justification = "Loop over the SCRUB_DEPTH local array: b.ne is its public counter, the register-offset store the volatile zeroing at that counter. No secret is read."
+name = "mce460896::scrub_stack_encaps"
+justification = "Loop over the SCRUB_DEPTH_ENCAPS local array: b.ne is its public counter, the register-offset store the volatile zeroing at that counter. No secret is read."
 shape = { "b.ne" = 2, "str [x, x]" = 1 }
 
 [[function]]

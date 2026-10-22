@@ -100,7 +100,7 @@ impl Vectors {
     }
 
     /// The public key, rebuilt from the secret key (liboqs.txt stores only
-    /// a hash of it, which `tests/vectors.rs` checks).
+    /// a hash of it, which `crates/mce460896/tests/mce_vectors.rs` checks).
     pub fn pk(&self, sk: &[u8; SK_LEN]) -> Box<[u8; PK_LEN]> {
         let mut pk = boxed::<PK_LEN>();
         assert!(mce460896::pk_from_sk(sk, &mut pk), "pk_from_sk");

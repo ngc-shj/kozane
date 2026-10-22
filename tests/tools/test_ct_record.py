@@ -22,7 +22,13 @@ def tree(tmp: pathlib.Path) -> pathlib.Path:
     (tmp / ct_record.VECTORS).mkdir(parents=True)
     (tmp / ct_record.VECTORS / "liboqs.txt").write_text("mce.0.ss 00\n")
     (tmp / "harness").write_bytes(b"\x7fELF harness")
+    (tmp / "tests").mkdir()
+    (tmp / ct_record.MANIFEST).write_text("CT-CASES 28\nCT-MARKED-BYTES 1\nRESIDUE-CASES 25\n")
     return tmp
+
+
+def edit_manifest(root):
+    (root / ct_record.MANIFEST).write_text("CT-CASES 29\nCT-MARKED-BYTES 1\nRESIDUE-CASES 25\n")
 
 
 def written(root: pathlib.Path, text: str = RECORD) -> pathlib.Path:
@@ -52,6 +58,10 @@ CASES = [
     ("vector edit refused", edit_vectors, VG, "no C9 pass record"),
     ("rebuilt harness refused", edit_harness, VG, "no C9 pass record"),
     ("other valgrind refused", None, "valgrind-3.25.0", "no C9 pass record"),
+    ("record with fewer cases than the manifest pins refused", edit_manifest, VG,
+     "CT-CASES 28, tests/manifest.txt pins 29"),
+    ("missing manifest refused", lambda root: (root / ct_record.MANIFEST).unlink(), VG,
+     "tests/manifest.txt: unreadable"),
 ]
 
 
@@ -70,14 +80,18 @@ def main() -> int:
             if not ok:
                 failures += 1
                 print(f"FAIL {name}: {why}")
-    with tempfile.TemporaryDirectory() as d:
-        root = tree(pathlib.Path(d))
-        written(root, RECORD.replace("RESIDUE-CASES 25\n", ""))
-        why = ct_record.check_record(root, root / "harness", VG)
-        n += 1
-        if not any("no RESIDUE-CASES line" for w in why):
-            failures += 1
-            print(f"FAIL record without RESIDUE-CASES refused: {why}")
+    # Each required line, dropped on its own, is refused by name. Listed
+    # here, not read from ct_record.REQUIRED: a key dropped there must fail.
+    for key in ("CT-CASES", "CT-MARKED-BYTES", "RESIDUE-CASES"):
+        line = next(l for l in RECORD.splitlines(keepends=True) if l.startswith(key + " "))
+        with tempfile.TemporaryDirectory() as d:
+            root = tree(pathlib.Path(d))
+            written(root, RECORD.replace(line, ""))
+            why = ct_record.check_record(root, root / "harness", VG)
+            n += 1
+            if not any(f"no {key} line" in w for w in why):
+                failures += 1
+                print(f"FAIL record without {key} refused: {why}")
     print(f"CT-RECORD-FIXTURES {n}")
     return 1 if failures else 0
 

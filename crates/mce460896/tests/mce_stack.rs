@@ -14,7 +14,9 @@ use std::hint::black_box;
 use std::process::{Command, Stdio};
 
 use common::boxed;
-use mce460896::{CT_LEN, ENCAPS_RAND_LEN, PK_LEN, SCRUB_DEPTH, SK_LEN, SS_LEN, decaps_core, encaps_attempt_core};
+use mce460896::{
+    CT_LEN, ENCAPS_RAND_LEN, PK_LEN, SCRUB_DEPTH, SCRUB_DEPTH_ENCAPS, SK_LEN, SS_LEN, decaps_core, encaps_attempt_core,
+};
 
 const CHILD: &str = "MCE460896_STACK_PROBE";
 const PAGE: usize = 4096;
@@ -31,8 +33,10 @@ fn padded(f: impl FnOnce()) {
     black_box(&pad);
 }
 
-/// Not a test of its own: the child half of `scrub_depth_covers_the_core_stack_peak`.
+/// Not a test of its own: the child half of `scrub_depth_covers_the_core_stack_peak`,
+/// run only by it (with `--ignored`), so it is not counted as a test.
 #[test]
+#[ignore = "the child half of scrub_depth_covers_the_core_stack_peak"]
 fn stack_probe_child() {
     let Ok(spec) = std::env::var(CHILD) else { return };
     let (stage, size) = spec.split_once(':').expect("stage:size");
@@ -65,7 +69,7 @@ fn stack_probe_child() {
 
 fn fits(stage: &str, size: usize) -> bool {
     Command::new(std::env::current_exe().expect("test binary"))
-        .args(["stack_probe_child", "--exact", "--test-threads=1", "--quiet"])
+        .args(["stack_probe_child", "--exact", "--ignored", "--test-threads=1", "--quiet"])
         .env(CHILD, format!("{stage}:{size}"))
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -91,7 +95,11 @@ fn scrub_depth_covers_the_core_stack_peak() {
     let base = min_stack("none");
     let decaps = min_stack("decaps") - base;
     let encaps = min_stack("encaps") - base;
-    eprintln!("stack peak: decaps_core {decaps} B, encaps_attempt_core {encaps} B (base {base} B); SCRUB_DEPTH {SCRUB_DEPTH} B");
+    eprintln!(
+        "stack peak: decaps_core {decaps} B, encaps_attempt_core {encaps} B (base {base} B); \
+         SCRUB_DEPTH {SCRUB_DEPTH} B, SCRUB_DEPTH_ENCAPS {SCRUB_DEPTH_ENCAPS} B"
+    );
     assert!(decaps > 0 && encaps > 0, "the measurement sees the stages");
-    assert!(SCRUB_DEPTH >= decaps.max(encaps) + MARGIN, "SCRUB_DEPTH below the measured peak plus {MARGIN}");
+    assert!(SCRUB_DEPTH >= decaps + MARGIN, "SCRUB_DEPTH below decaps_core's peak plus {MARGIN}");
+    assert!(SCRUB_DEPTH_ENCAPS >= encaps + MARGIN, "SCRUB_DEPTH_ENCAPS below encaps_attempt_core's peak plus {MARGIN}");
 }

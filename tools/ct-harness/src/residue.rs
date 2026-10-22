@@ -9,7 +9,7 @@ use std::hint::black_box;
 
 use mce460896::stages::{self, Vec13};
 use mce460896::{
-    CT_LEN, ENCAPS_RAND_LEN, PK_LEN, RngError, SCRUB_DEPTH, SK_LEN, SS_LEN, decaps, encaps,
+    CT_LEN, ENCAPS_RAND_LEN, PK_LEN, RngError, SCRUB_DEPTH, SCRUB_DEPTH_ENCAPS, SK_LEN, SS_LEN, decaps, encaps,
     encaps_attempt,
 };
 
@@ -54,11 +54,11 @@ const PAINT: u8 = 0x5c;
 /// much stack below the pad, so that the scanned region holds its frames.
 /// About half of each `_core` stage's own peak on this build (decaps_core
 /// 63 KiB, encaps_attempt_core 4 KiB), so that they hold with or without
-/// the scrub; with it, every call reaches `SCRUB_DEPTH`.
+/// the scrub; with it, every call reaches its scrub depth.
 const FLOOR_DECAPS: usize = 32 * 1024;
 const FLOOR_ENCAPS: usize = 2 * 1024;
 const _: () = assert!(
-    SCRUB_DEPTH >= FLOOR_DECAPS && SCRUB_DEPTH >= FLOOR_ENCAPS,
+    SCRUB_DEPTH >= FLOOR_DECAPS && SCRUB_DEPTH_ENCAPS >= FLOOR_ENCAPS,
     "the scrub must cover the painted-depth floor"
 );
 

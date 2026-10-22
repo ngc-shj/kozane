@@ -1,16 +1,21 @@
 # Trusted Verus constructs allowed in the verified crates (M4 plan C1).
-# Each entry: crate, file (relative to the crate), construct, and the
-# deviation-log line that justifies it. tools/verus_trusted.py compares the
-# crates' constructs with this list exactly; a stale entry also fails.
+# Each entry: crate, file (relative to the crate), construct, the item it
+# covers (the fn or type an attribute decorates; the fn enclosing a call),
+# optionally a count (default 1), and the deviation-log line that justifies
+# it. tools/verus_trusted.py compares the crates' constructs with this list
+# as a multiset, so a second construct on another item is not covered, and
+# a stale entry fails too.
 #
 # [[trusted]]
 # crate = "<crate>"
 # file = "src/<file>.rs"
 # construct = "external_body"
+# item = "<fn>"
 # deviation = "secureos-m4-verus-mceliece-deviation.md: <heading>"
 
 [[trusted]]
 crate = "msgs"
 file = "src/lib.rs"
 construct = "external_body"
+item = "chunk_ref"
 deviation = "secureos-m4-verus-mceliece-deviation.md: V2, msgs chunk_ref"

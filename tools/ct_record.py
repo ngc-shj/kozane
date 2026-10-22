@@ -24,6 +24,7 @@ POLICY = "policy/ct-declassify.toml"
 VECTORS = "crates/mce460896/tests/vectors"
 # The lines package requires in a record.
 REQUIRED = ("CT-CASES", "CT-MARKED-BYTES", "RESIDUE-CASES")
+MANIFEST = "tests/manifest.txt"
 
 
 def valgrind_version(valgrind: str = "valgrind") -> str:
@@ -56,8 +57,20 @@ def check_record(root: pathlib.Path, harness: pathlib.Path, vg_version: str) -> 
     path = record_path(root, record_key(root, harness, vg_version))
     if not path.is_file():
         return [f"no C9 pass record {path.relative_to(root)} for this harness, policy, vectors and valgrind"]
-    keys = {line.split(" ", 1)[0] for line in path.read_text().splitlines() if " " in line}
-    return [f"{path.relative_to(root)}: no {k} line" for k in REQUIRED if k not in keys]
+    have = dict(line.split(" ", 1) for line in path.read_text().splitlines() if " " in line)
+    why = [f"{path.relative_to(root)}: no {k} line" for k in REQUIRED if k not in have]
+    # The record must also say what `make check` pinned: a run that checked
+    # fewer cases (or marked fewer bytes) is not the gate's pass.
+    try:
+        manifest = dict(line.split(" ", 1) for line in (root / MANIFEST).read_text().splitlines() if " " in line)
+    except OSError as e:
+        return why + [f"{MANIFEST}: unreadable ({e.strerror}); the record's counts cannot be checked"]
+    for k in REQUIRED:
+        if k not in manifest:
+            why.append(f"{MANIFEST}: no {k} line to check the record against")
+        elif k in have and have[k].strip() != manifest[k].strip():
+            why.append(f"{path.relative_to(root)}: {k} {have[k].strip()}, {MANIFEST} pins {manifest[k].strip()}")
+    return why
 
 
 def main() -> int:

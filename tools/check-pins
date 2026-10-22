@@ -25,15 +25,17 @@ Rules:
      randomness comes only through `cpu` and the hedged source
   P9 no derive(Clone|Copy|Debug) on a type wrapping `Secret<` or
      `Zeroizing<` in rosenpass-core, pqkey-core, pds/pq, pds/pqkey,
-     pds/ingress or mce460896 (L12, M3 plan S12, M4 plan C11; pqkey-core
+     pds/ingress, and on any type in mce460896 but RngError, which keeps its
+     secrets in plain arrays (L12, M3 plan S12, M4 plan C11; pqkey-core
      holds its secrets in `Zeroizing`)
   P10 no `from_bytes(*` in the secret crates or in hs-core, key-core,
      data-core, wg-core and the key, hs and data PDs: a dereferenced array is a by-value temporary of
      the secret left on the stack; `copy_from(&..)` copies in place (L12)
 
   P12 in every crate of the Makefile's verus_crates, the Verus trusted
-     constructs (tools/verus_trusted.py, shared with the Verus gate) equal
-     policy/verus-trusted.toml (M4 plan C1, C11)
+     constructs equal policy/verus-trusted.toml as a multiset of (file,
+     construct, item), by tools/verus_trusted.py's comparison, the one the
+     Verus gate makes (M4 plan C1, C11)
   P13 no classic-mceliece-rust as a dependency key in any tracked
      Cargo.toml or Cargo.lock, nor as a Rust use/extern crate/path in crates/
      or tools/ (M4 plan C11)
@@ -42,8 +44,10 @@ Rules:
      or tools/ outside tools/ct-harness/src/vg.rs (M4 plan C9)
   P16 crates/mce460896's dependencies, as resolved: its [dependencies]
      name the packages sha3 and zeroize (by `package`, not key), from the
-     registry, and it has no build- or target-specific dependency table;
-     the workspace has no [patch] or [replace]; and the lock's closure of
+     registry, with default features off and no features named, and it has
+     no build- or target-specific dependency table; the workspace has no
+     [patch] or [replace], nor .cargo/config.toml a [patch] or [source]
+     replacement; and the lock's closure of
      the two is exactly MCE_CLOSURE (M4 plan C7). The lock stands for
      `cargo metadata`: every gate builds --locked, and the fixtures' partial
      trees could not be resolved by cargo.
@@ -96,6 +100,8 @@ PENDING: set[str] = set()
 # Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
 SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/ingress",
                  "crates/mce460896"]
+# mce460896's types that hold no secret (P9): every other type there does.
+MCE_PUBLIC_TYPES = {"RngError"}
 # Types that hold a secret under a name of their own, not as Secret<..> (P9,
 # M3b plan A1): the WireGuard cookie secret.
 SECRET_TYPES = ("Secret<", "Zeroizing<", "CookieSecret")
@@ -284,7 +290,14 @@ def check_secret_derives(root: pathlib.Path, out: list):
             for m in re.finditer(r"\bderive\(([^)]*)\)", code):
                 if not re.search(r"\b(Clone|Copy|Debug)\b", m.group(1)):
                     continue
-                wrapped = next((w for w in SECRET_TYPES if w in item_after(code, m.end())), None)
+                item = item_after(code, m.end())
+                wrapped = next((w for w in SECRET_TYPES if w in item), None)
+                # mce460896 holds its secrets in plain arrays, not in a
+                # wrapper type: there every type but the listed public ones
+                # counts as secret-holding.
+                name = re.match(r"\s*(?:struct|enum|union)\s+(\w+)", item)
+                if crate == "crates/mce460896" and name and name.group(1) not in MCE_PUBLIC_TYPES:
+                    wrapped = wrapped or f"mce460896 state ({name.group(1)})"
                 if wrapped:
                     n = code.count("\n", 0, m.start()) + 1
                     out.append(f"P9 {rel}:{n}: derive({m.group(1)}) on a type wrapping {wrapped}")
@@ -317,8 +330,7 @@ def check_verus_trusted(root: pathlib.Path, out: list):
     if not crates:
         out.append("P12 Makefile: no `verus_crates :=` list; nothing to check")
     policy = root / "policy/verus-trusted.toml"
-    allowed = {(e.get("crate"), e.get("file"), e.get("construct"))
-               for e in tomllib.loads(policy.read_text()).get("trusted", [])} if policy.is_file() else set()
+    entries = tomllib.loads(policy.read_text()).get("trusted", []) if policy.is_file() else []
     for crate in crates:
         base = root / "crates" / crate
         # As P11: a crate that exists without its sources has lost what this
@@ -329,11 +341,9 @@ def check_verus_trusted(root: pathlib.Path, out: list):
         if not (base / "src").is_dir():
             out.append(f"P12 crates/{crate}: listed in verus_crates but has no src/")
             continue
-        for f in sorted((base / "src").rglob("*.rs")):
-            rel = str(f.relative_to(base))
-            for line, construct in verus_trusted.trusted_in(f):
-                if (crate, rel, construct) not in allowed:
-                    out.append(f"P12 crates/{crate}/{rel}:{line}: Verus trusted construct `{construct}` not in policy/verus-trusted.toml")
+        # The Verus gate's own comparison (one adjudicator, R48).
+        for e in verus_trusted.trusted_mismatches(crate, base, entries):
+            out.append(f"P12 crates/{crate}/{e}")
 
 
 def check_cmr_gone(root: pathlib.Path, out: list):
@@ -402,7 +412,9 @@ def check_mce_deps(root: pathlib.Path, out: list):
     for key, spec in deps.items():
         spec = spec if isinstance(spec, dict) else {"version": spec}
         names.add(spec.get("package", key))
-        extra = set(spec) - {"version", "default-features", "features"}
+        extra = set(spec) - {"version", "default-features"}
+        if spec.get("default-features", True) is not False:
+            out.append(f"P16 crates/mce460896/Cargo.toml: dependency {key} keeps its default features")
         if extra:
             out.append(f"P16 crates/mce460896/Cargo.toml: dependency {key} has {sorted(extra)}; "
                        "a registry version only")
@@ -416,6 +428,17 @@ def check_mce_deps(root: pathlib.Path, out: list):
     for table in ("patch", "replace"):
         if table in ws:
             out.append(f"P16 Cargo.toml: [{table}] can redirect mce460896's dependencies")
+    # A config [patch] would show in the lock; source replacement would not.
+    config = root / ".cargo/config.toml"
+    if config.is_file():
+        try:
+            cfg = tomllib.loads(config.read_text())
+        except (UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+            out.append(f"P16 .cargo/config.toml: unreadable ({e})")
+            cfg = {}
+        for table in ("patch", "source"):
+            if table in cfg:
+                out.append(f"P16 .cargo/config.toml: [{table}] can redirect mce460896's dependencies")
     try:
         lock = tomllib.loads((root / "Cargo.lock").read_text())
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
