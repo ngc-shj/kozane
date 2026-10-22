@@ -53,6 +53,7 @@ import struct
 import subprocess
 import sys
 import tomllib
+import xml.etree.ElementTree as ET
 
 sys.dont_write_bytecode = True
 
@@ -421,12 +422,21 @@ def check_contained(binary: Binary, root: str, nodes: dict) -> list:
 
 
 def system_images(system: pathlib.Path) -> list:
-    """Every `program_image` path the system file names, in order."""
+    """Every `program_image` path the system file names, in order, parsed
+    as XML the way microkit and tools/laws read it (any quoting, spacing or
+    attribute order)."""
     try:
-        text = system.read_text()
+        root = ET.parse(system).getroot()
     except OSError as e:
         raise Fail(f"system file {system}: {e.strerror}")
-    images = re.findall(r'<program_image\s+path="([^"]+)"', text)
+    except ET.ParseError as e:
+        raise Fail(f"system file {system}: {e}")
+    images = []
+    for element in root.iter("program_image"):
+        path = element.get("path")
+        if not path:
+            raise Fail(f"system file {system}: a program_image without a path")
+        images.append(path)
     if not images:
         raise Fail(f"system file {system}: no program_image")
     return images

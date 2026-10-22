@@ -76,13 +76,22 @@ CFG_ATTR = re.compile(r"\s*(cfg|cfg_attr)\s*\(")
 CFG_MACRO = re.compile(r"\bcfg!\s*[\(\[\{]")
 # The one exempt cfg: an outer `#[cfg(verus_keep_ghost)]` on a `use vstd::..`
 # (the lemma imports the verified code needs).
-VSTD_USE = re.compile(r"\s*(?:#\[[^\]]*\]\s*)*use\s+(?:vstd|verus_builtin|verus_builtin_macros)::")
+# ... importing only proof lemmas (`lemma_*`/`group_*`, which exec code
+# cannot call), with no `as` and no glob, so the two builds cannot resolve
+# one name to two functions.
+VSTD_USE = re.compile(r"\s*use\s+vstd::(?:\w+::)*(?:(?:lemma|group)_\w+|\{\s*(?:lemma|group)_\w+"
+                      r"(?:\s*,\s*(?:lemma|group)_\w+)*\s*,?\s*\})\s*;")
+CFG_ANY = re.compile(r"\bcfg(_attr)?\s*\(")
+ITEM_HEAD = re.compile(r"\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:const|unsafe|async|default|open|closed|spec|proof|exec"
+                       r"|tracked|ghost|extern(?:\s+\"[^\"]*\")?)\s+)*")
+VERUS_VERIFY = re.compile(r"\bverus_verify\b")
+EXTERNAL = re.compile(r"\bexternal\b")
 PATH_ATTR = re.compile(r"\bpath\s*=")
 # `include_bytes!`/`include_str!` bring in data, not code.
 INCLUDE = re.compile(r"\binclude!\s*[\(\[\{]")
-VERUS_BLOCK = re.compile(r"\bverus!\s*([\{\(\[])")
+VERUS_BLOCK = re.compile(r"\bverus\s*!\s*([\{\(\[])")
 CLOSER = {"{": "}", "(": ")", "[": "]"}
-RAW_STRING = re.compile(r"(?<![A-Za-z0-9_])b?r(#*)\"")
+RAW_STRING = re.compile(r"(?<![A-Za-z0-9_])[bc]?r(#*)\"")
 CHAR_LITERAL = re.compile(r"b?'(?:\\u\{[0-9a-fA-F]{1,6}\}|\\x[0-9a-fA-F]{2}|\\.|[^\\'\n])'")
 FN_DEF = re.compile(r"\bfn\s+([A-Za-z_][A-Za-z0-9_]*)")
 ITEM = re.compile(r"\b(fn|struct|enum|union|trait|type|const|static|mod|use|impl|assume_specification)\b"
@@ -90,11 +99,28 @@ ITEM = re.compile(r"\b(fn|struct|enum|union|trait|type|const|static|mod|use|impl
 IMPL_START = re.compile(r"(?m)^[ \t]*(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+)?impl\b")
 
 
+# Left where a comment or literal never closes; trusted_in refuses it, so a
+# stray quote cannot blank the rest of a file from the scan.
+UNTERMINATED = "UNTERM"
+
+
 def strip_comments(text: str) -> str:
     """Comments and string literals replaced by spaces, newlines kept, so
-    offsets and line numbers are unchanged."""
+    offsets and line numbers are unchanged. Block comments nest, as rustc's
+    do; strings take the `b`/`c` prefixes and raw strings `r`/`br`/`cr` with
+    any number of `#`. An unterminated one becomes UNTERMINATED."""
     out = []
     i, n = 0, len(text)
+
+    def blank(a: int, b: int, closed: bool):
+        piece = re.sub(r"[^\n]", " ", text[a:b])
+        if not closed:
+            piece = UNTERMINATED + piece[len(UNTERMINATED):] if len(piece) >= len(UNTERMINATED) else UNTERMINATED
+        out.append(piece)
+
+    def ident_before(k: int) -> bool:
+        return k > 0 and re.match(r"[A-Za-z0-9_]", text[k - 1]) is not None
+
     while i < n:
         if text.startswith("//", i):
             j = text.find("\n", i)
@@ -102,26 +128,30 @@ def strip_comments(text: str) -> str:
             out.append(" " * (j - i))
             i = j
         elif text.startswith("/*", i):
-            j = text.find("*/", i + 2)
-            j = n if j < 0 else j + 2
-            out.append(re.sub(r"[^\n]", " ", text[i:j]))
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif text.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            blank(i, j, depth == 0)
             i = j
-        elif (m := RAW_STRING.match(text, i)) and (i == 0 or not re.match(r"[A-Za-z0-9_]", text[i - 1])):
+        elif (m := RAW_STRING.match(text, i)) and not ident_before(i):
             close = '"' + m.group(1)
             j = text.find(close, m.end())
-            j = n if j < 0 else j + len(close)
-            out.append(re.sub(r"[^\n]", " ", text[i:j]))
-            i = j
-        elif (m := CHAR_LITERAL.match(text, i)) and (i == 0 or not re.match(r"[A-Za-z0-9_]", text[i - 1])):
+            blank(i, n if j < 0 else j + len(close), j >= 0)
+            i = n if j < 0 else j + len(close)
+        elif (m := CHAR_LITERAL.match(text, i)) and not ident_before(i):
             out.append(" " * (m.end() - i))
             i = m.end()
-        elif text[i] == '"':
-            j = i + 1
+        elif text[i] == '"' or (text[i] in "bc" and text.startswith('"', i + 1) and not ident_before(i)):
+            j = i + (2 if text[i] != '"' else 1)
             while j < n and text[j] != '"':
                 j += 2 if text[j] == "\\" else 1
-            j = min(j + 1, n)
-            out.append(re.sub(r"[^\n]", " ", text[i:j]))
-            i = j
+            blank(i, min(j + 1, n), j < n)
+            i = min(j + 1, n)
         else:
             out.append(text[i])
             i += 1
@@ -259,18 +289,28 @@ def definitions(code: str):
 
 
 def item_after(code: str, offset: int, impls) -> str:
-    """The item an outer attribute at `offset` decorates: its name, `use`, or
-    `impl <Type>`. Qualifiers (`const fn`, `unsafe fn`, `pub(crate)`) are
-    skipped to the item keyword."""
-    m = ITEM.search(code, offset)
-    while m and m.group(1) in ("const", "static") and re.match(r"\s*(?:unsafe\s+|extern\s+)?fn\b", code[m.end(1):]):
-        m = ITEM.search(code, m.end(1))
+    """The item an outer attribute ending at `offset` decorates: its name
+    (`Type::fn` for a method), `use`, or `impl <Type>`. Later attributes
+    and the qualifiers before the item keyword are skipped; anything else
+    is "?" (still counted, so it cannot hide a construct)."""
+    at = offset
+    while True:
+        m = re.match(r"\s*#!?\[", code[at:])
+        if not m:
+            break
+        at = balanced(code, at + m.end() - 1)
+    at = ITEM_HEAD.match(code, at).end()
+    m = ITEM.match(code, at)
     if not m:
         return "?"
     if m.group(1) == "impl":
         owner = [t for s, e, t in impls if s > m.start()]
         return f"impl {owner[0]}" if owner else "impl"
-    return "use" if m.group(1) == "use" else (m.group(2) or m.group(1))
+    if m.group(1) == "use":
+        return "use"
+    name = m.group(2) or m.group(1)
+    owner = [t for s, e, t in impls if s < m.start() < e]
+    return f"{owner[-1]}::{name}" if owner and m.group(1) == "fn" else name
 
 
 def enclosing_fn(defs, offset: int) -> str:
@@ -283,6 +323,28 @@ def cfg_names(predicate: str) -> set:
     return set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", predicate)) - CFG_ALLOWED
 
 
+def cfg_problems(body: str) -> set:
+    """The disallowed names in every cfg predicate in an attribute body:
+    each `cfg(..)` and each `cfg_attr(<predicate>, ..)` at any depth,
+    since cfg_attr can produce a cfg. An unbalanced one is unparsable."""
+    names = set()
+    for m in CFG_ANY.finditer(body):
+        close = balanced(body, m.end() - 1)
+        if close > len(body) or body[close - 1] != ")":
+            names.add("<unparsable>")
+            continue
+        inner = body[m.end():close - 1]
+        if m.group(1):
+            depth, k = 0, len(inner)
+            for k, c in enumerate(inner):
+                depth += {"(": 1, ")": -1}.get(c, 0)
+                if c == "," and depth == 0:
+                    break
+            inner = inner[:k]
+        names |= cfg_names(inner)
+    return names
+
+
 def trusted_in(path: pathlib.Path):
     """(line, construct, item) of every trusted construct in `path`, one per
     occurrence (two on one line are two)."""
@@ -291,55 +353,67 @@ def trusted_in(path: pathlib.Path):
     impls = impl_spans(code)
     blocks = list(verus_blocks(code))
     found = {}
+    spans = []
 
     def add(offset: int, construct: str, item: str):
         found[(offset, construct)] = (line_of(code, offset), construct, item)
 
     for off, end, body, inner in attributes(code):
         item = enclosing_fn(defs, off) if inner else item_after(code, end, impls)
-        if ATTR_VERUS.search(body):
-            for t in ATTR_TRUSTED.finditer(body):
-                add(off + t.start(), t.group(1), item)
+        spans.append((off, end, item))
+        if body.lstrip().startswith("$"):
+            add(off, "attribute from a macro metavariable", item)
         if ATTR_META.search(body):
             add(off, "verifier::$meta", item)
         if INTERNAL_TOKEN.search(body):
             add(off, "verus::internal", item)
-        m = CFG_ATTR.match(body)
-        if m:
-            pred = body[m.end():] if m.group(1) == "cfg" else body[m.end():]
-            if m.group(1) == "cfg_attr":
-                # Only the predicate, up to the top-level comma.
-                depth, k = 0, 0
-                for k, c in enumerate(pred):
-                    depth += {"(": 1, ")": -1}.get(c, 0)
-                    if c == "," and depth == 0:
-                        break
-                pred = pred[:k]
-            names = cfg_names(pred)
-            exempt = (not inner and re.fullmatch(r"\s*cfg\s*\(\s*verus_keep_ghost\s*\)\s*", body)
-                      and VSTD_USE.match(code, end))
-            if names and not exempt:
-                add(off, f"cfg({' '.join(sorted(names))})", item)
+        for t in EXTERNAL.finditer(body):
+            add(off + 2 + int(inner) + t.start(), "external", item)
+        names = cfg_problems(body)
+        exempt = (not inner and re.fullmatch(r"\s*cfg\s*\(\s*verus_keep_ghost\s*\)\s*", body)
+                  and VSTD_USE.match(code, end))
+        if names and not exempt:
+            add(off, f"cfg({' '.join(sorted(names))})", item)
         if PATH_ATTR.search(body):
             add(off, "path", item)
+
+    def owner_of(offset: int) -> str:
+        for a, b, item in spans:
+            if a <= offset < b:
+                return item
+        return enclosing_fn(defs, offset)
+
+    # Every TRUSTED name, as an identifier wherever it occurs: in an
+    # attribute, a macro argument (`m!(verifier::external_body; ..)`), or a
+    # `use` alias. `external` alone is an ordinary word and counts only
+    # inside an attribute (above).
+    for m in ATTR_TRUSTED.finditer(code):
+        if m.group(1) != "external":
+            add(m.start(), m.group(1), owner_of(m.start()))
+    for m in VERUS_VERIFY.finditer(code):
+        if not any(a <= m.start() < b for a, b, _ in spans):
+            add(m.start(), "verus_verify outside an attribute", owner_of(m.start()))
+    for m in re.finditer(rf"\b{UNTERMINATED}\b", code):
+        add(m.start(), "unterminated literal or comment", owner_of(m.start()))
     for m in CFG_MACRO.finditer(code):
-        names = cfg_names(code[m.end():balanced(code, m.end() - 1) - 1])
+        close = balanced(code, m.end() - 1)
+        names = cfg_names(code[m.end():close - 1]) if close <= len(code) else {"<unparsable>"}
         if names:
             add(m.start(), f"cfg({' '.join(sorted(names))})", enclosing_fn(defs, m.start()))
     for m in ASSUME_IDENT.finditer(code):
-        add(m.start(), m.group(1) + "(", enclosing_fn(defs, m.start()))
+        add(m.start(), m.group(1) + "(", owner_of(m.start()))
     for m in ASSUME_CALL.finditer(code):
         at = m.start()
         inside = any(s <= at < e for s, e in blocks)
         if re.sub(r"\s", "", m.group(1)) == "kani::" and not inside:
             continue
-        add(at, "assume(", enclosing_fn(defs, at))
+        add(at, "assume(", owner_of(at))
     for m in KANI_SHADOW.finditer(code):
-        add(m.start(), "kani shadowed", enclosing_fn(defs, m.start()))
+        add(m.start(), "kani shadowed", owner_of(m.start()))
     for m in ITEM_TOKEN.finditer(code):
         add(m.start(), "assume_specification", item_after(code, m.end(), impls))
     for m in INCLUDE.finditer(code):
-        add(m.start(), "include!", enclosing_fn(defs, m.start()))
+        add(m.start(), "include!", owner_of(m.start()))
     return sorted(found.values())
 
 
@@ -356,9 +430,13 @@ def manifest_problems(crate_dir: pathlib.Path) -> list:
         out.append("Cargo.toml: [lib] path moves the compiled sources out of src/")
     if "build" in doc.get("package", {}) or (crate_dir / "build.rs").exists():
         out.append("Cargo.toml: a build script can emit cfgs and code the scan does not read")
+    allowed = [(crate_dir / d).resolve() for d in ("src", "tests", "examples", "benches")]
     for table in ("bin", "example", "test", "bench"):
         for t in doc.get(table, []):
-            if "path" in t and not str(t["path"]).startswith(("src/", "tests/", "examples/", "benches/")):
+            if "path" not in t:
+                continue
+            target = (crate_dir / str(t["path"])).resolve()
+            if not any(target.is_relative_to(d) for d in allowed):
                 out.append(f"Cargo.toml: [[{table}]] path {t['path']} is outside the crate's source dirs")
     return out
 

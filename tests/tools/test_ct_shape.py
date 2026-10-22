@@ -226,6 +226,8 @@ def cli(**kw):
     the unmutated tree: (exit status, the ct-shape: lines, the count)."""
     mutated = kw.pop("mutated", False)
     third = kw.pop("third", False)
+    system_text = kw.pop("system_text", None)
+    want = kw.pop("want", None)
 
     def run():
         d = pathlib.Path(tempfile.mkdtemp(prefix="test-ct-shape-"))
@@ -233,7 +235,11 @@ def cli(**kw):
             search, harness = elf.tree(d, **kw)
             shape_policy(search, harness, d)
             system = d / "secureos.system"
-            system.write_text(SYSTEM_TWO + ('<program_image path="pd-ingress.elf" />\n' if third else ""))
+            third_line = "<program_image path='pd-ingress.elf' />\n" if third == "single" else \
+                '<program_image path="pd-ingress.elf" />\n' if third else ""
+            text = system_text if system_text is not None else SYSTEM_TWO + third_line
+            if text is not False:
+                system.write_text(f"<system>\n{text}</system>\n")
             if third:
                 elf.build(search, "pd-ingress.elf", elf.program("a1", "pd_ingress"), 0x200000)
             if mutated:
@@ -245,9 +251,11 @@ def cli(**kw):
                                 str(search / "pd-pq.elf"), str(search / "pd-pqkey.elf")],
                                capture_output=True, text=True)
             lines = [line for line in r.stdout.splitlines() if line.startswith(("ct-shape: ", "CT-SHAPE-SYMBOLS"))]
+            if want is not None:
+                return [] if r.returncode == 1 and any(want in l for l in lines) else [f"exit {r.returncode}: {lines}"]
             if third:
-                want = "ct-shape: pd-ingress.elf: identity: mce460896::decaps is McEliece code in a PD outside"
-                return [] if r.returncode == 1 and any(l.startswith(want) for l in lines) \
+                want_third = "ct-shape: pd-ingress.elf: identity: mce460896::decaps is McEliece code in a PD outside"
+                return [] if r.returncode == 1 and any(l.startswith(want_third) for l in lines) \
                     else [f"exit {r.returncode}: {lines}"]
             return [] if (r.returncode, lines) == ((1, lines) if mutated else (0, ["CT-SHAPE-SYMBOLS 6"])) \
                 and (not mutated or len(lines) == 2) else [f"exit {r.returncode}: {lines}"]
@@ -342,6 +350,11 @@ CASES = [
     ("the CLI passes the unmutated tree", None, cli()),
     ("the CLI refuses a mutated ELF", None, cli(mutated=True)),
     ("the CLI refuses McEliece code in a third PD the system file lists", None, cli(third=True)),
+    ("the CLI reads a single-quoted program_image too", None, cli(third="single")),
+    ("an unreadable system file fails", None, cli(system_text=False, want="secureos.system: No such file")),
+    ("a system file without program_image fails", None, cli(system_text="", want="no program_image")),
+    ("a system file without a root's image fails", None,
+     cli(system_text='<program_image path="pd-pqkey.elf" />\n', want="no program_image pd-pq.elf")),
     ("a PD the system file lists but the search path lacks fails",
      ["pd-gone.elf: identity: cannot read <search>/pd-gone.elf: No such file or directory"],
      lambda: [e.replace(e[e.index("read ") + 5:e.index("/pd-gone")], "<search>") for e in listed_image_missing()()]),

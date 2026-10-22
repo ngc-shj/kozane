@@ -95,6 +95,20 @@ def main() -> int:
             if not any(f"no {key} line" in w for w in why):
                 failures += 1
                 print(f"FAIL record without {key} refused: {why}")
+    # promote: the one pending record becomes the pass record; none or two
+    # pending is refused (an interrupted `make ct` leaves only pending).
+    for count, ok_wanted in ((1, True), (0, False), (2, False)):
+        with tempfile.TemporaryDirectory() as d:
+            root = tree(pathlib.Path(d))
+            (root / "build/ct").mkdir(parents=True)
+            for i in range(count):
+                (root / f"build/ct/pending-{i:064x}").write_text(RECORD)
+            why = ct_record.promote(root)
+            passes = list((root / "build/ct").glob("pass-*"))
+            n += 1
+            if (not why and len(passes) == 1) != ok_wanted:
+                failures += 1
+                print(f"FAIL promote with {count} pending: {why}, {len(passes)} pass records")
     print(f"CT-RECORD-FIXTURES {n}")
     return 1 if failures else 0
 

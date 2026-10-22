@@ -875,8 +875,8 @@ record what changed in the plan's mechanisms.
   - **Counting:** constructs count per occurrence, so two on one line are
     two. They bind to the item they decorate (`impl <Type>` for an impl,
     through `const fn`), or to the fn whose body encloses the call.
-  - **Fixtures:** 15 new P12 fixtures. Each is red under the round 1
-    scanner.
+  - **Fixtures:** 16 new P12 deny fixtures and one allow fixture. Each
+    deny fixture is red under the round 1 scanner.
 - **C8 (T15, T16, S14):** the probe reports to the word, not the byte (S14).
   - **Two new refusals in `stack_headroom_case`:**
     - a mark shallower than the PD's own scrub (the probe is not
@@ -898,8 +898,12 @@ record what changed in the plan's mechanisms.
   sha3/zeroize must be featureless, since features unify (the tool
   workspaces build on their own). Every closure package needs a checksum.
 - **Selftest:**
-  - **Proof lock (T26):** the Kani/Verus lock is one file for the machine
-    (`/tmp/secureos-proof.lock`), not one per checkout. Before, the warm
+  - **Proof lock (T26):** the Kani/Verus lock is one file per container
+    (`/tmp/secureos-proof.lock`, the container's own `/tmp`), not one per
+    checkout. A second container would take its own lock (T32: only one
+    container runs proofs on a host). kani-gate.sh's comment still says
+    "machine"; it is corrected together with moving the lock out of the
+    hashed script, since any edit there invalidates every Kani cache. Before, the warm
     tree and the real tree would each take their own.
   - **Timeouts (T19):** a timed-out case fails whatever its output held.
   - **The warm tree (T17):** it now lives outside the checkout (no parent
@@ -961,3 +965,89 @@ record what changed in the plan's mechanisms.
   - **`integration-residue`, `integration-expiry-residue` and
     `integration-count`:** on `ff55c04` they pass. Re-run alone, with the
     boot filter, `integration-residue` took 137 s.
+
+## Phase 3 round 3 fixes
+
+Round 3 re-found the class the scanner kept growing for (S2/N1, S3/S6/N3,
+then S19): every fix to the source-text scan met a new spelling. The class
+is closed at its primitive instead, per the R42 convergence rule.
+
+- **Verus refuses what it trusted (S2, S3, S6, S19 for four crates):**
+  - **The flag:** a crate with no entry in `policy/verus-trusted.toml`
+    (wg-wire, rosenpass-wire, ring, wire) is verified with
+    `--fwd-verus-args-to roots -- --no-cheating`. Verus itself then refuses
+    assume, admit, external_body and assume_specification in what it
+    compiled, whatever cfg, macro or literal spelled them. vstd is not a
+    root, since it assumes internally.
+  - **Order in the gate:** the gate runs Verus and the source checks both,
+    and fails if either fails, so each has its own red-proof
+    (`verus-no-cheating`, needle "external_body/assume_specification not
+    allowed with --no-cheating"; `verus-trusted` and the required-function
+    cases for the scan).
+  - **Pinned:** `VERUS-NO-CHEATING-CRATES 4`.
+  - **msgs:** it keeps its one allowlisted external_body (`chunk_ref`,
+    Kani-checked), so it is verified without the flag and relies on the
+    scan. That is the residual.
+- **The scan, hardened for msgs and for P12 (S2/N1, S3/N3, S19, S20,
+  S21, S26, T31):**
+  - **cfg:** every `cfg`/`cfg_attr` predicate in an attribute is checked
+    at any depth (cfg_attr can produce a cfg), and an unbalanced one is
+    refused.
+  - **Attributes:** a macro-metavariable attribute (`#[$a]`) is flagged.
+  - **TRUSTED names:** every TRUSTED name but `external` is flagged as an
+    identifier anywhere (macro arguments, `use` aliases); `external`
+    inside any attribute. `verus_verify` outside an attribute is flagged.
+  - **The lexer:**
+    - nests block comments and reads `c`/`cr` strings;
+    - marks an unterminated literal or comment, which is refused (rustc
+      refuses it too, so it can only be there to hide code);
+    - matches `verus !` with a space.
+  - **The exempt `#[cfg(verus_keep_ghost)] use`:** it must import only
+    vstd `lemma_*`/`group_*` names, with no `as` and no glob.
+  - **Item binding:** an attribute's item skips later attributes and
+    qualifies methods.
+  - **Target paths:** they are resolved before the source-dir check.
+  - **Verus crates as dependencies:** only verus_crates may depend on
+    Verus's crates (lock).
+  - **Fixtures:** 15 new P12 deny fixtures (+1 allow). Each is red under
+    `32a016c`, except the `verus !` allow case, which `32a016c` wrongly
+    refused.
+- **The same lexer everywhere (R48, the owner's "横展開"):** P9, P10, P11,
+  P13 and P14 used two weaker comment strippers. In both, a `"//"` inside a
+  string cut the rest of the line, so a derive, a `from_bytes(*`, a cookie
+  compare, a cmr `use` or an `unsafe` after a URL string was hidden. They
+  now use the scanner's lexer and report unterminated literals. P7, P8 and
+  P15 read raw lines (comments included, and asm strings for P15) and
+  were left so. Six fixtures, red under `32a016c`.
+- **C10 (S22/F-R3-2, F-R3-3, T30):**
+  - **Parsing:** ct-shape and run.py read the system file as XML (any
+    quoting or spacing), as microkit and laws do.
+  - **The Makefile:** the ct-shape target passes `--system $(system)`.
+  - **Fixtures:** single quotes, an unreadable file, no program_image, and
+    a missing root.
+- **C9 record (T27, S23, F-R3-1):** ct-gate writes `pending-<key>`, and
+  `make ct`'s last line promotes it to `pass-<key>`, the only name package
+  accepts, after the harness clippy and tests. A failed or interrupted
+  `make ct` leaves no pass record. Promotion needs exactly one pending
+  record (three fixtures).
+- **C8 (T28, S25):**
+  - every high-water line must be attributed to pq or pqkey (a garbled
+    prefix is refused);
+  - pq's floor and the floor tie are fixtured, and the unused parameters
+    are gone.
+- **P16 (T25, N6, S24):**
+  - **Member tables:** every dependency table of every member is read
+    (target, dev and build included), along with `[features]` values that
+    enable sha3/zeroize features.
+  - **Config:** `rustflags` in the cargo config is refused.
+  - **Missing members:** a member without a Cargo.toml is refused.
+  - **Fixtures:** the bare-version, target-table, features, workspace-table
+    and rustflags paths. The ones that did not change behaviour are
+    red-proved by removing their branch.
+- **Selftest and counts:**
+  - **T19:** the timeout rule and the crashes clearing have fixtures, each
+    red when removed.
+  - **F11/T29:** the unit counts moved from the Makefile awk to
+    `tools/unit-counts`. It produces the same output on the real log, and
+    an unreadable owner is refused (4 fixtures).
+  - **T24:** P15 has a deny fixture in a second tool.

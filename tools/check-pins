@@ -276,7 +276,8 @@ def check_secret_copies(root: pathlib.Path, out: list):
         for rel, text in crate_sources(root, crate):
             if not rel.endswith(".rs"):
                 continue
-            code = re.sub(r"//[^\n]*", "", text)
+            code = strip_rust_comments(text)
+            unterminated("P10", rel, code, out)
             for m in re.finditer(r"\bfrom_bytes\(\s*\*", code):
                 n = code.count("\n", 0, m.start()) + 1
                 out.append(f"P10 {rel}:{n}: from_bytes(*..) copies a secret by value; use copy_from(&..)")
@@ -287,7 +288,8 @@ def check_secret_derives(root: pathlib.Path, out: list):
         for rel, text in crate_sources(root, crate):
             if not rel.endswith(".rs"):
                 continue
-            code = re.sub(r"//[^\n]*", "", text)
+            code = strip_rust_comments(text)
+            unterminated("P9", rel, code, out)
             for m in re.finditer(r"\bderive\(([^)]*)\)", code):
                 if not re.search(r"\b(Clone|Copy|Debug)\b", m.group(1)):
                     continue
@@ -313,15 +315,27 @@ def check_cookie_compares(root: pathlib.Path, out: list):
             if (root / rel).parents[1].is_dir():
                 out.append(f"P11 {rel}: missing; the cookie compare tripwire has nothing to check")
             continue
-        code = re.sub(r"//[^\n]*", "", path.read_text())
+        code = strip_rust_comments(path.read_text())
+        unterminated("P11", rel, code, out)
         for m in re.finditer(r"\b\w*cookie\w*\b[\])]*\s*[!=]=(?!=)|[!=]=\s*[&*]?\w*cookie\w*\b", code):
             n = code.count("\n", 0, m.start()) + 1
             out.append(f"P11 {rel}:{n}: a cookie compared with == or !=; use ct_eq")
 
 
 def strip_rust_comments(text: str) -> str:
-    text = re.sub(r"/\*.*?\*/", lambda m: re.sub(r"[^\n]", " ", m.group(0)), text, flags=re.S)
-    return re.sub(r"//[^\n]*", "", text)
+    """Comments and literals blanked by the Verus scanner's lexer (nested
+    block comments, `b`/`c`/raw strings), so every source rule reads Rust the
+    way rustc does and none can be desynchronised on its own (R48). An
+    unterminated literal or comment leaves UNTERMINATED, which the rules
+    report: rustc refuses it anyway, so it can only be there to hide code."""
+    import verus_trusted
+    return verus_trusted.strip_comments(text)
+
+
+def unterminated(rule: str, rel, code: str, out: list):
+    import verus_trusted
+    for m in re.finditer(rf"\b{verus_trusted.UNTERMINATED}\b", code):
+        out.append(f"{rule} {rel}:{code.count(chr(10), 0, m.start()) + 1}: unterminated literal or comment")
 
 
 def check_verus_trusted(root: pathlib.Path, out: list):
@@ -345,6 +359,19 @@ def check_verus_trusted(root: pathlib.Path, out: list):
         # The Verus gate's own comparison (one adjudicator, R48).
         for e in verus_trusted.trusted_mismatches(crate, base, entries):
             out.append(f"P12 crates/{crate}/{e}")
+    # Only the verified crates may depend on Verus's own crates: another
+    # workspace crate could re-export `assume_` (as a `kani` module, say)
+    # from sources this scan never reads.
+    try:
+        lock = tomllib.loads((root / "Cargo.lock").read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        lock = {}  # P6 reports it
+    verus_deps = {"vstd", "verus_builtin", "verus_builtin_macros", "verus_state_machines_macros"}
+    dependents = {p.get("name") for p in lock.get("package", [])
+                  if "source" not in p and verus_deps & {d.split()[0] for d in p.get("dependencies", [])}}
+    if lock and crates:
+        for name in sorted(dependents - set(crates)):
+            out.append(f"P12 Cargo.lock: {name} depends on a Verus crate but is not in verus_crates")
 
 
 def check_cmr_gone(root: pathlib.Path, out: list):
@@ -362,6 +389,7 @@ def check_cmr_gone(root: pathlib.Path, out: list):
             if any(part in ("target", "build") for part in rel.parts):
                 continue
             code = strip_rust_comments(p.read_text())
+            unterminated("P13", rel, code, out)
             for m in re.finditer(r"\b(use\s+|extern\s+crate\s+)?classic_mceliece_rust\b", code):
                 if m.group(1) or code[m.end():m.end() + 2] == "::":
                     n = code.count("\n", 0, m.start()) + 1
@@ -374,6 +402,7 @@ def check_mce_unsafe(root: pathlib.Path, out: list):
         if p.name == "barrier.rs" and p.parent == base:
             continue
         code = strip_rust_comments(p.read_text())
+        unterminated("P14", p.relative_to(root), code, out)
         for m in re.finditer(r"\bunsafe\b", code):
             if code[max(0, m.start() - 12):m.start()].endswith("deny("):
                 continue
@@ -435,19 +464,31 @@ def check_mce_deps(root: pathlib.Path, out: list):
     members = [root / "Cargo.toml"] + [root / m / "Cargo.toml" for m in ws_doc.get("workspace", {}).get("members", [])]
     for member in members:
         rel = member.relative_to(root)
-        if rel == pathlib.Path("crates/mce460896/Cargo.toml") or not member.is_file():
+        if rel == pathlib.Path("crates/mce460896/Cargo.toml"):
+            continue
+        if not member.is_file():
+            out.append(f"P16 {rel}: workspace member without a Cargo.toml; its features cannot be checked")
             continue
         try:
             doc = tomllib.loads(member.read_text())
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
             continue  # P3/P6 report unreadable manifests
-        tables = [doc.get("dependencies", {}), doc.get("workspace", {}).get("dependencies", {})]
+        tables = [doc.get("workspace", {}).get("dependencies", {})]
+        for scope in [doc] + list(doc.get("target", {}).values()):
+            for kind in ("dependencies", "dev-dependencies", "build-dependencies"):
+                tables.append(scope.get(kind, {}))
         for deps in tables:
             for key, spec in deps.items():
                 spec = spec if isinstance(spec, dict) else {"version": spec}
+                if spec.get("workspace") is True:
+                    continue  # judged where [workspace.dependencies] declares it
                 if spec.get("package", key) in ("sha3", "zeroize") and (
                         spec.get("features") or spec.get("default-features", True) is not False):
                     out.append(f"P16 {rel}: {key} with features or default features unifies them into mce460896")
+        for feature, enables in doc.get("features", {}).items():
+            for e in enables:
+                if re.match(r"(?:dep:)?(sha3|zeroize)\??/", str(e)):
+                    out.append(f"P16 {rel}: feature {feature} turns on {e}, which unifies into mce460896")
     ws = tomllib.loads((root / "Cargo.toml").read_text())
     for table in ("patch", "replace"):
         if table in ws:
@@ -465,6 +506,12 @@ def check_mce_deps(root: pathlib.Path, out: list):
         for table in ("patch", "source"):
             if table in cfg:
                 out.append(f"P16 {name}: [{table}] can redirect mce460896's dependencies")
+        # `--cfg feature="..."` in rustflags turns features on behind the
+        # manifests' back.
+        flagged = [k for k in ("build",) if "rustflags" in cfg.get(k, {})] + \
+                  [f"target.{t}" for t, v in cfg.get("target", {}).items() if isinstance(v, dict) and "rustflags" in v]
+        for where in flagged:
+            out.append(f"P16 {name}: rustflags in [{where}] can turn on features unseen")
     try:
         lock = tomllib.loads((root / "Cargo.lock").read_text())
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:

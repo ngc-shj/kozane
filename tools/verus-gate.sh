@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Runs `cargo verus verify` on one crate (M4 plan C1) and fails unless:
+# Runs `cargo verus verify` on one crate (M4 plan C1), with --no-cheating
+# unless the crate has an allowlisted trusted construct, and fails unless:
 # Verus exited 0; the crate's own summary line (not vstd's, which comes
 # first) reports n > 0 verified and 0 errors; the crate's trusted constructs
 # equal policy/verus-trusted.toml; and every function policy/verus-required.toml
@@ -56,30 +57,53 @@ if [ -f "$cache" ]; then
     exit 0
 fi
 
-# The source checks first: they are cheap and need no solver.
-if ! scan=$(python3 tools/verus_trusted.py check "$crate" "$crate_dir" \
-        policy/verus-trusted.toml policy/verus-required.toml); then
-    echo "verus-gate: source checks failed for $crate" >&2
-    exit 1
-fi
-ensures=$(printf '%s\n' "$scan" | sed -nE 's/^VERUS-ENSURES ([0-9]+)$/\1/p')
-
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
-# One SMT or cbmc run at a time on this machine, shared with kani-gate (the
-# same lock file for every checkout and copy): the host has frozen under two
-# concurrent proof runs.
+# One SMT or cbmc run at a time in this container, shared with kani-gate
+# and with every checkout and copy in it (the selftest's tree too): the
+# host has frozen under two concurrent proof runs. Another container takes
+# its own lock.
 exec 9>"${SECUREOS_PROOF_LOCK:-/tmp/secureos-proof.lock}"
 flock 9
+
+# A crate with no entry in policy/verus-trusted.toml is verified with
+# Verus's own --no-cheating (roots only: vstd itself assumes): Verus then
+# refuses assume, admit, external_body and assume_specification in what it
+# actually compiled, whatever spelling the source used (Phase 3 round 3).
+# Only a crate with an allowlisted construct (msgs' chunk_ref) relies on
+# the source checks alone.
+entries=$(python3 -c 'import sys, tomllib
+print(sum(e.get("crate") == sys.argv[1] for e in tomllib.load(open("policy/verus-trusted.toml", "rb")).get("trusted", [])))' \
+    "$crate") || { echo "verus-gate: cannot read policy/verus-trusted.toml" >&2; exit 1; }
+no_cheating=()
+if [ "$entries" = 0 ]; then
+    no_cheating=(--fwd-verus-args-to roots -- --no-cheating)
+fi
 
 # Cargo skips a crate it considers fresh, and then no summary is printed:
 # the crate's own artifacts are always cleaned so it is re-verified.
 cargo clean -p "$crate" --target-dir build/target-verus >/dev/null 2>&1 || true
-if ! cargo verus verify -p "$crate" --locked --offline --target-dir build/target-verus >"$log" 2>&1; then
+verus_ok=1
+cargo verus verify -p "$crate" --locked --offline --target-dir build/target-verus "${no_cheating[@]}" >"$log" 2>&1 \
+    || verus_ok=0
+
+# The source checks run whatever Verus said, and both must pass: a
+# construct both refuse is shown refused by each (selftest verus-no-cheating
+# for Verus, verus-trusted and the required-function cases for the scan).
+scan_ok=1
+scan=$(python3 tools/verus_trusted.py check "$crate" "$crate_dir" \
+    policy/verus-trusted.toml policy/verus-required.toml) || scan_ok=0
+if [ "$verus_ok" = 0 ]; then
     cat "$log"
     echo "verus-gate: cargo verus verify failed for $crate" >&2
+fi
+if [ "$scan_ok" = 0 ]; then
+    echo "verus-gate: source checks failed for $crate" >&2
+fi
+if [ "$verus_ok" = 0 ] || [ "$scan_ok" = 0 ]; then
     exit 1
 fi
+ensures=$(printf '%s\n' "$scan" | sed -nE 's/^VERUS-ENSURES ([0-9]+)$/\1/p')
 
 # The summary that follows `Checking <crate> v…` is the crate's own.
 summary=$(awk -v c="$crate" '$1 == "Checking" && $2 == c { mine = 1; next }
@@ -93,4 +117,5 @@ if [ -z "$verified" ] || [ "$verified" -eq 0 ]; then
 fi
 
 mkdir -p "$(dirname "$cache")"
-printf 'VERUS-VERIFIED %s\nVERUS-ENSURES %s\n' "$verified" "$ensures" | tee "$cache"
+{ printf 'VERUS-VERIFIED %s\nVERUS-ENSURES %s\n' "$verified" "$ensures"
+  if [ ${#no_cheating[@]} -gt 0 ]; then echo "VERUS-NO-CHEATING 1"; fi; } | tee "$cache"

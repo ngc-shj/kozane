@@ -52,6 +52,17 @@ def record_path(root: pathlib.Path, key: str) -> pathlib.Path:
     return root / "build/ct" / f"pass-{key}"
 
 
+def promote(root: pathlib.Path) -> list:
+    """ct-gate's pending record made the pass record, once the rest of
+    `make ct` has passed: exactly one pending record must exist."""
+    pending = sorted((root / "build/ct").glob("pending-*"))
+    if len(pending) != 1:
+        return [f"expected one pending C9 record in build/ct, found {len(pending)}"]
+    key = pending[0].name.removeprefix("pending-")
+    pending[0].rename(record_path(root, key))
+    return []
+
+
 def check_record(root: pathlib.Path, harness: pathlib.Path, vg_version: str) -> list:
     """The reasons the current inputs have no valid record (empty if they do)."""
     path = record_path(root, record_key(root, harness, vg_version))
@@ -75,11 +86,18 @@ def check_record(root: pathlib.Path, harness: pathlib.Path, vg_version: str) -> 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("cmd", choices=["key", "check"])
-    ap.add_argument("--harness", required=True, type=pathlib.Path)
+    ap.add_argument("cmd", choices=["key", "check", "promote"])
+    ap.add_argument("--harness", type=pathlib.Path)
     ap.add_argument("--root", type=pathlib.Path, default=pathlib.Path(__file__).resolve().parent.parent)
     ap.add_argument("--valgrind", default="valgrind")
     a = ap.parse_args()
+    if a.cmd == "promote":
+        why = promote(a.root)
+        for w in why:
+            print(f"ct_record: {w}")
+        return 1 if why else 0
+    if a.harness is None:
+        ap.error("--harness is required")
     version = valgrind_version(a.valgrind)
     if a.cmd == "key":
         print(record_key(a.root, a.harness, version))

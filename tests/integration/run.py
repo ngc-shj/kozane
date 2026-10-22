@@ -55,6 +55,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import xml.etree.ElementTree as ET
 import time
 import tomllib
 
@@ -2405,11 +2406,12 @@ STACK_HEADROOM_MIN = 16 * 1024
 
 
 def system_stack_size(pd: str) -> int:
-    text = open(os.path.join(ROOT, "system/secureos.system")).read()
-    m = re.search(rf'<protection_domain name="{pd}"[^>]*stack_size="(0x[0-9a-f_]+)"', text)
-    if not m:
-        raise Fail(f"no stack_size for {pd} in system/secureos.system")
-    return int(m.group(1).replace("_", ""), 16)
+    """`stack_size` of `pd`, read as XML (as microkit and laws read it)."""
+    root = ET.parse(os.path.join(ROOT, "system/secureos.system")).getroot()
+    sizes = [e.get("stack_size") for e in root.iter("protection_domain") if e.get("name") == pd]
+    if len(sizes) != 1 or not sizes[0]:
+        raise Fail(f"no single stack_size for {pd} in system/secureos.system")
+    return int(sizes[0].replace("_", ""), 0)
 
 
 def mce_const(name: str) -> int:
@@ -2421,7 +2423,7 @@ def mce_const(name: str) -> int:
     return int(m.group(1)) * 1024
 
 
-def stack_headroom_case(con, sizes=None, floors=None):
+def stack_headroom_case(con):
     """C8: pq and pqkey paint their free stack at init and print the deepest
     word used whenever it moves deeper (cpu::StackProbe); after the boot KAT
     and every exchange so far, each must leave STACK_HEADROOM_MIN free, at
@@ -2431,19 +2433,23 @@ def stack_headroom_case(con, sizes=None, floors=None):
     pq's encaps): a mark shallower than that means it is not measuring, and
     the headroom it reports is too good. Every printed line must parse: a
     line garbled by another PD's output would lose the deepest figure."""
+    # Every line, whatever ran into its PD prefix, must belong to pq or pqkey
+    # and parse: a garbled one would drop the deepest figure unseen.
+    every = len(con.count(r"stack high-water"))
+    attributed = sum(len(con.count(rf"\b{pd}: stack high-water (0x[0-9a-f]+) of (0x[0-9a-f]+)"))
+                     for pd in ("pq", "pqkey"))
+    if every != attributed:
+        raise Fail(f"{every - attributed} of {every} stack high-water lines garbled")
     for pd in ("pq", "pqkey"):
-        printed = con.count(rf"\b{pd}: stack high-water")
         lines = con.count(rf"\b{pd}: stack high-water (0x[0-9a-f]+) of (0x[0-9a-f]+)")
         if not lines:
             raise Fail(f"{pd}: no stack high-water line; the probe reported nothing")
-        if len(printed) != len(lines):
-            raise Fail(f"{pd}: {len(printed) - len(lines)} of {len(printed)} stack high-water lines garbled")
-        size = (sizes or {}).get(pd) or system_stack_size(pd)
+        size = system_stack_size(pd)
         painted = {int(n, 16) for _, n in lines}
         if painted != {size}:
             raise Fail(f"{pd}: probe painted {sorted(painted)} bytes, the system file gives {size}")
         hw = max(int(h, 16) for h, _ in lines)
-        floor = (floors or {}).get(pd) or mce_const("SCRUB_DEPTH" if pd == "pqkey" else "SCRUB_DEPTH_ENCAPS")
+        floor = mce_const("SCRUB_DEPTH" if pd == "pqkey" else "SCRUB_DEPTH_ENCAPS")
         if hw < floor:
             raise Fail(f"{pd}: stack high-water {hw} B is below its own scrub depth {floor}; the probe is not measuring")
         print(f"\n{pd}: stack high-water {hw} B of {size} B, {size - hw} B free", flush=True)

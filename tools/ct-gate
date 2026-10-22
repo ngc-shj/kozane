@@ -21,7 +21,7 @@ out=$root/build/ct
 counts=$root/build/counts
 
 mkdir -p "$out" "$counts"
-rm -f "$out"/pass-* "$counts/ct" "$out"/memcheck.log "$out"/ct.out "$out"/residue.out
+rm -f "$out"/pass-* "$out"/pending-* "$counts/ct" "$out"/memcheck.log "$out"/ct.out "$out"/residue.out
 cd "$out"
 
 fail() {
@@ -70,6 +70,9 @@ key=$(python3 "$root/tools/ct_record.py" key --root "$root" --harness "$harness"
 } > counts.tmp
 [ "$(wc -l < counts.tmp)" -eq 4 ] || fail "expected four count lines, got: $(cat counts.tmp)"
 cp counts.tmp "$counts/ct"
-mv counts.tmp "pass-$key"
-echo "ct-gate: pass, record build/ct/pass-$key"
+# Pending until `make ct` has also passed the harness's clippy and tests,
+# which then renames it to pass-<key>, the name tools/package accepts: an
+# interrupted or failed `make ct` leaves no pass record.
+mv counts.tmp "pending-$key"
+echo "ct-gate: pass, record build/ct/pending-$key"
 cat "$counts/ct"

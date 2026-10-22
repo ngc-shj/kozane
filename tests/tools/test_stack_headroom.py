@@ -49,7 +49,12 @@ CASES = [
     ("a mark shallower than the PD's own scrub fails", lines(61808, 90 * KIB),
      "pqkey: stack high-water 92160 B is below its own scrub depth 98304"),
     ("a garbled line fails", MEASURED + "pq: stack high-water 0x1audit: x\n",
-     "pq: 1 of 2 stack high-water lines garbled"),
+     "1 of 3 stack high-water lines garbled"),
+    ("a line with a garbled PD prefix fails", MEASURED + "auditpq: stack high-water 0x1f000 of 0x20000\n",
+     "1 of 3 stack high-water lines garbled"),
+    ("pq's mark shallower than its encaps scrub fails", lines(39 * KIB, 100096),
+     "pq: stack high-water 39936 B is below its own scrub depth 40960"),
+    ("a mark exactly at the scrub depth passes", lines(40 * KIB, 96 * KIB), None),
     ("the deepest of several lines counts", MEASURED + "pqkey: stack high-water 0x1f000 of 0x20000\n",
      "pqkey: 4096 B of stack free"),
 ]

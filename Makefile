@@ -145,19 +145,8 @@ unit: | $(counts)
 	# selftest needle in a later crate would never print).
 	cargo test --locked --no-fail-fast $(foreach c,$(host_crates),-p $(c)) > $(counts)/unit.log 2>&1 \
 		|| { cat $(counts)/unit.log; exit 1; }
-	# Per-crate counts too (M2 plan T12): a crate whose tests stop running
-	# fails the manifest even if the total still clears its minimum. Test
-	# binaries of two crates with one stem (tests/vectors.rs in both) would
-	# share a key and sum silently, so they report a collision key, which no
-	# manifest line allows. (A crate's lib and bin share theirs legitimately.)
-	awk '/^ *Running / { c = $$NF; sub(/\)$$/, "", c); sub(/.*\//, "", c); sub(/-[0-9a-f]+$$/, "", c); \
-			owner = $$NF; sub(/^.*\/build\//, "", owner); sub(/\/.*$$/, "", owner); \
-			if ((c in crate) && crate[c] != owner) clash[c] = 1; crate[c] = owner } \
-		/Doc-tests / { c = $$2 } \
-		/^test result: ok\./ { n += $$4; per[c] += $$4 } \
-		END { print "UNIT-TESTS", n; for (k in per) { u = toupper(k); gsub(/_/, "-", u); print "UNIT-" u, per[k] } \
-		      for (k in clash) { u = toupper(k); gsub(/_/, "-", u); print "UNIT-KEY-COLLISION-" u, 1 } }' \
-		$(counts)/unit.log > $(counts)/unit
+	# Per-crate counts too, and stem collisions refused (tools/unit-counts).
+	tools/unit-counts $(counts)/unit.log > $(counts)/unit
 
 kani: | $(counts)
 	rm -f $(counts)/kani.log
@@ -177,8 +166,8 @@ verus: | $(counts)
 		tools/verus-gate.sh -p $(c) >> $(counts)/verus.log \
 		|| { cat $(counts)/verus.log; exit 1; };)
 	awk '/^VERUS-CRATE / { c = toupper($$2); n++ } /^VERUS-VERIFIED/ { v += $$2; per[c] = $$2 } \
-		/^VERUS-ENSURES/ { ens[c] = $$2 } \
-		END { print "VERUS-FUNCTIONS", v; print "VERUS-TRUSTED-CHECKED", n; \
+		/^VERUS-ENSURES/ { ens[c] = $$2 } /^VERUS-NO-CHEATING/ { nc++ } \
+		END { print "VERUS-FUNCTIONS", v; print "VERUS-TRUSTED-CHECKED", n; print "VERUS-NO-CHEATING-CRATES", nc + 0; \
 		for (k in per) { print "VERUS-" k, per[k]; print "VERUS-ENSURES-" k, ens[k] } }' \
 		$(counts)/verus.log > $(counts)/verus
 
@@ -205,20 +194,21 @@ ct: ct-harness | $(counts)
 	# The harness's own clippy and unit tests (its report parser), on the
 	# host: it is its own workspace, so `make lint` and `make unit` do not
 	# see it. They run after ct-gate (a mutated harness must reach memcheck
-	# first), and a failure here removes the C9 pass record ct-gate wrote,
-	# which tools/package would otherwise accept.
+	# first). ct-gate's record is only pending: it becomes the pass record
+	# tools/package accepts on the last line, once both have passed, so a
+	# failed or interrupted `make ct` leaves none.
 	cargo clippy --locked --manifest-path tools/ct-harness/Cargo.toml --target-dir $(BUILD)/ct/target-host \
-		--all-targets -- -D warnings > $(counts)/ct-lint.log 2>&1 \
-		|| { cat $(counts)/ct-lint.log; rm -f $(BUILD)/ct/pass-*; echo "ct: harness lint failed; C9 pass record" "removed"; exit 1; }
+		--all-targets -- -D warnings > $(counts)/ct-lint.log 2>&1 || { cat $(counts)/ct-lint.log; exit 1; }
 	cargo test --locked --manifest-path tools/ct-harness/Cargo.toml --target-dir $(BUILD)/ct/target-host \
-		> $(counts)/ct-unit.log 2>&1 || { cat $(counts)/ct-unit.log; rm -f $(BUILD)/ct/pass-*; echo "ct: harness tests failed; C9 pass record" "removed"; exit 1; }
+		> $(counts)/ct-unit.log 2>&1 || { cat $(counts)/ct-unit.log; exit 1; }
 	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-CT-HARNESS", n + 0 }' $(counts)/ct-unit.log >> $(counts)/ct
+	python3 tools/ct_record.py promote --root .
 
 # C10 (tools/ct-shape): the mce460896 closures in pd-pqkey and pd-pq equal
 # the harness's, nothing forbidden in them, their shape equals
 # policy/ct-shape.toml, and no PD ships a Verus symbol (C1 erasure).
 ct-shape: pds ct-harness | $(counts)
-	tools/ct-shape --harness $(ct_harness) --search-path $(BUILD) $(foreach pd,$(pds),$(BUILD)/pd-$(pd).elf) \
+	tools/ct-shape --harness $(ct_harness) --search-path $(BUILD) --system $(system) $(foreach pd,$(pds),$(BUILD)/pd-$(pd).elf) \
 		> $(counts)/ct-shape.log 2>&1 || { cat $(counts)/ct-shape.log; exit 1; }
 	cat $(counts)/ct-shape.log
 	grep '^CT-SHAPE-SYMBOLS ' $(counts)/ct-shape.log > $(counts)/ct-shape
@@ -282,7 +272,8 @@ pins: | $(counts)
 	python3 tests/tools/test_ct_record.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_ct_shape.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_stack_headroom.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES)' $(counts)/pins.log > $(counts)/pins
+	python3 tests/tools/test_unit_counts.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES|UNIT-COUNTS-FIXTURES)' $(counts)/pins.log > $(counts)/pins
 
 # Builds its own deployment (fresh keys, generated config, package); see run.py.
 # it_boots (check-selftest only) runs a subset of the boots; such a run

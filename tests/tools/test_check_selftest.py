@@ -3,9 +3,12 @@
 Usage: python3 tests/tools/test_check_selftest.py
 """
 
+import contextlib
+import io
 import os
 import pathlib
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -96,6 +99,42 @@ def main() -> int:
            lambda s, d, t, now: "" if os.stat(d / "a.rs").st_mode & 0o777 == 0o755 else "mode not synced")
     synced("a dir replaced by a file is replaced",
            lambda s, d: (shutil.rmtree(s / "dir"), (s / "dir").write_text("now a file\n")), lambda s, d, t, now: same(s, d))
+    # A timed-out case fails even with its needle in the partial output; the
+    # same output with an ordinary failure passes (the allow side).
+    def timed(name, code, want):
+        nonlocal failures, ran
+        ran += 1
+        with tempfile.TemporaryDirectory() as d:
+            saved = (g["warm_tree"], g["run_make"])
+            g["warm_tree"] = lambda: pathlib.Path(d)
+            g["run_make"] = lambda tree, *targets: subprocess.CompletedProcess(["make"], code, "selftest-needle\n", "")
+            g["CASES"]["selftest-fixture"] = (["unit"], lambda t: None, "selftest-needle")
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    got = g["run_case"]("selftest-fixture")
+            finally:
+                g["warm_tree"], g["run_make"] = saved
+                del g["CASES"]["selftest-fixture"]
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} run_case: {name}: got {got} want {want}")
+
+    timed("a timed-out case fails though its needle printed", g["TIMED_OUT"], False)
+    timed("an ordinary failure with the needle passes", 2, True)
+
+    # bolero's crash inputs are cleared at any depth, but not inside a SKIP
+    # dir (a target dir is the build's own).
+    ran += 1
+    with tempfile.TemporaryDirectory() as d:
+        t = pathlib.Path(d)
+        for rel in ("crates/a/src/__fuzz__/x/crashes/c1", "crashes/c2", "target/crashes/keep"):
+            (t / rel).parent.mkdir(parents=True, exist_ok=True)
+            (t / rel).write_text("x\n")
+        g["clear_crashes"](t)
+        left = sorted(str(p.relative_to(t)) for p in t.rglob("*") if p.is_file())
+    ok = left == ["target/crashes/keep"]
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} clear_crashes: crash inputs removed: left {left}")
     print(f"CHECK-SELFTEST-FIXTURES {ran}")
     return 1 if failures else 0
 

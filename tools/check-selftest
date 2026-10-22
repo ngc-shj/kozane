@@ -140,7 +140,7 @@ CASES_FOR_GATE = {
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms",
            "mce-residue-encaps-scrub", "mce-residue-encaps-depth", "mce-residue-bm"},
     "ct-shape": {"ct-shape", "ct-identity", "verus-erasure"},
-    "verus": {"verus-cache", "verus-trusted", "verus-trusted-item", "verus-required", "verus-required-site",
+    "verus": {"verus-cache", "verus-trusted", "verus-trusted-item", "verus-no-cheating", "verus-required", "verus-required-site",
               "verus-required-member", "verus-wg-wire-window",
               "verus-wg-wire-roundtrip", "verus-rp-wire-roundtrip",
               "verus-msgs-exact", "verus-ring-mask", "verus-wire-ipv4"},
@@ -272,6 +272,14 @@ CASES = {
                                        "} // verus!\n\n#[inline]\nfn below_window(c: u64, window: u64, top: u64) -> bool {\n"
                                        "    c.saturating_add(window) < top\n}\n\nimpl<const BITS: usize> Default")),
                        "required function `below_window` is not defined inside verus!"),
+    # Verus's own --no-cheating on a crate without an allowlist entry
+    # (Phase 3 round 3): an external_body in wg-wire is refused by Verus,
+    # which now runs before the source checks.
+    "verus-no-cheating": (["verus", "verus_crates=wg-wire"],
+                          lambda t: edit(t, "crates/wg-wire/src/replay.rs",
+                                         "#[inline]\nfn below_window(",
+                                         "#[verifier::external_body]\n#[inline]\nfn below_window("),
+                          "external_body/assume_specification not allowed with --no-cheating"),
     # The allowlist covers chunk_ref, not its file: a second external_body
     # in msgs/src/lib.rs is unlisted (Phase 3, F2/S1).
     "verus-trusted-item": (["verus", "verus_crates=msgs"],
@@ -329,12 +337,12 @@ CASES = {
                                                "        let v = [1u8];\n        assert!(v.is_empty());\n    }\n\n"),
                         "selftest_injected_failure ... FAILED"),
     # ... and its clippy (T12): a lint in the report parser fails `make ct`
-    # after ct-gate, and the pass record ct-gate wrote is removed (the echo
-    # is split so make's printed recipe line cannot match the needle).
+    # after ct-gate, before the pending record is promoted (test_ct_record
+    # pins that promote needs exactly one pending record).
     "ct-harness-lint": (["ct"], lambda t: edit(t, "tools/ct-harness/src/report.rs", "#[cfg(test)]\nmod tests {\n",
                                                "pub fn selftest_lint() -> usize {\n    let v = vec![1u8];\n    v.len()\n}\n\n"
                                                "#[cfg(test)]\nmod tests {\n"),
-                        "ct: harness lint failed; C9 pass record removed"),
+                        "useless use of `vec!`"),
     # Without the canary, a run that checked nothing could look clean.
     "ct-canary": (["ct"], lambda t: edit(t, "tools/ct-harness/src/ct.rs", "    black_box(canary(&secret));\n", ""),
                   "want 1 errors (the canary)"),
@@ -806,16 +814,20 @@ def sync_tree(src: pathlib.Path, dst: pathlib.Path):
                 shutil.copymode(s, d)
 
 
-def warm_tree() -> pathlib.Path:
-    tree = WORK / "tree"
-    tree.mkdir(parents=True, exist_ok=True)
-    sync_tree(ROOT, tree)
-    # SKIP names survive sync_tree at any depth; bolero's crash inputs must
-    # not, or an old crash could make the bolero case pass.
+def clear_crashes(tree: pathlib.Path):
+    """SKIP names survive sync_tree at any depth; bolero's crash inputs must
+    not, or an old crash could make the bolero case pass."""
     for top, dirs, _ in os.walk(tree):
         if "crashes" in dirs:
             shutil.rmtree(pathlib.Path(top) / "crashes")
         dirs[:] = [d for d in dirs if d not in SKIP]
+
+
+def warm_tree() -> pathlib.Path:
+    tree = WORK / "tree"
+    tree.mkdir(parents=True, exist_ok=True)
+    sync_tree(ROOT, tree)
+    clear_crashes(tree)
     build = tree / "build"
     for item in build.iterdir() if build.is_dir() else []:
         if item.is_dir() and item.name == "ct":
