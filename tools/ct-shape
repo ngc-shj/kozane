@@ -1,0 +1,612 @@
+#!/usr/bin/env python3
+"""Identity and shape of the shipped McEliece code (M4 plan C10), and the
+Verus erasure check (C1).
+
+  tools/ct-shape --harness BIN --search-path DIR [--checks LIST]
+                 [--policy TOML] [ELF ...]
+  tools/ct-shape --harness BIN --search-path DIR --print-baseline
+
+For each root in ROOTS (a PD ELF under --search-path and the mce460896
+function it ships), the call-graph closure is derived from the ELF by
+following `bl` and tail-call `b <sym>` edges (any direct branch that leaves
+the function), stopping at panic entries (`core::` functions named
+`*_fail` / `*_failed`, or that never return: no `ret`, ending in a call into
+`core::panicking::`) and at memcpy, memset and memmove.
+
+  identity   the same root's closure in the C9 harness (--harness) is the
+             same set of functions (stops included), and each function's
+             normalised disassembly is identical. The normaliser replaces
+             only address operands (direct branch targets, adr/adrp, literal
+             loads and the lo12 immediate paired with an adrp) by what they
+             name, and masks hash noise in symbol names; opcodes, registers
+             and every other immediate stay.
+  forbidden  no udiv/sdiv, br/blr, call to memcmp/bcmp, or valgrind
+             client-request preamble (`ror x12, x12, #3` and the three
+             rotations after it) in those closures.
+             A udiv/sdiv may be listed in the policy's [[divide]] entries,
+             each naming its function and instruction with a justification;
+             an entry that matches nothing fails.
+  shape      per function of each PD closure (plus the shim's carrier, see
+             SHIM_*), the multiset of conditional instructions and of
+             register-offset memory operands equals the policy's
+             [[function]] entry, every entry justified.
+  erasure    no symbol of any ELF given as an argument demangles to a path
+             starting with `vstd::` or `verus_builtin`; the same demangler
+             must first find each ELF's own entry,
+             `sel4_microkit::entry::run_main<_, <crate>::init>` (the
+             positive control).
+
+--checks defaults to all four; tools/package runs identity,forbidden.
+--print-baseline prints the current shape as TOML on stdout, carrying the
+justification of every entry whose shape is unchanged and leaving the others
+empty (which `shape` refuses). Nothing writes the policy: a human reviews
+the output and commits it, and no make target calls this mode.
+"""
+
+import argparse
+import bisect
+import collections
+import hashlib
+import pathlib
+import re
+import struct
+import subprocess
+import sys
+import tomllib
+
+sys.dont_write_bytecode = True
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+POLICY = ROOT / "policy" / "ct-shape.toml"
+OBJDUMP = "aarch64-none-elf-objdump"
+CXXFILT = "c++filt"
+
+ROOTS = {"pd-pqkey.elf": "mce460896::decaps", "pd-pq.elf": "mce460896::encaps_attempt"}
+# The generic `encaps` shim is excluded from identity by name (C7 I8). It is
+# shape-baselined in pd-pq; where it was inlined into its only caller (it is,
+# at opt-level "s"), that caller carries it.
+SHIM_NAME = re.compile(r"^mce460896::encaps::<")
+SHIM_CARRIER = re.compile(r"^<rosenpass_core::kem::McEliece460896 as rosenpass_core::kem::Encaps<.*>>::encaps::<")
+SHIM_ELF = "pd-pq.elf"
+MEM_STOPS = ("memcpy", "memset", "memmove")
+CHECKS = ("identity", "forbidden", "shape", "erasure")
+
+BRANCHES = {"b", "bl", "cbz", "cbnz", "tbz", "tbnz"}
+SELECTS = {"csel", "csinc", "csinv", "csneg", "cset", "csetm", "cinc", "cinv", "cneg", "ccmp", "ccmn",
+           "fcsel", "fccmp", "fccmpe"}
+DIVIDES = ("udiv", "sdiv")
+INDIRECT = ("br", "blr", "braa", "braaz", "brab", "brabz", "blraa", "blraaz", "blrab", "blrabz")
+FORBIDDEN_CALLS = ("memcmp", "bcmp")
+# memcheck's aarch64 client-request preamble. The whole sequence, not its
+# first rotation alone: Keccak rotates by 3 too, and opt-level 3 put one such
+# `ror x12, x12, #3` in keccak_p.
+VALGRIND_PREAMBLE = ("ror x12, x12, #3", "ror x12, x12, #13", "ror x12, x12, #51", "ror x12, x12, #61")
+
+
+class Fail(Exception):
+    pass
+
+
+# --- ELF symbols -------------------------------------------------------------
+
+class Sym:
+    def __init__(self, name: str, value: int, size: int, kind: str):
+        self.name, self.value, self.size, self.kind = name, value, size, kind
+
+
+def elf_symbols(data: bytes) -> list:
+    """The .symtab of an ELF64 little-endian file; kind is 'func', 'object'
+    or 'other'."""
+    if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        raise Fail("not an ELF64 little-endian file")
+    shoff, = struct.unpack_from("<Q", data, 40)
+    shentsize, shnum = struct.unpack_from("<HH", data, 58)
+    sections = [struct.unpack_from("<IIQQQQIIQQ", data, shoff + i * shentsize) for i in range(shnum)]
+    syms = []
+    for sh in sections:
+        if sh[1] != 2:  # SHT_SYMTAB
+            continue
+        strtab = sections[sh[6]]
+        strs = data[strtab[4]:strtab[4] + strtab[5]]
+        for off in range(sh[4], sh[4] + sh[5], sh[9]):
+            st_name, st_info, _other, st_shndx, st_value, st_size = struct.unpack_from("<IBBHQQ", data, off)
+            if st_shndx == 0 or not st_name:
+                continue
+            name = strs[st_name:strs.index(b"\0", st_name)].decode()
+            kind = {2: "func", 1: "object"}.get(st_info & 0xF, "other")
+            syms.append(Sym(name, st_value, st_size, kind))
+    if not syms:
+        raise Fail("no symbol table")
+    return syms
+
+
+# --- names -------------------------------------------------------------------
+
+V0_CRATE = re.compile(r"C(?:s[0-9A-Za-z]*_)?(\d+)")
+
+
+def v0_tail(sym: str):
+    """(head, crate) when the v0 symbol ends in a crate root
+    `C[s<disambiguator>_]<len><ident>`, else None."""
+    for pos in (i for i, c in enumerate(sym) if c == "C"):
+        m = V0_CRATE.match(sym, pos)
+        if m and len(sym) - m.end() == int(m.group(1)) and re.fullmatch(r"[0-9A-Za-z_]+", sym[m.end():]):
+            return sym[:pos], sym[m.end():]
+    return None
+
+
+def demangle_all(names) -> dict:
+    """Raw symbol -> normalised name. A v0 symbol's instantiating crate is
+    kept as ` @<crate>`, so a generic codegen'd in another crate is another
+    function."""
+    names = sorted(set(names))
+    stripped = [re.sub(r"\.llvm\.\d+$", "", n) for n in names]
+    tails = {n: t for n in stripped if n.startswith("_R") and (t := v0_tail(n))}
+    queries = stripped + [head for head, _ in tails.values()]
+    out = subprocess.run([CXXFILT], input="\n".join(queries) + "\n", capture_output=True, text=True, check=True)
+    lines = out.stdout.splitlines()
+    if len(lines) != len(queries):
+        raise Fail(f"{CXXFILT} returned {len(lines)} names for {len(queries)}")
+    full = dict(zip(queries, lines))
+    result = {}
+    for raw, n in zip(names, stripped):
+        name = full[n]
+        if n in tails:
+            head, crate = tails[n]
+            # The tail was an instantiating crate only if dropping it leaves
+            # the demangled path unchanged.
+            if full[head] == name:
+                name += f" @{crate}"
+        result[raw] = normalise_name(name)
+    return result
+
+
+def normalise_name(name: str) -> str:
+    """Masks hash noise: crate disambiguators (`[hex]`, which is what the v0
+    `Cs<hash>_` demangles to), legacy `::h<hash>`, anonymous-constant
+    hashes."""
+    name = re.sub(r"\[[0-9a-f]+\]", "", name)
+    name = re.sub(r"::h[0-9a-f]{16}$", "", name)
+    name = re.sub(r"\banon\.[0-9a-f]{16,}\.", "anon.", name)
+    return re.sub(r"@plt$", "", name)
+
+
+# --- disassembly -------------------------------------------------------------
+
+INSN = re.compile(r"^\s*([0-9a-f]+):\t(\S+)(?:\t(.*))?$")
+PLT_LABEL = re.compile(r"^([0-9a-f]+) <([^>]+)@plt>:$")
+
+
+def parse_objdump(text: str):
+    """(address -> (mnemonic, operands), PLT stub address -> name) from
+    `objdump -d -w --no-show-raw-insn`. objdump's `//` comments go."""
+    insns, plt = {}, {}
+    for line in text.splitlines():
+        m = INSN.match(line)
+        if m:
+            ops = re.sub(r"\s*//.*$", "", m.group(3) or "").strip()
+            insns[int(m.group(1), 16)] = (m.group(2), ops)
+        elif (m := PLT_LABEL.match(line)):
+            plt[int(m.group(1), 16)] = normalise_name(m.group(2))
+    return insns, plt
+
+
+class Binary:
+    """One ELF's functions (by start address; merged aliases share one, named
+    `a = b`), data symbols and instructions."""
+
+    def __init__(self, label: str, syms: list, names: dict, insns: dict, plt: dict, sha256: str = ""):
+        self.label, self.insns, self.plt, self.sha256 = label, insns, plt, sha256
+        funcs = collections.defaultdict(set)
+        self.sizes = {}
+        for s in syms:
+            if s.kind == "func" and s.value in insns:
+                funcs[s.value].add(names[s.name])
+                self.sizes[s.value] = max(self.sizes.get(s.value, 0), s.size)
+        self.funcs = {a: " = ".join(sorted(n)) for a, n in funcs.items()}
+        self.by_name = collections.defaultdict(list)
+        for a, n in funcs.items():
+            for one in n:
+                self.by_name[one].append(a)
+        self.data = sorted((s.value, s.size, names[s.name]) for s in syms if s.kind in ("object", "func") and s.size)
+        labels = collections.defaultdict(set)
+        for s in syms:
+            if not s.size and not s.name.startswith("$"):
+                labels[s.value].add(names[s.name])
+        self.labels = {a: " = ".join(sorted(n)) for a, n in labels.items()}
+        self.names = names
+
+    @classmethod
+    def load(cls, path: pathlib.Path, label: str):
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            raise Fail(f"{label}: cannot read {path}: {e.strerror}")
+        try:
+            syms = elf_symbols(data)
+        except (Fail, struct.error, ValueError, IndexError) as e:
+            raise Fail(f"{label}: {path}: {e}")
+        out = subprocess.run([OBJDUMP, "-d", "-z", "-w", "--no-show-raw-insn", str(path)],
+                             capture_output=True, text=True, check=True).stdout
+        insns, plt = parse_objdump(out)
+        if not insns:
+            raise Fail(f"{label}: {OBJDUMP} disassembled nothing")
+        return cls(label, syms, demangle_all(s.name for s in syms), insns, plt, hashlib.sha256(data).hexdigest())
+
+    def function_name(self, addr: int):
+        return self.funcs.get(addr, self.plt.get(addr))
+
+    def symbolise(self, addr: int) -> str:
+        """An address operand, by what it names; an address no symbol covers
+        (a merged string, say) is masked as <addr>."""
+        name = self.function_name(addr)
+        if name is not None:
+            return f"<{name}>"
+        if addr in self.labels:
+            return f"<{self.labels[addr]}>"
+        i = bisect.bisect_right(self.data, (addr, float("inf"), "")) - 1
+        if i >= 0:
+            start, size, name = self.data[i]
+            if start <= addr < start + size:
+                return f"<{name}+{addr - start:#x}>" if addr != start else f"<{name}>"
+        return "<addr>"
+
+    def body(self, addr: int) -> list:
+        size = self.sizes.get(addr, 0)
+        if size <= 0:
+            raise Fail(f"{self.label}: {self.funcs.get(addr, hex(addr))} has no size")
+        return [(a, *self.insns[a]) for a in range(addr, addr + size, 4) if a in self.insns]
+
+
+ADDR_OPERAND = re.compile(r"(?:^|(?<=, ))([0-9a-f]+)(?: <[^>]*>)?$")
+MEM_PAIRED = re.compile(r"^(?P<pre>.*\[(?P<base>x\d+), #)(?P<imm>0x[0-9a-f]+|\d+)(?P<post>\].*)$")
+ADD_PAIRED = re.compile(r"^(?P<dst>[xw]\d+), (?P<base>x\d+), #(?P<imm>0x[0-9a-f]+|\d+)$")
+
+
+def branch_target(mnemonic: str, ops: str):
+    """The target address of a direct branch, or None."""
+    if mnemonic in BRANCHES or mnemonic.startswith("b."):
+        m = ADDR_OPERAND.search(ops)
+        if m:
+            return int(m.group(1), 16)
+    return None
+
+
+def normalise(binary: Binary, addr: int) -> list:
+    """The function at `addr`, one string per instruction, with its own
+    addresses dropped and every address operand replaced: a branch inside the
+    function by its offset (`.+0x40`), any other by the symbol it names, an
+    adrp page by `<page>` and the lo12 immediate of the add or load/store
+    that consumes that adrp register by the symbol page+lo12 names."""
+    end = addr + binary.sizes[addr]
+    pages, lines = {}, []
+    for _, mnemonic, ops in binary.body(addr):
+        text = ops
+        target = branch_target(mnemonic, ops)
+        literal = mnemonic in ("ldr", "ldrsw", "prfm") and "[" not in ops and ADDR_OPERAND.search(ops)
+        if mnemonic in ("adrp", "adr") or literal:
+            m = ADDR_OPERAND.search(ops)
+            value = int(m.group(1), 16)
+            if mnemonic == "adrp":
+                pages[ops.split(",")[0]] = value
+                text = ops[:m.start(1)] + "<page>"
+            else:
+                pages.pop(ops.split(",")[0], None)
+                text = ops[:m.start(1)] + binary.symbolise(value)
+        elif target is not None:
+            rel = f".+{target - addr:#x}" if addr <= target < end else binary.symbolise(target)
+            text = ADDR_OPERAND.sub(rel, ops)
+            if mnemonic == "bl":
+                # The callee may clobber every caller-saved register.
+                pages = {r: v for r, v in pages.items() if int(r[1:]) > 18}
+        else:
+            m = ADD_PAIRED.match(ops) if mnemonic == "add" else MEM_PAIRED.match(ops)
+            if m and m.group("base") in pages and (mnemonic == "add" or mnemonic.startswith(("ld", "st"))):
+                value = pages[m.group("base")] + int(m.group("imm"), 0)
+                if mnemonic == "add":
+                    text = f"{m.group('dst')}, {m.group('base')}, {binary.symbolise(value)}"
+                else:
+                    text = f"{m.group('pre')}{binary.symbolise(value)}{m.group('post')}"
+            # Any other write to an adrp'd register ends its pairing; an
+            # unpaired lo12 stays raw, so a mismatch fails rather than hides.
+            dst = ops.split(",")[0].strip()
+            if dst in pages and not mnemonic.startswith(("st", "prfm", "cmp", "cmn", "tst")):
+                del pages[dst]
+        lines.append(f"{mnemonic} {text}".rstrip())
+    return lines
+
+
+# --- closure -----------------------------------------------------------------
+
+def is_panic_entry(binary: Binary, addr: int) -> bool:
+    names = binary.funcs.get(addr, "").split(" = ")
+    if not any(n.startswith(("core::", "<core::")) for n in names):
+        return False
+    if any(re.search(r"_fail(ed)?$", n.split(" @")[0]) for n in names):
+        return True
+    body = binary.body(addr)
+    if any(m == "ret" for _, m, _ in body):
+        return False
+    tail = [(m, o) for _, m, o in body if m not in ("nop", "udf", "brk", ".inst", ".word")]
+    if not tail or tail[-1][0] not in ("b", "bl"):
+        return False
+    target = branch_target(*tail[-1])
+    callee = binary.function_name(target) if target is not None else None
+    return callee is not None and any(n.startswith("core::panicking::") for n in callee.split(" = "))
+
+
+def closure(binary: Binary, root: str):
+    """(name -> address of each function compared, stop names, problems)."""
+    addrs = binary.by_name.get(root, [])
+    if len(addrs) != 1:
+        raise Fail(f"{binary.label}: root {root} found {len(addrs)} times")
+    todo, seen, nodes, stops, problems = list(addrs), set(), {}, set(), []
+    while todo:
+        addr = todo.pop()
+        if addr in seen:
+            continue
+        seen.add(addr)
+        name = binary.function_name(addr)
+        if name is None:
+            problems.append(f"a branch to {addr:#x}, which starts no function")
+            continue
+        if addr in binary.plt or name in MEM_STOPS or is_panic_entry(binary, addr):
+            stops.add(name)
+            continue
+        if SHIM_NAME.match(name):
+            problems.append(f"the excluded shim {name} is reached")
+            continue
+        if name in nodes:
+            problems.append(f"two functions named {name}")
+        nodes[name] = addr
+        end = addr + binary.sizes[addr]
+        for _, mnemonic, ops in binary.body(addr):
+            target = branch_target(mnemonic, ops)
+            if target is not None and not addr <= target < end:
+                todo.append(target)
+    return nodes, stops, problems
+
+
+# --- checks ------------------------------------------------------------------
+
+def check_identity(elf: Binary, harness: Binary, root: str) -> list:
+    mine, my_stops, problems = closure(elf, root)
+    theirs, their_stops, their_problems = closure(harness, root)
+    errors = [f"{elf.label}: identity: closure of {root}: {p}" for p in problems]
+    errors += [f"{elf.label}: identity: the harness's closure of {root}: {p}" for p in their_problems]
+    for name in sorted(set(mine) - set(theirs)):
+        errors.append(f"{elf.label}: identity: {name} is in the closure of {root} but not in the harness's")
+    for name in sorted(set(theirs) - set(mine)):
+        errors.append(f"{elf.label}: identity: {name} is in the harness's closure of {root} but not in this ELF's")
+    for name in sorted(my_stops ^ their_stops):
+        side = "this ELF" if name in my_stops else "the harness"
+        errors.append(f"{elf.label}: identity: stop {name} is reached from {root} only in {side}")
+    for name in sorted(set(mine) & set(theirs)):
+        a, b = normalise(elf, mine[name]), normalise(harness, theirs[name])
+        if a != b:
+            errors.append(f"{elf.label}: identity: {name} differs from the harness: {first_diff(a, b)}")
+    return errors
+
+
+def first_diff(a: list, b: list) -> str:
+    for i in range(max(len(a), len(b))):
+        x, y = (f"'{v[i]}'" if i < len(v) else "no instruction" for v in (a, b))
+        if x != y:
+            return f"+{4 * i:#x} {x} here, {y} in the harness"
+    return "equal"
+
+
+def check_forbidden(binary: Binary, nodes: dict, divides: dict) -> list:
+    """`divides`: (elf, function, instruction) -> justification, the
+    policy's [[divide]] entries; each must match a udiv/sdiv here."""
+    errors, used = [], set()
+    for name, addr in sorted(nodes.items()):
+        body = binary.body(addr)
+        text = [f"{m} {o}" for _, m, o in body]
+        for i, (a, mnemonic, ops) in enumerate(body):
+            where = f"{binary.label}: forbidden: {name}+{a - addr:#x}"
+            insn = text[i]
+            key = (binary.label, name, insn)
+            if mnemonic in DIVIDES and key in divides:
+                used.add(key)
+            elif mnemonic in DIVIDES or mnemonic in INDIRECT:
+                errors.append(f"{where}: {insn}")
+            if tuple(text[i:i + len(VALGRIND_PREAMBLE)]) == VALGRIND_PREAMBLE:
+                errors.append(f"{where}: the valgrind client-request preamble ({'; '.join(VALGRIND_PREAMBLE)})")
+            target = branch_target(mnemonic, ops)
+            if target is not None and binary.function_name(target) in FORBIDDEN_CALLS:
+                errors.append(f"{where}: a call to {binary.function_name(target)}")
+    for key in sorted(k for k in divides if k[0] == binary.label and k not in used):
+        errors.append(f"{binary.label}: forbidden: [[divide]] {key[1]}: '{key[2]}' matches no instruction")
+    return errors
+
+
+REG_INDEX = re.compile(r"\[(?P<base>[xw]\d+|sp), (?P<index>[xw]\d+)(?P<ext>, [a-z]+(?: #\d+)?)?\]")
+REG_POST = re.compile(r"\], (?P<index>x\d+)$")
+
+
+def shape(binary: Binary, addr: int) -> dict:
+    """The multiset (element -> count) of conditional instructions (with
+    their condition) and of memory operands indexed by a register (the
+    registers reduced to their width)."""
+    counts = collections.Counter()
+    for _, mnemonic, ops in binary.body(addr):
+        if mnemonic.startswith("b.") or mnemonic in ("cbz", "cbnz", "tbz", "tbnz"):
+            counts[mnemonic] += 1
+        elif mnemonic in SELECTS:
+            counts[f"{mnemonic} {ops.split(', ')[-1]}"] += 1
+        if mnemonic.startswith(("ld", "st", "prfm")):
+            if (m := REG_INDEX.search(ops)):
+                counts[f"{mnemonic} [{m.group('base')[0]}, {m.group('index')[0]}{m.group('ext') or ''}]"] += 1
+            elif (m := REG_POST.search(ops)):
+                counts[f"{mnemonic} [x], x"] += 1
+    return dict(sorted(counts.items()))
+
+
+def shape_subjects(binaries: dict) -> dict:
+    """(elf, function) -> (binary, address): every PD closure function, and
+    the shim (or the caller it was inlined into) in SHIM_ELF."""
+    subjects = {}
+    for label, root in ROOTS.items():
+        nodes, _, _ = closure(binaries[label], root)
+        subjects.update({(label, name): (binaries[label], addr) for name, addr in nodes.items()})
+    binary = binaries[SHIM_ELF]
+    for pattern in (SHIM_NAME, SHIM_CARRIER):
+        shims = sorted({a for n, addrs in binary.by_name.items() if pattern.match(n) for a in addrs})
+        if shims:
+            break
+    if len(shims) != 1:
+        raise Fail(f"{SHIM_ELF}: shape: expected one encaps shim (or the caller it is inlined into), "
+                   f"found {len(shims)}")
+    subjects[(SHIM_ELF, binary.funcs[shims[0]])] = (binary, shims[0])
+    return subjects
+
+
+def load_policy(path: pathlib.Path):
+    """([[function]] entries by (elf, name), [[divide]] entries by
+    (elf, function, instruction))."""
+    try:
+        doc = tomllib.loads(path.read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        raise Fail(f"policy {path}: {e}")
+    if set(doc) - {"function", "divide"}:
+        raise Fail(f"policy {path}: unknown keys {sorted(set(doc) - {'function', 'divide'})}")
+    functions, divides = {}, {}
+    for i, e in enumerate(doc.get("function", [])):
+        if set(e) != {"elf", "name", "justification", "shape"} or not isinstance(e["shape"], dict) \
+                or not all(isinstance(v, int) and v > 0 for v in e["shape"].values()):
+            raise Fail(f"policy {path}: [[function]] {i} needs exactly elf, name, justification and a shape "
+                       "of positive counts")
+        key = (e["elf"], e["name"])
+        if key in functions:
+            raise Fail(f"policy {path}: [[function]] {e['elf']} {e['name']} is listed twice")
+        functions[key] = e
+    for i, e in enumerate(doc.get("divide", [])):
+        if set(e) != {"elf", "function", "instruction", "justification"} \
+                or not e["instruction"].startswith(DIVIDES) or not str(e["justification"]).strip():
+            raise Fail(f"policy {path}: [[divide]] {i} needs exactly elf, function, a udiv/sdiv instruction "
+                       "and a justification")
+        divides[(e["elf"], e["function"], e["instruction"])] = e["justification"]
+    return functions, divides
+
+
+def check_shape(binaries: dict, path: pathlib.Path) -> list:
+    entries, _ = load_policy(path)
+    subjects = shape_subjects(binaries)
+    errors = []
+    for key in sorted(set(subjects) - set(entries)):
+        errors.append(f"{key[0]}: shape: {key[1]} is not in {path.name}")
+    for key in sorted(set(entries) - set(subjects)):
+        errors.append(f"{key[0]}: shape: {key[1]} is listed in {path.name} but not in the closure")
+    for key in sorted(set(subjects) & set(entries)):
+        entry = entries[key]
+        if not str(entry["justification"]).strip():
+            errors.append(f"{key[0]}: shape: {key[1]} has no justification in {path.name}")
+        have, want = shape(*subjects[key]), entry["shape"]
+        for element in sorted(set(have) | set(want)):
+            if have.get(element, 0) != want.get(element, 0):
+                errors.append(f"{key[0]}: shape: {key[1]}: '{element}' {have.get(element, 0)} in the binary, "
+                              f"{want.get(element, 0)} in {path.name}")
+    return errors
+
+
+def toml_str(s: str) -> str:
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def print_baseline(binaries: dict, path: pathlib.Path):
+    """The [[function]] entries for the current binaries, on stdout. The
+    policy's header and [[divide]] entries are not reprinted."""
+    try:
+        old, _ = load_policy(path)
+    except Fail:
+        old = {}
+    for key, (binary, addr) in sorted(shape_subjects(binaries).items()):
+        have = shape(binary, addr)
+        prev = old.get(key)
+        why = prev["justification"] if prev and prev["shape"] == have else ""
+        items = ", ".join(f"{toml_str(k)} = {v}" for k, v in have.items())
+        print(f"\n[[function]]\nelf = {toml_str(key[0])}\nname = {toml_str(key[1])}\n"
+              f"justification = {toml_str(why)}\nshape = {{ {items} }}".replace("{  }", "{}"))
+
+
+# The positive control: the PD's entry, `run_main::<Handler, <crate>::init>`,
+# demangled (as a function, or as a generic argument where it was inlined).
+ENTRY_SYMBOL = r"sel4_microkit::entry::run_main(?:::)?<.*, {crate}::init>"
+
+
+def check_erasure(path: pathlib.Path) -> list:
+    label = path.name
+    try:
+        syms = elf_symbols(path.read_bytes())
+    except OSError as e:
+        return [f"{label}: erasure: cannot read {path}: {e.strerror}"]
+    except (Fail, struct.error, ValueError, IndexError) as e:
+        return [f"{label}: erasure: {e}"]
+    names = demangle_all(s.name for s in syms)
+    crate = re.sub(r"\.elf$", "", label).replace("-", "_")
+    control = re.compile(ENTRY_SYMBOL.format(crate=re.escape(crate)))
+    if not any(control.search(n) for n in names.values()):
+        return [f"{label}: erasure: positive control failed: no symbol demangles to "
+                f"sel4_microkit::entry::run_main<_, {crate}::init>"]
+    return [f"{label}: erasure: {n} is a Verus symbol"
+            for n in sorted(set(names.values())) if n.startswith(("vstd::", "<vstd::", "verus_builtin"))]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--harness", required=True, type=pathlib.Path)
+    ap.add_argument("--search-path", required=True, type=pathlib.Path)
+    ap.add_argument("--checks", default=",".join(CHECKS))
+    ap.add_argument("--policy", type=pathlib.Path, default=POLICY)
+    ap.add_argument("--print-baseline", action="store_true")
+    ap.add_argument("elfs", nargs="*", type=pathlib.Path)
+    a = ap.parse_args()
+    checks = a.checks.split(",")
+    if not set(checks) <= set(CHECKS):
+        print(f"ct-shape: --checks takes a comma-separated subset of {','.join(CHECKS)}")
+        return 2
+    errors, symbols = [], 0
+    try:
+        if not a.harness.is_file():
+            raise Fail(f"the C9 harness {a.harness} is missing")
+        binaries = {label: Binary.load(a.search_path / label, label) for label in ROOTS}
+        if a.print_baseline:
+            print_baseline(binaries, a.policy)
+            return 0
+        _, divides = load_policy(a.policy) if "forbidden" in checks else ({}, {})
+        harness = Binary.load(a.harness, "harness")
+        for label, binary in binaries.items():
+            print(f"CT-SHAPE-SHA256 {binary.sha256} {label}")
+        print(f"CT-SHAPE-SHA256 {harness.sha256} harness")
+        for label, root in ROOTS.items():
+            nodes, stops, _ = closure(binaries[label], root)
+            if "identity" in checks:
+                errors += check_identity(binaries[label], harness, root)
+            if "forbidden" in checks:
+                errors += check_forbidden(binaries[label], nodes, divides)
+            symbols += len(nodes)
+            print(f"CT-SHAPE-CLOSURE {label} {root}: {len(nodes)} functions, {len(stops)} stops")
+        if "shape" in checks:
+            errors += check_shape(binaries, a.policy)
+        if "erasure" in checks:
+            if not a.elfs:
+                raise Fail("erasure: no PD ELFs given")
+            for path in a.elfs:
+                if path.name not in ROOTS and path.is_file():
+                    print(f"CT-SHAPE-SHA256 {hashlib.sha256(path.read_bytes()).hexdigest()} {path.name}")
+                errors += check_erasure(path)
+    except Fail as e:
+        errors.append(str(e))
+    except subprocess.CalledProcessError as e:
+        errors.append(f"{e.cmd[0]} failed: {(e.stderr or '').strip()}")
+    for e in errors:
+        print(f"ct-shape: {e}")
+    if errors:
+        return 1
+    print(f"CT-SHAPE-SYMBOLS {symbols}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

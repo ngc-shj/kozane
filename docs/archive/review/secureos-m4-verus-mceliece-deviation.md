@@ -571,3 +571,63 @@ differs per build. The C10 normaliser must mask that hash.
   and three P13 fixtures are added: `CHECK-PINS-FIXTURES` 90 and
   `CHECK-PINS-RULES` 16.
 - **Still to do:** C10, the package binding and SC23's close.
+
+## M2b — identity and shape (C10), the package binding and SC23 (C11, part 2)
+
+### Result
+
+- **`make ct-shape`:**
+  - **Identity holds with no codegen flag change.** `-Z share-generics=no`
+    is not needed: both builds call the same crate's copy of each shared
+    generic. The normaliser keeps the instantiating crate (` @crate`), so a
+    future shift would show as an identity diff.
+  - **Closures:** `mce460896::decaps` in pd-pqkey has 39 functions and 12
+    stops; `mce460896::encaps_attempt` in pd-pq has 20 functions and 10
+    stops. `CT-SHAPE-SYMBOLS` is 59.
+  - **The shape baseline:** `policy/ct-shape.toml` holds 60 `[[function]]`
+    entries, each justified.
+  - **Erasure:** no PD carries a `vstd::`/`verus_builtin` symbol. The
+    positive control finds each PD's entry symbol.
+  - **Tests:** 30 normaliser and gate fixtures (`CT-SHAPE-FIXTURES`), run in
+    `make pins`.
+- **check-selftest `ct-shape` cases,** each red for its named reason:
+
+  | Case | Mutation | Needle |
+  |---|---|---|
+  | `ct-shape` | the ct-barrier mutation | `ct-shape: pd-pqkey.elf: shape: mce460896::bm::bm:` |
+  | `ct-identity` | pd-pq alone at `-Copt-level=3` | `ct-shape: pd-pq.elf: identity: mce460896::` |
+  | `verus-erasure` | wire's `parse_frame` takes a fn pointer to a vstd exec function, kept in the eth PDs | `erasure: vstd::` |
+
+- **The package binding:**
+  - `make package` depends on `ct-harness`.
+  - For every kernel config, `tools/package` runs ct-shape's identity and
+    forbidden checks, and refuses if the harness is missing.
+  - For non-debug configs it also requires the C9 pass record.
+  - `test_package.py` gains 8 fixtures (`PACKAGE-FIXTURES` 103). One of
+    them runs the real ct-shape on a mutated ELF.
+- **SC23 is closed** in `policy/waivers.toml`, with `tools/waivers.py` and
+  the file's comments stating the new binding. **L2 is amended**: the
+  architecture plan's L2 row names `pqkey`'s basis, and the M3 plan's
+  waiver row records the M4 amendment.
+
+### Deviations
+
+- **C10 (b) has four owner-approved `udiv` exceptions (R-M9).** The
+  `[[divide]]` entries in `policy/ct-shape.toml` are pinned to the function
+  and instruction. An entry that matches nothing fails. br/blr,
+  memcmp/bcmp and the client-request preamble can have no exception.
+- **The client-request preamble** is matched as the four-`ror` sequence.
+  A lone `ror x12, x12, #3` occurs legitimately in keccak at opt-level 3.
+- **The encaps shim** has no symbol in pd-pq; it is inlined into
+  `<rosenpass_core::kem::McEliece460896 as Encaps>::encaps::<Hedged<..>>`,
+  which carries its shape baseline.
+- **Unresolved `adr` targets:** an `adr` to a rodata address that no symbol
+  covers (a merged string) is masked as `<addr>`.
+- **No separate allow case for package-waiver.** The planned
+  `package-waiver-closed` selftest would need real secrets blobs and a full
+  package build. The allow side is covered by `test_package.py`'s
+  "everything green → allow" fixture and by the integration suite's three
+  `make package` runs.
+- **package-waiver** now opens a waiver (`SC99`) in its own copy, because
+  none is open in the tree.
+- **The check-pins P6 fixtures** are re-based on SC23 closed.

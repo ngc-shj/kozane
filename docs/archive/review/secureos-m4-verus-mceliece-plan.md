@@ -767,6 +767,13 @@ fixed locally, stop and ask the owner.
   no C9/C10 gate and no residue test. Owner: unscheduled (SC31). It is a
   one-time offline operation.
 - **R-M6:** C9 sees only the paths its inputs reach.
+- **R-M9:** C10 (b) allows four owner-approved `udiv` instructions (2026-10-22).
+  Each is pinned to its function and instruction in `policy/ct-shape.toml`.
+  They are in sha3's Keccak absorb and in core's `ChunksMut::size`, which
+  digest's block buffer and bm's `chunks_mut(64)` instantiate, and each
+  divides a public length by a public chunk size. A variable-time divide on
+  those operands leaks nothing; the residual is an operand misjudged as
+  public.
 - **R-M8:** C8 has no direct NIST round-3 KAT, because the submission
   ships no response file (deviation log, M1). Keygen equivalence rests on
   cmr 2.0.2, itself KAT-checked upstream, and the KEM's on liboqs.

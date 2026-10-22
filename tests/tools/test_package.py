@@ -19,6 +19,9 @@ import tempfile
 import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import ct_shape_elf  # noqa: E402
+
 loader = importlib.machinery.SourceFileLoader("package", str(ROOT / "tools/package"))
 spec = importlib.util.spec_from_loader("package", loader)
 pkg = importlib.util.module_from_spec(spec)
@@ -75,6 +78,49 @@ SC23_BOUND = "package: Cargo.lock requires waiver SC23 to be open, but policy/wa
 LOCK_CMR = 'version = 4\n\n[[package]]\nname = "classic-mceliece-rust"\nversion = "2.0.2"\n'
 LOCK_CMR_OTHER = LOCK_CMR.replace('"2.0.2"', '"2.0.3"')
 LOCK_NO_CMR = 'version = 4\n\n[[package]]\nname = "zeroize"\nversion = "1.8.1"\n'
+CT_RED_LINE = "pd-pq.elf: identity: mce460896::bm::bm differs from the harness"
+CT_RED = f"package: ct-shape refuses the packaged ELFs: {CT_RED_LINE}"
+NO_HARNESS = "package: the C9 harness <d>/ct-harness is missing; `make ct-harness` builds it"
+NO_RECORD = "no C9 pass record build/ct/pass-"
+VG = "valgrind-3.24.0"
+# tools/ct-shape stand-ins: green, or red with one refusal line.
+FAKE_CT_SHAPE = {True: "#!/bin/sh\nexit 0\n", False: f"#!/bin/sh\necho 'ct-shape: {CT_RED_LINE}'\nexit 1\n"}
+
+
+def ct_tree(d: pathlib.Path, harness: pathlib.Path, record: bool):
+    """A C9 record root (CT_ROOT) in `d`: the policy and vector files the key
+    covers, and with `record` the pass record `make ct` would have written."""
+    (d / "policy").mkdir(exist_ok=True)
+    (d / pkg.ct_record.POLICY).write_text('[[site]]\nid = "ss-out"\n')
+    (d / pkg.ct_record.VECTORS).mkdir(parents=True)
+    (d / pkg.ct_record.VECTORS / "liboqs.txt").write_text("mce.0.ss 00\n")
+    if record and harness.is_file():
+        path = pkg.ct_record.record_path(d, pkg.ct_record.record_key(d, harness, VG))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("CT-CASES 28\nCT-MARKED-BYTES 1\nCT-DECLASSIFY 3\nRESIDUE-CASES 25\n")
+
+
+class ct_stubs:
+    """tools/package's C11 binding pointed at scratch: a fake (or, with
+    `real`, the real) tools/ct-shape, an empty ct-shape policy, and a record
+    root in `d`. Restores what it replaced."""
+
+    def __init__(self, d: pathlib.Path, harness: pathlib.Path, green: bool = True, record: bool = True,
+                 real: bool = False):
+        self.saved = (pkg.CT_SHAPE, pkg.CT_POLICY, pkg.CT_ROOT, pkg.valgrind_version)
+        if not real:
+            fake = d / "fake-ct-shape"
+            fake.write_text(FAKE_CT_SHAPE[green])
+            fake.chmod(0o755)
+            pkg.CT_SHAPE = fake
+        (d / "ct-shape.toml").write_text("")
+        pkg.CT_POLICY = d / "ct-shape.toml"
+        pkg.CT_ROOT = d
+        pkg.valgrind_version = lambda: VG
+        ct_tree(d, harness, record)
+
+    def restore(self):
+        pkg.CT_SHAPE, pkg.CT_POLICY, pkg.CT_ROOT, pkg.valgrind_version = self.saved
 
 
 def package_system(path="/elsewhere/secrets.bin", pq_path="/elsewhere/pq.bin"):
@@ -104,16 +150,27 @@ def waivers_file(text):
     return run
 
 
-def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, stub_sc20=False, lock_text=LOCK_CMR):
+def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, stub_sc20=False, lock_text=LOCK_CMR,
+                harness=True, ct_green=True, record=True, real_ct=None):
     """Runs `main()` with `build` replaced and the waiver file and Cargo.lock
     pointed at scratch ones (None: absent). Returns what it printed (the success line
     dropped, the scratch dir shown as <d>), plus a note when the outcome disagrees with that output, so
     an accepted run returns [] and a refused one exactly its messages.
     With `stub_sc20` the SC20 predicate passes, so it cannot mask what
-    comes after it."""
+    comes after it. The C11 binding (ct_stubs) runs a fake tools/ct-shape,
+    green or not (`ct_green`), against a harness file that exists or not
+    (`harness`), with a C9 record or not (`record`); `real_ct` instead
+    builds ct_shape_elf's synthetic ELFs (its arguments to tree()) and runs
+    the real tools/ct-shape on them."""
     def run():
         d = tmp_tree()
         real = (pkg.build, pkg.require_debug, pkg.WAIVERS, pkg.LOCK, sys.argv)
+        search, harness_path = ("x", d / "ct-harness")
+        if real_ct is not None:
+            search, harness_path = ct_shape_elf.tree(d, **real_ct)
+        elif harness:
+            harness_path.write_bytes(b"\x7fELF harness")
+        stubs = ct_stubs(d, harness_path, green=ct_green, record=record, real=real_ct is not None)
         real_umask = os.umask(0o022)
         os.umask(real_umask)
         real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
@@ -138,8 +195,8 @@ def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, 
             pkg.build = fake_build
             sys.argv = ["package", "--secrets", str(d / "secrets.bin"), "--pq-secrets", str(d / "pq.bin"),
                         "--out", str(d / "pkg"), "--system", "x", "--policy", "x", "--image", "x",
-                        "--gen-config", str(d / "gen_config.h"), "--search-path", "x", "--board", "x",
-                        "--config", "x", "--microkit", "x"]
+                        "--gen-config", str(d / "gen_config.h"), "--search-path", str(search), "--board", "x",
+                        "--config", "x", "--microkit", "x", "--harness", str(harness_path)]
             captured = io.StringIO()
             with contextlib.redirect_stdout(captured):
                 status = pkg.main()
@@ -152,6 +209,7 @@ def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, 
             return printed
         finally:
             pkg.build, pkg.require_debug, pkg.WAIVERS, pkg.LOCK, sys.argv = real
+            stubs.restore()
             os.umask(real_umask)
             for s, h in real_handlers.items():
                 signal.signal(s, h)
@@ -212,9 +270,10 @@ def run_main(build_result):
     expected one for `build_result`)."""
     def run():
         d = tmp_tree()
-        real_build, real_argv = pkg.build, sys.argv
+        real_build, real_argv, real_check_ct = pkg.build, sys.argv, pkg.check_ct
         real_umask = os.umask(0o022)
         os.umask(real_umask)
+        pkg.check_ct = lambda *_: []
         try:
             blob = d / "secrets.bin"
             blob.write_bytes(BLOB)
@@ -267,7 +326,7 @@ def run_main(build_result):
             sys.argv = ["package", "--secrets", str(blob), "--pq-secrets", str(d / "pq.bin"), "--out", str(out),
                         "--system", "x", "--policy", "x",
                         "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
-                        "--config", "x", "--microkit", "x"]
+                        "--config", "x", "--microkit", "x", "--harness", "x"]
             real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
             real_sigmask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
             real_signal = signal.signal
@@ -385,7 +444,7 @@ def run_main(build_result):
                 errors.append(f"SIGTERM did not end the run through SystemExit (status {status})")
             return errors
         finally:
-            pkg.build, sys.argv = real_build, real_argv
+            pkg.build, sys.argv, pkg.check_ct = real_build, real_argv, real_check_ct
             os.umask(real_umask)
             shutil.rmtree(d)
     return run
@@ -395,7 +454,8 @@ def staging_in_forbidden_root():
     """A forbidden root covering the parent (as if a path component had been
     swapped after the check): main() must refuse before building."""
     d = tmp_tree()
-    real_roots, real_build, real_argv = pkg.forbidden_roots, pkg.build, sys.argv
+    real_roots, real_build, real_argv, real_check_ct = pkg.forbidden_roots, pkg.build, sys.argv, pkg.check_ct
+    pkg.check_ct = lambda *_: []
     real_umask = os.umask(0o022)
     os.umask(real_umask)
     real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
@@ -419,7 +479,7 @@ def staging_in_forbidden_root():
         sys.argv = ["package", "--secrets", str(blob), "--pq-secrets", str(d / "pq.bin"), "--out", str(d / "pkg"),
                     "--system", "x", "--policy", "x",
                     "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
-                    "--config", "x", "--microkit", "x"]
+                    "--config", "x", "--microkit", "x", "--harness", "x"]
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             status = pkg.main()
@@ -431,7 +491,7 @@ def staging_in_forbidden_root():
             errors.append(f"refused by another check: {out.getvalue().strip()!r}, {len(calls)} root lookups")
         return errors
     finally:
-        pkg.forbidden_roots, pkg.build, sys.argv = real_roots, real_build, real_argv
+        pkg.forbidden_roots, pkg.build, sys.argv, pkg.check_ct = real_roots, real_build, real_argv, real_check_ct
         os.umask(real_umask)
         for s, h in real_handlers.items():
             signal.signal(s, h)
@@ -752,6 +812,30 @@ CASES = [
     ("non-debug kernel with no open waiver: SC20 alone", [SC20],
      main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR)),
     ("non-debug kernel with an open waiver: both refusals", [SC20, SC23_OPEN], main_checks(gen=GEN_RELEASE)),
+    # The C11 binding (M4 plan C11): ct-shape (C10 (a), (b)) on every
+    # kernel, a C9 pass record on a non-debug one, a missing harness refuses.
+    ("SC23 closed with ct-shape red refuses", [CT_RED],
+     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR, ct_green=False)),
+    ("SC20 stubbed: SC23 closed, identity green, no C9 record refuses a release kernel", NO_RECORD,
+     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, stub_sc20=True, lock_text=LOCK_NO_CMR,
+                 record=False)),
+    ("SC20 stubbed: SC23 closed with everything green allows a release kernel", None,
+     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, stub_sc20=True, lock_text=LOCK_NO_CMR)),
+    ("SC23 closed without a C9 record allows a debug kernel", None,
+     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR, record=False)),
+    ("SC23 closed with the harness missing refuses", [NO_HARNESS],
+     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR, harness=False)),
+    ("SC20 stubbed: the harness missing refuses a release kernel", [NO_HARNESS],
+     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, stub_sc20=True, lock_text=LOCK_NO_CMR,
+                 harness=False)),
+    ("the real ct-shape passes unmutated ELFs through package", None,
+     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR, real_ct={})),
+    ("the real ct-shape refuses a mutated ELF through package",
+     [f"package: ct-shape refuses the packaged ELFs: {label}: identity: mce460896::bm::bm differs from the harness: "
+      "+0x14 'csel x0, x9, x2, eq' here, 'csel x0, x9, x1, eq' in the harness"
+      for label in ("pd-pqkey.elf", "pd-pq.elf")],
+     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR,
+                 real_ct={"pd_bm": [line.replace("x1, eq", "x2, eq") for line in ct_shape_elf.BM]})),
     ("secrets path inside the repo", "inside", lambda: pkg.check_secrets_path(ROOT / "build/secrets.bin", ROOT)),
     ("secrets path outside the repo", None, lambda: pkg.check_secrets_path(pathlib.Path("/tmp/s.bin"), ROOT)),
     ("secrets path inside the cargo home", "inside", secrets_in_cargo_home),

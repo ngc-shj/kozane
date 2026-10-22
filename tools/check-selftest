@@ -90,6 +90,7 @@ CASES_FOR_GATE = {
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
     "ct": {"ct-barrier", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub"},
+    "ct-shape": {"ct-shape", "ct-identity", "verus-erasure"},
     "verus": {"verus-cache", "verus-trusted", "verus-required", "verus-wg-wire-window",
               "verus-wg-wire-roundtrip", "verus-rp-wire-roundtrip",
               "verus-msgs-exact", "verus-ring-mask", "verus-wire-ipv4"},
@@ -265,6 +266,25 @@ CASES = {
         edit(t, "crates/mce460896/src/lib.rs", "    let accept = encaps_attempt_core(pk, rand, ct_out, ss_out);\n    scrub_stack();\n",
              "    let accept = encaps_attempt_core(pk, rand, ct_out, ss_out);\n")),
                           "RESIDUE-HIT keccak"),
+    # The identity and shape gate (M4 plan C10). The ct-barrier mutation
+    # changes bm's conditional-instruction multiset; identity stays green
+    # because the harness is built from the same source.
+    "ct-shape": (["ct-shape"], lambda t: edit(t, "crates/mce460896/src/bm.rs",
+                                              "        vec_cmov(&mut b_poly[0], &c_poly[0], mask);\n        vec_cmov(&mut b_poly[1], &c_poly[1], mask);\n",
+                                              "        if mask != 0 {\n            b_poly[0] = c_poly[0];\n            b_poly[1] = c_poly[1];\n        }\n"),
+                 "ct-shape: pd-pqkey.elf: shape: mce460896::bm::bm:"),
+    # One PD built with other codegen than the harness: identity fails.
+    "ct-identity": (["ct-shape"], lambda t: edit(t, "Makefile",
+                                                 "\tRUSTFLAGS=-Zunstable-options \\\n\tcargo build --locked \\\n",
+                                                 "\tRUSTFLAGS=\"-Zunstable-options $(if $(filter pq,$(1)),-Copt-level=3)\" \\\n\tcargo build --locked \\\n"),
+                    "ct-shape: pd-pq.elf: identity: mce460896::"),
+    # Verus's exec library reaching a shipped PD: wire (which already
+    # depends on vstd) calls a vstd exec function from parse_frame, which
+    # the eth PDs reach.
+    "verus-erasure": (["ct-shape"], lambda t: edit(t, "crates/wire/src/lib.rs",
+                                                   "{\n    parse_eth(b, false)\n}",
+                                                   "{\n    core::hint::black_box(vstd::invariant::create_open_invariant_credit as fn() -> _);\n    parse_eth(b, false)\n}"),
+                      "erasure: vstd::"),
     # End to end through the real `check` rule, once per gate: see
     # run_propagation(). The tuple is only a placeholder for the case table.
     "check-propagation": ([], lambda t: None, ""),
@@ -552,9 +572,13 @@ CASES = {
                                                         "check_waivers(gen_config, WAIVERS) + check_bindings",
                                                         "check_bindings"),
                                "FAIL SC20 stubbed: an open waiver refuses and names itself"),
+    # No waiver is open since M4 closed SC23, so the case opens one in its
+    # copy: the refusal names it.
     "package-waiver": (["package", "MICROKIT_CONFIG=release", "SECRETS=/nonexistent/s.bin",
                         "PQ_SECRETS=/nonexistent/pq.bin", "OUT=/nonexistent/pkg"],
-                       lambda t: None, "waiver SC23 (owner M4) is open"),
+                       lambda t: append(t, "policy/waivers.toml",
+                                        '\n[[waivers]]\nid = "SC99"\nowner = "M9"\nstatus = "open"\n'),
+                       "waiver SC99 (owner M9) is open"),
     # Deleting a test keeps `unit` green; only the manifest comparison notices.
     "manifest": (["unit", "manifest"], lambda t: edit(t, "crates/audit-event/src/tests.rs",
                                                      "#[test]\nfn first_occurrence_emits()",

@@ -6,6 +6,7 @@ L6): `key`'s blob in the `secrets` mr and `pqkey`'s in `pq_secrets`.
 Usage: package --secrets FILE --pq-secrets FILE --out DIR --system FILE
                --policy FILE --image LOADER --gen-config gen_config.h
                --search-path DIR --board BOARD --config CONFIG --microkit BIN
+               --harness CT_HARNESS
 
 The result is accepted only if, against the placeholder build:
   - the .system differs in nothing but those two attributes;
@@ -23,6 +24,10 @@ only `debug` kernels may be packaged, read from the kernel's own
 gen_config.h rather than a make variable. Independently, a non-debug kernel
 is refused while policy/waivers.toml lists an open waiver (M3 plan,
 Packaging), and a missing or unparsable waiver file refuses any package.
+For every kernel, tools/ct-shape's identity and forbidden checks (M4 plan
+C10 (a), (b)) must pass on the PD ELFs under --search-path against the C9
+harness, and a missing harness refuses; a non-debug kernel also needs the
+C9 pass record `make ct` wrote for that harness (tools/ct_record.py, C11).
 """
 
 import argparse
@@ -39,12 +44,17 @@ from typing import NamedTuple
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import ct_record  # noqa: E402
 import waivers  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 WAIVERS = ROOT / "policy" / "waivers.toml"
 LOCK = ROOT / "Cargo.lock"
 DEBUG_LINE = "#define CONFIG_DEBUG_BUILD  1"
+CT_SHAPE = ROOT / "tools" / "ct-shape"
+CT_POLICY = ROOT / "policy" / "ct-shape.toml"
+# Where build/ct/pass-<key> and the record's inputs are looked up.
+CT_ROOT = ROOT
 
 
 class BlobKind(NamedTuple):
@@ -114,6 +124,46 @@ def check_bindings(lock: pathlib.Path, path: pathlib.Path) -> list:
         return [f"package: Cargo.lock unusable, refusing: {e}"]
     return [f"package: Cargo.lock requires waiver {wid} to be open, but policy/waivers.toml does not list it as open"
             for wid in waivers.unmet(required, listed)]
+
+
+def run_ct_shape(harness: pathlib.Path, search_path: str) -> list:
+    """C10 (a) and (b) on the ELFs this package ships, against the harness
+    C9 ran: each line tools/ct-shape refused with, or its output when it
+    failed without one."""
+    try:
+        r = subprocess.run([str(CT_SHAPE), "--harness", str(harness), "--search-path", search_path,
+                            "--policy", str(CT_POLICY), "--checks", "identity,forbidden"],
+                           capture_output=True, text=True)
+    except OSError as e:
+        return [f"package: cannot run tools/ct-shape: {e}"]
+    if r.returncode == 0:
+        return []
+    lines = [line.removeprefix("ct-shape: ") for line in r.stdout.splitlines() if line.startswith("ct-shape: ")]
+    return [f"package: ct-shape refuses the packaged ELFs: {line}"
+            for line in lines or [(r.stdout + r.stderr).strip() or f"exit status {r.returncode}"]]
+
+
+def valgrind_version() -> str:
+    return ct_record.valgrind_version()
+
+
+def check_c9_record(harness: pathlib.Path) -> list:
+    try:
+        why = ct_record.check_record(CT_ROOT, harness, valgrind_version())
+    except (OSError, subprocess.CalledProcessError) as e:
+        return [f"package: cannot check the C9 pass record: {e}"]
+    return [f"package: {w}; a non-debug kernel needs `make ct` to have passed (C9)" for w in why]
+
+
+def check_ct(gen_config: str, harness: pathlib.Path, search_path: str) -> list:
+    """The C11 binding, for every kernel: identity and forbidden (C10) on
+    the packaged ELFs; for a non-debug kernel, also C9's pass record."""
+    if not harness.is_file():
+        return [f"package: the C9 harness {harness} is missing; `make ct-harness` builds it"]
+    errors = run_ct_shape(harness, search_path)
+    if not is_debug(gen_config):
+        errors += check_c9_record(harness)
+    return errors
 
 
 def check_blob(kind: BlobKind, blob: bytes) -> list:
@@ -282,15 +332,17 @@ def main() -> int:
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(s, exit_on_signal)
     ap = argparse.ArgumentParser()
-    for opt in ("secrets", "pq-secrets", "out", "system", "policy", "image", "gen-config", "search-path", "board", "config", "microkit"):
+    for opt in ("secrets", "pq-secrets", "out", "system", "policy", "image", "gen-config", "search-path", "board", "config", "microkit",
+                "harness"):
         ap.add_argument(f"--{opt}", required=True)
     a = ap.parse_args()
 
     secrets = {mr: pathlib.Path(path) for mr, path in blob_args(a).items()}
     out = pathlib.Path(a.out)
-    # Both run, so either refusal stays reachable with the other removed.
+    # All run, so each refusal stays reachable with the others removed.
     gen_config = pathlib.Path(a.gen_config).read_text()
     errors = require_debug(gen_config) + check_waivers(gen_config, WAIVERS) + check_bindings(LOCK, WAIVERS)
+    errors += check_ct(gen_config, pathlib.Path(a.harness), a.search_path)
     if errors:
         print("\n".join(errors))
         return 1

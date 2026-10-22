@@ -25,7 +25,7 @@ host_crates := wire ring audit-event ingress-core inner-core layout laws config 
 kani_crates := wire ring ingress-core inner-core wg-wire msgs rosenpass-wire
 
 .PHONY: clean-counts
-.PHONY: all image package run test check check-selftest audit lint lint-pds unit kani verus ct ct-harness bolero fuzz-long laws pins manifest kernel-config clean
+.PHONY: all image package run test check check-selftest audit lint lint-pds unit kani verus ct ct-harness ct-shape bolero fuzz-long laws pins manifest kernel-config clean
 all: image
 
 $(counts):
@@ -83,11 +83,14 @@ ifeq ($(and $(SECRETS),$(PQ_SECRETS),$(OUT)),)
 $(error package: set SECRETS=<blob> PQ_SECRETS=<blob> OUT=<dir>)
 endif
 endif
-package: image
+# tools/package also runs tools/ct-shape (identity, forbidden) on the PD ELFs
+# it packages against this harness, and wants a C9 pass record for it on a
+# non-debug kernel (M4 plan C11).
+package: image ct-harness
 	tools/package --secrets $(SECRETS) --pq-secrets $(PQ_SECRETS) --out $(OUT) --system $(system) --policy $(policy) \
 		--image $(loader) --gen-config $(sdk_config_dir)/include/kernel/gen_config.h \
 		--search-path $(BUILD) --board $(MICROKIT_BOARD) --config $(MICROKIT_CONFIG) \
-		--microkit $(MICROKIT_SDK)/bin/microkit
+		--microkit $(MICROKIT_SDK)/bin/microkit --harness $(ct_harness)
 
 # Boots an image interactively with both NICs as the integration test does
 # (outside on user-net with 51820 forwarded to RUN_PORT, inside on a dgram
@@ -197,6 +200,15 @@ ct: ct-harness | $(counts)
 		> $(counts)/ct-unit.log 2>&1 || { cat $(counts)/ct-unit.log; exit 1; }
 	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-CT-HARNESS", n + 0 }' $(counts)/ct-unit.log >> $(counts)/ct
 
+# C10 (tools/ct-shape): the mce460896 closures in pd-pqkey and pd-pq equal
+# the harness's, nothing forbidden in them, their shape equals
+# policy/ct-shape.toml, and no PD ships a Verus symbol (C1 erasure).
+ct-shape: pds ct-harness | $(counts)
+	tools/ct-shape --harness $(ct_harness) --search-path $(BUILD) $(foreach pd,$(pds),$(BUILD)/pd-$(pd).elf) \
+		> $(counts)/ct-shape.log 2>&1 || { cat $(counts)/ct-shape.log; exit 1; }
+	cat $(counts)/ct-shape.log
+	grep '^CT-SHAPE-SYMBOLS ' $(counts)/ct-shape.log > $(counts)/ct-shape
+
 bolero_targets := wire/tests::fuzz_parse_never_panics_and_round_trips \
 	wg-wire/tests::fuzz_parsers_never_panic_and_round_trip \
 	rosenpass-wire/tests::fuzz_parsers_never_panic_and_round_trip
@@ -254,7 +266,8 @@ pins: | $(counts)
 	python3 tests/tools/test_seccomp.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_rp_cookie_twin.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_ct_record.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES)' $(counts)/pins.log > $(counts)/pins
+	python3 tests/tools/test_ct_shape.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES)' $(counts)/pins.log > $(counts)/pins
 
 # Builds its own deployment (fresh keys, generated config, package); see run.py.
 test: | $(counts)
@@ -273,7 +286,7 @@ clean-counts:
 
 check:
 	$(MAKE) clean-counts
-	$(MAKE) pins audit lint lint-pds unit kani verus ct bolero laws test
+	$(MAKE) pins audit lint lint-pds unit kani verus ct ct-shape bolero laws test
 	$(MAKE) manifest
 
 # Requires a prior `make check` (the manifest case reuses build/counts).

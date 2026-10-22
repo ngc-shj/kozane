@@ -1,0 +1,406 @@
+# M4 plan C10, checked by tools/ct-shape.
+#
+# [[function]] (C10 (c), the shape baseline): one entry per function of each
+# PD's closure from its mce460896 root, and the encaps shim's carrier in
+# pd-pq. `shape` is the multiset of the function's conditional instructions
+# (b.<cond>, cbz/cbnz, tbz/tbnz, and the csel/cset/ccmp family with their
+# condition) and of its memory accesses indexed by a register. A change is a
+# tripwire, not a verdict: C9 is its recovery path. Names are demangled with
+# hashes stripped; ` @crate` is a generic's instantiating crate; `a = b` is
+# one body under several merged names.
+#
+# `tools/ct-shape --print-baseline` prints the current [[function]] entries
+# (justifications kept where the shape is unchanged) for review. No make
+# target writes this file.
+#
+# [[divide]] (C10 (b)): a udiv/sdiv C10 (b) would refuse, accepted at that
+# one function and instruction. Owner-approved 2026-10-22 (C10 listed no
+# exception; M4 deviation log, M2b; residual R-M9): both are core iterator code that sha3/digest and bm's
+# chunks_mut instantiate, dividing a public slice length by a public chunk
+# size; they cannot be removed from mce460896 alone. An entry that matches no
+# instruction fails. br/blr, memcmp/bcmp and the valgrind preamble have no
+# such list.
+
+[[divide]]
+elf = "pd-pqkey.elf"
+function = "<core::iter::adapters::zip::Zip<core::slice::iter::ChunksExact<u8>, core::slice::iter::IterMut<u64>> as core::iter::adapters::zip::ZipImpl<core::slice::iter::ChunksExact<u8>, core::slice::iter::IterMut<u64>>>::new @sha3"
+instruction = "udiv x8, x8, x9"
+justification = "sha3's Keccak absorb, block.chunks_exact(8).zip(state): the block length (the public rate) divided by the chunk size 8."
+
+[[divide]]
+elf = "pd-pqkey.elf"
+function = "<core::slice::iter::ChunksMut<u16> as core::iter::adapters::zip::TrustedRandomAccessNoCoerce>::size @mce460896 = <core::slice::iter::ChunksMut<u8> as core::iter::adapters::zip::TrustedRandomAccessNoCoerce>::size @mce460896"
+instruction = "udiv x0, x8, x9"
+justification = "ChunksMut::size, len / chunk_size: bm's coefs.chunks_mut(64) (256 / 64) and digest's block buffer inlined into hash_32b; both lengths are fixed sizes."
+
+[[divide]]
+elf = "pd-pq.elf"
+function = "<core::iter::adapters::zip::Zip<core::slice::iter::ChunksExact<u8>, core::slice::iter::IterMut<u64>> as core::iter::adapters::zip::ZipImpl<core::slice::iter::ChunksExact<u8>, core::slice::iter::IterMut<u64>>>::new @sha3"
+instruction = "udiv x8, x8, x9"
+justification = "sha3's Keccak absorb, block.chunks_exact(8).zip(state): the block length (the public rate) divided by the chunk size 8."
+
+[[divide]]
+elf = "pd-pq.elf"
+function = "<core::slice::iter::ChunksMut<u16> as core::iter::adapters::zip::TrustedRandomAccessNoCoerce>::size @mce460896 = <core::slice::iter::ChunksMut<u8> as core::iter::adapters::zip::TrustedRandomAccessNoCoerce>::size @mce460896"
+instruction = "udiv x0, x8, x9"
+justification = "ChunksMut::size, len / chunk_size: digest's block buffer inlined into hash_32b; both lengths are fixed sizes."
+
+[[function]]
+elf = "pd-pq.elf"
+name = "<&[generic_array::GenericArray<u8, typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UTerm, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>>] as core::iter::traits::collect::IntoIterator>::into_iter @sha3"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pq.elf"
+name = "<&[u16] as core::iter::traits::collect::IntoIterator>::into_iter"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pq.elf"
+name = "<core::iter::adapters::zip::Zip<core::slice::iter::ChunksExact<u8>, core::slice::iter::IterMut<u64>> as core::iter::adapters::zip::ZipImpl<core::slice::iter::ChunksExact<u8>, core::slice::iter::IterMut<u64>>>::new @sha3"
+justification = "core/digest iterator or buffer code over public lengths: branches on public slice lengths, chunk counts and buffer positions, or into the panic stops; csel clamps an iterator length to the shorter side (public). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "cbz" = 1, "csel cc" = 1 }
+
+[[function]]
+elf = "pd-pq.elf"
+name = "<core::iter::adapters::zip::Zip<core::slice::iter::ChunksExact<u8>, core::slice::iter::IterMut<u64>>>::new @sha3"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pq.elf"
+name = "<core::iter::adapters::zip::Zip<core::slice::iter::IterMut<u8>, core::slice::iter::Iter<u8>> as core::iter::adapters::zip::ZipImpl<core::slice::iter::IterMut<u8>, core::slice::iter::Iter<u8>>>::new"
+justification = "core/digest iterator or buffer code over public lengths: csel clamps an iterator length to the shorter side (public). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "csel cc" = 1 }
+
+[[function]]
+elf = "pd-pq.elf"
+name = "<core::slice::iter::ChunksExact<u8> as core::iter::traits::iterator::Iterator>::__iterator_get_unchecked @sha3"
+justification = "core/digest iterator or buffer code over public lengths: branches on public slice lengths, chunk counts and buffer positions, or into the panic stops. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.ne" = 1 }
+
+[[function]]
+elf = "pd-pq.elf"
+name = "<core::slice::iter::ChunksMut<u16> as core::iter::adapters::zip::TrustedRandomAccessNoCoerce>::size @mce460896 = <core::slice::iter::ChunksMut<u8> as core::iter::adapters::zip::TrustedRandomAccessNoCoerce>::size @mce460896"
+justification = "core/digest iterator or buffer code over public lengths: branches on public slice lengths, chunk counts and buffer positions, or into the panic stops. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.eq" = 1, "cbz" = 3 }
+
+[[function]]
+elf = "pd-pq.elf"
+name = "<core::slice::iter::IterMut<u64> as core::iter::adapters::zip::TrustedRandomAccessNoCoerce>::size @sha3"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pq.elf"
+name = "<digest::core_api::wrapper::CoreWrapper<sha3::Shake256Core> as digest::Update>::update::{closure#0} @mce460896"
+justification = "core/digest iterator or buffer code over public lengths: branches on public slice lengths, chunk counts and buffer positions, or into the panic stops; register-offset accesses at the public buffer position. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cs" = 1, "b.eq" = 1, "b.ne" = 2, "cbz" = 1, "ldr [x, x, lsl #3]" = 1, "str [x, x, lsl #3]" = 1 }
+
+[[function]]
+elf = "pd-pq.elf"
+name = "<generic_array::GenericArray<u8, typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UTerm, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>> as generic_array::sequence::GenericSequence<u8>>::generate::<<generic_array::GenericArray<u8, typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UTerm, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>> as core::default::Default>::default::{closure#0}> @sha3"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pq.elf"
+name = "<rosenpass_core::kem::McEliece460896 as rosenpass_core::kem::Encaps<524160: usize, 188: usize>>::encaps::<rosenpass_core::kem::Hedged<pd_pq::Cpu>>"
+justification = "The generic mce460896::encaps shim inlined into rosenpass-core's McEliece460896::encaps (C7 I8): tbnz is the RNG's Err (public), b.ne the loop on encaps_attempt's returned accept bit, the one datum C7 lets leave as public. Excluded from identity by name; baselined here as a tripwire."
+shape = { "b.ne" = 1, "tbnz" = 1 }
+
+[[function]]
+elf = "pd-pq.elf"
+name = "core::slice::copy_from_slice_impl::<core::mem::maybe_uninit::MaybeUninit<u8>> = core::slice::copy_from_slice_impl::<u8>"
+justification = "core/digest iterator or buffer code over public lengths: branches on public slice lengths, chunk counts and buffer positions, or into the panic stops. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.ne" = 1 }
+
+[[function]]
+elf = "pd-pq.elf"
+name = "core::slice::raw::from_ref::<generic_array::GenericArray<u8, typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UTerm, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>>> @sha3"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pq.elf"
+name = "keccak::keccak_p::<u64>"
+justification = "Keccak-p round loop: b.ne/cbz count the public round number, b.hi is the rounds <= 24 assert into core::panicking::panic. Data flow is branch-free. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.hi" = 1, "b.ne" = 1, "cbz" = 1 }
+
+[[function]]
+elf = "pd-pq.elf"
+name = "keccak::p1600"
+justification = "Tail call into keccak_p; no conditional instruction."
+shape = {}
+
+[[function]]
+elf = "pd-pq.elf"
+name = "mce460896::encaps_attempt"
+justification = "Thin root (C7 I5): calls encaps_attempt_core, tail-calls scrub_stack; no conditional instruction."
+shape = {}
+
+[[function]]
+elf = "pd-pq.elf"
+name = "mce460896::encaps_attempt_core"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4); register-offset accesses use public loop indices (I4) (packing ct and the preimage). The accept bit leaves as a value, not a branch. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cs" = 2, "b.ls" = 1, "b.ne" = 8, "cbnz" = 1, "cbz" = 2, "str [x, x]" = 1, "strb [x, x]" = 4, "strh [x, x]" = 2 }
+
+[[function]]
+elf = "pd-pq.elf"
+name = "mce460896::encrypt::gen_e"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4); csetm/csinv are the sampler's filter, compaction and duplicate masks (barrier, I3), branch-free selects; register-offset accesses use public loop indices (I4): the compaction writes every slot under a mask, never at a secret address. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cs" = 2, "b.eq" = 2, "b.ne" = 7, "csetm eq" = 3, "csinv ne" = 1, "ldr [x, x, lsl #3]" = 1, "ldrh [x, x]" = 4, "strh [x, x, lsl #1]" = 1, "strh [x, x]" = 1, "tbz" = 1 }
+
+[[function]]
+elf = "pd-pq.elf"
+name = "mce460896::encrypt::syndrome"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4) over pk rows and e words; csel cc clamps a zip length (public); register-offset accesses use public loop indices (I4). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.eq" = 1, "b.ne" = 3, "cbnz" = 1, "cbz" = 1, "csel cc" = 1, "ldr [x, x]" = 1, "ldrb [x, x]" = 1, "str [x, x]" = 1, "strb [x, x]" = 1 }
+
+[[function]]
+elf = "pd-pq.elf"
+name = "mce460896::hash_32b"
+justification = "SHAKE256 absorb/squeeze of the parts (digest's block buffer inlined): branches on the public part lengths and buffer position; csel cc clamps lengths; register-offset accesses use public loop indices (I4) into the block buffer. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cc" = 2, "b.cs" = 3, "b.ne" = 3, "cbz" = 3, "csel cc" = 2, "ldr [x, x, lsl #3]" = 1, "str [x, x, lsl #3]" = 1, "strb [x, x]" = 1 }
+
+[[function]]
+elf = "pd-pq.elf"
+name = "mce460896::scrub_stack"
+justification = "Loop over the SCRUB_DEPTH local array: b.ne is its public counter, the register-offset store the volatile zeroing at that counter. No secret is read."
+shape = { "b.ne" = 2, "str [x, x]" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<&[generic_array::GenericArray<u8, typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UTerm, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>>] as core::iter::traits::collect::IntoIterator>::into_iter @sha3"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<&[u64] as core::iter::traits::collect::IntoIterator>::into_iter @keccak"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<&[u8] as core::iter::traits::collect::IntoIterator>::into_iter"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<&mut core::ops::index_range::IndexRange as core::iter::traits::exact_size::ExactSizeIterator>::len"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<[u8]>::fill"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<core::iter::adapters::zip::Zip<core::iter::adapters::zip::Zip<core::slice::iter::IterMut<u8>, core::slice::iter::Iter<u8>>, core::slice::iter::Iter<u8>> as core::iter::adapters::zip::ZipImpl<core::iter::adapters::zip::Zip<core::slice::iter::IterMut<u8>, core::slice::iter::Iter<u8>>, core::slice::iter::Iter<u8>>>::new @mce460896"
+justification = "core/digest iterator or buffer code over public lengths: branches on public slice lengths, chunk counts and buffer positions, or into the panic stops; csel clamps an iterator length to the shorter side (public). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cc" = 1, "csel cc" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<core::iter::adapters::zip::Zip<core::slice::iter::ChunksExact<u8>, core::slice::iter::IterMut<u64>> as core::iter::adapters::zip::ZipImpl<core::slice::iter::ChunksExact<u8>, core::slice::iter::IterMut<u64>>>::new @sha3"
+justification = "core/digest iterator or buffer code over public lengths: branches on public slice lengths, chunk counts and buffer positions, or into the panic stops; csel clamps an iterator length to the shorter side (public). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "cbz" = 1, "csel cc" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<core::iter::adapters::zip::Zip<core::slice::iter::ChunksExact<u8>, core::slice::iter::IterMut<u64>>>::new @sha3"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<core::iter::adapters::zip::Zip<core::slice::iter::IterMut<u8>, core::slice::iter::Iter<u8>> as core::iter::adapters::zip::ZipImpl<core::slice::iter::IterMut<u8>, core::slice::iter::Iter<u8>>>::new"
+justification = "core/digest iterator or buffer code over public lengths: csel clamps an iterator length to the shorter side (public). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "csel cc" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<core::slice::iter::ChunksExact<u8> as core::iter::traits::iterator::Iterator>::__iterator_get_unchecked @sha3"
+justification = "core/digest iterator or buffer code over public lengths: branches on public slice lengths, chunk counts and buffer positions, or into the panic stops. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.ne" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<core::slice::iter::ChunksMut<u16> as core::iter::adapters::zip::TrustedRandomAccessNoCoerce>::size @mce460896 = <core::slice::iter::ChunksMut<u8> as core::iter::adapters::zip::TrustedRandomAccessNoCoerce>::size @mce460896"
+justification = "core/digest iterator or buffer code over public lengths: branches on public slice lengths, chunk counts and buffer positions, or into the panic stops. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.eq" = 1, "cbz" = 3 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<core::slice::iter::Iter<u8> as core::iter::adapters::zip::TrustedRandomAccessNoCoerce>::size = <core::slice::iter::IterMut<u8> as core::iter::adapters::zip::TrustedRandomAccessNoCoerce>::size"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<core::slice::iter::IterMut<u64> as core::iter::adapters::zip::TrustedRandomAccessNoCoerce>::size @sha3"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<digest::core_api::wrapper::CoreWrapper<sha3::Shake256Core> as digest::Update>::update::{closure#0} @mce460896"
+justification = "core/digest iterator or buffer code over public lengths: branches on public slice lengths, chunk counts and buffer positions, or into the panic stops; register-offset accesses at the public buffer position. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cs" = 1, "b.eq" = 1, "b.ne" = 2, "cbz" = 1, "ldr [x, x, lsl #3]" = 1, "str [x, x, lsl #3]" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<generic_array::GenericArray<u8, typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UTerm, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>> as generic_array::sequence::GenericSequence<u8>>::generate::<<generic_array::GenericArray<u8, typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UTerm, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>> as core::default::Default>::default::{closure#0}> @sha3"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "<mce460896::decrypt::Work as zeroize::Zeroize>::zeroize"
+justification = "zeroize's volatile wipe of the decrypt work area: b.ne is the loop over each fixed-size field, the register-offset stores its public index."
+shape = { "b.ne" = 14, "str [x, x]" = 8 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "core::slice::copy_from_slice_impl::<core::mem::maybe_uninit::MaybeUninit<u8>> = core::slice::copy_from_slice_impl::<u8>"
+justification = "core/digest iterator or buffer code over public lengths: branches on public slice lengths, chunk counts and buffer positions, or into the panic stops. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.ne" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "core::slice::raw::from_ref::<generic_array::GenericArray<u8, typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UInt<typenum::uint::UTerm, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B1>, typenum::bit::B0>, typenum::bit::B0>, typenum::bit::B0>>> @sha3"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "keccak::keccak_p::<u64>"
+justification = "Keccak-p round loop: b.ne/cbz count the public round number, b.hi is the rounds <= 24 assert into core::panicking::panic. Data flow is branch-free. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.hi" = 1, "b.ne" = 1, "cbz" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "keccak::p1600"
+justification = "Tail call into keccak_p; no conditional instruction."
+shape = {}
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::benes::benes"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4) over the Benes layers; register-offset accesses use public loop indices (I4). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.ne" = 12, "str [x, x]" = 4 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::benes::layer_ex"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4); csel hi is a public loop-bound clamp; register-offset accesses use public loop indices (I4): the swap is a mask, the indices are the layer's public stride. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cc" = 1, "b.cs" = 4, "b.eq" = 3, "b.hi" = 1, "b.ne" = 1, "cbnz" = 1, "csel hi" = 1, "ldr [x, x, lsl #3]" = 4, "str [x, x, lsl #3]" = 2 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::benes::layer_in"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4); register-offset accesses use public loop indices (I4): the swap is a mask, the indices the layer's public stride. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cs" = 4, "b.eq" = 3, "b.hi" = 2, "b.ne" = 1, "cbnz" = 1, "ldr [x, x]" = 1, "str [x, x]" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::benes::load_layer"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4) over the control-bit bytes of sk; register-offset accesses use public loop indices (I4) (byte offsets into sk are public). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.hi" = 2, "b.ls" = 3, "b.ne" = 1, "cbnz" = 1, "cbz" = 6, "ldrb [x, x]" = 1, "str [x, x]" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::bm::bm"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4) over the 2t BM iterations; the secret-dependent update (vec_cmov, the l/b update) is csetm/csel masks through the barrier, branch-free (the F1 site cmr got wrong); csel cc clamps zip lengths; register-offset accesses use public loop indices (I4). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cc" = 1, "b.cs" = 2, "b.eq" = 1, "b.hi" = 1, "b.ne" = 30, "cbnz" = 2, "cbz" = 3, "csel cc" = 3, "csetm cs" = 1, "csetm ne" = 1, "ldr [x, x, lsl #3]" = 3, "ldrh [x, x, lsl #1]" = 1, "str [x, x, lsl #3]" = 2, "str [x, x]" = 9, "strh [x, x, lsl #1]" = 1, "strh [x, x]" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::decaps"
+justification = "Thin root (C7 I5): calls decaps_core, tail-calls scrub_stack; no conditional instruction."
+shape = {}
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::decaps_core"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4); csel cc clamps a zip length (public); csetm eq turns the merged failure flag (the C1 compare and the decode failure) into the select mask, branch-free; register-offset accesses use public loop indices (I4). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cc" = 1, "b.ls" = 1, "b.ne" = 5, "cbz" = 1, "csel cc" = 1, "csetm eq" = 1, "ldrb [x, x]" = 1, "strb [x, x]" = 4 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::decrypt::decrypt"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4); ccmp/cset eq combine the weight check and the syndrome compare into the returned mask without a branch; csel cc clamps a zip length; register-offset accesses use public loop indices (I4). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.eq" = 1, "b.ls" = 1, "b.ne" = 11, "cbz" = 1, "ccmp eq" = 1, "csel cc" = 1, "cset eq" = 1, "ldr [x, x, lsl #3]" = 2, "ldr [x, x]" = 1, "ldrb [x, x]" = 1, "str [x, x, lsl #3]" = 1, "strb [x, x]" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::decrypt::scaling"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4) over the 128 field-element vectors; register-offset accesses use public loop indices (I4). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cc" = 1, "b.ne" = 9, "ldr [x, x, lsl #3]" = 1, "ldr [x, x]" = 1, "str [x, x]" = 4 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::decrypt::syndrome"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4); csel cc clamps a zip length (public); register-offset accesses use public loop indices (I4). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.ls" = 2, "b.ne" = 2, "cbz" = 1, "csel cc" = 1, "strb [x, x]" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::fft::fft"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4) over the radix conversions and butterflies; csel cc clamps a zip length; register-offset accesses use public loop indices (I4) (the butterfly schedule and FFT_CONSTS indices are public). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cs" = 5, "b.eq" = 3, "b.hi" = 1, "b.ls" = 1, "b.ne" = 15, "cbnz" = 1, "cbz" = 2, "csel cc" = 1, "ldr [x, x, lsl #3]" = 14, "ldr [x, x]" = 6, "ldrh [x, x, lsl #1]" = 1, "str [x, x, lsl #3]" = 3, "str [x, x]" = 6 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::fft_tr::fft_tr"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4) over the transposed butterflies; tbnz tests a public loop bit; register-offset accesses use public loop indices (I4). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cc" = 1, "b.cs" = 4, "b.eq" = 2, "b.hi" = 2, "b.ne" = 22, "cbnz" = 3, "ldr [x, x, lsl #3]" = 1, "ldr [x, x]" = 5, "ldrh [x, x, lsl #1]" = 1, "str [x, x, lsl #3]" = 3, "str [x, x]" = 12, "tbnz" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::hash_32b"
+justification = "SHAKE256 absorb/squeeze of the parts (digest's block buffer inlined): branches on the public part lengths and buffer position; csel cc clamps lengths; register-offset accesses use public loop indices (I4) into the block buffer. C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cc" = 2, "b.cs" = 3, "b.ne" = 3, "cbz" = 3, "csel cc" = 2, "ldr [x, x, lsl #3]" = 1, "str [x, x, lsl #3]" = 1, "strb [x, x]" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::scrub_stack"
+justification = "Loop over the SCRUB_DEPTH local array: b.ne is its public counter, the register-offset store the volatile zeroing at that counter. No secret is read."
+shape = { "b.ne" = 2, "str [x, x]" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::transpose::transpose_64x64"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4) over the six transpose rounds; register-offset accesses use public loop indices (I4). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cs" = 3, "b.eq" = 1, "b.hi" = 1, "b.ne" = 1, "cbnz" = 2, "ldr [x, x, lsl #3]" = 2, "str [x, x, lsl #3]" = 2 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::util::irr_load"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4) over the Goppa polynomial's coefficients; register-offset accesses use public loop indices (I4). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cs" = 1, "b.eq" = 1, "b.ne" = 4, "cbz" = 2, "ldrh [x, x]" = 1, "str [x, x, lsl #3]" = 2, "strh [x, x]" = 1 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::vec::inv"
+justification = "Loop control on the public exponent chain (b.ne); register-offset accesses use public loop indices (I4). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.ne" = 2, "str [x, x]" = 2 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::vec::mul"
+justification = "b.<cond>/cbz/cbnz are loop control on public counters over fixed-size arrays and bounds or overflow checks into the panic stops (public indices, I4) over the bitsliced product; register-offset accesses use public loop indices (I4). C9 CT mode runs it with sk and rand marked secret and reports nothing on its executed paths."
+shape = { "b.cs" = 1, "b.ne" = 3, "ldr [x, x, lsl #3]" = 1, "ldr [x, x]" = 2, "str [x, x]" = 2 }
+
+[[function]]
+elf = "pd-pqkey.elf"
+name = "mce460896::vec::sq"
+justification = "Straight-line bitsliced squaring: no conditional instruction or register-offset access."
+shape = {}

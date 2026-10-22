@@ -7,7 +7,11 @@
 # mechanical condition: while Cargo.lock locks any classic-mceliece-rust,
 # SC23 must be listed with status "open". `tools/check-pins` (P6) and
 # `tools/package` (`check_bindings`, every kernel) both enforce it.
-# SC26 has no mechanical signal and is closed by hand.
+# SC26 has no mechanical signal and is closed by hand. Closing SC23 does not
+# lift the release refusal on its own: `tools/package` also runs
+# `tools/ct-shape` (identity and forbidden instructions) over the ELFs it
+# packages, for every kernel config, and for non-debug configs requires the
+# constant-time gate's pass record (M4 plan C11).
 #
 # Schema (parsed by tools/waivers.py; anything else is an error):
 #
@@ -17,12 +21,13 @@
 #   status = "open" | "closed"
 
 # cmr 2.0.2 is unaudited, and the C8 spike found a secret-dependent load in
-# the pqkey ELF (Berlekamp-Massey select); replacing it with M4's
-# requirements met lifts the L2 constant-time waiver for `pqkey`.
+# the pqkey ELF (Berlekamp-Massey select). Closed by M4: cmr is replaced by
+# mce460896 under the C9 memcheck gate and the C10 identity gate, and L2 is
+# amended to name that basis (secureos-m4-verus-mceliece plan C11).
 [[waivers]]
 id = "SC23"
 owner = "M4"
-status = "open"
+status = "closed"
 
 # Rosenpass cookie gate under load, its flood and latency cases, and the
 # guest-RAM OSK residue scan. Closed by M3b: C6 and C7 pass in the solo

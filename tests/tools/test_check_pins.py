@@ -63,7 +63,8 @@ def lock_cmr(t: pathlib.Path, version: str = "2.0.2"):
                              'source = "registry+https://github.com/rust-lang/crates.io-index"\n')
 
 
-SC23 = '[[waivers]]\nid = "SC23"\nowner = "M4"\nstatus = "open"\n'
+# SC23 as the live policy lists it (closed since M4).
+SC23 = '[[waivers]]\nid = "SC23"\nowner = "M4"\nstatus = "closed"\n'
 SECRET = "\npub struct Secret<const N: usize>([u8; N]);\n"
 
 
@@ -149,11 +150,11 @@ CASES = [
     # The live tree no longer locks cmr (M4 cut-over), so the locked cases
     # inject it, and P13 (cmr is gone) fires on each of them too.
     ("cmr locked and SC23 open: only P13", {"P13"},
-     lambda t: (lock_cmr(t), edit(t / "policy/waivers.toml", SC23, SC23))),
+     lambda t: (lock_cmr(t), edit(t / "policy/waivers.toml", SC23, SC23.replace('"closed"', '"open"')))),
     ("P6 cmr locked and SC23 absent", {"P6", "P13"},
      lambda t: (lock_cmr(t), edit(t / "policy/waivers.toml", SC23, ""))),
     ("P6 cmr locked and SC23 closed", {"P6", "P13"},
-     lambda t: (lock_cmr(t), edit(t / "policy/waivers.toml", SC23, SC23.replace('"open"', '"closed"')))),
+     lambda t: (lock_cmr(t), edit(t / "policy/waivers.toml", SC23, SC23))),
     ("allow neither cmr nor SC23", set(), lambda t: edit(t / "policy/waivers.toml", SC23, "")),
     ("P6 cmr at another version and SC23 absent", {"P6", "P13"},
      lambda t: (lock_cmr(t, "2.0.3"), edit(t / "policy/waivers.toml", SC23, ""))),
@@ -173,7 +174,7 @@ CASES = [
     ("P6 waivers.toml missing", {"P6"}, lambda t: (t / "policy/waivers.toml").unlink()),
     ("P6 waivers.toml unparsable", {"P6"}, lambda t: edit(t / "policy/waivers.toml", SC23, SC23 + "status = \n")),
     ("P6 waiver status neither open nor closed", {"P6"},
-     lambda t: edit(t / "policy/waivers.toml", SC23, SC23.replace('"open"', '"waived"'))),
+     lambda t: edit(t / "policy/waivers.toml", SC23, SC23.replace('"closed"', '"waived"'))),
     ("P6 waiver with an unknown key", {"P6"},
      lambda t: edit(t / "policy/waivers.toml", SC23, SC23 + 'expires = "never"\n')),
     ("P6 waiver id listed twice", {"P6"}, lambda t: edit(t / "policy/waivers.toml", SC23, SC23 + "\n" + SC23)),

@@ -19,8 +19,10 @@ malformed lock refuses instead of requiring nothing.
 
 Known bypass (declared, not adjudicated): the binding is by crate name in
 Cargo.lock. A McEliece implementation vendored or forked under another name
-would not hold SC23 open; SC23 closes only through M4's disassembly check
-of the pqkey ELF (C8 spike, requirement (c)), not through this rule.
+would not hold SC23 open. Since M4, SC23 is closed, and the release path is
+bound instead by tools/package: it runs tools/ct-shape (C10 identity and
+forbidden instructions) on the ELFs it packages, and for non-debug configs
+requires the C9 pass record (secureos-m4-verus-mceliece plan C11).
 """
 
 import pathlib
