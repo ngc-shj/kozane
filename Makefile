@@ -141,7 +141,9 @@ SEL4_INCLUDE_DIRS=$(abspath $(sdk_config_dir)/include) \
 endef
 
 unit: | $(counts)
-	cargo test --locked $(foreach c,$(host_crates),-p $(c)) > $(counts)/unit.log 2>&1 \
+	# --no-fail-fast: one failing crate must not hide another's failure (a
+	# selftest needle in a later crate would never print).
+	cargo test --locked --no-fail-fast $(foreach c,$(host_crates),-p $(c)) > $(counts)/unit.log 2>&1 \
 		|| { cat $(counts)/unit.log; exit 1; }
 	# Per-crate counts too (M2 plan T12): a crate whose tests stop running
 	# fails the manifest even if the total still clears its minimum. Test
@@ -198,16 +200,18 @@ ct-harness:
 ct_valgrind := valgrind
 ct_residue_wrap :=
 ct: ct-harness | $(counts)
-	# The harness's own clippy and unit tests (its report parser), on the
-	# host: it is its own workspace, so `make lint` and `make unit` do not
-	# see it. They run before ct-gate, which writes the C9 pass record that
-	# tools/package accepts: a failure here must not leave one behind.
-	cargo clippy --locked --manifest-path tools/ct-harness/Cargo.toml --target-dir $(BUILD)/ct/target-host \
-		--all-targets -- -D warnings > $(counts)/ct-lint.log 2>&1 || { cat $(counts)/ct-lint.log; exit 1; }
-	cargo test --locked --manifest-path tools/ct-harness/Cargo.toml --target-dir $(BUILD)/ct/target-host \
-		> $(counts)/ct-unit.log 2>&1 || { cat $(counts)/ct-unit.log; exit 1; }
 	tools/ct-gate $(ct_harness) "$(ct_valgrind)" "$(ct_residue_wrap)" > $(counts)/ct.log 2>&1 \
 		|| { cat $(counts)/ct.log; exit 1; }
+	# The harness's own clippy and unit tests (its report parser), on the
+	# host: it is its own workspace, so `make lint` and `make unit` do not
+	# see it. They run after ct-gate (a mutated harness must reach memcheck
+	# first), and a failure here removes the C9 pass record ct-gate wrote,
+	# which tools/package would otherwise accept.
+	cargo clippy --locked --manifest-path tools/ct-harness/Cargo.toml --target-dir $(BUILD)/ct/target-host \
+		--all-targets -- -D warnings > $(counts)/ct-lint.log 2>&1 \
+		|| { cat $(counts)/ct-lint.log; rm -f $(BUILD)/ct/pass-*; echo "ct: harness lint failed; C9 pass record" "removed"; exit 1; }
+	cargo test --locked --manifest-path tools/ct-harness/Cargo.toml --target-dir $(BUILD)/ct/target-host \
+		> $(counts)/ct-unit.log 2>&1 || { cat $(counts)/ct-unit.log; rm -f $(BUILD)/ct/pass-*; echo "ct: harness tests failed; C9 pass record" "removed"; exit 1; }
 	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-CT-HARNESS", n + 0 }' $(counts)/ct-unit.log >> $(counts)/ct
 
 # C10 (tools/ct-shape): the mce460896 closures in pd-pqkey and pd-pq equal

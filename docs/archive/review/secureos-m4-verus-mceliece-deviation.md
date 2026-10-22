@@ -940,3 +940,24 @@ record what changed in the plan's mechanisms.
     two, rp gate boot for one. `integration-count` stays unfiltered,
     because it needs the full count.
   - **Unknown names:** an unknown boot name fails the run.
+- **The first full selftest on the warm tree** (code at `e2d7c97`) took
+  8,631 s for 100 cases. 90 passed and 8 failed, each for a reason in the
+  selftest or the gate rather than in the property it proves:
+  - **`verus-trusted`:** the needle predated round 1's per-item message.
+  - **`ct-canary`, `ct-early-exit` and `ct-declassify-width`:** these mutate
+    the harness, and round 1 (F7) had moved the harness clippy before
+    ct-gate, so clippy refused them first.
+    - ct-gate runs first again. A clippy or test failure after it removes
+      the pass record it wrote, which keeps F7's guarantee, and says so.
+    - `ct-harness-lint`'s needle is that message, its echo split so that
+      make's printed recipe cannot match it.
+  - **`c2-hello-burst` (stale since M3b):** M3b shrank `RP_IN_FLIGHT`, so
+    the mutated burst (15) no longer broke the C2 assertion. It went
+    unseen because an earlier crate's test failure stopped `cargo test`
+    before pqkey-core. Two fixes:
+    - `make unit` runs `--no-fail-fast`;
+    - the mutation sits at the boundary (21: 31 > 21 + 10 is false). Much
+      above that, ingress-core's arrays stop compiling.
+  - **`integration-residue`, `integration-expiry-residue` and
+    `integration-count`:** on `ff55c04` they pass. Re-run alone, with the
+    boot filter, `integration-residue` took 137 s.

@@ -258,7 +258,7 @@ CASES = {
                       lambda t: edit(t, "crates/wg-wire/src/replay.rs",
                                      "#[inline]\nfn below_window(",
                                      "#[inline]\n#[cfg_attr(verus_keep_ghost, verifier::external_body)]\nfn below_window("),
-                      "trusted construct `external_body` not in the allowlist"),
+                      "trusted construct `external_body` on `below_window` not in the allowlist"),
     # A required function moved below the verus! block, as plain Rust
     # without its ensures: the file still builds as Rust, and the source
     # check rejects it before Verus runs (Verus would also refuse the call
@@ -329,11 +329,12 @@ CASES = {
                                                "        let v = [1u8];\n        assert!(v.is_empty());\n    }\n\n"),
                         "selftest_injected_failure ... FAILED"),
     # ... and its clippy (T12): a lint in the report parser fails `make ct`
-    # before ct-gate runs.
+    # after ct-gate, and the pass record ct-gate wrote is removed (the echo
+    # is split so make's printed recipe line cannot match the needle).
     "ct-harness-lint": (["ct"], lambda t: edit(t, "tools/ct-harness/src/report.rs", "#[cfg(test)]\nmod tests {\n",
                                                "pub fn selftest_lint() -> usize {\n    let v = vec![1u8];\n    v.len()\n}\n\n"
                                                "#[cfg(test)]\nmod tests {\n"),
-                        "useless use of `vec!`"),
+                        "ct: harness lint failed; C9 pass record removed"),
     # Without the canary, a run that checked nothing could look clean.
     "ct-canary": (["ct"], lambda t: edit(t, "tools/ct-harness/src/ct.rs", "    black_box(canary(&secret));\n", ""),
                   "want 1 errors (the canary)"),
@@ -571,9 +572,13 @@ CASES = {
                                                  'mix: kh_public(&ckextract, b"mix")?', 'mix: kh_public(&ckextract, b"miy")?'),
                         "---- tests::resp_hello_and_its_ck_chain_match_upstream_byte_for_byte stdout ----"),
     # The pqkey budget invariant (M3 plan C2): each side loosened on its own.
+    # At the boundary: 32 - 1 > 21 + RP_IN_FLIGHT (10) is false by equality.
+    # (15 stopped failing it once M3b shrank RP_IN_FLIGHT, unseen while an
+    # earlier crate's test failure stopped `cargo test` before pqkey-core;
+    # much above 21, ingress-core's own arrays stop compiling.)
     "c2-hello-burst": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
                                                 "pub const RP_HELLO_GLOBAL_BURST: u64 = 8;",
-                                                "pub const RP_HELLO_GLOBAL_BURST: u64 = 15;"),
+                                                "pub const RP_HELLO_GLOBAL_BURST: u64 = 21;"),
                        "C2: forwarded InitHellos plus the pq backlog can exhaust pqkey's bucket"),
     "c2-hello-interval": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
                                                    "pub const RP_HELLO_GLOBAL_INTERVAL_NS: u64 = 10_000_000_000;",
