@@ -15,8 +15,13 @@ use std::path::{Path, PathBuf};
 const _: () = assert!(validate::MAX_PEERS <= secret_blob::MAX_PEERS);
 
 fn main() {
-    let path = std::env::var("SECUREOS_CONFIG")
-        .unwrap_or_else(|_| concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/gateway.toml").into());
+    // CARGO_MANIFEST_DIR is read when the script runs, not baked in when it
+    // is compiled: a build-script binary reused from another tree's build
+    // (the shared PD target directory, M5 C3) must not carry that tree's path.
+    let path = std::env::var("SECUREOS_CONFIG").unwrap_or_else(|_| {
+        let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|e| panic!("CARGO_MANIFEST_DIR: {e}"));
+        format!("{manifest}/../../config/gateway.toml")
+    });
     println!("cargo:rerun-if-env-changed=SECUREOS_CONFIG");
     println!("cargo:rerun-if-changed={path}");
     println!("cargo:rerun-if-changed=src/validate.rs");
