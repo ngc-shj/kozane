@@ -223,4 +223,38 @@ container.
 
 ## Resolution Status
 
-(Filled in once the round's fixes pass their gates.)
+Six rounds. The per-mechanism record is in the deviation log's sections
+"Phase 3 round 1 fixes" through "Round 6".
+
+| Round | Commits | Critical/Major raised | Resolved in |
+|---|---|---|---|
+| 1 | e2d7c97 | F1-F5, S1-S5, T1-T6 | round 1, re-checked in round 2 |
+| 2 | 10f8dd8, ff55c04, 5647da7, 32a016c | S2, S3, S6, S12, N1, T15 | round 3: Verus `--no-cheating` for four crates, plus the hardened scan |
+| 3 | 4a00aa1, d4da730, 0f8f0b7 | S2/N1, S3/S6/N3, S19 | round 4 |
+| 4 | ce76726 | F-R4-1, N1-N3 (security), T34 | round 5 |
+| 5 | 0b68f4f | F-R5-1 (env aliases), T34 continuing | round 6 confirmed resolved |
+| 6 | 3f113cc, f395187, 3ebe77a | none (F-R6-1, F-R6-2 Minor, fixed) | — |
+
+- **Accepted residuals:** each is in the deviation log with its worst case
+  and cost to close.
+  - **Where the source scan stops:** msgs relies on the scan, and the scan
+    is not complete against deliberate evasion. The MIR comparison is
+    deferred to M5.
+  - **Red-proofs not done:** g's residue needle has none, and neither does
+    verus-gate's own-summary clause (T10).
+  - **ct-identity:** it has no separate allow-side run (T8).
+  - **pqkey's stack:** its post-boot depth is unmonitored; it ran 688 B
+    deeper than the boot mark.
+  - **kani-gate.sh's lock comment:** it says "machine" rather than
+    "container". It is to be fixed when the lock moves out of the hashed
+    script.
+  - **Verus macro/vstd pairing:** checked by version only (S11), deferred
+    to M5's image rebuild.
+- **Final gates:**
+  - **`make check`:** at 3ebe77a, solo on gx10, it passed in 1,480 s.
+    Kani was served from cache, Verus verified four crates under
+    `--no-cheating`, and the stack headroom was pq 69,376 B and pqkey
+    31,664 B free.
+  - **Full selftest:** all cases passed at ce76726 on z1mn (6,074 s). The
+    layers the later commits touch (verus, pins, test) were re-run at
+    f395187 and 3ebe77a.

@@ -1177,3 +1177,14 @@ is closed at its primitive instead, per the R42 convergence rule.
   could be counted before its `lost=` arrived. pq's new StackHighWater
   record, printed at that moment, made the window wider. The wait now takes
   the whole line. No other wait in run.py is followed by such a recount.
+- **Observed once, on z1mn only:** `rp latency` ("no WireGuard handshake
+  within 19 s under a Rosenpass flood") failed inside the unfiltered
+  `integration-count` run at `3ebe77a`.
+  - **Elsewhere:** the same case passed in z1mn's full selftest at
+    `ce76726`, and in gx10's make check and `integration-count` at
+    `3ebe77a`.
+  - **Likely cause:** z1mn runs QEMU's TCG on Apple Silicon under Docker
+    Desktop, so its timing differs from gx10's. The case is a TCG timing
+    budget from M3b.
+  - **Residual:** if it recurs on either machine it is a test defect to
+    find, not to widen.

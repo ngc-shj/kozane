@@ -28,7 +28,7 @@ PQ-hybrid HTTPS reverse proxy on the same base.
 | M1 | virtio-net driver, `ingress` (ARP + UDP echo), `audit`, laws checker, proofs for `ring`/`wire`/driver copy | done |
 | M2 | WireGuard responder (`hs`, `key`, `data`), `rng`, second NIC, dev secrets packaging, fault policy | |
 | M3 | Rosenpass (`pq`), PQ-mandatory gate | |
-| M4 | Verus/Vest re-proofs | |
+| M4 | Verus/Vest re-proofs | done: Verus proofs for wg-wire, msgs, rosenpass-wire, wire and ring (278 functions; four under `--no-cheating`); Classic McEliece 460896 ported in-tree (mce460896) with the C9 constant-time and residue gate, C10 ELF identity and SC23 closed. Residuals: docs/archive/review/secureos-m4-verus-mceliece-deviation.md |
 | M5 | Reproducible build, measured boot, TPM sealing, attestation, signed releases, UART audit | |
 | M6 | HTTPS proxy | |
 | M7 | Real hardware (verified board) | |
