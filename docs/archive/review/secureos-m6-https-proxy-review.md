@@ -301,3 +301,62 @@ partial (N11); R43 N/A; R44 OK; R45 watch; R46 N/A; R47 resolved (N1 same
 class); R48 N/A; R49 OK; R50 N9; R51, R52 N/A; R53 resolved (N14); R54–R57
 N/A; RT1 resolved; RT2 resolved; RT3 watch; RT4 N5, N6; RT5 OK; RT6 N10; RT7
 N1, N5, N7, N9, N11; RT8 OK; RT9 watch; RT10 resolved; RT11 watch.
+
+# Review round 3
+Date: 2026-10-24
+
+## Changes from Previous Round
+
+Plan v3 (ec0df65, 954bd1f). Functionality: F-N1–F-N13 and F15 resolved;
+four Minors (N-a, N-c prose; N-b execution-reachable; N-d design).
+Security: all tracked findings resolved except S-N7 (partly); three Minors
+(R3-1, R3-2 design; R3-3 prose); no Critical or Major. Testing: six Majors
+and four Minors, all on test design (barriers, vacuity, red-proof reach).
+Saturation is not met (open Majors, design findings); round 4 follows.
+
+## Merged findings and dispositions (plan v4)
+
+| ID(s) | Sev | Subject | Resolution |
+|---|---|---|---|
+| T-R3-1 | Major | Coalesced totals asserted where no line prints | Case 11 first in `https-residue`, asserts `total=1`; case 9 crosses a printed point (≥ 64) |
+| T-R3-2 | Major | Case 2 barrier vs one request per connection | Cases 1→2 one connection: head + partial body, `k`, more body; the backend logging post-KeyUpdate body bytes is the barrier |
+| T-R3-3 | Major | Client EOF precedes the socket wipe | Wipe order stated; barrier = sniffer sees the abort RST |
+| T-R3-4 | Major | Recycling count does not exercise TIME-WAIT | Server-initiated closes, seven held in streaming and checked alive, red-proof without abort |
+| T-R3-5 | Major | Case 12 without overlap; red-proof trips the canary | Own boot without the canary; baseline and overlap precondition; named needle |
+| T-R3-6, S-R3-3 | Major/Minor | early_data skip untested; preconditions | Preconditions (offered, no sequence advance, until first success) in C6; host-client cases and mutations |
+| S-R3-1 | Minor | CA constraints open in the other name form | Both forms constrained per mode; negative leaves per mode |
+| S-R3-2 | Minor | Ephemerals not wiped; no `tls` stack scrub | Secret types; `tls` scrub after exchange and TlsSign; seam test; mutation |
+| F-N-a | Minor (prose) | Audit list gaps | D5 events and `tls` halt table; `StackHighWater` reused; base+value spellings |
+| F-N-b | Minor | Boot-time TLS check leaves stack copies | `key` stack scrubbed after the check |
+| F-N-c | Minor (prose) | L3 row narrower than C8 | `inner_rx`/`inner_tx` named |
+| F-N-d | Minor | TLS_PORTS validation | Rules and tests in C3 |
+| T-R3-7 | Minor | Case 8 zero-count control | `gateway_private` present |
+| T-R3-8 | Minor (prose) | Canary measurement | curl `time_appconnect − time_connect` vs 1/3 timeout |
+| T-R3-9 | Minor (prose) | Case 13 observation | `s_client -msg`, ECONNRESET, sniffer |
+| T-R3-10 | Minor | Lock pin without fixture | Fixture and selftest |
+
+## Recurring Issue Check (round 3)
+
+### Functionality expert
+R1 N-a; R2 resolved; R3 checked; R4 N-a; R5–R9 N/A; R10 checked; R11 N/A;
+R12 N-a; R13–R15 N/A; R16, R17 checked; R18 N-d; R19–R21 N/A; R22 checked;
+R23, R24 N/A; R25 resolved; R26–R28 N/A; R29 re-verified; R30, R31 N/A; R32
+checked; R33 N/A; R34, R35 checked; R36, R37 N/A; R38 resolved; R39 N-b; R40,
+R41 resolved; R42, R43 checked; R44–R48 N/A; R49 N-c; R50 checked; R51 N/A;
+R52 checked; R53 resolved; R54–R57 N/A.
+
+### Security expert
+R1, R2 OK; R3 R3-2; R4–R11 N/A; R12 OK; R13–R16 N/A; R17, R18 OK; R19–R28
+N/A; R29 OK; R30, R31 N/A; R32 OK; R33 N/A; R34, R35 OK; R36, R37 N/A; R38 OK;
+R39 R3-2; R40–R43 OK; R44–R46 N/A; R47–R53 OK; R54 N/A; R55 OK; R56, R57 N/A;
+RS1, RS2 OK; RS3 R3-3; RS4 OK; RS5 R3-1; RS6 OK.
+
+### Testing expert
+R1 N/A; R2 watch; R3 resolved; R4 R3-1; R5, R6 N/A; R7 resolved; R8–R11 N/A;
+R12 resolved; R13–R15 N/A; R16 resolved; R17 watch; R18 resolved; R19–R28
+N/A; R29 checked (kani-gate cover enforcement true); R30, R31 N/A; R32 OK;
+R33, R34 N/A; R35 OK; R36, R37 N/A; R38 R3-3; R39 R3-2, R3-3; R40, R41 OK; R42
+partial (R3-6, R3-10); R43 N/A; R44 OK; R45 watch; R46 N/A; R47 OK; R48 N/A;
+R49 OK; R50 resolved; R51, R52 N/A; R53 note (R3-8); R54–R57 N/A; RT1, RT2 OK;
+RT3 watch; RT4 R3-4, R3-5; RT5, RT6 OK; RT7 R3-5, R3-6, R3-7, R3-10; RT8 OK;
+RT9 watch; RT10 R3-6; RT11 watch.
