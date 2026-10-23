@@ -936,3 +936,15 @@ deviations from the plan:
 - **Accepted (S-TPMPD-2-A):** a stuck client keeps the other client Busy
   until its 120 s budget expires. Worst case, likelihood and cost are in
   the code review.
+
+## Phase 3 round 3 fixes
+
+- **The round-3 commit preceded its gates** (as in slice 5 and round 1).
+  The gates then found two test defects, fixed in the follow-up commit:
+  the RAM scan raced pqkey's unseal, and `measure-ctrlc`'s needle no
+  longer matched once Ctrl-C was also sent at spawn.
+- **One unexplained `measured boot` failure.** The first post-commit
+  `make test it_boots="measured boot"` failed and its log was overwritten
+  by the next run, so the cause is unknown. Four later runs of the same
+  boot, and every measure-* selftest run, passed. Logs are now kept per
+  run; a recurrence is to be diagnosed, not retried away.

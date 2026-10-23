@@ -1449,6 +1449,9 @@ def test_mismatched_blob(pkg: "Package"):
     try:
         m = con.wait_for(rf"audit: src=hs KeyUnavailable code={code} lost=\d+\r*\n", timeout=BOOT_TIMEOUT_S)
         con.wait_for(rf"audit: src=hs Halted reason={reason} lost=\d+\r*\n", since=m.end(), timeout=LINE_TIMEOUT_S)
+        # pq audits pqkey's stack mark only once pqkey's init has returned:
+        # before it, pqkey may not yet have unsealed its control plaintext.
+        con.wait_for(r"audit: src=pq KeyStackHighWater bytes=", timeout=BOOT_TIMEOUT_S)
         scan_absent(Monitor(monitor), gateway_private, pq_plain, os.path.join(deploy, "pmem-b.bin"),
                     "key's opened blob (an Unavailable key must hold no secret)", "pqkey's plaintext")
     finally:

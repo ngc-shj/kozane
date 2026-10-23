@@ -458,3 +458,74 @@ findings.
     hook in a shipped PD, which is itself an attack surface. Not worth it
     for a defence-in-depth wipe, since the Ready state holds the same data.
 - **Orchestrator sign-off:** acceptable-risk exception satisfied.
+
+# Round 3
+Date: 2026-10-24
+
+## Changes from Previous Round
+
+Round 3 reviewed the round-2 fixes (`6aa9f15..8193d9f`). The security
+expert resolved S-BOOT-5, S-REL-4 and the comment nit, and upheld
+S-TPM2-3 and S-TPMPD-2-A. It challenged T3's acceptance. R43 found no
+widening except the dropped power-off assertion (R3-S1). There are no new
+Critical or Major findings.
+
+## New findings (all Minor)
+
+- **R3-S1 (security)** round 2 dropped `con.alive` from `measure_boot`'s
+  refusal check. A refusal that stays alive and silent (power-off removed,
+  spin kept) passed, so S-BOOT-1's "U-Boot powers off" was no longer
+  tested.
+- **T3 challenge (security)** the acceptance assumed RNDR fault injection.
+  `test_mismatched_blob` already unseals a valid envelope and fails
+  `Oracle::boot` with `GatewayKeyMismatch`, which is exactly the
+  `inspect_err` path in `crates/pds/key`.
+- **R3-N1 (security, Nit)** S-TPM2-3's worst case and the `boot.rs` comment
+  name only the HMAC/KDF frames; the libcrux P-256 ECDH in `start()` (the
+  ephemeral scalar) is as likely to be the deepest.
+- **R3-N2 (security, Nit)** Ctrl-C is sent only after "boot refused", so a
+  fragment that lost `AUTOBOOT_KEYED` and an early Ctrl-C (skipping the
+  32-bit field checks with no refusal line) went unnoticed.
+
+## Resolution Status (round 3)
+
+### R3-S1 Minor power-off no longer checked
+- Action: the refusal branch fails with "U-Boot ran past its refusal" on a
+  later "secureos: measured" or a `=>` prompt, then with "U-Boot did not
+  power off after its refusal" if the console is alive at the deadline.
+- Red-proof: `measure-halt` (`HALT = "true"`) is red with "ran past";
+  the new case `measure-poweroff` (spin kept, power-off removed) is red
+  with "did not power off". Each proves its own control.
+- Modified file: tests/integration/run.py, tools/check-selftest
+
+### T3 Minor PD-side wipe — reopened and fixed
+- Action: after `KeyUnavailable` and `hs`'s halt, and once pq has audited
+  pqkey's `KeyStackHighWater` (pqkey's init has returned), the case dumps
+  guest RAM and requires that deployment B's gateway private key occurs
+  nowhere, while a slice of pqkey's McEliece secret key (deployment A,
+  Ready) occurs at least once, as the control.
+- Red-proof: the new case `key-wipe` replaces the `inspect_err` wipe with
+  `let _ = buf;` and is red with "key's opened blob (an Unavailable key
+  must hold no secret) still in guest RAM".
+- The first run without the `KeyStackHighWater` wait failed on the control
+  ("pqkey's plaintext not found"): the scan ran before pqkey had unsealed.
+  The wait is on that observable event, not on time.
+- Modified file: tests/integration/run.py, tools/check-selftest
+
+### R3-N1 Nit P-256 frames
+- Action: the `boot.rs` scrub comment names the P-256 ECDH frames in
+  `start()` with the HMAC/KDF/CFB ones. S-TPM2-3's worst case reads the
+  same: the deepest unwiped frames may be libcrux P-256, which also leaves
+  the ephemeral scalar; turning any of it into the KEK still needs the
+  captured unseal response.
+- Modified file: crates/tpm2/src/boot.rs
+
+### R3-N2 Nit early Ctrl-C
+- Action: `measure_boot` also sends 0x03 right after spawn; the byte waits
+  in the UART for the boot command's first poll.
+- Red-proof: `measure-ctrlc` now removes only the `AUTOBOOT_KEYED` line and
+  is red with "a wrapping range was not refused" (twice, the same way): the
+  early Ctrl-C ends the 32-bit field loops and the wrapping descriptor is
+  measured. The case no longer also drops the power-off, which made two
+  messages possible.
+- Modified file: tests/integration/run.py, tools/check-selftest

@@ -599,9 +599,6 @@ CASES = {
         t, "tools/uboot-config", 'HALT = "poweroff; while true; do true; done"\n',
         'HALT = "while true; do true; done"\n'),
         "measure_boot: U-Boot did not power off after its refusal"),
-    # S-BOOT-5: a power-off that returns leaves the refusal spinning; without
-    # AUTOBOOT_KEYED, the Ctrl-C measure_boot sends breaks the spin and the
-    # boot goes on to measure.
     # M5 plan C6 (review T3): without the wipe after a failed boot, the
     # Unavailable key keeps the opened blob in guest RAM.
     "key-wipe": (["test", "it_boots=mismatched blob halts key"], lambda t: edit(
@@ -613,11 +610,13 @@ CASES = {
         "    })\n",
         "    let _ = buf;\n    Oracle::boot(plain, &config::GATEWAY_PUBLIC, peers, &mut Hw)\n"),
         "key's opened blob (an Unavailable key must hold no secret) still in guest RAM"),
-    "measure-ctrlc": (["test", "it_boots=measured boot"], lambda t: (
-        edit(t, "tools/uboot-config", 'HALT = "poweroff; while true; do true; done"\n',
-             'HALT = "while true; do true; done"\n'),
-        edit(t, "support/u-boot/secureos.config", "CONFIG_AUTOBOOT_KEYED=y\n", "")),
-        "measure_boot: U-Boot ran past its refusal"),
+    # S-BOOT-5 (R3-N2): without AUTOBOOT_KEYED, the Ctrl-C measure_boot sends
+    # as U-Boot starts is read by the boot command's first poll, and the
+    # sticky flag ends the 32-bit field loops early: the wrapping range is
+    # measured instead of refused.
+    "measure-ctrlc": (["test", "it_boots=measured boot"], lambda t: edit(
+        t, "support/u-boot/secureos.config", "CONFIG_AUTOBOOT_KEYED=y\n", ""),
+        "a wrapping range was not refused"),
     "l8-fallback": (["test", "it_boots=wireguard"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                              "            Some(Entry::Absent) | None => Err(PskRefusal::Missing),",
                                              "            Some(Entry::Absent) | None => Ok(FreshPsk(Key32::from_bytes([0; 32]))),"),
