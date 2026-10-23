@@ -406,7 +406,8 @@ walkthroughs are in the Acceptance appendix.
     under `ct` removes the scrub. Binding to what ships (T-R5-1): every
     libcrux crate `tls-core` pulls into tools/ct-harness is `=`-pinned to the
     root lock's version (the `sha3`/`keccak` precedent), and ct-shape gains
-    `(pd-tls, tls_core exchange)` and the scrub as identity roots (identity
+    `(pd-tls, tls_core::exchange_with_randomness)` (the non-generic inner
+    function) and the scrub as identity roots (identity
     check only; libcrux stays outside the shape baseline, RM6-5). ct-shape
     gains an identity-only root class for this (T-R6-1), with
     tests/tools/test_ct_shape.py fixtures (a differing tls closure fails
@@ -436,10 +437,14 @@ walkthroughs are in the Acceptance appendix.
   and wiped anyway (F-R5-1). This sequencing (dispatched or not, the retry
   counter, wipe on exhaustion) lives in `tls-core::conn`, the PD only
   reporting the observed RST; unit tests: dispatched on pass k ≤ 8 → wiped
-  on that pass, never dispatched → wiped after pass 8 (T-R6-2). The
+  on that pass, never dispatched → wiped after pass 8 (T-R6-2). The backend
+  socket follows the same `conn` sequence, its RST observed on `tln` and
+  its polls those of the inside interface; the barrier ordering concerns
+  only the outside interface (F-R7-1). The
   backend socket's storage wipe itself has no integration observable (no
-  value on the backend path is unique to `tls`); its red-proof is this unit
-  test of the decision plus the PD's single wipe call site.
+  value on the backend path is unique to `tls`): the decision is red-proved
+  by the unit test; the storage wipe itself is a declared gap without a
+  red-proof, its single call site reviewed (T-R7-1).
 - Wipe points: the client handshake secret once the client Finished is
   verified, the server handshake secret once the application secrets exist
   (T-N4); the superseded traffic secret and keys at KeyUpdate; on close,
@@ -826,14 +831,14 @@ walkthroughs are in the Acceptance appendix.
 
 | ID | Subject | Status |
 |---|---|---|
-| C1 | System, laws, budget | pending |
-| C2 | ingress TCP admission and tli egress | pending |
-| C3 | tls PD TCP via smoltcp | pending |
-| C4 | inner backend routing | pending |
-| C5 | key TLS signing oracle | pending |
-| C6 | tls-wire parsing | pending |
-| C7 | tls-core handshake, key schedule, records | pending |
-| C8 | secrets and plaintext lifecycle in tls | pending |
-| C9 | http-wire head parsing and rewrite | pending |
-| C10 | proxy flow, limits, close, timeouts | pending |
-| C11 | packaging, config, certificate | pending |
+| C1 | System, laws, budget | locked |
+| C2 | ingress TCP admission and tli egress | locked |
+| C3 | tls PD TCP via smoltcp | locked |
+| C4 | inner backend routing | locked |
+| C5 | key TLS signing oracle | locked |
+| C6 | tls-wire parsing | locked |
+| C7 | tls-core handshake, key schedule, records | locked |
+| C8 | secrets and plaintext lifecycle in tls | locked |
+| C9 | http-wire head parsing and rewrite | locked |
+| C10 | proxy flow, limits, close, timeouts | locked |
+| C11 | packaging, config, certificate | locked |

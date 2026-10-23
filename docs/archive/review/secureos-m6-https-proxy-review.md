@@ -468,3 +468,28 @@ R6-2 the retry-exhausted wipe path is untested). No Critical or Major open.
 
 Security's out-of-scope observation (the backend socket storage wipe has no
 integration observable) is answered by T-R6-2's stated scope.
+
+# Review round 7
+Date: 2026-10-24
+
+## Changes from Previous Round
+
+Plan v7 (2a07f9a). Functionality: F-R6-1/2 resolved; one prose Minor
+(R7-1: name the non-generic identity root; the close sequence applies to the
+backend socket too). Testing: T-R6-1/2 resolved; one prose Minor (R7-1:
+the storage wipe is a declared gap, not a red-proof). Security: no findings
+since round 6. Both prose Minors are applied in the final plan.
+
+## Saturation call
+
+Round 7 meets all four conditions: (1) seven rounds completed; (2) no
+Critical or Major open in any category; (3) no finding against the design —
+the experts labelled both round-7 findings prose; (4) every remaining Minor
+was prose-only, and both are applied. No finding is carried forward, so the
+plan has no `Carried-Forward Plan Findings` section. Every contract is
+locked.
+
+Recorded Recurring Issue Check (round 7): functionality R3 R7-1(b), R38/R41
+resolved, R50 resolved with R7-1(a), others N/A or checked; testing R49
+R7-1 (prose), R3/R4/R7/R12/R16/R18/R52 resolved, R2/R17/R45/RT3/RT11 watch,
+others OK or N/A.
