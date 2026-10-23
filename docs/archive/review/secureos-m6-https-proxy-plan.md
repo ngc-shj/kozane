@@ -398,12 +398,22 @@ walkthroughs are in the Acceptance appendix.
     painted stack (high-water asserted within `SCRUB_DEPTH_EXCHANGE`) and
     searched for every stored form of the ephemeral scalar, the
     encapsulation randomness and both component shared secrets (as for
-    `tpm2::envelope::open_sealed`); RESIDUE-CASES raised; a selftest case
+    `tpm2::envelope::open_sealed`); the root is a non-generic inner
+    function taking the randomness as bytes, the RNG-generic shim excluded
+    from identity by name (the McEliece `encaps` precedent), and the scrub
+    is `#[inline(never)]`, called from the frame that called `exchange`
+    (F-R6-1); RESIDUE-CASES raised; a selftest case
     under `ct` removes the scrub. Binding to what ships (T-R5-1): every
     libcrux crate `tls-core` pulls into tools/ct-harness is `=`-pinned to the
     root lock's version (the `sha3`/`keccak` precedent), and ct-shape gains
     `(pd-tls, tls_core exchange)` and the scrub as identity roots (identity
-    check only; libcrux stays outside the shape baseline, RM6-5).
+    check only; libcrux stays outside the shape baseline, RM6-5). ct-shape
+    gains an identity-only root class for this (T-R6-1), with
+    tests/tools/test_ct_shape.py fixtures (a differing tls closure fails
+    with the identity message; a libcrux function absent from the shape
+    baseline does not fail for that root while existing roots still do),
+    CT-SHAPE-FIXTURES raised, CT-SHAPE-SYMBOLS updated, and a selftest case
+    under `ct-shape` perturbing the tls closure.
   - `compile_fail` doctests: `HybridSecret` not `Clone`/`Copy`, not
     constructible outside its module.
   - Integration: OpenSSL/curl complete; `-groups X25519` →
@@ -418,12 +428,18 @@ walkthroughs are in the Acceptance appendix.
   wiped, then it is transmitted. smoltcp owns socket storage while the
   socket exists and sends an abort's RST only from the live socket at the
   next poll, so the socket is aborted and polled; once that poll has
-  dispatched the RST (the device handed out a transmit token and the socket
-  has no segment pending), the socket is removed from its set, its storage
+  dispatched the RST (observed by `tls`'s own `Device` transmit path, which
+  records a RST for the aborted 4-tuple written into `tli`; F-R6-2), the socket is removed from its set, its storage
   wiped through the static and the listener re-created, before any further
   poll of the outside interface (F-R5-2). If `tli` had no free buffer, the
   RST is retried on the next passes, at most 8, then the socket is removed
-  and wiped anyway (F-R5-1).
+  and wiped anyway (F-R5-1). This sequencing (dispatched or not, the retry
+  counter, wipe on exhaustion) lives in `tls-core::conn`, the PD only
+  reporting the observed RST; unit tests: dispatched on pass k ≤ 8 → wiped
+  on that pass, never dispatched → wiped after pass 8 (T-R6-2). The
+  backend socket's storage wipe itself has no integration observable (no
+  value on the backend path is unique to `tls`); its red-proof is this unit
+  test of the decision plus the PD's single wipe call site.
 - Wipe points: the client handshake secret once the client Finished is
   verified, the server handshake secret once the application secrets exist
   (T-N4); the superseded traffic secret and keys at KeyUpdate; on close,
@@ -706,7 +722,8 @@ walkthroughs are in the Acceptance appendix.
   → no handshake (L9), the `TLS_TX_SHARE` tier, minimal DER INTEGERs, 413
   at head time, the no-key-share refusal reason, the RFC 6979 candidate
   cap, the `tls_egress` SYN refusal, the rejected-scalar wipe (D5), the
-  early_data skip after `Connected` and without its cap (T-R3-6), the `tls`
+  early_data skip after `Connected` and without its cap (T-R3-6), no wipe
+  after the RST retries are exhausted (T-R6-2), the `tls`
   stack scrub after `exchange` (S-R3-2), the libcrux-p256 lock pin
   (T-R3-10).
 - Keylog fixture (T-N13): captured against `openssl s_server -groups

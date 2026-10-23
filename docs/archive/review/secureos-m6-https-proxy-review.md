@@ -444,3 +444,27 @@ one Major (R5-1 residue case not bound to the shipped build) and two Minors
 - Testing: R2 watch; R3 R5-1; R16 partial (R5-1); R39 partial (R5-1, R5-2);
   R49 R5-1; R50 partial; RT1 R5-1; RT5 R5-2; RT9 watch; all other rules as in
   round 4.
+
+# Review round 6
+Date: 2026-10-24
+
+## Changes from Previous Round
+
+Plan v6 (d20ce32). Security: S-R5-1/2 resolved, **no findings**.
+Functionality: F-R5-1/2 resolved; two Minors, both labelled reachable only
+by building (R6-1 RNG-generic identity root and `#[inline(never)]` scrub;
+R6-2 no public smoltcp observable for "RST dispatched"). Testing: T-R5-1/2/3
+resolved; two design Minors (R6-1 ct-shape has no identity-only root class;
+R6-2 the retry-exhausted wipe path is untested). No Critical or Major open.
+
+## Dispositions (plan v7)
+
+| ID | Sev | Resolution |
+|---|---|---|
+| F-R6-1 | Minor | Non-generic inner root taking randomness as bytes; generic shim excluded by name; scrub `#[inline(never)]` from the caller's frame |
+| F-R6-2 | Minor | RST observed in `tls`'s own `Device` transmit path |
+| T-R6-1 | Minor | ct-shape identity-only root class with fixtures, CT-SHAPE-FIXTURES, selftest |
+| T-R6-2 | Minor | Close sequencing in `tls-core::conn` with unit tests; mutation; the storage wipe's red-proof scope stated |
+
+Security's out-of-scope observation (the backend socket storage wipe has no
+integration observable) is answered by T-R6-2's stated scope.
