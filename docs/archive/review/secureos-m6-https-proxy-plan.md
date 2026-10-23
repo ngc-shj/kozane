@@ -842,3 +842,53 @@ walkthroughs are in the Acceptance appendix.
 | C9 | http-wire head parsing and rewrite | locked |
 | C10 | proxy flow, limits, close, timeouts | locked |
 | C11 | packaging, config, certificate | locked |
+
+## Implementation Checklist
+
+Authored at Phase 2 start (Step 2-1); per slice. No CI config exists, so
+the local `make check` is the only gate set (no parity gap). Reusable code
+(must be reused, not reimplemented): `pdkit` (`Audit`, `send`, `take`,
+`release`, `recv` — ring I/O and audit for every PD), `ring`/`layout`
+(ring triples and channel ids), `wire` (Ethernet/IPv4 parse, checksums,
+`parse_frame_ip`, `emit`), `ingress-core` `Buckets`/`rp_tx_allowed`
+pattern, `audit-event` coalescing (`FRAME_DROPPED_BASE` pattern),
+`cpu::StackProbe`, `tpm2::boot::scrub_session_stack` (pattern for the
+`tls-core` scrub), `secret-blob` parse/write, `config` build.rs/validate.
+
+### Slice 1 (C1, C2, C3 echo)
+
+- Cargo: workspace members `crates/tls-wire`, `crates/tls-core`,
+  `crates/http-wire` (no_std stubs with one test each), `crates/pds/tls`;
+  dependencies added now so Cargo.lock changes once: smoltcp `=0.14.0`
+  (pds/tls; `default-features = false`, `medium-ip`, `proto-ipv4`,
+  `socket-tcp`), libcrux-hkdf `=0.0.9` and libcrux-ml-kem `=0.0.11` with
+  `mlkem768` (tls-core), libcrux-curve25519, libcrux-chacha20poly1305,
+  libcrux-sha2, libcrux-hmac (tls-core, existing versions), libcrux-p256
+  (key-core, existing version), `rfc6979` dev-dependency (key-core).
+- system/secureos.system: PD `tls` (priority 100, budget 500/10000, stack
+  0x20000), rings `itl`/`tli`/`tln`/`ntl`, `audit_tls`, channels
+  ingress↔tls, tls↔inner, timer→tls, tls→key (PPC), tls→audit.
+- policy/laws.toml: PD row (role `untrusted_input`), MRs, channels, budget
+  row, cap 0.95.
+- crates/layout: `tls` module, channel ids for ingress, inner, timer,
+  audit, key, and tests checking them against the system file.
+- crates/pds/timer `PEERS`; crates/pds/audit source list.
+- crates/wire: `parse_tcp(&Ip4Packet)`, `TcpHeader`, new `DropReason`
+  variants in `ALL`; Kani harnesses with `kani::cover!`; unit allow/deny
+  pairs; bolero seeds for TCP.
+- crates/ingress-core: `respond` fallback to `parse_frame_ip` on `NotUdp`,
+  TCP branch rules, SYN/data buckets via const-generic `Buckets`,
+  `tls_egress`, `TLS_TX_SHARE` with its compile-time assert; Kani harnesses;
+  unit tests.
+- crates/audit-event: `TCP_LIMITED_BASE` kinds (and the `tls` kinds'
+  bases reserved); run.py and the audit PD name table.
+- crates/pds/ingress: `itl`/`tli` wiring.
+- crates/pds/inner: maps `tln`/`ntl` (forwarding arrives in slice 4).
+- crates/pds/tls: smoltcp outside interface, 8 listeners on 443, echo mode;
+  `StackHighWater`.
+- Makefile: `pds`, `host_crates`, lint lists, `kani_crates`
+  (tls-wire, http-wire later), `bolero_targets` later.
+- tests/integration/run.py: `DROP_REASONS`/`frame_for` (NotUdp fixture to
+  protocol 47), boot group `https` with the slice-1 echo case.
+- tools/check-selftest: the four C1 `laws` cases; `CASES_FOR_GATE`.
+- tests/manifest.txt: every changed count.
