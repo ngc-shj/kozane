@@ -14,10 +14,16 @@ import pathlib
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-REFUSE = "echo secureos: boot refused; poweroff"
+# Powering off is the refusal; the loop after it is the backstop, so a
+# poweroff that ever returns still never reaches the next command (the boot
+# command is one hush line, run statement by statement).
+HALT = "poweroff; while true; do true; done"
+REFUSE = "echo secureos: boot refused; " + HALT
 RUN = {
-    "shipped": "dcache flush; dcache off; icache off; go 0x70000000",
-    "measure": "tpm2 pcr_read 8 0x6fb00040; md.b 0x6fb00040 0x20; echo secureos: measured; poweroff",
+    # If the loader ever returns, PCR 8 still holds the release's value: no
+    # prompt, power off.
+    "shipped": "dcache flush; dcache off; icache off; go 0x70000000; echo secureos: loader returned; " + HALT,
+    "measure": "tpm2 pcr_read 8 0x6fb00040; md.b 0x6fb00040 0x20; echo secureos: measured; " + HALT,
 }
 
 

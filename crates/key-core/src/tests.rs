@@ -300,3 +300,39 @@ fn pack_and_unpack_round_trip() {
     let v: [u8; 32] = core::array::from_fn(|i| i as u8);
     assert_eq!(unpack32(&pack32(&v)), Some(v));
 }
+
+struct FakeEntropy(bool);
+
+impl BootEntropy for FakeEntropy {
+    fn fill_random(&mut self, out: &mut [u8]) -> bool {
+        out.fill(0x42);
+        self.0
+    }
+
+    fn cntpct(&mut self) -> u64 {
+        7
+    }
+}
+
+/// M5 plan C6: validation and the boot seed are one fallible step (the PD
+/// wipes the region on its error). Allow: a valid region with entropy boots.
+#[test]
+fn boot_validates_and_derives_the_seed_in_one_step() {
+    let r = region();
+    let peers = peer_publics();
+    let o = Oracle::boot(&r, &gw_public(), peers.iter(), &mut FakeEntropy(true)).unwrap();
+    let mut reply = [0u64; MAX_WORDS];
+    assert_eq!(o.handle(HS, &mut bucket(), 0, LABEL_BOOT_SEED, &[], &mut reply).0, 0);
+}
+
+/// Deny: RNDR failing after a successful validation is a boot error, not a
+/// half-booted oracle.
+#[test]
+fn boot_with_rndr_failing_after_validation_is_refused() {
+    let r = region();
+    let peers = peer_publics();
+    assert!(matches!(
+        Oracle::boot(&r, &gw_public(), peers.iter(), &mut FakeEntropy(false)),
+        Err(BootError::RndrUnavailable)
+    ));
+}

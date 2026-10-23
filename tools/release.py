@@ -2,7 +2,7 @@
 """Signed releases and their verification (M5 plan C13, C12).
 
   release.py make --keys DIR --pkg DIR --out DIR [--version V] [--allow-dirty]
-  release.py verify --pub DIR --release DIR [--envelope FILE --kind key|pq]
+  release.py verify --pub DIR --release DIR [--envelope FILE --kind key|pq] [--allow-dirty]
 
 `make` writes OUT/{manifest, manifest.sig, published.img, boot.desc}. The
 manifest's image and descriptor digests and its PCR 8 come from the files it
@@ -27,6 +27,7 @@ import pathlib
 import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -69,11 +70,17 @@ def make(a) -> None:
     pcr8 = measure.expected_pcr8(desc.read_bytes(), image.read_bytes()).hex()
     if (pkg / "pcr8").read_text().strip() != pcr8:
         raise Refused("the package's pcr8 differs from tools/measure.py's")
-    if git("status", "--porcelain", "--untracked-files=no") and not a.allow_dirty:
+    placeholder = measure.check_placeholder(image.read_bytes(), desc.read_bytes())
+    if placeholder:
+        raise Refused("; ".join(placeholder))
+    dirty = bool(git("status", "--porcelain", "--untracked-files=no"))
+    if dirty and not a.allow_dirty:
         raise Refused("the tree has uncommitted changes; a release must name the commit it was built from")
     fields = {
         "version": a.version,
-        "commit": git("rev-parse", "HEAD"),
+        # A dirty tree is never named by its HEAD alone (S4); verify refuses
+        # it unless asked to accept it.
+        "commit": git("rev-parse", "HEAD") + ("-dirty" if dirty else ""),
         # The dev image is identified by its pinned recipe: its digest is not
         # visible from inside the container.
         "dev_image": "dockerfile-sha256:" + sha256(ROOT / "docker/Dockerfile"),
@@ -84,11 +91,21 @@ def make(a) -> None:
         **versions(),
     }
     manifest = tool("render", *(f"{k}={v}" for k, v in fields.items()))
-    out.mkdir(mode=0o755)
-    (out / "manifest").write_text(manifest)
-    tool("sign", "--keys", a.keys, "--manifest", str(out / "manifest"), "--out", str(out / "manifest.sig"))
-    shutil.copyfile(image, out / "published.img")
-    shutil.copyfile(desc, out / "boot.desc")
+    # Built in a staging directory beside OUT and renamed into place only
+    # once signed and complete (F1): a failure leaves no OUT to block the
+    # retry, and no reader ever sees a half-written release. The commit
+    # point is the rename, after the signature is written.
+    staging = pathlib.Path(tempfile.mkdtemp(prefix=f".{out.name}.release-", dir=out.parent))
+    try:
+        (staging / "manifest").write_text(manifest)
+        tool("sign", "--keys", a.keys, "--manifest", str(staging / "manifest"), "--out", str(staging / "manifest.sig"))
+        shutil.copyfile(image, staging / "published.img")
+        shutil.copyfile(desc, staging / "boot.desc")
+        staging.chmod(0o755)
+        os.rename(staging, out)
+    except BaseException:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise
     print(f"release: wrote {out}")
 
 
@@ -97,6 +114,11 @@ def verify(a) -> None:
     printed = tool("verify", "--pub", a.pub, "--manifest", str(rel / "manifest"), "--sig", str(rel / "manifest.sig"))
     fields = dict(line.split("=", 1) for line in printed.splitlines() if "=" in line)
     image, desc = rel / "published.img", rel / "boot.desc"
+    if fields.get("commit", "").endswith("-dirty") and not a.allow_dirty:
+        raise Refused(f"the release was built from a dirty tree ({fields['commit']})")
+    placeholder = measure.check_placeholder(image.read_bytes(), desc.read_bytes())
+    if placeholder:
+        raise Refused("; ".join(placeholder))
     want = {
         "loader_img_sha256": sha256(image),
         "boot_desc_sha256": sha256(desc),
@@ -128,6 +150,7 @@ def main() -> int:
     v.add_argument("--release", required=True)
     v.add_argument("--envelope")
     v.add_argument("--kind", choices=("key", "pq"))
+    v.add_argument("--allow-dirty", action="store_true")
     a = ap.parse_args()
     if a.cmd == "verify" and bool(a.envelope) != bool(a.kind):
         ap.error("--envelope and --kind go together")

@@ -42,8 +42,9 @@ def make(d, out="rel"):
                "--allow-dirty")
 
 
-def verify(d, pub="keys", rel="rel"):
-    return run(*RELEASE, "verify", "--pub", str(d / pub), "--release", str(d / rel))
+def verify(d, pub="keys", rel="rel", *extra):
+    # The test tree may be dirty, so its releases may carry -dirty.
+    return run(*RELEASE, "verify", "--pub", str(d / pub), "--release", str(d / rel), "--allow-dirty", *extra)
 
 
 def flip(path: pathlib.Path, at: int = 100):
@@ -103,6 +104,46 @@ def case_keys_in_repo(d):
     return rc == 1 and "keys must live elsewhere" in out and not (ROOT / "build/release/keys-in-repo").exists(), out
 
 
+def case_sign_fails_leaves_nothing(d):
+    bad = d / "badkeys"
+    bad.mkdir()
+    for f in ("ed25519.pub", "ml-dsa-65.pub", "ml-dsa-65.key"):
+        (bad / f).write_bytes((d / "keys" / f).read_bytes())
+    (bad / "ed25519.key").write_text("00\n")
+    rc, out = run(*RELEASE, "make", "--keys", str(bad), "--pkg", str(d / "pkg"), "--out", str(d / "rel"),
+                  "--allow-dirty")
+    leftovers = [p.name for p in d.iterdir() if p.name.startswith(".rel.")]
+    rc2, out2 = make(d)
+    return rc == 1 and not leftovers and rc2 == 0 and (d / "rel/manifest.sig").exists(), out + out2
+
+
+def case_dirty_refused(d):
+    rel = d / "rel"
+    rel.mkdir()
+    fields = {"version": "m5-dev", "commit": "0" * 40 + "-dirty", "dev_image": "x",
+              "loader_img_sha256": __import__("hashlib").sha256((d / "pkg/published.img").read_bytes()).hexdigest(),
+              "boot_desc_sha256": __import__("hashlib").sha256((d / "pkg/boot.desc").read_bytes()).hexdigest(),
+              "pcr8": (d / "pkg/pcr8").read_text().strip(), "cargo_lock_sha256": "x", "verus": "x", "kani": "x"}
+    rc, manifest = run(BIN, "render", *(f"{k}={v}" for k, v in fields.items()))
+    (rel / "manifest").write_text(manifest)
+    run(BIN, "sign", "--keys", str(d / "keys"), "--manifest", str(rel / "manifest"), "--out", str(rel / "manifest.sig"))
+    for f in ("published.img", "boot.desc"):
+        (rel / f).write_bytes((d / "pkg" / f).read_bytes())
+    rc1, out1 = run(*RELEASE, "verify", "--pub", str(d / "keys"), "--release", str(rel))
+    rc2, out2 = verify(d)
+    return rc == 0 and rc1 == 1 and "dirty tree" in out1 and rc2 == 0, out1 + out2
+
+
+def case_range_over_code(d):
+    img = bytearray((d / "pkg/published.img").read_bytes())
+    img[0x1000] = 1
+    (d / "pkg/published.img").write_bytes(bytes(img))
+    desc = (d / "pkg/boot.desc").read_bytes()
+    (d / "pkg/pcr8").write_text(measure.expected_pcr8(desc, bytes(img)).hex() + "\n")
+    rc, out = make(d)
+    return rc == 1 and "zero placeholder" in out, out
+
+
 CASES = [
     ("a release made and verified with its own key", case_allow),
     ("a published image changed after signing is refused", case_image),
@@ -112,6 +153,9 @@ CASES = [
     ("a package whose pcr8 disagrees with measure.py is refused", case_pkg_pcr8),
     ("an existing OUT is refused", case_existing_out),
     ("release keys inside the repo are refused", case_keys_in_repo),
+    ("a failed signing leaves no OUT and no staging, and the retry succeeds", case_sign_fails_leaves_nothing),
+    ("a release from a dirty tree is refused unless accepted", case_dirty_refused),
+    ("a descriptor range over non-zero image bytes is refused", case_range_over_code),
 ]
 
 

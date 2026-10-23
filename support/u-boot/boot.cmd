@@ -8,7 +8,8 @@
 #   0x70000000  published loader.img, also the entry
 #   0x6fb00000  scratch for digests
 # Order: measure the descriptor, then the image; check the descriptor; copy
-# each envelope into the image at its range; run. Every failure powers off.
+# each envelope into the image at its range; run. Every failure powers off
+# and then spins, so no failure falls through to a later command or a prompt.
 tpm2 init || REFUSE
 tpm2 startup TPM2_SU_CLEAR || REFUSE
 hash sha256 0x6ff00000 0x40 *0x6fb00000 || REFUSE
@@ -27,6 +28,10 @@ setexpr.l cnt *0x6ff0000c; if test 0x$cnt -ne 2; then REFUSE; fi
 setexpr.q rsv *0x6ff00038; if test 0x$rsv -ne 0; then REFUSE; fi
 setexpr.q o0 *0x6ff00018; setexpr.q l0 *0x6ff00020; setexpr.q o1 *0x6ff00028; setexpr.q l1 *0x6ff00030
 for v in $o0 $l0 $o1 $l1; do setexpr hi 0x$v / 0x100000000; if test 0x$hi -ne 0; then REFUSE; fi; done
+# Each envelope fits its load slot (measure.ENVELOPE_ROOM), as the host
+# model requires: the two adjudicators refuse the same descriptors.
+if test 0x$l0 -gt 0x100000; then REFUSE; fi
+if test 0x$l1 -gt 0x100000; then REFUSE; fi
 # offset <= image_len, then len <= image_len - offset (no wrap); the end at
 # exactly image_len is allowed.
 if test 0x$o0 -gt 0x$img; then REFUSE; fi
@@ -36,6 +41,8 @@ setexpr room 0x$img - 0x$o1; if test 0x$l1 -gt 0x$room; then REFUSE; fi
 # Disjoint: one range ends at or before the other starts.
 setexpr e0 0x$o0 + 0x$l0; setexpr e1 0x$o1 + 0x$l1
 if test 0x$e0 -gt 0x$o1 && test 0x$e1 -gt 0x$o0; then REFUSE; fi
-setexpr d0 0x70000000 + 0x$o0; cp.b 0x6fc00000 $d0 $l0
-setexpr d1 0x70000000 + 0x$o1; cp.b 0x6fd00000 $d1 $l1
+setexpr d0 0x70000000 + 0x$o0
+cp.b 0x6fc00000 $d0 $l0 || REFUSE
+setexpr d1 0x70000000 + 0x$o1
+cp.b 0x6fd00000 $d1 $l1 || REFUSE
 RUN

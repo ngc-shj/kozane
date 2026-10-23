@@ -79,6 +79,17 @@ def parse(desc: bytes, expected=None) -> tuple:
     return image_len, ranges
 
 
+def check_placeholder(image: bytes, desc: bytes) -> list:
+    """The published image holds the zero placeholder over every envelope
+    range: a descriptor cannot name loader code as an envelope slot (I8.2,
+    checked from public files alone, so the release verifier runs it too)."""
+    image_len, ranges = parse(desc)
+    if len(image) < image_len:
+        return [f"measure: image is {len(image)} bytes, descriptor says {image_len}"]
+    return [f"measure: range {i} ({off:#x}, {length:#x}) is not the zero placeholder in the published image"
+            for i, (off, length) in enumerate(ranges) if any(image[off:off + length])]
+
+
 def extend(pcr: bytes, digest: bytes) -> bytes:
     return hashlib.sha256(pcr + digest).digest()
 

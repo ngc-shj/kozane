@@ -36,9 +36,10 @@ done
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/secureos-repro.XXXXXX")
 pd_target=$(make -s -C "$root" --no-print-directory print-pd-target MICROKIT_CONFIG="$config")
 # The copy's build leaves units in the shared target directory that cargo
-# would reuse for the primary tree, with the copy's paths baked into build
-# script outputs (config's env! path): clear it on every exit, so the next
-# primary build is cold rather than wrong.
+# would reuse for the primary tree; any build-script output that embeds the
+# copy's absolute path would then be wrong there (config's was, until it read
+# CARGO_MANIFEST_DIR at run time). Clear it on every exit, so the next
+# primary build is cold rather than possibly wrong.
 trap 'rm -rf "$scratch" "$pd_target"' EXIT
 # The primary build's artifacts, before the cold build below reuses the
 # shared target directory.

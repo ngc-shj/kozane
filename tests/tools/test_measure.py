@@ -62,6 +62,10 @@ CASES = [
         lambda: measure.parse(measure.pack(IMG, GOOD)[:-1] + b"\x01"))),
     ("an envelope longer than its range is refused", lambda: "envelope" in raises(
         lambda: measure.assemble(bytes(IMG), measure.pack(IMG, GOOD), [bytes(0x1001), bytes(0x4000)]))),
+    ("ranges over the zero placeholder are allowed",
+     lambda: not measure.check_placeholder(bytes(IMG), measure.pack(IMG, GOOD))),
+    ("a range over non-zero image bytes (loader code) is refused", lambda: "zero placeholder" in "".join(
+        measure.check_placeholder(bytes(0x2fff) + b"\x01" + bytes(IMG - 0x3000), measure.pack(IMG, GOOD)))),
     ("assembly writes each envelope at its range only", lambda: measure.assemble(
         bytes(IMG), measure.pack(IMG, GOOD), [b"\x01" * 0x1000, b"\x02" * 0x4000])
      == bytes(0x2000) + b"\x01" * 0x1000 + bytes(0x1000) + b"\x02" * 0x4000 + bytes(IMG - 0x8000)),

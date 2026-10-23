@@ -57,6 +57,10 @@ const SHORT_TIMEOUT_NS: u64 = 5_000_000_000;
 /// well under a second; a real TPM's long commands take seconds.
 const COMMAND_TIMEOUT_NS: u64 = 60_000_000_000;
 
+/// Tries of the cap's PCR_Extend before giving up (each one bounded by the
+/// TIS timeouts above).
+const CAP_ATTEMPTS: usize = 3;
+
 /// Why the device did not answer a command; the code is RSP_DEVICE's arg.
 #[derive(Clone, Copy)]
 enum DeviceError {
@@ -252,10 +256,25 @@ impl Tpm {
 
     /// Once both clients have finished: the one PCR_Extend the gate issues.
     /// The gate is capped from here on whatever the device answers.
+    /// The gate refuses every Unseal from here whatever the device answers;
+    /// the device's PCR 8 is what closes RM5-5's window, so the extend is
+    /// confirmed by the TPM's own response and retried on a transient
+    /// failure. If every attempt fails there is no channel to report it on:
+    /// PCR 8 stays at its sealed value until reboot, which is RM5-5's
+    /// accepted state before the cap.
     fn cap(&mut self) {
         let mut cmd = [0u8; tpm2_wire::PCR_EXTEND_CMD_LEN];
         if let Some(n) = self.gate.cap(&mut cmd) {
-            let _ = self.tis.transact(cmd.get(..n).unwrap_or(&[]), &mut self.rsp);
+            let cmd = cmd.get(..n).unwrap_or(&[]);
+            for _ in 0..CAP_ATTEMPTS {
+                let done = match self.tis.transact(cmd, &mut self.rsp) {
+                    Ok(len) => self.rsp.get(..len).is_some_and(|r| tpm2_wire::parse_pcr_extend(r).is_ok()),
+                    Err(_) => false,
+                };
+                if done {
+                    break;
+                }
+            }
             self.rsp.fill(0);
         }
     }

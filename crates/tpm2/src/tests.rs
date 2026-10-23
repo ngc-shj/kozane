@@ -214,6 +214,21 @@ fn sealed_envelope_parses_and_opens_to_the_region_both_kinds() {
     }
 }
 
+/// The payload is the region without its trailing zeros: a blob whose last
+/// used bytes are zero seals a shorter payload and still opens to the whole
+/// region, byte for byte (`open` zero-fills before the AEAD writes).
+#[test]
+fn a_region_ending_in_zero_bytes_opens_to_itself() {
+    let mut plain = region(Kind::Key, 1000);
+    plain[990..1000].fill(0);
+    plain[995] = 0x01;
+    let env = sealed(Kind::Key, &plain, 1);
+    assert_eq!(Envelope::parse(&env, Kind::Key).unwrap().payload_len(), 996);
+    let (r, out) = open(&env, Kind::Key, &kek(1));
+    assert_eq!(r, Ok(()));
+    assert!(out == plain, "a region ending in zero bytes did not open to itself");
+}
+
 #[test]
 fn the_envelope_header_offsets_are_the_documented_ones() {
     let env = sealed(Kind::Key, &region(Kind::Key, 10), 1);

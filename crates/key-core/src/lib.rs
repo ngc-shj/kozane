@@ -235,6 +235,16 @@ impl Bucket {
     }
 }
 
+/// RNDR samples mixed into the boot seed.
+pub const SEED_SAMPLES: usize = 4;
+
+/// The boot seed's entropy inputs; the PD implements it over `cpu`.
+pub trait BootEntropy {
+    /// Fills `out` from RNDR; false if the hardware failed.
+    fn fill_random(&mut self, out: &mut [u8]) -> bool;
+    fn cntpct(&mut self) -> u64;
+}
+
 pub struct Oracle<'a> {
     blob: Blob<'a>,
     boot_seed: Key32,
@@ -269,6 +279,29 @@ impl<'a> Oracle<'a> {
     /// (BLAKE2s(blob seed ‖ RNDR ‖ CNTPCT)); the blob seed never leaves `key`.
     pub fn new(blob: Blob<'a>, boot_seed: Key32) -> Self {
         Self { blob, boot_seed }
+    }
+
+    /// Everything `key` does with the unsealed region before it can answer:
+    /// validation, then the per-boot seed (blob seed ‖ RNDR ‖ CNTPCT). One
+    /// fallible call, so the PD wipes the region on any of its failures
+    /// with a single guard, as `pqkey` does (M5 plan C6: an Unavailable
+    /// `key` holds no secret).
+    pub fn boot<'p>(
+        region: &'a [u8],
+        gateway_public: &[u8; 32],
+        peers: impl ExactSizeIterator<Item = &'p [u8; 32]>,
+        entropy: &mut impl BootEntropy,
+    ) -> Result<Self, BootError> {
+        let blob = validate(region, gateway_public, peers)?;
+        // Both wipe themselves on drop (tpm2::Secret), on every return.
+        let mut samples = tpm2::Secret::<{ SEED_SAMPLES * 8 }>::zero();
+        if !entropy.fill_random(samples.as_mut_bytes()) {
+            return Err(BootError::RndrUnavailable);
+        }
+        let mut seed = tpm2::Secret::<32>::zero();
+        *seed.as_mut_bytes() = crypto::hash(&[blob.boot_seed(), samples.as_bytes(), &entropy.cntpct().to_le_bytes()])
+            .map_err(|_| BootError::SeedDerivation)?;
+        Ok(Self::new(blob, Key32::copy_from(seed.as_bytes())))
     }
 
     /// Answers one request from `caller` (None: a channel with no caller).

@@ -15,7 +15,7 @@
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
-use key_core::{BootError, Bucket, Caller, ERR_BAD_REQUEST, KEY_BURST, KEY_INTERVAL_NS, MAX_WORDS, Oracle};
+use key_core::{BootEntropy, BootError, Bucket, Caller, ERR_BAD_REQUEST, KEY_BURST, KEY_INTERVAL_NS, MAX_WORDS, Oracle};
 use layout::key as ch;
 use layout::tpm::{self as ipc, MSG_BYTES, MSG_WORDS};
 use sel4_microkit::{
@@ -24,7 +24,6 @@ use sel4_microkit::{
 };
 use tpm2::boot::Transport;
 use tpm2::envelope::Kind;
-use wg_core::crypto::{self, Key32};
 use zeroize::Zeroize;
 
 const HS: Channel = Channel::new(ch::CH_HS);
@@ -80,8 +79,18 @@ fn caller(channel: Channel) -> Option<Caller> {
     (channel == HS).then_some(Caller::Hs)
 }
 
-/// RNDR samples mixed into the boot seed.
-const SEED_SAMPLES: usize = 4;
+/// The boot seed's entropy: RNDR and CNTPCT.
+struct Hw;
+
+impl BootEntropy for Hw {
+    fn fill_random(&mut self, out: &mut [u8]) -> bool {
+        cpu::fill_random(out)
+    }
+
+    fn cntpct(&mut self) -> u64 {
+        cpu::cntpct()
+    }
+}
 
 enum Key {
     Ready { oracle: Oracle<'static>, bucket: Bucket },
@@ -105,27 +114,13 @@ fn boot() -> Result<Oracle<'static>, BootError> {
     // the system (the oracle borrows it).
     let plain: &'static [u8] = unsafe { &*buf };
     let peers = config::PEERS.iter().map(|p| &p.public);
-    let blob = match key_core::validate(plain, &config::GATEWAY_PUBLIC, peers) {
-        Ok(blob) => blob,
-        Err(e) => {
-            // SAFETY: the validation's borrow ended with its error, and
-            // nothing reads the buffer again.
-            unsafe { &mut *buf }.zeroize();
-            return Err(e);
-        }
-    };
-
-    let mut samples = [0u8; SEED_SAMPLES * 8];
-    if !cpu::fill_random(&mut samples) {
-        zeroize::Zeroize::zeroize(&mut samples);
-        return Err(BootError::RndrUnavailable);
-    }
-    let seed = crypto::hash(&[blob.boot_seed(), &samples, &cpu::cntpct().to_le_bytes()]);
-    zeroize::Zeroize::zeroize(&mut samples);
-    let mut seed = seed.map_err(|_| BootError::SeedDerivation)?;
-    let seed_key = Key32::copy_from(&seed);
-    zeroize::Zeroize::zeroize(&mut seed);
-    Ok(Oracle::new(blob, seed_key))
+    // Every failure after the unseal wipes the plaintext, not only
+    // validation's: an Unavailable `key` holds no secret (M5 plan C6).
+    Oracle::boot(plain, &config::GATEWAY_PUBLIC, peers, &mut Hw).inspect_err(|_| {
+        // SAFETY: the failed boot's borrow ended with its error, and nothing
+        // reads the buffer again.
+        unsafe { &mut *buf }.zeroize();
+    })
 }
 
 #[protection_domain]

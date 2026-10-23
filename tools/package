@@ -562,7 +562,16 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
     # 2. The descriptor and the PCR 8 U-Boot will produce.
     ranges = [(standin_img.find(standins[mr]), len(standins[mr])) for mr in SECRETS_MRS]
     try:
-        desc = measure.pack(len(published), ranges, expected=ranges)
+        # The ranges are where microkit placed each stand-in; check_images
+        # above already proved they are the only bytes that differ from the
+        # published image. The independent I8.2 check is that the published
+        # image holds the zero placeholder there, which the release verifier
+        # repeats from public files.
+        desc = measure.pack(len(published), ranges)
+        placeholder = measure.check_placeholder(published, desc)
+        if placeholder:
+            print("\n".join(f"package: {e}" for e in placeholder))
+            return 1
         pcr8 = measure.expected_pcr8(desc, published)
     except measure.DescriptorError as e:
         print(f"package: {e}")

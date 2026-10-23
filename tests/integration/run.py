@@ -1689,6 +1689,9 @@ class TpmProxy:
         self.thread.join(timeout=5)
         for s in [self.listener] + self.socks:
             s.close()
+        # As Swtpm.close: a relay that outlives its boot fails the case (T2).
+        if self.thread.is_alive():
+            raise Fail("tpm proxy relay thread survived its boot")
 
 
 def boot_uboot(uboot: str, files: list, tpm: Swtpm) -> tuple:
@@ -1723,6 +1726,14 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
         try:
             m = con.wait_for(r"secureos: (measured|boot refused)\r*\n", timeout=BOOT_TIMEOUT_S)
             if m.group(1) == "boot refused":
+                # A refusal must end the boot: U-Boot powers off by itself
+                # and runs nothing after it (S-BOOT-1). Waiting for that
+                # exit is a condition with a bound, not a timing judgement.
+                deadline = time.monotonic() + LINE_TIMEOUT_S
+                while con.alive and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if con.alive or "secureos: measured" in con.text[m.end():]:
+                    raise Fail("measure_boot: U-Boot did not stop at its refusal")
                 return None, True
             dump = PCR_DUMP.search(con.text, 0, m.start())
             if not dump:
