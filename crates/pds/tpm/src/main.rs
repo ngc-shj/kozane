@@ -255,13 +255,14 @@ impl Tpm {
     }
 
     /// Once both clients have finished: the one PCR_Extend the gate issues.
-    /// The gate is capped from here on whatever the device answers.
     /// The gate refuses every Unseal from here whatever the device answers;
     /// the device's PCR 8 is what closes RM5-5's window, so the extend is
     /// confirmed by the TPM's own response and retried on a transient
-    /// failure. If every attempt fails there is no channel to report it on:
-    /// PCR 8 stays at its sealed value until reboot, which is RM5-5's
-    /// accepted state before the cap.
+    /// failure. A retry after a lost response may extend PCR 8 twice, which
+    /// moves it further from the sealed value (fail-closed, F4). If every
+    /// attempt fails on the device there is no channel to report it on: PCR
+    /// 8 stays at its sealed value until reboot, which is RM5-5's accepted
+    /// state before the cap.
     fn cap(&mut self) {
         let mut cmd = [0u8; tpm2_wire::PCR_EXTEND_CMD_LEN];
         if let Some(n) = self.gate.cap(&mut cmd) {

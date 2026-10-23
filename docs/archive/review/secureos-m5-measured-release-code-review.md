@@ -252,6 +252,15 @@ Found by the full check-selftest run at `9bd8436` (140 min, 128/130):
     it (S18).
   - **Likelihood:** low. It needs an init-time crash or a compromise of a
     PD that is not callable before its init ends.
+  - **Round 2 addition, the mirror crash:** if `pqkey` crashes mid-unseal
+    (a fault, or A7 feeding it a malformed response), `key` gets Busy and
+    then `TpmUnavailable`, so the whole gateway is out. That is worse than
+    the worst case stated above. The acceptance stands all the same:
+    - whoever can crash `pqkey` mid-unseal can already deny `key` directly.
+      A7 can cut the TPM off entirely, and a bug in `tpm2::boot::unseal`
+      is code `key` runs too;
+    - so the outage needs no capability the attacker lacks without this
+      path.
   - **Cost to fix:** a PD-level liveness deadline that force-fails a stuck
     client. It needs care to avoid racing the client's own retry budget
     (about 1 day with Kani coverage of the new transition). Recorded here
@@ -277,7 +286,7 @@ Found by the full check-selftest run at `9bd8436` (140 min, 128/130):
   that closure at a non-root function, which ct-shape refuses.
 - Severity merged as Minor: the client PD holds the decrypted plaintext for
   its whole life, so a stack reader gains nothing new.
-- Modified file: crates/tpm2/src/boot.rs, crates/tpm2/src/envelope.rs
+- Modified file: crates/tpm2/src/boot.rs (round 2 correction: envelope.rs is not modified)
 
 ### S-TPM2-2-A Minor no zero-tailed region test
 - Action: `a_region_ending_in_zero_bytes_opens_to_itself`
@@ -345,3 +354,107 @@ under `tools/proof-lock`):
 | ownership always true (`if true { Ok(()) }`) | `cross_client_handles_are_refused` | 1 failure |
 | Done/Failed refusal disabled | `a_finished_client_is_refused` | 1 failure |
 | cap refusal disabled (`if false && self.capped`) | `unseal_after_the_cap_is_refused` | 1 failure: the harness asserts `Err(Refusal::Capped)` exactly, so the Finished refusal does not mask it |
+
+---
+
+# Round 2
+Date: 2026-10-24
+
+## Changes from Previous Round
+
+Round 2 reviewed only the round-1 fixes (`9bd8436..6aa9f15`). Each
+expert resolved every round-1 finding of theirs, or upheld its accepted or
+no-change disposition. The security expert's R43 comparison against the
+previous round found no widening. There are no new Critical or Major
+findings.
+
+## New findings (all Minor)
+
+- **S-BOOT-5 (security)** hush loops poll Ctrl-C, and autoboot leaves Ctrl-C
+  on without `CONFIG_AUTOBOOT_KEYED`. One 0x03 on the UART breaks the
+  refusal's spin, and the sticky flag also ends every later loop,
+  including the 32-bit field checks. The deviation log's "runs nothing
+  after a refusal" was false.
+- **S-TPM2-3 (security) / F5 (functionality)** the session scrub reuses
+  `OPEN_SCRUB_DEPTH` with no measurement of the HMAC/KDF chain's depth and
+  no red-proof. The resolution named envelope.rs as modified, which it is
+  not.
+- **S-REL-4 (security)** verify's placeholder refusal had no fixture of its
+  own, and the default verify path (no flag, clean commit) had lost its
+  allow test.
+- **F4 (functionality)** a cap retry after a lost response may extend PCR 8
+  twice. That is fail-closed, but the PD comment claimed PCR 8 stays at its
+  sealed value.
+- **T3 (testing)** the PD-side wipe after a failed `Oracle::boot` has no
+  automated proof. `pds/key` is not host-testable, and no integration case
+  takes that path.
+- **Nit (security)** `crates/pds/tpm/src/main.rs` kept an old sentence
+  beside the new one.
+
+## Resolution Status (round 2)
+
+### S-BOOT-5 Minor Ctrl-C breaks the refusal spin
+- Action:
+  - The fragment sets `CONFIG_AUTOBOOT_KEYED=y` and leaves
+    `AUTOBOOT_KEYED_CTRLC` unset. Autoboot then disables Ctrl-C around the
+    boot command; with `BOOTDELAY=-2` no prompt appears. `uboot-config
+    verify` refuses a build where Kconfig drops it.
+  - `measure_boot` sends 0x03 after "boot refused", then requires that
+    neither a later "secureos: measured" nor a `=>` prompt appears while
+    U-Boot powers off (or spins, bounded).
+- Red-proof: the new check-selftest case `measure-ctrlc` removes the
+  power-off and the `AUTOBOOT_KEYED` line and is red with "measure_boot:
+  U-Boot did not stop at its refusal".
+- The deviation-log sentence is corrected.
+- Modified file: support/u-boot/secureos.config, tests/integration/run.py,
+  tools/check-selftest, deviation log
+
+### S-REL-4 Minor verify-side fixtures
+- Action: two new fixtures (`RELEASE-FIXTURES 13`):
+  - a clean-commit release verifies by default, with no flag;
+  - a signed release whose image is non-zero inside a range is refused by
+    verify with "zero placeholder".
+- Red-proof on a committed scratch copy: removing verify's
+  `check_placeholder` turns exactly that fixture red. A helper now signs
+  releases by hand, so each verify check can be met on its own.
+- Modified file: tests/tools/test_release.py
+
+### F4 Minor cap comment
+- Action: the comment states the double-extend case and its fail-closed
+  direction. The duplicate old sentence is removed (the security nit).
+- Modified file: crates/pds/tpm/src/main.rs
+
+### S-TPM2-3 / F5 Minor session scrub unmeasured — Accepted
+- **Anti-Deferral check:** acceptable risk.
+- **Justification:**
+  - **Worst case:** the libcrux HMAC/KDF frames of the TPM session run
+    deeper than 8 KiB, so some session-key-derived state survives on the
+    client PD's stack.
+  - **That gains a reader nothing:** the same PD holds the decrypted blob
+    in its private memory for its whole life (Ready state), so anyone who
+    can read its stack can read the plaintext secrets directly. In the
+    Unavailable states the plaintext is wiped. Getting the KEK there would
+    also need the boot's captured TPM traffic and the envelope from boot
+    media, and all of that comes to the same blob.
+  - **Likelihood:** low. It needs a memory-read capability inside
+    `key`/`pqkey`, which is already the "Everything" row of the threat
+    model.
+  - **Cost to fix:** a residue-harness `unseal` case over a fake TPM that
+    holds an SRK private key, plus a measured floor. About 2 to 3 hours. It
+    is recorded as a known limitation; the scrub stays as defence in depth.
+- **Orchestrator sign-off:** acceptable-risk exception satisfied.
+
+### T3 Minor PD-side wipe not proven by a test — Accepted
+- **Anti-Deferral check:** acceptable risk.
+- **Justification:**
+  - **Worst case:** a later edit drops the PD's `inspect_err` wipe, and no
+    test notices.
+  - **Likelihood:** low, for three reasons:
+    - the wipe is one expression over the single fallible call;
+    - it mirrors pqkey's reviewed shape line for line;
+    - a reviewer of any change to `crates/pds/key` sees it.
+  - **Cost to fix:** a QEMU case that makes RNDR fail after a valid unseal
+    and then scans guest RAM for the blob. That needs a fault-injection
+    hook in a shipped PD, which is itself an attack surface. Not worth it
+    for a defence-in-depth wipe, since the Ready state holds the same data.
+- **Orchestrator sign-off:** acceptable-risk exception satisfied.

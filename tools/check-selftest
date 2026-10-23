@@ -148,7 +148,7 @@ CASES_FOR_GATE = {
               "verus-msgs-exact", "verus-ring-mask", "verus-wire-ipv4"},
     "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire"},
     "laws": {"laws", "laws-timer-ingress", "laws-pq-key", "laws-hs-pqkey", "laws-pq-secrets-writable"},
-    "test": {"measure-twin", "measure-wrap", "measure-halt", "sealed-pcr-unbound", "sealed-srk-name", "sealed-cap", "tpm-proxy-hmac",
+    "test": {"measure-twin", "measure-wrap", "measure-halt", "measure-ctrlc", "sealed-pcr-unbound", "sealed-srk-name", "sealed-cap", "tpm-proxy-hmac",
              "integration", "integration-count", "integration-residue", "integration-cookie",
              "integration-pq-residue", "l8-fallback", "integration-rp-src-meter", "integration-rotation",
              "integration-expiry", "rp-cookie-gate", "integration-expiry-residue"},
@@ -592,6 +592,14 @@ CASES = {
     # to the next command; the measured-boot cases must see the boot go on.
     "measure-halt": (["test", "it_boots=measured boot"], lambda t: edit(
         t, "tools/uboot-config", 'HALT = "poweroff; while true; do true; done"\n', 'HALT = "true"\n'),
+        "measure_boot: U-Boot did not stop at its refusal"),
+    # S-BOOT-5: a power-off that returns leaves the refusal spinning; without
+    # AUTOBOOT_KEYED, the Ctrl-C measure_boot sends breaks the spin and the
+    # boot goes on to measure.
+    "measure-ctrlc": (["test", "it_boots=measured boot"], lambda t: (
+        edit(t, "tools/uboot-config", 'HALT = "poweroff; while true; do true; done"\n',
+             'HALT = "while true; do true; done"\n'),
+        edit(t, "support/u-boot/secureos.config", "CONFIG_AUTOBOOT_KEYED=y\n", "")),
         "measure_boot: U-Boot did not stop at its refusal"),
     "l8-fallback": (["test", "it_boots=wireguard"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                              "            Some(Entry::Absent) | None => Err(PskRefusal::Missing),",

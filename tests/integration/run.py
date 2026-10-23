@@ -1726,13 +1726,20 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
         try:
             m = con.wait_for(r"secureos: (measured|boot refused)\r*\n", timeout=BOOT_TIMEOUT_S)
             if m.group(1) == "boot refused":
-                # A refusal must end the boot: U-Boot powers off by itself
-                # and runs nothing after it (S-BOOT-1). Waiting for that
-                # exit is a condition with a bound, not a timing judgement.
+                # A refusal must end the boot: nothing runs after it, not
+                # even when someone on the UART presses Ctrl-C (S-BOOT-1,
+                # S-BOOT-5). U-Boot powers off; until it does (or for the
+                # bound, if its power-off ever returned and it spins), the
+                # console must show neither a later measurement nor a prompt.
+                try:
+                    child.send("\x03")
+                except OSError:
+                    pass  # already powered off
                 deadline = time.monotonic() + LINE_TIMEOUT_S
                 while con.alive and time.monotonic() < deadline:
                     time.sleep(0.05)
-                if con.alive or "secureos: measured" in con.text[m.end():]:
+                after = con.text[m.end():]
+                if "secureos: measured" in after or re.search(r"(^|\n)=> ", after):
                     raise Fail("measure_boot: U-Boot did not stop at its refusal")
                 return None, True
             dump = PCR_DUMP.search(con.text, 0, m.start())

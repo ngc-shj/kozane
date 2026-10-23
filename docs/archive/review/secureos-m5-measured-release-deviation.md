@@ -916,7 +916,8 @@ deviations from the plan:
   - the AEAD decides.
 - **Refusal halts twice (S-BOOT-1).** `poweroff` is followed by a spin
   loop, so a firmware whose power-off returns still runs nothing after a
-  refusal. The shipped command ends the same way after `go` (S2).
+  refusal, provided Ctrl-C is off during the boot command: hush loops poll
+  it, so round 2 adds `CONFIG_AUTOBOOT_KEYED` (S-BOOT-5). The shipped command ends the same way after `go` (S2).
 - **I8.2's "equals the prefill ranges" is checked as "the published image
   holds the zero placeholder there"** (`measure.check_placeholder`), from
   public files, by packaging and by the release verifier. The old

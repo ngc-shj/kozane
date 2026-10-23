@@ -5,6 +5,7 @@ Usage: python3 tests/tools/test_release.py   (after `make release-tool`)
 Prints "RELEASE-FIXTURES <n>" and exits non-zero on any mismatch.
 """
 
+import hashlib
 import pathlib
 import subprocess
 import sys
@@ -122,21 +123,49 @@ def case_sign_fails_leaves_nothing(d):
     return rc == 1 and not leftovers and rc2 == 0 and (d / "rel/manifest.sig").exists(), out + out2
 
 
-def case_dirty_refused(d):
+def signed_release(d, commit: str, image: bytes = None) -> bool:
+    """A release signed by hand, bypassing `make`'s own refusals, so each of
+    verify's checks can be met on its own: OUT is d/rel."""
     rel = d / "rel"
     rel.mkdir()
-    fields = {"version": "m5-dev", "commit": "0" * 40 + "-dirty", "dev_image": "x",
-              "loader_img_sha256": __import__("hashlib").sha256((d / "pkg/published.img").read_bytes()).hexdigest(),
-              "boot_desc_sha256": __import__("hashlib").sha256((d / "pkg/boot.desc").read_bytes()).hexdigest(),
-              "pcr8": (d / "pkg/pcr8").read_text().strip(), "cargo_lock_sha256": "x", "verus": "x", "kani": "x"}
+    img = image if image is not None else (d / "pkg/published.img").read_bytes()
+    desc = (d / "pkg/boot.desc").read_bytes()
+    fields = {"version": "m5-dev", "commit": commit, "dev_image": "x",
+              "loader_img_sha256": hashlib.sha256(img).hexdigest(),
+              "boot_desc_sha256": hashlib.sha256(desc).hexdigest(),
+              "pcr8": measure.expected_pcr8(desc, img).hex(), "cargo_lock_sha256": "x", "verus": "x", "kani": "x"}
     rc, manifest = run(BIN, "render", *(f"{k}={v}" for k, v in fields.items()))
     (rel / "manifest").write_text(manifest)
-    run(BIN, "sign", "--keys", str(d / "keys"), "--manifest", str(rel / "manifest"), "--out", str(rel / "manifest.sig"))
-    for f in ("published.img", "boot.desc"):
-        (rel / f).write_bytes((d / "pkg" / f).read_bytes())
-    rc1, out1 = run(*RELEASE, "verify", "--pub", str(d / "keys"), "--release", str(rel))
+    rc2, _ = run(BIN, "sign", "--keys", str(d / "keys"), "--manifest", str(rel / "manifest"),
+                 "--out", str(rel / "manifest.sig"))
+    (rel / "published.img").write_bytes(img)
+    (rel / "boot.desc").write_bytes(desc)
+    return rc == 0 and rc2 == 0
+
+
+def verify_default(d):
+    return run(*RELEASE, "verify", "--pub", str(d / "keys"), "--release", str(d / "rel"))
+
+
+def case_dirty_refused(d):
+    made = signed_release(d, "0" * 40 + "-dirty")
+    rc1, out1 = verify_default(d)
     rc2, out2 = verify(d)
-    return rc == 0 and rc1 == 1 and "dirty tree" in out1 and rc2 == 0, out1 + out2
+    return made and rc1 == 1 and "dirty tree" in out1 and rc2 == 0, out1 + out2
+
+
+def case_clean_default_verify(d):
+    made = signed_release(d, "0" * 40)
+    rc, out = verify_default(d)
+    return made and rc == 0 and "release: verified" in out, out
+
+
+def case_verify_placeholder(d):
+    img = bytearray((d / "pkg/published.img").read_bytes())
+    img[0x1000] = 1
+    made = signed_release(d, "0" * 40, bytes(img))
+    rc, out = verify_default(d)
+    return made and rc == 1 and "zero placeholder" in out, out
 
 
 def case_range_over_code(d):
@@ -160,6 +189,8 @@ CASES = [
     ("release keys inside the repo are refused", case_keys_in_repo),
     ("a failed signing leaves no OUT and no staging, and the retry succeeds", case_sign_fails_leaves_nothing),
     ("a release from a dirty tree is refused unless accepted", case_dirty_refused),
+    ("a clean release verifies by default, no flag", case_clean_default_verify),
+    ("verify refuses a signed range over non-zero image bytes", case_verify_placeholder),
     ("a descriptor range over non-zero image bytes is refused", case_range_over_code),
 ]
 
