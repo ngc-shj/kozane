@@ -230,3 +230,74 @@ None: every finding carried file/line evidence or a stated derivation.
 - RT9 watch (Python HKDF is an independent oracle)
 - RT10 finding (T17)
 - RT11 watch (second tap and backend thread teardown)
+
+# Review round 2
+Date: 2026-10-24
+
+## Changes from Previous Round
+
+Plan v2 (76fe9fa) answered every round-1 finding. Round 2 confirmed most
+of them: functionality F1–F23 resolved except F15 (partly), security S1–S18
+resolved except S1 (partly) and S10, testing T1–T22 resolved except T4, T7
+(not) and T11 (partly). The new findings are numbered N1… by each expert
+and are prefixed here F-N, S-N and T-N.
+
+## Merged findings and dispositions (plan v3)
+
+| ID(s) | Sev | Subject | Resolution |
+|---|---|---|---|
+| F-N1 | Major (prose, R29) | secret-blob `FIXED` is 80 → 112, not 112 → 144 | C5 corrected; mirror test asserts Rust body length = `_key_body` |
+| F-N2, T-N2 | Major | Attacker-driven audit kinds are coalesced, so `TlsClosed`/`TlsTimeout` lines cannot be barriers | C10 audit shape: per-value code bases, `a` = running total, value events for high-waters; no barrier depends on an audit line; residue cases in a dedicated boot |
+| S-N2, T-N3 | Major | Rewrite/tx buffers unlisted; inside-path cleartext makes the marker scan fail and RM6-1 overclaim; control on the head timer | C8 wipe list extended; scope stated (tls-owned memory; backend link cleartext by design); marker = dropped `Keep-Alive` value; control held in response streaming; RM6-1 restated |
+| T-N4 | Major | Residue cases 1–2 without a server-side barrier; case 2 ambiguous | Backend log of a request head as barrier; client handshake secret kept until the client Finished is verified; case 2 client secrets, `K` variant |
+| T-N1 | Major | P11 name tripwire cannot see the Finished compare | P11 `tls-core` name set anchored on the Finished file, fixtures |
+| T-N5 | Major | Case 9 precondition event missing; no red-proof; recovery | `TcpLimited` coalesced ingress kind; case 9 declared a positive availability check whose controls are red-proved by unit cases; run last |
+| T-N6 | Major | Case 10 tests the cap for the wrong cause; wall-clock leg | Cap tested with free slots and an allow pair; recycling by counting |
+| T-N7, S-N1, F-N7 | Major/Minor | Interference invariant mis-modelled; red-proof cannot redden; copied constant; generator unspecified | Per-call wait formula with +1 period; `TLS_BUDGET_NS` in `layout` checked against `.system`; `SIGN_COST_NS` max of 20 × 2 with a lock-entry re-measure rule; `KeyWaitHighWater` observable; red-proof by lowering the budget; replayed-ClientHello generator |
+| T-N8 | Major | Close rules untested | Case 13 + conn-core unit tests |
+| T-N9 | Major | Kani accept path vacuous within 96 bytes | `kani::cover!` per harness; ClientHello accept side by bolero/unit, stated |
+| T-N10 | Major | mkcert untested | test_mkcert.py, MKCERT-FIXTURES, selftest |
+| S-N3, F-N8 | Minor | Rejected TLS scalar stays in `key`; code typing; borrow | TLS check before the long borrow, bytes wiped, status stored; `TlsKeyError` separate; count 0 in case 8 |
+| S-N4, F-N6 | Minor | RFC 6979 loop unbounded; h ≥ n vectors | Cap 8 candidates → `ERR_CRYPTO`, seam test; h ≥ n vectors in the differential test (carried into the Phase 2 checklist with the C5 tests) |
+| S-N5 | Minor | `tls_egress` admits bare SYN | Refused; Kani clause; SYN-ACK/RST allowed |
+| S-N6, F-N11 | Minor | RM6-7 omits ACK floods and ISN predictability | Verified smoltcp 0.14 ISNs are PCG32 (`src/rand.rs`); RM6-7 and SC38 extended; data bucket constants recorded in slice 1 |
+| S-N7, F-N12 | Minor | IP SANs unconstrained; CA key custody; negative-test leaf | iPAddress subtree; key never serialized; `--test-negative`; 30-day re-issue in scenario 1 |
+| S-N8 | Minor | early_data rationale wrong; curl `Expect` | early_data ignored per §4.2.10 with a 16 KiB skip cap; curl `-H 'Expect:'` |
+| F-N3, F-N4 | Minor | Refusal close; 2 s wait start | Close rules extended; wait starts when the send buffer drains |
+| F-N5 | Minor | `set_timeout` socket-wide | 5 s on listen, 30 s on Established |
+| F-N9 | Minor | TCP branch lacks the Ethernet destination check | Added |
+| F-N10 | Minor | D3 vs C5 on `pds/hs` | `hs` changes only for `KeyWaitHighWater`, now in both |
+| F-N13 | Minor | Config shapes | Walkthrough row gives the Rust types |
+| T-N11 | Minor | Mutation gaps | Added to the mutation list |
+| T-N12 | Minor | Manifest keys | Listed |
+| T-N13 | Minor | Keylog fixture source | `openssl s_server` capture with the script committed |
+| T-N14 | Minor | Probe margin per host | run.py canary "probe margin exceeded" |
+| T-N15 | Minor | Slot-wipe observable | `Slot::is_zeroized()` `cfg(test)` accessor |
+
+## Recurring Issue Check (round 2)
+
+### Functionality expert
+R1 no finding; R2 N7, N1; R3 no new finding; R4 N2; R5–R9 N/A; R10 checked;
+R11 N/A; R12 N2; R13–R15 N/A; R16 checked; R17 no finding; R18 no finding;
+R19–R21 N/A; R22 no finding; R23, R24 N/A; R25 N1, N8; R26–R28 N/A; R29 N1,
+N7 (other figures re-verified); R30, R31 N/A; R32 checked; R33 N/A; R34, R35
+checked; R36, R37 N/A; R38 N3, N4, N5; R39 [Adjacent] N8; R40 N2; R41 N2; R42
+no finding beyond N1; R43 checked; R44–R48 N/A; R49 N11; R50 resolved; R51
+N/A; R52 checked; R53 no finding; R54–R57 N/A.
+
+### Security expert
+R1 N/A; R2 OK; R3 resolved; R4–R11 N/A; R12 OK; R13–R16 N/A; R17, R18 OK;
+R19–R28 N/A; R29 N1, N8 (other citations verified); R30, R31 N/A; R32 OK; R33
+N/A; R34, R35 OK; R36, R37 N/A; R38 OK; R39 N2, N3; R40, R41, R42 OK; R43 N1;
+R44–R46 N/A; R47 OK; R48 OK; R49 N2, N6; R50 resolved; R51, R52 OK; R53 N1;
+R54–R57 N/A; RS1 OK; RS2 N6; RS3 OK; RS4 OK; RS5 N7; RS6 OK.
+
+### Testing expert
+R1 N/A; R2 watch; R3 resolved; R4 N2, N5; R5, R6 N/A; R7 resolved; R8–R11
+N/A; R12 resolved; R13–R15 N/A; R16 resolved (watch N14); R17 watch; R18
+partial (N12); R19–R28 N/A; R29 N1, N2; R30, R31 N/A; R32 OK; R33–R37 N/A
+except R35 OK; R38 partial (N8); R39 N3, N4; R40 OK; R41 resolved; R42
+partial (N11); R43 N/A; R44 OK; R45 watch; R46 N/A; R47 resolved (N1 same
+class); R48 N/A; R49 OK; R50 N9; R51, R52 N/A; R53 resolved (N14); R54–R57
+N/A; RT1 resolved; RT2 resolved; RT3 watch; RT4 N5, N6; RT5 OK; RT6 N10; RT7
+N1, N5, N7, N9, N11; RT8 OK; RT9 watch; RT10 resolved; RT11 watch.

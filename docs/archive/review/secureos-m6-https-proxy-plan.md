@@ -71,7 +71,8 @@ parser bounded and checked.
 - **D3 One image, one more PD.** `tls` joins the existing system. Changed
   VPN-side code: `wire`, `ingress-core`/`ingress`, `inner-core`/`inner`,
   `key-core`/`key`, `secret-blob`, `layout`, `timer`, `audit`, `config`,
-  `hs-core` (invariants only), `tpm2` (envelope assert). The L13 cap rises
+  `hs-core` (invariants), `hs` (the key-wait audit), `tpm2` (envelope
+  assert). The L13 cap rises
   0.90 → 0.95 for `tls` at 0.05 (C1). Stop rule: if the slice-1 or slice-3
   probe (C10) misses its margin, the slice stops and re-plans the budget
   split (re-planning, not widening: the M3 rule).
@@ -149,18 +150,22 @@ walkthroughs are in the Acceptance appendix.
   SYN+FIN, no SYN+RST, no zero ports; options are length-walked only. Any
   other protocol → `NotUdp` as today. New `DropReason` variants are appended
   to `ALL` and run.py's mirror.
-- Branch rules: destination our IP and port `HTTPS_PORT`, source not our IP
-  and source MAC not ours (S16) → `Outcome::Tls`; other TCP → `NoService`.
+- Branch rules: Ethernet destination our MAC, destination our IP and port
+  `HTTPS_PORT`, source not our IP and source MAC not ours (S16, F-N9) → `Outcome::Tls`; other TCP → `NoService`.
   SYNs (SYN without ACK) pass a per-source SYN bucket and a global SYN
   bucket (`SYN_GLOBAL_BURST`, `SYN_GLOBAL_INTERVAL_NS`); all other segments
-  pass a separate global TCP data bucket (F11). `Buckets` gains its
+  pass a separate global TCP data bucket (F11), whose constants and the
+  throughput they allow are recorded in slice 1 (F-N11). Bucket refusals
+  raise a coalesced audit kind `TcpLimited{syn_source|syn_global|data}`
+  (T-N5). `Buckets` gains its
   constants as const generics so the SYN instance has its own (S18; the
   existing instance's Kani harnesses re-run).
 - `ingress` copies the IP packet into `itl`.
 - Egress (F2, S2, S3): `ingress_core::tls_egress(packet, tx_free) ->
   Result<Frame, DropReason>`: IPv4, protocol 6, source = outside IP, source
   port = `HTTPS_PORT`, destination unicast and not ours, length ≤ 1500,
-  checksums valid; framed to `router_mac` (no ARP cache). TX tier: allowed
+  checksums valid, no SYN without ACK (`tls` never opens outbound
+  connections; S-N5); framed to `router_mac` (no ARP cache). TX tier: allowed
   only while `tx_free > TX_RESERVE + TLS_TX_SHARE` (compile-time asserted
   ≥ the `Unsolicited` tier), so `hs`/`data` keep their reserve.
 - Control class: fail-closed verification gate (Kani-proved parser and
@@ -181,9 +186,12 @@ walkthroughs are in the Acceptance appendix.
 - Two `Interface`s (`Medium::Ip`) with two `SocketSet`s (F5): outside
   (outside IP, `itl`/`tli`, `MAX_CONNS` = 8 listeners on 443) and inside
   (inside IP, `ntl`/`tln`, 8 backend sockets). Each set is polled only by
-  its interface. `Config::random_seed` (ISN) from the hedged RNG (C7).
-- Socket options: `set_ack_delay(None)`, Nagle off, a SYN-RECEIVED/connect
-  timeout via `set_timeout` (F6, F11). Polling: on every ring notification
+  its interface. `Config::random_seed` from the hedged RNG (C7). smoltcp 0.14 derives
+  ISNs from PCG32 seeded once (`src/rand.rs`, read 2026-10-24), so ISNs
+  are predictable from observed ones (RM6-7, SC38).
+- Socket options: `set_ack_delay(None)`, Nagle off. `set_timeout` is
+  socket-wide, so a listener is armed with 5 s and the socket's timeout is
+  raised to the 30 s idle timeout on reaching Established (F6, F11, F-N5). Polling: on every ring notification
   and timer tick; the timer is 1 Hz, so retransmission and probes run at
   ≥ 1 s granularity (accepted, recorded; F6).
 - Backend ports: `TLS_PORTS` (config, 1024 ports) allocated round-robin; the
@@ -221,13 +229,20 @@ walkthroughs are in the Acceptance appendix.
 - Blob v3 (`secret-blob`): v2 layout plus `tls_private[32]` (P-256 scalar,
   big-endian) after `boot_seed`; version 3; v2 refused (`BadVersion`).
   Member set: `grep -rnE 'KEY_MAX_PEERS|_key_body|KEY_BLOB_FIXED|FIXED|MAX_PEERS|80 \+' crates/secret-blob crates/tpm2 tools/package tools/mksecrets crates/config tests/integration/run.py`
-  (F15, S18): secret-blob `FIXED` 112 → 144 / `MAX_PEERS` 124 → 123,
+  (F15, S18): secret-blob `FIXED` 80 → 112 (F-N1) / `MAX_PEERS` 124 → 123,
   envelope `KEY_MAX_PEERS` 110 → 109, tools/package `_key_body` 80 → 112 and
-  `VERSION` 2 → 3, the secret-blob Python mirror test, run.py offsets.
+  `VERSION` 2 → 3, the secret-blob Python mirror test (extended to assert
+  that Rust's body length equals `_key_body` for several peer counts),
+  run.py offsets.
 - Validation (D5): the scalar is valid and its public point equals
   `config::TLS_PUBLIC`; else the TLS capability is `Unavailable{code}`
   (`TlsKeyInvalid` 17, `TlsKeyMismatch` 18) while `hs`'s labels keep
-  working. Codes added to the code table and run.py's mirror.
+  working. The TLS check runs on the mutable plaintext before the
+  long-lived `Blob` borrow; on failure bytes [80:112] are wiped and the
+  TLS status is stored beside the blob (the checksum is not re-checked
+  after the wipe) (S-N3, F-N8). The codes are a separate `TlsKeyError`
+  sharing the code space, never returned by `Oracle::boot`; a unit test
+  shows no `code()` collides. Codes added to run.py's mirror.
 - `LABEL_TLS_SIGN` = 4: request 4 words = the 32-byte transcript hash; `key`
   builds the TLS 1.3 server CertificateVerify content (64 × 0x20 ‖ "TLS 1.3,
   server CertificateVerify" ‖ 0x00 ‖ hash, RFC 8446 §4.4.3) and signs it
@@ -240,7 +255,8 @@ walkthroughs are in the Acceptance appendix.
   compromised (RM6-1).
 - Nonce (S7): RFC 6979 §3.2 HMAC-DRBG (HMAC-SHA256, libcrux-hmac) with the
   §3.6 additional input k' = 32 bytes of RNDR; a candidate the sign function
-  rejects (k ∉ [1, q−1]) continues step h.3. K, V, k, k' and the content
+  rejects (k ∉ [1, q−1]) continues step h.3, at most 8 candidates, then
+  `ERR_CRYPTO` (S-N4, F-N6; a retry has probability ≈ 2^-128). K, V, k, k' and the content
   buffer are `Secret` types, wiped after each signature; `key`'s stack is
   scrubbed after the call (the `scrub_session_stack` pattern). RNDR failure
   → `ERR_CRYPTO` (L9).
@@ -251,11 +267,20 @@ walkthroughs are in the Acceptance appendix.
 - Bucket and interference invariants (F12, S1, S14), compile-time:
   `TLS_SIGN_BURST − TLS_BOOT_CALLS ≥ SYN_GLOBAL_BURST`,
   `TLS_SIGN_INTERVAL_NS ≤ SYN_GLOBAL_INTERVAL_NS` (sized at the forwarded
-  handshake rate: the abuse bound), and `TLS_SIGN_BURST ×
-  ceil(SIGN_COST_NS / tls_budget_ns) × period_ns ≤ HS_KEY_WAIT_MAX_NS`, where
-  `SIGN_COST_NS` is measured under TCG in slice 2 (recorded with its method)
-  and `HS_KEY_WAIT_MAX_NS` is a stated fraction of WireGuard's
-  REKEY_TIMEOUT. If no constants satisfy all three, D3's stop rule applies.
+  handshake rate: the abuse bound), and the per-call wait `(ceil(
+  SIGN_COST_NS / TLS_BUDGET_NS) + 1) × PERIOD_NS ≤ HS_KEY_WAIT_MAX_NS`: `tls`
+  is single-threaded and the endpoint queue is priority-ordered (`hs` 110 >
+  `tls` 100), so `hs` waits behind at most one sign in progress, plus the
+  part of `tls`'s current period already spent (S-N1, F-N7).
+  `TLS_BUDGET_NS`/`PERIOD_NS` live in `layout`, checked against the
+  `.system` by layout's tests. `SIGN_COST_NS` = the maximum of 20 runs under
+  TCG × 2, recorded with the libcrux-p256 lock entry; a check-pins rule
+  fails when Cargo.lock's libcrux-p256 entry differs from the recorded one
+  (re-measure trigger). `HS_KEY_WAIT_MAX_NS` is a stated fraction of
+  WireGuard's REKEY_TIMEOUT. If no constants satisfy all three, D3's stop
+  rule applies. `hs` audits its key-call wait high-water as a value event
+  (`KeyWaitHighWater us=N`, like `RpCostHighWater`) — the runtime
+  observable (T-N7).
 - Control class: enforceable boundary (closed label table, callee-only PPC).
   Adjudication: `Oracle::handle`'s exhaustive match.
 - Acceptance: key-core unit tests (each label × caller incl. `Tls` →
@@ -264,10 +289,9 @@ walkthroughs are in the Acceptance appendix.
   crate (dev-dependency only) over random keys, hashes and k' values, a
   forced rejection-branch test, two k' values giving different r, RNDR
   failure → `ERR_CRYPTO`; integration: OpenSSL verifies CertificateVerify;
-  a ClientHello flood while a WireGuard handshake completes within its
-  timeout (S1), red-proved by raising `TLS_SIGN_BURST`; residue (T8).
+  case 12 (S1, T-N7); residue (T8).
 - Files: crates/secret-blob, crates/key-core, crates/pds/key,
-  crates/hs-core (invariants), crates/pds/hs (per-caller seed), crates/tpm2
+  crates/hs-core (invariants), crates/pds/hs (`KeyWaitHighWater`), crates/tpm2
   (envelope assert), tools/package, tools/mksecrets, tests/integration/run.py
   (`KEY_CALLERS`, codes, offsets).
 
@@ -293,9 +317,10 @@ walkthroughs are in the Acceptance appendix.
   algorithms must include 0x0403; ALPN optional (`http/1.1` selected, only
   others → `no_application_protocol`); server_name parsed, unused;
   `pre_shared_key` must be last and requires `psk_key_exchange_modes`
-  (§4.2.9) — then ignored (no tickets are ever issued); `early_data` →
-  refused with `illegal_parameter` (S11g; no tickets means no conforming
-  client sends it). Unknown extensions skipped.
+  (§4.2.9) — then ignored (no tickets are ever issued); `early_data` is
+  ignored as RFC 8446 §4.2.10 allows: records that fail deprotection
+  under the handshake key are skipped up to 16 KiB in total, then
+  `bad_record_mac` (S11g, S-N8). Unknown extensions skipped.
 - Serializers into caller buffers, sizes checked: ServerHello,
   EncryptedExtensions, Certificate (one DER), CertificateVerify with the
   DER `ECDSA-Sig-Value` from r ‖ s (8..=72 bytes, minimal INTEGERs; F8),
@@ -358,25 +383,36 @@ walkthroughs are in the Acceptance appendix.
 
 ### C8 — Secrets and plaintext lifecycle in `tls` (Critical tier, L12)
 
-- Wipe points: handshake secrets when the application secrets exist; the
-  superseded traffic secret and keys at KeyUpdate; on close, alert, timeout
-  and refusal: traffic secrets, record keys, `HybridSecret`, the record and
-  head buffers and both sockets' storage (S10). The slot is wiped before the
-  client sees the connection end, and `tls` audits `TlsClosed{reason}`
-  after the wipe (T7: the scan's barrier).
-- Acceptance: integration residue cases with OpenSSL `s_client
-  -keylogfile`, scanning for the secrets and for the record key/IV derived
-  from them in Python (T6, T7):
-  1. While a connection is open after the handshake: handshake traffic
-     secrets absent, CLIENT_TRAFFIC_SECRET_0 present (the control).
-  2. After an `s_client` KeyUpdate (`k`): secret_0 absent, secret_1
-     (HKDF-Expand-Label "traffic upd") present.
-  3. After `TlsClosed`: the connection's secrets, keys and a request/
-     response marker string absent; the control is a second, held-open
-     connection's traffic secret (kept within its idle timeout, read from
-     the Rust source).
-  Alert and timeout wipes are host unit tests on the connection core (C10).
-  Selftest cases (one per wipe point) remove each wipe and turn its case red.
+- Wipe points: the client handshake secret once the client Finished is
+  verified, the server handshake secret once the application secrets exist
+  (T-N4); the superseded traffic secret and keys at KeyUpdate; on close,
+  alert, timeout and refusal: traffic secrets, record keys, `HybridSecret`,
+  the rx and tx record buffers, the head and rewrite buffers and both
+  sockets' storage (S10, S-N2). The slot is wiped before the client sees the
+  connection end (the host-observed barrier: client EOF/RST; T-N2).
+- Scope (S-N2): the claim covers `tls`-owned memory. The backend link
+  (`tln`/`ntl`, `inner`, `eth_in` buffers) carries the request and response
+  in cleartext by design, as `dn`/`nd` do for the VPN.
+- Acceptance: integration residue cases in a dedicated boot `https-residue`
+  (T-N2) with OpenSSL `s_client -keylogfile`, scanning for the secrets and
+  for the record key/IV derived from them in Python (T6, T7). Barriers are
+  host-observed (T-N4): the raw backend's log of a request head proves the
+  server verified the client Finished and decrypted data sent after a
+  KeyUpdate; the backend then holds the response open.
+  1. After the backend logs the first request head: the client and server
+     handshake traffic secrets absent, CLIENT_TRAFFIC_SECRET_0 present.
+  2. After `k` and a second request logged: client secret_0 absent, client
+     secret_1 (HKDF-Expand-Label "traffic upd") present; a `K` variant for
+     the server write secret.
+  3. After client EOF: the connection's secrets, keys and a marker absent.
+     The marker is the value of a `Keep-Alive` field, which `rewrite` drops,
+     so only `tls` ever holds it (asserted absent from the backend log too;
+     T-N3). The control is a second connection held in response streaming
+     (the backend sends part of a response and keeps the socket open; idle
+     timeout and lifetime read from the Rust source).
+  Alert and timeout wipes are unit tests on `tls-core::conn`, asserting
+  through a `cfg(test)` accessor `Slot::is_zeroized()` (T-N15). Selftest
+  cases (one per wipe point) remove each wipe and turn its case red.
 - Files: crates/tls-core, crates/pds/tls, tests/integration/run.py.
 
 ### C9 — `http-wire`: request head parsing and rewrite (Critical tier: A8 bytes)
@@ -417,9 +453,12 @@ walkthroughs are in the Acceptance appendix.
   injected clock (T16), the PD only wiring rings and smoltcp to it.
 - Flow: TLS handshake → head (≤ 8 KiB) → rewrite → backend connect → head +
   body (≤ `MAX_BODY` 1 MiB, streamed) → response streamed to the client.
-- Close rules (F4, F7): close_notify only after a clean backend FIN; then
+- Close rules (F4, F7): close_notify only after a clean backend FIN or
+  after a response `tls` generated itself in full before any backend byte
+  (a refusal; F-N3); once the send buffer has drained (close_notify ACKed),
   `tls` waits ≤ 2 s for the client's close_notify/FIN and aborts the socket
-  (no TIME-WAIT slot). Backend RST, any timeout, a `tls` error or a refusal
+  (no TIME-WAIT slot); the whole close is bounded by the idle timeout
+  (F-N4). Backend RST, any timeout, a `tls` error or a refusal
   after the response started → TCP RST to the client without close_notify
   (truncation is visible). A client FIN or close_notify before the response
   ends → backend aborted.
@@ -432,10 +471,15 @@ walkthroughs are in the Acceptance appendix.
   256 tx record buffer (server records ≤ 4 KiB), head 8 KiB, rewrite 9 KiB
   ≈ 86 KiB; × 8 ≈ 690 KiB static, asserted at compile time against
   `TLS_STATE_MAX` (1 MiB).
-- Audit (L10; `crates/audit-event`, appended): `TlsAccepted`,
-  `TlsRefused{reason: u8}`, `TlsClosed{reason: u8}`, `HttpRefused{status:
-  u16}`, `BackendUnavailable`, `TlsTimeout{stage: u8}`, `TlsStackHighWater`;
-  the audit PD's name table and run.py's parser updated.
+- Audit (L10; `crates/audit-event`, appended; F-N2): attacker-driven kinds
+  are coalesced with one code per value, as `FRAME_DROPPED_BASE + reason`:
+  `TLS_REFUSED_BASE + reason`, `TLS_CLOSED_BASE + reason`,
+  `HTTP_REFUSED_BASE + status index` (400, 413, 417, 431, 501),
+  `TLS_TIMEOUT_BASE + stage`, `TcpLimited` (C2), `BackendUnavailable`;
+  `a` is the running total. Value events (not coalesced, emitted on a new
+  high): `TlsStackHighWater`, `KeyWaitHighWater` (C5). No barrier depends
+  on an audit line; cases assert totals where they need counts. The audit
+  PD's name table and run.py's parser are updated.
 - Probes (D3, T13, F19): slice 1 measures ML-KEM-768 encapsulation +
   X25519 + HKDF CPU time at 0.05; slice 3 measures 20 full handshakes and 8
   concurrent ones. Margin: the slowest handshake ≤ 1/3 of the 10 s handshake
@@ -454,9 +498,13 @@ walkthroughs are in the Acceptance appendix.
   `tls.pub`, then runs `tools/mkcert` (Python `cryptography`, host only) to
   make the dev CA and the leaf, then writes config naming the leaf and
   `tls_public`, then validates it; `make package` takes the blob as in M5.
-- Dev CA (S8): critical NameConstraints (permitted dNSName = the configured
-  SAN), `pathLen=0`, 30-day validity; its private key is destroyed after
-  issuing the leaf. Leaf: SAN from config, EKU serverAuth, KU
+- Dev CA (S8, S-N7): critical NameConstraints — permitted dNSName = the
+  configured name when the SAN is a name, and an iPAddress subtree that
+  permits only the configured address (or excludes 0.0.0.0/0 when the SAN
+  is a name) — `pathLen=0`, 30-day validity; the CA key exists only in
+  mkcert's memory and is never serialized. A `--test-negative` option
+  issues, before the key is dropped, a leaf for another name for the
+  acceptance test (F-N12). Leaf: SAN from config, EKU serverAuth, KU
   digitalSignature, CA:false.
 - Config (`config/gateway.toml`): `https_port`, `tls_ports`, backend
   address and port, `tls_cert` (DER path), `tls_public` (hex). `config`'s
@@ -474,8 +522,12 @@ walkthroughs are in the Acceptance appendix.
   `tls` audits and halts, the VPN still completes a handshake (D5); OpenSSL:
   a leaf for another name signed by the CA fails verification, the
   configured SAN passes.
-- Files: tools/mksecrets, tools/mkcert (new), crates/config, config/
-  gateway.toml, tools/package, Makefile.
+- Acceptance (T-N10): `tests/tools/test_mkcert.py` with a fixture per
+  property (critical NameConstraints for both name forms, `pathLen=0`,
+  validity, no key file written, leaf EKU/KU/CA:false), manifest key
+  `MKCERT-FIXTURES`, a selftest case under `pins`.
+- Files: tools/mksecrets, tools/mkcert (new), tests/tools/test_mkcert.py
+  (new), crates/config, config/gateway.toml, tools/package, Makefile.
 
 ## Testing strategy
 
@@ -486,16 +538,24 @@ walkthroughs are in the Acceptance appendix.
   `host_crates`, lint, `kani_crates` (tls-wire, http-wire) and
   `bolero_targets` (tls-wire, http-wire); `tls` joins the PD, lint-pds and
   ct-shape "no Verus symbols" lists; check-pins P9/P10/P11 crate lists gain
-  `tls-core`, `pds/tls` and `key-core` (S9); new manifest keys:
-  UNIT-TLS-WIRE, UNIT-TLS-CORE, UNIT-HTTP-WIRE, KANI-TLS-WIRE,
-  KANI-HTTP-WIRE and updated KANI-WIRE/INGRESS-CORE/INNER-CORE,
+  `tls-core`, `pds/tls` and `key-core` (S9); P11 gains a `tls-core` name
+  set (`finished`, `verify_data`) anchored on the file that verifies
+  Finished, as `TAG_ANCHOR` does for tpm2, with a fixture per name (T-N1);
+  manifest keys: new UNIT-TLS-WIRE, UNIT-TLS-CORE, UNIT-HTTP-WIRE,
+  KANI-TLS-WIRE, KANI-HTTP-WIRE, MKCERT-FIXTURES; changed KANI-WIRE/
+  INGRESS-CORE/INNER-CORE, UNIT-WIRE/INGRESS-CORE/INNER-CORE/KEY-CORE/
+  SECRET-BLOB/AUDIT-EVENT/CONFIG/MKSECRETS, LINT-CRATES, LINT-PDS,
   BOLERO-TARGETS 4 → 6, CHECK-PINS-RULES/FIXTURES, MIR-CRATES,
-  INTEGRATION-CASES.
+  INTEGRATION-CASES, UNIT-TESTS (T-N12).
 - Kani bounds (T15): `parse_tcp` over a ≤ 64-byte symbolic payload;
   `tls_egress` and inner branches over ≤ 64-byte packets; `tls-wire` record
   header and the extension walker over ≤ 96-byte messages; the DER encoder
   over symbolic r, s; `http-wire` head over ≤ 96 bytes and ≤ 4 headers;
-  unwind stated per harness. All new crates (as stubs), all dependencies and
+  unwind stated per harness. Each harness has a `kani::cover!` on an
+  accepting path (the crates/wire/src/proofs.rs pattern); a ClientHello
+  cannot be accepted within 96 bytes (1216-byte key share), so the
+  ClientHello accept side is covered by bolero and unit tests only, and its
+  harness covers the extension walker accepting other extensions (T-N9). All new crates (as stubs), all dependencies and
   the `tls` PD land in slice 1 so the Kani cache keys (Cargo.toml/Cargo.lock)
   change once.
 - Integration (boot group `https`, netns): outside tap with curl/OpenSSL
@@ -503,7 +563,10 @@ walkthroughs are in the Acceptance appendix.
   raw-socket backend that logs each connection's peer and raw bytes and
   answers fixed or echo responses (T10). `ip_forward=0` asserted. Preflight
   fails unless `openssl list -tls-groups` has X25519MLKEM768 and curl links
-  OpenSSL 3.5 (T21). Cases:
+  OpenSSL 3.5 (T21). run.py times case 1's handshake and fails with "probe
+  margin exceeded" when it is above the C10 margin, so an eroded margin on
+  another host is diagnosed, not flaky (T-N14). curl runs with `-H
+  'Expect:'` where a body is large (S-N8). Cases:
   1. GET returns the backend body byte for byte; curl verifies the chain and
      hostname; the negotiated group is X25519MLKEM768; a wrong CA or name
      fails curl (verification is on).
@@ -518,19 +581,35 @@ walkthroughs are in the Acceptance appendix.
      the stated status; after each, a valid request is sent and the backend
      log grows by exactly that one connection (barrier, T10).
   6. Head > 8 KiB → 431.
-  7. Residue cases (C8) and the scalar count (below).
-  8. TLS-only key failure (C11): HTTPS refused, VPN handshake completes.
-  9. HTTPS SYN flood (spoofed sources): ingress SYN-drop audit total ≥ N
-     first, then a WireGuard handshake and transport still work (the VPN
-     half; HTTPS during the flood is RM6-7) (S4, T11).
-  10. Eight connections from four sources held established; a ninth from a
-      fifth source is refused with RST; a third from one source is refused
-      (per-source cap); more than `MAX_CONNS` sequential connections within
-      10 s are all served (F4).
+  7. Residue cases (C8, boot `https-residue`) and the scalar count (below).
+  8. TLS-only key failure (C11): HTTPS refused, VPN handshake completes; the
+     rejected scalar occurs 0 times in guest RAM (S-N3).
+  9. HTTPS SYN flood (spoofed sources), run last in its boot: the ingress
+     `TcpLimited{syn_global}` total rises by ≥ N first, then a WireGuard
+     handshake and transport still work. This is a positive availability
+     check without its own red-proof: the controls it relies on (SYN
+     buckets, `TLS_TX_SHARE`) are red-proved by `ingress-core` unit cases
+     (S4, T11, T-N5).
+  10. Per-source cap with free slots: two connections from source A held,
+      a third from A refused (RST), one from B accepted (allow pair). Slot
+      recycling without wall-clock bounds: seven held, the eighth closed and
+      reopened nine times, each accepted (F4, T-N6). With eight held from
+      four sources, a ninth from a fifth source gets RST.
   11. Slowloris: one byte at intervals shorter than the timeout until past
-      it → `TlsTimeout{Handshake}` and EOF/RST, bounded from above only.
-  12. ClientHello flood while a WireGuard handshake completes (C5, S1).
-  13. The full VPN suite unchanged.
+      it → client EOF/RST, bounded from above only; the
+      `TLS_TIMEOUT_BASE + Handshake` total rises (T12, T-N2).
+  12. ClientHello flood while a WireGuard handshake runs: a replayed
+      OpenSSL ClientHello (captured on the tap; the generator and its source
+      addresses — four sources × two connections — in run.py) keeps `key`
+      signing; `hs`'s `KeyWaitHighWater` stays ≤ `HS_KEY_WAIT_MAX_NS` and
+      the handshake completes. Red-proof: a scratch tree lowers `tls`'s
+      budget and `TLS_BUDGET_NS` with the compile-time assert removed, so the
+      high-water exceeds the bound (S1, S-N1, T-N7).
+  13. Backend RST mid-response (`SO_LINGER` 0) → the client sees RST and no
+      close_notify; a client FIN before the response ends → the backend sees
+      its connection aborted (T-N8, with conn-core unit tests for the 2 s
+      wait).
+  14. The full VPN suite unchanged.
 - Scalar residue (T8, F21): a helper asserts an exact count; after a
   handshake observed on the client, the TLS scalar occurs exactly once
   big-endian (`key`'s plaintext buffer) and never little-endian in guest RAM;
@@ -543,7 +622,15 @@ walkthroughs are in the Acceptance appendix.
   CertificateVerify content built in `key`, `parse_tcp` checksum/offset/
   SYN+FIN, `tls_egress` fields, inner both directions, SYN buckets, TE and
   duplicate-CL refusals, `Connection` naming CL, the `X-Forwarded-*` strip,
-  the per-source cap.
+  the per-source cap; and (T-N11) a handshake/head timer reset by activity,
+  the conn-core alert/timeout wipes, the truncation rule, `tls` RNDR failure
+  → no handshake (L9), the `TLS_TX_SHARE` tier, minimal DER INTEGERs, 413
+  at head time, the no-key-share refusal reason, the RFC 6979 candidate
+  cap, the `tls_egress` SYN refusal, the rejected-scalar wipe (D5).
+- Keylog fixture (T-N13): captured against `openssl s_server -groups
+  X25519MLKEM768 -ciphersuites TLS_CHACHA20_POLY1305_SHA256` (independent of
+  our server, available before slice 3), with the capture script committed
+  beside the fixture.
 - Integration cost (T22): stated after slice 3 (INTEGRATION-CASES delta,
   number of 2 GiB scans, wall time).
 
@@ -576,8 +663,9 @@ walkthroughs are in the Acceptance appendix.
   fixtures, the host test client and OpenSSL interop. Worst case (A3 on
   `tls`): plaintext and traffic keys of current connections, and server
   CertificateVerify signatures for arbitrary transcripts while compromised
-  (impersonation for that period); never `key`'s secrets; past connections'
-  plaintext is wiped (C8).
+  (impersonation for that period); never `key`'s secrets. Past connections'
+  plaintext is wiped from `tls`-owned memory (C8); the backend link and its
+  buffers (`tln`/`ntl`, `inner`, `eth_in`) hold cleartext by design.
 - **RM6-2** smoltcp is unverified code in a tainted PD; same worst case. A
   panic in `tls` or smoltcp ends HTTPS until reboot (no restart, SC17).
 - **RM6-3** dev CA only (VE9).
@@ -587,9 +675,14 @@ walkthroughs are in the Acceptance appendix.
   elsewhere, R-M1 class).
 - **RM6-6** no HRR: a client that supports X25519MLKEM768 but sends no key
   share for it is refused rather than asked again.
-- **RM6-7** HTTPS under a spoofed SYN flood: smoltcp has no SYN cookies, so
-  spoofed SYNs can occupy the listeners until their SYN-RECEIVED timeout;
-  ingress buckets keep the flood from reaching the VPN and `key`.
+- **RM6-7** HTTPS under spoofed floods: smoltcp has no SYN cookies, so
+  spoofed SYNs occupy listeners until their 5 s timeout; spoofed ACK/data
+  segments exhaust the global TCP data bucket and stall established HTTPS
+  connections; smoltcp's ISNs come from PCG32 and are predictable from
+  observed ones, enabling blind spoofed handshakes (filling slots past the
+  per-source cap) and blind RST injection (S-N6, F-N11). TLS keeps content
+  and X-Forwarded-For authentic. Ingress buckets keep the floods from
+  reaching the VPN and `key`.
 
 ## Scope contract
 
@@ -600,13 +693,14 @@ walkthroughs are in the Acceptance appendix.
 | SC35 | Verus proofs for `parse_tcp`, `tls-wire`, `http-wire` (Kani in M6) | unscheduled (SC29 Vest) |
 | SC36 | HTTP keep-alive, HTTP/2, multiple backends, TLS session tickets | unscheduled |
 | SC37 | WebPKI certificate issuance and renewal | ops (VE9) |
-| SC38 | SYN cookies / client puzzles for HTTPS (RM6-7) | unscheduled |
+| SC38 | SYN cookies, RFC 6528 ISNs (a smoltcp patch or fork), client puzzles for HTTPS (RM6-7) | unscheduled |
 
 ## User operation scenarios
 
 1. Operator: puts the backend in config, runs `mksecrets` (blob v3, fresh
    P-256 key, dev CA and leaf, config) and `make package` → envelopes sealed
-   as in M5; boots; `curl --cacert devca.pem https://gw/` returns the
+   as in M5 (the 30-day dev leaf means re-issue, re-package and re-seal
+   within 30 days; S-N7); boots; `curl --cacert devca.pem https://gw/` returns the
    backend's page.
 2. A browser without X25519MLKEM768 connects → handshake failure, audit
    `TlsRefused{NoPqGroup}`.
@@ -626,8 +720,8 @@ walkthroughs are in the Acceptance appendix.
 | `TlsSign` reply | `key` | `tls-wire` reads 8 words → r [0..32], s [32..64] big-endian → DER `ECDSA-Sig-Value` |
 | `itl`/`ntl` buffers | ingress / inner | `tls` reads one raw IPv4 packet ≤ 1500 bytes (length in the used-ring entry) → smoltcp `Device::receive`; producer notifies `tls` |
 | `tli`/`tln` buffers | `tls` | ingress `tls_egress` / inner reads one raw IPv4 packet → checks of C2/C4 → frame; `tls` notifies the consumer |
-| Audit events | `tls` | audit PD reads code + integers → name table line on the UART; run.py parses `audit: src=tls <Name> field=N` |
-| Config outputs | config build.rs | ingress: `HTTPS_PORT`; inner: backend IP/port, `TLS_PORTS`; tls: both plus `TLS_CERT`; key: `TLS_PUBLIC` |
+| Audit events | `tls`, `ingress`, `hs` | audit PD reads the kind code (a base + value for coalesced kinds) and `a` (running total, or the value for high-water events) → name table line on the UART; run.py parses `audit: src=<pd> <Name> total=N` / `us=N` / `bytes=N` (F-N2) |
+| Config outputs | config build.rs | `HTTPS_PORT: u16` (ingress, tls); `TLS_PORTS: (u16, u16)` start and count (inner, tls); `BACKEND: ([u8; 4], u16)` (inner, tls); `TLS_CERT: &[u8]` (tls); `TLS_PUBLIC: [u8; 65]` uncompressed point (key) (F-N13) |
 
 ## Go/No-Go Gate
 
