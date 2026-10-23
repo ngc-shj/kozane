@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# RUSTC_WRAPPER for the MIR gate (M5 plan C4, tools/mir-gate). It runs rustc
+# as asked and, when the unit is the library of a crate in MIR_CRATES, runs
+# the same command once more printing MIR, so the MIR comes from exactly the
+# flags, cfgs, features and environment cargo used for that unit.
+#
+# Each MIR file is $MIR_OUT/<crate>.<hash of the args>.mir; the hash keeps
+# one file per distinct unit (a crate built with two feature sets yields two).
+set -euo pipefail
+rustc=$1
+shift
+"$rustc" "$@"
+
+crate="" lib=0 args=() prev=""
+for a in "$@"; do
+    case $prev in
+        --crate-name) crate=$a ;;
+        --crate-type) [ "$a" = lib ] || [ "$a" = rlib ] && lib=1 ;;
+    esac
+    # Output selection is replaced by the MIR printout.
+    case $prev in
+        --emit|--out-dir|-o) prev=$a; continue ;;
+    esac
+    case $a in
+        --emit|--out-dir|-o) prev=$a; continue ;;
+        --emit=*|--out-dir=*) prev=$a; continue ;;
+    esac
+    args+=("$a")
+    prev=$a
+done
+case " ${MIR_CRATES:-} " in
+    *" $crate "*) ;;
+    *) exit 0 ;;
+esac
+[ "$lib" = 1 ] || exit 0
+mkdir -p "$MIR_OUT"
+key=$(printf '%s\n' "${args[@]}" | sha256sum | cut -c1-16)
+"$rustc" "${args[@]}" -Zunpretty=mir -Zmir-opt-level=0 > "$MIR_OUT/$crate.$key.mir"

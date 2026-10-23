@@ -242,3 +242,47 @@ holding `env!("CARGO_MANIFEST_DIR")` to the timer PD.
   crates (about 30 s). `make clean` removes it too.
 - **The cross-machine comparison** (gx10 against z1mn, same image and
   commit) remains the manual end-of-milestone step the plan names.
+
+## Slice 4b — verified-vs-shipped MIR gate (C4)
+
+### Result
+
+`make mir` compares the shipped and proof MIR of every member
+(`MIR-CRATES 7`, about 30 s): verus_crates (wg-wire, rosenpass-wire, msgs,
+ring, wire) plus the kani_crates some PD links (ingress-core, inner-core).
+The two configurations' MIR is identical as rustc prints it, with no
+normalisation.
+
+check-selftest has four cases, each red with the failure-only needle
+`mir-gate: wire: shipped MIR differs from the proof build`. Each puts one
+split into wire:
+
+- `mir-target-split`: a body under `cfg(target_os = "none")`;
+- `mir-env-split`: one on `option_env!("CARGO_PRIMARY_PACKAGE")`;
+- `mir-debug-split`: one on `cfg(debug_assertions)`;
+- `mir-feature-split`: one on a feature that only ingress-core turns on.
+
+The comparison and member derivation are fixtured too
+(`MIR-GATE-FIXTURES 9`).
+
+### Deviations
+
+- **No normalisation.** The plan allowed stripping spans, scope comments
+  and paths. The MIR came out byte-identical without it, so the gate
+  compares exact text, which is strictly stronger.
+- **How the MIR is captured.** `tools/mir-capture` is a `RUSTC_WRAPPER`.
+  It re-runs the unit's exact rustc command with
+  `-Zunpretty=mir -Zmir-opt-level=0`, so cargo's feature unification and
+  environment are what is compared, not a reconstruction of them.
+- **The proof configuration is the release profile with debug assertions
+  on, one member per cargo invocation.**
+  - **Why not the dev profile:** it differs from the PD build in panic
+    strategy (unwind edges in every MIR body).
+  - **Debug assertions on:** that is the value unit tests and Kani build
+    with, so the `cfg(debug_assertions)` axis is still compared.
+  - **One member per invocation:** members selected together would unify
+    their features, which hid the feature split. Before each member is
+    built it is `cargo clean`ed, because a member compiled earlier as
+    another member's dependency is fresh and the wrapper would not see it.
+- **Stated limit (RM5-3, unchanged).** The Verus-only cfgs and Verus's own
+  rustc are not compared. The M4 source scan covers that axis.

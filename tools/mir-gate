@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Verified-vs-shipped MIR gate (M5 plan C4).
+
+For every member crate, the MIR a PD ships equals the MIR the proof
+configuration compiles, as rustc itself prints it (`-Zunpretty=mir
+-Zmir-opt-level=0`, no normalisation). tools/mir-capture, a RUSTC_WRAPPER,
+re-runs rustc with exactly the arguments and environment cargo used for the
+unit, so the comparison sees cargo's own feature unification.
+
+  (a) shipped: `make pds MICROKIT_CONFIG=release` into a private target
+      directory (target aarch64-sel4-microkit, release profile, features as
+      unified for each PD, CARGO_PRIMARY_PACKAGE unset);
+  (b) proof:   `cargo build --release -p <member>`, one member per cargo
+      invocation (as Kani and Verus verify one crate at a time, so members
+      do not unify features), on the host target with debug assertions on (the value unit tests and Kani build with),
+      CARGO_PRIMARY_PACKAGE=1, cfg(kani) off.
+
+Both are aarch64, and the profiles share opt-level, overflow checks and
+panic strategy, so a difference is a split on a target cfg, a feature,
+debug_assertions or a build-environment read. Not compared: the Verus-only
+cfgs (verus_keep_ghost*) and Verus's own rustc; the M4 source scan covers
+that axis (residual RM5-3). Equal MIR does not prove Verus saw a body; it
+proves the shipped body is the one the host-side proof builds compile.
+
+Members: verus_crates, plus the kani_crates that some PD links (derived from
+cargo metadata's resolve graph). Control class: fail-closed verification
+gate; a member with no shipped or no proof MIR, or with two proof variants,
+is a refusal.
+
+Usage: tools/mir-gate --verus "<crates>" --kani "<crates>" --pds "<pds>"
+Prints "MIR-CRATES <n>" when every member matches.
+"""
+
+import argparse
+import difflib
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def lib_name(crate: str) -> str:
+    return crate.replace("-", "_")
+
+
+def members(verus: list, kani: list, pds: list, meta: dict) -> list:
+    """verus ∪ (kani ∩ the dependency closure of every pd-<name> package)."""
+    names = {p["id"]: p["name"] for p in meta["packages"]}
+    deps = {n["id"]: [d["pkg"] for d in n["deps"]] for n in meta["resolve"]["nodes"]}
+    roots = [i for i, n in names.items() if n in {f"pd-{p}" for p in pds}]
+    if len(roots) != len(pds):
+        raise SystemExit(f"mir-gate: PD packages not all found: {sorted(set(pds) - {names[r][3:] for r in roots})}")
+    seen, todo = set(), list(roots)
+    while todo:
+        i = todo.pop()
+        if i not in seen:
+            seen.add(i)
+            todo += deps.get(i, [])
+    linked = {names[i] for i in seen}
+    return sorted(set(verus) | (set(kani) & linked))
+
+
+def compare(shipped: pathlib.Path, proof: pathlib.Path, crates: list) -> tuple:
+    """(errors, matched count) over the captured MIR files."""
+    errors, matched = [], 0
+    for crate in crates:
+        lib = lib_name(crate)
+        ship = sorted(shipped.glob(f"{lib}.*.mir"))
+        want = sorted(proof.glob(f"{lib}.*.mir"))
+        if not ship:
+            errors.append(f"mir-gate: {crate}: no shipped MIR was captured")
+            continue
+        if len(want) != 1:
+            errors.append(f"mir-gate: {crate}: expected one proof MIR, captured {len(want)}")
+            continue
+        reference = want[0].read_text().splitlines()
+        ok = True
+        for s in ship:
+            got = s.read_text().splitlines()
+            if got != reference:
+                ok = False
+                diff = list(difflib.unified_diff(reference, got, "proof", "shipped", n=0, lineterm=""))[:12]
+                errors.append(f"mir-gate: {crate}: shipped MIR differs from the proof build ({s.name})\n  "
+                              + "\n  ".join(diff))
+        matched += ok
+    return errors, matched
+
+
+def run(cmd: list, env: dict, log: pathlib.Path):
+    with log.open("w") as f:
+        r = subprocess.run(cmd, cwd=ROOT, env=env, stdout=f, stderr=subprocess.STDOUT)
+    if r.returncode != 0:
+        sys.stdout.write("".join(log.read_text().splitlines(keepends=True)[-30:]))
+        raise SystemExit(f"mir-gate: {' '.join(cmd[:3])} failed ({r.returncode}); see {log}")
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--verus", required=True)
+    ap.add_argument("--kani", required=True)
+    ap.add_argument("--pds", required=True)
+    args = ap.parse_args()
+    meta = json.loads(subprocess.run(["cargo", "metadata", "--locked", "--format-version", "1"], cwd=ROOT,
+                                     check=True, capture_output=True, text=True).stdout)
+    crates = members(args.verus.split(), args.kani.split(), args.pds.split(), meta)
+    out = ROOT / "build/mir"
+    shutil.rmtree(out, ignore_errors=True)
+    out.mkdir(parents=True)
+    env = dict(os.environ, RUSTC_WRAPPER=str(ROOT / "tools/mir-capture"),
+               MIR_CRATES=" ".join(lib_name(c) for c in crates))
+    run(["make", "pds", "MICROKIT_CONFIG=release", f"pd_target={out / 'pd-target'}"],
+        dict(env, MIR_OUT=str(out / "shipped")), out / "shipped.log")
+    # One cargo invocation per member, as the proof gates verify one crate at
+    # a time: members selected together would unify their features.
+    for c in crates:
+        # A member built earlier as another member's dependency would be
+        # fresh, and the wrapper would not see it.
+        run(["cargo", "clean", "--release", "--target-dir", str(out / "proof-target"), "-p", c], env,
+            out / f"proof-clean-{c}.log")
+        run(["cargo", "build", "--locked", "--release", "--target-dir", str(out / "proof-target"), "-p", c],
+            dict(env, MIR_OUT=str(out / "proof"), MIR_CRATES=lib_name(c), CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS="true"),
+            out / f"proof-{c}.log")
+    errors, matched = compare(out / "shipped", out / "proof", crates)
+    for e in errors:
+        print(e)
+    print(f"MIR-CRATES {matched}")
+    return 1 if errors or matched != len(crates) else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

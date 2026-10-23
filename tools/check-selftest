@@ -111,6 +111,8 @@ def two_key_channel(tree: pathlib.Path, caller: str, caller_id: int, callee: str
            f'pp = {{ {caller} = true, {callee} = false }}\nnotify = {{ {caller} = false, {callee} = true }}\n')
 
 
+MIR_SPLIT = "\n{a}\npub fn selftest_split() -> u32 {{\n    1\n}}\n{b}\npub fn selftest_split() -> u32 {{\n    2\n}}\n"
+MIR_NEEDLE = "mir-gate: wire: shipped MIR differs from the proof build"
 UNIT_TEST = "\n#[test]\nfn selftest_injected_failure() {\n    assert_eq!(1, 2);\n}\n"
 KANI_HARNESS = (
     "\n#[kani::proof]\nfn selftest_unsatisfiable_cover() {\n"
@@ -150,6 +152,7 @@ CASES_FOR_GATE = {
              "integration-pq-residue", "l8-fallback", "integration-rp-src-meter", "integration-rotation",
              "integration-expiry", "rp-cookie-gate", "integration-expiry-residue"},
     "repro": {"repro-path-leak"},
+    "mir": {"mir-target-split", "mir-env-split", "mir-debug-split", "mir-feature-split"},
     "manifest": {"manifest"},
 }
 
@@ -195,6 +198,23 @@ CASES = {
     "repro-path-leak": (["repro"], lambda t: append(t, "crates/pds/timer/src/main.rs",
                                                     '\n#[used]\nstatic SELFTEST_PATH: &str = env!("CARGO_MANIFEST_DIR");\n'),
                         "repro: pd-timer.elf differs between"),
+    # M5 plan C4: each split gives the shipped wire a body the proof build
+    # does not compile, and only the MIR comparison can see it.
+    "mir-target-split": (["mir"], lambda t: append(t, "crates/wire/src/lib.rs", MIR_SPLIT.format(
+        a='#[cfg(target_os = "none")]', b='#[cfg(not(target_os = "none"))]')), MIR_NEEDLE),
+    "mir-env-split": (["mir"], lambda t: append(t, "crates/wire/src/lib.rs",
+                                                "\npub fn selftest_split() -> u32 {\n"
+                                                "    if option_env!(\"CARGO_PRIMARY_PACKAGE\").is_some() { 1 } else { 2 }\n}\n"),
+                      MIR_NEEDLE),
+    "mir-debug-split": (["mir"], lambda t: append(t, "crates/wire/src/lib.rs", MIR_SPLIT.format(
+        a="#[cfg(debug_assertions)]", b="#[cfg(not(debug_assertions))]")), MIR_NEEDLE),
+    # A feature only ingress-core turns on (features do not touch Cargo.lock).
+    "mir-feature-split": (["mir"], lambda t: (
+        append(t, "crates/wire/Cargo.toml", '\n[features]\nselftest-split = []\n'),
+        edit(t, "crates/ingress-core/Cargo.toml", 'wire = { path = "../wire" }',
+             'wire = { path = "../wire", features = ["selftest-split"] }'),
+        append(t, "crates/wire/src/lib.rs", MIR_SPLIT.format(
+            a='#[cfg(feature = "selftest-split")]', b='#[cfg(not(feature = "selftest-split"))]'))), MIR_NEEDLE),
     "unit": (["unit"], lambda t: append(t, "crates/wire/src/tests.rs", UNIT_TEST), "selftest_injected_failure"),
     # Only ring: the injection invalidates every proof cache entry, and
     # re-proving wire takes ~40 minutes.
