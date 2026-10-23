@@ -286,8 +286,10 @@ walkthroughs are in the Acceptance appendix.
 - Acceptance: key-core unit tests (each label × caller incl. `Tls` →
   `StaticDh` refused, lengths, buckets, D5 codes); RFC 6979: A.2.5 (empty
   k') reproduced, a host differential test against the RustCrypto `rfc6979`
-  crate (dev-dependency only) over random keys, hashes and k' values, a
-  forced rejection-branch test, two k' values giving different r, RNDR
+  crate (dev-dependency only) over random keys, hashes and k' values plus
+  hash values ≥ n reduced independently in the test (S-N4), a forced
+  rejection-branch test, the 8-candidate cap through a seam that keeps
+  rejecting, two k' values giving different r, RNDR
   failure → `ERR_CRYPTO`; integration: OpenSSL verifies CertificateVerify;
   case 12 (S1, T-N7); residue (T8).
 - Files: crates/secret-blob, crates/key-core, crates/pds/key,
