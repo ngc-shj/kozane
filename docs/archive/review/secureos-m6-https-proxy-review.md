@@ -360,3 +360,52 @@ partial (R3-6, R3-10); R43 N/A; R44 OK; R45 watch; R46 N/A; R47 OK; R48 N/A;
 R49 OK; R50 resolved; R51, R52 N/A; R53 note (R3-8); R54–R57 N/A; RT1, RT2 OK;
 RT3 watch; RT4 R3-4, R3-5; RT5, RT6 OK; RT7 R3-5, R3-6, R3-7, R3-10; RT8 OK;
 RT9 watch; RT10 R3-6; RT11 watch.
+
+# Review round 4
+Date: 2026-10-24
+
+## Changes from Previous Round
+
+Plan v4 (b7aa69f). Security: S-R3-1/2/3 and S-N7 resolved; two Minors
+(prose; one reachable only by building), no design finding — saturated in
+its scope. Functionality: F-N-a…d resolved; one Major (socket-storage wipe
+order infeasible with smoltcp) and one prose Minor. Testing: T-R3-1…10
+resolved; one Major (no gate sees the `tls` stack-scrub mutation) and three
+Minors.
+
+## Merged findings and dispositions (plan v5)
+
+| ID(s) | Sev | Subject | Resolution |
+|---|---|---|---|
+| F-R4-1 | Major | smoltcp owns socket storage; "wipe before abort RST" infeasible | Abort and poll (RST out), then remove, wipe and re-create in the same event-loop pass; barrier = abort RST then a fresh SYN answered in a later pass |
+| T-R4-1 | Major | `tls` stack scrub after `exchange` has no detecting gate | ct-harness residue case for `exchange` + scrub; RESIDUE-CASES; selftest under `ct` |
+| F-R4-2, S-R4-1 | Minor (prose) | close_notify sealing order; the wait cannot decrypt | Seal, wipe, transmit; the wait ends on any inbound record or FIN, undecrypted |
+| S-R4-2 | Minor (build-reachable) | IP-mode leaf CN vs `invalid` dNSName constraint | Empty subject in IP mode; IP-mode positive fixture |
+| T-R4-2 | Minor | Held connections may idle out | Backend sends a byte to each between cycles |
+| T-R4-3 | Minor (build-reachable) | Red-proof magnitude | Lowered budget makes the per-call wait several times the bound |
+| T-R4-4 | Minor (prose) | Rosenpass setup for `https-contention` | Reuses the cookie boots' installation |
+
+## Recurring Issue Check (round 4)
+
+### Functionality expert
+R1–R3 checked; R4 resolved; R5–R11 N/A; R12 resolved; R13–R15 N/A; R16,
+R17 checked; R18 resolved; R19–R21 N/A; R22 checked; R23, R24 N/A; R25
+checked; R26–R28 N/A; R29 checked; R30, R31 N/A; R32 checked; R33 N/A; R34,
+R35 checked; R36, R37 N/A; R38 R4-1, R4-2; R39 R4-1; R40 checked; R41 R4-1;
+R42, R43 checked; R44–R48 N/A; R49 resolved; R50 checked; R51 N/A; R52, R53
+checked; R54–R57 N/A.
+
+### Security expert
+R1–R3 OK; R4–R11 N/A; R12 OK; R13–R16 N/A; R17, R18 OK; R19–R28 N/A; R29 OK
+(R4-2 note); R30, R31 N/A; R32 OK; R33 N/A; R34, R35 OK; R36, R37 N/A; R38 OK;
+R39 OK (R4-1 prose); R40–R43 OK; R44–R46 N/A; R47–R53 OK; R54 N/A; R55 OK;
+R56, R57 N/A; RS1–RS6 OK.
+
+### Testing expert
+R1 N/A; R2 watch; R3, R4 resolved; R5, R6 N/A; R7 resolved; R8–R11 N/A; R12
+resolved; R13–R15 N/A; R16 resolved; R17 watch; R18 resolved; R19–R28 N/A;
+R29 checked; R30, R31 N/A; R32 OK; R33, R34 N/A; R35 OK; R36, R37 N/A; R38
+resolved; R39 R4-1; R40–R42 OK; R43 N/A; R44 OK; R45 watch; R46 N/A; R47 OK;
+R48 N/A; R49, R50 OK; R51, R52 N/A; R53 OK; R54–R57 N/A; RT1, RT2 OK; RT3
+watch; RT4 resolved; RT5, RT6 OK; RT7 R4-1 (R4-3 note); RT8 OK; RT9 watch;
+RT10 resolved; RT11 watch.

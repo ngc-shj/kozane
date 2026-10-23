@@ -392,6 +392,12 @@ walkthroughs are in the Acceptance appendix.
     undecryptable record → `bad_record_mac`; one after `Connected` →
     `bad_record_mac`. With a deterministic-RNG seam, after `exchange` the
     ephemeral and the randomness are absent from the wiped buffers (S-R3-2).
+  - ct-harness residue mode (T-R4-1): `HybridSecret::exchange` with a known
+    RNG followed by `tls`'s `scrub_session_stack`, run on the harness's
+    painted stack and searched for every stored form of the ephemeral
+    scalar, the encapsulation randomness and both component shared secrets
+    (as for `tpm2::envelope::open_sealed`); RESIDUE-CASES raised; a selftest
+    case under `ct` removes the scrub.
   - `compile_fail` doctests: `HybridSecret` not `Clone`/`Copy`, not
     constructible outside its module.
   - Integration: OpenSSL/curl complete; `-groups X25519` →
@@ -401,17 +407,23 @@ walkthroughs are in the Acceptance appendix.
 
 ### C8 — Secrets and plaintext lifecycle in `tls` (Critical tier, L12)
 
-- Order (T-R3-3): keys and the record, head and rewrite buffers are wiped
-  before close_notify (or the RST) goes out; socket storage is wiped before
-  the abort RST.
+- Order (T-R3-3, F-R4-1, S-R4-1): close_notify is sealed into the socket's
+  send buffer, then keys and the record, head and rewrite buffers are
+  wiped, then it is transmitted. smoltcp owns socket storage while the
+  socket exists and sends an abort's RST only from the live socket at the
+  next poll, so the socket is aborted and polled (RST out), then — in the
+  same event-loop pass — removed from its set, its storage wiped through
+  the static, and the listener re-created.
 - Wipe points: the client handshake secret once the client Finished is
   verified, the server handshake secret once the application secrets exist
   (T-N4); the superseded traffic secret and keys at KeyUpdate; on close,
   alert, timeout and refusal: traffic secrets, record keys, `HybridSecret`,
   the rx and tx record buffers, the head and rewrite buffers and both
   sockets' storage (S10, S-N2). The host-observed barrier for a closed
-  connection is the server's abort RST for its 4-tuple, seen by an
-  AF_PACKET sniffer on the tap (T-R3-3).
+  connection: the sniffer sees the server's abort RST for its 4-tuple, then
+  a fresh SYN to 443 gets its SYN-ACK or RST; `tls` handles that SYN in a
+  later pass than the one that emitted the abort RST, so the wipe is done
+  (T-R3-3, F-R4-1).
 - Scope (S-N2): the claim covers `tls`-owned memory. The backend link
   (`tln`/`ntl`, `inner`, `eth_in` buffers) carries the request and response
   in cleartext by design, as `dn`/`nd` do for the VPN.
@@ -429,8 +441,8 @@ walkthroughs are in the Acceptance appendix.
      (decrypted under the new key): client secret_0 absent, client secret_1
      (HKDF-Expand-Label "traffic upd") present; a `K` variant for the server
      write secret.
-  3. After the sniffer sees the abort RST: the connection's secrets, keys
-     and its marker absent.
+  3. After that barrier: the connection's secrets, keys and its marker
+     absent.
      The marker is the value of a `Keep-Alive` field, which `rewrite` drops,
      so only `tls` ever holds it (asserted absent from the backend log too;
      T-N3). The control is a second connection held in response streaming
@@ -483,7 +495,8 @@ walkthroughs are in the Acceptance appendix.
 - Close rules (F4, F7): close_notify only after a clean backend FIN or
   after a response `tls` generated itself in full before any backend byte
   (a refusal; F-N3); once the send buffer has drained (close_notify ACKed),
-  `tls` waits ≤ 2 s for the client's close_notify/FIN and aborts the socket
+  `tls` waits ≤ 2 s for any inbound record or FIN (not decrypted: the read
+  key is already wiped; F-R4-2, S-R4-1) and aborts the socket
   (no TIME-WAIT slot); the whole close is bounded by the idle timeout
   (F-N4). Backend RST, any timeout, a `tls` error or a refusal
   after the response started → TCP RST to the client without close_notify
@@ -532,7 +545,9 @@ walkthroughs are in the Acceptance appendix.
   forms — name mode: permitted dNSName = the configured name, excluded
   iPAddress 0.0.0.0/0 and ::/0; IP mode: permitted iPAddress = the
   configured address/32, excluded ::/0, permitted dNSName `invalid` (RFC
-  6761) only — `pathLen=0`, 30-day validity; the CA key exists only in
+  6761) only — `pathLen=0`, 30-day validity; in IP mode the leaf has an
+  empty subject (no hostname-like CN for OpenSSL to check against the
+  dNSName constraint; S-R4-2); the CA key exists only in
   mkcert's memory and is never serialized. A `--test-negative` option
   issues, before the key is dropped, a leaf for another name for the
   acceptance test (F-N12). Leaf: SAN from config, EKU serverAuth, KU
@@ -555,7 +570,8 @@ walkthroughs are in the Acceptance appendix.
   configured SAN passes.
 - Acceptance (T-N10): `tests/tools/test_mkcert.py` with a fixture per
   property (critical NameConstraints for both name forms, a negative leaf
-  in the other name form for each mode, `pathLen=0`,
+  in the other name form for each mode, an IP-mode positive leaf verified
+  by OpenSSL, `pathLen=0`,
   validity, no key file written, leaf EKU/KU/CA:false), manifest key
   `MKCERT-FIXTURES`, a selftest case under `pins`.
 - Files: tools/mksecrets, tools/mkcert (new), tests/tools/test_mkcert.py
@@ -630,7 +646,9 @@ walkthroughs are in the Acceptance appendix.
       recycling (F4, T-N6, T-R3-4): seven connections held in response
       streaming (the backend holds; idle timeout and lifetime from the Rust
       source); the eighth slot runs nine full requests whose close the server
-      initiates (backend FIN → close_notify → abort), each accepted; then
+      initiates (backend FIN → close_notify → abort), each accepted, the
+      backend sending one response byte to each held connection between
+      cycles so none reaches its idle timeout (T-R4-2); then
       the seven are still alive (the backend finishes and the clients
       receive their responses). Red-proof: without the abort (TIME-WAIT
       kept) a cycle fails. With eight held from four sources, a ninth from a
@@ -648,8 +666,11 @@ walkthroughs are in the Acceptance appendix.
       precondition); then the high-water stays ≤ `HS_KEY_WAIT_MAX_NS` and a
       handshake completes. Needle: "KeyWaitHighWater above
       HS_KEY_WAIT_MAX_NS". Red-proof: a scratch tree lowers `tls`'s budget
-      and `TLS_BUDGET_NS` with the compile-time assert removed (S1, S-N1,
-      T-N7).
+      and `TLS_BUDGET_NS` with the compile-time assert removed, to a value
+      where `(ceil(SIGN_COST_NS / budget) + 1) × PERIOD_NS` is several times
+      `HS_KEY_WAIT_MAX_NS`, so the overlap precondition alone exceeds the
+      bound (S1, S-N1, T-N7, T-R4-3). The boot reuses the cookie boots'
+      Rosenpass/PSK installation so `hs` reaches `key` (L8; T-R4-4).
   13. Backend RST mid-response (`SO_LINGER` 0) → `s_client -msg` shows no
       close_notify alert and the read fails with ECONNRESET, and the sniffer
       sees the server's RST (T-R3-9); a client FIN before the response ends → the backend sees
