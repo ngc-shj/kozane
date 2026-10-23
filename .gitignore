@@ -5,3 +5,4 @@
 !/crates/*/src/__fuzz__/*/corpus/seed-*
 /crates/*/src/__fuzz__/*/crashes/
 __pycache__/
+/tools/*/target/

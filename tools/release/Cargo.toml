@@ -1,0 +1,13 @@
+# Release signing and verification (M5 plan C13, C12): a host tool in its own
+# workspace, so its signature libraries never enter the PD build's lock.
+[package]
+name = "release"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+
+[workspace]
+
+[dependencies]
+libcrux-ml-dsa = { version = "=0.0.11", default-features = false, features = ["std", "mldsa65"] }
+libcrux-ed25519 = "=0.0.10"
