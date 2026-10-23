@@ -866,3 +866,37 @@ only), `make test` (`INTEGRATION-CASES 44`), and every selftest case.
   exception file, `policy/audit-ignore-release.toml`. Its one entry is the
   same build-time `proc-macro-error2` the root lock already excepts
   (through libcrux's hax-lib-macros).
+
+## Phase 2 self-check (step 2-5)
+
+Three experts checked the recurring-issue list over `e132cd6..HEAD`:
+
+- **Functionality: R34.** Slice 7's note on `crates/config/build.rs` was
+  not in the Anti-Deferral form; see below.
+- **Security: R39.** `tools/release` left decode-time copies of the
+  signing keys unwiped (the hex `String` and the decoded `Vec` in
+  `read_hex`/`load_signing`). **Fixed**, with the same class swept across
+  the tool:
+  - `read_hex` returns `Zeroizing` buffers and holds the text in one too;
+  - `load_signing` fills a `SigningKeys` in place, so no `Copy` array
+    outlives it;
+  - `keygen` wipes the hex text of each private key once written.
+
+  `zeroize 1.9.1` is already in that lock. `make pins` now also runs the
+  tool's clippy with `-D warnings`.
+- **Testing: no findings** (RT7, RT9, RT10, RT11).
+
+### R34 — Major — config's compile-time default path — Fixed
+
+- **What happened:** `crates/config/build.rs` baked its default config
+  path in with `env!("CARGO_MANIFEST_DIR")`. `make repro` builds a copy of
+  the tree into the shared PD target directory. cargo then reused that
+  build-script binary for the primary tree, with the copy's
+  (since-deleted) path in it.
+- **Symptom fix (slice 7 verification):** `tools/repro` removes the PD
+  target directory on every exit.
+- **Root-cause fix (this step):** the build script reads
+  `CARGO_MANIFEST_DIR` at run time, which cargo sets for every build-script
+  run. It was made after the full Kani run, because config is a path
+  dependency of proved crates and editing it mid-run would have moved
+  their cache keys.

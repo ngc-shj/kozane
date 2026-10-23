@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use libcrux_ml_dsa::ml_dsa_65::{MLDSA65SigningKey, MLDSA65VerificationKey};
+use zeroize::Zeroizing;
 
 fn urandom(buf: &mut [u8]) -> bool {
     fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf)).is_ok()
@@ -32,9 +33,13 @@ fn arg(args: &[String], name: &str) -> Result<String, String> {
     args.get(i + 1).cloned().ok_or(format!("{name} needs a value"))
 }
 
-fn read_hex(path: &Path) -> Result<Vec<u8>, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    sig::unhex(text.trim_end_matches('\n')).ok_or(format!("{}: not lowercase hex", path.display()))
+/// The decoded file. Both the text and the bytes are wiped on drop: the
+/// signing keys pass through here (L12).
+fn read_hex(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
+    let text = Zeroizing::new(fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?);
+    sig::unhex(text.trim_end_matches('\n'))
+        .map(Zeroizing::new)
+        .ok_or(format!("{}: not lowercase hex", path.display()))
 }
 
 fn write_new(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
@@ -67,31 +72,40 @@ fn keygen(args: &[String]) -> Result<(), String> {
     check_location(&dir, &forbid)?;
     fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let (sk, pk) = sig::keygen(&mut urandom).map_err(|e| e.to_string())?;
-    write_new(&dir.join("ed25519.key"), format!("{}\n", sig::hex(&sk.ed25519)).as_bytes(), 0o600)?;
-    write_new(&dir.join("ml-dsa-65.key"), format!("{}\n", sig::hex(sk.ml_dsa.as_ref())).as_bytes(), 0o600)?;
+    // The hex text of a private key is wiped once written (L12).
+    let ed_hex = Zeroizing::new(format!("{}\n", sig::hex(&sk.ed25519)));
+    write_new(&dir.join("ed25519.key"), ed_hex.as_bytes(), 0o600)?;
+    let ml_hex = Zeroizing::new(format!("{}\n", sig::hex(sk.ml_dsa.as_ref())));
+    write_new(&dir.join("ml-dsa-65.key"), ml_hex.as_bytes(), 0o600)?;
     write_new(&dir.join("ed25519.pub"), format!("{}\n", sig::hex(&pk.ed25519)).as_bytes(), 0o644)?;
     write_new(&dir.join("ml-dsa-65.pub"), format!("{}\n", sig::hex(pk.ml_dsa.as_ref())).as_bytes(), 0o644)?;
     println!("release: dev keys in {}", dir.display());
     Ok(())
 }
 
-fn fixed<const N: usize>(bytes: Vec<u8>, what: &str) -> Result<[u8; N], String> {
+fn fixed<const N: usize>(bytes: &[u8], what: &str) -> Result<[u8; N], String> {
     bytes.try_into().map_err(|_| format!("{what}: wrong length"))
 }
 
+/// Filled in place, so no copy of either key outlives this call unwiped:
+/// `SigningKeys` wipes itself on drop, `read_hex`'s buffers wipe themselves.
 fn load_signing(dir: &Path) -> Result<sig::SigningKeys, String> {
-    let ed = fixed::<32>(read_hex(&dir.join("ed25519.key"))?, "ed25519.key")?;
-    let mut ml = MLDSA65SigningKey::zero();
-    let bytes = read_hex(&dir.join("ml-dsa-65.key"))?;
-    if bytes.len() != MLDSA65SigningKey::len() {
+    let mut keys = sig::SigningKeys { ed25519: [0; 32], ml_dsa: MLDSA65SigningKey::zero() };
+    let ed = read_hex(&dir.join("ed25519.key"))?;
+    if ed.len() != keys.ed25519.len() {
+        return Err("ed25519.key: wrong length".into());
+    }
+    keys.ed25519.copy_from_slice(&ed);
+    let ml = read_hex(&dir.join("ml-dsa-65.key"))?;
+    if ml.len() != MLDSA65SigningKey::len() {
         return Err("ml-dsa-65.key: wrong length".into());
     }
-    ml.as_ref_mut().copy_from_slice(&bytes);
-    Ok(sig::SigningKeys { ed25519: ed, ml_dsa: ml })
+    keys.ml_dsa.as_ref_mut().copy_from_slice(&ml);
+    Ok(keys)
 }
 
 fn load_verifying(dir: &Path) -> Result<sig::VerifyingKeys, String> {
-    let ed = fixed::<32>(read_hex(&dir.join("ed25519.pub"))?, "ed25519.pub")?;
+    let ed = fixed::<32>(&read_hex(&dir.join("ed25519.pub"))?, "ed25519.pub")?;
     let mut ml = MLDSA65VerificationKey::zero();
     let bytes = read_hex(&dir.join("ml-dsa-65.pub"))?;
     if bytes.len() != MLDSA65VerificationKey::len() {

@@ -593,6 +593,7 @@ version = "0.1.0"
 dependencies = [
  "libcrux-ed25519",
  "libcrux-ml-dsa",
+ "zeroize",
 ]
 
 [[package]]
