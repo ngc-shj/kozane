@@ -948,3 +948,14 @@ deviations from the plan:
   by the next run, so the cause is unknown. Four later runs of the same
   boot, and every measure-* selftest run, passed. Logs are now kept per
   run; a recurrence is to be diagnosed, not retried away.
+
+## Phase 3 round 4 fixes
+
+- **U-Boot's version string is pinned (R4-O1).** The plan's reproducible
+  build covered the PD images and the loader; U-Boot's build read the
+  enclosing tree's git state through setlocalversion. It no longer does.
+  U-Boot is not in `tools/repro`'s artifact list; the version string was
+  the only git-dependent input found.
+- **The round-3 "unexplained measured boot failure"** has a plausible
+  cause in R4-S1 (a Ctrl-C sent before QEMU's raw mode is SIGINT). The
+  send now waits for the banner.

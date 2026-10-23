@@ -1473,6 +1473,8 @@ UBOOT_MEASURE = os.path.join(ROOT, "build/u-boot-measure/u-boot.bin")
 # the jump to the loader.
 UBOOT = os.path.join(ROOT, "build/u-boot-shipped/u-boot.bin")
 SWTPM_SOCKET_WAIT_S = 10.0
+# How often measure_boot repeats its Ctrl-C until the boot command decides.
+CTRLC_REPEAT_S = 0.25
 # The swtpm state file that holds the TPM's seeds (the SRK derives from
 # them); a volatile state file would make U-Boot's TPM2_Startup fail.
 SWTPM_PERMALL = "tpm2-00.permall"
@@ -1742,17 +1744,34 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
         child, con = boot_uboot(UBOOT_MEASURE, list(zip(paths, (measure.LOAD_IMAGE, measure.LOAD_DESC)
                                                               + measure.LOAD_ENVELOPES)), tpm)
         try:
-            # A Ctrl-C before the boot command starts waits in the UART for its
-            # first poll: with the lock (AUTOBOOT_KEYED) it is never read, so it
-            # cannot skip a check of the command either (S-BOOT-5, R3-N2).
-            child.send("\x03")
-            m = con.wait_for(r"secureos: (measured|boot refused)\r*\n", timeout=BOOT_TIMEOUT_S)
+            # Ctrl-C on the UART throughout the boot command: with the lock
+            # (AUTOBOOT_KEYED) it is never read, so it cannot skip a check of
+            # the command (S-BOOT-5, R3-N2). It starts after U-Boot's banner,
+            # once QEMU's stdio is raw (an earlier 0x03 is the pty's SIGINT)
+            # and the PL011 is set up, and repeats, so one is always pending
+            # when the command's first loop polls (R4-S1).
+            banner = con.wait_for(r"U-Boot \d{4}\.\d{2} ", timeout=BOOT_TIMEOUT_S)
+            deadline = time.monotonic() + BOOT_TIMEOUT_S
+            while True:
+                try:
+                    child.send("\x03")
+                except OSError:
+                    pass  # QEMU has exited; wait_for reports it
+                try:
+                    m = con.wait_for(r"secureos: (measured|boot refused)\r*\n", since=banner.end(),
+                                     timeout=CTRLC_REPEAT_S)
+                    break
+                except Fail:
+                    if not con.alive or time.monotonic() > deadline:
+                        raise
             if m.group(1) == "boot refused":
                 # A refusal must end the boot: nothing runs after it, not
                 # even when someone on the UART presses Ctrl-C (S-BOOT-1,
                 # S-BOOT-5). U-Boot powers off; until it does (or for the
                 # bound, if its power-off ever returned and it spins), the
                 # console must show neither a later measurement nor a prompt.
+                # measure-ctrlc proves the lock through the Ctrl-C above; this
+                # one has no red-proof of its own (R4-N1).
                 try:
                     child.send("\x03")
                 except OSError:
@@ -1760,7 +1779,7 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
                 deadline = time.monotonic() + LINE_TIMEOUT_S
                 while con.alive and time.monotonic() < deadline:
                     time.sleep(0.05)
-                after = con.text[m.end():]
+                after = con.text[banner.end() + m.end():]
                 # Two controls, each failing on its own: nothing runs after the
                 # refusal (the spin and the Ctrl-C lock), and U-Boot powers off.
                 if "secureos: measured" in after or re.search(r"(^|\n)=> ", after):
@@ -1768,7 +1787,7 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
                 if con.alive:
                     raise Fail("measure_boot: U-Boot did not power off after its refusal")
                 return None, True
-            dump = PCR_DUMP.search(con.text, 0, m.start())
+            dump = PCR_DUMP.search(con.text, 0, banner.end() + m.start())
             if not dump:
                 raise Fail("measure variant printed no PCR 8 dump")
             return bytes.fromhex((dump.group(1) + dump.group(2)).replace(" ", "")), False

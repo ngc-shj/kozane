@@ -529,3 +529,53 @@ Critical or Major findings.
   measured. The case no longer also drops the power-off, which made two
   messages possible.
 - Modified file: tests/integration/run.py, tools/check-selftest
+
+# Round 4
+Date: 2026-10-24
+
+## Changes from Previous Round
+
+The security expert reviewed the round-3 fixes (`8193d9f..13b4956`) and
+resolved R3-S1, T3, R3-N1 and R3-N2. R43 found no widening. There are no
+new Critical or Major findings.
+
+## New findings
+
+- **R4-S1 (security, Minor)** the spawn-time Ctrl-C depended on timing.
+  Before QEMU puts its stdio pty in raw mode, the line discipline turns
+  0x03 into SIGINT and QEMU exits; a byte that arrives before U-Boot sets
+  up the PL011 may be dropped. Either way `measure-ctrlc` was not
+  guaranteed deterministic, and the first could explain round 3's
+  unexplained `measured boot` failure.
+- **R4-N1 (security, Nit)** the post-refusal Ctrl-C no longer has a
+  red-proof of its own: the spawn-time one catches a lost lock first.
+- **R4-O1 (orchestrator, found while fixing R4-S1)** U-Boot's version
+  string came from the git state of the tree the tarball was unpacked in
+  (`CONFIG_LOCALVERSION_AUTO=y`, the defconfig's default): a selftest copy
+  built `2025.01-g13b495677f50-dirty`. The shipped firmware depended on
+  the tree's git state, not only on its sources.
+
+## Resolution Status (round 4)
+
+### R4-S1 Minor spawn-time Ctrl-C relied on timing
+- Action: `measure_boot` waits for U-Boot's banner (after QEMU's raw mode
+  and the PL011 setup), then sends 0x03 every 0.25 s until the boot command
+  prints "secureos: measured" or "boot refused", so a byte is pending at
+  every poll.
+- Evidence: `measured boot` green four times; `measure-ctrlc` red with "a
+  wrapping range was not refused" twice; measure-halt, measure-poweroff,
+  measure-wrap and measure-twin red with their own needles.
+- Modified file: tests/integration/run.py
+
+### R4-N1 Nit post-refusal Ctrl-C
+- Action: kept as defence in depth; its comment says that measure-ctrlc
+  proves the lock through the earlier Ctrl-C and that this one has no
+  red-proof of its own.
+- Modified file: tests/integration/run.py
+
+### R4-O1 U-Boot version string depended on git state
+- Action: the fragment turns `CONFIG_LOCALVERSION_AUTO` off and the build
+  passes `LOCALVERSION=` (setlocalversion appends no "+"). Both variants
+  now print `U-Boot 2025.01 (`; the banner regex of R4-S1 requires the
+  bare version, so a suffix returning fails every measured boot.
+- Modified file: support/u-boot/secureos.config, Makefile

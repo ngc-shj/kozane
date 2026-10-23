@@ -331,6 +331,8 @@ test: ct uboot | $(counts)
 # fragment and the boot command of support/u-boot/boot.cmd compiled in. The
 # measure variant stops after measuring and prints PCR 8 (the C8 acceptance
 # boot); both come from the same command lines (tools/uboot-config).
+# LOCALVERSION= (set, though empty) keeps setlocalversion from appending
+# "+" for an untagged tree; the fragment turns LOCALVERSION_AUTO off.
 uboot_tarball ?= /opt/u-boot/u-boot-2025.01.tar.bz2
 uboot := $(BUILD)/u-boot-shipped/u-boot.bin
 uboot_measure := $(BUILD)/u-boot-measure/u-boot.bin
@@ -346,7 +348,7 @@ $(BUILD)/u-boot-%/u-boot.bin: support/u-boot/secureos.config support/u-boot/boot
 	cd $(BUILD)/u-boot-$* && scripts/kconfig/merge_config.sh -m .config secureos.frag >> ../u-boot-$*.log 2>&1
 	env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/u-boot-$* olddefconfig >> $(BUILD)/u-boot-$*.log 2>&1
 	tools/uboot-config verify $(BUILD)/u-boot-$*/secureos.frag $(BUILD)/u-boot-$*/.config
-	SOURCE_DATE_EPOCH=0 env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/u-boot-$* -j$$(nproc) >> $(BUILD)/u-boot-$*.log 2>&1 \
+	SOURCE_DATE_EPOCH=0 env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/u-boot-$* -j$$(nproc) LOCALVERSION= >> $(BUILD)/u-boot-$*.log 2>&1 \
 		|| { tail -30 $(BUILD)/u-boot-$*.log; exit 1; }
 
 # M5 plan C13: hybrid-signed releases with dev keys (residual RM5-1).
