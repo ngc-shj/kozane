@@ -409,3 +409,38 @@ resolved; R39 R4-1; R40–R42 OK; R43 N/A; R44 OK; R45 watch; R46 N/A; R47 OK;
 R48 N/A; R49, R50 OK; R51, R52 N/A; R53 OK; R54–R57 N/A; RT1, RT2 OK; RT3
 watch; RT4 resolved; RT5, RT6 OK; RT7 R4-1 (R4-3 note); RT8 OK; RT9 watch;
 RT10 resolved; RT11 watch.
+
+# Review round 5
+Date: 2026-10-24
+
+## Changes from Previous Round
+
+Plan v5 (565135c). Security: S-R4-1/2 resolved; two prose Minors (R5-1
+fatal alerts share the seal-then-wipe order; R5-2 critical SAN for an
+empty-subject leaf) — no design finding. Functionality: F-R4-1/2 resolved;
+two Minors (R5-1 RST dispatch before removal, design; R5-2 no outside poll
+between RST and wipe, prose). Testing: T-R4-2/3/4 resolved, T-R4-1 partly;
+one Major (R5-1 residue case not bound to the shipped build) and two Minors
+(R5-2 scrub in the library, R5-3 barrier SYN rate-limited).
+
+## Dispositions (plan v6)
+
+| ID | Sev | Resolution |
+|---|---|---|
+| T-R5-1 | Major | libcrux crates `=`-pinned in tools/ct-harness to the root lock; ct-shape identity roots for `exchange` and the scrub in pd-tls |
+| T-R5-2 | Minor | `tls_core::scrub_session_stack` and `SCRUB_DEPTH_EXCHANGE`; the harness asserts the high-water |
+| T-R5-3 | Minor | Barrier SYN from an otherwise unused address, bounded retries, distinct failure message |
+| F-R5-1 | Minor | Remove and wipe once the RST is dispatched; retried up to 8 passes, then removed anyway |
+| F-R5-2 | Minor (prose) | No outside poll between the RST-emitting poll and the wipe |
+| S-R5-1 | Minor (prose) | Order covers close_notify or a fatal alert |
+| S-R5-2 | Minor (prose) | Critical SAN on the IP-mode leaf |
+
+## Recurring Issue Check (round 5)
+
+- Functionality: R38 R5-1; R39 resolved; R41 R5-1; R49 R5-2; all other rules
+  checked or N/A as in round 4.
+- Security: R3 R5-1 (prose); R29 RFC 5280 §4.2.1.6 cited; all other rules OK
+  or N/A as in round 4.
+- Testing: R2 watch; R3 R5-1; R16 partial (R5-1); R39 partial (R5-1, R5-2);
+  R49 R5-1; R50 partial; RT1 R5-1; RT5 R5-2; RT9 watch; all other rules as in
+  round 4.

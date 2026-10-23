@@ -355,8 +355,9 @@ walkthroughs are in the Acceptance appendix.
   ecdhe-mlkem order). `HybridSecret`: not `Copy`/`Clone`/`Debug`, wiped on
   drop, no other constructor. The X25519 ephemeral scalar, the ML-KEM
   encapsulation randomness and both component shared secrets are wiping
-  `Secret` types; `tls` scrubs its stack (its own `scrub_session_stack`,
-  sized from the exchange's measured depth) after `exchange` and after the
+  `Secret` types; `tls` scrubs its stack with `tls_core::scrub_session_stack`
+  (in the library, with an exported `SCRUB_DEPTH_EXCHANGE` sized from the
+  exchange's measured depth; T-R5-2) after `exchange` and after the
   `TlsSign` call (S-R3-2).
 - Key schedule (RFC 8446 §7.1, libcrux-hkdf/SHA-256): `KeySchedule::new(
   HybridSecret, transcript)` wraps a private `schedule_from_ikm(&[u8; N])`
@@ -393,11 +394,16 @@ walkthroughs are in the Acceptance appendix.
     `bad_record_mac`. With a deterministic-RNG seam, after `exchange` the
     ephemeral and the randomness are absent from the wiped buffers (S-R3-2).
   - ct-harness residue mode (T-R4-1): `HybridSecret::exchange` with a known
-    RNG followed by `tls`'s `scrub_session_stack`, run on the harness's
-    painted stack and searched for every stored form of the ephemeral
-    scalar, the encapsulation randomness and both component shared secrets
-    (as for `tpm2::envelope::open_sealed`); RESIDUE-CASES raised; a selftest
-    case under `ct` removes the scrub.
+    RNG followed by `tls_core::scrub_session_stack`, run on the harness's
+    painted stack (high-water asserted within `SCRUB_DEPTH_EXCHANGE`) and
+    searched for every stored form of the ephemeral scalar, the
+    encapsulation randomness and both component shared secrets (as for
+    `tpm2::envelope::open_sealed`); RESIDUE-CASES raised; a selftest case
+    under `ct` removes the scrub. Binding to what ships (T-R5-1): every
+    libcrux crate `tls-core` pulls into tools/ct-harness is `=`-pinned to the
+    root lock's version (the `sha3`/`keccak` precedent), and ct-shape gains
+    `(pd-tls, tls_core exchange)` and the scrub as identity roots (identity
+    check only; libcrux stays outside the shape baseline, RM6-5).
   - `compile_fail` doctests: `HybridSecret` not `Clone`/`Copy`, not
     constructible outside its module.
   - Integration: OpenSSL/curl complete; `-groups X25519` →
@@ -407,13 +413,17 @@ walkthroughs are in the Acceptance appendix.
 
 ### C8 — Secrets and plaintext lifecycle in `tls` (Critical tier, L12)
 
-- Order (T-R3-3, F-R4-1, S-R4-1): close_notify is sealed into the socket's
-  send buffer, then keys and the record, head and rewrite buffers are
+- Order (T-R3-3, F-R4-1, S-R4-1, S-R5-1): close_notify or a fatal alert is
+  sealed into the socket's send buffer, then keys and the record, head and rewrite buffers are
   wiped, then it is transmitted. smoltcp owns socket storage while the
   socket exists and sends an abort's RST only from the live socket at the
-  next poll, so the socket is aborted and polled (RST out), then — in the
-  same event-loop pass — removed from its set, its storage wiped through
-  the static, and the listener re-created.
+  next poll, so the socket is aborted and polled; once that poll has
+  dispatched the RST (the device handed out a transmit token and the socket
+  has no segment pending), the socket is removed from its set, its storage
+  wiped through the static and the listener re-created, before any further
+  poll of the outside interface (F-R5-2). If `tli` had no free buffer, the
+  RST is retried on the next passes, at most 8, then the socket is removed
+  and wiped anyway (F-R5-1).
 - Wipe points: the client handshake secret once the client Finished is
   verified, the server handshake secret once the application secrets exist
   (T-N4); the superseded traffic secret and keys at KeyUpdate; on close,
@@ -421,7 +431,9 @@ walkthroughs are in the Acceptance appendix.
   the rx and tx record buffers, the head and rewrite buffers and both
   sockets' storage (S10, S-N2). The host-observed barrier for a closed
   connection: the sniffer sees the server's abort RST for its 4-tuple, then
-  a fresh SYN to 443 gets its SYN-ACK or RST; `tls` handles that SYN in a
+  a fresh SYN to 443, from an address the boot uses for nothing else and
+  retried a bounded number of times (failing with "barrier SYN
+  unanswered"; T-R5-3), gets its SYN-ACK or RST; `tls` handles that SYN in a
   later pass than the one that emitted the abort RST, so the wipe is done
   (T-R3-3, F-R4-1).
 - Scope (S-N2): the claim covers `tls`-owned memory. The backend link
@@ -546,8 +558,8 @@ walkthroughs are in the Acceptance appendix.
   iPAddress 0.0.0.0/0 and ::/0; IP mode: permitted iPAddress = the
   configured address/32, excluded ::/0, permitted dNSName `invalid` (RFC
   6761) only — `pathLen=0`, 30-day validity; in IP mode the leaf has an
-  empty subject (no hostname-like CN for OpenSSL to check against the
-  dNSName constraint; S-R4-2); the CA key exists only in
+  empty subject and a critical SAN (RFC 5280 §4.2.1.6; no hostname-like CN
+  for OpenSSL to check against the dNSName constraint; S-R4-2, S-R5-2); the CA key exists only in
   mkcert's memory and is never serialized. A `--test-negative` option
   issues, before the key is dropped, a leaf for another name for the
   acceptance test (F-N12). Leaf: SAN from config, EKU serverAuth, KU
