@@ -690,3 +690,98 @@ fn two_seals_of_one_blob_differ_and_both_unseal() {
         assert!(out == region);
     }
 }
+
+/// The `tpm` PD as crates/pds/tpm runs it (gate, the one-flow-at-a-time
+/// Busy rule, the cap after both clients finished), over swtpm, shared by
+/// two client threads.
+struct PdModel {
+    tpm: Tpm,
+    gate: Gate,
+    busy: usize,
+}
+
+struct PdCall<'m> {
+    pd: &'m std::sync::Mutex<PdModel>,
+    client: usize,
+    start: Instant,
+}
+
+impl tpm2::boot::Transport for PdCall<'_> {
+    fn call(&mut self, label: u64, req: &[u8], rsp: &mut [u8; ipc::MSG_BYTES]) -> (u64, usize) {
+        let mut pd = self.pd.lock().unwrap();
+        let other = 1 - self.client;
+        match ipc::kind(label) {
+            ipc::REQ_COMMAND => {
+                if pd.gate.state(self.client) == Some(State::Fresh) && pd.gate.state(other) == Some(State::Unsealing) {
+                    pd.busy += 1;
+                    return (ipc::label(ipc::RSP_BUSY, 0), 0);
+                }
+                let Ok(fwd) = pd.gate.command(self.client, req) else {
+                    return (ipc::label(ipc::RSP_REFUSED, 1), 0);
+                };
+                let r = pd.tpm.transact(req);
+                pd.gate.response(fwd, &r);
+                rsp[..r.len()].copy_from_slice(&r);
+                (ipc::label(ipc::RSP_OK, r.len()), ipc::words(r.len()) * 8)
+            }
+            kind => {
+                if pd.gate.finish(self.client, kind == ipc::REQ_DONE).is_err() {
+                    return (ipc::label(ipc::RSP_REFUSED, 2), 0);
+                }
+                let mut cmd = [0u8; IPC_MSG_BYTES];
+                if let Some(n) = pd.gate.cap(&mut cmd) {
+                    let r = pd.tpm.transact(&cmd[..n]);
+                    tpm2_wire::parse_pcr_extend(&r).unwrap();
+                }
+                (ipc::label(ipc::RSP_OK, 0), 0)
+            }
+        }
+    }
+
+    fn now_ns(&mut self) -> u64 {
+        self.start.elapsed().as_nanos() as u64
+    }
+
+    fn random(&mut self, out: &mut [u8]) -> bool {
+        let e = entropy::<CLIENT_ENTROPY_LEN>(&format!("boot-{}", self.client));
+        out.copy_from_slice(&e.as_bytes()[..out.len()]);
+        true
+    }
+}
+
+use layout::tpm as ipc;
+use tpm2_wire::gate::State;
+
+#[test]
+fn both_key_pds_unseal_concurrently_through_the_pd_model_and_pcr8_is_capped() {
+    let mut swtpm = Swtpm::start("boot-both", true);
+    let mut tpm = swtpm.connect();
+    let (srk_public, _) = tpm.srk();
+    measured_boot(&mut tpm);
+    let key_blob = blob(Kind::Key, "key");
+    let pq_blob = blob(Kind::Pq, "pq");
+    let key_env = seal(Kind::Key, &key_blob, &srk_public, &expected_pcr8(), "boot-seal-key");
+    let pq_env = seal(Kind::Pq, &pq_blob, &srk_public, &expected_pcr8(), "boot-seal-pq");
+    let pd = std::sync::Mutex::new(PdModel { tpm, gate: Gate::new(), busy: 0 });
+    let start = Instant::now();
+    // Two flows at once would need four transient objects (swtpm has
+    // three): the Busy rule serialises them, whichever starts first.
+    let run = |client: usize, env: &[u8], kind: Kind| {
+        let mut out = vec![0xAAu8; kind.region_size()];
+        let r = tpm2::boot::unseal(&mut PdCall { pd: &pd, client, start }, env, kind, &mut out);
+        (r, out)
+    };
+    let (key, pq) = std::thread::scope(|s| {
+        let a = s.spawn(|| run(0, &key_env, Kind::Key));
+        let b = s.spawn(|| run(1, &pq_env, Kind::Pq));
+        (a.join().unwrap(), b.join().unwrap())
+    });
+    assert_eq!(key.0, Ok(()));
+    assert!(key.1 == key_blob, "key's region");
+    assert_eq!(pq.0, Ok(()));
+    assert!(pq.1 == pq_blob, "pqkey's region");
+    let mut pd = pd.into_inner().unwrap();
+    assert!(pd.gate.is_capped());
+    assert_eq!(pd.tpm.pcr8(), extend(&expected_pcr8(), &CAP_DIGEST), "PCR 8 after the cap");
+    eprintln!("busy replies: {}", pd.busy);
+}

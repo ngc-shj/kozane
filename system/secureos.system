@@ -16,6 +16,9 @@
     <memory_region name="timer_mmio" size="0x1000" phys_addr="0x90d0000" />
     <!-- PL011 UART, the only console (M5 plan C6): audit's, transmit only. -->
     <memory_region name="uart_mmio" size="0x1000" phys_addr="0x9000000" />
+    <!-- TPM TIS, locality 0 only (M5 plan C9): QEMU virt's tpm-tis-device,
+         the first device on the platform bus. The tpm PD's alone. -->
+    <memory_region name="tpm_mmio" size="0x1000" phys_addr="0xc000000" />
     <!-- Static secrets (law L2): zero placeholder here; `make package` swaps
          only this prefill_path for a real blob. -->
     <memory_region name="secrets" size="0x1000" prefill_path="secrets-placeholder.bin" />
@@ -122,6 +125,14 @@
         <program_image path="pd-timer.elf" />
         <map mr="timer_mmio" vaddr="0x2_000_000" perms="rw" cached="false" setvar_vaddr="timer_mmio_vaddr" />
         <irq irq="43" id="0" />
+    </protection_domain>
+
+    <!-- Passive: each command runs on its caller's scheduling context
+         (key's or pqkey's init); above both, as Microkit's PPC rule wants.
+         Polls the TIS with bounded timeouts; no irq. -->
+    <protection_domain name="tpm" priority="145" budget="1_000" period="10_000" passive="true" stack_size="0x10_000">
+        <program_image path="pd-tpm.elf" />
+        <map mr="tpm_mmio" vaddr="0x2_000_000" perms="rw" cached="false" setvar_vaddr="tpm_mmio_vaddr" />
     </protection_domain>
 
     <protection_domain name="key" priority="140" budget="2_000" period="10_000" passive="true" stack_size="0x20_000">
@@ -334,5 +345,13 @@
     <channel>
         <end pd="pq" id="5" />
         <end pd="audit" id="7" />
+    </channel>
+    <channel>
+        <end pd="key" id="3" pp="true" notify="false" />
+        <end pd="tpm" id="1" pp="false" notify="false" />
+    </channel>
+    <channel>
+        <end pd="pqkey" id="3" pp="true" notify="false" />
+        <end pd="tpm" id="2" pp="false" notify="false" />
     </channel>
 </system>

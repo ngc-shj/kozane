@@ -88,15 +88,21 @@ fn boot_error_messages_are_distinct() {
     }
 }
 
-/// Every BootError: the four plain kinds, then each BlobError reached by
+/// Every BootError: the ten plain kinds, then each BlobError reached by
 /// `next`. The walk must visit every BlobError and BootError must have
-/// exactly the five kinds listed, or this fails.
-fn all_boot_errors(next: impl Fn(BlobError) -> Option<BlobError>) -> [BootError; 10] {
-    let mut all = [BootError::GatewayKeyMismatch; 10];
+/// exactly the eleven kinds listed, or this fails.
+fn all_boot_errors(next: impl Fn(BlobError) -> Option<BlobError>) -> [BootError; 16] {
+    let mut all = [BootError::GatewayKeyMismatch; 16];
     all[1] = BootError::PeerMismatch;
     all[2] = BootError::RndrUnavailable;
     all[3] = BootError::SeedDerivation;
-    let mut n = 4;
+    all[4] = BootError::EnvelopeInvalid;
+    all[5] = BootError::TpmUnavailable;
+    all[6] = BootError::SrkMismatch;
+    all[7] = BootError::UnsealRefused;
+    all[8] = BootError::TpmResponseInvalid;
+    all[9] = BootError::EnvelopeOpen;
+    let mut n = 10;
     let mut e = Some(BlobError::BadMagic);
     while let Some(v) = e {
         all[n] = BootError::Blob(v);
@@ -104,8 +110,8 @@ fn all_boot_errors(next: impl Fn(BlobError) -> Option<BlobError>) -> [BootError;
         e = next(v);
     }
     assert_eq!(n, all.len(), "every BlobError listed");
-    assert_eq!(n - 4, core::mem::variant_count::<BlobError>());
-    assert_eq!(core::mem::variant_count::<BootError>(), 5);
+    assert_eq!(n - 10, core::mem::variant_count::<BlobError>());
+    assert_eq!(core::mem::variant_count::<BootError>(), 11);
     all
 }
 
@@ -132,6 +138,29 @@ fn boot_error_codes_are_distinct_nonzero_and_fit_the_unavailable_label() {
         assert_eq!(unavailable_code(unavailable_label(a.code())), Some(a.code()), "{a:?}");
         for b in &all[i + 1..] {
             assert_ne!(a.code(), b.code());
+        }
+    }
+}
+
+#[test]
+fn each_unseal_failure_has_its_own_boot_error() {
+    use tpm2::boot::UnsealError;
+    let all = [
+        UnsealError::Rndr,
+        UnsealError::EnvelopeInvalid,
+        UnsealError::TpmUnavailable,
+        UnsealError::SrkMismatch,
+        UnsealError::UnsealRefused,
+        UnsealError::ResponseInvalid,
+        UnsealError::EnvelopeOpen,
+    ];
+    assert_eq!(all.len(), core::mem::variant_count::<UnsealError>());
+    assert_eq!(BootError::from(UnsealError::Rndr), BootError::RndrUnavailable);
+    assert_eq!(BootError::from(UnsealError::SrkMismatch).code(), 13);
+    assert_eq!(BootError::from(UnsealError::UnsealRefused).code(), 14);
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert_ne!(BootError::from(*a), BootError::from(*b), "{a:?} and {b:?}");
         }
     }
 }

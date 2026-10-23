@@ -59,6 +59,9 @@ BLOB = seal(KEY_BODY, 4096)
 PQ_BODY = b"SOSPQKY1" + le32(1) + bytes((i * 7 + 3) % 256 for i in range(13904 - 12))
 PQ_BLOB = seal(PQ_BODY, 16384)
 BLOBS = {"secrets": BLOB, "pq_secrets": PQ_BLOB}
+# An SRK TPM2B_PUBLIC as tpm2_readpublic -o writes it (framing only: the
+# template is mksecrets' check).
+SRK = (90).to_bytes(2, "big") + bytes(range(90))
 PAD = bytes(5000)
 KEY_AT = 4 + len(PAD)
 PQ_AT = KEY_AT + len(BLOB) + len(PAD)
@@ -173,7 +176,7 @@ def waivers_file(text):
 
 
 def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BLOB, lock_text=LOCK_NO_CMR,
-                harness=True, ct_green=True, record=True, real_ct=None):
+                harness=True, ct_green=True, record=True, real_ct=None, srk=SRK):
     """Runs `main()` with `build` replaced and the waiver file and Cargo.lock
     pointed at scratch ones (None: absent). Returns what it printed (the success line
     dropped, the scratch dir shown as <d>), plus a note when the outcome disagrees with that output, so
@@ -202,9 +205,11 @@ def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BL
             stubs = ct_stubs(d, harness_path, green=ct_green, record=record, real=real_ct is not None)
             (d / "secrets.bin").write_bytes(key)
             (d / "pq.bin").write_bytes(pq)
+            (d / "srk.pub").write_bytes(srk)
             (d / "gen_config.h").write_text(gen)
             (d / "secureos.system").write_text(
-                '<system>\n<program_image path="pd-pqkey.elf" />\n<program_image path="pd-pq.elf" />\n</system>\n')
+                '<system>\n<program_image path="pd-pqkey.elf" />\n<program_image path="pd-pq.elf" />\n'
+                '<program_image path="pd-key.elf" />\n</system>\n')
             if waivers_text is not None:
                 (d / "waivers.toml").write_text(waivers_text)
             pkg.WAIVERS = d / "waivers.toml"
@@ -212,13 +217,13 @@ def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BL
                 (d / "Cargo.lock").write_text(lock_text)
             pkg.LOCK = d / "Cargo.lock"
 
-            def fake_build(a, blobs, staging):
-                built.append(blobs)
-                (staging / "loader.img").write_bytes(b"image")
+            def fake_build(a, blobs, srk_bytes, staging):
+                built.append((blobs, srk_bytes))
+                (staging / "published.img").write_bytes(b"image")
                 return 0
             pkg.build = fake_build
             sys.argv = ["package", "--secrets", str(d / "secrets.bin"), "--pq-secrets", str(d / "pq.bin"),
-                        "--out", str(d / "pkg"), "--system", str(d / "secureos.system"), "--policy", "x", "--image", "x",
+                        "--srk-public", str(d / "srk.pub"), "--out", str(d / "pkg"), "--system", str(d / "secureos.system"), "--policy", "x", "--image", "x",
                         "--gen-config", str(d / "gen_config.h"), "--search-path", str(search), "--board", "x",
                         "--config", "x", "--microkit", "x", "--harness", str(harness_path)]
             captured = io.StringIO()
@@ -226,7 +231,7 @@ def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BL
                 status = pkg.main()
             printed = [line.replace(str(d), "<d>") for line in captured.getvalue().splitlines()
                        if not line.startswith("package: wrote ")]
-            if status == 0 and (printed or built != [BLOBS]):
+            if status == 0 and (printed or built != [(BLOBS, srk)]):
                 printed.append(f"accepted, but printed {printed} and built {len(built)}")
             if status != 0 and (not printed or built):
                 printed.append(f"refused (status {status}) with built {len(built)}")
@@ -303,15 +308,16 @@ def run_main(build_result):
             blob = d / "secrets.bin"
             blob.write_bytes(BLOB)
             (d / "pq.bin").write_bytes(PQ_BLOB)
+            (d / "srk.pub").write_bytes(SRK)
             gen = d / "gen_config.h"
             gen.write_text(GEN_RELEASE)
             out = d / "pkg"
 
             built = []
 
-            def fake_build(a, blobs, staging):
+            def fake_build(a, blobs, srk, staging):
                 built.append(1)
-                (staging / "loader.img").write_bytes(b"image")
+                (staging / "published.img").write_bytes(b"image")
                 if build_result == "raise":
                     raise RuntimeError("microkit failed")
                 if build_result == "out-appears":
@@ -348,8 +354,8 @@ def run_main(build_result):
                 return build_result
 
             pkg.build = fake_build
-            sys.argv = ["package", "--secrets", str(blob), "--pq-secrets", str(d / "pq.bin"), "--out", str(out),
-                        "--system", "x", "--policy", "x",
+            sys.argv = ["package", "--secrets", str(blob), "--pq-secrets", str(d / "pq.bin"),
+                        "--srk-public", str(d / "srk.pub"), "--out", str(out), "--system", "x", "--policy", "x",
                         "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
                         "--config", "x", "--microkit", "x", "--harness", "x"]
             real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
@@ -436,10 +442,10 @@ def run_main(build_result):
                 if status != 1 or list(out.iterdir()):
                     errors.append(f"OUT appearing during the build was not refused (status {status})")
             elif build_result in (0, "signal-during-publish", "signal-after-rename"):
-                if status != 0 or not (out / "loader.img").exists():
+                if status != 0 or not (out / "published.img").exists():
                     errors.append(f"success did not produce OUT (status {status})")
-                elif oct(out.stat().st_mode & 0o777) != "0o700" or oct((out / "loader.img").stat().st_mode & 0o777) != "0o600":
-                    errors.append("OUT or loader.img not owner-only")
+                elif oct(out.stat().st_mode & 0o777) != "0o700" or oct((out / "published.img").stat().st_mode & 0o777) != "0o600":
+                    errors.append("OUT or published.img not owner-only")
             elif out.exists():
                 errors.append(f"OUT exists after a failed build (status {status})")
             if not built:
@@ -489,6 +495,7 @@ def staging_in_forbidden_root():
         blob = d / "secrets.bin"
         blob.write_bytes(BLOB)
         (d / "pq.bin").write_bytes(PQ_BLOB)
+        (d / "srk.pub").write_bytes(SRK)
         gen = d / "gen_config.h"
         gen.write_text(GEN_RELEASE)
         calls = []
@@ -501,8 +508,8 @@ def staging_in_forbidden_root():
 
         pkg.forbidden_roots = roots
         pkg.build = lambda *a: built.append(1) or 0
-        sys.argv = ["package", "--secrets", str(blob), "--pq-secrets", str(d / "pq.bin"), "--out", str(d / "pkg"),
-                    "--system", "x", "--policy", "x",
+        sys.argv = ["package", "--secrets", str(blob), "--pq-secrets", str(d / "pq.bin"),
+                    "--srk-public", str(d / "srk.pub"), "--out", str(d / "pkg"), "--system", "x", "--policy", "x",
                     "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
                     "--config", "x", "--microkit", "x", "--harness", "x"]
         out = io.StringIO()
@@ -595,66 +602,98 @@ def handler_ignores_further_signals():
             signal.signal(s, h)
 
 
-def build_uses_the_checked_bytes(tamper: bool = False):
-    """The image must be built from a private copy of the checked bytes, not
-    by following the caller's path again (TOCTOU), and the copy must not be
-    left beside the image. With `tamper`, the .system microkit consumed
-    differs from the generated one: the build must refuse it, although the
-    packaged .system is rewritten afterwards (S11-2)."""
-    return lambda: _build_case(tamper)
+def build_case(variant=None):
+    """`build` (M5 plan C8, C11) with microkit and `mksecrets seal` stood in
+    for: microkit puts each prefill where the placeholder image holds its
+    zeros, seal writes a fake envelope. The blobs must reach seal only as
+    private copies of the checked bytes and never reach microkit, the
+    descriptor must name where the stand-ins landed, PCR 8 must be the one
+    measure computes, and OUT must hold the five outputs alone. `variant`
+    breaks one step: "tamper" (the .system microkit consumed changes),
+    "standin" (the stand-in image differs outside the ranges), "envelope"
+    (seal writes the plaintext), "assembly" (the envelope image is not the
+    assembly). Returns the errors, or build's own output for a variant."""
+    return lambda: _build_case(variant)
 
 
-def _build_case(tamper: bool):
+def envelope(mr: str) -> bytes:
+    kind = pkg.KEY if mr == "secrets" else pkg.PQ
+    return pkg.ENVELOPE_MAGIC + le32(1) + le32(pkg.SEAL_KINDS[mr][1]) + bytes(range(1, 101)) \
+        + bytes(kind.size - 116)
+
+
+def _build_case(variant):
     d = tmp_tree()
     real_run = pkg.subprocess.run
-    seen = {}
+    microkit_saw, sealed = [], {}
     try:
         (d / "system.xml").write_text(SYSTEM)
         (d / "placeholder.img").write_bytes(PLACEHOLDER_IMG)
         staging = d / "staging"
         staging.mkdir()
 
+        def arg(cmd, flag):
+            return cmd[cmd.index(flag) + 1]
+
         def fake_run(cmd, check=False, **_):
+            if cmd[:2] == ["cargo", "run"] and "mksecrets" in cmd:
+                mr = {"key": "secrets", "pq": "pq_secrets"}[arg(cmd, "--kind")]
+                blob = pathlib.Path(arg(cmd, "--blob"))
+                sealed[mr] = (str(blob), blob.read_bytes(), pathlib.Path(arg(cmd, "--srk-public")).read_bytes(),
+                              arg(cmd, "--pcr8"))
+                out = BLOBS[mr] if variant == "envelope" else envelope(mr)
+                pathlib.Path(arg(cmd, "--out")).write_bytes(out)
+                return
             if cmd[0] == "cargo":
                 return
             system = pathlib.Path(cmd[1])
-            for mr in pkg.SECRETS_MRS:
+            img = bytearray(PLACEHOLDER_IMG)
+            for mr, at in (("secrets", KEY_AT), ("pq_secrets", PQ_AT)):
                 prefill = [m.get("prefill_path") for m in pkg.ET.fromstring(system.read_text())
                            .iter("memory_region") if m.get("name") == mr][0]
-                seen[mr] = (prefill, pathlib.Path(prefill).read_bytes() if pathlib.Path(prefill).is_file() else b"")
-            if tamper:
+                data = pathlib.Path(prefill).read_bytes()
+                microkit_saw.append(data)
+                img[at:at + len(data)] = data
+            if variant == "tamper":
                 system.write_text(system.read_text().replace('priority="140"', 'priority="141"'))
-            pathlib.Path(cmd[cmd.index("-o") + 1]).write_bytes(PACKAGE_IMG)
+            if (variant == "standin" and not sealed) or (variant == "assembly" and sealed):
+                img[2] ^= 1
+            pathlib.Path(arg(cmd, "-o")).write_bytes(bytes(img))
 
         pkg.subprocess.run = fake_run
 
         class A:
             system, image, policy, search_path, board, config, microkit = (
                 str(d / "system.xml"), str(d / "placeholder.img"), "p", "s", "b", "c", "microkit")
-            secrets = str(d / "operator" / "secrets.bin")
-            pq_secrets = str(d / "operator" / "pq.bin")
 
         captured = io.StringIO()
         with contextlib.redirect_stdout(captured):
-            status = pkg.build(A, BLOBS, staging)
-        if tamper:
-            if status != 1 or "attributes of <protection_domain>" not in captured.getvalue():
-                return [f"a changed consumed .system was accepted (status {status})"]
-            return []
-        errors = []
-        if status != 0:
-            errors.append(f"build failed ({status})")
-        for mr, operator in (("secrets", A.secrets), ("pq_secrets", A.pq_secrets)):
-            prefill, consumed = seen.get(mr, ("", b""))
-            if not prefill.startswith(str(staging)) or consumed != BLOBS[mr]:
-                errors.append(f"'{mr}' not built from its private copy: {prefill}")
-            packaged = [m.get("prefill_path") for m in pkg.ET.fromstring((staging / "secureos.system").read_text())
-                        .iter("memory_region") if m.get("name") == mr][0]
-            if packaged != operator:
-                errors.append(f"packaged .system names {packaged} for '{mr}', not the operator's blob")
-        left = sorted(p.name for p in staging.iterdir() if p.suffix == ".bin")
-        if left:
-            errors.append(f"private blob copies left beside the image: {left}")
+            status = pkg.build(A, BLOBS, SRK, staging)
+        if variant is not None:
+            return captured.getvalue().splitlines() if status == 1 else [f"accepted (status {status})"]
+        errors = [] if status == 0 else [f"build failed ({status}): {captured.getvalue()}"]
+        if any(data in (BLOB, PQ_BLOB) for data in microkit_saw):
+            errors.append("a blob reached microkit")
+        if len(microkit_saw) != 4:
+            errors.append(f"microkit saw {len(microkit_saw)} prefills, want two builds of two")
+        desc = (staging / "boot.desc").read_bytes() if (staging / "boot.desc").exists() else b""
+        if desc and pkg.measure.parse(desc)[1] != [(KEY_AT, len(BLOB)), (PQ_AT, len(PQ_BLOB))]:
+            errors.append(f"descriptor ranges {pkg.measure.parse(desc)[1]}")
+        for mr in pkg.SECRETS_MRS:
+            path, data, srk, pcr8 = sealed.get(mr, ("", b"", b"", ""))
+            if not path.startswith(str(staging)) or data != BLOBS[mr]:
+                errors.append(f"'{mr}' not sealed from its private copy: {path}")
+            if srk != SRK or (desc and pcr8 != pkg.measure.expected_pcr8(desc, PLACEHOLDER_IMG).hex()):
+                errors.append(f"'{mr}' sealed to another SRK or PCR 8 ({pcr8})")
+            if (staging / f"{mr}.env").exists() and (staging / f"{mr}.env").read_bytes() != envelope(mr):
+                errors.append(f"'{mr}' envelope is not the one sealed")
+        if sorted(p.name for p in staging.iterdir()) != sorted(pkg.OUTPUTS):
+            errors.append(f"OUT holds {sorted(p.name for p in staging.iterdir())}")
+        if (staging / "pcr8").exists() and desc and \
+                (staging / "pcr8").read_text() != pkg.measure.expected_pcr8(desc, PLACEHOLDER_IMG).hex() + "\n":
+            errors.append("pcr8 is not the descriptor's and the published image's")
+        if (staging / "published.img").exists() and (staging / "published.img").read_bytes() != PLACEHOLDER_IMG:
+            errors.append("published.img is not the published image")
         return errors
     finally:
         pkg.subprocess.run = real_run
@@ -705,27 +744,19 @@ IMAGE_BLOBS = [BLOB, PQ_BLOB]
 
 # (name, expected: an error substring, a list of the exact errors, or None
 # for accept; check)
-def boot_files(tamper=False):
-    """write_boot_files (M5 plan C8) on a synthetic image: microkit's packaged
-    image is the published one with each blob at its range."""
+def assembly(tamper=False):
+    """check_assembly (M5 plan C8 F2) on a synthetic image: the image built
+    with the envelopes is the published one with each at its range."""
     def run():
         key, pq = b"K" * 0x100, b"Q" * 0x200
         published = bytes(0x1000)
-        packaged = bytearray(published)
-        packaged[0x400:0x500] = key
-        packaged[0x800:0xa00] = pq
+        built = bytearray(published)
+        built[0x400:0x500] = key
+        built[0x800:0xa00] = pq
         if tamper:
-            packaged[0x10] = 1
-        with tempfile.TemporaryDirectory() as d:
-            out = pathlib.Path(d)
-            errors = pkg.write_boot_files(published, bytes(packaged), {"secrets": key, "pq_secrets": pq}, out)
-            if not errors:
-                desc = (out / "boot.desc").read_bytes()
-                if pkg.measure.parse(desc)[1] != [(0x400, 0x100), (0x800, 0x200)] \
-                        or (out / "pcr8").read_text().strip() != pkg.measure.expected_pcr8(desc, published).hex() \
-                        or (out / "secrets.env").read_bytes() != key or (out / "published.img").read_bytes() != published:
-                    errors = ["boot files have the wrong content"]
-        return errors
+            built[0x10] = 1
+        desc = pkg.measure.pack(len(published), [(0x400, 0x100), (0x800, 0x200)])
+        return pkg.check_assembly(published, desc, [key, pq], bytes(built))
     return run
 
 
@@ -908,8 +939,18 @@ CASES = [
     ("staging that resolves into a forbidden root is refused", None, staging_in_forbidden_root),
     ("a failed staging removal fails loudly", None, failed_staging_removal_is_reported),
     ("a signal during the staging removal waits for it", None, signal_during_removal_does_not_cut_it_short),
-    ("the image is built from a private copy of the checked blob", None, build_uses_the_checked_bytes()),
-    ("a consumed .system that differs from the generated one is refused", None, build_uses_the_checked_bytes(tamper=True)),
+    ("the blobs are sealed from private copies, never reach microkit, and OUT holds the five outputs", None,
+     build_case()),
+    ("a consumed .system that differs from the generated one is refused",
+     ["package: system/protection_domain[3]: attributes of <protection_domain> changed"], build_case("tamper")),
+    ("a stand-in image that differs outside the ranges is refused",
+     [f"package: image differs outside the blobs (0x2..0x2 vs {SPANS})"], build_case("standin")),
+    ("an envelope that is not sealed is refused",
+     ["package: 'secrets' envelope has no SOSSEAL1 magic", "package: 'pq_secrets' envelope has no SOSSEAL1 magic"],
+     build_case("envelope")),
+    ("an envelope image that is not the boot-time assembly is refused",
+     ["package: the boot-time assembly differs from the image microkit built with the envelopes"],
+     build_case("assembly")),
     ("publishing refuses to replace an OUT that appeared", None, publish_never_replaces(True)),
     ("publishing to a free OUT succeeds", None, publish_never_replaces(False)),
     ("a failed publish is reported and leaves no OUT or staging", None, run_main("publish-fails")),
@@ -921,9 +962,22 @@ CASES = [
     ("output through a symlink into the repo", "inside", out_case(link_into_repo)),
     ("output directory already exists", "already exists", out_case(existing_out)),
     ("fresh output outside the repo", None, out_case(lambda d: d / "pkg")),
-    ("boot files: the assembly must give back microkit's image", "boot-time assembly differs",
-     boot_files(tamper=True)),
-    ("boot files: descriptor, envelopes, published image and PCR 8 are written", None, boot_files()),
+    ("assembly: the envelope image must be the published one with the envelopes",
+     ["package: the boot-time assembly differs from the image microkit built with the envelopes"],
+     assembly(tamper=True)),
+    ("assembly: the published image with each envelope at its range is accepted", None, assembly()),
+    ("an envelope of the other kind is refused", ["package: 'secrets' envelope is not of its mr's kind"],
+     lambda: pkg.check_envelope(pkg.KEY, envelope("pq_secrets")[:4096])),
+    ("a short envelope is refused", ["package: 'pq_secrets' envelope is 16383 bytes, expected 16384"],
+     lambda: pkg.check_envelope(pkg.PQ, envelope("pq_secrets")[:-1])),
+    ("sealed envelopes of their kinds are accepted", None,
+     lambda: pkg.check_envelope(pkg.KEY, envelope("secrets")) + pkg.check_envelope(pkg.PQ, envelope("pq_secrets"))),
+    ("main() refuses an SRK public that is not a TPM2B_PUBLIC",
+     ["package: --srk-public is 91 bytes, not an SRK TPM2B_PUBLIC (2 + 90, as tpm2_readpublic -o writes it)"],
+     main_checks(srk=SRK[:-1])),
+    ("main() refuses an SRK public whose TPM2B size disagrees",
+     ["package: --srk-public is 92 bytes, not an SRK TPM2B_PUBLIC (2 + 90, as tpm2_readpublic -o writes it)"],
+     main_checks(srk=b"\x00\x59" + SRK[2:])),
 ]
 
 

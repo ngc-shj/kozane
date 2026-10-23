@@ -622,3 +622,257 @@ fn every_command_of_the_flow_fits_one_ipc_message() {
         client.response(&rsp);
     }
 }
+
+// --- boot: the unseal over PPC to `tpm` (C9) -------------------------------
+
+use layout::tpm as ipc;
+use tpm2_wire::gate::{Gate, State};
+
+use super::boot::{self, BUSY_PAUSE_NS, BUSY_TIMEOUT_NS, Transport, UnsealError};
+
+/// `tpm` as the PD runs it: the gate in front of the fake TPM, with knobs
+/// for the transport's failures.
+struct FakePpc {
+    tpm: FakeTpm,
+    gate: Gate,
+    /// (request kind, length) of every call.
+    calls: Vec<(u64, usize)>,
+    /// Busy replies before the gate sees a command.
+    busy: usize,
+    clock: u64,
+    random_ok: bool,
+    /// The command code the device fails on.
+    device_error_at: Option<u32>,
+    /// Unseal answered with this response code.
+    unseal_rc: Option<u32>,
+    /// Replaces the reply to Done or Failed.
+    finish_reply: Option<u64>,
+    /// The reply words carry 8 bytes fewer than the label's length.
+    short_words: bool,
+}
+
+impl FakePpc {
+    fn new(env: &[u8]) -> Self {
+        FakePpc {
+            tpm: FakeTpm::new(env, 3),
+            gate: Gate::new(),
+            calls: Vec::new(),
+            busy: 0,
+            clock: 0,
+            random_ok: true,
+            device_error_at: None,
+            unseal_rc: None,
+            finish_reply: None,
+            short_words: false,
+        }
+    }
+
+    fn commands(&self) -> usize {
+        self.calls.iter().filter(|(k, _)| *k == ipc::REQ_COMMAND).count()
+    }
+
+    fn last(&self) -> u64 {
+        self.calls.last().unwrap().0
+    }
+}
+
+impl Transport for FakePpc {
+    fn call(&mut self, label: u64, req: &[u8], rsp: &mut [u8; ipc::MSG_BYTES]) -> (u64, usize) {
+        self.calls.push((ipc::kind(label), ipc::arg(label)));
+        match ipc::kind(label) {
+            ipc::REQ_COMMAND => {
+                assert_eq!(ipc::arg(label), req.len(), "the label carries the command's length");
+                if self.busy > 0 {
+                    self.busy -= 1;
+                    return (ipc::label(ipc::RSP_BUSY, 0), 0);
+                }
+                let fwd = match self.gate.command(0, req) {
+                    Ok(fwd) => fwd,
+                    Err(r) => return (ipc::label(ipc::RSP_REFUSED, r as usize), 0),
+                };
+                let cc = fwd.command_code();
+                if self.device_error_at == Some(cc) {
+                    return (ipc::label(ipc::RSP_DEVICE, 1), 0);
+                }
+                let r = match self.unseal_rc {
+                    Some(rc) if cc == CC_UNSEAL => {
+                        let mut r = vec![0x80, 0x01, 0, 0, 0, 10];
+                        r.extend_from_slice(&rc.to_be_bytes());
+                        r
+                    }
+                    _ => self.tpm.respond(req),
+                };
+                self.gate.response(fwd, &r);
+                rsp[..r.len()].copy_from_slice(&r);
+                let carried = if self.short_words { r.len() - 8 } else { ipc::words(r.len()) * 8 };
+                (ipc::label(ipc::RSP_OK, r.len()), carried)
+            }
+            kind => {
+                assert!(kind == ipc::REQ_DONE || kind == ipc::REQ_FAILED, "unknown request {kind}");
+                assert!(req.is_empty());
+                let ok = self.gate.finish(0, kind == ipc::REQ_DONE).is_ok();
+                let reply = if ok { ipc::label(ipc::RSP_OK, 0) } else { ipc::label(ipc::RSP_REFUSED, 1) };
+                (self.finish_reply.unwrap_or(reply), 0)
+            }
+        }
+    }
+
+    fn now_ns(&mut self) -> u64 {
+        self.clock += 1_000_000;
+        self.clock
+    }
+
+    fn random(&mut self, out: &mut [u8]) -> bool {
+        out.copy_from_slice(&client_entropy().as_bytes()[..out.len()]);
+        self.random_ok
+    }
+}
+
+fn boot_unseal(env: &[u8], ppc: &mut FakePpc) -> (Result<(), UnsealError>, Vec<u8>) {
+    let mut out = vec![0xAAu8; Kind::Key.region_size()];
+    let r = boot::unseal(ppc, env, Kind::Key, &mut out);
+    (r, out)
+}
+
+#[test]
+fn boot_unseals_through_the_gate_and_sends_done() {
+    let plain = region(Kind::Key, 500);
+    let env = sealed(Kind::Key, &plain, 3);
+    let mut ppc = FakePpc::new(&env);
+    let (r, out) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Ok(()));
+    assert!(out == plain);
+    assert_eq!(ppc.commands(), FULL_FLOW.len());
+    assert_eq!(ppc.last(), ipc::REQ_DONE);
+    assert_eq!(ppc.gate.state(0), Some(State::Done));
+    assert_eq!(ppc.tpm.flushed, [OBJECT_HANDLE, SESSION_HANDLE, SRK_HANDLE]);
+}
+
+#[test]
+fn a_busy_tpm_is_asked_again_after_a_pause() {
+    let plain = region(Kind::Key, 500);
+    let env = sealed(Kind::Key, &plain, 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.busy = 3;
+    let (r, out) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Ok(()));
+    assert!(out == plain);
+    assert_eq!(ppc.commands(), FULL_FLOW.len() + 3);
+    assert!(ppc.clock >= 3 * BUSY_PAUSE_NS, "asked again without pausing: {} ns", ppc.clock);
+}
+
+#[test]
+fn a_tpm_busy_past_the_timeout_leaves_tpm_unavailable_and_sends_failed() {
+    let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.busy = usize::MAX;
+    let (r, out) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Err(UnsealError::TpmUnavailable));
+    assert!(out.iter().all(|b| *b == 0));
+    assert_eq!(ppc.last(), ipc::REQ_FAILED);
+    assert!(ppc.clock >= BUSY_TIMEOUT_NS);
+}
+
+#[test]
+fn a_device_error_mid_flow_is_tpm_unavailable_after_the_flushes() {
+    let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.device_error_at = Some(CC_LOAD);
+    let (r, out) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Err(UnsealError::TpmUnavailable));
+    assert!(out.iter().all(|b| *b == 0));
+    assert_eq!(ppc.tpm.flushed, [SESSION_HANDLE, SRK_HANDLE]);
+    assert_eq!(ppc.last(), ipc::REQ_FAILED);
+    assert_eq!(ppc.gate.state(0), Some(State::Failed));
+}
+
+#[test]
+fn an_unseal_the_tpm_refuses_is_unseal_refused() {
+    let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.unseal_rc = Some(0x99D); // TPM_RC_POLICY_FAIL: PCR 8 is another value
+    let (r, out) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Err(UnsealError::UnsealRefused));
+    assert!(out.iter().all(|b| *b == 0));
+    assert_eq!(ppc.last(), ipc::REQ_FAILED);
+}
+
+#[test]
+fn a_forged_unseal_response_is_response_invalid() {
+    let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.tpm.flip_unseal_hmac = true;
+    let (r, out) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Err(UnsealError::ResponseInvalid));
+    assert!(out.iter().all(|b| *b == 0));
+}
+
+#[test]
+fn another_tpms_srk_is_srk_mismatch() {
+    let mut env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
+    let mut ppc = FakePpc::new(&env);
+    let other = crypto::public_point(&secret(&range(0x55))).unwrap();
+    env[56 + 22..56 + 90].copy_from_slice(&crypto::ecc_point(&other));
+    let name = crypto::name(&env[56..146]);
+    env[20..54].copy_from_slice(&name);
+    let (r, _) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Err(UnsealError::SrkMismatch));
+    assert_eq!(ppc.last(), ipc::REQ_FAILED);
+}
+
+#[test]
+fn a_plaintext_blob_is_envelope_invalid_and_reaches_no_tpm_command() {
+    let mut blob = Box::new([0u8; secret_blob::REGION_SIZE]);
+    secret_blob::write(&mut blob, &[1; 32], &[2; 32], &[[3; 32]]).unwrap();
+    let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
+    let mut ppc = FakePpc::new(&env);
+    let (r, out) = boot_unseal(&blob[..], &mut ppc);
+    assert_eq!(r, Err(UnsealError::EnvelopeInvalid));
+    assert!(out.iter().all(|b| *b == 0));
+    assert_eq!(ppc.commands(), 0);
+    assert_eq!(ppc.calls, [(ipc::REQ_FAILED, 0)]);
+}
+
+#[test]
+fn a_failed_random_source_is_rndr() {
+    let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.random_ok = false;
+    let (r, _) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Err(UnsealError::Rndr));
+    assert_eq!(ppc.calls, [(ipc::REQ_FAILED, 0)]);
+}
+
+#[test]
+fn a_done_tpm_does_not_acknowledge_leaves_no_plaintext() {
+    let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.finish_reply = Some(ipc::label(ipc::RSP_REFUSED, 2));
+    let (r, out) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Err(UnsealError::TpmUnavailable));
+    assert!(out.iter().all(|b| *b == 0));
+}
+
+#[test]
+fn a_response_longer_than_its_reply_words_is_refused() {
+    let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.short_words = true;
+    let (r, out) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Err(UnsealError::TpmUnavailable));
+    assert!(out.iter().all(|b| *b == 0));
+}
+
+#[test]
+fn open_sealed_wipes_the_kek_on_success_and_on_failure() {
+    let plain = region(Kind::Key, 100);
+    let env = sealed(Kind::Key, &plain, 1);
+    let e = Envelope::parse(&env, Kind::Key).unwrap();
+    for (tag, want) in [(1, Ok(())), (2, Err(EnvError::Auth))] {
+        let mut k = secret::<32>(&kek(tag));
+        let mut out = vec![0xAAu8; Kind::Key.region_size()];
+        assert_eq!(envelope::open_sealed(&e, &mut k, &mut out), want);
+        assert!(k.as_bytes().iter().all(|b| *b == 0), "KEK {tag} not wiped");
+        assert_eq!(out == plain, want.is_ok());
+    }
+}

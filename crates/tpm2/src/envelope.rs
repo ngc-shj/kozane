@@ -281,6 +281,39 @@ impl<'a> Envelope<'a> {
     }
 }
 
+/// Bytes of stack [`open_sealed`] zeroes after the open: libcrux's
+/// ChaCha20 state, which holds the KEK, stays in the dead frames of the
+/// AEAD otherwise. The open's peak on this build is far below this (the C9
+/// residue harness requires the scrub to cover it: no KEK window survives).
+pub const OPEN_SCRUB_DEPTH: usize = 8 * 1024;
+
+/// The envelope-open closure (I10.3): the unsealed KEK becomes the AEAD
+/// key and is wiped, the envelope is opened into `out` (zero on failure),
+/// and the stack the AEAD used is scrubbed. The PDs ship this function and
+/// the C9 residue harness runs the same compiled closure (C10 identity), so
+/// it is never inlined.
+#[inline(never)]
+pub fn open_sealed(envelope: &Envelope<'_>, kek: &mut Secret<32>, out: &mut [u8]) -> Result<(), EnvError> {
+    let r = open_core(envelope, kek, out);
+    scrub_stack();
+    r
+}
+
+#[inline(never)]
+fn open_core(envelope: &Envelope<'_>, kek: &mut Secret<32>, out: &mut [u8]) -> Result<(), EnvError> {
+    let key = Key32::copy_from(kek.as_bytes());
+    kek.wipe();
+    envelope.open(&key, out)
+}
+
+/// Zeroes, with volatile writes, `OPEN_SCRUB_DEPTH` bytes of stack below
+/// the caller's frame: where `open_core` and the AEAD just ran.
+#[inline(never)]
+fn scrub_stack() {
+    let mut area = [0u64; OPEN_SCRUB_DEPTH / 8];
+    zeroize::Zeroize::zeroize(&mut area);
+}
+
 /// Seal entropy: KEK ‖ obfuscation seed ‖ ephemeral ECDH scalar.
 pub const SEAL_ENTROPY_LEN: usize = 3 * 32;
 

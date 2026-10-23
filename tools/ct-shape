@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
-"""Identity and shape of the shipped McEliece code (M4 plan C10), the
-Verus erasure check (C1), and the no-debug-printing check (M5 plan C6).
+"""Identity and shape of the shipped McEliece code (M4 plan C10) and of the
+envelope-open closure (M5 plan I10.3), the Verus erasure check (C1), and
+the no-debug-printing check (M5 plan C6).
 
   tools/ct-shape --harness BIN --search-path DIR [--checks LIST]
                  [--policy TOML] [ELF ...]
   tools/ct-shape --harness BIN --search-path DIR --print-baseline
 
-For each root in ROOTS (a PD ELF under --search-path and the mce460896
-function it ships), the call-graph closure is derived from the ELF by
+For each root in ROOTS (a PD ELF under --search-path and the mce460896 or
+tpm2 envelope-open function it ships), the call-graph closure is derived
+from the ELF by
 following `bl` and tail-call `b <sym>` edges (any direct branch that leaves
 the function), stopping at panic entries (`core::` functions named
-`*_fail` / `*_failed`, or that never return: no `ret`, ending in a call into
-`core::panicking::`) and at memcpy, memset and memmove.
+`*_fail` / `*_failed`, `core::panicking::` itself, or that never return: no
+`ret`, ending in a call into `core::panicking::`) and at memcpy, memset and
+memmove.
 
   identity   the same root's closure in the C9 harness (--harness) is the
              same set of functions (stops included), and each function's
@@ -72,7 +75,14 @@ POLICY = ROOT / "policy" / "ct-shape.toml"
 OBJDUMP = "aarch64-none-elf-objdump"
 CXXFILT = "c++filt"
 
-ROOTS = {"pd-pqkey.elf": "mce460896::decaps", "pd-pq.elf": "mce460896::encaps_attempt"}
+# (ELF, root): McEliece's two entry points (M4 plan C10), and the envelope
+# open `key` and `pqkey` run on the unsealed KEK (M5 plan I10.3), which the
+# C9 residue harness scans.
+OPEN_ROOT = "tpm2::envelope::open_sealed"
+ROOTS = [("pd-pqkey.elf", "mce460896::decaps"), ("pd-pq.elf", "mce460896::encaps_attempt"),
+         ("pd-key.elf", OPEN_ROOT), ("pd-pqkey.elf", OPEN_ROOT)]
+ROOT_ELFS = sorted({label for label, _ in ROOTS})
+MCE_ELFS = sorted({label for label, root in ROOTS if root.startswith("mce460896::")})
 # The generic `encaps` shim is excluded from identity by name (C7 I8). It is
 # shape-baselined in pd-pq; where it was inlined into its only caller (it is,
 # at opt-level "s"), that caller carries it.
@@ -337,6 +347,11 @@ def is_panic_entry(binary: Binary, addr: int) -> bool:
         return False
     if any(re.search(r"_fail(ed)?$", n.split(" @")[0]) for n in names):
         return True
+    # core::panicking itself (panic_fmt, called directly by a formatted
+    # panic!): past it is the target's panic handler, which the PD and the
+    # harness do not share.
+    if any(n.startswith("core::panicking::") for n in names):
+        return True
     body = binary.body(addr)
     if any(m == "ret" for _, m, _ in body):
         return False
@@ -402,6 +417,13 @@ def check_identity(elf: Binary, harness: Binary, root: str) -> list:
 
 
 MCE_NAME = re.compile(r"^<?mce460896::")
+# The open closure's own functions (I10.3): entered only through the root,
+# whose stack scrub a direct call to them would skip.
+OPEN_NAME = re.compile(r"^(?:tpm2::envelope::(?:open_core|scrub_stack)|<tpm2::envelope::Envelope>::open)$")
+
+
+def contained_name(root: str):
+    return OPEN_NAME if root == OPEN_ROOT else MCE_NAME
 
 
 def check_contained(binary: Binary, root: str, nodes: dict) -> list:
@@ -412,22 +434,25 @@ def check_contained(binary: Binary, root: str, nodes: dict) -> list:
     core helpers, `copy_from_slice` say, have callers of their own.) A direct `decaps_core` call would skip the
     root's stack scrub; a call to some other entry point (`keypair`,
     `stages::*`) would ship code that neither identity nor the forbidden
-    instructions check."""
+    instructions check. The same for the envelope open's own functions
+    (OPEN_NAME) and its root."""
     inside = set(nodes.values())
     root_addr = nodes[root]
+    own = contained_name(root)
+    what = "the envelope open's code" if root == OPEN_ROOT else "McEliece code"
     shims = {a for n, addrs in binary.by_name.items() if SHIM_NAME.match(n) or SHIM_CARRIER.match(n) for a in addrs}
     errors = []
     for addr, name in sorted(binary.funcs.items()):
         if addr in inside:
             continue
-        if addr not in shims and any(MCE_NAME.match(n) for n in name.split(" = ")):
-            errors.append(f"{binary.label}: identity: {name} is McEliece code outside the closure of {root}")
+        if addr not in shims and any(own.match(n) for n in name.split(" = ")):
+            errors.append(f"{binary.label}: identity: {name} is {what} outside the closure of {root}")
         # A sizeless symbol (an assembly entry label) has no body to scan;
         # what it falls into is a sized function, scanned on its own.
         for a, mnemonic, ops in binary.body(addr) if binary.sizes.get(addr, 0) > 0 else []:
             target = branch_target(mnemonic, ops)
             if target is not None and target in inside and target != root_addr \
-                    and any(MCE_NAME.match(n) for n in binary.funcs[target].split(" = ")):
+                    and any(own.match(n) for n in binary.funcs[target].split(" = ")):
                 errors.append(f"{binary.label}: identity: {name}+{a - addr:#x} enters the closure of {root} "
                               f"at {binary.funcs[target]}, not at the root")
     return errors
@@ -463,7 +488,7 @@ def check_no_mce_elsewhere(search: pathlib.Path, images: list) -> list:
     residual.)"""
     errors = []
     for name in images:
-        if name in ROOTS:
+        if name in MCE_ELFS:
             continue
         path = search / name
         try:
@@ -476,7 +501,7 @@ def check_no_mce_elsewhere(search: pathlib.Path, images: list) -> list:
             continue
         names = demangle_all(s.name for s in syms)
         for n in sorted({n for n in names.values() if MCE_NAME.match(n)}):
-            errors.append(f"{name}: identity: {n} is McEliece code in a PD outside {', '.join(ROOTS)}")
+            errors.append(f"{name}: identity: {n} is McEliece code in a PD outside {', '.join(MCE_ELFS)}")
     return errors
 
 
@@ -541,7 +566,7 @@ def shape_subjects(binaries: dict) -> dict:
     """(elf, function) -> (binary, address): every PD closure function, and
     the shim (or the caller it was inlined into) in SHIM_ELF."""
     subjects = {}
-    for label, root in ROOTS.items():
+    for label, root in ROOTS:
         nodes, _, _ = closure(binaries[label], root)
         subjects.update({(label, name): (binaries[label], addr) for name, addr in nodes.items()})
     binary = binaries[SHIM_ELF]
@@ -682,7 +707,7 @@ def main() -> int:
     try:
         if not a.harness.is_file():
             raise Fail(f"the C9 harness {a.harness} is missing")
-        binaries = {label: Binary.load(a.search_path / label, label) for label in ROOTS}
+        binaries = {label: Binary.load(a.search_path / label, label) for label in ROOT_ELFS}
         if a.print_baseline:
             print_baseline(binaries, a.policy)
             return 0
@@ -691,18 +716,23 @@ def main() -> int:
         for label, binary in binaries.items():
             print(f"CT-SHAPE-SHA256 {binary.sha256} {label}")
         print(f"CT-SHAPE-SHA256 {harness.sha256} harness")
-        for label, root in ROOTS.items():
+        # The forbidden scan covers each ELF's closures together, so a
+        # [[divide]] entry is judged against all of them.
+        scanned = {label: {} for label in ROOT_ELFS}
+        for label, root in ROOTS:
             nodes, stops, _ = closure(binaries[label], root)
             if "identity" in checks:
                 errors += check_identity(binaries[label], harness, root)
                 errors += check_contained(binaries[label], root, nodes)
-            if "forbidden" in checks:
-                errors += check_forbidden(binaries[label], nodes, divides)
+            scanned[label].update(nodes)
             symbols += len(nodes)
             print(f"CT-SHAPE-CLOSURE {label} {root}: {len(nodes)} functions, {len(stops)} stops")
+        if "forbidden" in checks:
+            for label, nodes in scanned.items():
+                errors += check_forbidden(binaries[label], nodes, divides)
         if "identity" in checks:
             images = system_images(a.system)
-            missing = sorted(set(ROOTS) - set(images))
+            missing = sorted(set(ROOT_ELFS) - set(images))
             if missing:
                 raise Fail(f"system file {a.system}: no program_image {', '.join(missing)}")
             errors += check_no_mce_elsewhere(a.search_path, images)
@@ -712,7 +742,7 @@ def main() -> int:
             if not a.elfs:
                 raise Fail("erasure: no PD ELFs given")
             for path in a.elfs:
-                if path.name not in ROOTS and path.is_file():
+                if path.name not in ROOT_ELFS and path.is_file():
                     print(f"CT-SHAPE-SHA256 {hashlib.sha256(path.read_bytes()).hexdigest()} {path.name}")
                 errors += check_erasure(path)
         if "printing" in checks:

@@ -34,6 +34,9 @@ pub enum Role {
     Data,
     Service,
     Timer,
+    /// The TPM driver (M5 plan C9): untainted, owns the TIS page, callee
+    /// of `key` pds only.
+    Tpm,
 }
 
 impl Role {
@@ -45,8 +48,9 @@ impl Role {
             "data" => Ok(Role::Data),
             "service" => Ok(Role::Service),
             "timer" => Ok(Role::Timer),
+            "tpm" => Ok(Role::Tpm),
             other => Err(err(format!(
-                "unknown role '{other}' (expected driver, untrusted_input, key, data, service or timer)"
+                "unknown role '{other}' (expected driver, untrusted_input, key, data, service, timer or tpm)"
             ))),
         }
     }
@@ -91,14 +95,20 @@ impl SharePerms {
 /// user-mappable in both Microkit configs per `platform_gen.json`).
 pub const PL011_PAGE: (u64, u64) = (0x900_0000, 0x1000);
 
+/// The TPM TIS page, locality 0 (M5 plan C9): QEMU virt's tpm-tis-device,
+/// the first device on its platform bus. The only page a tpm mr may be
+/// pinned at.
+pub const TIS_PAGE: (u64, u64) = (0xc00_0000, 0x1000);
+
 #[derive(Debug, Clone)]
 pub enum MrPolicy {
     /// MMIO owned by exactly one driver, page-granular (L5). `phys_addr`
     /// and `size` pin the physical range the `.system` must match exactly
     /// (finding 3) and are what the board-RAM overlap check (finding 2)
     /// uses. `console` marks the one console page, owned by a `service`
-    /// pd (L5 as amended by the M5 plan, C6).
-    Device { owner: String, phys_addr: u64, size: u64, console: bool },
+    /// pd (L5 as amended by the M5 plan, C6); `tpm` the TIS page, owned by
+    /// a `tpm` pd (C9).
+    Device { owner: String, phys_addr: u64, size: u64, console: bool, tpm: bool },
     /// DMA buffer owned by exactly one driver, never shared (L5).
     Dma { owner: String },
     /// An MR holding static secrets, mapped only into its `key`-role owner
@@ -115,6 +125,12 @@ impl MrPolicy {
     /// not seed taint (L1). Keyed to the pin, not to the flag alone.
     pub fn is_pl011_console(&self) -> bool {
         matches!(self, MrPolicy::Device { console: true, phys_addr, size, .. } if (*phys_addr, *size) == PL011_PAGE)
+    }
+
+    /// A tpm mr pinned at the TIS page: like the console, it does not seed
+    /// taint (L1, S14), keyed to the pin.
+    pub fn is_tis(&self) -> bool {
+        matches!(self, MrPolicy::Device { tpm: true, phys_addr, size, .. } if (*phys_addr, *size) == TIS_PAGE)
     }
 }
 
@@ -192,6 +208,8 @@ enum RawMr {
         size: u64,
         #[serde(default)]
         console: bool,
+        #[serde(default)]
+        tpm: bool,
     },
     Dma { owner: String },
     // `Option` so a missing owner gets an L2-specific policy error rather
@@ -282,20 +300,26 @@ impl Policy {
         let mut secrets_owners: BTreeMap<String, String> = BTreeMap::new();
         for (name, mr) in raw.mrs {
             let policy_mr = match mr {
-                RawMr::Device { owner, phys_addr, size, console } => {
+                RawMr::Device { owner, phys_addr, size, console, tpm } => {
                     require_pd(&pds, &owner)?;
                     let role = pds.get(&owner).map(|p| p.role);
-                    // A service pd's devices are judged by the laws (only a
-                    // console is allowed, C6), so a wrong one is a reported
-                    // violation rather than an unloadable policy.
-                    if !role.is_some_and(|r| r.owns_hardware() || r == Role::Service) {
+                    // A service or tpm pd's devices are judged by the laws
+                    // (only a console, C6, or the TIS page, C9), so a wrong
+                    // one is a reported violation rather than an unloadable
+                    // policy.
+                    if !role.is_some_and(|r| r.owns_hardware() || r == Role::Service || r == Role::Tpm) {
                         return Err(err(format!(
-                            "device mr '{name}' owner '{owner}' must have role 'driver', 'timer' or 'service'"
+                            "device mr '{name}' owner '{owner}' must have role 'driver', 'timer', 'service' or 'tpm'"
                         )));
                     }
                     if console && role != Some(Role::Service) {
                         return Err(err(format!(
                             "device mr '{name}' is marked console but its owner '{owner}' is not a service pd"
+                        )));
+                    }
+                    if tpm && role != Some(Role::Tpm) {
+                        return Err(err(format!(
+                            "device mr '{name}' is marked tpm but its owner '{owner}' is not a tpm pd"
                         )));
                     }
                     if size == 0 {
@@ -304,7 +328,7 @@ impl Policy {
                     if phys_addr.checked_add(size).is_none() {
                         return Err(err(format!("device mr '{name}' phys_addr + size overflows a 64-bit address")));
                     }
-                    MrPolicy::Device { owner, phys_addr, size, console }
+                    MrPolicy::Device { owner, phys_addr, size, console, tpm }
                 }
                 RawMr::Dma { owner } => {
                     require_role(&pds, &owner, Role::Driver)?;
@@ -664,6 +688,40 @@ mod tests {
     fn console_owned_by_a_driver_is_rejected() {
         let e = Policy::load(&console_policy("driver")).unwrap_err().to_string();
         assert!(e.contains("is marked console but its owner 'audit' is not a service pd"), "{e}");
+    }
+
+    fn tpm_policy(owner_role: &str) -> String {
+        format!(
+            r#"
+            [pds.tpm]
+            role = "{owner_role}"
+
+            [mrs.tis]
+            kind = "device"
+            owner = "tpm"
+            phys_addr = 0xc000000
+            size = 0x1000
+            tpm = true
+
+            [budgets]
+            ratio_cap = 0.2
+            ratio_sum_cap = 0.5
+            {BOARD}
+        "#
+        )
+    }
+
+    #[test]
+    fn the_tis_page_owned_by_a_tpm_pd_loads() {
+        let p = Policy::load(&tpm_policy("tpm")).unwrap();
+        assert_eq!(p.role("tpm"), Some(Role::Tpm));
+        assert!(p.mrs["tis"].is_tis());
+    }
+
+    #[test]
+    fn a_tpm_mr_owned_by_a_driver_is_rejected() {
+        let e = Policy::load(&tpm_policy("driver")).unwrap_err().to_string();
+        assert!(e.contains("is marked tpm but its owner 'tpm' is not a tpm pd"), "{e}");
     }
 
     #[test]

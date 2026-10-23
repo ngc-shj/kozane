@@ -1,0 +1,39 @@
+[pds.key]
+role = "key"
+
+[pds.tpm]
+role = "tpm"
+
+[pds.tpm2]
+role = "tpm"
+
+[mrs.tis]
+kind = "device"
+owner = "tpm"
+phys_addr = 0xc000000
+size = 0x1000
+tpm = true
+
+[mrs.secrets]
+kind = "secrets"
+owner = "key"
+
+[[channels]]
+between = ["key", "tpm"]
+pp = { key = true, tpm = false }
+notify = { key = false, tpm = false }
+
+[[channels]]
+between = ["key", "tpm2"]
+pp = { key = true, tpm2 = false }
+notify = { key = false, tpm2 = false }
+
+[priority]
+below = [["key", "tpm"]]
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

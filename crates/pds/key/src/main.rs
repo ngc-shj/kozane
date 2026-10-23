@@ -1,25 +1,80 @@
 //! Key oracle PD (plan C10, laws L1/L2): passive, device-less, and the only
-//! PD that maps the secrets region. Validates it against the compiled
-//! configuration at boot; afterwards answers the fixed-size requests defined
-//! in `key-core`, each caller limited to its row of the caller → label table
-//! (`hs` is the only caller). A failed boot leaves it Unavailable (M5 plan
-//! C6): no secret held, every call answered with the boot error's code,
-//! which `hs` audits (`key` itself has no audit ring and no console).
+//! PD that maps the secrets region, which holds the blob sealed (M5 plan
+//! C11). At boot it unseals it through `tpm` (its one PPC callee, C9) into
+//! its own memory and validates it against the compiled configuration;
+//! afterwards it answers the fixed-size requests defined in `key-core`,
+//! each caller limited to its row of the caller → label table (`hs` is the
+//! only caller). The whole unseal runs in `init`, so no caller reaches
+//! `key` before it is done (S18). A failed boot leaves it Unavailable (M5
+//! plan C6): no secret held, every call answered with the boot error's
+//! code, which `hs` audits (`key` itself has no audit ring and no console).
 
 #![no_std]
 #![no_main]
 
+use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
 use key_core::{BootError, Bucket, Caller, ERR_BAD_REQUEST, KEY_BURST, KEY_INTERVAL_NS, MAX_WORDS, Oracle};
 use layout::key as ch;
+use layout::tpm::{self as ipc, MSG_BYTES, MSG_WORDS};
 use sel4_microkit::{
     Channel, Handler, Infallible, MessageInfo, memory_region_symbol, protection_domain, with_msg_regs,
     with_msg_regs_mut,
 };
+use tpm2::boot::Transport;
+use tpm2::envelope::Kind;
 use wg_core::crypto::{self, Key32};
+use zeroize::Zeroize;
 
 const HS: Channel = Channel::new(ch::CH_HS);
+const TPM: Channel = Channel::new(ch::CH_TPM);
+
+/// `tpm` over PPC (M5 plan C9): one TPM command or response per call, its
+/// byte length in the label. The registers are zeroed after each call.
+struct Ppc;
+
+impl Transport for Ppc {
+    fn call(&mut self, label: u64, req: &[u8], rsp: &mut [u8; MSG_BYTES]) -> (u64, usize) {
+        let mut words = [0u64; MSG_WORDS];
+        let n = ipc::pack(req, &mut words).unwrap_or(0);
+        with_msg_regs_mut(|mrs| {
+            for (dst, src) in mrs.iter_mut().zip(words.iter().take(n)) {
+                *dst = *src;
+            }
+        });
+        let info = TPM.pp_call(MessageInfo::new(label, n));
+        let count = info.count().min(MSG_WORDS);
+        with_msg_regs(|mrs| {
+            for (dst, src) in words.iter_mut().zip(mrs.iter().take(count)) {
+                *dst = *src;
+            }
+        });
+        let carried = count.saturating_mul(8);
+        let ok = ipc::unpack(words.get(..count).unwrap_or(&[]), carried, rsp).is_some();
+        words.fill(0);
+        with_msg_regs_mut(|mrs| mrs.iter_mut().take(MSG_WORDS).for_each(|w| *w = 0));
+        (info.label(), if ok { carried } else { 0 })
+    }
+
+    fn now_ns(&mut self) -> u64 {
+        cpu::now_ns()
+    }
+
+    fn random(&mut self, out: &mut [u8]) -> bool {
+        cpu::fill_random(out)
+    }
+}
+
+/// The unsealed blob: PD-private memory, never the secrets region (M5
+/// plan C11), which stays read-only ciphertext.
+struct Plaintext(UnsafeCell<[u8; secret_blob::REGION_SIZE]>);
+
+// SAFETY: a PD runs one thread, and only `boot` (once, from init) touches
+// the buffer.
+unsafe impl Sync for Plaintext {}
+
+static PLAINTEXT: Plaintext = Plaintext(UnsafeCell::new([0; secret_blob::REGION_SIZE]));
 
 fn caller(channel: Channel) -> Option<Caller> {
     (channel == HS).then_some(Caller::Hs)
@@ -42,8 +97,23 @@ fn region() -> &'static [u8] {
 }
 
 fn boot() -> Result<Oracle<'static>, BootError> {
+    let buf = PLAINTEXT.0.get();
+    // SAFETY: init runs once and is the only caller; no other reference to
+    // the buffer exists while this one is used.
+    tpm2::boot::unseal(&mut Ppc, region(), Kind::Key, unsafe { &mut *buf })?;
+    // SAFETY: as above. From here the buffer is only read, for the life of
+    // the system (the oracle borrows it).
+    let plain: &'static [u8] = unsafe { &*buf };
     let peers = config::PEERS.iter().map(|p| &p.public);
-    let blob = key_core::validate(region(), &config::GATEWAY_PUBLIC, peers)?;
+    let blob = match key_core::validate(plain, &config::GATEWAY_PUBLIC, peers) {
+        Ok(blob) => blob,
+        Err(e) => {
+            // SAFETY: the validation's borrow ended with its error, and
+            // nothing reads the buffer again.
+            unsafe { &mut *buf }.zeroize();
+            return Err(e);
+        }
+    };
 
     let mut samples = [0u8; SEED_SAMPLES * 8];
     if !cpu::fill_random(&mut samples) {

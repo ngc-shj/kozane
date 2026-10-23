@@ -23,7 +23,7 @@ policy := policy/laws.toml
 loader := $(BUILD)/loader.img
 counts := $(BUILD)/counts
 
-pds := eth-out eth-in ingress audit timer key hs inner data pq pqkey
+pds := eth-out eth-in ingress audit timer tpm key hs inner data pq pqkey
 host_crates := wire ring audit-event ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2
 kani_crates := wire ring ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire
 
@@ -72,7 +72,8 @@ kernel-config:
 	grep -q '^#define CONFIG_KERNEL_MCS  1$$' $(sdk_config_dir)/include/kernel/gen_config.h
 
 # Zero blob for the secrets region: `make image` is never deployable (`key`
-# is Unavailable on it); `make package` swaps in a real one (plan C16).
+# is Unavailable on it); `make package` seals a real one for U-Boot to copy
+# in at boot (plan C16, M5 plan C8).
 $(BUILD)/secrets-placeholder.bin:
 	mkdir -p $(BUILD)
 	head -c 4096 /dev/zero > $@
@@ -92,12 +93,14 @@ image: pds kernel-config $(BUILD)/secrets-placeholder.bin $(BUILD)/pq-secrets-pl
 		-r $(BUILD)/report.txt \
 		-o $(loader)
 
-# Same system with only the secrets prefill_path changed; tools/package
-# refuses anything else, and any kernel but a release one (M5 plan C7):
+# The published image, its boot descriptor and the two blobs sealed to one
+# TPM's SRK and the image's PCR 8 (M5 plan C8, C11); tools/package builds the
+# same system with only the secrets prefill_paths changed and refuses
+# anything else, and any kernel but a release one (M5 plan C7):
 # `make package MICROKIT_CONFIG=release ...`.
 ifneq ($(filter package,$(MAKECMDGOALS)),)
-ifeq ($(and $(SECRETS),$(PQ_SECRETS),$(OUT)),)
-$(error package: set SECRETS=<blob> PQ_SECRETS=<blob> OUT=<dir>)
+ifeq ($(and $(SECRETS),$(PQ_SECRETS),$(SRK_PUBLIC),$(OUT)),)
+$(error package: set SECRETS=<blob> PQ_SECRETS=<blob> SRK_PUBLIC=<tpm2b_public> OUT=<dir>)
 endif
 endif
 # tools/package also runs tools/ct-shape (identity, forbidden, shape,
@@ -105,7 +108,8 @@ endif
 # pass record for it on a non-debug kernel (M4 plan C11), so `make ct` must
 # have passed.
 package: image ct-harness
-	tools/package --secrets $(SECRETS) --pq-secrets $(PQ_SECRETS) --out $(OUT) --system $(system) --policy $(policy) \
+	tools/package --secrets $(SECRETS) --pq-secrets $(PQ_SECRETS) --srk-public $(SRK_PUBLIC) --out $(OUT) \
+		--system $(system) --policy $(policy) \
 		--image $(loader) --gen-config $(sdk_config_dir)/include/kernel/gen_config.h \
 		--search-path $(BUILD) --board $(MICROKIT_BOARD) --config $(MICROKIT_CONFIG) \
 		--microkit $(MICROKIT_SDK)/bin/microkit --harness $(ct_harness)
@@ -113,10 +117,11 @@ package: image ct-harness
 # Boots an image interactively with both NICs as the integration test does
 # (outside on user-net with 51820 forwarded to RUN_PORT, inside on a dgram
 # socket). The default image holds the zero placeholder, so `key` is
-# Unavailable and `hs` halts; boot a packaged one with LOADER=<dir>/loader.img.
+# Unavailable and `hs` halts. A package is no loader image any more: it boots
+# through U-Boot with the TPM it was sealed to (tests/integration/run.py).
 LOADER ?= $(loader)
 RUN_PORT ?= 51820
-# Build the default image; a packaged LOADER= is booted as is.
+# Build the default image; another LOADER= is booted as is.
 run: $(if $(filter $(loader),$(LOADER)),image)
 	qemu-system-aarch64 \
 		-machine virt,virtualization=on -cpu neoverse-n2 -m size=2G \

@@ -175,6 +175,12 @@ fn boot_error_messages_are_distinct() {
         BootError::SpkmMismatch,
         BootError::KatMismatch,
         BootError::RndrUnavailable,
+        BootError::EnvelopeInvalid,
+        BootError::TpmUnavailable,
+        BootError::SrkMismatch,
+        BootError::UnsealRefused,
+        BootError::TpmResponseInvalid,
+        BootError::EnvelopeOpen,
         BootError::Blob(BlobError::BadMagic),
         BootError::Blob(BlobError::BadVersion),
         BootError::Blob(BlobError::BadPeerCount),
@@ -183,8 +189,8 @@ fn boot_error_messages_are_distinct() {
         BootError::Blob(BlobError::TooSmall),
     ];
     // A variant missing from the list fails here.
-    assert_eq!(core::mem::variant_count::<BootError>(), 4);
-    assert_eq!(all.len() - 3, core::mem::variant_count::<BlobError>());
+    assert_eq!(core::mem::variant_count::<BootError>(), 10);
+    assert_eq!(all.len() - 9, core::mem::variant_count::<BlobError>());
     for (i, a) in all.iter().enumerate() {
         for b in &all[i + 1..] {
             assert_ne!(a.message(), b.message());
@@ -192,6 +198,39 @@ fn boot_error_messages_are_distinct() {
         }
         assert!((1..=0xff).contains(&a.code()), "{a:?}");
         assert_eq!(unavailable_code(unavailable_label(a.code())), Some(a.code()), "{a:?}");
+    }
+}
+
+#[test]
+fn unseal_failures_carry_key_cores_codes() {
+    use tpm2::boot::UnsealError;
+    let all = [
+        UnsealError::Rndr,
+        UnsealError::EnvelopeInvalid,
+        UnsealError::TpmUnavailable,
+        UnsealError::SrkMismatch,
+        UnsealError::UnsealRefused,
+        UnsealError::ResponseInvalid,
+        UnsealError::EnvelopeOpen,
+    ];
+    assert_eq!(all.len(), core::mem::variant_count::<UnsealError>());
+    for e in all {
+        assert_eq!(BootError::from(e).code(), key_core_code(e), "{e:?}");
+    }
+}
+
+/// key-core's codes for the same failures (pqkey-core does not depend on
+/// it; the integration suite reads both tables).
+fn key_core_code(e: tpm2::boot::UnsealError) -> u32 {
+    use tpm2::boot::UnsealError;
+    match e {
+        UnsealError::Rndr => 9,
+        UnsealError::EnvelopeInvalid => 11,
+        UnsealError::TpmUnavailable => 12,
+        UnsealError::SrkMismatch => 13,
+        UnsealError::UnsealRefused => 14,
+        UnsealError::ResponseInvalid => 15,
+        UnsealError::EnvelopeOpen => 16,
     }
 }
 

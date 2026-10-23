@@ -4,8 +4,9 @@
 `program(...)` returns the assembly of a small mce460896-shaped program:
 the two C10 roots, a helper with a branch, a select, an adrp-paired load
 and a register-offset load, a panic entry by property and one by name,
-memcpy, the PD entry symbol the erasure control looks for and, on request,
-rust-sel4's DebugPutChar syscall wrapper (the printing check's target). `build`
+memcpy, the envelope-open root (M5 plan I10.3) with its one helper, the PD
+entry symbol the erasure control looks for and, on request, rust-sel4's
+DebugPutChar syscall wrapper (the printing check's target). `build`
 assembles and links it with the aarch64-none-elf toolchain at a chosen base
 address, so a PD and a "harness" differ in every address and in their crate
 hashes while their code is the same.
@@ -20,8 +21,10 @@ LD = "aarch64-none-elf-ld"
 
 def syms(h: str) -> dict:
     """v0 symbols, `h` standing in for the crate hashes (`Cs<h>_`)."""
-    mce, core = f"Cs{h}_9mce460896", f"Cs{h}0_4core"
+    mce, core, tpm2 = f"Cs{h}_9mce460896", f"Cs{h}0_4core", f"Cs{h}6_4tpm2"
     return {
+        "open": f"_RNvNt{tpm2}8envelope11open_sealed",
+        "open_core": f"_RNvNt{tpm2}8envelope9open_core",
         "decaps": f"_RNv{mce}6decaps",
         "attempt": f"_RNv{mce}14encaps_attempt",
         "bm": f"_RNvNt{mce}2bm2bm",
@@ -58,9 +61,12 @@ BM = [
 
 
 def program(h: str, crate: str, filler: int = 0, bm=None, extra=(), vstd: bool = False, mul: bool = False,
-            only_root=None, entry_body=("ret",), debug_put_char: bool = False) -> str:
+            only_root=None, entry_body=("ret",), debug_put_char: bool = False, mce: bool = True,
+            open_root: bool = True) -> str:
     """`only_root`: keep one of the two roots ("decaps" or "attempt"), as
-    each PD links only its own. `entry_body`: the PD entry's instructions."""
+    each PD links only its own; `mce` False drops McEliece altogether (as
+    `key` links none) and `open_root` False the envelope open (as `pq`
+    links none). `entry_body`: the PD entry's instructions."""
     s = syms(h)
     funcs = [
         ("decaps", ["stp x29, x30, [sp, #-16]!", "bl {bm}", "ldp x29, x30, [sp], #16", "b {scrub}"]),
@@ -70,14 +76,19 @@ def program(h: str, crate: str, filler: int = 0, bm=None, extra=(), vstd: bool =
         ("bounds", ["stp x29, x30, [sp, #-16]!", "bl {panic_fmt}"]),
         ("fail", ["b {panic_fmt}"]),
         ("panic_fmt", ["b ."]),
+        ("open", ["stp x29, x30, [sp, #-16]!", "bl {open_core}", "ldp x29, x30, [sp], #16", "ret"]),
+        ("open_core", ["cbz x0, 1f", "bl memcpy", "1: ret"]),
     ]
     out = [".text", ".globl _start", "_start:", "b ."]
     out += ["nop"] * filler
     names = {k: v for k, v in s.items()}
     other = {"decaps": "attempt", "attempt": "decaps"}.get(only_root)
-    named = [(s[k], body) for k, body in funcs if k != other]
-    named += [("memcpy", ["ret"]), ("memcmp", ["ret"]), (entry(crate, h), list(entry_body)),
-                                                   (s["shim"], ["cbnz w0, 1f", "1: ret"])]
+    dropped = {other} | ({"decaps", "attempt", "bm", "scrub"} if not mce else set()) \
+        | ({"open", "open_core"} if not open_root else set())
+    named = [(s[k], body) for k, body in funcs if k not in dropped]
+    named += [("memcpy", ["ret"]), ("memcmp", ["ret"]), (entry(crate, h), list(entry_body))]
+    if mce:
+        named.append((s["shim"], ["cbnz w0, 1f", "1: ret"]))
     if mul:
         named.append((s["mul"], ["ret"]))
     if vstd:
@@ -90,7 +101,7 @@ def program(h: str, crate: str, filler: int = 0, bm=None, extra=(), vstd: bool =
         out += [f".size {sym}, . - {sym}"]
     out += [".section .rodata", ".balign 8"]
     out += ["nop_pad: .zero 64" if filler else ""]
-    for key in ("table", "table2"):
+    for key in ("table", "table2") if mce else ():
         sym = s[key]
         out += [f".globl {sym}", f".type {sym}, %object", f"{sym}:", ".zero 128", f".size {sym}, 128"]
     return "\n".join(out) + "\n"
@@ -106,15 +117,21 @@ def build(d: pathlib.Path, name: str, source: str, base: int) -> pathlib.Path:
 
 def tree(d: pathlib.Path, pd_bm=None, pd_extra=(), harness_bm=None, harness_extra=(), vstd: bool = False,
          harness_mul: bool = False, pd_mul: bool = False, pd_entry=("ret",), debug_put_char=None):
-    """A search path with pd-pq.elf and pd-pqkey.elf, each with its own root
-    only, and a harness (with both) built at other addresses with other
-    crate hashes. `debug_put_char` names the PD ELF that also gets the
-    DebugPutChar wrapper. Returns (search path, harness)."""
+    """A search path with pd-pq.elf and pd-pqkey.elf, each with its own
+    McEliece root only, pqkey and pd-key.elf with the envelope open (key
+    without McEliece), and a harness (with all three roots) built at other
+    addresses with other crate hashes. `debug_put_char` names the PD ELF
+    that also gets the DebugPutChar wrapper. Returns (search path,
+    harness)."""
     search = d / "search"
     search.mkdir()
     for label, crate, root in (("pd-pq.elf", "pd_pq", "attempt"), ("pd-pqkey.elf", "pd_pqkey", "decaps")):
         build(search, label, program("a1", crate, bm=pd_bm, extra=pd_extra, vstd=vstd, mul=pd_mul, only_root=root,
-                                     entry_body=pd_entry, debug_put_char=label == debug_put_char), 0x200000)
+                                     entry_body=pd_entry, debug_put_char=label == debug_put_char,
+                                     open_root=root == "decaps"), 0x200000)
+    # The McEliece knobs (bm, extra, mul, entry) are pqkey's and pq's.
+    build(search, "pd-key.elf", program("a1", "pd_key", vstd=vstd, debug_put_char=debug_put_char == "pd-key.elf",
+                                        mce=False), 0x200000)
     harness = build(d, "ct-harness", program("b7", "ct_harness", filler=37, bm=harness_bm, extra=harness_extra,
                                                      mul=harness_mul),
                     0x412340)

@@ -3,6 +3,10 @@
 //! the stack is searched for every stored form of every secret the call
 //! handled. The needles are computed on the main thread into the heap,
 //! from the port's own `pub` stage, pack and transpose functions.
+//!
+//! The same scan covers the envelope-open closure `key` and `pqkey` ship
+//! (M5 plan I10.3): `tpm2::envelope::open_sealed` on an envelope sealed
+//! here under a known KEK, its needles the KEK and the opened blob.
 
 use std::collections::{HashMap, HashSet};
 use std::hint::black_box;
@@ -13,12 +17,15 @@ use mce460896::{
     encaps_attempt,
 };
 
+use tpm2::Secret;
+use tpm2::envelope::{self, Envelope, Kind, OPEN_SCRUB_DEPTH, SEAL_ENTROPY_LEN};
+
 use crate::stack::OwnedStack;
 use crate::vectors::{self, CLASSES, ENTRIES, SYND_BYTES, SYS_N, Vectors, boxed, h32};
 use crate::vg;
 
 /// The needle forms; a hit line names one.
-const FORMS: [&str; 10] = [
+const FORMS: [&str; 12] = [
     "rand",
     "e-bytes",
     "ind",
@@ -29,6 +36,8 @@ const FORMS: [&str; 10] = [
     "bm",
     "keccak",
     "ss",
+    "kek",
+    "plain",
 ];
 #[derive(Clone, Copy)]
 enum Form {
@@ -42,6 +51,8 @@ enum Form {
     Bm,
     Keccak,
     Ss,
+    Kek,
+    Plain,
 }
 
 /// The stack each call runs on, and the padding frame between the
@@ -62,10 +73,18 @@ const _: () = assert!(
     "the scrub must cover the painted-depth floor"
 );
 
+/// The envelope open's floor: what `open_core` and the AEAD disturb with
+/// or without the scrub (the scrub alone writes `OPEN_SCRUB_DEPTH`).
+const FLOOR_OPEN: usize = 512;
+const _: () = assert!(
+    OPEN_SCRUB_DEPTH >= FLOOR_OPEN,
+    "the open's scrub must cover the painted-depth floor"
+);
+
 /// Decapsulations (the four classes per entry), encapsulation attempts
-/// (every draw of each stream, the two crafted rejections), and the
-/// generic shim once per entry.
-const CASES: usize = ENTRIES * CLASSES.len() + (1 + 3 + 4) + 2 + ENTRIES;
+/// (every draw of each stream, the two crafted rejections), the generic
+/// shim once per entry, and the envelope open for each blob kind.
+const CASES: usize = ENTRIES * CLASSES.len() + (1 + 3 + 4) + 2 + ENTRIES + 2;
 
 /// 8-byte windows of the secret forms, at every byte offset.
 struct Needles {
@@ -290,6 +309,36 @@ fn attempt_needles(
     (accept, ct, ss)
 }
 
+/// Deterministic bytes per label, every 8-byte window distinctive.
+fn stream(label: &[u8], len: usize) -> Vec<u8> {
+    let mut rng = vectors::SplitMix::new(u64::from_le_bytes(h32(&[label])[..8].try_into().expect("8")));
+    let mut out = vec![0u8; len];
+    rng.fill(&mut out);
+    out
+}
+
+/// An envelope of `kind` sealed here (to an SRK of a fixed scalar, PCR 8
+/// fixed): the envelope, its KEK and the blob it opens to (the region,
+/// its payload nonzero up to `len`).
+fn sealed_envelope(kind: Kind, len: usize) -> (Vec<u8>, Box<Secret<32>>, Vec<u8>) {
+    let mut scalar = Secret::<32>::zero();
+    scalar.as_mut_bytes().copy_from_slice(&stream(b"srk", 32));
+    let point = tpm2::crypto::public_point(&scalar).expect("SRK scalar");
+    let srk = [&tpm2_wire::SRK_PUBLIC_PREFIX[..], &tpm2::crypto::ecc_point(&point)].concat();
+    let mut entropy = Secret::<SEAL_ENTROPY_LEN>::zero();
+    entropy
+        .as_mut_bytes()
+        .copy_from_slice(&stream(&[b"seal".as_slice(), &kind.code().to_le_bytes()].concat(), SEAL_ENTROPY_LEN));
+    let mut plain = vec![0u8; kind.region_size()];
+    plain[..len].copy_from_slice(&stream(b"blob", len));
+    plain[len - 1] |= 1;
+    let mut env = vec![0u8; kind.region_size()];
+    envelope::seal(&mut env, kind, &plain, &srk, &[0x88; 32], &entropy).expect("seal");
+    let mut kek = Box::new(Secret::<32>::zero());
+    kek.as_mut_bytes().copy_from_slice(&entropy.as_bytes()[..32]);
+    (env, kek, plain)
+}
+
 #[inline(never)]
 fn padded(f: impl FnOnce()) {
     let mut pad = [0u8; PAD];
@@ -436,6 +485,26 @@ pub fn run() -> ! {
         shim_rejected |= attempts.len() > 1;
     }
     scan.check("the shim saw no rejected attempt", shim_rejected);
+
+    // The envelope-open closure (I10.3): after it returns, neither the KEK
+    // nor the blob it opened is left on the stack, and the KEK is wiped.
+    for (kind, len) in [(Kind::Key, 1000), (Kind::Pq, secret_blob::pq::USED_LEN)] {
+        let (env, mut kek, plain) = sealed_envelope(kind, len);
+        let mut needles = Needles::new();
+        needles.add(Form::Kek, kek.as_bytes());
+        needles.add(Form::Plain, &plain[..len]);
+        let parsed = Envelope::parse(&env, kind).expect("envelope");
+        let mut out = vec![0u8; kind.region_size()];
+        let mut result = Box::new(Err(envelope::EnvError::Seal));
+        let name = format!("open.{kind:?}");
+        scan.case(&name, FLOOR_OPEN, &needles, || {
+            *result = envelope::open_sealed(&parsed, &mut kek, &mut out);
+        });
+        scan.check(
+            &format!("{name} output"),
+            result.is_ok() && out == plain && kek.as_bytes().iter().all(|b| *b == 0),
+        );
+    }
     scan.check(
         &format!("{} cases run, {CASES} planned", scan.cases),
         scan.cases == CASES,

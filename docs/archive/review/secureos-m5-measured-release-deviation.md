@@ -534,3 +534,279 @@ The comparison and member derivation are fixtured too
   instead, the 365-byte maximum leaves ample room.
 - **run.py.** It should read `CAP_DIGEST` from the source (RT3) for the
   expected-then-capped PCR 8.
+
+## Slice 7 — tpm PD (C9), sealed secrets in key/pqkey (C11), integration (C14)
+
+### Result
+
+- **`tpm` PD** (`crates/pds/tpm`): passive, priority 145 (`key` 140,
+  `pqkey` 130), budget 1000/10000, stack 64 KiB. It maps only the TIS page
+  (`tpm_mmio`, uncached, at 0xc000000), has no irq and is the PPC callee of
+  `key` and `pqkey` alone. The `tpm2_wire` gate is its only decision point.
+  The TIS driver works on locality 0: request the locality, commandReady,
+  write the command in bursts, check Expect is clear, go, poll dataAvail,
+  read the header, bound the size to 960 bytes, read the rest, check no
+  data is left. Every exit then writes commandReady and releases the
+  locality. All waits are bounded by CNTPCT: 5 s for the register
+  handshakes, 60 s for a command. A timeout or protocol error answers
+  RSP_DEVICE with the failing step and leaves the gate as it was. After
+  both clients' Done/Failed it issues the gate's cap. There is no audit
+  channel and no printing.
+- **`tpm2-wire` is unchanged**, `gate.rs` included. The PD uses the gate's
+  existing `command`/`response`/`finish`/`cap`/`state`.
+- **`key`/`pqkey`.** The whole unseal runs in `init`
+  (`tpm2::boot::unseal`): random client entropy through `cpu::fill_random`,
+  the client flow over PPC, the envelope read in place from the read-only
+  secrets MR, and the plaintext written into a PD-private `static`
+  buffer. The KEK is wiped in `envelope::open_sealed` and the session
+  secrets in the client, on every path. Done or Failed is sent whatever
+  happened. Afterwards `key_core::validate` /
+  `pqkey_core::Oracle::boot` run on the plaintext as before; on their
+  failure the buffer is zeroized. The plaintext `SOSSECR1` format no longer
+  reaches the PDs: it fails `Envelope::parse` (`EnvelopeInvalid`).
+- **New `BootError` codes**, the same numbers in `key-core` and
+  `pqkey-core` (`pqkey-core` skips 10), so one failure reads the same from
+  `hs` and from `pq`:
+
+  | code | variant | cause (`tpm2::boot::UnsealError`) |
+  |---|---|---|
+  | 11 | EnvelopeInvalid | the region is not an envelope of the PD's kind |
+  | 12 | TpmUnavailable | `tpm` refused, failed (device), stayed Busy past 120 s, a TPM command other than Unseal failed, or Done was not acknowledged |
+  | 13 | SrkMismatch | CreatePrimary's Name is not the pinned SRK's (I10.2) |
+  | 14 | UnsealRefused | the TPM refused Unseal (PCR 8 policy) |
+  | 15 | TpmResponseInvalid | a response failed the client's checks: format, Unseal HMAC/attributes/outData, Load Name (A7) |
+  | 16 | EnvelopeOpen | the unsealed KEK did not open the envelope |
+
+  An RNDR failure, or four unusable ECDH scalars in a row, maps to the
+  existing `RndrUnavailable` (9).
+- **IPC** (`layout::tpm`, one definition for both sides). Each message
+  carries one TPM command or response, little-endian bytes in the message
+  words, with `label = kind << 16 | byte length`. `MSG_BYTES` (960) is
+  const-asserted equal to `tpm2_wire::IPC_MSG_BYTES` in the PD and in
+  `tpm2::boot`. Requests are COMMAND, DONE and FAILED; replies are OK
+  (length), REFUSED (refusal code), DEVICE (step), BUSY and BAD_REQUEST.
+- **Laws.** New role `tpm`, and device mrs gain `tpm = true` (a policy
+  error on any other owner role).
+  - L5: one tpm mr, pinned at the TIS page (0xc000000/0x1000); a tpm pd
+    owning any other device is refused.
+  - L1: a tpm pd must be untainted, map nothing but its tpm mr, have
+    channels only to key pds, and never have pp on its own end. A key pd
+    may have at most one pp end, and only towards a tpm pd; a pp end
+    towards anything else is the existing key-exemption finding. The
+    key→tpm channel is no exemption: taint crosses it both ways and both
+    ends must stay clean.
+  - S14: the TIS page, like the console, does not seed taint, keyed to
+    the pin.
+  - L13: `["key", "tpm"]` in `[priority] below`.
+  - Fixtures, each with exact messages: an allow; and as denies a tainted
+    tpm, a tpm with a non-device mr, a second pp channel from key, a tpm
+    channel to a non-key pd, a tpm calling out (pp on its own end), a tpm
+    owning a non-TIS device, a tpm not above key, and a tpm mr off the TIS
+    page (refused, and it seeds taint). The live system test passes.
+- **Packaging** (`tools/package --srk-public`) runs in four steps:
+  1. microkit with random, size-correct stand-ins; `check_images` is kept
+     for this build: it differs from the published image only where the
+     stand-ins land, which held zeros;
+  2. the descriptor from those ranges, and PCR 8 from `tools/measure.py`;
+  3. `mksecrets seal` for each blob, from a private copy in staging that
+     is deleted as soon as both are sealed;
+  4. microkit with the envelopes as prefill;
+     `measure.assemble(published, desc, envelopes)` must equal that image
+     byte for byte.
+
+  OUT holds exactly `published.img`, `boot.desc`, `secrets.env`,
+  `pq_secrets.env` and `pcr8`. No microkit run ever sees a blob, and no
+  image with a secret in it is written. A real run (microkit, mksecrets
+  seal, the assembly check) passed on this tree with only the C9-record
+  binding stubbed, because `make ct` has not run here
+  (`PACKAGE-FIXTURES 116`).
+- **I10.3.**
+  - **The closure:** `tpm2::envelope::open_sealed`, `#[inline(never)]`,
+    is the envelope-open closure `key` and `pqkey` ship. It runs
+    `open_core` (KEK → `Key32`, KEK wiped, AEAD open), then zeroes 8 KiB
+    of stack below its frame (`OPEN_SCRUB_DEPTH`). libcrux's ChaCha20
+    state, which holds the key, is otherwise left in the AEAD's dead
+    frames.
+  - **The residue harness:** two cases, `open.Key` and `open.Pq`. Each
+    opens an envelope sealed in the harness under a known KEK, and the
+    stack is scanned for KEK and plaintext windows (new forms `kek` and
+    `plain`). The output and the KEK wipe are checked as well.
+  - **Measured natively:** green with the scrub (open depth 8280 B,
+    `RESIDUE-CASES 27`). On a scratch copy without the scrub,
+    `RESIDUE-HIT kek case=open.Key windows=26` and `plain … windows=33`
+    appear (both kinds), with the open's own depth 1392 B. The selftest
+    case `tpm2-open-residue` uses that needle.
+  - **C10:** `tools/ct-shape`'s roots are now a list:
+    `pd-key.elf`/`pd-pqkey.elf` → `open_sealed`, next to the McEliece
+    roots. Identity holds (20 functions, 6 stops in each ELF), the
+    forbidden scan is clean, and 38 shape entries were added with
+    justifications that claim no C9 CT run (`CT-SHAPE-SYMBOLS 99`; the
+    McEliece closures stay at 39 + 20).
+
+### Deviations
+
+- **TIS locality 0 only: 0x1000, not 0x5000.** QEMU 9.0's tpm-tis-device
+  region is `TPM_TIS_NUM_LOCALITIES << TPM_TIS_LOCALITY_SHIFT` = 0x5000
+  (`hw/tpm/tpm_tis_sysbus.c`), at the virt platform bus base 0x0c000000.
+  It is the first dynamic sysbus device, which matches U-Boot's
+  `tpm_tis@0` probe. The PD uses locality 0 alone. Higher localities are
+  more privilege on a real TPM (locality-restricted PCR resets and
+  extends), so the MR, the laws pin and `layout::tpm::TIS_SIZE` cover
+  the first page only.
+  - **Verification:** no QEMU source is in the image and QEMU may not be
+    run in this slice. The address and size come from QEMU's source as
+    above, plus slice 5's probe. The sealed boots are the check: a wrong
+    address means no TPM response, so every case fails with code 12.
+- **One flow at a time (Busy), beyond the plan.** swtpm (libtpms) holds
+  three transient objects, and the two flows need four at once (SRK and
+  sealed object each). `key`'s and `pqkey`'s inits interleave at budget
+  boundaries, so the PD answers RSP_BUSY to a Fresh client while the other
+  client is Unsealing, and the client retries every 10 ms for at most
+  120 s. This decision is in the PD, outside the gate, but it can only
+  refuse more than the gate does; a started flow always runs to its end.
+  The interop test
+  `both_key_pds_unseal_concurrently_through_the_pd_model_and_pcr8_is_capped`
+  runs both clients in threads through a model of the PD over swtpm. It
+  saw one Busy, then both opened and PCR 8 was capped.
+- **The IPC encoding is in `layout`, not `tpm2-wire`.** This leaves the
+  Kani-verified crate byte-identical. The proof caches are invalidated
+  anyway: `Cargo.lock` changed (new member `pd-tpm`; `tpm2` now depends
+  on `layout`, and `key-core`, `pqkey-core`, `pd-key` and `pd-pqkey` on
+  `tpm2`; no external package was added).
+- **Both ends of a key→tpm channel have `notify=false`.** This is fewer
+  capabilities than the hs→key pattern, whose callee end can notify.
+- **ct-shape stops at `core::panicking::` itself.** libcrux's decrypt
+  calls `core::panicking::panic_fmt` directly. Past it lies the target's
+  panic handler (sel4-panicking in the PD, std in the harness), so
+  identity could never hold. The McEliece closures are unchanged by the
+  rule (39/12 and 20/10 as before). The forbidden scan now runs once per
+  ELF over all its closures, so pd-pqkey's two `[[divide]]` entries are
+  judged against both of its roots.
+- **ct-harness lock.** The harness now depends on `tpm2`, `tpm2-wire` and
+  `secret-blob`. wg-core's wg-wire pulls `vstd`, so the harness patches
+  the six Verus crates to `third_party/verus` like the root workspace;
+  without that it would resolve them from the registry. Its lock was
+  seeded from the root lock, and every other package in it (117) has the
+  root lock's name, version and source. A unification check showed no `zeroize`
+  feature turned on.
+- **Tampered descriptor = `image_len` cut short, not a moved range.**
+  A moved range makes U-Boot copy the envelope elsewhere, so the PD finds
+  zeros (code 11, not a PCR mismatch), and the copy may overwrite code.
+  Cutting `image_len` to the end of the last range keeps both envelopes in
+  place, and U-Boot accepts the descriptor. PCR 8 differs, so both PDs get
+  `UnsealRefused` (14). This shows that the image tail past `image_len`
+  is still run while unmeasured (it is in RAM from QEMU's load); the seal
+  policy is what refuses it, not the measurement. A board loader reading
+  `image_len` bytes from media would not run the tail.
+- **The wrong-image byte** is the first byte of audit's
+  `HandshakePskStale` text (found once, inside `image_len`, outside both
+  ranges). No sealed-boot case prints it, so the boot is otherwise
+  identical.
+- **The cap read** needs no `--server` socket. A probe (host-side,
+  swtpm 0.7.1, no QEMU) showed that swtpm refuses CMD_SET_DATAFD when
+  started with `--server`, so QEMU's backend and a data socket cannot be
+  combined. It also showed that swtpm keeps the TPM running once the data
+  fd a killed QEMU held closes. A second control connection with
+  CMD_SET_DATAFD (no CMD_INIT) then reads PCR 8. run.py's `read_pcr8`
+  does exactly that after `kill_qemu`, before the swtpm is stopped.
+  `CAP_DIGEST` and `DIGEST_LEN` are read from `crates/tpm2-wire` (RT3).
+- **The A7 proxy is implemented, its feasibility unconfirmed.** It sits
+  on the socket QEMU's tpm-emulator backend uses as its control channel.
+  Control bytes pass through verbatim. The data fd QEMU sends with
+  CMD_SET_DATAFD is swapped for one end of a socketpair whose other end
+  swtpm receives. TPM frames are relayed and framed by their headers;
+  the flip variant flips outData's first byte in each successful Unseal
+  response.
+  - **Host-side check:** a QEMU-style session (ctrl, SET_DATAFD,
+    CMD_INIT, Startup, PCR_Extend, PCR_Read) went through the proxy
+    unchanged, and the flip logic was exercised on a synthetic response.
+  - **Still open:** whether QEMU's backend works through it is the F6-A
+    question, which only a QEMU run answers. The case first requires the
+    unmodified relay to pass a sealed boot (`hs`/`pq` ready, two Unseal
+    responses seen). If that fails, the case is to be recorded here as
+    blocked, with slice 6's relay tests covering the property.
+- **Per-deployment TPMs.** run.py provisions swtpm states `tpm-a`,
+  `tpm-c` and `tpm-foreign`. Each starts once with a data socket;
+  tpm2-tools creates the SRK with the storage template and reads its
+  TPM2B_PUBLIC; then swtpm is killed, so no volatile state is saved and
+  U-Boot's TPM2_Startup finds a fresh TPM. Only `tpm2-00.permall` is kept
+  (swtpm's `.lock` is removed). A second copy must yield the same SRK.
+  Every boot copies `permall` into a fresh `swtpm-*` directory; `kill()`
+  stops that swtpm and fails the run if the directory survives (T6).
+  - **Mismatched-blob boot:** B's key blob with A's pq blob, sealed to
+    TPM A.
+  - **Foreign case:** A's blobs sealed to `tpm-foreign`, booted on TPM A.
+  - **Host-side check:** provisioning, the state copy, the per-boot
+    CMD_INIT and Startup, `read_pcr8`, and the proxy relay were checked
+    against swtpm without QEMU (local scratch scripts under `build/s7probe/`,
+    not committed).
+- **Pre-existing, found here:** after `make repro`, a default-config
+  release build fails. `crates/config/build.rs` takes its default path
+  from `env!("CARGO_MANIFEST_DIR")` at compile time, and the cached
+  build-script binary in `pd-target-release` came from the repro copy,
+  which no longer exists. `make check` is unaffected: `ct-shape` runs
+  before `repro`, and run.py sets SECUREOS_CONFIG. A manual
+  `make ct-shape` after `make repro` fails until
+  `~/.cache/secureos/pd-target-release/release/build/config` is removed;
+  I removed it here. A fix (reading the variable at run time) is the
+  owner's call.
+
+### Selftest cases (not run here)
+
+| Case | Mutation | Failure-only needle |
+|---|---|---|
+| `tpm2-open-residue` (ct) | `open_sealed` without its stack scrub | `RESIDUE-HIT kek case=open.` (seen on a scratch copy) |
+| `sealed-pcr-unbound` (test, sealed boot) | seal policy PolicyAuthValue alone, client skips PolicyPCR | `FAIL [sealed boot]: Fail: wrong image: the key PD unsealed` |
+| `sealed-srk-name` (test, sealed boot) | client's SRK Name check removed | `foreign TPM: hs audited KeyUnavailable code=…, want SrkMismatch` |
+| `sealed-cap` (test, sealed boot) | `tpm` never calls `cap` | `cap: PCR 8 after the boot is … (uncapped)` |
+| `tpm-proxy-hmac` (test, tpm proxy) | Unseal response HMAC check removed | `A7 proxy: hs audited KeyUnavailable code=…, want TpmResponseInvalid` |
+
+The wrong-image and tampered-descriptor controls are the TPM's PCR
+policy. The mutation that reaches them removes the PCR binding on both
+sides; the TPM itself cannot be mutated cheaply.
+
+### Not run here (owner)
+
+Kani (all caches invalidated by `Cargo.lock`), `make mir` (`MIR-CRATES 8`:
+`tpm2-wire` enters through pd-tpm, pd-key and pd-pqkey), `make repro`
+(`REPRO-ARTIFACTS 14`), `make ct` (`RESIDUE-CASES 27` measured natively
+only), `make test` (`INTEGRATION-CASES 44`), and every selftest case.
+
+### Side fixes
+
+- **Two check-selftest anchors were stale before this slice.** Each makes
+  its case stop with "injection anchor … matched N times":
+  - `ct-identity` (since slice 3): the build_pd line now carries
+    `--remap-path-prefix`. The anchor is the current line, and the
+    mutation adds `-Copt-level=3` for pq as before.
+  - `pins` (since slice 5): `\trm -rf $(BUILD)` also matched the U-Boot
+    rule. It is now `\trm -rf $(BUILD) $(HOME)`, the `clean` recipe.
+
+  Every `edit()` anchor in check-selftest was checked to match exactly
+  once in this tree.
+
+### Slice 7 verification (orchestrator, under QEMU)
+
+- **Integration:** all 44 cases pass on the U-Boot + swtpm path
+  (`INTEGRATION-CASES 44`). That covers the TIS mapping at `0xc000000`,
+  sealed boot, the wrong-image (code 14), tampered-descriptor (code 14),
+  foreign-TPM (code 13) and cap cases, and the A7 proxy. The proxy is
+  feasible: the unmodified relay passes a sealed boot, and a flipped Unseal
+  response byte gives code 15.
+- **check-selftest:** each of these is red with its failure-only needle:
+  `tpm2-open-residue`, `sealed-pcr-unbound`, `sealed-srk-name`,
+  `sealed-cap`, `tpm-proxy-hmac`, the re-anchored `ct-identity` and `pins`,
+  and `laws-pq-key` and `laws-hs-pqkey`.
+- **`make ct`:** RESIDUE-CASES 27.
+- **U-Boot `CONFIG_CMD_CACHE`.** The shipped boot command's
+  `dcache flush; dcache off; icache off` printed "Unknown command": the
+  fragment lacked `CMD_CACHE`. QEMU booted anyway because the Microkit
+  loader manages caches itself, but the Microkit manual's board procedure
+  needs caches off before `go`, so the fragment now enables it, and a
+  re-run boot shows no unknown command.
+- **`make repro` cleans up after itself.** The copy's build left units in
+  the shared PD target directory, including config's build-script output
+  with the copy's absolute path. Cargo then reused those units for the
+  primary tree, whose next release build failed. `tools/repro` now removes
+  the PD target directory on every exit, so the next primary build is cold
+  (about 30 s).

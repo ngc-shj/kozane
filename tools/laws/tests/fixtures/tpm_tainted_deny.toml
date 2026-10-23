@@ -1,0 +1,45 @@
+[pds.nic]
+role = "driver"
+
+[pds.key]
+role = "key"
+
+[pds.tpm]
+role = "tpm"
+
+[mrs.tis]
+kind = "device"
+owner = "tpm"
+phys_addr = 0xc000000
+size = 0x1000
+tpm = true
+
+[mrs.secrets]
+kind = "secrets"
+owner = "key"
+
+[mrs.nic]
+kind = "device"
+owner = "nic"
+phys_addr = 0xa003000
+size = 0x1000
+
+[[channels]]
+between = ["nic", "key"]
+pp = { nic = true, key = false }
+notify = { nic = true, key = true }
+
+[[channels]]
+between = ["key", "tpm"]
+pp = { key = true, tpm = false }
+notify = { key = false, tpm = false }
+
+[priority]
+below = [["key", "tpm"]]
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

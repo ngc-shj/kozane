@@ -17,8 +17,8 @@
 //!   only then is outData decrypted (the session's `encrypt` attribute,
 //!   AES-128-CFB).
 //! - I10.3: the KEK exists only here, decrypted, and is wiped right after
-//!   the envelope opens (`finish`), on every path; so are the salt and the
-//!   session key.
+//!   the envelope opens (`finish`, through `envelope::open_sealed`), on
+//!   every path; so are the salt and the session key.
 //!
 //! After any failure the client still flushes every handle it holds, so
 //! the TPM's object slots are free for the other client, then reports the
@@ -31,7 +31,7 @@ use tpm2_wire::{
     CC_UNSEAL, COORD_LEN, DIGEST_LEN, MAX_PRIVATE, NAME_LEN, NONCE_LEN, NONCE_MIN, POINT_LEN, RspError,
     SESSION_CONTINUE, SESSION_ENCRYPT,
 };
-use wg_core::crypto::{Key32, ct_eq};
+use wg_core::crypto::ct_eq;
 
 use crate::Secret;
 use crate::crypto::{self, AES_BLOCK_LEN, AES_KEY_LEN};
@@ -398,8 +398,7 @@ impl<'e> Client<'e> {
         if !self.unsealed {
             return Err(Failure { step: Step::Finished, cause: Cause::Order });
         }
-        let kek = Key32::copy_from(self.kek.as_bytes());
-        self.kek.wipe();
-        self.envelope.open(&kek, out).map_err(|e| Failure { step: Step::Finished, cause: Cause::Open(e) })
+        crate::envelope::open_sealed(&self.envelope, &mut self.kek, out)
+            .map_err(|e| Failure { step: Step::Finished, cause: Cause::Open(e) })
     }
 }

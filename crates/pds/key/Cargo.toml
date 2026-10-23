@@ -11,5 +11,6 @@ key-core = { path = "../../key-core" }
 layout = { path = "../../layout" }
 secret-blob = { path = "../../secret-blob" }
 sel4-microkit = { workspace = true }
+tpm2 = { path = "../../tpm2" }
 wg-core = { path = "../../wg-core" }
 zeroize = { version = "=1.8.1", default-features = false }

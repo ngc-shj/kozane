@@ -1,9 +1,11 @@
 //! `pqkey`'s oracle: McEliece decapsulation and the pq boot seed behind a
 //! closed caller → label table (M3 plan C2).
 //!
-//! The PD maps its secrets region read-only, validates it once at boot
-//! (format, `H(spkm)` against the configuration, then a known-answer
-//! decapsulation). Afterwards it answers:
+//! The PD maps its secrets region read-only; it holds the blob sealed (M5
+//! plan C11), which the PD unseals through `tpm` into its own memory at
+//! boot (`tpm2::boot`). The plaintext is validated once (format, `H(spkm)`
+//! against the configuration, then a known-answer decapsulation).
+//! Afterwards the PD answers:
 //!
 //! | label           | request (words)                    | reply (words)          |
 //! |-----------------|------------------------------------|------------------------|
@@ -39,6 +41,7 @@
 
 use secret_blob::pq::{self, Blob};
 use secret_blob::{BlobError, blake2s};
+use tpm2::boot::UnsealError;
 use zeroize::Zeroizing;
 
 pub const LABEL_PQ_DECAPS: u64 = 1;
@@ -136,6 +139,33 @@ pub enum BootError {
     SpkmMismatch,
     KatMismatch,
     RndrUnavailable,
+    /// The secrets region is not a sealed envelope of `pqkey`'s kind (M5
+    /// plan C11: a plaintext blob is refused here).
+    EnvelopeInvalid,
+    /// `tpm` refused, failed or stayed busy (M5 plan C9).
+    TpmUnavailable,
+    /// The TPM's SRK is not the envelope's pinned one: another TPM (I10.2).
+    SrkMismatch,
+    /// The TPM refused the Unseal: PCR 8 is not the value sealed to.
+    UnsealRefused,
+    /// A TPM response failed the client's checks (A7).
+    TpmResponseInvalid,
+    /// The unsealed KEK did not open the envelope.
+    EnvelopeOpen,
+}
+
+impl From<UnsealError> for BootError {
+    fn from(e: UnsealError) -> Self {
+        match e {
+            UnsealError::Rndr => BootError::RndrUnavailable,
+            UnsealError::EnvelopeInvalid => BootError::EnvelopeInvalid,
+            UnsealError::TpmUnavailable => BootError::TpmUnavailable,
+            UnsealError::SrkMismatch => BootError::SrkMismatch,
+            UnsealError::UnsealRefused => BootError::UnsealRefused,
+            UnsealError::ResponseInvalid => BootError::TpmResponseInvalid,
+            UnsealError::EnvelopeOpen => BootError::EnvelopeOpen,
+        }
+    }
 }
 
 impl BootError {
@@ -146,6 +176,12 @@ impl BootError {
             BootError::SpkmMismatch => "pq secrets: public key hash does not match the configuration",
             BootError::KatMismatch => "pq secrets: boot KAT decapsulation mismatch",
             BootError::RndrUnavailable => "RNDR unavailable",
+            BootError::EnvelopeInvalid => "pq secrets: not a sealed envelope for pqkey",
+            BootError::TpmUnavailable => "pq secrets: tpm unavailable",
+            BootError::SrkMismatch => "pq secrets: sealed to another TPM",
+            BootError::UnsealRefused => "pq secrets: the TPM refused to unseal (PCR 8)",
+            BootError::TpmResponseInvalid => "pq secrets: a TPM response failed its checks",
+            BootError::EnvelopeOpen => "pq secrets: the unsealed KEK does not open the envelope",
         }
     }
 
@@ -162,6 +198,14 @@ impl BootError {
             BootError::SpkmMismatch => 7,
             BootError::KatMismatch => 8,
             BootError::RndrUnavailable => 9,
+            // The unseal codes are `key-core`'s, so one failure reads the
+            // same from `hs` and from `pq` (10 is unused here).
+            BootError::EnvelopeInvalid => 11,
+            BootError::TpmUnavailable => 12,
+            BootError::SrkMismatch => 13,
+            BootError::UnsealRefused => 14,
+            BootError::TpmResponseInvalid => 15,
+            BootError::EnvelopeOpen => 16,
         }
     }
 }

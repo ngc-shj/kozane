@@ -1,24 +1,40 @@
 #!/usr/bin/env python3
-"""Packages a deployment image: the `make image` system with only the two
-secrets regions' `prefill_path`s pointed at real blobs (plan C16, M3 plan
-L6): `key`'s blob in the `secrets` mr and `pqkey`'s in `pq_secrets`.
+"""Packages a deployment for one TPM (plan C16, M3 plan L6, M5 plan C8,
+C11): the published image (`make image`'s, with the zero placeholders), the
+boot descriptor naming where U-Boot copies each envelope, the two sealed
+envelopes (`key`'s blob for the `secrets` mr, `pqkey`'s for `pq_secrets`),
+and the PCR 8 they are sealed to. No image with a secret in it is written.
 
-Usage: package --secrets FILE --pq-secrets FILE --out DIR --system FILE
-               --policy FILE --image LOADER --gen-config gen_config.h
-               --search-path DIR --board BOARD --config CONFIG --microkit BIN
-               --harness CT_HARNESS
+Usage: package --secrets FILE --pq-secrets FILE --srk-public FILE --out DIR
+               --system FILE --policy FILE --image LOADER
+               --gen-config gen_config.h --search-path DIR --board BOARD
+               --config CONFIG --microkit BIN --harness CT_HARNESS
 
-The result is accepted only if, against the placeholder build:
-  - the .system differs in nothing but those two attributes;
-  - the loader images have equal length, differ somewhere, and every
-    differing byte lies inside one of the two places the blobs appear in
-    the new image, where the placeholder image held zeros;
-  - each blob is a full region of its own kind (magic, version, checksum,
-    zero padding), so neither can be placed into the other's mr.
+--srk-public is the target TPM's SRK, the TPM2B_PUBLIC `tpm2_readpublic -o`
+writes (mksecrets seal checks it is the storage template). The flow:
+
+  1. microkit builds the system with size-correct, random stand-ins as the
+     two prefills: where they land are the envelope ranges;
+  2. the descriptor names those ranges, and PCR 8 is computed from it and
+     the published image (tools/measure.py, what U-Boot will extend);
+  3. `mksecrets seal` seals each blob to that SRK and PCR 8, each under a
+     fresh KEK;
+  4. microkit builds the system again with the envelopes as prefills, and
+     the assembly U-Boot performs (tools/measure.py) must give back that
+     image byte for byte.
+
+Each build is accepted only if, against the placeholder build:
+  - the .system differs in nothing but the two secrets mrs' prefill_path;
+  - (stand-ins) the images have equal length, differ somewhere, and every
+    differing byte lies inside one of the two places the stand-ins appear,
+    where the placeholder image held zeros;
+and each blob must be a full region of its own kind (magic, version,
+checksum, zero padding), each envelope a sealed envelope of its kind.
 Both blobs and OUT must resolve outside the repository (and so `build/`)
-and the toolchain caches. OUT must not exist yet: the image is built in a
+and the toolchain caches. OUT must not exist yet: everything is built in a
 fresh 0700 staging directory beside it under umask 077, renamed into place
-only after every check passed, and removed on every failure path.
+only after every check passed, and removed on every failure path. OUT holds
+published.img, boot.desc, secrets.env, pq_secrets.env and pcr8.
 Only `release` kernels are packaged (M5 plan C7, closing SC20 and
 architecture R4 on shipped images), judged from the kernel's own
 gen_config.h rather than a make variable: no CONFIG_DEBUG_BUILD, no
@@ -91,6 +107,12 @@ KEY = BlobKind("secrets", b"SOSSECR1", 2, 4096, _key_body)
 PQ = BlobKind("pq_secrets", b"SOSPQKY1", 1, 16384, lambda _blob: 13904)
 KINDS = (KEY, PQ)
 SECRETS_MRS = tuple(k.mr for k in KINDS)
+# `mksecrets seal --kind` and the envelope's kind code (tpm2::envelope).
+SEAL_KINDS = {"secrets": ("key", 1), "pq_secrets": ("pq", 2)}
+ENVELOPE_MAGIC = b"SOSSEAL1"
+# tpm2_wire::SRK_PUBLIC_LEN: the SRK's TPMT_PUBLIC (a P-256 point).
+SRK_PUBLIC_LEN = 90
+OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "pcr8")
 
 
 def is_debug(gen_config: str) -> bool:
@@ -214,6 +236,27 @@ def check_blob(kind: BlobKind, blob: bytes) -> list:
     return []
 
 
+def check_srk_public(srk: bytes) -> list:
+    """The TPM2B framing of an SRK public; the template is mksecrets'
+    check."""
+    if len(srk) != 2 + SRK_PUBLIC_LEN or int.from_bytes(srk[:2], "big") != SRK_PUBLIC_LEN:
+        return [f"package: --srk-public is {len(srk)} bytes, not an SRK TPM2B_PUBLIC "
+                f"(2 + {SRK_PUBLIC_LEN}, as tpm2_readpublic -o writes it)"]
+    return []
+
+
+def check_envelope(kind: BlobKind, env: bytes) -> list:
+    """What `mksecrets seal` wrote: a full region, sealed, of this kind."""
+    name = f"package: '{kind.mr}' envelope"
+    if len(env) != kind.size:
+        return [f"{name} is {len(env)} bytes, expected {kind.size}"]
+    if env[:len(ENVELOPE_MAGIC)] != ENVELOPE_MAGIC:
+        return [f"{name} has no {ENVELOPE_MAGIC.decode()} magic"]
+    if int.from_bytes(env[12:16], "little") != SEAL_KINDS[kind.mr][1]:
+        return [f"{name} is not of its mr's kind"]
+    return []
+
+
 def forbidden_roots(repo: pathlib.Path) -> list:
     """The repository (which contains `build/`) and the toolchain caches,
     resolved. The repo must resolve; a cache that does not exist is skipped
@@ -326,8 +369,8 @@ def with_prefill(system: str, blob_paths: dict) -> str:
 
 def exit_on_signal(signum, _frame):
     # SIGTERM/SIGHUP/SIGINT must run the `finally` that removes the staging dir:
-    # after microkit it holds an image with the secrets embedded. Later
-    # signals are ignored so they cannot interrupt that removal.
+    # while the envelopes are sealed it holds private copies of the blobs.
+    # Later signals are ignored so they cannot interrupt that removal.
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(s, signal.SIG_IGN)
     raise SystemExit(128 + signum)
@@ -355,8 +398,8 @@ def main() -> int:
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(s, exit_on_signal)
     ap = argparse.ArgumentParser()
-    for opt in ("secrets", "pq-secrets", "out", "system", "policy", "image", "gen-config", "search-path", "board", "config", "microkit",
-                "harness"):
+    for opt in ("secrets", "pq-secrets", "srk-public", "out", "system", "policy", "image", "gen-config", "search-path", "board",
+                "config", "microkit", "harness"):
         ap.add_argument(f"--{opt}", required=True)
     a = ap.parse_args()
 
@@ -380,6 +423,12 @@ def main() -> int:
         return 1
     blobs = {mr: path.read_bytes() for mr, path in secrets.items()}
     errors = [e for kind in KINDS for e in check_blob(kind, blobs[kind.mr])]
+    try:
+        srk = pathlib.Path(a.srk_public).read_bytes()
+    except OSError as e:
+        print(f"package: cannot read --srk-public: {e}")
+        return 1
+    errors += check_srk_public(srk)
     if errors:
         print("\n".join(errors))
         return 1
@@ -396,7 +445,7 @@ def main() -> int:
         errors = check_location("staging directory", staging, forbidden_roots(ROOT))
         if errors:
             print("\n".join(errors))
-        elif build(a, blobs, staging) == 0:
+        elif build(a, blobs, srk, staging) == 0:
             if out.exists() or out.is_symlink():
                 print(f"package: output directory {out} appeared during the build")
             else:
@@ -442,7 +491,7 @@ def main() -> int:
         if held_exit is not None:
             raise held_exit
     if status == 0:
-        print(f"package: wrote {out / 'loader.img'}")
+        print(f"package: wrote {out}")
     return status
 
 
@@ -469,64 +518,101 @@ def blob_args(a) -> dict:
     return {KEY.mr: a.secrets, PQ.mr: a.pq_secrets}
 
 
-def build(a, blobs: dict, out: pathlib.Path) -> int:
-    """Builds in the staging dir `out`. The image is made from private copies
-    of the blob bytes that were checked (`blobs`, by mr), never from the
-    caller's paths again, so swapping a path after the check cannot change
-    what is embedded."""
-    copies = {mr: out / f"{mr}.bin" for mr in SECRETS_MRS}
-    for mr, copy in copies.items():
-        copy.write_bytes(blobs[mr])
-    placeholder_system = pathlib.Path(a.system).read_text()
-    system = out / "secureos.system"
-    system.write_text(with_prefill(placeholder_system, {mr: str(copy) for mr, copy in copies.items()}))
-    loader = out / "loader.img"
-
+def microkit(a, system: pathlib.Path, image: pathlib.Path, report: pathlib.Path):
+    """The laws checker, then microkit, on the exact file handed over."""
     subprocess.run(["cargo", "run", "--locked", "-q", "-p", "laws", "--", "check", "--system", str(system),
                     "--policy", a.policy, "--search-path", a.search_path], check=True)
     subprocess.run([a.microkit, str(system), "--search-path", a.search_path, "--board", a.board,
-                    "--config", a.config, "-r", str(out / "report.txt"), "-o", str(loader)], check=True)
+                    "--config", a.config, "-r", str(report), "-o", str(image)], check=True)
 
-    # The blobs now live only inside the image; drop the private copies. The
-    # .system microkit consumed is checked before it is replaced by one that
-    # names the operator's blobs again (names only: nothing here follows
-    # them), so the operator can rebuild the image from that file; both are
-    # checked.
-    for copy in copies.values():
-        copy.unlink()
+
+def seal(blob: pathlib.Path, mr: str, srk: pathlib.Path, pcr8: bytes, out: pathlib.Path):
+    """`mksecrets seal`: one envelope, under a fresh KEK."""
+    subprocess.run(["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "seal", "--kind", SEAL_KINDS[mr][0],
+                    "--blob", str(blob), "--srk-public", str(srk), "--pcr8", pcr8.hex(), "--out", str(out)],
+                   check=True)
+
+
+def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
+    """Builds in the staging dir `out`. The envelopes are sealed from private
+    copies of the blob bytes that were checked (`blobs`, by mr), never from
+    the caller's paths again, so swapping a path after the check cannot
+    change what is sealed; the copies go as soon as both are sealed. No
+    microkit run ever sees a blob."""
+    placeholder_system = pathlib.Path(a.system).read_text()
+    published = pathlib.Path(a.image).read_bytes()
+    srk_copy = out / "srk.pub"
+    srk_copy.write_bytes(srk)
+
+    # 1. Stand-ins: where microkit puts each prefill.
+    standins = {mr: os.urandom(kind.size) for mr, kind in zip(SECRETS_MRS, KINDS)}
+    standin_paths = {mr: out / f"standin-{mr}.bin" for mr in SECRETS_MRS}
+    for mr, path in standin_paths.items():
+        path.write_bytes(standins[mr])
+    system = out / "standin.system"
+    system.write_text(with_prefill(placeholder_system, {mr: str(p) for mr, p in standin_paths.items()}))
+    microkit(a, system, out / "standin.img", out / "standin-report.txt")
+    standin_img = (out / "standin.img").read_bytes()
     errors = check_systems(placeholder_system, system.read_text())
-    system.write_text(with_prefill(placeholder_system,
-                                   {mr: os.path.abspath(path) for mr, path in blob_args(a).items()}))
-    errors += check_systems(placeholder_system, system.read_text())
-    published, packaged = pathlib.Path(a.image).read_bytes(), loader.read_bytes()
-    errors += check_images(published, packaged, list(blobs.values()))
-    if not errors:
-        errors += write_boot_files(published, packaged, blobs, out)
+    errors += check_images(published, standin_img, [standins[mr] for mr in SECRETS_MRS])
     if errors:
         print("\n".join(errors))
         return 1
+
+    # 2. The descriptor and the PCR 8 U-Boot will produce.
+    ranges = [(standin_img.find(standins[mr]), len(standins[mr])) for mr in SECRETS_MRS]
+    try:
+        desc = measure.pack(len(published), ranges, expected=ranges)
+        pcr8 = measure.expected_pcr8(desc, published)
+    except measure.DescriptorError as e:
+        print(f"package: {e}")
+        return 1
+
+    # 3. Seal each blob from its private copy.
+    copies = {mr: out / f"{mr}.bin" for mr in SECRETS_MRS}
+    try:
+        for mr, copy in copies.items():
+            copy.write_bytes(blobs[mr])
+        for mr, copy in copies.items():
+            seal(copy, mr, srk_copy, pcr8, out / f"{mr}.env")
+    finally:
+        for copy in copies.values():
+            copy.unlink(missing_ok=True)
+    envelopes = {mr: (out / f"{mr}.env").read_bytes() for mr in SECRETS_MRS}
+    errors = [e for kind in KINDS for e in check_envelope(kind, envelopes[kind.mr])]
+    if errors:
+        print("\n".join(errors))
+        return 1
+
+    # 4. The image with the envelopes, as U-Boot assembles it at boot.
+    system = out / "secureos.system"
+    system.write_text(with_prefill(placeholder_system, {mr: str(out / f"{mr}.env") for mr in SECRETS_MRS}))
+    microkit(a, system, out / "envelope.img", out / "report.txt")
+    errors = check_systems(placeholder_system, system.read_text())
+    errors += check_assembly(published, desc, [envelopes[mr] for mr in SECRETS_MRS],
+                             (out / "envelope.img").read_bytes())
+    if errors:
+        print("\n".join(errors))
+        return 1
+    (out / "published.img").write_bytes(published)
+    (out / "boot.desc").write_bytes(desc)
+    (out / "pcr8").write_text(pcr8.hex() + "\n")
+    for p in out.iterdir():
+        if p.name not in OUTPUTS:
+            p.unlink()
     return 0
 
 
-def write_boot_files(published: bytes, packaged: bytes, blobs: dict, out: pathlib.Path) -> list:
-    """The measured-boot inputs (M5 plan C8): the published image, the boot
-    descriptor naming where each envelope goes (where microkit placed its
-    blob, i.e. the system file's prefill ranges), the envelopes, and the PCR
-    8 U-Boot will produce. The assembly U-Boot performs must give back the
-    image microkit built, byte for byte."""
-    ranges = [(packaged.find(blobs[mr]), len(blobs[mr])) for mr in SECRETS_MRS]
+def check_assembly(published: bytes, desc: bytes, envelopes: list, built: bytes) -> list:
+    """The image U-Boot assembles (the published image with each envelope at
+    its descriptor range, by the shared helper) must be the one microkit
+    built with the envelopes as prefills, byte for byte (M5 plan C8 F2)."""
     try:
-        desc = measure.pack(len(published), ranges, expected=ranges)
-        assembled = measure.assemble(published, desc, [blobs[mr] for mr in SECRETS_MRS])
+        assembled = measure.assemble(published, desc, envelopes)
     except measure.DescriptorError as e:
         return [f"package: {e}"]
-    if assembled != packaged:
-        return ["package: the boot-time assembly differs from the image microkit built"]
-    (out / "published.img").write_bytes(published)
-    (out / "boot.desc").write_bytes(desc)
-    for mr in SECRETS_MRS:
-        (out / f"{mr}.env").write_bytes(blobs[mr])
-    (out / "pcr8").write_text(measure.expected_pcr8(desc, published).hex() + "\n")
+    if assembled != built:
+        return ["package: the boot-time assembly differs from the image microkit built with the envelopes"]
     return []
 
 

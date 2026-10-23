@@ -12,6 +12,11 @@ publish = false
 
 [dependencies]
 mce460896 = { path = "../../crates/mce460896" }
+# The envelope-open closure `key` and `pqkey` ship (M5 plan I10.3), and
+# what the residue case seals with.
+secret-blob = { path = "../../crates/secret-blob" }
+tpm2 = { path = "../../crates/tpm2" }
+tpm2-wire = { path = "../../crates/tpm2-wire" }
 # The same versions mce460896 resolves to in the root lock: the expected
 # values (sha3) and the residue scan's keccak-state needles (keccak).
 sha3 = { version = "=0.10.9", default-features = false }
@@ -25,3 +30,13 @@ panic = "abort"
 opt-level = "s"
 overflow-checks = true
 debug = "line-tables-only"
+
+# wg-core's wg-wire depends on vstd: built from the vendored sources the
+# root workspace patches in (M5 plan C5), never from the registry.
+[patch.crates-io]
+vstd = { path = "../../third_party/verus/vstd" }
+verus_builtin = { path = "../../third_party/verus/verus_builtin" }
+verus_builtin_macros = { path = "../../third_party/verus/verus_builtin_macros" }
+verus_state_machines_macros = { path = "../../third_party/verus/verus_state_machines_macros" }
+verus_syn = { path = "../../third_party/verus/verus_syn" }
+verus_prettyplease = { path = "../../third_party/verus/verus_prettyplease" }

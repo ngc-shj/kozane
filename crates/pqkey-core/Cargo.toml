@@ -8,4 +8,5 @@ license.workspace = true
 ingress-core = { path = "../ingress-core" }
 mce460896 = { path = "../mce460896" }
 secret-blob = { path = "../secret-blob" }
+tpm2 = { path = "../tpm2" }
 zeroize = { version = "=1.8.1", default-features = false }

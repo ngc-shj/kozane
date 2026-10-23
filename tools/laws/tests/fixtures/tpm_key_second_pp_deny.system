@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <memory_region name="tis" size="0x1000" phys_addr="0xc000000" />
+    <memory_region name="secrets" size="0x1000" />
+    <protection_domain name="key" priority="2" passive="true">
+        <program_image path="key.elf" />
+        <map mr="secrets" vaddr="0x2000000" perms="r" />
+    </protection_domain>
+    <protection_domain name="tpm" priority="3" passive="true">
+        <program_image path="tpm.elf" />
+        <map mr="tis" vaddr="0x2000000" perms="rw" cached="false" />
+    </protection_domain>
+    <protection_domain name="tpm2" priority="3" passive="true">
+        <program_image path="tpm2.elf" />
+    </protection_domain>
+    <channel>
+        <end pd="key" id="3" pp="true" notify="false" />
+        <end pd="tpm" id="1" pp="false" notify="false" />
+    </channel>
+    <channel>
+        <end pd="key" id="4" pp="true" notify="false" />
+        <end pd="tpm2" id="1" pp="false" notify="false" />
+    </channel>
+</system>

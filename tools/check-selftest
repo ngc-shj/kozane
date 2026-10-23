@@ -140,7 +140,7 @@ CASES_FOR_GATE = {
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
     "ct": {"ct-barrier", "ct-c1-barrier", "ct-harness-unit", "ct-harness-lint", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms",
-           "mce-residue-encaps-scrub", "mce-residue-encaps-depth", "mce-residue-bm"},
+           "mce-residue-encaps-scrub", "mce-residue-encaps-depth", "mce-residue-bm", "tpm2-open-residue"},
     "ct-shape": {"ct-shape", "ct-identity", "verus-erasure"},
     "verus": {"verus-cache", "verus-trusted", "verus-trusted-item", "verus-no-cheating", "verus-required", "verus-required-site",
               "verus-required-member", "verus-wg-wire-window",
@@ -148,7 +148,8 @@ CASES_FOR_GATE = {
               "verus-msgs-exact", "verus-ring-mask", "verus-wire-ipv4"},
     "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire"},
     "laws": {"laws", "laws-timer-ingress", "laws-pq-key", "laws-hs-pqkey", "laws-pq-secrets-writable"},
-    "test": {"measure-twin", "measure-wrap", "integration", "integration-count", "integration-residue", "integration-cookie",
+    "test": {"measure-twin", "measure-wrap", "sealed-pcr-unbound", "sealed-srk-name", "sealed-cap", "tpm-proxy-hmac",
+             "integration", "integration-count", "integration-residue", "integration-cookie",
              "integration-pq-residue", "l8-fallback", "integration-rp-src-meter", "integration-rotation",
              "integration-expiry", "rp-cookie-gate", "integration-expiry-residue"},
     "repro": {"repro-path-leak"},
@@ -438,6 +439,13 @@ CASES = {
         edit(t, "crates/mce460896/src/lib.rs", "    let accept = encaps_attempt_core(pk, rand, ct_out, ss_out);\n    scrub_stack_encaps();\n",
              "    let accept = encaps_attempt_core(pk, rand, ct_out, ss_out);\n")),
                           "RESIDUE-HIT keccak"),
+    # The envelope open's stack scrub removed (M5 plan I10.3): libcrux's
+    # ChaCha20 state, which holds the KEK, stays in the AEAD's dead frames
+    # (measured on a scratch copy: kek and plain hit in both open cases).
+    "tpm2-open-residue": (["ct"], lambda t: edit(t, "crates/tpm2/src/envelope.rs",
+                                                 "    let r = open_core(envelope, kek, out);\n    scrub_stack();\n    r\n",
+                                                 "    open_core(envelope, kek, out)\n"),
+                          re.compile(r"RESIDUE-HIT kek case=open\.")),
     # The identity and shape gate (M4 plan C10). The ct-barrier mutation
     # changes bm's conditional-instruction multiset; identity stays green
     # because the harness is built from the same source.
@@ -447,8 +455,10 @@ CASES = {
                  "ct-shape: pd-pqkey.elf: shape: mce460896::bm::bm:"),
     # One PD built with other codegen than the harness: identity fails.
     "ct-identity": (["ct-shape"], lambda t: edit(t, "Makefile",
-                                                 "\tRUSTFLAGS=-Zunstable-options \\\n\tcargo build --locked \\\n",
-                                                 "\tRUSTFLAGS=\"-Zunstable-options $(if $(filter pq,$(1)),-Copt-level=3)\" \\\n\tcargo build --locked \\\n"),
+                                                 "\tRUSTFLAGS=\"-Zunstable-options --remap-path-prefix=$(CURDIR)=/secureos\" \\\n"
+                                                 "\tcargo build --locked \\\n",
+                                                 "\tRUSTFLAGS=\"-Zunstable-options --remap-path-prefix=$(CURDIR)=/secureos"
+                                                 " $(if $(filter pq,$(1)),-Copt-level=3)\" \\\n\tcargo build --locked \\\n"),
                     "ct-shape: pd-pq.elf: identity: mce460896::"),
     # Verus's exec library reaching a shipped PD: wire (which already
     # depends on vstd) calls a vstd exec function from parse_frame, which
@@ -474,7 +484,7 @@ CASES = {
     "audit": (["audit"], lambda t: edit(t, "policy/audit-ignore.toml", 'id = "RUSTSEC-2024-0436"', 'id = "RUSTSEC-0000-0000"'),
               "unmaintained warning RUSTSEC-2024-0436 for paste"),
     "laws": (["laws"], lambda t: edit(t, "system/secureos.system", "</system>", "    <selftest_unknown />\n</system>"), "L4"),
-    "pins": (["pins"], lambda t: edit(t, "Makefile", "\trm -rf $(BUILD)", "\t-rm -rf $(BUILD)"), "P5"),
+    "pins": (["pins"], lambda t: edit(t, "Makefile", "\trm -rf $(BUILD) $(HOME)", "\t-rm -rf $(BUILD) $(HOME)"), "P5"),
     "integration": (["test", "it_boots=wireguard"], lambda t: edit(t, "tests/integration/run.py",
                                               "        if bad.consume_response(resp):",
                                               "        if not bad.consume_response(resp):"), "response opened with a wrong PSK"),
@@ -549,6 +559,35 @@ CASES = {
         t, "support/u-boot/boot.cmd",
         "for v in $o0 $l0 $o1 $l1; do setexpr hi 0x$v / 0x100000000; if test 0x$hi -ne 0; then REFUSE; fi; done\n", ""),
         "a wrapping range was not refused"),
+    # M5 plan C14. The PCR binding gone from both sides (the seal policy
+    # PolicyAuthValue alone, the client skipping PolicyPCR): another image
+    # unseals.
+    "sealed-pcr-unbound": (["test", "it_boots=sealed boot"], lambda t: (
+        edit(t, "crates/tpm2/src/crypto.rs",
+             "    sha256(&[&policy_pcr_digest(pcr8), &CC_POLICY_AUTH_VALUE.to_be_bytes()])",
+             "    let _ = pcr8;\n    sha256(&[&[0u8; DIGEST_LEN], &CC_POLICY_AUTH_VALUE.to_be_bytes()])"),
+        edit(t, "crates/tpm2/src/client.rs",
+             "            Step::StartAuthSession => self.on_start_auth_session(rsp).map(|()| Step::PolicyPcr),",
+             "            Step::StartAuthSession => self.on_start_auth_session(rsp).map(|()| Step::PolicyAuthValue),")),
+                           "FAIL [sealed boot]: Fail: wrong image: the key PD unsealed"),
+    # I10.2: without the client's SRK Name check, envelopes sealed to another
+    # TPM fail later (at Import), under another code.
+    "sealed-srk-name": (["test", "it_boots=sealed boot"], lambda t: edit(
+        t, "crates/tpm2/src/client.rs",
+        "        if r.name != self.envelope.srk_name() {\n            return Err(Cause::SrkName);\n        }\n", ""),
+                        re.compile(r"FAIL \[sealed boot\]: Fail: foreign TPM: hs audited KeyUnavailable code=\d+, "
+                                   r"want SrkMismatch")),
+    # The cap: tpm never extends PCR 8 after both clients finished.
+    "sealed-cap": (["test", "it_boots=sealed boot"], lambda t: edit(
+        t, "crates/pds/tpm/src/main.rs", "                        self.cap();\n", ""),
+                   re.compile(r"FAIL \[sealed boot\]: Fail: cap: PCR 8 after the boot is [0-9a-f]{64} \(uncapped\)")),
+    # I10.1 on the A7 path: without the response HMAC check the flipped
+    # outData decrypts to a wrong KEK, refused only by the envelope's AEAD.
+    "tpm-proxy-hmac": (["test", "it_boots=tpm proxy"], lambda t: edit(
+        t, "crates/tpm2/src/client.rs",
+        "        if !ct_eq(&expected, r.auth.hmac) {\n            return Err(Cause::ResponseHmac);\n        }\n", ""),
+                       re.compile(r"FAIL \[tpm proxy\]: Fail: A7 proxy: hs audited KeyUnavailable code=\d+, "
+                                  r"want TpmResponseInvalid")),
     "l8-fallback": (["test", "it_boots=wireguard"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                              "            Some(Entry::Absent) | None => Err(PskRefusal::Missing),",
                                              "            Some(Entry::Absent) | None => Ok(FreshPsk(Key32::from_bytes([0; 32]))),"),

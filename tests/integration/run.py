@@ -3,11 +3,15 @@
 Usage: run.py            (from `make test`)
 
 Generates fresh keys with tools/mksecrets into a temporary directory
-(removed on every exit path), builds the image against that configuration
-and packages it on a release kernel (M5 plan C7: no debug printing; every
-line on the console is `audit`'s, C6), then re-runs itself inside
-`unshare -rn` (no NET_ADMIN in the container; architecture R5) for six
-boots:
+(removed on every exit path), provisions a swtpm state per deployment and
+reads its SRK, builds the image against that configuration and packages it
+on a release kernel (M5 plan C7: no debug printing; every line on the
+console is `audit`'s, C6) with its secrets sealed to that SRK (C11). Then
+it re-runs itself inside `unshare -rn` (no NET_ADMIN in the container;
+architecture R5). Every boot is the shipped path (C14): U-Boot measures the
+published image and descriptor into PCR 8, copies the envelopes in and
+runs the loader; its TPM is a fresh copy of the deployment's swtpm state,
+removed after the boot. The boots:
 
   1. raw frames: the outside NIC on a `-netdev dgram` socket; ARP, one frame
      per wire::DropReason, a coalesced flood, ARP as the liveness barrier;
@@ -29,16 +33,23 @@ boots:
      WireGuard key with the other peer's Rosenpass key;
   6. a blob whose public key does not match the configuration: `key`
      stays up Unavailable and `hs`, its caller, audits `KeyUnavailable`
-     with the boot error's code, then halts.
+     with the boot error's code, then halts;
+  7. measured boot (C8): U-Boot's measure variant against tools/measure.py;
+  8. sealed boots (C14): another image, a tampered descriptor and another
+     TPM's envelopes leave both key PDs Unavailable with the codes the Rust
+     tables give; after a sealed boot PCR 8 is capped;
+  9. the A7 proxy between QEMU and swtpm: the unmodified relay passes a
+     sealed boot, a flipped Unseal response is refused.
 
 Since M3 (L8) hs refuses every WireGuard initiation without a fresh
 Rosenpass PSK, so each WireGuard peer first runs upstream rosenpass (the VE9
-oracle in the dev image) and its key_out is the PresharedKey. Boots 1 and 6
-run no Rosenpass.
+oracle in the dev image) and its key_out is the PresharedKey. Boots 1 and
+6 to 9 run no Rosenpass.
 
 Missing prerequisites fail the run; nothing is skipped.
 """
 
+import array
 import base64
 import bisect
 import contextlib
@@ -50,6 +61,7 @@ import math
 import os
 import re
 import secrets
+import select
 import shutil
 import signal
 import socket
@@ -325,30 +337,66 @@ def free_udp_port() -> int:
             return port
 
 
-def boot(loader: str, outside: str, inside: str, monitor: str = "") -> tuple:
-    cmd = [
-        "-machine", "virt,virtualization=on", "-cpu", "neoverse-n2", "-m", "size=2G",
-        "-serial", "mon:stdio", "-nographic",
-        "-device", f"loader,file={loader},addr=0x70000000,cpu-num=0",
-        "-device", f"virtio-net-device,netdev=n0,mac={GW_MAC.hex(':')},bus=virtio-mmio-bus.31",
-        "-netdev", outside,
-        "-device", f"virtio-net-device,netdev=n1,mac={INSIDE_MAC.hex(':')},bus=virtio-mmio-bus.23",
-        "-netdev", inside,
-    ]
-    if monitor:
-        cmd += ["-monitor", f"unix:{monitor},server,nowait"]
-    # pexpect makes the child a session leader, so kill() takes the group.
-    child = pexpect.spawn(DIE_WITH_PARENT[0], DIE_WITH_PARENT[1:] + ["qemu-system-aarch64"] + cmd,
-                          encoding="utf-8", timeout=BOOT_TIMEOUT_S)
+def boot(pkg: "Package", outside: str, inside: str, monitor: str = "", media=None, flip=None) -> tuple:
+    """Every boot is the shipped one (M5 plan C14): U-Boot measures and
+    assembles the package's boot media (`media`, the package's own unless
+    given: (path, address) pairs at measure.LOAD_*), and its TPM is a fresh
+    copy of the deployment's provisioned swtpm state (the same SRK, fresh
+    PCRs), stopped and removed by kill(). `flip` puts the A7 proxy between
+    QEMU and swtpm, flipping a byte of each Unseal response if true."""
+    tpm = Swtpm(os.path.dirname(pkg.dir), state=pkg.state)
+    proxy = None
+    try:
+        if flip is not None:
+            proxy = TpmProxy(tpm, flip)
+        cmd = ["-machine", "virt,virtualization=on", "-cpu", "neoverse-n2", "-m", "size=2G",
+               "-serial", "mon:stdio", "-nographic", "-bios", UBOOT]
+        for path, addr in media or pkg.media():
+            cmd += ["-device", f"loader,file={path},addr={addr:#x},force-raw=on"]
+        cmd += (proxy or tpm).qemu_args()
+        cmd += [
+            "-device", f"virtio-net-device,netdev=n0,mac={GW_MAC.hex(':')},bus=virtio-mmio-bus.31",
+            "-netdev", outside,
+            "-device", f"virtio-net-device,netdev=n1,mac={INSIDE_MAC.hex(':')},bus=virtio-mmio-bus.23",
+            "-netdev", inside,
+        ]
+        if monitor:
+            cmd += ["-monitor", f"unix:{monitor},server,nowait"]
+        # pexpect makes the child a session leader, so kill() takes the group.
+        child = pexpect.spawn(DIE_WITH_PARENT[0], DIE_WITH_PARENT[1:] + ["qemu-system-aarch64"] + cmd,
+                              encoding="utf-8", timeout=BOOT_TIMEOUT_S)
+    except BaseException:
+        close_tpm(proxy, tpm)
+        raise
+    child.tpm, child.proxy = tpm, proxy
     return child, Console(child)
 
 
-def kill(child: pexpect.spawn):
+def close_tpm(proxy, tpm):
+    """The proxy, then swtpm and its state directory (T6: a leftover fails)."""
+    try:
+        if proxy is not None:
+            proxy.close()
+    finally:
+        if tpm is not None:
+            tpm.close()
+
+
+def kill_qemu(child: pexpect.spawn):
     try:
         os.killpg(child.pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
     child.close(force=True)
+
+
+def kill(child: pexpect.spawn):
+    """Ends QEMU, then the boot's TPM. Idempotent: the teardown paths call
+    it again after a stop signal."""
+    kill_qemu(child)
+    tpm, proxy = getattr(child, "tpm", None), getattr(child, "proxy", None)
+    child.tpm = child.proxy = None
+    close_tpm(proxy, tpm)
 
 
 class Monitor:
@@ -581,9 +629,9 @@ def wait_arp_ready(w: Wire, con: Console):
 FLOOD_BATCH = 32
 
 
-def test_raw(loader: str):
+def test_raw(pkg: "Package"):
     w = Wire()
-    child, con = boot(loader, w.netdev("n0"), dgram("n1", free_udp_port(), free_udp_port()))
+    child, con = boot(pkg, w.netdev("n0"), dgram("n1", free_udp_port(), free_udp_port()))
     try:
         wait_arp_ready(w, con)
         con.wait_for(r"audit: src=ingress ArpReplied total=1 lost=0")
@@ -930,13 +978,13 @@ class Pinger(threading.Thread):
             time.sleep(max(0.0, t + PING_LOOP_S - time.monotonic()))
 
 
-def test_wireguard(loader: str, deploy: str, passed: list):
+def test_wireguard(pkg: "Package", deploy: str, passed: list):
     inside = Wire()
     hostfwd = free_udp_port()
     rp_fwd = free_udp_port()
     host = InsideHost(inside)
     monitor = os.path.join(deploy, "monitor.sock")
-    child, con = boot(loader, f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT},"
+    child, con = boot(pkg, f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT},"
                               f"hostfwd=udp:127.0.0.1:{rp_fwd}-:{RP_PORT}", inside.netdev("n1"), monitor)
     wg = None
     rps = []
@@ -1305,14 +1353,14 @@ def swap_rp_records(path: str):
         f.write(text)
 
 
-def test_peer_binding(loader: str, deploy: str, passed: list):
+def test_peer_binding(pkg: "Package", deploy: str, passed: list):
     """Only client 0 runs, with WireGuard key wg0 and Rosenpass key rp0, on
     deployment `c`, where rp0 belongs to record 1: its PSK lands at record 1,
     so wg0 is refused, while wg1 with that PSK is accepted [R5-T-R1]. The
     correctly bound allow side is boot 2's interop."""
     hostfwd = free_udp_port()
     rp_fwd = free_udp_port()
-    child, con = boot(loader, f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT},"
+    child, con = boot(pkg, f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT},"
                               f"hostfwd=udp:127.0.0.1:{rp_fwd}-:{RP_PORT}",
                       dgram("n1", free_udp_port(), free_udp_port()))
     rp = sock = None
@@ -1377,13 +1425,13 @@ def halt_reason(pd: str, name: str) -> int:
     return int(m.group(1))
 
 
-def test_mismatched_blob(loader: str):
+def test_mismatched_blob(pkg: "Package"):
     """Under the release kernel nothing but `audit` prints (C6, C7): `key`
     stays up Unavailable, and `hs`'s boot-seed call, its first call to
     `key`, is where the failure shows."""
     code = key_boot_code("GatewayKeyMismatch")
     reason = halt_reason("hs", "NO_BOOT_SEED")
-    child, con = boot(loader, dgram("n0", free_udp_port(), free_udp_port()),
+    child, con = boot(pkg, dgram("n0", free_udp_port(), free_udp_port()),
                       dgram("n1", free_udp_port(), free_udp_port()))
     try:
         m = con.wait_for(rf"audit: src=hs KeyUnavailable code={code} lost=\d+\r*\n", timeout=BOOT_TIMEOUT_S)
@@ -1403,38 +1451,244 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import measure  # noqa: E402  (the host model of support/u-boot/boot.cmd)
 
 UBOOT_MEASURE = os.path.join(ROOT, "build/u-boot-measure/u-boot.bin")
+# What every other boot runs (M5 plan C14): the same boot command, ending in
+# the jump to the loader.
+UBOOT = os.path.join(ROOT, "build/u-boot-shipped/u-boot.bin")
 SWTPM_SOCKET_WAIT_S = 10.0
+# The swtpm state file that holds the TPM's seeds (the SRK derives from
+# them); a volatile state file would make U-Boot's TPM2_Startup fail.
+SWTPM_PERMALL = "tpm2-00.permall"
+SWTPM_VOLATILE = "tpm2-00.volatilestate"
 
 
 class Swtpm:
     """One swtpm per boot, in its own state directory (plan T6): started
     before QEMU, stopped and its directory removed after, and a directory
-    that survives the removal fails the case."""
+    that survives the removal fails the case. `state`, a provisioned state
+    directory, is copied in first: the deployment's SRK, fresh PCRs."""
 
-    def __init__(self, parent: str):
+    def __init__(self, parent: str, state: str = None):
         self.dir = tempfile.mkdtemp(prefix="swtpm-", dir=parent)
         self.sock = os.path.join(self.dir, "ctrl.sock")
-        self.proc = subprocess.Popen(DIE_WITH_PARENT + ["swtpm", "socket", "--tpm2", "--tpmstate",
-                                                        f"dir={self.dir}", "--ctrl", f"type=unixio,path={self.sock}"],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-        deadline = time.monotonic() + SWTPM_SOCKET_WAIT_S
-        while not os.path.exists(self.sock):
-            if self.proc.poll() is not None or time.monotonic() > deadline:
-                self.close()
-                raise Fail("swtpm did not open its control socket")
-            time.sleep(0.05)
+        self.proc = None
+        try:
+            if state is not None:
+                shutil.copy2(os.path.join(state, SWTPM_PERMALL), self.dir)
+            self.proc = subprocess.Popen(DIE_WITH_PARENT + ["swtpm", "socket", "--tpm2", "--tpmstate",
+                                                            f"dir={self.dir}", "--ctrl",
+                                                            f"type=unixio,path={self.sock}"],
+                                         stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+            deadline = time.monotonic() + SWTPM_SOCKET_WAIT_S
+            while not os.path.exists(self.sock):
+                if self.proc.poll() is not None or time.monotonic() > deadline:
+                    raise Fail("swtpm did not open its control socket")
+                time.sleep(0.05)
+        except BaseException:
+            self.close()
+            raise
 
     def qemu_args(self) -> list:
         return ["-chardev", f"socket,id=chrtpm,path={self.sock}", "-tpmdev", "emulator,id=tpm0,chardev=chrtpm",
                 "-device", "tpm-tis-device,tpmdev=tpm0"]
 
     def close(self):
-        if self.proc.poll() is None:
-            self.proc.kill()
-        self.proc.wait()
+        if self.proc is not None:
+            if self.proc.poll() is None:
+                self.proc.kill()
+            self.proc.wait()
         shutil.rmtree(self.dir, ignore_errors=True)
         if os.path.exists(self.dir):
             raise Fail(f"swtpm state {self.dir} survived its boot")
+
+
+class Package:
+    """One deployment's boot media, as tools/package wrote them, and the
+    provisioned swtpm state its envelopes are sealed to."""
+
+    def __init__(self, pkg_dir: str, state: str):
+        self.dir, self.state = pkg_dir, state
+
+    def path(self, name: str) -> str:
+        return os.path.join(self.dir, name)
+
+    def read(self, name: str) -> bytes:
+        with open(self.path(name), "rb") as f:
+            return f.read()
+
+    def media(self) -> list:
+        names = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env")
+        return list(zip(map(self.path, names), (measure.LOAD_IMAGE, measure.LOAD_DESC) + measure.LOAD_ENVELOPES))
+
+
+def recv_exact(sock: socket.socket, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise Fail(f"socket closed after {len(buf)} of {n} bytes")
+        buf += chunk
+    return buf
+
+
+# swtpm's control channel (tpm_ioctl.h): commands are big-endian u32 codes.
+SWTPM_CMD_SET_DATAFD = 16
+# TPM2_PCR_Read of PCR 8, sha256 bank (tpm2_wire::pcr_read).
+PCR_READ_8 = bytes.fromhex("8001" "00000014" "0000017e" "00000001" "000b" "03" "000100")
+PCR8_SELECTION = bytes.fromhex("00000001" "000b" "03" "000100")
+
+
+def read_pcr8(tpm: Swtpm) -> bytes:
+    """PCR 8 of a swtpm whose QEMU has been killed (T11): a second control
+    connection hands swtpm a fresh data socket (CMD_SET_DATAFD; no CMD_INIT,
+    which would restart the TPM), then TPM2_PCR_Read. Probed host-side in
+    slice 7: swtpm keeps the TPM running once the killed QEMU's data socket
+    closes."""
+    ctrl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    mine, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        ctrl.settimeout(LINE_TIMEOUT_S)
+        ctrl.connect(tpm.sock)
+        ctrl.sendmsg([struct.pack(">I", SWTPM_CMD_SET_DATAFD)],
+                     [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [theirs.fileno()]))])
+        if recv_exact(ctrl, 4) != bytes(4):
+            raise Fail("swtpm refused a data socket after QEMU exited")
+        theirs.close()
+        mine.settimeout(LINE_TIMEOUT_S)
+        mine.sendall(PCR_READ_8)
+        head = recv_exact(mine, 10)
+        rsp = head + recv_exact(mine, struct.unpack(">I", head[2:6])[0] - 10)
+    finally:
+        for s in (ctrl, mine, theirs):
+            s.close()
+    # header, pcrUpdateCounter, the selection as asked, one 32-byte digest.
+    if len(rsp) != 62 or rsp[6:10] != bytes(4) or rsp[14:24] != PCR8_SELECTION or rsp[24:30] != bytes.fromhex("000000010020"):
+        raise Fail(f"unexpected PCR_Read response {rsp.hex()}")
+    return rsp[30:]
+
+
+CC_UNSEAL = 0x15E
+
+
+class TpmProxy:
+    """The A7 proxy (M5 plan C14): QEMU's tpm-emulator backend talks to
+    this socket instead of swtpm's control channel. Control bytes pass
+    through as they are; the data socket QEMU hands over (CMD_SET_DATAFD)
+    is swapped for one end of a pair whose other end swtpm gets, and TPM
+    commands and responses are relayed between the two, framed by their
+    headers. With `flip`, the first byte of every successful Unseal
+    response's outData is flipped. Feasibility (F6-A): the unmodified relay
+    must pass a sealed boot first."""
+
+    def __init__(self, tpm: Swtpm, flip: bool):
+        self.tpm, self.flip = tpm, flip
+        self.path = os.path.join(tpm.dir, "proxy.sock")
+        self.unseals = self.flipped = 0
+        self.error = None
+        self.stopped = False
+        self.socks = []
+        self.listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.listener.bind(self.path)
+        self.listener.listen(1)
+        self.listener.settimeout(0.2)
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        start_without_stop_signals(self.thread)
+
+    def qemu_args(self) -> list:
+        return ["-chardev", f"socket,id=chrtpm,path={self.path}", "-tpmdev", "emulator,id=tpm0,chardev=chrtpm",
+                "-device", "tpm-tis-device,tpmdev=tpm0"]
+
+    def _run(self):
+        try:
+            self._relay()
+        except Exception as e:  # reported by the case, which then fails
+            if not self.stopped:
+                self.error = e
+
+    def _relay(self):
+        while True:
+            if self.stopped:
+                return
+            try:
+                qemu, _ = self.listener.accept()
+                break
+            except socket.timeout:
+                continue
+        swtpm = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        swtpm.connect(self.tpm.sock)
+        self.socks += [qemu, swtpm]
+        # (QEMU's data socket, ours to swtpm, command buffer, response
+        # buffer, command codes awaiting their response)
+        relays = []
+        while not self.stopped:
+            readable, _, _ = select.select([qemu, swtpm] + [s for r in relays for s in r[:2]], [], [], 0.2)
+            for s in readable:
+                if s is qemu:
+                    data, anc, _, _ = qemu.recvmsg(4096, socket.CMSG_LEN(4 * array.array("i").itemsize))
+                    if not data:
+                        return
+                    fds = [fd for level, kind, raw in anc if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS
+                           for fd in array.array("i", raw[:len(raw) - len(raw) % 4])]
+                    if fds:
+                        theirs = socket.socket(fileno=fds[0])
+                        mine, for_swtpm = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+                        swtpm.sendmsg([data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                                                 array.array("i", [for_swtpm.fileno()]))])
+                        for_swtpm.close()
+                        self.socks += [theirs, mine]
+                        relays.append([theirs, mine, b"", b"", []])
+                    else:
+                        swtpm.sendall(data)
+                elif s is swtpm:
+                    data = swtpm.recv(4096)
+                    if not data:
+                        return
+                    qemu.sendall(data)
+                else:
+                    for r in relays:
+                        if s is r[0]:
+                            self._commands(r, s.recv(4096))
+                        elif s is r[1]:
+                            self._responses(r, s.recv(4096))
+
+    @staticmethod
+    def _frames(buf: bytes):
+        """Complete TPM frames at the head of `buf`, and the rest."""
+        frames = []
+        while len(buf) >= 10 and len(buf) >= struct.unpack(">I", buf[2:6])[0]:
+            n = struct.unpack(">I", buf[2:6])[0]
+            if n < 10:
+                raise Fail(f"proxy: a TPM frame of {n} bytes")
+            frames.append(bytearray(buf[:n]))
+            buf = buf[n:]
+        return frames, buf
+
+    def _commands(self, r: list, data: bytes):
+        if not data:
+            raise Fail("proxy: QEMU closed its data socket")
+        frames, r[2] = self._frames(r[2] + data)
+        for cmd in frames:
+            r[4].append(struct.unpack(">I", cmd[6:10])[0])
+            r[1].sendall(cmd)
+
+    def _responses(self, r: list, data: bytes):
+        if not data:
+            raise Fail("proxy: swtpm closed its data socket")
+        frames, r[3] = self._frames(r[3] + data)
+        for rsp in frames:
+            cc = r[4].pop(0) if r[4] else None
+            if cc == CC_UNSEAL and rsp[6:10] == bytes(4) and len(rsp) > 16:
+                self.unseals += 1
+                if self.flip:
+                    # parameterSize (4), outData's size (2), then outData.
+                    rsp[16] ^= 1
+                    self.flipped += 1
+            r[0].sendall(bytes(rsp))
+
+    def close(self):
+        self.stopped = True
+        self.thread.join(timeout=5)
+        for s in [self.listener] + self.socks:
+            s.close()
 
 
 def boot_uboot(uboot: str, files: list, tpm: Swtpm) -> tuple:
@@ -1551,6 +1805,172 @@ def test_measured_boot(pkg: str, passed: list):
         passed.append("measured boot: range at image_len allowed")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+# ---------------------------------------------------------------- sealed boots (M5 plan C14)
+
+
+def boot_code(crate: str, variant: str) -> int:
+    """`BootError::<variant> => <n>,` from a key PD core's code table (C6)."""
+    src = open(os.path.join(ROOT, f"crates/{crate}/src/lib.rs")).read()
+    m = re.search(rf"^\s+BootError::{variant} => (\d+),$", src, re.M)
+    if not m:
+        raise Fail(f"BootError::{variant} has no code in crates/{crate}/src/lib.rs")
+    return int(m.group(1))
+
+
+def cap_digest() -> bytes:
+    """`CAP_DIGEST`, what tpm extends PCR 8 with once both clients finished
+    (crates/tpm2-wire, RT3)."""
+    src = open(os.path.join(ROOT, "crates/tpm2-wire/src/gate.rs")).read()
+    m = re.search(r"^pub const CAP_DIGEST: \[u8; DIGEST_LEN\] = \[0x([0-9A-Fa-f]{2}); DIGEST_LEN\];$", src, re.M)
+    n = re.search(r"^pub const DIGEST_LEN: usize = (\d+);$",
+                  open(os.path.join(ROOT, "crates/tpm2-wire/src/lib.rs")).read(), re.M)
+    if not m or not n:
+        raise Fail("CAP_DIGEST or DIGEST_LEN not found in crates/tpm2-wire")
+    return bytes([int(m.group(1), 16)]) * int(n.group(1))
+
+
+# The PDs whose init calls a key PD, and the key PD's code table.
+KEY_CALLERS = (("hs", "key-core"), ("pq", "pqkey-core"))
+
+
+def key_outcomes(con: Console, codes: dict, what: str):
+    """Waits for each caller's `KeyUnavailable` with the code `codes` names
+    (a variant per key-core crate). A caller reaching `<pd>: ready` means
+    its key PD unsealed: that, or another code, fails at once
+    (failure-only)."""
+    for pd, crate in KEY_CALLERS:
+        want = boot_code(crate, codes[crate])
+        m = con.wait_for(rf"audit: src={pd} KeyUnavailable code=(\d+) lost=\d+\r*\n|{pd}: ready\r*\n",
+                         timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        if m.group(1) is None:
+            raise Fail(f"{what}: the {crate.removesuffix('-core')} PD unsealed ({pd} became ready)")
+        if int(m.group(1)) != want:
+            raise Fail(f"{what}: {pd} audited KeyUnavailable code={m.group(1)}, want {codes[crate]} ({want})")
+
+
+def media_with(pkg: Package, scratch: str, image: bytes = None, desc: bytes = None) -> list:
+    """The package's boot media with the image or the descriptor replaced."""
+    media = pkg.media()
+    for i, data in ((0, image), (1, desc)):
+        if data is not None:
+            path = os.path.join(scratch, os.path.basename(media[i][0]))
+            with open(path, "wb") as f:
+                f.write(data)
+            media[i] = (path, media[i][1])
+    return media
+
+
+def sealed_boot(pkg: Package, media=None, flip=None) -> tuple:
+    return boot(pkg, dgram("n0", free_udp_port(), free_udp_port()), dgram("n1", free_udp_port(), free_udp_port()),
+                media=media, flip=flip)
+
+
+def stop(child):
+    try:
+        with signals_held():
+            kill(child)
+    except SystemExit:
+        kill(child)
+        raise
+
+
+def test_sealed(good: Package, foreign: Package, passed: list):
+    """C14 on the shipped path: the envelopes open only on the image and
+    descriptor they were sealed to, and only on their own TPM; once both key
+    PDs have finished, PCR 8 is capped. The allow side, a sealed boot that
+    reaches its handshakes, is every other boot's."""
+    image, desc = good.read("published.img"), good.read("boot.desc")
+    image_len, ranges = measure.parse(desc)
+    refused = {"key-core": "UnsealRefused", "pqkey-core": "UnsealRefused"}
+    scratch = tempfile.mkdtemp(prefix="sealed-", dir=os.path.dirname(good.dir))
+    try:
+        # Another image: one byte of audit's text (printed by no case here),
+        # inside image_len and outside both envelope ranges.
+        text = b"HandshakePskStale"
+        at = image.find(text)
+        if image.count(text) != 1 or not at < image_len or any(o <= at < o + n for o, n in ranges):
+            raise Fail("wrong image: the byte to flip is not one place inside the image outside the envelopes")
+        flipped = image[:at] + bytes([image[at] ^ 1]) + image[at + 1:]
+        child, con = sealed_boot(good, media_with(good, scratch, image=flipped))
+        try:
+            key_outcomes(con, refused, "wrong image")
+        finally:
+            stop(child)
+        passed.append("sealed boot: another image is refused")
+
+        # A tampered descriptor, valid for U-Boot: image_len cut short of the
+        # image (both ranges still inside), so less is measured while the
+        # whole image still runs. PCR 8 differs; the TPM refuses.
+        end = max(o + n for o, n in ranges)
+        if end >= image_len:
+            raise Fail("tampered descriptor: an envelope range ends at image_len; cannot cut it short")
+        cut = desc[:16] + struct.pack("<Q", end) + desc[24:]
+        measure.parse(cut)
+        child, con = sealed_boot(good, media_with(good, scratch, desc=cut))
+        try:
+            key_outcomes(con, refused, "tampered descriptor")
+        finally:
+            stop(child)
+        passed.append("sealed boot: a tampered descriptor is refused")
+
+        # Envelopes sealed to another TPM's SRK, booted on this one (I10.2).
+        child, con = sealed_boot(Package(foreign.dir, good.state))
+        try:
+            key_outcomes(con, {"key-core": "SrkMismatch", "pqkey-core": "SrkMismatch"}, "foreign TPM")
+        finally:
+            stop(child)
+        passed.append("sealed boot: another TPM's envelopes are refused")
+
+        # The cap (T11): once hs and pq are ready both key PDs have sent Done,
+        # and tpm extended PCR 8 with CAP_DIGEST before answering the second.
+        # Read from swtpm after QEMU is gone and before swtpm is stopped.
+        want = measure.extend(measure.expected_pcr8(desc, image), cap_digest())
+        child, con = sealed_boot(good)
+        try:
+            con.wait_for(r"hs: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+            con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+            # QEMU killed (no CMD_SHUTDOWN reaches swtpm), its TPM kept.
+            kill_qemu(child)
+            got = read_pcr8(child.tpm)
+        finally:
+            stop(child)
+        if got != want:
+            capped = "uncapped" if got == measure.expected_pcr8(desc, image) else "unexpected"
+            raise Fail(f"cap: PCR 8 after the boot is {got.hex()} ({capped}), want {want.hex()}")
+        passed.append("sealed boot: PCR 8 capped after both key PDs")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def test_tpm_proxy(good: Package, passed: list):
+    """A7 (C14, integrity evidence only, S9): a proxy between QEMU and swtpm.
+    F6-A: the unmodified relay must first pass a sealed boot; only then is
+    the flipped Unseal response's refusal evidence."""
+    child, con = sealed_boot(good, flip=False)
+    try:
+        try:
+            con.wait_for(r"hs: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+            con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        except Fail as e:
+            raise Fail(f"A7 proxy: the unmodified relay did not pass a sealed boot ({e}); "
+                       f"relay error: {child.proxy.error!r}") from None
+        if child.proxy.unseals != 2:
+            raise Fail(f"A7 proxy: the relay saw {child.proxy.unseals} Unseal responses, want 2")
+    finally:
+        stop(child)
+    passed.append("A7 proxy: the unmodified relay passes a sealed boot")
+
+    invalid = {"key-core": "TpmResponseInvalid", "pqkey-core": "TpmResponseInvalid"}
+    child, con = sealed_boot(good, flip=True)
+    try:
+        key_outcomes(con, invalid, "A7 proxy")
+        if child.proxy.flipped != 2 or child.proxy.error is not None:
+            raise Fail(f"A7 proxy: {child.proxy.flipped} responses flipped, relay error {child.proxy.error!r}")
+    finally:
+        stop(child)
+    passed.append("A7 proxy: a flipped Unseal response is refused")
 
 
 # ---------------------------------------------------------------- cookie boots (M2.5 plan C6)
@@ -2762,14 +3182,14 @@ def rp_old_client_case(con, tap, deploy, endpoint, hello, rps):
     old.stop()
 
 
-def test_rp_gate(loader: str, deploy: str, passed: list):
+def test_rp_gate(pkg: "Package", deploy: str, passed: list):
     """Boot "rp gate" (M3b plan C6): the Rosenpass cookie gate under its
     attacks, each case after the previous one's load has cleared."""
     tap = Tap()
     inside = Wire()
     host = InsideHost(inside)
     try:
-        child, con = boot(loader, tap.netdev("n0"), inside.netdev("n1"))
+        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"))
     except BaseException:
         tap.close()
         raise
@@ -2826,7 +3246,7 @@ def test_rp_gate(loader: str, deploy: str, passed: list):
             raise
 
 
-def test_cookie_a(loader: str, deploy: str, passed: list):
+def test_cookie_a(pkg: "Package", deploy: str, passed: list):
     """Boot "cookie-a": Rosenpass 0.2.3 interop (peer 2) and ingress's
     Rosenpass pairs, then the keepalive case and the paired cookie case
     (peer 1)."""
@@ -2834,7 +3254,7 @@ def test_cookie_a(loader: str, deploy: str, passed: list):
     inside = Wire()
     host = InsideHost(inside)
     try:
-        child, con = boot(loader, tap.netdev("n0"), inside.netdev("n1"))
+        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"))
     except BaseException:
         tap.close()
         raise
@@ -3094,13 +3514,13 @@ def flood_case(con: Console, tap: Tap, sniffer: Sniffer, deploy: str, gw_pub: by
     sniffer.check_drops()
 
 
-def test_cookie_b(loader: str, deploy: str, passed: list):
+def test_cookie_b(pkg: "Package", deploy: str, passed: list):
     """Boot "cookie-b": the flood case."""
     tap = Tap()
     inside = Wire()
     host = InsideHost(inside)
     try:
-        child, con = boot(loader, tap.netdev("n0"), inside.netdev("n1"))
+        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"))
     except BaseException:
         tap.close()
         raise
@@ -3155,8 +3575,8 @@ def check_rosenpass_oracle():
 def check_oracle_not_in_image(loader: str):
     """VE9: the oracle never enters an seL4 image. Each binary's ELF and
     program headers (its entry point and segment layout, unique to it) must
-    not occur in the packaged loader. Code or tables could match by accident:
-    the oracle links some of the same crates."""
+    not occur in the published image. Code or tables could match by
+    accident: the oracle links some of the same crates."""
     image = open(loader, "rb").read()
     for path in sorted(ORACLE_BINS):
         data = open(path, "rb").read()
@@ -3166,8 +3586,11 @@ def check_oracle_not_in_image(loader: str):
 
 def preflight():
     check_rosenpass_oracle()
-    missing = [t for t in ("unshare", "setpriv", "wireguard-go", "wg", "ip", "ping", "qemu-system-aarch64")
+    missing = [t for t in ("unshare", "setpriv", "wireguard-go", "wg", "ip", "ping", "qemu-system-aarch64", "swtpm",
+                           "tpm2_createprimary", "tpm2_readpublic")
                if not shutil.which(t)]
+    if not os.path.isfile(UBOOT):
+        raise Fail(f"{UBOOT} is missing; `make uboot` builds it")
     if missing:
         raise Fail(f"missing tools: {missing}")
     if not os.path.exists("/dev/net/tun"):
@@ -3203,31 +3626,111 @@ def make(*args, env=None):
         raise Fail(f"make {' '.join(args)} failed:\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
 
 
-def build(tmp: str) -> tuple:
-    """Three deployments: A (packaged normally, three peers: the third is
-    the Rosenpass 0.2.3 client's), B (only its `key` blob, packaged onto
-    A's image for the mismatch case) and C (two peers with their Rosenpass
-    keys swapped, its own image: the peer binding case)."""
+# The SRK every envelope is sealed to: the TCG storage template, as
+# tpm2::envelope pins it (the interop tests check the two agree).
+SRK_TEMPLATE = ["-C", "o", "-G", "ecc256:aes128cfb", "-g", "sha256", "-a",
+                "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda|restricted|decrypt"]
+
+
+def read_srk(state: str, out: str):
+    """Starts swtpm on `state` with a data socket for tpm2-tools, writes the
+    SRK's TPM2B_PUBLIC to `out`, and kills it again (nothing volatile is
+    saved, so a boot's TPM2_Startup finds a fresh TPM)."""
+    # tpm2-tss's swtpm TCTI finds the control socket at the data path + ".ctrl".
+    data = os.path.join(state, "tpm.sock")
+    ctrl = data + ".ctrl"
+    ctx = out + ".ctx"
+    proc = subprocess.Popen(DIE_WITH_PARENT + ["swtpm", "socket", "--tpm2", "--tpmstate", f"dir={state}",
+                                               "--ctrl", f"type=unixio,path={ctrl}", "--server",
+                                               f"type=unixio,path={data}", "--flags", "not-need-init,startup-clear"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+    try:
+        deadline = time.monotonic() + SWTPM_SOCKET_WAIT_S
+        while not os.path.exists(data):
+            if proc.poll() is not None or time.monotonic() > deadline:
+                raise Fail("swtpm did not open its data socket for provisioning")
+            time.sleep(0.05)
+        env = {**os.environ, "TPM2TOOLS_TCTI": f"swtpm:path={data}"}
+        subprocess.run(["tpm2_createprimary", "-Q", *SRK_TEMPLATE, "-c", ctx], check=True, env=env,
+                       capture_output=True)
+        subprocess.run(["tpm2_readpublic", "-Q", "-c", ctx, "-o", out], check=True, env=env, capture_output=True)
+    finally:
+        proc.kill()
+        proc.wait()
+        # swtpm's lock file goes too: only the TPM's own state is copied.
+        for path in (ctrl, data, ctx, os.path.join(state, ".lock")):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(path)
+    if sorted(os.listdir(state)) != [SWTPM_PERMALL]:
+        raise Fail(f"provisioned swtpm state holds {sorted(os.listdir(state))}, want {SWTPM_PERMALL} alone")
+
+
+def provision_tpm(root: str, name: str) -> tuple:
+    """One deployment's TPM (C14): a swtpm state initialised once and its
+    SRK public read (state directory, SRK public file). Every boot runs on a
+    copy of the state; a copy's SRK must be the same one."""
+    state = os.path.join(root, f"tpm-{name}")
+    os.mkdir(state, 0o700)
+    srk = os.path.join(root, f"tpm-{name}.srk.pub")
+    read_srk(state, srk)
+    copy = tempfile.mkdtemp(prefix=f"tpm-{name}-copy-", dir=root)
+    again = copy + ".srk.pub"
+    try:
+        shutil.copy2(os.path.join(state, SWTPM_PERMALL), copy)
+        read_srk(copy, again)
+        if open(again, "rb").read() != open(srk, "rb").read():
+            raise Fail(f"TPM {name}: a copy of the provisioned state has another SRK")
+    finally:
+        shutil.rmtree(copy)
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(again)
+    return state, srk
+
+
+def build(tmp: str):
+    """Three deployments, each package sealed to a provisioned TPM: A
+    (three peers: the third is the Rosenpass 0.2.3 client's), B (only its
+    `key` blob, packaged with A's on A's image and TPM for the mismatch
+    case) and C (two peers with their Rosenpass keys swapped, its own image
+    and TPM: the peer binding case). A is packaged a second time, sealed to
+    a third TPM that never boots (the foreign-TPM case)."""
     for name, peers in (("a", "3"), ("b", "3"), ("c", "2")):
         subprocess.run(["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "--template",
                         os.path.join(ROOT, "config/gateway.toml"), "--peers", peers, "--out",
                         os.path.join(tmp, name)], check=True, cwd=ROOT)
     swap_rp_records(os.path.join(tmp, "c/gateway.toml"))
+    _, srk_a = provision_tpm(tmp, "a")
+    _, srk_c = provision_tpm(tmp, "c")
+    _, srk_foreign = provision_tpm(tmp, "foreign")
     env = {**os.environ, "SECUREOS_CONFIG": os.path.join(tmp, "a/gateway.toml")}
     make("image", env=env)
-    make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin", f"OUT={tmp}/a/pkg",
-         env=env)
+    make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin", f"SRK_PUBLIC={srk_a}",
+         f"OUT={tmp}/a/pkg", env=env)
     # Only `key`'s blob mismatches: pqkey keeps A's, so only `key` is
     # Unavailable.
-    make("package", f"SECRETS={tmp}/b/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin", f"OUT={tmp}/b/pkg",
-         env=env)
+    make("package", f"SECRETS={tmp}/b/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin", f"SRK_PUBLIC={srk_a}",
+         f"OUT={tmp}/b/pkg", env=env)
+    make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
+         f"SRK_PUBLIC={srk_foreign}", f"OUT={tmp}/a/pkg-foreign", env=env)
     env_c = {**os.environ, "SECUREOS_CONFIG": os.path.join(tmp, "c/gateway.toml")}
-    make("package", f"SECRETS={tmp}/c/secrets.bin", f"PQ_SECRETS={tmp}/c/pqkey-secrets.bin", f"OUT={tmp}/c/pkg",
-         env=env_c)
-    loaders = tuple(f"{tmp}/{name}/pkg/loader.img" for name in ("a", "b", "c"))
-    for loader in loaders:
-        check_oracle_not_in_image(loader)
-    return loaders
+    make("package", f"SECRETS={tmp}/c/secrets.bin", f"PQ_SECRETS={tmp}/c/pqkey-secrets.bin", f"SRK_PUBLIC={srk_c}",
+         f"OUT={tmp}/c/pkg", env=env_c)
+    for pkg in ("a/pkg", "b/pkg", "a/pkg-foreign", "c/pkg"):
+        if sorted(os.listdir(os.path.join(tmp, pkg))) != sorted(PACKAGE_OUTPUTS):
+            raise Fail(f"{pkg} holds {sorted(os.listdir(os.path.join(tmp, pkg)))}, want {sorted(PACKAGE_OUTPUTS)}")
+        check_oracle_not_in_image(os.path.join(tmp, pkg, "published.img"))
+
+
+# What tools/package writes: no image with a secret in it (M5 plan C8 F2).
+PACKAGE_OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "pcr8")
+
+
+def packages(tmp: str) -> dict:
+    """The packages build() made, with the TPM state each boots on."""
+    return {"good": Package(os.path.join(tmp, "a/pkg"), os.path.join(tmp, "tpm-a")),
+            "mismatched": Package(os.path.join(tmp, "b/pkg"), os.path.join(tmp, "tpm-a")),
+            "binding": Package(os.path.join(tmp, "c/pkg"), os.path.join(tmp, "tpm-c")),
+            "foreign": Package(os.path.join(tmp, "a/pkg-foreign"), os.path.join(tmp, "tpm-foreign"))}
 
 
 def check_harness_matches_config(deploy: str):
@@ -3259,8 +3762,11 @@ def check_harness_matches_config(deploy: str):
         raise Fail("config/gateway.toml no longer matches the harness: " + "; ".join(wrong))
 
 
-def in_netns(good: str, mismatched: str, binding: str, deploy: str) -> int:
+def in_netns(tmp: str) -> int:
     guard_thread_starts()
+    pkgs = packages(tmp)
+    good, mismatched, binding, foreign = pkgs["good"], pkgs["mismatched"], pkgs["binding"], pkgs["foreign"]
+    deploy = os.path.join(tmp, "a")
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     try:
         check_harness_matches_config(deploy)
@@ -3285,7 +3791,9 @@ def in_netns(good: str, mismatched: str, binding: str, deploy: str) -> int:
              ("rp gate boot", lambda: test_rp_gate(good, deploy, passed)),
              ("peer binding", lambda: test_peer_binding(binding, os.path.join(os.path.dirname(deploy), "c"), passed)),
              ("mismatched blob halts key", single("mismatched blob", lambda: test_mismatched_blob(mismatched))),
-             ("measured boot", lambda: test_measured_boot(os.path.dirname(good), passed))]
+             ("measured boot", lambda: test_measured_boot(good.dir, passed)),
+             ("sealed boot", lambda: test_sealed(good, foreign, passed)),
+             ("tpm proxy", lambda: test_tpm_proxy(good, passed))]
     # check-selftest's red-proofs need only the boot their injection breaks:
     # SECUREOS_IT_BOOTS names those (comma-separated). A filtered run never
     # prints INTEGRATION-CASES, so it can never pass `make check`'s manifest.
@@ -3385,16 +3893,16 @@ def main() -> int:
         if str(os.getppid()) != os.environ.get("SECUREOS_IT_PARENT"):
             print("\nFAIL [setup]: outer harness already gone", file=sys.stderr)
             return 1
-        return in_netns(*sys.argv[2:6])
+        return in_netns(sys.argv[2])
     tmp = tempfile.mkdtemp(prefix="secureos-it-")
     status = 1
     try:
         preflight()
-        good, mismatched, binding = build(tmp)
+        build(tmp)
         # `unshare` execs the child, so the Popen pid is the netns harness.
         # The outer harness has no threads, so preexec_fn is safe here.
-        child = subprocess.Popen(["unshare", "-rn", sys.executable, os.path.abspath(__file__), "--netns",
-                                  good, mismatched, binding, os.path.join(tmp, "a")], preexec_fn=die_with_parent,
+        child = subprocess.Popen(["unshare", "-rn", sys.executable, os.path.abspath(__file__), "--netns", tmp],
+                                 preexec_fn=die_with_parent,
                                  env={**os.environ, "SECUREOS_IT_PARENT": str(os.getpid())})
         try:
             status = child.wait()

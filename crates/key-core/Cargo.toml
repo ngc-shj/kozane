@@ -6,4 +6,5 @@ license.workspace = true
 
 [dependencies]
 secret-blob = { path = "../secret-blob" }
+tpm2 = { path = "../tpm2" }
 wg-core = { path = "../wg-core" }

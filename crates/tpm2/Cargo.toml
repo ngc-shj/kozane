@@ -8,6 +8,7 @@ license.workspace = true
 # The block cipher only; CFB is written in `crypto` over it. `zeroize`
 # wipes its round keys on drop.
 aes = { version = "=0.8.4", default-features = false, features = ["zeroize"] }
+layout = { path = "../layout" }
 libcrux-hmac = { version = "=0.0.9", default-features = false }
 libcrux-p256 = { version = "=0.0.9", default-features = false }
 libcrux-sha2 = { version = "=0.0.9", default-features = false }

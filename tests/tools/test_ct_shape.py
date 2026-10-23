@@ -47,7 +47,7 @@ def with_tree(**kw):
 
 
 def load(search, harness):
-    return ({label: cts.Binary.load(search / label, label) for label in cts.ROOTS},
+    return ({label: cts.Binary.load(search / label, label) for label in cts.ROOT_ELFS},
             cts.Binary.load(harness, "harness"))
 
 
@@ -65,6 +65,18 @@ def contained(**kw):
         binaries, _ = load(search, harness)
         nodes, _, _ = cts.closure(binaries["pd-pqkey.elf"], "mce460896::decaps")
         return cts.check_contained(binaries["pd-pqkey.elf"], "mce460896::decaps", nodes)
+    return run
+
+
+def open_contained(entry_body=("ret",)):
+    """The envelope open's own code is entered only through its root (I10.3),
+    in pd-key.elf rebuilt with `entry_body` as its PD entry."""
+    @with_tree()
+    def run(search, harness, _d):
+        elf.build(search, "pd-key.elf", elf.program("a1", "pd_key", mce=False, entry_body=entry_body), 0x200000)
+        binaries, _ = load(search, harness)
+        nodes, _, _ = cts.closure(binaries["pd-key.elf"], cts.OPEN_ROOT)
+        return cts.check_contained(binaries["pd-key.elf"], cts.OPEN_ROOT, nodes)
     return run
 
 
@@ -89,7 +101,8 @@ def listed_image_missing():
     return run
 
 
-SYSTEM_TWO = '<program_image path="pd-pqkey.elf" />\n<program_image path="pd-pq.elf" />\n'
+SYSTEM_TWO = ('<program_image path="pd-pqkey.elf" />\n<program_image path="pd-pq.elf" />\n'
+              '<program_image path="pd-key.elf" />\n')
 
 
 def bm_with(old: str, new: str) -> list:
@@ -271,7 +284,7 @@ def cli(**kw):
                 want_third = "ct-shape: pd-ingress.elf: identity: mce460896::decaps is McEliece code in a PD outside"
                 return [] if r.returncode == 1 and any(l.startswith(want_third) for l in lines) \
                     else [f"exit {r.returncode}: {lines}"]
-            return [] if (r.returncode, lines) == ((1, lines) if mutated else (0, ["CT-SHAPE-SYMBOLS 6"])) \
+            return [] if (r.returncode, lines) == ((1, lines) if mutated else (0, ["CT-SHAPE-SYMBOLS 10"])) \
                 and (not mutated or len(lines) == 2) else [f"exit {r.returncode}: {lines}"]
         finally:
             shutil.rmtree(d)
@@ -318,6 +331,11 @@ CASES = [
       f"closure of mce460896::decaps at {BM}, not at the root"],
      contained(pd_entry=("bl {bm}", "ret"))),
     ("a call to one of the closure's stops is not an entry", None, contained(pd_entry=("bl memcpy", "ret"))),
+    ("the envelope open is reached only through its root", None, open_contained()),
+    ("a call into the envelope open past its root is caught",
+     ["pd-key.elf: identity: sel4_microkit::entry::run_main::<pd_key::PqK, pd_key::init>+0x0 enters the "
+      "closure of tpm2::envelope::open_sealed at tpm2::envelope::open_core, not at the root"],
+     open_contained(("bl {open_core}", "ret"))),
     ("a third PD without McEliece code passes", None, third_pd(False)),
     ("McEliece code in a third PD is caught", None, third_pd(True)),
     ("panic entries stop the closure by property", None, stops_by_property),
@@ -381,7 +399,7 @@ CASES = [
     ("a program_image without a path fails", None,
      cli(system_text="<program_image />\n", want="a program_image without a path")),
     ("a system file without a root's image fails", None,
-     cli(system_text='<program_image path="pd-pqkey.elf" />\n', want="no program_image pd-pq.elf")),
+     cli(system_text='<program_image path="pd-pqkey.elf" />\n', want="no program_image pd-key.elf, pd-pq.elf")),
     ("a PD the system file lists but the search path lacks fails",
      ["pd-gone.elf: identity: cannot read <search>/pd-gone.elf: No such file or directory"],
      lambda: [e.replace(e[e.index("read ") + 5:e.index("/pd-gone")], "<search>") for e in listed_image_missing()()]),

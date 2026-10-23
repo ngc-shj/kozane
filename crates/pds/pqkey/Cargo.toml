@@ -11,3 +11,5 @@ layout = { path = "../../layout" }
 pqkey-core = { path = "../../pqkey-core" }
 secret-blob = { path = "../../secret-blob" }
 sel4-microkit = { workspace = true }
+tpm2 = { path = "../../tpm2" }
+zeroize = { version = "=1.8.1", default-features = false }

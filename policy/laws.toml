@@ -10,7 +10,7 @@
 # Schema:
 #
 #   [pds.<name>]
-#   role = "driver" | "untrusted_input" | "key" | "data" | "service" | "timer"
+#   role = "driver" | "untrusted_input" | "key" | "data" | "service" | "timer" | "tpm"
 #   irqs = [<n>, ...]
 #     Every pd in the `.system` must have an entry here. `driver` pds may
 #     own device/dma mrs (L5) and claim the hardware IRQ numbers listed in
@@ -27,7 +27,13 @@
 #     taint exemption (L1, L2); there may be several, each mapping
 #     exactly its own secrets mr and nothing else, and no pd may hold
 #     pp=true channels to two of them (L2: disjoint secrets and disjoint
-#     callers, M3 plan Law amendments); `untrusted_input`,
+#     callers, M3 plan Law amendments). A `key` pd may have exactly one
+#     channel with pp=true on its own end, and it leads to a `tpm` pd (L1
+#     as amended by the M5 plan, C9); that channel is no exemption: taint
+#     crosses it both ways. `tpm` (C9) owns the TIS device mr (below) and
+#     nothing else, must be untainted, maps nothing but its tpm mr, has
+#     channels only to `key` pds and is their callee only (pp=false on its
+#     own end), and claims no irq; `untrusted_input`,
 #     `data` and `service` carry no extra mr privileges of their own but
 #     matter for taint reporting and priority ordering (below). Any role,
 #     including `driver`, may be the producer of a `data`-kind mr (below)
@@ -37,8 +43,8 @@
 #
 #   [mrs.<name>]
 #   kind = "device" | "dma" | "secrets" | "data" | "plain"
-#     device: owner = "<driver, timer or service pd>", phys_addr = <addr>, size = <bytes>,
-#             console = <bool, default false>
+#     device: owner = "<driver, timer, service or tpm pd>", phys_addr = <addr>, size = <bytes>,
+#             console = <bool, default false>, tpm = <bool, default false>
 #       MMIO owned by exactly that driver, page-granular (L5): only the
 #       owner may map it, its `.system` `phys_addr`/`size` must match the
 #       pinned values here exactly (L5), its range must not overlap
@@ -52,6 +58,12 @@
 #       is for the TX-FIFO flag). Its owner claims no irq (L4), which with
 #       no receive code in the PD is the no-RX guarantee. A console mr
 #       does not seed taint (L1).
+#       `tpm = true` marks the TPM's TIS page (M5 plan C9, L5 as amended):
+#       its owner must have role `tpm`, at most one tpm mr may be declared,
+#       and it must be pinned at the TIS page of locality 0 (phys_addr
+#       0xc000000, size 0x1000). A tpm pd owning any other device mr is an
+#       L5 violation. A tpm mr at the TIS page does not seed taint (L1,
+#       S14); anywhere else it does.
 #     dma: owner = "<driver pd>"
 #       A DMA buffer, mapped only into its owning driver (L5) and never
 #       shared as a `data` region. `setvar region_paddr` may only name a
@@ -109,10 +121,11 @@
 #
 # Design notes (decisions not spelled out by C7 itself, so recorded here):
 #   - "Maps a NIC device" (L1's taint seed) is generalised to "maps any
-#     device-kind mr owned by a non-timer pd, other than the console": every
-#     such device is a NIC today, so this is equivalent and keeps the rule
-#     simple. The console exemption is keyed to the pinned PL011 page, not
-#     to the flag alone, so a console mr pinned anywhere else seeds taint.
+#     device-kind mr owned by a non-timer pd, other than the console and
+#     the TPM": every such device is a NIC today, so this is equivalent and
+#     keeps the rule simple. The console and TPM exemptions are keyed to
+#     the pinned PL011 and TIS pages, not to the flags alone, so a console
+#     or tpm mr pinned anywhere else seeds taint (S14).
 #   - "x permission on shared maps" is enforced for any mr mapped by more
 #     than one distinct pd in the `.system`, regardless of kind.
 #   - DOCTYPE, entities and duplicate attributes are rejected by the XML
@@ -134,7 +147,10 @@
 #   `pqkey` from `pq` only and maps only `pq_secrets`; L2 as amended).
 #   `timer` is exempt as notify-only (L1): it notifies `data`, `hs`,
 #   `ingress` and `pq`, none of which can notify it. `audit` (M5) owns the
-#   PL011 page as the only console and writes its lines there.
+#   PL011 page as the only console and writes its lines there. `tpm` (M5)
+#   owns the TIS page and is called by `key` and `pqkey` alone, each over
+#   its one pp channel, to unseal their secrets at boot; it is untainted
+#   and ordered above `key` (L13, and Microkit's callee-above-caller rule).
 
 [pds.eth_out]
 role = "driver"
@@ -172,6 +188,9 @@ role = "untrusted_input"
 [pds.pqkey]
 role = "key"
 
+[pds.tpm]
+role = "tpm"
+
 [mrs.eth_out_mmio]
 kind = "device"
 owner = "eth_out"
@@ -204,6 +223,13 @@ owner = "audit"
 phys_addr = 0x9000000
 size = 0x1000
 console = true
+
+[mrs.tpm_mmio]
+kind = "device"
+owner = "tpm"
+phys_addr = 0xc000000
+size = 0x1000
+tpm = true
 
 [mrs.secrets]
 kind = "secrets"
@@ -542,9 +568,21 @@ between = ["pq", "audit"]
 pp = { pq = false, audit = false }
 notify = { pq = true, audit = true }
 
+[[channels]]
+between = ["key", "tpm"]
+pp = { key = true, tpm = false }
+notify = { key = false, tpm = false }
+
+[[channels]]
+between = ["pqkey", "tpm"]
+pp = { pqkey = true, tpm = false }
+notify = { pqkey = false, tpm = false }
+
 [priority]
-# L13: untrusted-input and tunnel PDs run strictly below `key` and `timer`.
+# L13: untrusted-input and tunnel PDs run strictly below `key` and `timer`;
+# `tpm`, the key pds' callee, above `key` (M5 plan C9).
 below = [
+    ["key", "tpm"],
     ["untrusted_input", "key"],
     ["untrusted_input", "timer"],
     ["data", "key"],

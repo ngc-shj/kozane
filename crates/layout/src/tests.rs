@@ -78,7 +78,7 @@ fn every_region_is_a_link_an_audit_ring_or_a_named_singleton() {
         .flat_map(|l| ["used", "free", "data"].map(|s| std::format!("{l}_{s}")))
         .chain(AUDITS.iter().map(|a| String::from(*a)))
         .chain(
-            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "secrets", "pq_secrets"]
+            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "tpm_mmio", "secrets", "pq_secrets"]
                 .map(String::from),
         )
         .collect();
@@ -92,6 +92,47 @@ fn every_region_is_a_link_an_audit_ring_or_a_named_singleton() {
 fn secrets_region_holds_one_blob() {
     // Mirrors secret_blob::REGION_SIZE (key maps it whole).
     assert_eq!(mr_sizes()["secrets"], 4096);
+}
+
+#[test]
+fn tpm_region_is_the_tis_page() {
+    let text = system_text();
+    let doc = roxmltree::Document::parse(&text).expect("parse .system");
+    let mr = doc
+        .descendants()
+        .find(|n| n.has_tag_name("memory_region") && n.attribute("name") == Some("tpm_mmio"))
+        .expect("tpm_mmio");
+    assert_eq!(parse_num(mr.attribute("phys_addr").expect("phys_addr")), tpm::TIS_PADDR);
+    assert_eq!(parse_num(mr.attribute("size").expect("size")), tpm::TIS_SIZE);
+}
+
+#[test]
+fn tpm_messages_round_trip_through_words_at_every_length() {
+    let bytes: std::vec::Vec<u8> = (0..tpm::MSG_BYTES).map(|i| (i * 7 + 1) as u8).collect();
+    for len in [0, 1, 7, 8, 9, 365, tpm::MSG_BYTES - 1, tpm::MSG_BYTES] {
+        let mut words = [0u64; tpm::MSG_WORDS];
+        assert_eq!(tpm::pack(&bytes[..len], &mut words), Some(tpm::words(len)), "len {len}");
+        assert!(words[tpm::words(len)..].iter().all(|w| *w == 0), "len {len}: words past the message");
+        let mut out = [0u8; tpm::MSG_BYTES];
+        assert_eq!(tpm::unpack(&words[..tpm::words(len)], len, &mut out), Some(()), "len {len}");
+        assert_eq!(&out[..len], &bytes[..len], "len {len}");
+    }
+}
+
+#[test]
+fn tpm_pack_and_unpack_refuse_what_does_not_fit() {
+    let mut words = [0u64; tpm::MSG_WORDS];
+    assert_eq!(tpm::pack(&[1; tpm::MSG_BYTES + 1], &mut words), None);
+    let mut out = [0u8; tpm::MSG_BYTES];
+    assert_eq!(tpm::unpack(&words[..2], 17, &mut out), None, "fewer words than the length needs");
+    assert_eq!(tpm::unpack(&words, 9, &mut out[..8]), None, "an output shorter than the length");
+}
+
+#[test]
+fn tpm_labels_carry_kind_and_length() {
+    let l = tpm::label(tpm::RSP_OK, tpm::MSG_BYTES);
+    assert_eq!((tpm::kind(l), tpm::arg(l)), (tpm::RSP_OK, tpm::MSG_BYTES));
+    assert_ne!(tpm::label(tpm::REQ_DONE, 0), tpm::label(tpm::REQ_FAILED, 0));
 }
 
 #[test]
@@ -150,6 +191,8 @@ fn channel_ids_match_layout() {
         (("pq", pq::CH_HS), ("hs", hs::CH_PQ)),
         (("timer", timer::CH_PQ), ("pq", pq::CH_TIMER)),
         (("pq", pq::CH_AUDIT), ("audit", audit::CH_PQ)),
+        (("key", key::CH_TPM), ("tpm", tpm::CH_KEY)),
+        (("pqkey", pqkey::CH_TPM), ("tpm", tpm::CH_PQKEY)),
     ];
     for (a, b) in expected {
         assert!(has_channel(a, b), "{a:?} <-> {b:?}");

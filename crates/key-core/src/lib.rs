@@ -1,7 +1,9 @@
 //! `key` oracle logic (plan C10, law L2): the only code that touches the
 //! gateway's static WireGuard private key. The PD maps the secrets region
-//! read-only, validates it against the compiled configuration once at boot,
-//! and then answers fixed-size PPC requests:
+//! read-only; it holds the blob sealed (M5 plan C11), which the PD unseals
+//! through `tpm` into its own memory at boot (`tpm2::boot`). The plaintext
+//! is validated against the compiled configuration once; then the PD
+//! answers fixed-size PPC requests:
 //!
 //! | label        | request (words)        | reply (words)        |
 //! |--------------|------------------------|----------------------|
@@ -33,6 +35,7 @@
 )]
 
 use secret_blob::{Blob, BlobError};
+use tpm2::boot::UnsealError;
 use wg_core::crypto::{self, Key32};
 
 pub const LABEL_STATIC_DH: u64 = 1;
@@ -89,6 +92,33 @@ pub enum BootError {
     RndrUnavailable,
     /// Hashing the boot seed failed.
     SeedDerivation,
+    /// The secrets region is not a sealed envelope of `key`'s kind (M5
+    /// plan C11: a plaintext blob is refused here).
+    EnvelopeInvalid,
+    /// `tpm` refused, failed or stayed busy (M5 plan C9).
+    TpmUnavailable,
+    /// The TPM's SRK is not the envelope's pinned one: another TPM (I10.2).
+    SrkMismatch,
+    /// The TPM refused the Unseal: PCR 8 is not the value sealed to.
+    UnsealRefused,
+    /// A TPM response failed the client's checks (A7).
+    TpmResponseInvalid,
+    /// The unsealed KEK did not open the envelope.
+    EnvelopeOpen,
+}
+
+impl From<UnsealError> for BootError {
+    fn from(e: UnsealError) -> Self {
+        match e {
+            UnsealError::Rndr => BootError::RndrUnavailable,
+            UnsealError::EnvelopeInvalid => BootError::EnvelopeInvalid,
+            UnsealError::TpmUnavailable => BootError::TpmUnavailable,
+            UnsealError::SrkMismatch => BootError::SrkMismatch,
+            UnsealError::UnsealRefused => BootError::UnsealRefused,
+            UnsealError::ResponseInvalid => BootError::TpmResponseInvalid,
+            UnsealError::EnvelopeOpen => BootError::EnvelopeOpen,
+        }
+    }
 }
 
 impl BootError {
@@ -100,6 +130,12 @@ impl BootError {
             BootError::PeerMismatch => "secrets: peer keys do not match the configuration",
             BootError::RndrUnavailable => "RNDR unavailable",
             BootError::SeedDerivation => "boot seed derivation failed",
+            BootError::EnvelopeInvalid => "secrets: not a sealed envelope for key",
+            BootError::TpmUnavailable => "secrets: tpm unavailable",
+            BootError::SrkMismatch => "secrets: sealed to another TPM",
+            BootError::UnsealRefused => "secrets: the TPM refused to unseal (PCR 8)",
+            BootError::TpmResponseInvalid => "secrets: a TPM response failed its checks",
+            BootError::EnvelopeOpen => "secrets: the unsealed KEK does not open the envelope",
         }
     }
 
@@ -117,6 +153,12 @@ impl BootError {
             BootError::PeerMismatch => 8,
             BootError::RndrUnavailable => 9,
             BootError::SeedDerivation => 10,
+            BootError::EnvelopeInvalid => 11,
+            BootError::TpmUnavailable => 12,
+            BootError::SrkMismatch => 13,
+            BootError::UnsealRefused => 14,
+            BootError::TpmResponseInvalid => 15,
+            BootError::EnvelopeOpen => 16,
         }
     }
 }

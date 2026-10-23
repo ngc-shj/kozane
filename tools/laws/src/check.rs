@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use crate::law::{Finding, LawId};
-use crate::policy::{MrPolicy, PL011_PAGE, Policy, Role};
+use crate::policy::{MrPolicy, PL011_PAGE, Policy, Role, TIS_PAGE};
 use crate::sdf::{Perms, System};
 
 pub fn check(system: &System, policy: &Policy) -> Vec<Finding> {
@@ -20,6 +20,7 @@ pub fn check(system: &System, policy: &Policy) -> Vec<Finding> {
     check_secrets_and_taint(system, policy, &tainted, &mut findings);
     check_device_and_dma(system, policy, &mut findings);
     check_console(system, policy, &mut findings);
+    check_tpm(system, policy, &tainted, &mut findings);
     check_dma_setvar_present(system, policy, &mut findings);
     check_irq_duplicates(system, &mut findings);
     check_data_confinement(system, policy, &mut findings);
@@ -176,8 +177,10 @@ fn check_default_deny(system: &System, policy: &Policy, findings: &mut Vec<Findi
 
 /// Pds tainted per L1: seeded by mapping a device mr, propagated over
 /// channels and shared mrs, with the `key` and `timer` exemptions. A
-/// `timer`'s own device page and the PL011 console (neither a NIC) do not
-/// seed taint.
+/// `timer`'s own device page, the PL011 console and the TPM's TIS page
+/// (none a NIC) do not seed taint. A `key` pd's call to a `tpm` pd (L1 as
+/// amended by the M5 plan, C9) is no exemption: taint crosses it both ways,
+/// and both ends must stay untainted.
 fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) -> BTreeSet<String> {
     let mut adjacency: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut add_edge = |from: &str, to: &str| {
@@ -210,11 +213,13 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
         let b_role = policy.role(&b.pd);
 
         let a_exempt = match a_role {
+            Some(Role::Key) if a.pp && b_role == Some(Role::Tpm) => false,
             Some(Role::Key) => channel_is_exempt(system, policy, a, b, findings),
             Some(Role::Timer) => timer_channel_is_exempt(system, policy, a, b, findings),
             _ => false,
         };
         let b_exempt = match b_role {
+            Some(Role::Key) if b.pp && a_role == Some(Role::Tpm) => false,
             Some(Role::Key) => channel_is_exempt(system, policy, b, a, findings),
             Some(Role::Timer) => timer_channel_is_exempt(system, policy, b, a, findings),
             _ => false,
@@ -250,7 +255,9 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
         .filter(|pd| policy.role(&pd.name) != Some(Role::Timer))
         .filter(|pd| {
             mrs_mapped_by(pd).any(|m| {
-                policy.mrs.get(m.mr.as_str()).is_some_and(|mp| matches!(mp, MrPolicy::Device { .. }) && !mp.is_pl011_console())
+                policy.mrs.get(m.mr.as_str()).is_some_and(|mp| {
+                    matches!(mp, MrPolicy::Device { .. }) && !mp.is_pl011_console() && !mp.is_tis()
+                })
             })
         })
         .map(|pd| pd.name.as_str())
@@ -555,7 +562,7 @@ fn check_console(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
         ));
     }
     for (name, mp) in &policy.mrs {
-        let MrPolicy::Device { owner, phys_addr, size, console } = mp else { continue };
+        let MrPolicy::Device { owner, phys_addr, size, console, .. } = mp else { continue };
         if *console && (*phys_addr, *size) != PL011_PAGE {
             findings.push(Finding::new(
                 LawId::L5,
@@ -583,6 +590,89 @@ fn check_console(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
                     format!("console mr '{}' is mapped into pd '{}' with perms other than rw", m.mr, pd.name),
                 ));
             }
+        }
+    }
+}
+
+/// The `tpm` role (M5 plan C9). L5 as amended: a tpm mr is pinned at the
+/// TIS page, at most one is declared, and a `tpm` pd owns no other device.
+/// L1 as amended: a `tpm` pd is untainted, maps nothing but its tpm mr, has
+/// channels only to `key` pds and is their callee (never pp on its own
+/// end); a `key` pd has at most one channel with pp on its own end, and it
+/// leads to a `tpm` pd (a pp end towards anything else is the key
+/// exemption's finding).
+fn check_tpm(system: &System, policy: &Policy, tainted: &BTreeSet<String>, findings: &mut Vec<Finding>) {
+    let tpms: Vec<&str> = policy
+        .mrs
+        .iter()
+        .filter(|(_, mp)| matches!(mp, MrPolicy::Device { tpm: true, .. }))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if tpms.len() > 1 {
+        findings.push(Finding::new(
+            LawId::L5,
+            format!("{} tpm mrs are declared ({}); the TIS page is the only one", tpms.len(), tpms.join(", ")),
+        ));
+    }
+    for (name, mp) in &policy.mrs {
+        let MrPolicy::Device { owner, phys_addr, size, tpm, .. } = mp else { continue };
+        if *tpm && (*phys_addr, *size) != TIS_PAGE {
+            findings.push(Finding::new(
+                LawId::L5,
+                format!(
+                    "tpm mr '{name}' is pinned at phys_addr={phys_addr:#x}/size={size:#x}, not the TIS page \
+                     (phys_addr={:#x}/size={:#x})",
+                    TIS_PAGE.0, TIS_PAGE.1
+                ),
+            ));
+        }
+        if !*tpm && policy.role(owner) == Some(Role::Tpm) {
+            findings.push(Finding::new(
+                LawId::L5,
+                format!("tpm pd '{owner}' owns device mr '{name}', which is not the TIS mr"),
+            ));
+        }
+    }
+
+    for pd in system.pds.iter().filter(|pd| policy.role(&pd.name) == Some(Role::Tpm)) {
+        if tainted.contains(&pd.name) {
+            findings.push(Finding::new(LawId::L1, format!("tpm pd '{}' is tainted", pd.name)));
+        }
+        for m in mrs_mapped_by(pd) {
+            if !matches!(policy.mrs.get(m.mr.as_str()), Some(MrPolicy::Device { tpm: true, owner, .. }) if owner == &pd.name) {
+                findings.push(Finding::new(
+                    LawId::L1,
+                    format!("tpm pd '{}' maps mr '{}', not just its TIS mr", pd.name, m.mr),
+                ));
+            }
+        }
+    }
+
+    let mut key_pp: BTreeMap<&str, usize> = BTreeMap::new();
+    for channel in &system.channels {
+        let [a, b] = &channel.ends;
+        for (end, peer) in [(a, b), (b, a)] {
+            let peer_role = policy.role(&peer.pd);
+            match policy.role(&end.pd) {
+                Some(Role::Tpm) if peer_role != Some(Role::Key) => findings.push(Finding::new(
+                    LawId::L1,
+                    format!("tpm pd '{}' has a channel to '{}', which is not a key pd", end.pd, peer.pd),
+                )),
+                Some(Role::Tpm) if end.pp => findings.push(Finding::new(
+                    LawId::L1,
+                    format!("tpm pd '{}' has pp=true on its channel to '{}'; it is a callee only", end.pd, peer.pd),
+                )),
+                Some(Role::Key) if end.pp => *key_pp.entry(end.pd.as_str()).or_default() += 1,
+                _ => {}
+            }
+        }
+    }
+    for (pd, n) in key_pp {
+        if n > 1 {
+            findings.push(Finding::new(
+                LawId::L1,
+                format!("key pd '{pd}' has {n} channels with pp=true on its own end, at most one (to a tpm pd)"),
+            ));
         }
     }
 }

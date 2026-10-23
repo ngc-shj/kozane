@@ -608,6 +608,7 @@ name = "key-core"
 version = "0.1.0"
 dependencies = [
  "secret-blob",
+ "tpm2",
  "wg-core",
 ]
 
@@ -1059,6 +1060,7 @@ dependencies = [
  "layout",
  "secret-blob",
  "sel4-microkit",
+ "tpm2",
  "wg-core",
  "zeroize",
 ]
@@ -1091,6 +1093,8 @@ dependencies = [
  "pqkey-core",
  "secret-blob",
  "sel4-microkit",
+ "tpm2",
+ "zeroize",
 ]
 
 [[package]]
@@ -1099,6 +1103,16 @@ version = "0.1.0"
 dependencies = [
  "layout",
  "sel4-microkit",
+]
+
+[[package]]
+name = "pd-tpm"
+version = "0.1.0"
+dependencies = [
+ "cpu",
+ "layout",
+ "sel4-microkit",
+ "tpm2-wire",
 ]
 
 [[package]]
@@ -1183,6 +1197,7 @@ dependencies = [
  "ingress-core",
  "mce460896",
  "secret-blob",
+ "tpm2",
  "zeroize",
 ]
 
@@ -1923,6 +1938,7 @@ name = "tpm2"
 version = "0.1.0"
 dependencies = [
  "aes",
+ "layout",
  "libcrux-hmac",
  "libcrux-p256",
  "libcrux-sha2",

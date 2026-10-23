@@ -348,6 +348,81 @@ fn the_console_mapped_other_than_rw_is_l5() {
     assert_deny_exactly("console_perms_deny", &["L5: console mr 'uart' is mapped into pd 'audit' with perms other than rw"]);
 }
 
+// --- M5 plan C9: the tpm role (L1 and L5 as amended, S14 seeding, L13) ---
+
+#[test]
+fn key_pds_calling_an_untainted_tpm_on_the_tis_page_are_allowed() {
+    // tpm has no explicit budget: a TIS page that seeded taint would make
+    // that an L13 finding.
+    assert_allow("tpm_allow");
+}
+
+#[test]
+fn a_tainted_tpm_is_l1() {
+    assert_deny_exactly(
+        "tpm_tainted_deny",
+        &[
+            "L1: channel between key pd 'key' and 'nic' does not meet the key exemption \
+             (peer pp=true, key pp=false, peer notify=false, key maps only the secrets mr)",
+            "L1: tainted pd 'key' maps secrets mr 'secrets'",
+            "L1: tpm pd 'tpm' is tainted",
+            "L13: tainted pd 'key' needs an explicit budget < period",
+            "L13: tainted pd 'tpm' needs an explicit budget < period",
+        ],
+    );
+}
+
+#[test]
+fn a_tpm_mapping_a_non_device_mr_is_l1() {
+    assert_deny_exactly("tpm_non_device_mr_deny", &["L1: tpm pd 'tpm' maps mr 'scratch', not just its TIS mr"]);
+}
+
+#[test]
+fn a_second_pp_channel_from_a_key_pd_is_l1() {
+    assert_deny_exactly(
+        "tpm_key_second_pp_deny",
+        &["L1: key pd 'key' has 2 channels with pp=true on its own end, at most one (to a tpm pd)"],
+    );
+}
+
+#[test]
+fn a_tpm_channel_to_a_non_key_pd_is_l1() {
+    assert_deny_exactly("tpm_channel_non_key_deny", &["L1: tpm pd 'tpm' has a channel to 'hs', which is not a key pd"]);
+}
+
+#[test]
+fn a_tpm_calling_out_is_l1() {
+    assert_deny_exactly(
+        "tpm_pp_deny",
+        &["L1: tpm pd 'tpm' has pp=true on its channel to 'key'; it is a callee only"],
+    );
+}
+
+#[test]
+fn a_tpm_owning_a_non_tis_device_is_l5() {
+    assert_deny_exactly("tpm_non_tis_device_deny", &["L5: tpm pd 'tpm' owns device mr 'nic', which is not the TIS mr"]);
+}
+
+#[test]
+fn a_tpm_not_above_key_is_l13() {
+    assert_deny_exactly("tpm_priority_deny", &["L13: pd 'key' (priority 2) must be strictly below pd 'tpm' (priority 2)"]);
+}
+
+#[test]
+fn a_tpm_mr_off_the_tis_page_is_l5_and_seeds_taint() {
+    assert_deny_exactly(
+        "tpm_not_tis_deny",
+        &[
+            "L1: tainted pd 'key' maps secrets mr 'secrets'",
+            "L1: tpm pd 'tpm' is tainted",
+            "L5: tpm mr 'tis' is pinned at phys_addr=0xc001000/size=0x1000, not the TIS page \
+             (phys_addr=0xc000000/size=0x1000)",
+            "L13: tainted pd 'key' needs an explicit budget < period",
+            "L13: tainted pd 'tpm' needs an explicit budget < period",
+        ],
+    );
+}
+
 /// Regression test against the real files (not a frozen fixture): keeps
 /// `policy/laws.toml` honest as `system/secureos.system` grows, since C2
 /// wires `laws check` into `make image` against exactly these two paths.
