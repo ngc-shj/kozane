@@ -279,13 +279,15 @@ fuzz-long:
 # advisory-db (tools/audit-gate; exceptions in policy/audit-ignore.toml).
 audit: | $(counts)
 	tools/audit-gate > $(counts)/audit.log 2>&1 || { cat $(counts)/audit.log; exit 1; }
+	# The release tool's own workspace (M5 plan C13) is checked too.
+	tools/audit-gate --lock tools/release/Cargo.lock --ignore policy/audit-ignore-release.toml > $(counts)/audit-release.log 2>&1 || { cat $(counts)/audit-release.log; exit 1; }
 	grep '^AUDIT-ADVISORIES' $(counts)/audit.log > $(counts)/audit
 
 laws: | $(counts)
 	cargo run --locked -q -p laws -- check --system $(system) --policy $(policy) --search-path $(BUILD) --no-elf-check
 	echo "LAWS-SYSTEMS 1" > $(counts)/laws
 
-pins: | $(counts)
+pins: release-tool | $(counts)
 	tools/check-pins > $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_check_pins.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_check_selftest.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
@@ -305,8 +307,12 @@ pins: | $(counts)
 	python3 tests/tools/test_verus_pairing.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_mir_gate.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_measure.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	python3 tests/tools/test_release.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	cargo test --locked --manifest-path tools/release/Cargo.toml --target-dir $(BUILD)/release/target \
+		> $(counts)/release-unit.log 2>&1 || { cat $(counts)/release-unit.log; exit 1; }
+	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-RELEASE-TOOL", n + 0 }' $(counts)/release-unit.log >> $(counts)/pins.log
 	tools/verus-pairing >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES|UNIT-COUNTS-FIXTURES|PROOF-LOCK-FIXTURES|VERUS-PAIRING-FIXTURES|VERUS-PAIRED|MIR-GATE-FIXTURES|MEASURE-FIXTURES)' $(counts)/pins.log > $(counts)/pins
+	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES|UNIT-COUNTS-FIXTURES|PROOF-LOCK-FIXTURES|VERUS-PAIRING-FIXTURES|VERUS-PAIRED|MIR-GATE-FIXTURES|MEASURE-FIXTURES|RELEASE-FIXTURES|UNIT-RELEASE-TOOL)' $(counts)/pins.log > $(counts)/pins
 
 # Builds its own deployment (fresh keys, generated config, release package);
 # see run.py. Packaging a release kernel needs the C9 pass record, hence
@@ -340,6 +346,24 @@ $(BUILD)/u-boot-%/u-boot.bin: support/u-boot/secureos.config support/u-boot/boot
 	tools/uboot-config verify $(BUILD)/u-boot-$*/secureos.frag $(BUILD)/u-boot-$*/.config
 	SOURCE_DATE_EPOCH=0 env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/u-boot-$* -j$$(nproc) >> $(BUILD)/u-boot-$*.log 2>&1 \
 		|| { tail -30 $(BUILD)/u-boot-$*.log; exit 1; }
+
+# M5 plan C13: hybrid-signed releases with dev keys (residual RM5-1).
+#   make release-keys KEYS=<new dir outside the repo and cache volumes>
+#   make release KEYS=<dir> PKG=<package OUT> OUT=<new dir>
+#   make release-verify PUB=<keys dir> REL=<release dir> [ENVELOPE=<file> KIND=key|pq]
+release_bin := $(BUILD)/release/target/release/release
+.PHONY: release-tool release-keys release release-verify
+release-tool:
+	cargo build --locked --release --manifest-path tools/release/Cargo.toml --target-dir $(BUILD)/release/target
+release-keys: release-tool
+	test -n "$(KEYS)" || { echo "release-keys: set KEYS=<dir>"; exit 1; }
+	$(release_bin) keygen --dir $(KEYS) --forbid $(CURDIR) --forbid $(HOME)/.cargo/registry
+release: release-tool
+	test -n "$(KEYS)" -a -n "$(PKG)" -a -n "$(OUT)" || { echo "release: set KEYS= PKG= OUT="; exit 1; }
+	python3 tools/release.py make --keys $(KEYS) --pkg $(PKG) --out $(OUT)
+release-verify: release-tool
+	test -n "$(PUB)" -a -n "$(REL)" || { echo "release-verify: set PUB= REL="; exit 1; }
+	python3 tools/release.py verify --pub $(PUB) --release $(REL) $(if $(ENVELOPE),--envelope $(ENVELOPE) --kind $(KIND))
 
 # M5 plan C4: the MIR each PD ships from a verified crate equals the MIR the
 # proof configuration compiles (tools/mir-gate).

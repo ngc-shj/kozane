@@ -425,3 +425,25 @@ fn seal_refuses_a_blob_of_the_other_kind_a_bad_pcr8_and_a_bad_srk_file() {
     let e = seal_file(Kind::Key, &key, srk_public(&other).unwrap(), &pcr).unwrap_err();
     assert!(e.contains("SrkPublic"), "{e}");
 }
+
+/// C12: the release verifier's envelope check. Allow: sealed to the
+/// manifest's PCR 8. Deny: another PCR 8, the other kind, a header policy
+/// that differs from the object public's.
+#[test]
+fn check_envelope_accepts_its_own_pcr8_only() {
+    let s = Scratch::new("check-envelope");
+    let (key, _, _) = blob_files(&s);
+    let srk = srk_tpm2b();
+    let pcr = pcr8(PCR8_HEX).unwrap();
+    let env = seal_file(Kind::Key, &key, srk_public(&srk).unwrap(), &pcr).unwrap();
+    assert_eq!(envelope_sealed_to(&env, Kind::Key, &pcr), Ok(()));
+    let mut other = pcr;
+    other[0] ^= 1;
+    assert_eq!(envelope_sealed_to(&env, Kind::Key, &other), Err("the envelope's sealed object enforces another PCR 8".into()));
+    assert!(envelope_sealed_to(&env, Kind::Pq, &pcr).is_err());
+    let policy = tpm2::crypto::policy_digest(&pcr);
+    let at = env.windows(32).position(|w| w == policy).expect("header policy copy");
+    let mut tampered = env.clone();
+    tampered[at] ^= 1;
+    assert!(envelope_sealed_to(&tampered, Kind::Key, &pcr).is_err());
+}

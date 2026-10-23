@@ -538,10 +538,52 @@ fn run_seal(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// M5 plan C12: the envelope's sealed object enforces this PCR 8. The
+/// policy is the object public's authPolicy, the one the TPM enforces (S15);
+/// `Envelope::parse` already refuses a header copy that disagrees with it,
+/// attributes other than the sealed object's (userWithAuth clear) and a PCR
+/// selection other than {8}/sha256.
+fn envelope_sealed_to(bytes: &[u8], kind: Kind, pcr8: &[u8; 32]) -> Result<(), String> {
+    let envelope = tpm2::envelope::Envelope::parse(bytes, kind).map_err(|e| format!("envelope: {e:?}"))?;
+    if envelope.object_policy() != &tpm2::crypto::policy_digest(pcr8) {
+        return Err("the envelope's sealed object enforces another PCR 8".into());
+    }
+    Ok(())
+}
+
+fn run_check_envelope(args: &[String]) -> Result<(), String> {
+    let (mut kind, mut envelope, mut pcr) = (None, None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--kind" => {
+                kind = Some(match value()?.as_str() {
+                    "key" => Kind::Key,
+                    "pq" => Kind::Pq,
+                    other => return Err(format!("--kind: {other} is not key or pq")),
+                })
+            }
+            "--envelope" => envelope = Some(PathBuf::from(value()?)),
+            "--pcr8" => pcr = Some(pcr8(&value()?)?),
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    let (Some(kind), Some(envelope), Some(pcr)) = (kind, envelope, pcr) else {
+        return Err("usage: mksecrets check-envelope --kind key|pq --envelope FILE --pcr8 HEX".into());
+    };
+    let bytes = std::fs::read(&envelope).map_err(|e| format!("{}: {e}", envelope.display()))?;
+    envelope_sealed_to(&bytes, kind, &pcr)?;
+    let pcr_hex: String = pcr.iter().map(|b| format!("{b:02x}")).collect();
+    println!("mksecrets: {} is sealed to PCR 8 {pcr_hex}", envelope.display());
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((mode, rest)) if mode == "seal" => run_seal(rest),
+        Some((mode, rest)) if mode == "check-envelope" => run_check_envelope(rest),
         _ => run(&args),
     };
     match result {

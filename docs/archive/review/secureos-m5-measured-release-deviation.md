@@ -810,3 +810,59 @@ only), `make test` (`INTEGRATION-CASES 44`), and every selftest case.
   primary tree, whose next release build failed. `tools/repro` now removes
   the PD target directory on every exit, so the next primary build is cold
   (about 30 s).
+
+## Slice 8 — signed releases (C13) and the release verifier (C12)
+
+### Result
+
+- **`tools/release`** is a host tool in its own workspace and lock, built
+  by `make release-tool`. It has four subcommands: `keygen`, `render`,
+  `sign` and `verify`.
+  - **Signatures:** Ed25519 (libcrux-ed25519 0.0.10) and ML-DSA-65
+    (libcrux-ml-dsa 0.0.11, empty context), both over
+    `"secureos-release-v1\0" || manifest`. A release verifies only when both
+    do.
+  - **Manifest parser:** it accepts only the canonical form: the exact key
+    set, sorted, each key once, printable ASCII values, LF line ends.
+  - **Tests:** 14 unit tests (`UNIT-RELEASE-TOOL 14`). They cover a valid
+    release, a flipped manifest byte, each signature invalid alone, a
+    missing line, another key, the domain prefix, and duplicate, unknown,
+    missing and unsorted keys, CRLF, a missing final LF and uppercase hex.
+  - **Red-proof:** an OR-verification mutant (on a copy) turns both
+    single-signature tests red.
+- **`tools/release.py`** builds and checks releases.
+  - **`make`:** builds the manifest from a package's public outputs. It
+    recomputes PCR 8 with `tools/measure.py`, which must equal the
+    package's `pcr8`, and refuses a tree with uncommitted changes to tracked
+    files. It then signs and ships `published.img` and `boot.desc` beside
+    the manifest.
+  - **`verify`:** checks both signatures, then recomputes both digests and
+    PCR 8 from the shipped files. With `--envelope`, it also checks that the
+    envelope's sealed object enforces the signed PCR 8 (C12).
+  - **Tests:** `RELEASE-FIXTURES 8`, end to end with ephemeral keys. They
+    cover allow, the image or descriptor changed after signing, an edited
+    manifest, another key, a disagreeing package `pcr8`, an existing OUT,
+    and keys inside the repo.
+- **Make targets:** `release-keys`, `release` and `release-verify`. The key
+  directory is refused under the repo or the cargo registry volume, created
+  0700, and its private files are 0600 (RM5-1: dev keys).
+
+### Deviations
+
+- **The envelope check is `mksecrets check-envelope`, not part of the
+  release tool.** The release tool cannot link `tpm2`:
+  - libcrux-ml-dsa's `tls_codec` requires `zeroize ^1.9`;
+  - `tpm2` pins `zeroize =1.8.1`, the version mce460896's P16 closure
+    fixes.
+
+  mksecrets already links `tpm2`, so the check uses the PDs' own envelope
+  parser. The policy compared is the object public's authPolicy. `parse`
+  already refuses a header copy that differs, other attributes and another
+  PCR selection (S15). One unit test covers allow, another PCR 8, the
+  other kind and a tampered header policy (`UNIT-MKSECRETS 26`).
+- **The manifest's `dev_image` is `dockerfile-sha256:<hex>`** of the pinned
+  recipe. The image digest is not visible from inside the container.
+- **`make audit` also checks `tools/release/Cargo.lock`**, with its own
+  exception file, `policy/audit-ignore-release.toml`. Its one entry is the
+  same build-time `proc-macro-error2` the root lock already excepts
+  (through libcrux's hax-lib-macros).

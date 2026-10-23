@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+"""Signed releases and their verification (M5 plan C13, C12).
+
+  release.py make --keys DIR --pkg DIR --out DIR [--version V] [--allow-dirty]
+  release.py verify --pub DIR --release DIR [--envelope FILE --kind key|pq]
+
+`make` writes OUT/{manifest, manifest.sig, published.img, boot.desc}. The
+manifest's image and descriptor digests and its PCR 8 come from the files it
+ships, PCR 8 through tools/measure.py (the one host model of the boot
+command), and must agree with the package's own pcr8. A tree with
+uncommitted changes to tracked files is refused: the commit a release names
+must be the tree it was built from.
+
+`verify` checks both signatures (tools/release), then recomputes every digest
+and PCR 8 from the shipped files and compares them with the signed fields;
+with --envelope it also checks that the envelope's sealed object enforces the
+signed PCR 8 (`mksecrets check-envelope`, the PDs' own parser).
+
+Control class: fail-closed verification gate; a missing file, a failing tool
+or any disagreement is a refusal.
+"""
+
+import argparse
+import hashlib
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+import measure  # noqa: E402
+
+RELEASE_BIN = ROOT / "build/release/target/release/release"
+
+
+class Refused(Exception):
+    pass
+
+
+def sha256(path: pathlib.Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def tool(*args, capture=True) -> str:
+    r = subprocess.run([str(RELEASE_BIN), *args], cwd=ROOT, capture_output=capture, text=True)
+    if r.returncode != 0:
+        raise Refused((r.stderr or r.stdout or "").strip() or f"tools/release {args[0]} failed")
+    return r.stdout
+
+
+def git(*args) -> str:
+    return subprocess.run(["git", *args], cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def versions() -> dict:
+    verus = (pathlib.Path("/opt/verus/SOURCE").read_text().strip() if pathlib.Path("/opt/verus/SOURCE").exists()
+             else "absent")
+    kani = subprocess.run(["cargo", "kani", "--version"], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+    return {"verus": verus, "kani": kani.split()[-1] if kani else "absent"}
+
+
+def make(a) -> None:
+    pkg, out = pathlib.Path(a.pkg), pathlib.Path(a.out)
+    if out.exists():
+        raise Refused(f"{out} already exists")
+    image, desc = pkg / "published.img", pkg / "boot.desc"
+    pcr8 = measure.expected_pcr8(desc.read_bytes(), image.read_bytes()).hex()
+    if (pkg / "pcr8").read_text().strip() != pcr8:
+        raise Refused("the package's pcr8 differs from tools/measure.py's")
+    if git("status", "--porcelain", "--untracked-files=no") and not a.allow_dirty:
+        raise Refused("the tree has uncommitted changes; a release must name the commit it was built from")
+    fields = {
+        "version": a.version,
+        "commit": git("rev-parse", "HEAD"),
+        # The dev image is identified by its pinned recipe: its digest is not
+        # visible from inside the container.
+        "dev_image": "dockerfile-sha256:" + sha256(ROOT / "docker/Dockerfile"),
+        "loader_img_sha256": sha256(image),
+        "boot_desc_sha256": sha256(desc),
+        "pcr8": pcr8,
+        "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),
+        **versions(),
+    }
+    manifest = tool("render", *(f"{k}={v}" for k, v in fields.items()))
+    out.mkdir(mode=0o755)
+    (out / "manifest").write_text(manifest)
+    tool("sign", "--keys", a.keys, "--manifest", str(out / "manifest"), "--out", str(out / "manifest.sig"))
+    shutil.copyfile(image, out / "published.img")
+    shutil.copyfile(desc, out / "boot.desc")
+    print(f"release: wrote {out}")
+
+
+def verify(a) -> None:
+    rel = pathlib.Path(a.release)
+    printed = tool("verify", "--pub", a.pub, "--manifest", str(rel / "manifest"), "--sig", str(rel / "manifest.sig"))
+    fields = dict(line.split("=", 1) for line in printed.splitlines() if "=" in line)
+    image, desc = rel / "published.img", rel / "boot.desc"
+    want = {
+        "loader_img_sha256": sha256(image),
+        "boot_desc_sha256": sha256(desc),
+        "pcr8": measure.expected_pcr8(desc.read_bytes(), image.read_bytes()).hex(),
+    }
+    for key, value in want.items():
+        if fields.get(key) != value:
+            raise Refused(f"{key}: the shipped files give {value}, the signed manifest says {fields.get(key)}")
+    if a.envelope:
+        r = subprocess.run(["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "check-envelope",
+                            "--kind", a.kind, "--envelope", a.envelope, "--pcr8", fields["pcr8"]],
+                           cwd=ROOT, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise Refused(r.stderr.strip() or "mksecrets check-envelope failed")
+    print("release: verified" + (" (envelope sealed to its PCR 8)" if a.envelope else ""))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    m = sub.add_parser("make")
+    m.add_argument("--keys", required=True)
+    m.add_argument("--pkg", required=True)
+    m.add_argument("--out", required=True)
+    m.add_argument("--version", default="m5-dev")
+    m.add_argument("--allow-dirty", action="store_true")
+    v = sub.add_parser("verify")
+    v.add_argument("--pub", required=True)
+    v.add_argument("--release", required=True)
+    v.add_argument("--envelope")
+    v.add_argument("--kind", choices=("key", "pq"))
+    a = ap.parse_args()
+    if a.cmd == "verify" and bool(a.envelope) != bool(a.kind):
+        ap.error("--envelope and --kind go together")
+    try:
+        (make if a.cmd == "make" else verify)(a)
+    except (Refused, measure.DescriptorError, OSError) as e:
+        print(f"release: refused: {e}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

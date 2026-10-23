@@ -1,0 +1,11 @@
+# RustSec exceptions for tools/release/Cargo.lock (M5 plan C13): none.
+# Same format as audit-ignore.toml; an unused exception fails the gate.
+
+# The same build-time proc-macro as the root lock's entry, through libcrux's
+# hax-lib-macros (libcrux-intrinsics, under libcrux-ml-dsa); no code from it
+# reaches the release tool's output.
+[[ignore]]
+id = "RUSTSEC-2026-0173"
+crate = "proc-macro-error2"
+reason = "unmaintained; proc-macro used at build time by libcrux hax-lib-macros, no runtime code"
+owner = "M5"
