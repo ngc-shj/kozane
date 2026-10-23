@@ -307,5 +307,9 @@ COPY --from=advisory-db /opt/advisory-db /opt/advisory-db
 ARG VERUS_RUST=1.98.1
 RUN rustup toolchain install "$VERUS_RUST" --profile minimal --component rustc-dev,llvm-tools
 COPY --from=verus /opt/verus /opt/verus
+# The sources of Verus's syn and prettyplease forks, beside the other
+# verified sources, for the C5 pairing check (M5 plan C5).
+COPY --from=verus /src/verus/dependencies/syn /opt/verus/syn
+COPY --from=verus /src/verus/dependencies/prettyplease /opt/verus/prettyplease
 
 WORKDIR /work

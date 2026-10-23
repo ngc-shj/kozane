@@ -136,3 +136,64 @@
   `stub_sc20` fixture mechanism is gone, because a release config now
   passes C7 on its own. check-selftest's `package-release` case is now
   `package-debug`: the default debug config is refused.
+
+## Slice 4a — Verus macro/vstd pairing (C5)
+
+### Result
+
+The pairing failed on content, not just on the manifest. The plan said not
+to pre-accept a content difference, and it is resolved structurally.
+
+- **What differed.** crates.io's `vstd` 2026-10-04 was published from Verus
+  919cc9d. Its `verus_builtin_macros` 2026-09-20 came from 3204118, and
+  `verus_builtin`, `verus_syn`, `verus_prettyplease` and
+  `verus_state_machines_macros` from older commits. None of them matches the
+  image's Verus, 426d8b0:
+  - four `vstd` files differ;
+  - `builtin_macros/src/attr_rewrite.rs` and `contrib/hooks.rs` differ in
+    closure-capture code under `erase.keep()`.
+
+  So since M4, the shipped build compiled macro and library sources that
+  were never the ones Verus verified with.
+- **The fix.** The six crates are vendored under `third_party/verus/<name>`
+  and patched in by the root `Cargo.toml`. Each vendored crate is
+  crates.io's packaging (its normalised `Cargo.toml`, `.cargo_vcs_info.json`
+  and README) with the 426d8b0 sources over it.
+  - **Why not patch to `/opt/verus` directly:** those manifests inherit from
+    the Verus source workspace, which excludes them, so cargo cannot
+    resolve them.
+  - **The image adds** `/opt/verus/syn` and `/opt/verus/prettyplease`, so
+    all six image trees exist.
+  - **Not vendored:** directories cargo never compiles for a dependency
+    (`tests/`, `examples/`, `benches/`, `cargo-expand/`, `codegen/`). The
+    policy lists them as `image_only`, and neither side's copy of them is
+    compared. This keeps the vendored tree at 6.4 MB instead of 13 MB.
+- **The gate.** `tools/verus-pairing` is a fail-closed gate run under
+  `make pins`. Each Cargo.lock `vstd`/`verus_*` package must:
+  - be a path source;
+  - be patched to `third_party/verus/<name>` in the root `Cargo.toml`;
+  - be listed in `policy/verus-pairing.toml`;
+  - equal its image tree file by file (`VERUS-PAIRED 6`).
+
+  The fixtures cover one changed byte, an extra file, a missing file, a
+  registry source, a patch pointing elsewhere, an unlisted member, a
+  missing tree on either side, a stale policy entry, and the `image_only`
+  prefix semantics (`VERUS-PAIRING-FIXTURES 12`).
+- **Verus is unchanged** with the vendored crates: 278 functions, four
+  crates under `--no-cheating`, the same counts as M4.
+
+### Deviations
+
+- **check-pins P12 and P16 narrowed for the vendored crates.**
+  - **P16:** it refused any workspace `[patch]`. It now permits exactly one
+    shape: `[patch.crates-io]` entries for `vstd`/`verus_*`, each
+    `{ path = "third_party/verus/<name>" }`. None of these is in
+    mce460896's closure. Other keys, other paths, git sources, other
+    registries and `[replace]` stay refused; four fixtures were added
+    (`CHECK-PINS-FIXTURES 213`).
+  - **P12:** the vendored Verus crates are no longer counted as workspace
+    crates that depend on Verus.
+- **Proof cache keys include the vendored sources.** Path packages outside
+  the workspace have no Cargo.lock checksum, so `kani-gate.sh` and
+  `verus-gate.sh` now hash their directories too. A change to a vendored
+  macro therefore re-runs every proof.

@@ -41,6 +41,13 @@ while todo:
     seen.add(n)
     print(os.path.relpath(os.path.dirname(pkgs[n]["manifest_path"])))
     todo += [d["name"] for d in pkgs[n]["dependencies"] if d.get("path")]
+# Path packages outside the workspace (the vendored Verus crates, patched in
+# by the root Cargo.toml) carry no registry checksum in Cargo.lock, so their
+# sources must enter the key themselves (M5 plan C5).
+if seen:
+    for p in sorted(meta["packages"], key=lambda p: p["name"]):
+        if p["source"] is None and p["id"] not in ws:
+            print(os.path.relpath(os.path.dirname(p["manifest_path"])))
 ' "$crate")
 crate_dir=$(printf '%s\n' "$dirs" | head -1)
 if [ -z "$crate_dir" ]; then

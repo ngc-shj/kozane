@@ -33,3 +33,13 @@ opt-level = 3
 
 [profile.dev.package.mce460896]
 opt-level = 3
+
+# The Verus crates are built from the sources the dev image's Verus verified
+# with (M5 plan C5; tools/verus-pairing checks them file by file).
+[patch.crates-io]
+vstd = { path = "third_party/verus/vstd" }
+verus_builtin = { path = "third_party/verus/verus_builtin" }
+verus_builtin_macros = { path = "third_party/verus/verus_builtin_macros" }
+verus_state_machines_macros = { path = "third_party/verus/verus_state_machines_macros" }
+verus_syn = { path = "third_party/verus/verus_syn" }
+verus_prettyplease = { path = "third_party/verus/verus_prettyplease" }

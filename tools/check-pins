@@ -46,7 +46,8 @@ Rules:
      name the packages sha3 and zeroize (by `package`, not key), from the
      registry, with default features off and no features named, and it has
      no build- or target-specific dependency table; the workspace has no
-     [patch] or [replace], nor .cargo/config(.toml) a [patch] or [source]
+     [replace] and no [patch] except crates.io's vstd/verus_* crates, each
+     to path third_party/verus/<name> (M5 plan C5), nor .cargo/config(.toml) a [patch] or [source]
      replacement, nor mce460896 a [features] table, nor any other member a
      sha3/zeroize with features (they unify); and the lock's closure of
      the two is exactly MCE_CLOSURE (M4 plan C7). The lock stands for
@@ -367,8 +368,10 @@ def check_verus_trusted(root: pathlib.Path, out: list):
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
         lock = {}  # P6 reports it
     verus_deps = {"vstd", "verus_builtin", "verus_builtin_macros", "verus_state_machines_macros"}
+    # The vendored Verus crates themselves (M5 plan C5) depend on each other.
     dependents = {p.get("name") for p in lock.get("package", [])
-                  if "source" not in p and verus_deps & {d.split()[0] for d in p.get("dependencies", [])}}
+                  if "source" not in p and not VERUS_VENDORED.match(p.get("name", ""))
+                  and verus_deps & {d.split()[0] for d in p.get("dependencies", [])}}
     if lock and crates:
         for name in sorted(dependents - set(crates)):
             out.append(f"P12 Cargo.lock: {name} depends on a Verus crate but is not in verus_crates")
@@ -430,6 +433,8 @@ MCE_CLOSURE = {"block-buffer@0.10.4", "cpufeatures@0.2.17", "crypto-common@0.1.7
                "generic-array@0.14.7", "keccak@0.1.6", "libc@0.2.191", "sha3@0.10.9", "typenum@1.20.1",
                "version_check@0.9.5", "zeroize@1.8.1"}
 REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
+# The Verus crates vendored under third_party/verus (M5 plan C5).
+VERUS_VENDORED = re.compile(r"^(vstd|verus_[a-z_]+)$")
 
 
 def check_mce_deps(root: pathlib.Path, out: list):
@@ -507,9 +512,18 @@ def check_mce_deps(root: pathlib.Path, out: list):
                 if m and (m.group(1) in guarded or m.group(1) in ("sha3", "zeroize")):
                     out.append(f"P16 {rel}: feature {feature} turns on {e}, which unifies into mce460896")
     ws = tomllib.loads((root / "Cargo.toml").read_text())
-    for table in ("patch", "replace"):
-        if table in ws:
-            out.append(f"P16 Cargo.toml: [{table}] can redirect mce460896's dependencies")
+    if "replace" in ws:
+        out.append("P16 Cargo.toml: [replace] can redirect mce460896's dependencies")
+    # The one permitted [patch] (M5 plan C5): crates.io's Verus crates, each to
+    # its vendored copy. None of them is in mce460896's closure.
+    for registry, entries in ws.get("patch", {}).items():
+        for key, spec in (entries.items() if isinstance(entries, dict) else []):
+            vendored = registry == "crates-io" and VERUS_VENDORED.match(key) \
+                and spec == {"path": f"third_party/verus/{key}"}
+            if not vendored:
+                out.append(f"P16 Cargo.toml: [patch.{registry}] {key} can redirect mce460896's dependencies")
+        if not isinstance(entries, dict):
+            out.append(f"P16 Cargo.toml: [patch.{registry}] is not a table")
     # A config [patch] would show in the lock; source replacement would not.
     for config in (root / ".cargo/config.toml", root / ".cargo/config"):
         if not config.is_file():

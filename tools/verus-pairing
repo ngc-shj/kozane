@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""The Verus crates the shipped build compiles equal the sources the dev
+image's Verus verified with (M5 plan C5; closes M4 code review S11).
+
+The member set is every Cargo.lock package named `vstd` or `verus_*`. Each
+member must:
+  - resolve to third_party/verus/<name>: a path source in Cargo.lock (no
+    registry checksum) that the root Cargo.toml's [patch.crates-io] points
+    there, so the build cannot silently fall back to crates.io;
+  - be listed in policy/verus-pairing.toml with its tree in the image;
+  - equal that tree file by file, except for the packaging files the policy
+    lists as vendor_only and the never-compiled directories it lists as
+    image_only.
+
+Control class: fail-closed verification gate; adjudication is byte equality
+of the files and Cargo.lock's own record of each package's source. A missing
+image tree, an unreadable file or an unlisted member is a refusal.
+
+Usage: tools/verus-pairing [--root DIR] [--image-root DIR]
+Prints "VERUS-PAIRED <n>" and exits 0 only when every member pairs.
+"""
+
+import argparse
+import hashlib
+import pathlib
+import re
+import sys
+import tomllib
+
+MEMBER = re.compile(r"^(vstd|verus_[a-z_]+)$")
+
+
+def lock_packages(lock_text: str) -> dict:
+    """name -> list of source strings ("" for a path source)."""
+    out = {}
+    for pkg in tomllib.loads(lock_text).get("package", []):
+        out.setdefault(pkg["name"], []).append(pkg.get("source", ""))
+    return out
+
+
+def tree(root: pathlib.Path) -> dict:
+    """relative path -> sha256 of every regular file under root."""
+    files = {}
+    for p in sorted(root.rglob("*")):
+        if p.is_symlink():
+            raise OSError(f"{p}: symlink in a compared tree")
+        if p.is_file():
+            files[p.relative_to(root).as_posix()] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return files
+
+
+def check(root: pathlib.Path, image_root_override=None) -> tuple:
+    errors = []
+    try:
+        policy = tomllib.loads((root / "policy/verus-pairing.toml").read_text())
+        packages = lock_packages((root / "Cargo.lock").read_text())
+        patches = tomllib.loads((root / "Cargo.toml").read_text()).get("patch", {}).get("crates-io", {})
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        return [f"verus-pairing: {e}"], 0
+    crates = policy.get("crates", {})
+    vendor_only = set(policy.get("vendor_only", []))
+    image_only = tuple(policy.get("image_only", []))
+    image_root = pathlib.Path(image_root_override or policy.get("image_root", ""))
+    members = sorted(n for n in packages if MEMBER.match(n))
+    if not members:
+        return ["verus-pairing: Cargo.lock has no vstd/verus_* package; nothing to check"], 0
+    paired = 0
+    for name in members:
+        if packages[name] != [""]:
+            errors.append(f"verus-pairing: {name}: Cargo.lock resolves it from {packages[name]}, not third_party/verus")
+            continue
+        want_path = f"third_party/verus/{name}"
+        if not isinstance(patches.get(name), dict) or patches[name].get("path") != want_path:
+            errors.append(f"verus-pairing: {name}: the root Cargo.toml does not patch it to {want_path}")
+            continue
+        if name not in crates:
+            errors.append(f"verus-pairing: {name}: no entry in policy/verus-pairing.toml")
+            continue
+        vendored, image = root / "third_party/verus" / name, image_root / crates[name]
+        if not vendored.is_dir():
+            errors.append(f"verus-pairing: {name}: third_party/verus/{name} is missing")
+            continue
+        if not image.is_dir():
+            errors.append(f"verus-pairing: {name}: image tree {image} is missing")
+            continue
+        try:
+            got, want = tree(vendored), tree(image)
+        except OSError as e:
+            errors.append(f"verus-pairing: {name}: {e}")
+            continue
+        bad = False
+        for rel in sorted(set(got) | set(want)):
+            if rel in vendor_only or rel.startswith(image_only):
+                continue
+            if rel not in want:
+                errors.append(f"verus-pairing: {name}: {rel} is only in the vendored copy")
+            elif rel not in got:
+                errors.append(f"verus-pairing: {name}: {rel} is missing from the vendored copy")
+            elif got[rel] != want[rel]:
+                errors.append(f"verus-pairing: {name}: {rel} differs from the verified source")
+            else:
+                continue
+            bad = True
+        paired += not bad
+    for name in sorted(set(crates) - set(members)):
+        errors.append(f"verus-pairing: {name}: listed in the policy but not in Cargo.lock")
+    return errors, paired
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--root", default=pathlib.Path(__file__).resolve().parents[1], type=pathlib.Path)
+    ap.add_argument("--image-root", type=pathlib.Path)
+    args = ap.parse_args()
+    errors, paired = check(args.root, args.image_root)
+    for e in errors:
+        print(e)
+    print(f"VERUS-PAIRED {paired}")
+    return 1 if errors else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,25 @@
+# M5 plan C5: every Verus crate the shipped build compiles is vendored under
+# third_party/verus/<name> (patched in by the root Cargo.toml) and must equal
+# the source tree the dev image's Verus verified with, file by file.
+#
+# [crates] maps the crate name to that tree in the image. Only the files in
+# vendor_only may exist in the vendored copy alone: they are the crates.io
+# packaging of the crate (its normalised manifest, which resolves the Verus
+# workspace inheritance the image tree uses), not code.
+
+image_root = "/opt/verus"
+
+# Directories cargo never compiles for a dependency (tests, examples,
+# benches, and the forks' own tooling). They are not vendored, and neither
+# side's copy is compared.
+image_only = ["tests/", "examples/", "benches/", "cargo-expand/", "codegen/"]
+
+vendor_only = ["Cargo.toml", "Cargo.toml.orig", "Cargo.lock", ".cargo_vcs_info.json", ".cargo-ok", "README.md"]
+
+[crates]
+vstd = "vstd"
+verus_builtin = "builtin"
+verus_builtin_macros = "builtin_macros"
+verus_state_machines_macros = "state_machines_macros"
+verus_syn = "syn"
+verus_prettyplease = "prettyplease"
