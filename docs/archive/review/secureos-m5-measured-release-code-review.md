@@ -619,3 +619,13 @@ are no new Critical or Major findings.
 - Action: recorded in the deviation log as a known limitation. U-Boot's
   bytes depend on the build host's architecture and toolchain as well as on
   its sources.
+
+# Round 6
+Date: 2026-10-24
+
+The security expert reviewed `12cd4cd..99e41f4` and resolved R5-S1 and
+R5-N1. The PCR regex matches `cmd/tpm-v2.c`'s header and
+`print_byte_string`'s two 16-byte lines (with the console's `\r\r\n`).
+Nothing on the measure path after the for loop polls Ctrl-C, and nothing
+else read `md.b`'s output. There are no new findings. No Critical, Major
+or Minor finding remains open.
