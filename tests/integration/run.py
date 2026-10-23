@@ -1475,8 +1475,12 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
                 raise Fail("measure variant printed no PCR 8 dump")
             return bytes.fromhex((dump.group(1) + dump.group(2)).replace(" ", "")), False
         finally:
-            with signals_held():
+            try:
+                with signals_held():
+                    kill(child)
+            except SystemExit:
                 kill(child)
+                raise
     finally:
         tpm.close()
 
