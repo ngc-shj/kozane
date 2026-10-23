@@ -1428,14 +1428,29 @@ def halt_reason(pd: str, name: str) -> int:
 def test_mismatched_blob(pkg: "Package"):
     """Under the release kernel nothing but `audit` prints (C6, C7): `key`
     stays up Unavailable, and `hs`'s boot-seed call, its first call to
-    `key`, is where the failure shows."""
+    `key`, is where the failure shows.
+
+    The envelope unseals and opens: only validation fails, after the unseal.
+    An Unavailable `key` holds no secret (M5 plan C6), so the opened blob's
+    gateway key must be gone from guest RAM, while pqkey, which booted, still
+    holds its own plaintext (the control, so the scan proves something)."""
     code = key_boot_code("GatewayKeyMismatch")
     reason = halt_reason("hs", "NO_BOOT_SEED")
+    deploy = os.path.dirname(pkg.dir)
+    with open(os.path.join(deploy, "secrets.bin"), "rb") as f:
+        gateway_private = f.read()[16:48]  # secret_blob: the header, then the gateway key
+    with open(os.path.join(os.path.dirname(deploy), "a", "pqkey-secrets.bin"), "rb") as f:
+        pq_plain = f.read()[1024:1088]  # inside the McEliece secret key
+    if not any(gateway_private) or not any(pq_plain):
+        raise Fail("mismatched blob: a needle is all zero; the scan would prove nothing")
+    monitor = os.path.join(deploy, "monitor.sock")
     child, con = boot(pkg, dgram("n0", free_udp_port(), free_udp_port()),
-                      dgram("n1", free_udp_port(), free_udp_port()))
+                      dgram("n1", free_udp_port(), free_udp_port()), monitor)
     try:
         m = con.wait_for(rf"audit: src=hs KeyUnavailable code={code} lost=\d+\r*\n", timeout=BOOT_TIMEOUT_S)
         con.wait_for(rf"audit: src=hs Halted reason={reason} lost=\d+\r*\n", since=m.end(), timeout=LINE_TIMEOUT_S)
+        scan_absent(Monitor(monitor), gateway_private, pq_plain, os.path.join(deploy, "pmem-b.bin"),
+                    "key's opened blob (an Unavailable key must hold no secret)", "pqkey's plaintext")
     finally:
         try:
             with signals_held():
@@ -1724,6 +1739,10 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
         child, con = boot_uboot(UBOOT_MEASURE, list(zip(paths, (measure.LOAD_IMAGE, measure.LOAD_DESC)
                                                               + measure.LOAD_ENVELOPES)), tpm)
         try:
+            # A Ctrl-C before the boot command starts waits in the UART for its
+            # first poll: with the lock (AUTOBOOT_KEYED) it is never read, so it
+            # cannot skip a check of the command either (S-BOOT-5, R3-N2).
+            child.send("\x03")
             m = con.wait_for(r"secureos: (measured|boot refused)\r*\n", timeout=BOOT_TIMEOUT_S)
             if m.group(1) == "boot refused":
                 # A refusal must end the boot: nothing runs after it, not
@@ -1739,8 +1758,12 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
                 while con.alive and time.monotonic() < deadline:
                     time.sleep(0.05)
                 after = con.text[m.end():]
+                # Two controls, each failing on its own: nothing runs after the
+                # refusal (the spin and the Ctrl-C lock), and U-Boot powers off.
                 if "secureos: measured" in after or re.search(r"(^|\n)=> ", after):
-                    raise Fail("measure_boot: U-Boot did not stop at its refusal")
+                    raise Fail("measure_boot: U-Boot ran past its refusal")
+                if con.alive:
+                    raise Fail("measure_boot: U-Boot did not power off after its refusal")
                 return None, True
             dump = PCR_DUMP.search(con.text, 0, m.start())
             if not dump:

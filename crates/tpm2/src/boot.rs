@@ -136,9 +136,11 @@ pub fn unseal(tpm: &mut impl Transport, envelope: &[u8], kind: Kind, out: &mut [
         Ok(client) => run(tpm, client, out, &mut rsp),
         Err(e) => Err(e),
     };
-    // The session key passed through libcrux's HMAC and KDF frames below
-    // this one, which do not wipe their own state (crypto.rs); clear that
-    // stack once the session is over, as open_sealed does for the KEK.
+    // The session's secrets passed through frames below this one that do not
+    // wipe their own state (crypto.rs): libcrux's P-256 ECDH in start (the
+    // ephemeral scalar and shared point) and its HMAC and KDF frames in run.
+    // Clear that stack once the session is over, as open_sealed does for the
+    // KEK.
     scrub_session_stack();
     let finish = if result.is_ok() { ipc::REQ_DONE } else { ipc::REQ_FAILED };
     let (label, _) = tpm.call(ipc::label(finish, 0), &[], &mut rsp);

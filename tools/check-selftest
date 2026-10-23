@@ -148,7 +148,7 @@ CASES_FOR_GATE = {
               "verus-msgs-exact", "verus-ring-mask", "verus-wire-ipv4"},
     "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire"},
     "laws": {"laws", "laws-timer-ingress", "laws-pq-key", "laws-hs-pqkey", "laws-pq-secrets-writable"},
-    "test": {"measure-twin", "measure-wrap", "measure-halt", "measure-ctrlc", "sealed-pcr-unbound", "sealed-srk-name", "sealed-cap", "tpm-proxy-hmac",
+    "test": {"measure-twin", "measure-wrap", "measure-halt", "measure-poweroff", "measure-ctrlc", "key-wipe", "sealed-pcr-unbound", "sealed-srk-name", "sealed-cap", "tpm-proxy-hmac",
              "integration", "integration-count", "integration-residue", "integration-cookie",
              "integration-pq-residue", "l8-fallback", "integration-rp-src-meter", "integration-rotation",
              "integration-expiry", "rp-cookie-gate", "integration-expiry-residue"},
@@ -592,15 +592,32 @@ CASES = {
     # to the next command; the measured-boot cases must see the boot go on.
     "measure-halt": (["test", "it_boots=measured boot"], lambda t: edit(
         t, "tools/uboot-config", 'HALT = "poweroff; while true; do true; done"\n', 'HALT = "true"\n'),
-        "measure_boot: U-Boot did not stop at its refusal"),
+        "measure_boot: U-Boot ran past its refusal"),
+    # S-BOOT-1: the power-off is its own control; without it the spin holds
+    # (nothing runs on) but U-Boot never stops.
+    "measure-poweroff": (["test", "it_boots=measured boot"], lambda t: edit(
+        t, "tools/uboot-config", 'HALT = "poweroff; while true; do true; done"\n',
+        'HALT = "while true; do true; done"\n'),
+        "measure_boot: U-Boot did not power off after its refusal"),
     # S-BOOT-5: a power-off that returns leaves the refusal spinning; without
     # AUTOBOOT_KEYED, the Ctrl-C measure_boot sends breaks the spin and the
     # boot goes on to measure.
+    # M5 plan C6 (review T3): without the wipe after a failed boot, the
+    # Unavailable key keeps the opened blob in guest RAM.
+    "key-wipe": (["test", "it_boots=mismatched blob halts key"], lambda t: edit(
+        t, "crates/pds/key/src/main.rs",
+        "    Oracle::boot(plain, &config::GATEWAY_PUBLIC, peers, &mut Hw).inspect_err(|_| {\n"
+        "        // SAFETY: the failed boot's borrow ended with its error, and nothing\n"
+        "        // reads the buffer again.\n"
+        "        unsafe { &mut *buf }.zeroize();\n"
+        "    })\n",
+        "    let _ = buf;\n    Oracle::boot(plain, &config::GATEWAY_PUBLIC, peers, &mut Hw)\n"),
+        "key's opened blob (an Unavailable key must hold no secret) still in guest RAM"),
     "measure-ctrlc": (["test", "it_boots=measured boot"], lambda t: (
         edit(t, "tools/uboot-config", 'HALT = "poweroff; while true; do true; done"\n',
              'HALT = "while true; do true; done"\n'),
         edit(t, "support/u-boot/secureos.config", "CONFIG_AUTOBOOT_KEYED=y\n", "")),
-        "measure_boot: U-Boot did not stop at its refusal"),
+        "measure_boot: U-Boot ran past its refusal"),
     "l8-fallback": (["test", "it_boots=wireguard"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                              "            Some(Entry::Absent) | None => Err(PskRefusal::Missing),",
                                              "            Some(Entry::Absent) | None => Ok(FreshPsk(Key32::from_bytes([0; 32]))),"),
