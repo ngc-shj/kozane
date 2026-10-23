@@ -197,3 +197,48 @@ to pre-accept a content difference, and it is resolved structurally.
   the workspace have no Cargo.lock checksum, so `kani-gate.sh` and
   `verus-gate.sh` now hash their directories too. A change to a vendored
   macro therefore re-runs every proof.
+
+## Slice 3 — reproducible build (C3)
+
+### Result
+
+`make repro` builds the release image twice and compares 13 artifacts
+(`REPRO-ARTIFACTS 13`): `loader.img`, `report.txt` and the 11 PD ELFs.
+The second build runs from a copy of the tree at another absolute path,
+from a cold PD target directory, and all 13 are byte-identical. It takes
+about 50 s on gx10 and is part of `make check`.
+
+The selftest case `repro-path-leak` is red with the failure-only needle
+`repro: pd-timer.elf differs between`. It appends a `#[used]` static
+holding `env!("CARGO_MANIFEST_DIR")` to the timer PD.
+
+### Deviations
+
+- **Two sources of path dependence, two fixes.**
+  1. **Source paths in panic locations.** The sel4-sys build-script
+     `OUT_DIR` and the workspace sources are absolute in panic locations.
+     Fixed by `--remap-path-prefix=$(CURDIR)=/secureos` in the PD
+     `RUSTFLAGS`.
+  2. **The ThinLTO symbol hash.** LLVM's local ThinLTO names promoted
+     symbols (`….llvm.<hash>`) with a hash that depends on the absolute
+     target directory, not on the source path. This was measured: two trees
+     built into one target directory are identical, and one tree built into
+     two target directories differs. The hash lands in `.strtab`, and from
+     there one byte of `loader.img`; the loaded sections were identical.
+     Fixed by a fixed PD target directory outside every tree:
+     `pd_target ?= $(HOME)/.cache/secureos/pd-target-<config>`.
+- **I3.1 holds with one stated input.** The published image does not
+  depend on the tree's path, but it does depend on `pd_target`, which the
+  Makefile fixes and which is the same in every dev container.
+- **`codegen-units = 1` was tried and rejected.** It removes ThinLTO
+  promotion and also made the image path-independent. But it re-inlines
+  mce460896's encaps shim and its carrier, which breaks M4's C10 shape
+  baseline (`expected one encaps shim ... found 0`). Taking it would have
+  meant a new ct-shape carrier rule, a re-baseline of about 100
+  justified function shapes, and a C9 re-run, all for a property the
+  fixed target directory gives without touching codegen.
+- **Trees share the PD target directory.** cargo's own lock on it
+  serialises concurrent builds, and switching trees rebuilds the workspace
+  crates (about 30 s). `make clean` removes it too.
+- **The cross-machine comparison** (gx10 against z1mn, same image and
+  commit) remains the manual end-of-milestone step the plan names.

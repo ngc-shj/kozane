@@ -28,7 +28,7 @@ host_crates := wire ring audit-event ingress-core inner-core layout laws config 
 kani_crates := wire ring ingress-core inner-core wg-wire msgs rosenpass-wire
 
 .PHONY: clean-counts
-.PHONY: all image package run test check check-selftest audit lint lint-pds unit kani verus ct ct-harness ct-shape bolero fuzz-long laws pins manifest kernel-config clean
+.PHONY: all image package run test check check-selftest repro audit lint lint-pds unit kani verus ct ct-harness ct-shape bolero fuzz-long laws pins manifest kernel-config clean
 all: image
 
 $(counts):
@@ -43,15 +43,25 @@ $(counts):
 pds:
 	$(foreach pd,$(pds),$(call build_pd,$(pd));)
 
+# The PD target directory is outside the tree and fixed per config: LLVM's
+# local ThinLTO names promoted symbols with a hash of the absolute output
+# path, so the image is reproducible from any tree path only if this does
+# not move (M5 plan C3, tools/repro). Source paths are remapped below.
+pd_target ?= $(HOME)/.cache/secureos/pd-target-$(MICROKIT_CONFIG)
+
+.PHONY: print-pd-target
+print-pd-target:
+	@echo $(pd_target)
+
 define build_pd
 SEL4_INCLUDE_DIRS=$(abspath $(sdk_config_dir)/include) \
-	RUSTFLAGS=-Zunstable-options \
+	RUSTFLAGS="-Zunstable-options --remap-path-prefix=$(CURDIR)=/secureos" \
 	cargo build --locked \
 		-Z build-std=core,alloc,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem \
 		--target $(target) \
 		--release \
-		--target-dir $(BUILD)/target-$(MICROKIT_CONFIG) \
+		--target-dir $(pd_target) \
 		--artifact-dir $(BUILD) -Z unstable-options \
 		-p pd-$(1) $(if $(features_$(1)),--features $(features_$(1)))
 endef
@@ -301,6 +311,13 @@ test: ct | $(counts)
 		|| { tail -40 $(counts)/test.log; exit 1; }
 	grep '^INTEGRATION-CASES ' $(counts)/test.log > $(counts)/test
 
+# M5 plan C3: the published (release) image rebuilt from a copy of the tree
+# at another path, from a cold PD target directory, equals this one.
+repro: | $(counts)
+	$(MAKE) image MICROKIT_CONFIG=release
+	tools/repro release $(pds) > $(counts)/repro.log 2>&1 || { cat $(counts)/repro.log; exit 1; }
+	grep '^REPRO-ARTIFACTS ' $(counts)/repro.log > $(counts)/repro
+
 manifest:
 	tools/check-manifest tests/manifest.txt $(counts)
 
@@ -312,7 +329,7 @@ clean-counts:
 
 check:
 	$(MAKE) clean-counts
-	$(MAKE) pins audit lint lint-pds unit kani verus ct ct-shape bolero laws test
+	$(MAKE) pins audit lint lint-pds unit kani verus ct ct-shape bolero laws repro test
 	$(MAKE) manifest
 
 # Requires a prior `make check` (the manifest case reuses build/counts).
@@ -320,4 +337,4 @@ check-selftest:
 	tools/check-selftest
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf $(BUILD) $(HOME)/.cache/secureos

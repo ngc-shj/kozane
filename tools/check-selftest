@@ -149,6 +149,7 @@ CASES_FOR_GATE = {
     "test": {"integration", "integration-count", "integration-residue", "integration-cookie",
              "integration-pq-residue", "l8-fallback", "integration-rp-src-meter", "integration-rotation",
              "integration-expiry", "rp-cookie-gate", "integration-expiry-residue"},
+    "repro": {"repro-path-leak"},
     "manifest": {"manifest"},
 }
 
@@ -189,6 +190,11 @@ def check_gates(text: str = "") -> list:
 # A tuple of needles matches when any one is printed (a mutant that one of
 # several failure-only checks must catch, depending on run timing).
 CASES = {
+    # M5 plan C3: a PD that embeds its tree's absolute path (remapping does
+    # not reach env! values) differs when the copy at another path rebuilds.
+    "repro-path-leak": (["repro"], lambda t: append(t, "crates/pds/timer/src/main.rs",
+                                                    '\n#[used]\nstatic SELFTEST_PATH: &str = env!("CARGO_MANIFEST_DIR");\n'),
+                        "repro: pd-timer.elf differs between"),
     "unit": (["unit"], lambda t: append(t, "crates/wire/src/tests.rs", UNIT_TEST), "selftest_injected_failure"),
     # Only ring: the injection invalidates every proof cache entry, and
     # re-proving wire takes ~40 minutes.

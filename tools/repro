@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Reproducible-build gate (M5 plan C3): the published image is a pure
+# function of the tree and the dev image, not of where the tree lives.
+#
+# Copies the work tree (without build/, target dirs, .git and crashes/) to a
+# directory at another absolute path, builds the published image there from
+# a cold PD target directory, and compares loader.img, report.txt and every
+# PD ELF with the primary build, which the caller has just made.
+#
+# The PD target directory is fixed by the Makefile (pd_target), outside any
+# tree: LLVM's local ThinLTO names promoted symbols with a hash of the
+# absolute output path, so only the target directory may not move. Source
+# paths are remapped by the build itself.
+#
+# Control class: fail-closed verification gate; adjudication is byte
+# equality. A copy that fails to build, or an artifact missing on either
+# side, is a refusal.
+#
+# Usage: tools/repro <config> <pd>...   (run from the tree root)
+# Prints "REPRO-ARTIFACTS <n>" when every artifact matches.
+set -euo pipefail
+shopt -s inherit_errexit
+
+if [ $# -lt 2 ]; then
+    echo "usage: tools/repro <config> <pd>..." >&2
+    exit 2
+fi
+config=$1
+shift
+root=$(pwd)
+artifacts=(loader.img report.txt)
+for pd in "$@"; do
+    artifacts+=("pd-$pd.elf")
+done
+
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/secureos-repro.XXXXXX")
+trap 'rm -rf "$scratch"' EXIT
+# The primary build's artifacts, before the cold build below reuses the
+# shared target directory.
+mkdir "$scratch/primary"
+for a in "${artifacts[@]}"; do
+    if [ ! -f "build/$a" ]; then
+        echo "repro: primary build/$a is missing" >&2
+        exit 1
+    fi
+    cp "build/$a" "$scratch/primary/$a"
+done
+
+copy="$scratch/elsewhere/tree"
+mkdir -p "$copy"
+tar -C "$root" --exclude=./build --exclude=./.git --exclude=./crashes --exclude='*/target' -cf - . \
+    | tar -C "$copy" -xf -
+pd_target=$(make -s -C "$root" --no-print-directory print-pd-target MICROKIT_CONFIG="$config")
+rm -rf "$pd_target"
+if ! make -C "$copy" image MICROKIT_CONFIG="$config" > "$scratch/build.log" 2>&1; then
+    tail -30 "$scratch/build.log"
+    echo "repro: the copy at $copy did not build" >&2
+    exit 1
+fi
+
+bad=0
+for a in "${artifacts[@]}"; do
+    if [ ! -f "$copy/build/$a" ]; then
+        echo "repro: $a was not built by the copy"
+        bad=1
+    elif ! cmp -s "$scratch/primary/$a" "$copy/build/$a"; then
+        echo "repro: $a differs between $root and $copy"
+        bad=1
+    fi
+done
+if [ "$bad" != 0 ]; then
+    exit 1
+fi
+echo "REPRO-ARTIFACTS ${#artifacts[@]}"
