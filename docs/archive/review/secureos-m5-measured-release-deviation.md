@@ -347,3 +347,190 @@ The comparison and member derivation are fixtured too
 - **run.py `Console.wait_for` re-checks the text after EOF.** A guest that
   powers off right after its last line could otherwise be reported as
   "QEMU exited".
+
+## Slice 6 — TPM session crate (C10) and envelope sealing (C11, host)
+
+### Result
+
+- **Two crates, split like wg-wire/wg-core.**
+  - `tpm2-wire`: no dependencies, no cryptography. It holds the
+    marshalling of the ten commands, the response parsers, the two public
+    areas, and the `tpm` gate (allowlist, handle ownership, Done/Failed,
+    cap). Kani therefore never compiles libcrux, and slice 7's `tpm` PD
+    links no crypto.
+  - `tpm2`: the primitives, the envelope with its offline sealing, and the
+    client state machine.
+- **Interop holds against swtpm 0.7.1.** The salted policy session
+  (KDFe/KDFa, the command HMAC, the response HMAC, CFB) and the offline
+  TPM2_Import duplicate work. tpm2-tools agrees on the SRK public, its Name
+  and the policy digest (a trial session). Twelve interop tests
+  (`UNIT-SWTPM-INTEROP 12`) run under `make unit`.
+- **Host sealing:** `mksecrets seal --kind key|pq --blob F --srk-public F
+  --pcr8 HEX --out F`.
+  - The SRK public is the TPM2B_PUBLIC that `tpm2_readpublic -o` writes.
+  - The blob is format-checked before it is sealed.
+  - KEK, obfuscation seed and ECDH scalar come fresh from /dev/urandom on
+    every call.
+- **Envelope sizes.** The header is 448 bytes and the tag 16. The payload
+  is the blob without its trailing zeros; the PD zero-fills the rest of
+  its region.
+  - `key`: capacity 3632 bytes, so a sealed blob carries at most 110
+    peers (`KEY_MAX_PEERS`). The plaintext format allows 124 and the
+    config allows 8.
+  - `pqkey`: capacity 15920 bytes, against the blob's 13936.
+  - Both fit; no MR grows. Every envelope is exactly its region's size,
+    so the C8 range length equals the envelope length.
+- **IPC size (C9).** The longest command is 365 bytes: Load with the
+  256-byte cap on Import's outPrivate. Every parser refuses a response
+  over 960 bytes. Both are const-asserted against `IPC_MSG_BYTES`.
+
+### Deviations
+
+- **The plan's PolicyAuthValue red-proof does not hold, and C9's "cannot
+  unsalt" claim is wrong.**
+  - **What was measured:** sealed under PolicyPCR alone, with the relay
+    dropping the client's PolicyAuthValue and stripping `encrypt` from
+    Unseal, swtpm still answers TPM_RC_BAD_AUTH (0x9A2) and returns no
+    outData.
+  - **Why:** the TPM checks a policy session's command HMAC whether or
+    not the policy holds PolicyAuthValue (libtpms `SessionProcess.c`,
+    `CheckAuthSession`, as in the TCG reference code). The key is the
+    salted session key. PolicyAuthValue only appends the authValue, and
+    the authValue is empty.
+  - **So in S9's deny case,** the salt is what refuses a stripped
+    `encrypt`, not the clause.
+  - **The unsalt rewrite C9 says is impossible works.** A relay rewrites
+    StartAuthSession into an unsalted session (session key empty),
+    recomputes Unseal's HMAC with the empty key (the empty authValue adds
+    nothing), strips `encrypt`, and reads the KEK. The client still
+    refuses the response (its response HMAC is under its own salted key),
+    so integrity holds.
+  - **Reading:** this is an instance of RM5-5 (no confidentiality against
+    an active A7), which the plan already accepts. It is not a new
+    exposure, but C9's bullet "Cannot (with PolicyAuthValue) … unsalt it"
+    must be struck. Closing it would need a secret the client holds
+    before unsealing, and the boot media cannot provide one.
+  - **The tests pin what is true:**
+    - `stripping_encrypt_from_unseal_gets_a_bad_auth_and_no_outdata`;
+    - `without_policy_auth_value_a_stripped_encrypt_still_fails_the_salted_session_hmac`,
+      in place of the red-proof the plan asked for;
+    - `rm5_5_a_relay_that_unsalts_the_session_reads_the_kek_and_the_client_refuses`.
+  - **PolicyAuthValue stays,** because the policy is contracted (C11). It
+    is defence in depth, not load-bearing. Dropping it is the owner's call
+    (one command and one allowlist entry fewer).
+  - **The deny response code is TPM_RC_BAD_AUTH, not TPM_RC_AUTH_FAIL.**
+    The sealed object is noDA (next item).
+- **Sealed object attributes: noDA only.** userWithAuth is clear (policy
+  only). fixedTPM and fixedParent are clear, as TPM2_Import requires.
+  sign, decrypt and encryptedDuplication are clear: a data object, outer
+  wrapper only, symmetricAlg NULL. noDA is set because the authValue is
+  empty, so lockout protects nothing, while every relay or tamper failure
+  would count toward a lockout that denies service to both clients.
+- **AAD is the whole 448-byte header,** not only magic/version/kind. It
+  binds the pinned SRK, the policy and the duplicate as well. Envelope
+  integers are little-endian like the other blobs; the TPM structures
+  inside stay in TPM (big-endian) marshalling, so the client forwards them
+  unchanged.
+- **The envelope parser checks consistency, not the PCR value.** The pinned
+  Name must equal Name(pinned public), and the header's policy must equal
+  the object public's authPolicy. The parser cannot know PCR 8; the TPM
+  enforces it.
+- **Primitives and pins.** No in-repo primitive; CFB is written over the
+  block cipher.
+  - libcrux-sha2, libcrux-hmac and libcrux-p256 are `=0.0.9`.
+    libcrux-ecdh was not taken: it depends on `rand`.
+  - `aes` is `=0.8.4` with its `zeroize` feature (round keys wiped on
+    drop), not 0.9. 0.8 reuses the locked generic-array, crypto-common and
+    cpufeatures; the lock gains only aes, cipher 0.4.4 and inout 0.1.4.
+  - Without `--cfg aes_armv8`, `aes` uses its fixsliced software AES on
+    aarch64: constant-time, and the same code on the host as on the PD.
+    The crate builds for `aarch64-sel4-microkit`.
+  - `make audit`: clean. `make pins`: P16 holds. No member names
+    zeroize/sha3 features; `aes`' feature is its own.
+- **Reuse.** `ct_eq` and the AEAD come from wg-core through a dependency,
+  not a third copy: `aead_seal`/`aead_open` with counter 0 (an all-zero
+  nonce, safe under a fresh KEK) and `Key32` for the KEK.
+- **KAT sources.** TPM 2.0 Part 1 has no numeric KDFa/KDFe examples, and
+  tpm2-tss vectors were not used. The sources:
+  - KDFa, KDFe and P-256 ECDH: pyca/cryptography 43.0.0 (KBKDFHMAC
+    counter mode, ConcatKDFHash, SECP256R1 ECDH), an implementation
+    independent of libcrux;
+  - CFB: SP 800-38A F.3.13;
+  - HMAC: RFC 4231 case 2;
+  - SHA-256: the FIPS 180 "abc" vector.
+
+  The decisive check is still swtpm accepting the session and the import.
+- **swtpm harness.**
+  - Unix sockets instead of TCP ports, so there is no port allocation and
+    tests can run in parallel.
+  - Flow tests pass `--terminate`, so a test process that dies without
+    unwinding takes its swtpm with it. The two oracle tests do not,
+    because tpm2-tools opens its own connections.
+  - Every test kills its swtpm and removes its state directory on drop.
+- **S2 as a replay.** Client B's recorded, valid Unseal response is
+  handed to client A, and A's response HMAC refuses it. The flows run one
+  after the other, because swtpm has three transient object slots.
+- **Gate rules beyond the plan's list.**
+  - CreatePrimary, StartAuthSession, Load and Unseal are allowed once per
+    client per boot.
+  - The tag must match the command: sessions only where the flow uses
+    them.
+  - CreatePrimary only under the owner hierarchy, and StartAuthSession
+    only unbound.
+  - Every session in an auth area must be the password session or one the
+    client owns.
+  - A returned handle of the wrong kind (not 0x80…/0x03…), or one already
+    recorded, fails the client instead of being recorded.
+  - `CAP_DIGEST` is 32 × 0xFF. The core counts as capped once it has
+    issued the cap, whatever the device answers.
+- **The client flushes after any failure.** It flushes every handle it got
+  (object, session, SRK), so the other client finds free slots. Flush
+  responses do not change the outcome.
+- **check-pins.**
+  - P9 and P10 now cover `crates/tpm2`.
+  - P11 gains `TAG_FILES` (`crates/tpm2/src/client.rs`): an HMAC tag
+    compared with `==`/`!=` is red. This is the plan's "ct_eq-only
+    forbidden pattern". Three fixtures were added
+    (`CHECK-PINS-FIXTURES 216`).
+  - P11 was missing from the tool's docstring and is now described there.
+- **Kani: 8 harnesses in `tpm2-wire`, not run here.**
+  - Parsers: two harnesses (all parsers on 64 bytes; Unseal on 120).
+  - Gate, deny: an arbitrary u32 command code off the allowlist;
+    cross-client handles, PolicyAuthValue included; a finished client;
+    Unseal after the cap.
+  - Gate, allow: the owner's flow; a flushed handle number reused by the
+    other client.
+
+  They compile against a stub `kani` crate on a scratch copy; nothing
+  more was checked. `KANI-TPM2-WIRE 8` needs the owner's run.
+- **bolero.** `make bolero` ran the new target (9 seeds loaded, about 18M
+  runs in 30 s, no crash). It stops at the "committed seed-*" check
+  because the seeds are not committed yet (no commits in this slice).
+
+### Mutations (scratch copy, each red)
+
+| Control | Red test | Failure-only needle |
+|---|---|---|
+| I10.1 response HMAC check removed | `a_forged_unseal_response_hmac_is_refused_and_no_kek_is_used`; interop: flip, swap, unsalt | `left: Ok(())` / `cause: ResponseAttributes` |
+| I10.2 SRK Name check removed | `an_srk_whose_name_differs…`; interop `envelope_sealed_to_a_foreign_tpm…` | `Failure { step: Import, cause: Response(Tpm(991)) }` |
+| CFB decrypt dropped | `client_runs_the_whole_flow_and_opens_the_envelope` | `Open(Auth)` |
+| S17 Load Name check removed | `a_load_with_a_substituted_name…` | `left: Ok(())` |
+| Gate ownership check removed | four gate tests | `Ok(Forward { client: 0, cc: 374, … })` |
+| PolicyAuthValue exempt from ownership | `the_other_clients_handles_are_refused_for_every_command` | `attempt 2` |
+| PCR_Extend forwarded | `command_codes_off_the_allowlist…` | `cc 0x182` |
+| Unseal after the cap | `the_cap_comes_once…` | `Ok(Forward { client: 0, cc: 350, … })` |
+| Fixed KEK (S13, T13) | mksecrets `two_seals_of_one_blob_give_different_ciphertexts` | `identical ciphertexts from two seals` |
+| No AAD, both sides | `every_flipped_byte_in_header_or_ciphertext…` | `byte 236 flipped and the envelope opened` |
+| `==` on the tag | check-pins P11 fixture | `an HMAC tag compared with == or !=` |
+
+### Left for slice 7
+
+- **I10.3 (T2, T10).** The envelope-open path joins the residue harness
+  and `policy/ct-shape.toml`. Both need the closure `key`/`pqkey` ship.
+- **MIR gate.** `tpm2-wire` enters the MIR member set once a PD links it
+  (kani_crates ∩ PD closure): `MIR-CRATES 8`.
+- **IPC length.** The byte length of a command or response must travel
+  outside the 120 message words (the label). If a length word is used
+  instead, the 365-byte maximum leaves ample room.
+- **run.py.** It should read `CAP_DIGEST` from the source (RT3) for the
+  expected-then-capped PCR 8.

@@ -1,0 +1,17 @@
+[package]
+name = "tpm2"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The block cipher only; CFB is written in `crypto` over it. `zeroize`
+# wipes its round keys on drop.
+aes = { version = "=0.8.4", default-features = false, features = ["zeroize"] }
+libcrux-hmac = { version = "=0.0.9", default-features = false }
+libcrux-p256 = { version = "=0.0.9", default-features = false }
+libcrux-sha2 = { version = "=0.0.9", default-features = false }
+secret-blob = { path = "../secret-blob" }
+tpm2-wire = { path = "../tpm2-wire" }
+wg-core = { path = "../wg-core" }
+zeroize = { version = "=1.8.1", default-features = false }

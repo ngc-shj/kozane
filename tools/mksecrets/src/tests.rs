@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use super::*;
+use tpm2::envelope::Kind;
 use std::os::unix::fs::PermissionsExt;
 
 const TEMPLATE: &str = include_str!("../../../config/gateway.toml");
@@ -331,4 +332,96 @@ fn a_staging_directory_that_already_exists_is_left_untouched() {
     assert_eq!(leftovers(&staging), ["theirs"], "someone else's staging directory was modified");
     assert_eq!(leftovers(&parent), [".deploy.mksecrets-taken"], "nothing was published");
     std::fs::remove_dir_all(&parent).unwrap();
+}
+
+/// A TPM2B_PUBLIC of the SRK template with a valid P-256 point, as
+/// `tpm2_readpublic -o` writes it.
+fn srk_tpm2b() -> Vec<u8> {
+    let mut scalar = Secret::<32>::zero();
+    scalar.as_mut_bytes().copy_from_slice(&[0x21; 32]);
+    let point = tpm2::crypto::public_point(&scalar).unwrap();
+    let mut public = tpm2_wire::SRK_PUBLIC_PREFIX.to_vec();
+    public.extend_from_slice(&tpm2::crypto::ecc_point(&point));
+    let mut out = (public.len() as u16).to_be_bytes().to_vec();
+    out.extend_from_slice(&public);
+    out
+}
+
+const PCR8_HEX: &str = "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b\n";
+
+/// Both blobs of the shared deployment, written where `seal` reads them.
+fn blob_files(s: &Scratch) -> (PathBuf, PathBuf, PathBuf) {
+    let d = deployment();
+    let dir = s.dir("in");
+    let (key, pqb, srk) = (dir.join("secrets.bin"), dir.join("pqkey-secrets.bin"), dir.join("srk.pub"));
+    std::fs::write(&key, &d.blob[..]).unwrap();
+    std::fs::write(&pqb, &d.pq_blob[..]).unwrap();
+    std::fs::write(&srk, srk_tpm2b()).unwrap();
+    (key, pqb, srk)
+}
+
+#[test]
+fn seal_writes_envelopes_that_parse_for_their_kind() {
+    let s = Scratch::new("seal");
+    let (key, pqb, srk) = blob_files(&s);
+    for (kind, name, blob) in [("key", "secrets.env", &key), ("pq", "pq_secrets.env", &pqb)] {
+        let out = s.0.join(name);
+        let args: Vec<String> = [
+            "--kind", kind, "--blob", blob.to_str().unwrap(), "--srk-public", srk.to_str().unwrap(),
+            "--pcr8", PCR8_HEX, "--out", out.to_str().unwrap(),
+        ]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+        run_seal(&args).unwrap_or_else(|e| panic!("{e}"));
+        let bytes = std::fs::read(&out).unwrap();
+        let kind = if kind == "key" { Kind::Key } else { Kind::Pq };
+        let env = tpm2::envelope::Envelope::parse(&bytes, kind).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(env.object_policy(), &tpm2::crypto::policy_digest(&pcr8(PCR8_HEX).unwrap()));
+        assert_eq!(env.srk_public(), &srk_tpm2b()[2..]);
+        // The output is never replaced.
+        assert!(run_seal(&args).is_err());
+    }
+}
+
+/// S13 / T13: the KEK is fresh per envelope, so sealing one blob twice
+/// gives two ciphertexts.
+#[test]
+fn two_seals_of_one_blob_give_different_ciphertexts() {
+    let s = Scratch::new("seal-twice");
+    let (key, _, _) = blob_files(&s);
+    let srk = srk_tpm2b();
+    let pcr = pcr8(PCR8_HEX).unwrap();
+    // The encrypted body without its tag: the tag covers the header, which
+    // differs between seals whatever the KEK.
+    let body = |e: &[u8]| {
+        let ct = tpm2::envelope::Envelope::parse(e, Kind::Key).unwrap().ciphertext().to_vec();
+        ct[..ct.len() - 16].to_vec()
+    };
+    let first = seal_file(Kind::Key, &key, srk_public(&srk).unwrap(), &pcr).unwrap();
+    let second = seal_file(Kind::Key, &key, srk_public(&srk).unwrap(), &pcr).unwrap();
+    assert!(body(&first) != body(&second), "seal: identical ciphertexts from two seals of one blob (the KEK is not fresh)");
+}
+
+#[test]
+fn seal_refuses_a_blob_of_the_other_kind_a_bad_pcr8_and_a_bad_srk_file() {
+    let s = Scratch::new("seal-refuse");
+    let (key, pqb, _) = blob_files(&s);
+    let srk = srk_tpm2b();
+    let pcr = pcr8(PCR8_HEX).unwrap();
+    let e = seal_file(Kind::Key, &pqb, srk_public(&srk).unwrap(), &pcr).unwrap_err();
+    assert!(e.contains("a Key blob is 4096"), "{e}");
+    let mut corrupt = deployment().blob.to_vec();
+    corrupt[100] ^= 1;
+    let bad = s.dir("bad").join("secrets.bin");
+    std::fs::write(&bad, &corrupt).unwrap();
+    let e = seal_file(Kind::Key, &bad, srk_public(&srk).unwrap(), &pcr).unwrap_err();
+    assert!(e.contains("checksum mismatch"), "{e}");
+    assert!(pcr8("f5a5").is_err());
+    assert!(pcr8(&"zz".repeat(32)).is_err());
+    assert!(srk_public(&srk[..50]).is_err());
+    let mut other = srk.clone();
+    other[9] ^= 0x40; // userWithAuth off: not the template
+    let e = seal_file(Kind::Key, &key, srk_public(&other).unwrap(), &pcr).unwrap_err();
+    assert!(e.contains("SrkPublic"), "{e}");
 }

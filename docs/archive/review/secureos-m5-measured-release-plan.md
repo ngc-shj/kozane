@@ -353,9 +353,13 @@ stated.
     HMAC under a session key salted by ECDH to the SRK; per-client AEAD with
     the header as AAD; nonces against replay). Test: a fake TPM returning the
     other client's valid response → `Unavailable`.
-  - Cannot (with PolicyAuthValue, C11): rewrite a client's session (strip
-    `encrypt`, unsalt it), because the TPM then checks the command HMAC
-    before releasing anything. Object substitution is refused by the
+  - Cannot strip `encrypt` from a client's salted session: the TPM checks
+    a policy session's command HMAC, keyed by the salted session key, before
+    releasing anything. (Corrected in slice 6 by measurement: the salt, not
+    PolicyAuthValue, carries this; PolicyAuthValue is kept but not
+    load-bearing. A relay that rewrites StartAuthSession to unsalted CAN
+    then recompute the HMAC and read the KEK; the client refuses the
+    response afterwards. That is RM5-5, not a new exposure.) Object substitution is refused by the
     client: it computes the object Name (nameAlg ‖ H(objectPublic)) from its
     own envelope, refuses a Load response whose name differs, and uses its
     own Name in cpHash; unit tests allow a matching name and deny a
@@ -443,8 +447,9 @@ stated.
   pinned SRK name and public, PCR selection (8) and policy digest, the
   TPM2_Import duplicate (encrypted seed, duplicate, object public with
   `userWithAuth` clear and authPolicy = PolicyPCR(8, sha256) ∧
-  PolicyAuthValue with an empty authValue, so the TPM verifies the command
-  HMAC under the salted session key, S9), and the existing secret-blob
+  PolicyAuthValue with an empty authValue, S9; slice 6 measured that the
+  command-HMAC check comes from the salted policy session itself, so
+  PolicyAuthValue is defence in depth, not the control), and the existing secret-blob
   plaintext under ChaCha20-Poly1305 (libcrux) keyed by the 32-byte KEK the
   sealed object holds, header as AAD. The KEK is fresh random per envelope,
   which makes a fixed nonce safe; a host check seals the same blob twice
@@ -591,7 +596,8 @@ stated.
 - **RM5-5** the seal policy binds secrets to the TPM and PCR 8, not to the
   caller: anyone with TPM command access while PCR 8 holds the expected
   value (before the cap, or after a TPM reset and a replay of the public
-  extends) can unseal the KEK and, with the envelope from boot media, the
+  extends, or by rewriting a client's StartAuthSession to unsalted) can
+  unseal the KEK and, with the envelope from boot media, the
   secrets (S9). Worst case: gateway impersonation by an active bus
   attacker. Likelihood on QEMU: the harness only. On a board: needs
   physical access to the TPM bus or reset line. Close (SC32): a

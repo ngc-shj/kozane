@@ -13,6 +13,17 @@
 //! The Rosenpass endpoint defaults to the WireGuard endpoint's host with the
 //! template's `rp_port`.
 //!
+//! `mksecrets seal` seals one of those blobs offline into its envelope (M5
+//! plan C11) for one TPM and one expected PCR 8:
+//!
+//!   mksecrets seal --kind key|pq --blob FILE --srk-public FILE --pcr8 HEX --out FILE
+//!
+//! The SRK public is the TPM2B_PUBLIC `tpm2_readpublic -o` writes for the
+//! SRK (the storage template `tpm2::envelope` pins); PCR 8 is the hex value
+//! `tools/package` writes to `pcr8`. Every envelope gets a fresh KEK,
+//! obfuscation seed and ECDH scalar from /dev/urandom (S13). The envelope
+//! is public; OUT must not exist yet.
+//!
 //! DIR must not exist yet and, after resolving symlinks, must lie outside
 //! the repository and the toolchain caches, so secrets never land where a
 //! commit, a build artefact or a cache volume could pick them up.
@@ -24,6 +35,8 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use secret_blob::pq;
+use tpm2::Secret;
+use tpm2::envelope::{Kind, SEAL_ENTROPY_LEN};
 
 // Shared with the config build script; only the parsers and `check` are used here.
 #[allow(dead_code)]
@@ -441,9 +454,97 @@ fn run(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The TPMT_PUBLIC inside a TPM2B_PUBLIC file.
+fn srk_public(tpm2b: &[u8]) -> Result<&[u8], String> {
+    let (size, public) = tpm2b.split_at_checked(2).ok_or("--srk-public: shorter than a TPM2B")?;
+    if usize::from(u16::from_be_bytes([size[0], size[1]])) != public.len() {
+        return Err("--srk-public: the TPM2B size does not match the file (expected tpm2_readpublic -o output)".into());
+    }
+    Ok(public)
+}
+
+fn pcr8(hex: &str) -> Result<[u8; 32], String> {
+    let hex = hex.trim();
+    let mut out = [0u8; 32];
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("--pcr8: expected 64 hex digits".into());
+    }
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| "--pcr8: not hex")?;
+    }
+    Ok(out)
+}
+
+/// Reads exactly the region from `path` into `region`, then checks it is a
+/// blob of its kind (`key`'s peer count is the blob's own).
+fn read_blob(path: &Path, kind: Kind, region: &mut [u8]) -> Result<(), String> {
+    let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let len = f.metadata().map_err(|e| format!("{}: {e}", path.display()))?.len();
+    if usize::try_from(len).ok() != Some(region.len()) {
+        return Err(format!("{}: {len} bytes, a {kind:?} blob is {}", path.display(), region.len()));
+    }
+    f.read_exact(region).map_err(|e| format!("{}: {e}", path.display()))?;
+    let checked = match kind {
+        Kind::Key => {
+            let peers = region.get(12..16).map_or(0, |p| u32::from_le_bytes([p[0], p[1], p[2], p[3]]));
+            secret_blob::Blob::parse(region, peers as usize).map(|_| ())
+        }
+        Kind::Pq => pq::Blob::parse(region).map(|_| ()),
+    };
+    checked.map_err(|e| format!("{}: {}", path.display(), e.message()))
+}
+
+/// Seals the blob at `blob` into its envelope.
+fn seal_file(kind: Kind, blob: &Path, srk_public: &[u8], pcr8: &[u8; 32]) -> Result<Vec<u8>, String> {
+    let mut region = Secret::<{ pq::REGION_SIZE }>::zero();
+    let region = region.as_mut_bytes().get_mut(..kind.region_size()).ok_or("region size")?;
+    read_blob(blob, kind, region)?;
+    let mut entropy = Secret::<SEAL_ENTROPY_LEN>::zero();
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(entropy.as_mut_bytes()))
+        .map_err(|e| format!("/dev/urandom: {e}"))?;
+    let mut out = vec![0u8; kind.region_size()];
+    tpm2::envelope::seal(&mut out, kind, region, srk_public, pcr8, &entropy).map_err(|e| format!("seal: {e:?}"))?;
+    Ok(out)
+}
+
+fn run_seal(args: &[String]) -> Result<(), String> {
+    let (mut kind, mut blob, mut srk, mut pcr, mut out) = (None, None, None, None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--kind" => {
+                kind = Some(match value()?.as_str() {
+                    "key" => Kind::Key,
+                    "pq" => Kind::Pq,
+                    other => return Err(format!("--kind: {other} is not key or pq")),
+                })
+            }
+            "--blob" => blob = Some(PathBuf::from(value()?)),
+            "--srk-public" => srk = Some(PathBuf::from(value()?)),
+            "--pcr8" => pcr = Some(pcr8(&value()?)?),
+            "--out" => out = Some(PathBuf::from(value()?)),
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    let (Some(kind), Some(blob), Some(srk), Some(pcr), Some(out)) = (kind, blob, srk, pcr, out) else {
+        return Err("usage: mksecrets seal --kind key|pq --blob FILE --srk-public FILE --pcr8 HEX --out FILE".into());
+    };
+    let srk_file = std::fs::read(&srk).map_err(|e| format!("{}: {e}", srk.display()))?;
+    let envelope = seal_file(kind, &blob, srk_public(&srk_file)?, &pcr)?;
+    write_private(&out, &envelope)?;
+    println!("mksecrets: sealed {} to {}", blob.display(), out.display());
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match run(&args) {
+    let result = match args.split_first() {
+        Some((mode, rest)) if mode == "seal" => run_seal(rest),
+        _ => run(&args),
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("mksecrets: {e}");

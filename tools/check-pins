@@ -27,11 +27,13 @@ Rules:
      `Zeroizing<` in rosenpass-core, pqkey-core, pds/pq, pds/pqkey,
      pds/ingress, and on any type in mce460896 but RngError, which keeps its
      secrets in plain arrays (L12, M3 plan S12, M4 plan C11; pqkey-core
-     holds its secrets in `Zeroizing`)
+     holds its secrets in `Zeroizing`), and in tpm2 (M5 plan I10.3)
   P10 no `from_bytes(*` in the secret crates or in hs-core, key-core,
-     data-core, wg-core and the key, hs and data PDs: a dereferenced array is a by-value temporary of
+     data-core, wg-core, tpm2 and the key, hs and data PDs: a dereferenced array is a by-value temporary of
      the secret left on the stack; `copy_from(&..)` copies in place (L12)
-
+  P11 no cookie (COOKIE_FILES, M3b plan S3) and no HMAC tag (TAG_FILES:
+     tpm2's Unseal response check, M5 plan I10.1) compared with == or !=;
+     every compare goes through ct_eq
   P12 in every crate of the Makefile's verus_crates, the Verus trusted
      constructs equal policy/verus-trusted.toml as a multiset of (file,
      construct, item), by tools/verus_trusted.py's comparison, the one the
@@ -96,12 +98,12 @@ import waivers  # noqa: E402
 
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16"]
 # Crates whose secrets must not be copied by value (P10).
-COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core",
+COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
                "crates/pds/key", "crates/pds/hs", "crates/pds/data"]
 PENDING: set[str] = set()
 # Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
 SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/ingress",
-                 "crates/mce460896"]
+                 "crates/mce460896", "crates/tpm2"]
 # mce460896's types that hold no secret (P9): every other type there does.
 MCE_PUBLIC_TYPES = {"RngError"}
 # Types that hold a secret under a name of their own, not as Secret<..> (P9,
@@ -110,6 +112,9 @@ SECRET_TYPES = ("Secret<", "Zeroizing<", "CookieSecret")
 # Files that compare cookie values; every compare goes through ct_eq (P11,
 # M3b plan S3). A tripwire over names: a value not named *cookie* escapes it.
 COOKIE_FILES = ["crates/rosenpass-core/src/cookie.rs", "crates/pds/ingress/src/rp_cookie.rs"]
+# Files that compare HMAC tags; every compare goes through ct_eq (P11, M5
+# plan I10.1). The same kind of tripwire, over *hmac*/*tag* names.
+TAG_FILES = ["crates/tpm2/src/client.rs"]
 
 
 def run_blocks(dockerfile: str):
@@ -321,6 +326,17 @@ def check_cookie_compares(root: pathlib.Path, out: list):
         for m in re.finditer(r"\b\w*cookie\w*\b[\])]*\s*[!=]=(?!=)|[!=]=\s*[&*]?\w*cookie\w*\b", code):
             n = code.count("\n", 0, m.start()) + 1
             out.append(f"P11 {rel}:{n}: a cookie compared with == or !=; use ct_eq")
+    for rel in TAG_FILES:
+        path = root / rel
+        if not path.is_file():
+            if (root / rel).parents[1].is_dir():
+                out.append(f"P11 {rel}: missing; the tag compare tripwire has nothing to check")
+            continue
+        code = strip_rust_comments(path.read_text())
+        unterminated("P11", rel, code, out)
+        for m in re.finditer(r"\b\w*(?:hmac|tag)\w*\b[\])]*\s*[!=]=(?!=)|[!=]=\s*[&*]?\w*(?:hmac|tag)\w*\b", code):
+            n = code.count("\n", 0, m.start()) + 1
+            out.append(f"P11 {rel}:{n}: an HMAC tag compared with == or !=; use ct_eq")
 
 
 def strip_rust_comments(text: str) -> str:

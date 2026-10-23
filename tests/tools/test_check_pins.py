@@ -238,6 +238,15 @@ CASES = [
      lambda t: append(t / "crates/pds/ingress/src/rp_cookie.rs", "\nfn bad(want: [u8; 16], got: [u8; 16]) -> bool {\n    want != cookie_field(got)\n}\n")),
     ("P11 the cookie adapter removed", {"P11"},
      lambda t: (t / "crates/pds/ingress/src/rp_cookie.rs").unlink()),
+    # P11, M5 plan I10.1: tpm2's Unseal response tag.
+    ("P11 == on an HMAC tag in tpm2's client", {"P11"},
+     lambda t: append(t / "crates/tpm2/src/client.rs",
+                      "\nfn bad(expected: &[u8; 32], hmac: &[u8]) -> bool {\n    hmac == &expected[..]\n}\n")),
+    ("P11 tpm2's client removed", {"P11"},
+     lambda t: (t / "crates/tpm2/src/client.rs").unlink()),
+    ("allow ct_eq on an HMAC tag in tpm2's client", set(),
+     lambda t: append(t / "crates/tpm2/src/client.rs",
+                      "\nfn ok(expected: &[u8; 32], hmac: &[u8]) -> bool {\n    ct_eq(expected, hmac)\n}\n")),
     # P10: by-value secret copies.
     ("P10 from_bytes(*..) in hs-core", {"P10"},
      lambda t: append(t / "crates/hs-core/src/lib.rs", "\nfn f(k: &[u8; 32]) -> Key32 { Key32::from_bytes(*k) }\n")),
