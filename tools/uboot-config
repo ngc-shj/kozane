@@ -23,7 +23,9 @@ RUN = {
     # If the loader ever returns, PCR 8 still holds the release's value: no
     # prompt, power off.
     "shipped": "dcache flush; dcache off; icache off; go 0x70000000; echo secureos: loader returned; " + HALT,
-    "measure": "tpm2 pcr_read 8 0x6fb00040; md.b 0x6fb00040 0x20; echo secureos: measured; " + HALT,
+    # pcr_read prints the digest itself (print_byte_string, which never
+    # polls Ctrl-C); md.b's print_buffer would abort on a pending 0x03 (R5-S1).
+    "measure": "tpm2 pcr_read 8 0x6fb00040; echo secureos: measured; " + HALT,
 }
 
 

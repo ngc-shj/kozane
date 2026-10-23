@@ -1727,7 +1727,9 @@ def boot_uboot(uboot: str, files: list, tpm: Swtpm) -> tuple:
     return child, Console(child)
 
 
-PCR_DUMP = re.compile(r"6fb00040:((?: [0-9a-f]{2}){16}).*\r*\n6fb00050:((?: [0-9a-f]{2}){16})")
+# `tpm2 pcr_read 8`'s own print of the digest, 16 bytes a line.
+PCR_DUMP = re.compile(r"PCR #8 sha256 32 byte content \(\d+ known updates\):\r*\n"
+                      r"((?: [0-9a-f]{2}){16})\r*\n((?: [0-9a-f]{2}){16})\r*\n")
 
 
 def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: list) -> tuple:

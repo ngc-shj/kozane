@@ -579,3 +579,43 @@ new Critical or Major findings.
   now print `U-Boot 2025.01 (`; the banner regex of R4-S1 requires the
   bare version, so a suffix returning fails every measured boot.
 - Modified file: support/u-boot/secureos.config, Makefile
+
+# Round 5
+Date: 2026-10-24
+
+## Changes from Previous Round
+
+The security expert reviewed `13b4956..12cd4cd` and resolved R4-S1, R4-N1
+and R4-O1. It traced U-Boot 2025.01's sources: the banner prints after
+QEMU's raw mode and the PL011 setup, no compiled `ctrlc()` caller runs
+before the lock, and a correct boot is unaffected by repeated 0x03. There
+are no new Critical or Major findings.
+
+## New findings
+
+- **R5-S1 (security, Minor)** in the `measure-ctrlc` mutant a second
+  queued 0x03 is read by `md.b`'s `print_buffer`, which polls Ctrl-C per
+  line and aborts after one line. The case would then fail with "printed
+  no PCR 8 dump" instead of its needle, depending on how many bytes were
+  queued (boot speed). The shipped-config test is unaffected.
+- **R5-N1 (security, Nit)** U-Boot still embeds host state
+  (`HOST_ARCH`, compiler and linker version strings), so firmware bytes
+  differ between arm64 and amd64 build hosts. No security impact: U-Boot is
+  neither measured into PCR 8 nor in `tools/repro`.
+
+## Resolution Status (round 5)
+
+### R5-S1 Minor measure-ctrlc message depended on queued bytes
+- Action: the measure variant drops `md.b`; `measure_boot` parses PCR 8
+  from `tpm2 pcr_read`'s own print (`print_byte_string`, which never polls
+  Ctrl-C). Repeated bytes can no longer change the dump.
+- Evidence: `make uboot`, pins and lint green; `measured boot` green
+  twice; measure-halt, measure-poweroff, measure-wrap, measure-twin red with
+  their own needles, measure-ctrlc red twice with "a wrapping range was not
+  refused".
+- Modified file: tools/uboot-config, tests/integration/run.py
+
+### R5-N1 Nit U-Boot host state
+- Action: recorded in the deviation log as a known limitation. U-Boot's
+  bytes depend on the build host's architecture and toolchain as well as on
+  its sources.
