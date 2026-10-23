@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Runs one command under the proof lock: one Kani (cbmc) or Verus (SMT) run
+# at a time in this container. A single cbmc can exceed 28 GB RSS, and two
+# concurrent runs once froze the host. The lock is shared by every checkout
+# and copy in the container (the selftest's tree too); another container or
+# machine takes its own. The lock fd stays open in the command, so it is
+# held until the command exits.
+#
+# This file is deliberately outside kani-gate.sh's and verus-gate.sh's cache
+# keys: it decides nothing about a proof, so changing it must not invalidate
+# hours of cached passes.
+set -euo pipefail
+if [ $# -eq 0 ]; then
+    echo "usage: proof-lock <command> [args...]" >&2
+    exit 2
+fi
+exec 9>"${SECUREOS_PROOF_LOCK:-/tmp/secureos-proof.lock}"
+flock 9
+exec "$@"

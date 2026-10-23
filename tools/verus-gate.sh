@@ -14,6 +14,11 @@ shopt -s inherit_errexit
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
+# The whole run holds the proof lock (tools/proof-lock): one Kani or
+# Verus run at a time in this container.
+if [ -z "${SECUREOS_PROOF_LOCKED:-}" ]; then
+    exec tools/proof-lock env SECUREOS_PROOF_LOCKED=1 "$0" "$@"
+fi
 if [ $# -ne 2 ] || [ "$1" != "-p" ]; then
     echo "usage: verus-gate.sh -p <crate>" >&2
     exit 2
@@ -59,13 +64,6 @@ fi
 
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
-# One SMT or cbmc run at a time in this container, shared with kani-gate
-# and with every checkout and copy in it (the selftest's tree too): the
-# host has frozen under two concurrent proof runs. Another container takes
-# its own lock.
-exec 9>"${SECUREOS_PROOF_LOCK:-/tmp/secureos-proof.lock}"
-flock 9
-
 # A crate with no entry in policy/verus-trusted.toml is verified with
 # Verus's own --no-cheating (roots only: vstd itself assumes): Verus then
 # refuses assume, admit, external_body and assume_specification in what it

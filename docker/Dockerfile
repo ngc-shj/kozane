@@ -183,7 +183,22 @@ RUN apt-get update -q && apt-get install -y --no-install-recommends \
     libsodium23 \
     # M4 C9: the constant-time gate runs the harness under memcheck
     valgrind \
+    # M5 C8-C14: software TPM for QEMU, and tpm2-tools to provision it and
+    # read PCRs (interop oracle)
+    swtpm \
+    swtpm-tools \
+    tpm2-tools \
     && rm -rf /var/lib/apt/lists/*
+
+# M5 C8: U-Boot source, built by `make uboot` with the repo's config
+# fragment and compiled-in boot command (so changing the command needs no
+# image rebuild).
+ARG UBOOT_VERSION=2025.01
+ARG UBOOT_SHA256=cdef7d507c93f1bbd9f015ea9bc21fa074268481405501945abc6f854d5b686f
+RUN set -eux; \
+    mkdir -p /opt/u-boot; \
+    curl -sSfL -o /opt/u-boot/u-boot-${UBOOT_VERSION}.tar.bz2 "https://ftp.denx.de/pub/u-boot/u-boot-${UBOOT_VERSION}.tar.bz2"; \
+    echo "$UBOOT_SHA256  /opt/u-boot/u-boot-${UBOOT_VERSION}.tar.bz2" | sha256sum -c -
 
 ARG ARM_GNU_URL=https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-aarch64-aarch64-none-elf.tar.xz
 ARG ARM_GNU_SHA256=c4f0daab43f78e0d56ec2bdad76b98a0223ce12ce7fc51a6ce82f9cc6c6dfba0

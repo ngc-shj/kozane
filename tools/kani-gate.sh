@@ -14,6 +14,11 @@ shopt -s inherit_errexit
 
 root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
+# The whole run holds the proof lock (tools/proof-lock): one Kani or
+# Verus run at a time in this container.
+if [ -z "${SECUREOS_PROOF_LOCKED:-}" ]; then
+    exec tools/proof-lock env SECUREOS_PROOF_LOCKED=1 "$0" "$@"
+fi
 # Resolves the full dependency graph with --locked (cargo kani has no
 # --locked), and lists the crate under proof plus its path dependencies.
 dirs=$(cargo metadata --locked --format-version 1 | python3 -c '
@@ -53,13 +58,6 @@ fi
 
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
-
-# One proof at a time on this machine: a single cbmc can exceed 28 GB RSS,
-# and two concurrent runs (parallel agents) once exhausted the host's memory
-# and froze it. One lock for every checkout and copy (the selftest's tree
-# too), not one per tree. It is released when this script exits.
-exec 9>"${SECUREOS_PROOF_LOCK:-/tmp/secureos-proof.lock}"
-flock 9
 
 if ! cargo kani "$@" >"$log" 2>&1; then
     cat "$log"
