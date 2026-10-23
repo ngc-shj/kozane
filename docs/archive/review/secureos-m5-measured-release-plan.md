@@ -654,3 +654,25 @@ stated.
 | C12 | Implicit attestation and release verifier | locked |
 | C13 | Signed releases (Ed25519 + ML-DSA-65) | locked |
 | C14 | Integration on the measured, sealed, release path | locked |
+
+## Implementation Checklist
+
+Written at the end of Phase 2 from the slices' impact analyses, which the
+deviation log records slice by slice. Each contract's files:
+
+| Contract | Files |
+|---|---|
+| C1 | `docker/Dockerfile` |
+| C2 | `tools/proof-lock`, `tools/kani-gate.sh`, `tools/verus-gate.sh`, `tests/tools/test_proof_lock.py` |
+| C3 | `tools/repro`, `Makefile` (`pd_target`, remap, `repro`), `crates/config/build.rs`, `tools/check-selftest` (`repro-path-leak`) |
+| C4 | `tools/mir-gate`, `tools/mir-capture`, `tests/tools/test_mir_gate.py`, `tools/check-selftest` (`mir-*`) |
+| C5 | `third_party/verus/*`, root `Cargo.toml` `[patch]`, `policy/verus-pairing.toml`, `tools/verus-pairing`, `tests/tools/test_verus_pairing.py`, `tools/check-pins` (P12, P16) |
+| C6 | `crates/audit-event`, `crates/pdkit`, `crates/netdrv`, `crates/pds/{audit,data,hs,ingress,inner,key,pq,pqkey,eth-in,eth-out}`, `crates/key-core`, `crates/pqkey-core`, `system/secureos.system`, `policy/laws.toml`, `tools/laws`, `tools/ct-shape` |
+| C7 | `tools/package`, `tests/tools/test_package.py`, `Makefile` (`test`), `tests/integration/run.py` |
+| C8 | `support/u-boot/{secureos.config,boot.cmd}`, `tools/uboot-config`, `tools/measure.py`, `tests/tools/test_measure.py`, `tools/package`, `tests/integration/run.py` |
+| C9 | `crates/pds/tpm`, `crates/tpm2-wire` (`gate.rs`, `proofs.rs`), `crates/layout`, `system/secureos.system`, `policy/laws.toml`, `tools/laws` |
+| C10 | `crates/tpm2`, `crates/tpm2-wire`, `tools/check-pins` (P9–P11), `tools/ct-harness`, `policy/ct-shape.toml` |
+| C11 | `crates/tpm2/src/envelope.rs`, `tools/mksecrets`, `crates/pds/{key,pqkey}`, `tools/package` |
+| C12 | `tools/mksecrets` (`check-envelope`), `tools/release.py` |
+| C13 | `tools/release/*`, `tools/release.py`, `tests/tools/test_release.py`, `policy/audit-ignore-release.toml`, `Makefile` (`release-*`, `pins`, `audit`) |
+| C14 | `tests/integration/run.py`, `tools/check-selftest`, `tests/manifest.txt` |
