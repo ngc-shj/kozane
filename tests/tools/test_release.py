@@ -30,7 +30,12 @@ def setup(d: pathlib.Path) -> None:
             raise SystemExit(f"keygen failed: {out}")
     pkg = d / "pkg"
     pkg.mkdir()
-    image = bytes(range(256)) * 64
+    # Code-like bytes everywhere except the two envelope ranges, which hold
+    # the zero placeholder as a published image does.
+    image = bytearray(bytes(range(1, 256)) * 65)[:0x4000]
+    image[0x1000:0x1400] = bytes(0x400)
+    image[0x2000:0x2800] = bytes(0x800)
+    image = bytes(image)
     desc = measure.pack(len(image), [(0x1000, 0x400), (0x2000, 0x800)])
     (pkg / "published.img").write_bytes(image)
     (pkg / "boot.desc").write_bytes(desc)

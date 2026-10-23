@@ -130,3 +130,218 @@ clean; R56 N/A; R57 clean.
 | VE5 (no board) | UART, release kernel on a board, PCR 0–7 | blocked-deferred (M7), Anti-Deferral entry in the plan |
 
 ## Resolution Status
+
+The late area sub-review (packaging, release, supply chain) added:
+- **S-REL-1** (sub-review, Critical, escalate:true) `tools/verus-pairing`
+  did not refuse a vendored or image crate path that is itself a symlink.
+  `rglob` follows a linked root, so a vendored crate linked at the image
+  tree compared a tree with itself. Merged at Major: it needs a committed
+  symlink, which is visible in review as a mode change.
+- **S-REL-2** (sub-review, Major) the release tool's `SigningKeys` drop and
+  keygen seed used `fill(0)`. The optimiser may remove that as a dead
+  store.
+- **S-REL-3** (sub-review, Major) the P11 tag tripwire scanned one file.
+  A check moved elsewhere in tpm2 would be uncovered.
+
+Found by the full check-selftest run at `9bd8436` (140 min, 128/130):
+- **The `package-debug` and `package-waiver` cases were stale.** Slice 7
+  made `SRK_PUBLIC` required and did not update them, so both stopped at the
+  Makefile's argument check, before the refusals they name.
+- **The `run_make` fixture failed once under load.** It judged the
+  grandchild's death on the first look after the group SIGKILL, which is
+  not instant. This race predates M5.
+
+## Resolution Status
+
+### F1 Major release.py make() not transactional
+- Action: `make` builds in a staging directory beside OUT and renames it
+  into place once the signature and both files are written. Any failure
+  removes the staging directory.
+- Fixture: a signing failure leaves no OUT and no staging, and the retry
+  succeeds (`RELEASE-FIXTURES 11`).
+- Modified file: tools/release.py (`make`), tests/tools/test_release.py
+
+### F2 Minor stale repro comment
+- Action: the comment now names the general hazard and says config's case
+  was fixed at its source.
+- Modified file: tools/repro
+
+### F3 / S3 / S-BOOT-3 Minor tautological expected-range check
+- Action: `expected=ranges` was dropped. The independent I8.2 check is now
+  `measure.check_placeholder`: the published image must hold the zero
+  placeholder over every envelope range. `tools/package` runs it, and so
+  do `release.py make` and `verify`, from public files.
+- Fixtures: allow and deny in `test_measure.py` (`MEASURE-FIXTURES 18`); a
+  release with a range over non-zero bytes is refused.
+- Modified file: tools/measure.py, tools/package, tools/release.py, tests
+
+### S1 / S-KEYLAW-1 Major key kept plaintext on a post-validation boot failure
+- Action: validation and the boot seed moved into one fallible
+  `key_core::Oracle::boot`, beside the new `BootEntropy` trait (the same
+  shape as pqkey-core). The PD wipes `PLAINTEXT` with a single
+  `inspect_err` over the whole call, so every `BootError` after the unseal
+  leaves no secret.
+- Tests: an allow test (boot with entropy answers) and a deny test (RNDR
+  failing after validation is `RndrUnavailable`).
+- No new dependency and no `Cargo.lock` change: samples and the seed are
+  `tpm2::Secret`s.
+- Modified file: crates/key-core/src/lib.rs, crates/key-core/src/tests.rs,
+  crates/pds/key/src/main.rs
+
+### S2 Minor fall-through to the prompt after `go`
+- Action: the shipped command ends with
+  `go …; echo secureos: loader returned; poweroff; while true; do true; done`.
+- Modified file: tools/uboot-config
+
+### S4 Minor dirty release named by HEAD
+- Action: a dirty tree gives `commit=<sha>-dirty`, and `verify` refuses it
+  unless `--allow-dirty` is passed. Fixture added.
+- Modified file: tools/release.py, tests/tools/test_release.py
+
+### S5 Minor on-device envelope-length check
+- Action: recorded as a deviation. U-Boot cannot know the size of a file
+  QEMU loaded at a fixed address. What holds instead:
+  - each length is bounded on-device by its load slot (S-BOOT-2) and by
+    `image_len`;
+  - `Envelope::parse` requires the exact region size;
+  - the AEAD decides.
+- Modified file: docs (deviation log)
+
+### S-BOOT-1 Major (merged) refusal could fall through if poweroff returned
+- Action: `REFUSE` is now `echo …; poweroff; while true; do true; done`.
+  `measure_boot` requires QEMU to stop by itself after a refusal, with
+  nothing measured after it.
+- Red-proof: the new check-selftest case `measure-halt` replaces the halt
+  with `true` and is red with "measure_boot: U-Boot did not stop at its
+  refusal".
+- Modified file: tools/uboot-config, tests/integration/run.py,
+  tools/check-selftest
+
+### S-BOOT-2 Major on-device and host adjudicators differed
+- Action: boot.cmd refuses `l0`/`l1 > 0x100000`, the host's
+  `ENVELOPE_ROOM`.
+- Modified file: support/u-boot/boot.cmd
+
+### S-BOOT-4 Minor unguarded cp.b
+- Action: both copies are `cp.b … || REFUSE`.
+- Modified file: support/u-boot/boot.cmd
+
+### S-TPMPD-1 Major (merged) cap extend unconfirmed
+- Action: the PD confirms the extend through the TPM's own response
+  (`parse_pcr_extend`) and retries up to `CAP_ATTEMPTS` (3). The gate's
+  software refusal is unchanged; the Kani-verified `gate.rs` is not
+  edited.
+- Modified file: crates/pds/tpm/src/main.rs
+
+### S-TPMPD-2-A Major a stuck client keeps the other Busy — Accepted
+- **Anti-Deferral check:** acceptable risk.
+- **Justification:**
+  - **Worst case:** `key` crashes or is compromised mid-flow, and `pqkey`
+    gets Busy until its 120 s budget expires, then `TpmUnavailable`; `pq`
+    reports `KeyUnavailable`.
+  - **That is no worse than today:**
+    - a compromised `key` already holds every WireGuard secret (the
+      architecture plan's threat table: "`key`: Everything");
+    - a crashed `key` already ends every handshake, since `hs` cannot boot
+      without it;
+    - so the extra loss, Rosenpass for a gateway that cannot handshake
+      anyway, adds nothing an attacker can use.
+  - **The mirror case, a stuck `pqkey` denying `key`,** needs a
+    compromised `pqkey`. That PD sees only Rosenpass ciphertext from `pq`,
+    and only after init. Before its init returns, no tainted input reaches
+    it (S18).
+  - **Likelihood:** low. It needs an init-time crash or a compromise of a
+    PD that is not callable before its init ends.
+  - **Cost to fix:** a PD-level liveness deadline that force-fails a stuck
+    client. It needs care to avoid racing the client's own retry budget
+    (about 1 day with Kani coverage of the new transition). Recorded here
+    as a known limitation.
+- **Orchestrator sign-off:** acceptable-risk exception satisfied (worst
+  case, likelihood and cost stated).
+
+### S-TPMPD-3 Minor MAX_RESPONSE assert tautological — no change
+- Action: none. The comment "No parser accepts a longer response" is
+  accurate:
+  - `response_header` refuses longer input;
+  - the PD's TIS driver bounds the size field to `..=MSG_BYTES` before it
+    reads.
+
+  The constant is a shared bound, not a computed maximum. Editing the
+  Kani-verified crate for a comment would re-prove it (about 45 min) and
+  would change no behaviour.
+
+### S-TPM2-1 Major (merged as Minor) session-key residue in libcrux frames
+- Action: `tpm2::boot::unseal` scrubs `OPEN_SCRUB_DEPTH` bytes of stack
+  below its frame once the session is over (`scrub_session_stack`). The
+  scrub is its own copy because calling open_sealed's scrub would enter
+  that closure at a non-root function, which ct-shape refuses.
+- Severity merged as Minor: the client PD holds the decrypted plaintext for
+  its whole life, so a stack reader gains nothing new.
+- Modified file: crates/tpm2/src/boot.rs, crates/tpm2/src/envelope.rs
+
+### S-TPM2-2-A Minor no zero-tailed region test
+- Action: `a_region_ending_in_zero_bytes_opens_to_itself`
+  (`UNIT-TPM2 +1`).
+- Modified file: crates/tpm2/src/tests.rs
+
+### S-REL-1 Major (merged) verus-pairing followed a linked crate root
+- Action: a vendored or image crate path that is a symlink is refused
+  before any comparison. Fixture: a vendored crate linked at the image tree
+  is refused (`VERUS-PAIRING-FIXTURES 13`). The allow fixtures, real
+  directories, still pass.
+- Modified file: tools/verus-pairing, tests/tools/test_verus_pairing.py
+
+### S-REL-2 Major release key wipes could be dead-store eliminated
+- Action: `SigningKeys`' drop and keygen's seed (and the early-return path)
+  use `zeroize`.
+- **Swept the class:** every `fill(0)` in M5 code is either a write to
+  caller-visible memory (an `&mut` parameter) or to a local holding public
+  data or ciphertext (TPM command and response buffers, hs requests). Only
+  the release tool's two wipes held secrets in memory nothing reads again.
+- Modified file: tools/release/src/sig.rs
+
+### S-REL-3 Major P11 tag tripwire scanned one file
+- Action: P11 scans every `.rs` under `crates/tpm2`, and `client.rs` must
+  exist. The docstring now states the tripwire's limits: lowercase names,
+  `==`/`!=` only. Fixture: a tag `==` in `boot.rs` is flagged
+  (`CHECK-PINS-FIXTURES` +1). The widened scan has no false hit in the
+  crate today.
+- Modified file: tools/check-pins, tests/tools/test_check_pins.py
+
+### T1 Major tpm2-wire's Kani harnesses unrecorded
+- Action: recorded in the deviation log. All eight harnesses ran alone at
+  HEAD (`the_owners_flow_is_forwarded` took 1,248 s; peak 22.4 GiB), and
+  again in the full `make kani` (68 harnesses, 134 min, peak 23.5 GiB).
+- Red-proofs per deny harness: see the Kani mutation table appended below.
+
+### T2 Minor TpmProxy teardown
+- Action: `close()` fails the case if the relay thread survives, as
+  `Swtpm.close()` does.
+- Modified file: tests/integration/run.py
+
+### Stale package selftest cases, and the run_make fixture race
+- **Stale cases:** `package-debug` and `package-waiver` now pass
+  `SRK_PUBLIC`. Re-run, both are red with their own needles.
+- **Fixture race:** the `run_make` fixture now waits, with a bound, for the
+  grandchild's death after the group SIGKILL, instead of judging the first
+  look. It passed three consecutive runs.
+- Modified file: tools/check-selftest, tests/tools/test_check_selftest.py
+
+### S-KEYLAW-1-A Minor (Adjacent) L10 has no laws-tool check — no change
+- Action: none. L10 is structural: `Record` is
+  `{code: u16, _reserved: u16, a: u32, b: u32}` and `Event::value()` returns
+  `Option<u32>`, so a byte-carrying variant cannot be encoded without
+  changing those types, and that change would show in review.
+
+#### T1 Kani mutation table
+
+Each mutation was applied to its own scratch copy of the tree, and only the
+harness it targets was run (`cargo kani -p tpm2-wire --harness … --exact`
+under `tools/proof-lock`):
+
+| Mutation in gate.rs | Harness | Result |
+|---|---|---|
+| allowlist check disabled (`if false && !ALLOWED.contains(&cc)`) | `unlisted_command_codes_never_reach_the_device` | 1 failure |
+| ownership always true (`if true { Ok(()) }`) | `cross_client_handles_are_refused` | 1 failure |
+| Done/Failed refusal disabled | `a_finished_client_is_refused` | 1 failure |
+| cap refusal disabled (`if false && self.capped`) | `unseal_after_the_cap_is_refused` | 1 failure: the harness asserts `Err(Refusal::Capped)` exactly, so the Finished refusal does not mask it |

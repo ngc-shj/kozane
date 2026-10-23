@@ -139,7 +139,7 @@ pub fn unseal(tpm: &mut impl Transport, envelope: &[u8], kind: Kind, out: &mut [
     // The session key passed through libcrux's HMAC and KDF frames below
     // this one, which do not wipe their own state (crypto.rs); clear that
     // stack once the session is over, as open_sealed does for the KEK.
-    crate::envelope::scrub_stack();
+    scrub_session_stack();
     let finish = if result.is_ok() { ipc::REQ_DONE } else { ipc::REQ_FAILED };
     let (label, _) = tpm.call(ipc::label(finish, 0), &[], &mut rsp);
     rsp.fill(0);
@@ -183,4 +183,14 @@ fn run(
         Err(_) if transport_failed => Err(UnsealError::TpmUnavailable),
         Err(f) => Err(UnsealError::of(f)),
     }
+}
+
+/// Zeroes, with volatile writes, `envelope::OPEN_SCRUB_DEPTH` bytes of stack
+/// below the caller's frame. Its own copy of open_sealed's scrub: calling
+/// that one from here would enter open_sealed's closure (M4 C10) at a
+/// function other than its root.
+#[inline(never)]
+fn scrub_session_stack() {
+    let mut area = [0u64; crate::envelope::OPEN_SCRUB_DEPTH / 8];
+    zeroize::Zeroize::zeroize(&mut area);
 }

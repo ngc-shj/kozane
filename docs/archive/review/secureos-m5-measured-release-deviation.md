@@ -900,3 +900,38 @@ Three experts checked the recurring-issue list over `e132cd6..HEAD`:
   run. It was made after the full Kani run, because config is a path
   dependency of proved crates and editing it mid-run would have moved
   their cache keys.
+
+## Phase 3 round 1 fixes
+
+The findings and their dispositions are in
+`secureos-m5-measured-release-code-review.md`. Recorded here are the
+deviations from the plan:
+
+- **C8 "each length equals its envelope's length" is not checked
+  on-device (S5).** U-Boot cannot know the size of a file QEMU loaded at a
+  fixed address. What holds instead:
+  - each length is bounded on-device by `image_len` and by its load slot
+    (`0x100000`, the host's `ENVELOPE_ROOM`, S-BOOT-2);
+  - `Envelope::parse` requires the exact region size;
+  - the AEAD decides.
+- **Refusal halts twice (S-BOOT-1).** `poweroff` is followed by a spin
+  loop, so a firmware whose power-off returns still runs nothing after a
+  refusal. The shipped command ends the same way after `go` (S2).
+- **I8.2's "equals the prefill ranges" is checked as "the published image
+  holds the zero placeholder there"** (`measure.check_placeholder`), from
+  public files, by packaging and by the release verifier. The old
+  `expected=` argument compared the ranges with themselves.
+- **The cap's PCR_Extend is confirmed by the TPM's response and retried
+  (S-TPMPD-1).** The gate's software refusal after the cap is unchanged.
+- **The release key wipes use `zeroize`; the P11 tag tripwire covers all of
+  `crates/tpm2`; verus-pairing refuses a linked crate root.**
+- **Kani for tpm2-wire, recorded (T1):**
+  - all eight harnesses ran alone at `cb1f134` (slice 6), the longest
+    1,248 s, peak 22.4 GiB;
+  - all 68 harnesses passed in `make kani` at `d91cfca` (134 min, peak
+    23.5 GiB);
+  - each of the four deny harnesses is red under the mutation of the check
+    it names (table in the code review).
+- **Accepted (S-TPMPD-2-A):** a stuck client keeps the other client Busy
+  until its 120 s budget expires. Worst case, likelihood and cost are in
+  the code review.

@@ -31,9 +31,11 @@ Rules:
   P10 no `from_bytes(*` in the secret crates or in hs-core, key-core,
      data-core, wg-core, tpm2 and the key, hs and data PDs: a dereferenced array is a by-value temporary of
      the secret left on the stack; `copy_from(&..)` copies in place (L12)
-  P11 no cookie (COOKIE_FILES, M3b plan S3) and no HMAC tag (TAG_FILES:
-     tpm2's Unseal response check, M5 plan I10.1) compared with == or !=;
-     every compare goes through ct_eq
+  P11 no cookie (COOKIE_FILES, M3b plan S3) and no HMAC tag (any source in
+     TAG_CRATE, crates/tpm2: its Unseal response check, M5 plan I10.1)
+     compared with == or !=; every compare goes through ct_eq. A tripwire:
+     the names it reads are lowercase `cookie`/`hmac`/`tag`, and only `==`
+     and `!=` are matched (not `.eq()` or a wrapper)
   P12 in every crate of the Makefile's verus_crates, the Verus trusted
      constructs equal policy/verus-trusted.toml as a multiset of (file,
      construct, item), by tools/verus_trusted.py's comparison, the one the
@@ -114,7 +116,11 @@ SECRET_TYPES = ("Secret<", "Zeroizing<", "CookieSecret")
 COOKIE_FILES = ["crates/rosenpass-core/src/cookie.rs", "crates/pds/ingress/src/rp_cookie.rs"]
 # Files that compare HMAC tags; every compare goes through ct_eq (P11, M5
 # plan I10.1). The same kind of tripwire, over *hmac*/*tag* names.
-TAG_FILES = ["crates/tpm2/src/client.rs"]
+# The crate whose every source file must compare HMAC tags with ct_eq (P11,
+# M5 plan I10.1): the whole crate, so a check that moves out of client.rs
+# stays covered. client.rs, which holds the Unseal check today, must exist.
+TAG_CRATE = "crates/tpm2"
+TAG_ANCHOR = "crates/tpm2/src/client.rs"
 
 
 def run_blocks(dockerfile: str):
@@ -326,13 +332,12 @@ def check_cookie_compares(root: pathlib.Path, out: list):
         for m in re.finditer(r"\b\w*cookie\w*\b[\])]*\s*[!=]=(?!=)|[!=]=\s*[&*]?\w*cookie\w*\b", code):
             n = code.count("\n", 0, m.start()) + 1
             out.append(f"P11 {rel}:{n}: a cookie compared with == or !=; use ct_eq")
-    for rel in TAG_FILES:
-        path = root / rel
-        if not path.is_file():
-            if (root / rel).parents[1].is_dir():
-                out.append(f"P11 {rel}: missing; the tag compare tripwire has nothing to check")
+    if (root / TAG_CRATE).is_dir() and not (root / TAG_ANCHOR).is_file():
+        out.append(f"P11 {TAG_ANCHOR}: missing; the tag compare tripwire has nothing to check")
+    for rel, text in crate_sources(root, TAG_CRATE):
+        if not rel.endswith(".rs"):
             continue
-        code = strip_rust_comments(path.read_text())
+        code = strip_rust_comments(text)
         unterminated("P11", rel, code, out)
         for m in re.finditer(r"\b\w*(?:hmac|tag)\w*\b[\])]*\s*[!=]=(?!=)|[!=]=\s*[&*]?\w*(?:hmac|tag)\w*\b", code):
             n = code.count("\n", 0, m.start()) + 1

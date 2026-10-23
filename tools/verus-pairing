@@ -77,6 +77,13 @@ def check(root: pathlib.Path, image_root_override=None) -> tuple:
             errors.append(f"verus-pairing: {name}: no entry in policy/verus-pairing.toml")
             continue
         vendored, image = root / "third_party/verus" / name, image_root / crates[name]
+        # Each tree must be a directory itself, not a link: tree() refuses
+        # links inside it, but rglob follows a linked root, so a vendored
+        # crate linked at the image tree would compare a tree with itself.
+        linked = [str(p) for p in (vendored, image) if p.is_symlink()]
+        if linked:
+            errors.append(f"verus-pairing: {name}: {', '.join(linked)} is a symlink, not a tree")
+            continue
         if not vendored.is_dir():
             errors.append(f"verus-pairing: {name}: third_party/verus/{name} is missing")
             continue

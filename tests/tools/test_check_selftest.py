@@ -141,12 +141,20 @@ def main() -> int:
             dead = True
             if child_dead:
                 # The grandchild (make's own child) must die with the group.
+                # SIGKILL to the group is certain but its delivery is not
+                # instant: wait, bounded, for the death rather than judging
+                # the first look (a load-dependent false failure, M5 review).
                 pid = int((pathlib.Path(d) / "child.pid").read_text())
-                try:
-                    os.kill(pid, 0)
-                    dead = pathlib.Path(f"/proc/{pid}/stat").read_text().split()[2] == "Z"
-                except ProcessLookupError:
-                    dead = True
+                deadline = time.monotonic() + 10
+                while True:
+                    try:
+                        os.kill(pid, 0)
+                        dead = pathlib.Path(f"/proc/{pid}/stat").read_text().split()[2] == "Z"
+                    except (ProcessLookupError, FileNotFoundError):
+                        dead = True
+                    if dead or time.monotonic() > deadline:
+                        break
+                    time.sleep(0.05)
         ok = out.returncode == want_code and want_err in out.stderr and dead
         failures += not ok
         print(f"{'ok  ' if ok else 'FAIL'} run_make: {name}: code {out.returncode}, child dead {dead}")

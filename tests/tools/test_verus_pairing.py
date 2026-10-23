@@ -97,6 +97,12 @@ def image_tests_named_like_src(root, image):
     (image / "vstd/testsuite.rs").write_text("\n")
 
 
+def vendored_link_to_image(root, image):
+    import shutil
+    shutil.rmtree(root / "third_party/verus/vstd")
+    (root / "third_party/verus/vstd").symlink_to(image / "vstd")
+
+
 def patch_elsewhere(root, image):
     (root / "Cargo.toml").write_text(PATCH.replace("third_party/verus/verus_builtin", "vendor/verus_builtin"))
 
@@ -112,6 +118,8 @@ CASES = [
     ("a file missing from the vendored copy is refused", LOCK_PATH, missing, 1,
      "verus_builtin: src/lib.rs is missing from the vendored copy"),
     ("a registry source is refused", LOCK_REGISTRY, None, 1, "verus_builtin: Cargo.lock resolves it from"),
+    ("a vendored crate linked at the image tree is refused", LOCK_PATH, vendored_link_to_image, 1,
+     "vstd: "),
     ("a patch pointing elsewhere is refused", LOCK_PATH, patch_elsewhere, 1,
      "verus_builtin: the root Cargo.toml does not patch it to third_party/verus/verus_builtin"),
     ("a member without a policy entry is refused", LOCK_EXTRA, None, 2, "verus_syn: no entry in policy/verus-pairing.toml"),

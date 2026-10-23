@@ -2,6 +2,7 @@
 //! same domain-separated message; a release verifies only when both do.
 
 use libcrux_ml_dsa::ml_dsa_65::{self, MLDSA65Signature, MLDSA65SigningKey, MLDSA65VerificationKey};
+use zeroize::Zeroize;
 
 /// Prefixed to the manifest before signing, so these signatures cannot be
 /// replayed as signatures over anything else either key signs.
@@ -14,8 +15,10 @@ pub struct SigningKeys {
 
 impl Drop for SigningKeys {
     fn drop(&mut self) {
-        self.ed25519.fill(0);
-        self.ml_dsa.as_ref_mut().fill(0);
+        // zeroize, not fill: a plain store to memory nothing reads again is
+        // a dead store the optimiser may remove (L12).
+        self.ed25519.zeroize();
+        self.ml_dsa.as_ref_mut().zeroize();
     }
 }
 
@@ -55,12 +58,14 @@ pub fn keygen(random: &mut dyn FnMut(&mut [u8]) -> bool) -> Result<(SigningKeys,
     let mut ed = [0u8; 32];
     let mut seed = [0u8; 32];
     if !random(&mut ed) || !random(&mut seed) || ed.iter().all(|&b| b == 0) {
+        ed.zeroize();
+        seed.zeroize();
         return Err(SigError::Randomness);
     }
     let mut ed_pub = [0u8; 32];
     libcrux_ed25519::secret_to_public(&mut ed_pub, &ed);
     let pair = ml_dsa_65::generate_key_pair(seed);
-    seed.fill(0);
+    seed.zeroize();
     Ok((SigningKeys { ed25519: ed, ml_dsa: pair.signing_key }, VerifyingKeys { ed25519: ed_pub, ml_dsa: pair.verification_key }))
 }
 

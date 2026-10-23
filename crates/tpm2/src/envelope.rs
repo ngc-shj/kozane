@@ -309,7 +309,7 @@ fn open_core(envelope: &Envelope<'_>, kek: &mut Secret<32>, out: &mut [u8]) -> R
 /// Zeroes, with volatile writes, `OPEN_SCRUB_DEPTH` bytes of stack below
 /// the caller's frame: where `open_core` and the AEAD just ran.
 #[inline(never)]
-pub(crate) fn scrub_stack() {
+fn scrub_stack() {
     let mut area = [0u64; OPEN_SCRUB_DEPTH / 8];
     zeroize::Zeroize::zeroize(&mut area);
 }
