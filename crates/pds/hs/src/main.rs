@@ -13,8 +13,8 @@ use key_core::MAX_WORDS;
 use layout::hs as ch;
 use pdkit::{Audit, Buf, Rx, Tx};
 use sel4_microkit::{
-    Channel, ChannelSet, Handler, Infallible, MessageInfo, debug_println, memory_region_symbol, protection_domain,
-    with_msg_regs, with_msg_regs_mut,
+    Channel, ChannelSet, Handler, Infallible, MessageInfo, memory_region_symbol, protection_domain, with_msg_regs,
+    with_msg_regs_mut,
 };
 
 const KEY: Channel = Channel::new(ch::CH_KEY);
@@ -82,16 +82,22 @@ struct Hs {
     scratch: Buf,
 }
 
-fn halt(msg: &str) -> ! {
-    debug_println!("hs: {msg}");
-    panic!("hs: halted");
+/// `Halted` reasons (the record's `a`), stable per M5 plan C6.
+mod halt {
+    /// CNTFRQ is 0: no clock to age PSKs and sessions by.
+    pub const NO_CLOCK: u32 = 1;
+    /// `key` refused the boot seed (after `KeyUnavailable`, if it is
+    /// Unavailable).
+    pub const NO_BOOT_SEED: u32 = 2;
+    /// The handshaker could not be built from the boot seed.
+    pub const INIT_FAILED: u32 = 3;
 }
 
 #[protection_domain]
 fn init() -> Hs {
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout` (checked by tools/laws and layout tests).
-    let (from_pq, from_ingress, to_ingress, to_data, audit) = unsafe {
+    let (from_pq, from_ingress, to_ingress, to_data, mut audit) = unsafe {
         (
             pdkit::rx(
                 memory_region_symbol!(pqh_used: *mut u8),
@@ -117,16 +123,28 @@ fn init() -> Hs {
         )
     };
     if cpu::checked_frequency(cpu::cntfrq()).is_none() {
-        halt("CNTFRQ is 0; refusing to run without a clock");
+        audit.halt(halt::NO_CLOCK);
     }
     let mut key = KeyClient::new(Ppc);
-    let seed = key.boot_seed().unwrap_or_else(|_| halt("no boot seed from key"));
-    let handshaker = Handshaker::new(&config::GATEWAY_PUBLIC, &seed).unwrap_or_else(|_| halt("init failed"));
+    let seed = match key.boot_seed() {
+        Ok(seed) => seed,
+        Err(_) => {
+            // The boot seed is hs's first call to `key`, so this is the first
+            // time an Unavailable `key` can show: audited once, as hs then
+            // halts.
+            if let Some(code) = key_core::unavailable_code(key.last_error) {
+                audit.record(Event::KeyUnavailable { code });
+            }
+            audit.halt(halt::NO_BOOT_SEED)
+        }
+    };
+    let handshaker =
+        Handshaker::new(&config::GATEWAY_PUBLIC, &seed).unwrap_or_else(|_| audit.halt(halt::INIT_FAILED));
     let mut peers = [[0u8; 32]; MAX_PEERS];
     for (dst, p) in peers.iter_mut().zip(config::PEERS) {
         *dst = p.public;
     }
-    debug_println!("hs: ready");
+    audit.ready();
     Hs {
         from_pq,
         from_ingress,

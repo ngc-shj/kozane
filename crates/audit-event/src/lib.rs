@@ -8,9 +8,13 @@
 //! every occurrence; producers raise them only on state edges, never at a
 //! rate an attacker drives.
 //!
-//! One kind carries a value instead of a running total:
-//! `RpCostHighWater`'s `a` is the measured cost in µs, and `CostHighWater`
-//! gates how often it fires.
+//! Some kinds carry a value instead of a running total: `RpCostHighWater`'s
+//! `a` is the measured cost in µs (`CostHighWater` gates how often it
+//! fires), the stack marks' `a` is bytes, `Halted`'s a reason code closed
+//! per producer and `KeyUnavailable`'s the key PD's boot error code.
+//!
+//! No kind names its producer: the producer is the audit ring a record
+//! arrived on (M5 plan C6), so a PD cannot report on another's behalf.
 
 #![no_std]
 #![deny(
@@ -162,6 +166,22 @@ pub enum Event {
     /// when deeper). `pq` reports it this way rather than printing, so its
     /// line cannot interleave with `audit`'s on the console (M4 plan C8).
     StackHighWater { bytes: u32 },
+    /// The producer finished init (edge; never coalesced). `audit` prints
+    /// it as `<pd>: ready`, the line the PDs printed themselves before the
+    /// release kernel took debug printing away (M5 plan C6).
+    Ready,
+    /// The producer stops for good; `reason` (the record's `a`) is a code
+    /// from the producer's own closed table, documented where it is raised
+    /// (never coalesced; raised once, just before the PD halts).
+    Halted { reason: u32 },
+    /// The key PD the producer calls answered with its boot error `code`
+    /// (the record's `a`): it failed validation and holds no secret
+    /// (never coalesced; raised the first time, once per boot).
+    KeyUnavailable { code: u32 },
+    /// The stack high-water mark of the key PD the producer calls, which
+    /// has no audit ring of its own; `bytes` is the record's `a` (never
+    /// coalesced; `pq` raises it once, for `pqkey`'s boot mark).
+    KeyStackHighWater { bytes: u32 },
 }
 
 impl Event {
@@ -227,17 +247,21 @@ impl Event {
             Event::RpCookieReplySent => 0x004f,
             Event::RpCookieAccepted => 0x0050,
             Event::RpCookieSuppressed => 0x0051,
+            Event::Ready => 0x0053,
             Event::RpCostHighWater { .. } => COST_HIGH_WATER,
             Event::StackHighWater { .. } => STACK_HIGH_WATER,
+            Event::Halted { .. } => HALTED,
+            Event::KeyUnavailable { .. } => KEY_UNAVAILABLE,
+            Event::KeyStackHighWater { .. } => KEY_STACK_HIGH_WATER,
             Event::FrameDropped { reason } => {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
             }
         }
     }
 
-    /// Every variant except the parameterised `FrameDropped`,
-    /// `RpCostHighWater` and `StackHighWater`.
-    pub const FIXED: [Event; 60] = [
+    /// Every variant except the parameterised `FrameDropped` and the
+    /// value-carrying ones (`Event::value` is `Some`).
+    pub const FIXED: [Event; 61] = [
         Event::ArpReplied,
         Event::UdpEchoed,
         Event::RingCorrupt,
@@ -298,6 +322,7 @@ impl Event {
         Event::RpCookieReplySent,
         Event::RpCookieAccepted,
         Event::RpCookieSuppressed,
+        Event::Ready,
     ];
 
     /// Display name; exhaustive, so a new variant fails to compile here.
@@ -363,8 +388,12 @@ impl Event {
             Event::RpCookieReplySent => "RpCookieReplySent",
             Event::RpCookieAccepted => "RpCookieAccepted",
             Event::RpCookieSuppressed => "RpCookieSuppressed",
+            Event::Ready => "Ready",
             Event::RpCostHighWater { .. } => "RpCostHighWater",
             Event::StackHighWater { .. } => "StackHighWater",
+            Event::Halted { .. } => "Halted",
+            Event::KeyUnavailable { .. } => "KeyUnavailable",
+            Event::KeyStackHighWater { .. } => "KeyStackHighWater",
             Event::FrameDropped { .. } => "FrameDropped",
         }
     }
@@ -384,7 +413,11 @@ impl Event {
             | Event::RpCookieSecretExpired
             | Event::RpCookieSecretUnavailable
             | Event::RpCostHighWater { .. }
-            | Event::StackHighWater { .. } => false,
+            | Event::StackHighWater { .. }
+            | Event::Ready
+            | Event::Halted { .. }
+            | Event::KeyUnavailable { .. }
+            | Event::KeyStackHighWater { .. } => false,
             Event::ArpReplied
             | Event::UdpEchoed
             | Event::FrameDropped { .. }
@@ -444,6 +477,9 @@ impl Event {
         match self {
             Event::RpCostHighWater { us } => Some(us),
             Event::StackHighWater { bytes } => Some(bytes),
+            Event::Halted { reason } => Some(reason),
+            Event::KeyUnavailable { code } => Some(code),
+            Event::KeyStackHighWater { bytes } => Some(bytes),
             _ => None,
         }
     }
@@ -516,8 +552,12 @@ impl Event {
             Event::RpCookieReplySent => 57,
             Event::RpCookieAccepted => 58,
             Event::RpCookieSuppressed => 59,
+            Event::Ready => 60,
             Event::RpCostHighWater { .. } => COST_HIGH_WATER_SLOT,
             Event::StackHighWater { .. } => STACK_HIGH_WATER_SLOT,
+            Event::Halted { .. } => HALTED_SLOT,
+            Event::KeyUnavailable { .. } => KEY_UNAVAILABLE_SLOT,
+            Event::KeyStackHighWater { .. } => KEY_STACK_HIGH_WATER_SLOT,
             Event::FrameDropped { reason } => {
                 // FIXED_SLOTS..FIXED_SLOTS+64, clamped like `code`.
                 let r = if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason };
@@ -527,15 +567,22 @@ impl Event {
     }
 }
 
-const FIXED_SLOTS: usize = 60;
+const FIXED_SLOTS: usize = 61;
 const COST_HIGH_WATER_SLOT: usize = FIXED_SLOTS + MAX_DROP_REASON as usize + 1;
 const STACK_HIGH_WATER_SLOT: usize = COST_HIGH_WATER_SLOT + 1;
-const SLOTS: usize = STACK_HIGH_WATER_SLOT + 1;
+const HALTED_SLOT: usize = STACK_HIGH_WATER_SLOT + 1;
+const KEY_UNAVAILABLE_SLOT: usize = HALTED_SLOT + 1;
+const KEY_STACK_HIGH_WATER_SLOT: usize = KEY_UNAVAILABLE_SLOT + 1;
+const SLOTS: usize = KEY_STACK_HIGH_WATER_SLOT + 1;
 
 /// `RpCostHighWater`'s code, the first after the fixed range.
 pub const COST_HIGH_WATER: u16 = 0x0048;
 /// `StackHighWater`'s code, after the fixed range's last.
 pub const STACK_HIGH_WATER: u16 = 0x0052;
+/// The M5 value-carrying codes, after `Ready` (0x0053).
+pub const HALTED: u16 = 0x0054;
+pub const KEY_UNAVAILABLE: u16 = 0x0055;
+pub const KEY_STACK_HIGH_WATER: u16 = 0x0056;
 
 /// Per-producer coalescing state.
 pub struct Coalescer {
@@ -610,6 +657,12 @@ pub enum Decoded {
     CostHighWater,
     /// `StackHighWater`: the record's `a` is the bytes used.
     StackHighWater,
+    /// `Halted`: the record's `a` is the producer's reason code.
+    Halted,
+    /// `KeyUnavailable`: the record's `a` is the key PD's boot error code.
+    KeyUnavailable,
+    /// `KeyStackHighWater`: the record's `a` is the bytes used.
+    KeyStackHighWater,
     Unknown,
 }
 
@@ -622,6 +675,15 @@ pub fn decode(code: u16) -> Decoded {
     }
     if code == STACK_HIGH_WATER {
         return Decoded::StackHighWater;
+    }
+    if code == HALTED {
+        return Decoded::Halted;
+    }
+    if code == KEY_UNAVAILABLE {
+        return Decoded::KeyUnavailable;
+    }
+    if code == KEY_STACK_HIGH_WATER {
+        return Decoded::KeyStackHighWater;
     }
     match code.checked_sub(FRAME_DROPPED_BASE) {
         Some(r) if r <= MAX_DROP_REASON => Decoded::FrameDropped(r),

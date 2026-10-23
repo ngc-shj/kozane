@@ -179,11 +179,17 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::RpCookieSecretUnavailable
         | Event::RpCookieReplySent
         | Event::RpCookieAccepted
-        | Event::RpCookieSuppressed => true,
-        Event::FrameDropped { .. } | Event::RpCostHighWater { .. } | Event::StackHighWater { .. } => false,
+        | Event::RpCookieSuppressed
+        | Event::Ready => true,
+        Event::FrameDropped { .. }
+        | Event::RpCostHighWater { .. }
+        | Event::StackHighWater { .. }
+        | Event::Halted { .. }
+        | Event::KeyUnavailable { .. }
+        | Event::KeyStackHighWater { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
-    assert_eq!(Event::FIXED.len(), 60);
+    assert_eq!(Event::FIXED.len(), 61);
 }
 
 #[test]
@@ -230,6 +236,7 @@ fn only_state_edge_kinds_are_never_coalesced() {
             Event::RpLoadCleared,
             Event::RpCookieSecretExpired,
             Event::RpCookieSecretUnavailable,
+            Event::Ready,
         ]
     );
     assert!(Event::FrameDropped { reason: 0 }.is_coalesced());
@@ -261,7 +268,63 @@ fn decode_classifies_fixed_dropped_and_unknown_codes() {
     assert_eq!(decode(0x004a), Decoded::Fixed(Event::RpPqSyncDead));
     assert_eq!(decode(0x0051), Decoded::Fixed(Event::RpCookieSuppressed));
     assert_eq!(decode(0x0052), Decoded::StackHighWater);
-    assert_eq!(decode(0x0053), Decoded::Unknown);
+    assert_eq!(decode(0x0053), Decoded::Fixed(Event::Ready));
+    assert_eq!(decode(0x0054), Decoded::Halted);
+    assert_eq!(decode(0x0055), Decoded::KeyUnavailable);
+    assert_eq!(decode(0x0056), Decoded::KeyStackHighWater);
+    assert_eq!(decode(0x0057), Decoded::Unknown);
+}
+
+#[test]
+fn ready_is_emitted_on_every_occurrence_and_decodes_as_itself() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::Ready, 2, &mut out);
+    assert_eq!(out.iter().map(|r| (r.code, r.a)).collect::<Vec<_>>(), [(0x0053, 1), (0x0053, 2)]);
+    assert_eq!(Event::Ready.name(), "Ready");
+    assert_eq!(decode(Event::Ready.code()), Decoded::Fixed(Event::Ready));
+}
+
+#[test]
+fn halted_carries_its_reason_not_a_count() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::Halted { reason: 3 }, 2, &mut out);
+    assert_eq!(out, [Record { code: HALTED, _reserved: 0, a: 3, b: 0 }; 2]);
+    assert_eq!(decode(HALTED), Decoded::Halted);
+}
+
+#[test]
+fn key_unavailable_carries_the_boot_error_code_not_a_count() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::KeyUnavailable { code: 7 }, 2, &mut out);
+    assert_eq!(out, [Record { code: KEY_UNAVAILABLE, _reserved: 0, a: 7, b: 0 }; 2]);
+    assert_eq!(decode(KEY_UNAVAILABLE), Decoded::KeyUnavailable);
+}
+
+#[test]
+fn key_stack_high_water_is_its_own_kind_apart_from_the_producers_mark() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::StackHighWater { bytes: 61_808 }, 1, &mut out);
+    run(&mut c, Event::KeyStackHighWater { bytes: 100_096 }, 1, &mut out);
+    let got: Vec<_> = out.iter().map(|r| (r.code, r.a)).collect();
+    assert_eq!(got, [(STACK_HIGH_WATER, 61_808), (KEY_STACK_HIGH_WATER, 100_096)]);
+    assert!(!Event::KeyStackHighWater { bytes: 0 }.is_coalesced());
+    assert_eq!(decode(KEY_STACK_HIGH_WATER), Decoded::KeyStackHighWater);
+}
+
+#[test]
+fn m5_codes_are_distinct_from_every_other_code() {
+    let m5 = [HALTED, KEY_UNAVAILABLE, KEY_STACK_HIGH_WATER];
+    let mut others: Vec<u16> = Event::FIXED.iter().map(|e| e.code()).collect();
+    others.extend([COST_HIGH_WATER, STACK_HIGH_WATER]);
+    for (i, c) in m5.iter().enumerate() {
+        assert!(*c < FRAME_DROPPED_BASE);
+        assert!(!others.contains(c));
+        assert!(!m5[i + 1..].contains(c));
+    }
 }
 
 #[test]

@@ -87,13 +87,18 @@ impl SharePerms {
     }
 }
 
+/// The PL011 page, the only page a console mr may be pinned at (M5 plan C6;
+/// user-mappable in both Microkit configs per `platform_gen.json`).
+pub const PL011_PAGE: (u64, u64) = (0x900_0000, 0x1000);
+
 #[derive(Debug, Clone)]
 pub enum MrPolicy {
     /// MMIO owned by exactly one driver, page-granular (L5). `phys_addr`
     /// and `size` pin the physical range the `.system` must match exactly
     /// (finding 3) and are what the board-RAM overlap check (finding 2)
-    /// uses.
-    Device { owner: String, phys_addr: u64, size: u64 },
+    /// uses. `console` marks the one console page, owned by a `service`
+    /// pd (L5 as amended by the M5 plan, C6).
+    Device { owner: String, phys_addr: u64, size: u64, console: bool },
     /// DMA buffer owned by exactly one driver, never shared (L5).
     Dma { owner: String },
     /// An MR holding static secrets, mapped only into its `key`-role owner
@@ -103,6 +108,14 @@ pub enum MrPolicy {
     Data { producer: String, consumers: BTreeSet<String> },
     /// Any other shared buffer (e.g. a ring region): explicit per-pd perms.
     Plain { shares: BTreeMap<String, SharePerms> },
+}
+
+impl MrPolicy {
+    /// A console mr pinned at the PL011 page: the one device mr that does
+    /// not seed taint (L1). Keyed to the pin, not to the flag alone.
+    pub fn is_pl011_console(&self) -> bool {
+        matches!(self, MrPolicy::Device { console: true, phys_addr, size, .. } if (*phys_addr, *size) == PL011_PAGE)
+    }
 }
 
 /// Per-pd policy: its role plus, for `driver`-role pds, the hardware IRQ
@@ -173,7 +186,13 @@ struct RawPd {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RawMr {
-    Device { owner: String, phys_addr: u64, size: u64 },
+    Device {
+        owner: String,
+        phys_addr: u64,
+        size: u64,
+        #[serde(default)]
+        console: bool,
+    },
     Dma { owner: String },
     // `Option` so a missing owner gets an L2-specific policy error rather
     // than serde's generic "missing field".
@@ -263,10 +282,21 @@ impl Policy {
         let mut secrets_owners: BTreeMap<String, String> = BTreeMap::new();
         for (name, mr) in raw.mrs {
             let policy_mr = match mr {
-                RawMr::Device { owner, phys_addr, size } => {
+                RawMr::Device { owner, phys_addr, size, console } => {
                     require_pd(&pds, &owner)?;
-                    if !pds.get(&owner).is_some_and(|p| p.role.owns_hardware()) {
-                        return Err(err(format!("device mr '{name}' owner '{owner}' must have role 'driver' or 'timer'")));
+                    let role = pds.get(&owner).map(|p| p.role);
+                    // A service pd's devices are judged by the laws (only a
+                    // console is allowed, C6), so a wrong one is a reported
+                    // violation rather than an unloadable policy.
+                    if !role.is_some_and(|r| r.owns_hardware() || r == Role::Service) {
+                        return Err(err(format!(
+                            "device mr '{name}' owner '{owner}' must have role 'driver', 'timer' or 'service'"
+                        )));
+                    }
+                    if console && role != Some(Role::Service) {
+                        return Err(err(format!(
+                            "device mr '{name}' is marked console but its owner '{owner}' is not a service pd"
+                        )));
                     }
                     if size == 0 {
                         return Err(err(format!("device mr '{name}' must have a nonzero size")));
@@ -274,7 +304,7 @@ impl Policy {
                     if phys_addr.checked_add(size).is_none() {
                         return Err(err(format!("device mr '{name}' phys_addr + size overflows a 64-bit address")));
                     }
-                    MrPolicy::Device { owner, phys_addr, size }
+                    MrPolicy::Device { owner, phys_addr, size, console }
                 }
                 RawMr::Dma { owner } => {
                     require_role(&pds, &owner, Role::Driver)?;
@@ -601,6 +631,39 @@ mod tests {
         "#
         );
         assert!(Policy::load(&text).is_err());
+    }
+
+    fn console_policy(owner_role: &str) -> String {
+        format!(
+            r#"
+            [pds.audit]
+            role = "{owner_role}"
+
+            [mrs.uart]
+            kind = "device"
+            owner = "audit"
+            phys_addr = 0x9000000
+            size = 0x1000
+            console = true
+
+            [budgets]
+            ratio_cap = 0.2
+            ratio_sum_cap = 0.5
+            {BOARD}
+        "#
+        )
+    }
+
+    #[test]
+    fn console_owned_by_a_service_pd_loads() {
+        let p = Policy::load(&console_policy("service")).unwrap();
+        assert!(p.mrs["uart"].is_pl011_console());
+    }
+
+    #[test]
+    fn console_owned_by_a_driver_is_rejected() {
+        let e = Policy::load(&console_policy("driver")).unwrap_err().to_string();
+        assert!(e.contains("is marked console but its owner 'audit' is not a service pd"), "{e}");
     }
 
     #[test]

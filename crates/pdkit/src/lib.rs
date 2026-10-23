@@ -108,6 +108,22 @@ impl Audit {
             self.channel.notify();
         }
     }
+
+    /// The end of init: `Ready`, notified at once (`audit` prints the
+    /// PD's `<pd>: ready` line).
+    pub fn ready(&mut self) {
+        self.record(Event::Ready);
+        self.flush();
+    }
+
+    /// Stops the PD for good (fail-closed): `Halted { reason }` is pushed and
+    /// `audit` notified first, so the record is queued before the fault.
+    /// `reason` comes from the calling PD's own closed table.
+    pub fn halt(&mut self, reason: u32) -> ! {
+        self.record(Event::Halted { reason });
+        self.flush();
+        panic!("halted");
+    }
 }
 
 /// Reclaims returned buffers, then sends `data` (copied into a buffer the

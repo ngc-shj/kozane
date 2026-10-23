@@ -20,7 +20,7 @@ use layout::{AUDIT_RING_SLOTS, NET_BUF_SIZE, NET_BUFFERS, NET_REGION_SIZE, NET_R
 use ring::Producer;
 use ring::link::{LinkError, Receiver, Sender};
 use ring::shmem::{Region, ShmRing};
-use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, debug_println};
+use sel4_microkit::{Channel, ChannelSet, Handler, Infallible};
 use sel4_virtio_hal_impl::HalImpl;
 use virtio_drivers::device::net::VirtIONetRaw;
 use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
@@ -34,11 +34,26 @@ const RAW_BUF: usize = NET_BUF_SIZE + 64;
 type NetRing = ShmRing<ring::Desc, NET_RING_SLOTS>;
 type AuditRing = ShmRing<Record, AUDIT_RING_SLOTS>;
 type Buffers = Box<[[u8; RAW_BUF]]>;
+type AuditProducer = Producer<AuditRing, Record, AUDIT_RING_SLOTS>;
+
+/// `Halted` reasons (the record's `a`), stable per M5 plan C6; the same
+/// table for `eth_out` and `eth_in`.
+pub mod halt {
+    /// A patched region symbol (mmio or dma vaddr, dma paddr) is unset.
+    pub const SYMBOL_UNSET: u32 = 1;
+    /// The virtio-mmio header pointer is null.
+    pub const MMIO_UNSET: u32 = 2;
+    /// The mmio page holds no valid virtio-mmio header.
+    pub const BAD_HEADER: u32 = 3;
+    /// The virtio device is not a network device.
+    pub const NOT_NET: u32 = 4;
+    /// The virtio-net device failed to initialise.
+    pub const DEVICE_INIT: u32 = 5;
+}
 
 /// What a driver binary hands over: values patched in by the Microkit tool
 /// (symbol names differ per PD, so the binaries read them) and its channels.
 pub struct Params {
-    pub name: &'static str,
     pub mmio_vaddr: usize,
     pub mmio_offset: usize,
     pub dma_vaddr: usize,
@@ -58,7 +73,6 @@ pub struct Params {
 }
 
 pub struct Driver {
-    name: &'static str,
     dev: VirtIONetRaw<HalImpl, MmioTransport<'static>, QUEUE_SIZE>,
     /// Heap-allocated so they never move while the device holds them.
     rx_bufs: Buffers,
@@ -72,7 +86,7 @@ pub struct Driver {
     tx_idle: [bool; QUEUE_SIZE],
     to_peer: Sender<NetRing, NetRing, NET_RING_SLOTS, NET_BUFFERS, NET_BUF_SIZE>,
     from_peer: Receiver<NetRing, NetRing, NET_RING_SLOTS, NET_BUFFERS, NET_BUF_SIZE>,
-    audit: Producer<AuditRing, Record, AUDIT_RING_SLOTS>,
+    audit: AuditProducer,
     coalescer: Coalescer,
     scratch: [u8; NET_BUF_SIZE],
     audit_pending: bool,
@@ -83,26 +97,21 @@ pub struct Driver {
     ch_audit: Channel,
 }
 
-/// Initialises the device and the rings. Panics (halting the PD, fail-closed)
-/// on unset symbols or a device that is not a virtio-net.
+/// Pushes `Halted { reason }`, notifies `audit`, then stops the PD
+/// (fail-closed). Init's failures only, before the `Driver` exists.
+fn halt(audit: &mut AuditProducer, ch_audit: Channel, reason: u32) -> ! {
+    let _ = Coalescer::new().record(Event::Halted { reason }, |r| audit.push(r).is_ok());
+    ch_audit.notify();
+    panic!("halted");
+}
+
+/// Initialises the device and the rings. Halts the PD (fail-closed, audited
+/// as `Halted`) on unset symbols or a device that is not a virtio-net.
 pub fn start(p: Params) -> Driver {
-    // 0 is the default of every patched symbol and also a valid physical
-    // address, so an unset value must stop the PD before the device sees it.
-    assert!(p.dma_vaddr != 0 && p.dma_paddr != 0 && p.mmio_vaddr != 0, "netdrv: region symbol unset");
-    HalImpl::init(p.dma_size, p.dma_vaddr, p.dma_paddr);
-
-    let header = NonNull::new(p.mmio_vaddr.wrapping_add(p.mmio_offset) as *mut VirtIOHeader)
-        .unwrap_or_else(|| panic!("netdrv: mmio vaddr unset"));
-    // SAFETY: the .system maps the virtio-mmio page at mmio_vaddr, uncached,
-    // for this PD only (law L5).
-    let transport = unsafe { MmioTransport::new(header, MMIO_SIZE) }
-        .unwrap_or_else(|_| panic!("netdrv: bad virtio-mmio header"));
-    assert!(transport.device_type() == DeviceType::Network, "netdrv: not a network device");
-    let dev = VirtIONetRaw::new(transport).unwrap_or_else(|_| panic!("netdrv: device init"));
-
     // SAFETY: the .system maps each region into this PD and its peer only,
-    // sized as in `layout`; rings are 4-byte aligned page starts.
-    let (to_peer, from_peer, audit) = unsafe {
+    // sized as in `layout`; rings are 4-byte aligned page starts. The audit
+    // ring comes first, so every halt below is reported.
+    let (to_peer, from_peer, mut audit) = unsafe {
         (
             Sender::new(
                 NetRing::producer(p.rx_used.as_ptr()),
@@ -118,8 +127,25 @@ pub fn start(p: Params) -> Driver {
         )
     };
 
+    // 0 is the default of every patched symbol and also a valid physical
+    // address, so an unset value must stop the PD before the device sees it.
+    if p.dma_vaddr == 0 || p.dma_paddr == 0 || p.mmio_vaddr == 0 {
+        halt(&mut audit, p.ch_audit, halt::SYMBOL_UNSET);
+    }
+    HalImpl::init(p.dma_size, p.dma_vaddr, p.dma_paddr);
+
+    let header = NonNull::new(p.mmio_vaddr.wrapping_add(p.mmio_offset) as *mut VirtIOHeader)
+        .unwrap_or_else(|| halt(&mut audit, p.ch_audit, halt::MMIO_UNSET));
+    // SAFETY: the .system maps the virtio-mmio page at mmio_vaddr, uncached,
+    // for this PD only (law L5).
+    let transport = unsafe { MmioTransport::new(header, MMIO_SIZE) }
+        .unwrap_or_else(|_| halt(&mut audit, p.ch_audit, halt::BAD_HEADER));
+    if transport.device_type() != DeviceType::Network {
+        halt(&mut audit, p.ch_audit, halt::NOT_NET);
+    }
+    let dev = VirtIONetRaw::new(transport).unwrap_or_else(|_| halt(&mut audit, p.ch_audit, halt::DEVICE_INIT));
+
     let mut drv = Driver {
-        name: p.name,
         dev,
         rx_bufs: vec![[0u8; RAW_BUF]; QUEUE_SIZE].into_boxed_slice(),
         tx_bufs: vec![[0u8; RAW_BUF]; QUEUE_SIZE].into_boxed_slice(),
@@ -143,7 +169,7 @@ pub fn start(p: Params) -> Driver {
     }
     drv.dev.ack_interrupt();
     let _ = drv.ch_device.irq_ack();
-    debug_println!("{}: ready", drv.name);
+    drv.audit(Event::Ready);
     // Frames may complete before the first interrupt is delivered.
     drv.service();
     drv

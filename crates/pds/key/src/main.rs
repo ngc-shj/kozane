@@ -1,19 +1,21 @@
 //! Key oracle PD (plan C10, laws L1/L2): passive, device-less, and the only
 //! PD that maps the secrets region. Validates it against the compiled
-//! configuration at boot and halts on any mismatch; afterwards answers the
-//! fixed-size requests defined in `key-core`, each caller limited to its row
-//! of the caller → label table (`hs` is the only caller).
+//! configuration at boot; afterwards answers the fixed-size requests defined
+//! in `key-core`, each caller limited to its row of the caller → label table
+//! (`hs` is the only caller). A failed boot leaves it Unavailable (M5 plan
+//! C6): no secret held, every call answered with the boot error's code,
+//! which `hs` audits (`key` itself has no audit ring and no console).
 
 #![no_std]
 #![no_main]
 
 use core::ptr::NonNull;
 
-use key_core::{Bucket, Caller, ERR_BAD_REQUEST, KEY_BURST, KEY_INTERVAL_NS, MAX_WORDS, Oracle};
+use key_core::{BootError, Bucket, Caller, ERR_BAD_REQUEST, KEY_BURST, KEY_INTERVAL_NS, MAX_WORDS, Oracle};
 use layout::key as ch;
 use sel4_microkit::{
-    Channel, Handler, Infallible, MessageInfo, debug_println, memory_region_symbol, protection_domain,
-    with_msg_regs, with_msg_regs_mut,
+    Channel, Handler, Infallible, MessageInfo, memory_region_symbol, protection_domain, with_msg_regs,
+    with_msg_regs_mut,
 };
 use wg_core::crypto::{self, Key32};
 
@@ -26,14 +28,10 @@ fn caller(channel: Channel) -> Option<Caller> {
 /// RNDR samples mixed into the boot seed.
 const SEED_SAMPLES: usize = 4;
 
-struct Key {
-    oracle: Oracle<'static>,
-    bucket: Bucket,
-}
-
-fn halt(msg: &str) -> ! {
-    debug_println!("key: {msg}");
-    panic!("key: halted");
+enum Key {
+    Ready { oracle: Oracle<'static>, bucket: Bucket },
+    /// The boot failed with `BootError::code` `code`; nothing else is kept.
+    Unavailable { code: u32 },
 }
 
 fn region() -> &'static [u8] {
@@ -43,22 +41,29 @@ fn region() -> &'static [u8] {
     unsafe { p.as_ref() }
 }
 
-#[protection_domain]
-fn init() -> Key {
+fn boot() -> Result<Oracle<'static>, BootError> {
     let peers = config::PEERS.iter().map(|p| &p.public);
-    let blob = key_core::validate(region(), &config::GATEWAY_PUBLIC, peers).unwrap_or_else(|e| halt(e.message()));
+    let blob = key_core::validate(region(), &config::GATEWAY_PUBLIC, peers)?;
 
     let mut samples = [0u8; SEED_SAMPLES * 8];
     if !cpu::fill_random(&mut samples) {
-        halt("RNDR unavailable");
+        zeroize::Zeroize::zeroize(&mut samples);
+        return Err(BootError::RndrUnavailable);
     }
-    let mut seed = crypto::hash(&[blob.boot_seed(), &samples, &cpu::cntpct().to_le_bytes()])
-        .unwrap_or_else(|_| halt("boot seed derivation failed"));
+    let seed = crypto::hash(&[blob.boot_seed(), &samples, &cpu::cntpct().to_le_bytes()]);
     zeroize::Zeroize::zeroize(&mut samples);
+    let mut seed = seed.map_err(|_| BootError::SeedDerivation)?;
     let seed_key = Key32::copy_from(&seed);
     zeroize::Zeroize::zeroize(&mut seed);
-    debug_println!("key: secrets valid ({} peers)", blob.peer_count());
-    Key { oracle: Oracle::new(blob, seed_key), bucket: Bucket::new(KEY_BURST, KEY_INTERVAL_NS) }
+    Ok(Oracle::new(blob, seed_key))
+}
+
+#[protection_domain]
+fn init() -> Key {
+    match boot() {
+        Ok(oracle) => Key::Ready { oracle, bucket: Bucket::new(KEY_BURST, KEY_INTERVAL_NS) },
+        Err(e) => Key::Unavailable { code: e.code() },
+    }
 }
 
 impl Handler for Key {
@@ -76,14 +81,17 @@ impl Handler for Key {
             }
         });
         let mut reply = [0u64; MAX_WORDS];
-        let (label, n) = self.oracle.handle(
-            caller(channel),
-            &mut self.bucket,
-            cpu::now_ns(),
-            msg_info.label(),
-            req.get(..count).unwrap_or(&[]),
-            &mut reply,
-        );
+        let (label, n) = match self {
+            Key::Ready { oracle, bucket } => oracle.handle(
+                caller(channel),
+                bucket,
+                cpu::now_ns(),
+                msg_info.label(),
+                req.get(..count).unwrap_or(&[]),
+                &mut reply,
+            ),
+            Key::Unavailable { code } => key_core::unavailable(caller(channel), *code, &mut reply),
+        };
         // Overwrite every register beyond this reply, so no part of an
         // earlier, longer reply is handed back to `hs`. The reply words
         // themselves stay in `key`'s own IPC buffer until the next call; only

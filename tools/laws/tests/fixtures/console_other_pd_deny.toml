@@ -1,0 +1,19 @@
+[pds.audit]
+role = "service"
+
+[pds.other]
+role = "service"
+
+[mrs.uart]
+kind = "device"
+owner = "audit"
+phys_addr = 0x9000000
+size = 0x1000
+console = true
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

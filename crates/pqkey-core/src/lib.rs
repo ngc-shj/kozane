@@ -3,18 +3,28 @@
 //!
 //! The PD maps its secrets region read-only, validates it once at boot
 //! (format, `H(spkm)` against the configuration, then a known-answer
-//! decapsulation) and halts on any mismatch. Afterwards it answers:
+//! decapsulation). Afterwards it answers:
 //!
-//! | label          | request (words)                    | reply (words)      |
-//! |----------------|------------------------------------|--------------------|
-//! | `PQ_DECAPS`    | ciphertext (24; last 4 bytes zero) | shared key (4)     |
-//! | `PQ_BOOT_SEED` | — (0)                              | per-boot seed (4)  |
+//! | label           | request (words)                    | reply (words)          |
+//! |-----------------|------------------------------------|------------------------|
+//! | `PQ_DECAPS`     | ciphertext (24; last 4 bytes zero) | shared key (4)         |
+//! | `PQ_BOOT_SEED`  | — (0)                              | per-boot seed (4)      |
+//! | `PQ_STACK_MARK` | — (0)                              | boot stack mark (1)    |
 //!
-//! Callers: `Pq → {PQ_DECAPS, PQ_BOOT_SEED}`. An unknown caller, a label
-//! outside the caller's row or a malformed request is refused before any
-//! budget is spent. McEliece uses implicit rejection, so a wrong but
-//! well-formed ciphertext yields a pseudorandom key, never an error. Words
-//! are little-endian `u64`s, as in seL4 message registers.
+//! Callers: `Pq → {PQ_DECAPS, PQ_BOOT_SEED, PQ_STACK_MARK}`. An unknown
+//! caller, a label outside the caller's row or a malformed request is
+//! refused before any budget is spent. McEliece uses implicit rejection, so
+//! a wrong but well-formed ciphertext yields a pseudorandom key, never an
+//! error. Words are little-endian `u64`s, as in seL4 message registers.
+//!
+//! `PQ_STACK_MARK` hands `pq` the stack depth `pqkey` measured after its
+//! boot KAT, for `pq` to audit: `pqkey` has no audit ring and no console
+//! (M5 plan C6). The depth of the constant-time decapsulation does not
+//! depend on the key.
+//!
+//! A boot that fails (`BootError`) leaves the PD up but Unavailable: it
+//! holds no secret and answers every call from a known caller with
+//! `unavailable_label(code)` and no data, so `pq` can report the failure.
 
 #![no_std]
 #![cfg_attr(test, feature(variant_count))]
@@ -34,15 +44,21 @@ use zeroize::Zeroizing;
 pub const LABEL_PQ_DECAPS: u64 = 1;
 pub const LABEL_PQ_BOOT_SEED: u64 = 2;
 
+pub const LABEL_PQ_STACK_MARK: u64 = 3;
+
 /// Reply labels (the values `key-core` uses for the same meanings).
 pub const OK: u64 = 0;
 pub const ERR_BAD_REQUEST: u64 = 1;
 pub const ERR_RATE_LIMITED: u64 = 4;
+/// `ERR_UNAVAILABLE | code`: the boot failed with `BootError::code` `code`.
+pub const ERR_UNAVAILABLE: u64 = 0x100;
 
 pub const PQ_DECAPS_REQ_WORDS: usize = 24;
 pub const PQ_DECAPS_REPLY_WORDS: usize = 4;
 pub const PQ_BOOT_SEED_REQ_WORDS: usize = 0;
 pub const PQ_BOOT_SEED_REPLY_WORDS: usize = 4;
+pub const PQ_STACK_MARK_REQ_WORDS: usize = 0;
+pub const PQ_STACK_MARK_REPLY_WORDS: usize = 1;
 /// Largest request or reply.
 pub const MAX_WORDS: usize = PQ_DECAPS_REQ_WORDS;
 
@@ -76,8 +92,9 @@ const _: () = assert!(
     PQ_KEY_INTERVAL_NS <= ingress_core::RP_HELLO_GLOBAL_INTERVAL_NS,
     "C2: ingress can forward InitHellos faster than pqkey refills"
 );
-/// Calls `pq` makes outside handshakes: `PQ_BOOT_SEED` at init.
-pub const PQ_BOOT_CALLS: u64 = 1;
+/// Calls `pq` makes outside handshakes: `PQ_BOOT_SEED` and `PQ_STACK_MARK`
+/// at init.
+pub const PQ_BOOT_CALLS: u64 = 2;
 /// Wall-clock cost of one InitHello → RespHello in `pq` at its committed
 /// budget under TCG, preemption included: what `RpCostHighWater` reports.
 /// The measured maximum (16.1 s, N = 26, median 8.5 s) with 25% headroom;
@@ -101,7 +118,7 @@ impl Caller {
     /// The closed caller → label table (M3 plan C2, law L2).
     pub const fn allows(self, label: u64) -> bool {
         match self {
-            Caller::Pq => matches!(label, LABEL_PQ_DECAPS | LABEL_PQ_BOOT_SEED),
+            Caller::Pq => matches!(label, LABEL_PQ_DECAPS | LABEL_PQ_BOOT_SEED | LABEL_PQ_STACK_MARK),
         }
     }
 }
@@ -122,8 +139,7 @@ pub enum BootError {
 }
 
 impl BootError {
-    /// Stable text for the boot log, one per failure: the boot-check
-    /// fixtures use these as needles (M3 plan C2).
+    /// Stable text, one per failure (M3 plan C2).
     pub const fn message(self) -> &'static str {
         match self {
             BootError::Blob(e) => e.message(),
@@ -131,6 +147,43 @@ impl BootError {
             BootError::KatMismatch => "pq secrets: boot KAT decapsulation mismatch",
             BootError::RndrUnavailable => "RNDR unavailable",
         }
+    }
+
+    /// Stable code, one per failure, carried by the Unavailable reply label
+    /// and by `pq`'s `KeyUnavailable` audit record (M5 plan C6). Never 0.
+    pub const fn code(self) -> u32 {
+        match self {
+            BootError::Blob(BlobError::BadMagic) => 1,
+            BootError::Blob(BlobError::BadVersion) => 2,
+            BootError::Blob(BlobError::BadPeerCount) => 3,
+            BootError::Blob(BlobError::BadChecksum) => 4,
+            BootError::Blob(BlobError::NonZeroPadding) => 5,
+            BootError::Blob(BlobError::TooSmall) => 6,
+            BootError::SpkmMismatch => 7,
+            BootError::KatMismatch => 8,
+            BootError::RndrUnavailable => 9,
+        }
+    }
+}
+
+/// The reply label of an Unavailable `pqkey` whose boot failed with `code`.
+pub const fn unavailable_label(code: u32) -> u64 {
+    ERR_UNAVAILABLE | (code as u64 & 0xff)
+}
+
+/// The boot error code an Unavailable reply label carries, if it is one.
+pub const fn unavailable_code(label: u64) -> Option<u32> {
+    if label & !0xff == ERR_UNAVAILABLE { Some((label & 0xff) as u32) } else { None }
+}
+
+/// The answer of an Unavailable `pqkey` (no oracle, no secret): every call
+/// from a known caller gets `unavailable_label(code)`, an unknown caller
+/// `ERR_BAD_REQUEST`; never any data, and `reply` is zeroed.
+pub fn unavailable(caller: Option<Caller>, code: u32, reply: &mut [u64]) -> (u64, usize) {
+    reply.fill(0);
+    match caller {
+        Some(_) => (unavailable_label(code), 0),
+        None => (ERR_BAD_REQUEST, 0),
     }
 }
 
@@ -227,15 +280,22 @@ fn decaps_ct(req: &[u64]) -> Option<[u8; pq::CT_LEN]> {
 pub struct Oracle<'a> {
     blob: Blob<'a>,
     boot_seed: Zeroizing<[u8; 32]>,
+    stack_mark: u64,
 }
 
 impl<'a> Oracle<'a> {
     /// Boot: validates the region against the configured `H(spkm)` and
-    /// draws the boot seed. The PD halts on any error.
+    /// draws the boot seed. On any error the PD stays Unavailable.
     pub fn boot(region: &'a [u8], spkm_hash: &[u8; 32], entropy: &mut impl BootEntropy) -> Result<Self, BootError> {
         let blob = validate(region, spkm_hash)?;
         let boot_seed = boot_seed(blob.blob_seed(), entropy)?;
-        Ok(Self { blob, boot_seed })
+        Ok(Self { blob, boot_seed, stack_mark: 0 })
+    }
+
+    /// Records the stack depth (bytes) the PD measured after the boot KAT,
+    /// which `PQ_STACK_MARK` answers.
+    pub fn set_stack_mark(&mut self, bytes: u64) {
+        self.stack_mark = bytes;
     }
 
     /// Answers one request from `caller` (None: a channel with no caller).
@@ -269,6 +329,7 @@ impl<'a> Oracle<'a> {
                 None => return (ERR_BAD_REQUEST, 0),
             },
             LABEL_PQ_BOOT_SEED if req.len() == PQ_BOOT_SEED_REQ_WORDS => None,
+            LABEL_PQ_STACK_MARK if req.len() == PQ_STACK_MARK_REQ_WORDS => None,
             _ => return (ERR_BAD_REQUEST, 0),
         };
         if !bucket.take(now_ns) {
@@ -280,6 +341,7 @@ impl<'a> Oracle<'a> {
                 decapsulate(self.blob.secret_key(), &ct, &mut shk);
                 put_bytes(reply, &shk[..])
             }
+            None if label == LABEL_PQ_STACK_MARK => put_bytes(reply, &self.stack_mark.to_le_bytes()),
             None => put_bytes(reply, &self.boot_seed[..]),
         };
         match written {

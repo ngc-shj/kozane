@@ -70,6 +70,18 @@ fn assert_deny(name: &str, expected: &[&str]) {
     assert_eq!(actual, expected, "fixture '{name}' violated law set mismatch\nstdout:\n{text}");
 }
 
+/// Like [`assert_deny`], and the violation lines are exactly `expected`
+/// ("<law>: <message>", in the checker's sorted order), so the fixture
+/// cannot pass on some other finding of the same law.
+fn assert_deny_exactly(name: &str, expected: &[&str]) {
+    let mut laws: Vec<&str> = expected.iter().map(|m| m.split(':').next().unwrap()).collect();
+    laws.dedup();
+    assert_deny(name, &laws);
+    let text = stdout(&run(name));
+    let lines: Vec<&str> = text.lines().skip_while(|l| !l.starts_with("VIOLATIONS:")).skip(1).collect();
+    assert_eq!(lines, expected, "fixture '{name}' violation messages\nstdout:\n{text}");
+}
+
 /// Asserts `name` is a parse/usage error: exit 2, never reported as a law
 /// violation.
 fn assert_parse_error(name: &str) {
@@ -273,6 +285,67 @@ fn timer_channel_with_pp_on_peer_end_is_l1() {
 #[test]
 fn timer_sharing_an_mr_with_a_tainted_pd_is_l1() {
     assert_deny("timer_shared_mr_deny", &["L1"]);
+}
+
+// --- M5 plan C6: the audit console (L5 as amended, L1 seed, L4 irq) ---
+
+const NOT_PL011: &str = "L5: console mr 'uart2' is pinned at phys_addr=0x9001000/size=0x1000, not the PL011 page \
+                         (phys_addr=0x9000000/size=0x1000)";
+
+#[test]
+fn service_pd_owning_the_pl011_console_is_allowed_and_untainted() {
+    // audit has no explicit budget: a console that seeded taint would make
+    // that an L13 finding.
+    assert_allow("console_allow");
+}
+
+#[test]
+fn a_second_console_page_is_l5() {
+    assert_deny_exactly(
+        "console_second_deny",
+        &["L5: 2 console mrs are declared (uart, uart2); the PL011 page is the only console", NOT_PL011],
+    );
+}
+
+#[test]
+fn the_console_page_mapped_into_another_pd_is_l5() {
+    assert_deny_exactly("console_other_pd_deny", &["L5: device mr 'uart' (owner 'audit') is also mapped into pd 'other'"]);
+}
+
+#[test]
+fn an_irq_on_the_console_owner_is_l4() {
+    assert_deny_exactly(
+        "console_irq_deny",
+        &[
+            "L4: pd 'audit' claims irq 33, which is not listed in its policy irqs",
+            "L4: pd 'audit' declares <irq> but is not a driver or timer",
+        ],
+    );
+}
+
+#[test]
+fn the_console_owner_owning_a_non_console_device_is_l5() {
+    assert_deny_exactly(
+        "console_non_console_deny",
+        &["L5: service pd 'audit' owns device mr 'nic', which is not a console mr"],
+    );
+}
+
+#[test]
+fn a_console_off_the_pl011_page_is_l5_and_seeds_taint() {
+    assert_deny_exactly(
+        "console_not_pl011_deny",
+        &[
+            "L5: console mr 'uart' is pinned at phys_addr=0x9001000/size=0x1000, not the PL011 page \
+             (phys_addr=0x9000000/size=0x1000)",
+            "L13: tainted pd 'audit' needs an explicit budget < period",
+        ],
+    );
+}
+
+#[test]
+fn the_console_mapped_other_than_rw_is_l5() {
+    assert_deny_exactly("console_perms_deny", &["L5: console mr 'uart' is mapped into pd 'audit' with perms other than rw"]);
 }
 
 /// Regression test against the real files (not a frozen fixture): keeps

@@ -29,7 +29,7 @@ class Console:
 
 
 def lines(pq: int, pqkey: int) -> str:
-    return (f"pqkey: stack high-water {pqkey:#x} of {SIZE:#x}\n"
+    return (f"audit: src=pq KeyStackHighWater bytes={pqkey} lost=0\n"
             f"audit: src=pq StackHighWater bytes={pq} lost=0\n")
 
 
@@ -42,7 +42,8 @@ CASES = [
     ("exactly the minimum free passes", lines(61808, SIZE - run.STACK_HEADROOM_MIN), None),
     ("one byte under the minimum free fails", lines(61808, SIZE - run.STACK_HEADROOM_MIN + 1),
      "pqkey: 16383 B of stack free, want at least 16384"),
-    ("no report from pq fails", "pqkey: stack high-water 0x18700 of 0x20000\n", "pq: no stack high-water report"),
+    ("no report from pq fails", "audit: src=pq KeyStackHighWater bytes=100096 lost=0\n",
+     "pq: no stack high-water report"),
     ("no report from pqkey fails", "audit: src=pq StackHighWater bytes=61808 lost=0\n",
      "pqkey: no stack high-water report"),
     ("a mark shallower than the PD's own scrub fails", lines(61808, 90 * KIB),
@@ -52,7 +53,7 @@ CASES = [
     ("a mark exactly at the scrub depth passes", lines(40 * KIB, 96 * KIB), None),
     ("a garbled pq report fails", MEASURED + "audit: src=pq StackHighWater bytes=6audit: x\n",
      "pq: 1 of 2 stack high-water reports garbled"),
-    ("a pqkey line with a garbled prefix fails", MEASURED + "auditpqkey: stack high-water 0x1f000 of 0x20000\n",
+    ("a garbled pqkey report fails", MEASURED + "audit: src=pq KeyStackHighWater bytes=1audit: x\n",
      "pqkey: 1 of 2 stack high-water reports garbled"),
     ("the deepest of several reports counts", MEASURED + "audit: src=pq StackHighWater bytes=126976 lost=0\n",
      "pq: 4096 B of stack free"),

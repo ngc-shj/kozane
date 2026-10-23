@@ -66,9 +66,15 @@ PQ_END = PQ_AT + len(PQ_BLOB)
 PLACEHOLDER_IMG = b"\x7fELF" + PAD + bytes(4096) + PAD + bytes(16384) + PAD
 PACKAGE_IMG = b"\x7fELF" + PAD + BLOB + PAD + PQ_BLOB + PAD
 SPANS = f"{KEY_AT:#x}..{KEY_AT + len(BLOB):#x}, {PQ_AT:#x}..{PQ_END:#x}"
-GEN_DEBUG = "/* x */\n#define CONFIG_DEBUG_BUILD  1\n#define CONFIG_PRINTING  1\n"
-GEN_RELEASE = "/* disabled: CONFIG_DEBUG_BUILD */\n/* disabled: CONFIG_PRINTING */\n"
-SC20 = "package: kernel config is not debug; images are dev-only until release kernels are tested (SC20)"
+GEN_DEBUG = "/* x */\n#define CONFIG_DEBUG_BUILD  1\n#define CONFIG_PRINTING  1\n" \
+    "#define CONFIG_KERNEL_MCS  1\n#define CONFIG_MAX_NUM_NODES  1\n"
+GEN_RELEASE = "/* disabled: CONFIG_DEBUG_BUILD */\n/* disabled: CONFIG_PRINTING */\n" \
+    "#define CONFIG_KERNEL_MCS  1\n#define CONFIG_MAX_NUM_NODES  1\n"
+C7_DEBUG = "package: kernel config is a debug build (CONFIG_DEBUG_BUILD); only release kernels are packaged (C7)"
+C7_PRINTING = "package: kernel config has CONFIG_PRINTING; a packaged kernel must not print (C7)"
+C7_MCS = "package: kernel config lacks CONFIG_KERNEL_MCS 1 (C7)"
+C7_NODES = "package: kernel config is not single-node (CONFIG_MAX_NUM_NODES 1) (C7)"
+C7_REFUSED = [C7_DEBUG, C7_PRINTING]
 WAIVERS_OPEN = '[[waivers]]\nid = "SC23"\nowner = "M4"\nstatus = "open"\n' \
     '[[waivers]]\nid = "SC9"\nowner = "M3b"\nstatus = "closed"\n'
 WAIVERS_CLOSED = WAIVERS_OPEN.replace('"open"', '"closed"')
@@ -166,20 +172,20 @@ def waivers_file(text):
     return run
 
 
-def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, stub_sc20=False, lock_text=LOCK_CMR,
+def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BLOB, lock_text=LOCK_NO_CMR,
                 harness=True, ct_green=True, record=True, real_ct=None):
     """Runs `main()` with `build` replaced and the waiver file and Cargo.lock
     pointed at scratch ones (None: absent). Returns what it printed (the success line
     dropped, the scratch dir shown as <d>), plus a note when the outcome disagrees with that output, so
     an accepted run returns [] and a refused one exactly its messages.
-    With `stub_sc20` the SC20 predicate passes, so it cannot mask what
-    comes after it. The C11 binding (ct_stubs) runs a fake tools/ct-shape,
+    The defaults are a release kernel, no open waiver and no cmr locked,
+    which package accepts. The C11 binding (ct_stubs) runs a fake tools/ct-shape,
     green or not (`ct_green`), against a harness file that exists or not
     (`harness`), with a C9 record or not (`record`); `real_ct` instead
     builds ct_shape_elf's synthetic ELFs (its arguments to tree()) and runs
     the real tools/ct-shape on them."""
     def run():
-        real = (pkg.build, pkg.require_debug, pkg.WAIVERS, pkg.LOCK, sys.argv)
+        real = (pkg.build, pkg.WAIVERS, pkg.LOCK, sys.argv)
         real_umask = os.umask(0o022)
         os.umask(real_umask)
         real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
@@ -205,8 +211,6 @@ def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, 
             if lock_text is not None:
                 (d / "Cargo.lock").write_text(lock_text)
             pkg.LOCK = d / "Cargo.lock"
-            if stub_sc20:
-                pkg.require_debug = lambda _gen: []
 
             def fake_build(a, blobs, staging):
                 built.append(blobs)
@@ -228,7 +232,7 @@ def main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, key=BLOB, pq=PQ_BLOB, 
                 printed.append(f"refused (status {status}) with built {len(built)}")
             return printed
         finally:
-            pkg.build, pkg.require_debug, pkg.WAIVERS, pkg.LOCK, sys.argv = real
+            pkg.build, pkg.WAIVERS, pkg.LOCK, sys.argv = real
             if stubs is not None:
                 stubs.restore()
             os.umask(real_umask)
@@ -300,7 +304,7 @@ def run_main(build_result):
             blob.write_bytes(BLOB)
             (d / "pq.bin").write_bytes(PQ_BLOB)
             gen = d / "gen_config.h"
-            gen.write_text(GEN_DEBUG)
+            gen.write_text(GEN_RELEASE)
             out = d / "pkg"
 
             built = []
@@ -486,7 +490,7 @@ def staging_in_forbidden_root():
         blob.write_bytes(BLOB)
         (d / "pq.bin").write_bytes(PQ_BLOB)
         gen = d / "gen_config.h"
-        gen.write_text(GEN_DEBUG)
+        gen.write_text(GEN_RELEASE)
         calls = []
 
         def roots(repo):
@@ -705,7 +709,7 @@ CASES = [
     ("real package accepted", None,
      lambda: pkg.check_systems(SYSTEM, package_system())
      + pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG, IMAGE_BLOBS)
-     + pkg.check_blob(pkg.KEY, BLOB) + pkg.check_blob(pkg.PQ, PQ_BLOB) + pkg.require_debug(GEN_DEBUG)),
+     + pkg.check_blob(pkg.KEY, BLOB) + pkg.check_blob(pkg.PQ, PQ_BLOB) + pkg.require_release(GEN_RELEASE)),
     ("both blobs swapped in, in either order", None,
      lambda: pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG, [PQ_BLOB, BLOB])),
     ("empty image diff", "identical to the placeholder",
@@ -785,7 +789,15 @@ CASES = [
      lambda: pkg.check_systems(SYSTEM, package_system().replace('prefill_path="/elsewhere/pq.bin"', 'prefill_path=""'))),
     ("element added", "children",
      lambda: pkg.check_systems(SYSTEM, package_system().replace("</system>", '<memory_region name="x" size="0x1000" /></system>'))),
-    ("non-debug kernel", "not debug", lambda: pkg.require_debug(GEN_RELEASE)),
+    # Only release kernels (M5 plan C7), judged from gen_config.h.
+    ("a debug kernel is refused", C7_REFUSED, lambda: pkg.require_release(GEN_DEBUG)),
+    ("a release kernel with CONFIG_PRINTING defined is refused", [C7_PRINTING],
+     lambda: pkg.require_release(GEN_RELEASE + "#define CONFIG_PRINTING  1\n")),
+    ("a release kernel without MCS is refused", [C7_MCS],
+     lambda: pkg.require_release(GEN_RELEASE.replace("#define CONFIG_KERNEL_MCS  1\n", ""))),
+    ("a multi-node release kernel is refused", [C7_NODES],
+     lambda: pkg.require_release(GEN_RELEASE.replace("NODES  1", "NODES  2"))),
+    ("a release kernel is accepted", None, lambda: pkg.require_release(GEN_RELEASE)),
     ("open waiver refuses a non-debug kernel, named", [SC23_OPEN], lambda: waivers_file(WAIVERS_OPEN)(GEN_RELEASE)),
     ("each open waiver is named",
      [SC23_OPEN, "package: waiver SC9 (owner M3b) is open; non-debug kernels are refused until it closes"],
@@ -793,29 +805,27 @@ CASES = [
     ("open waiver allows a debug kernel", None, lambda: waivers_file(WAIVERS_OPEN)(GEN_DEBUG)),
     ("no open waiver allows a non-debug kernel", None, lambda: waivers_file(WAIVERS_CLOSED)(GEN_RELEASE)),
     ("the repository's waiver file parses", None, lambda: pkg.check_waivers(GEN_DEBUG, pkg.WAIVERS)),
-    # With the SC20 predicate stubbed to pass, so it cannot mask the waiver
-    # gate (M3 plan, Packaging).
-    ("SC20 stubbed: an open waiver refuses and names itself", [SC23_OPEN],
-     main_checks(gen=GEN_RELEASE, stub_sc20=True)),
-    ("SC20 stubbed: a missing waiver file refuses", [MISSING_WAIVERS],
-     main_checks(gen=GEN_RELEASE, waivers_text=None, stub_sc20=True)),
-    ("SC20 stubbed: an unparsable waiver file refuses",
+    # On a release kernel, which C7 lets through, so only the waiver gate
+    # can refuse (M3 plan, Packaging).
+    ("release kernel: an open waiver refuses and names itself", [SC23_OPEN],
+     main_checks(waivers_text=WAIVERS_OPEN, lock_text=LOCK_CMR)),
+    ("release kernel: a missing waiver file refuses", [MISSING_WAIVERS], main_checks(waivers_text=None)),
+    ("release kernel: an unparsable waiver file refuses",
      [f"package: waiver file unusable, refusing: not valid TOML: {toml_error('[[waivers]')}"],
-     main_checks(gen=GEN_RELEASE, waivers_text="[[waivers]", stub_sc20=True)),
-    ("SC20 stubbed: a waiver outside the schema refuses",
+     main_checks(waivers_text="[[waivers]")),
+    ("release kernel: a waiver outside the schema refuses",
      ["package: waiver file unusable, refusing: waiver SC23: status 'maybe' is not one of open, closed"],
-     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_OPEN.replace('"open"', '"maybe"'), stub_sc20=True)),
-    ("SC20 stubbed: no open waiver allows", None,
-     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, stub_sc20=True, lock_text=LOCK_NO_CMR)),
+     main_checks(waivers_text=WAIVERS_OPEN.replace('"open"', '"maybe"'))),
+    ("release kernel: no open waiver allows", None, main_checks()),
     # SC23 bound to cmr in Cargo.lock, whatever its version and kernel
     # (M3 plan, Packaging; P6's rule, which `make package` does not run).
-    ("SC23 closed while cmr is locked refuses a debug kernel", [SC23_BOUND],
-     main_checks(waivers_text=WAIVERS_CLOSED)),
+    ("SC23 closed while cmr is locked refuses", [SC23_BOUND], main_checks(lock_text=LOCK_CMR)),
     ("SC23 closed while cmr is locked at another version refuses", [SC23_BOUND],
-     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_CMR_OTHER)),
-    ("an empty waiver file refuses while cmr is locked", [SC23_BOUND], main_checks(waivers_text="")),
-    ("SC20 stubbed: SC23 closed while cmr is locked refuses a non-debug kernel too", [SC23_BOUND],
-     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, stub_sc20=True)),
+     main_checks(lock_text=LOCK_CMR_OTHER)),
+    ("an empty waiver file refuses while cmr is locked", [SC23_BOUND],
+     main_checks(waivers_text="", lock_text=LOCK_CMR)),
+    ("SC23 closed while cmr is locked refuses a debug kernel too", C7_REFUSED + [SC23_BOUND],
+     main_checks(gen=GEN_DEBUG, lock_text=LOCK_CMR)),
     ("an empty Cargo.lock refuses",
      ["package: Cargo.lock unusable, refusing: Cargo.lock has no [[package]] tables"], main_checks(lock_text="")),
     ("a Cargo.lock whose package is not an array of tables refuses",
@@ -824,44 +834,35 @@ CASES = [
     ("a Cargo.lock package without a string name refuses",
      ["package: Cargo.lock unusable, refusing: Cargo.lock has a [[package]] entry without a string name"],
      main_checks(lock_text='version = 4\n[[package]]\nversion = "1"\n')),
-    ("SC23 closed without cmr locked allows a debug kernel", None,
-     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR)),
     ("a missing Cargo.lock refuses",
      ["package: Cargo.lock unusable, refusing: [Errno 2] No such file or directory: '<d>/Cargo.lock'"],
      main_checks(lock_text=None)),
-    ("a missing waiver file refuses a debug kernel too", [MISSING_WAIVERS], main_checks(waivers_text=None)),
-    ("non-debug kernel with no open waiver: SC20 alone", [SC20],
-     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR)),
-    ("non-debug kernel with an open waiver: both refusals", [SC20, SC23_OPEN], main_checks(gen=GEN_RELEASE)),
+    ("a missing waiver file refuses a debug kernel too", C7_REFUSED + [MISSING_WAIVERS],
+     main_checks(gen=GEN_DEBUG, waivers_text=None)),
+    ("debug kernel with no open waiver: the C7 refusal alone", C7_REFUSED, main_checks(gen=GEN_DEBUG)),
+    ("debug kernel with an open waiver: the C7 refusal (waivers judge non-debug kernels)", C7_REFUSED,
+     main_checks(gen=GEN_DEBUG, waivers_text=WAIVERS_OPEN, lock_text=LOCK_CMR)),
     # The C11 binding (M4 plan C11): ct-shape (C10 (a), (b)) on every
     # kernel, a C9 pass record on a non-debug one, a missing harness refuses.
-    ("SC23 closed with ct-shape red refuses", [CT_RED],
-     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR, ct_green=False)),
-    ("SC20 stubbed: SC23 closed, identity green, no C9 record refuses a release kernel", NO_RECORD,
-     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, stub_sc20=True, lock_text=LOCK_NO_CMR,
-                 record=False)),
-    ("SC20 stubbed: SC23 closed with everything green allows a release kernel", None,
-     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, stub_sc20=True, lock_text=LOCK_NO_CMR)),
-    ("SC23 closed without a C9 record allows a debug kernel", None,
-     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR, record=False)),
-    ("SC23 closed with the harness missing refuses", [NO_HARNESS],
-     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR, harness=False)),
-    ("SC20 stubbed: the harness missing refuses a release kernel", [NO_HARNESS],
-     main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, stub_sc20=True, lock_text=LOCK_NO_CMR,
-                 harness=False)),
-    ("the real ct-shape passes unmutated ELFs through package", None,
-     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR, real_ct={})),
+    ("ct-shape red refuses", [CT_RED], main_checks(ct_green=False)),
+    ("no C9 record refuses a release kernel", NO_RECORD, main_checks(record=False)),
+    ("a debug kernel without a C9 record: the C7 refusal, no record asked for", C7_REFUSED,
+     main_checks(gen=GEN_DEBUG, record=False)),
+    ("the harness missing refuses", [NO_HARNESS], main_checks(harness=False)),
+    ("the real ct-shape passes unmutated ELFs through package", None, main_checks(real_ct={})),
     ("the real ct-shape refuses a mutated ELF through package",
      [f"package: ct-shape refuses the packaged ELFs: {label}: identity: mce460896::bm::bm differs from the harness: "
       "+0x14 'csel x0, x9, x2, eq' here, 'csel x0, x9, x1, eq' in the harness"
       for label in ("pd-pqkey.elf", "pd-pq.elf")],
-     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR,
-                 real_ct={"pd_bm": [line.replace("x1, eq", "x2, eq") for line in ct_shape_elf.BM]})),
+     main_checks(real_ct={"pd_bm": [line.replace("x1, eq", "x2, eq") for line in ct_shape_elf.BM]})),
     ("the real ct-shape refuses a shape change through package",
      [f"package: ct-shape refuses the packaged ELFs: {label}: shape: mce460896::bm::bm: 'csel eq' 2 in the binary, "
       "1 in ct-shape.toml" for label in ("pd-pq.elf", "pd-pqkey.elf")],
-     main_checks(waivers_text=WAIVERS_CLOSED, lock_text=LOCK_NO_CMR,
-                 real_ct={"pd_extra": ["csel x1, x1, x2, eq"], "harness_extra": ["csel x1, x1, x2, eq"]})),
+     main_checks(real_ct={"pd_extra": ["csel x1, x1, x2, eq"], "harness_extra": ["csel x1, x1, x2, eq"]})),
+    ("the real ct-shape refuses a PD that references DebugPutChar through package",
+     ["package: ct-shape refuses the packaged ELFs: pd-pqkey.elf: printing: "
+      "sel4_sys::syscalls::calls::seL4_DebugPutChar is the DebugPutChar syscall wrapper"],
+     main_checks(real_ct={"debug_put_char": "pd-pqkey.elf"})),
     ("secrets path inside the repo", "inside", lambda: pkg.check_secrets_path(ROOT / "build/secrets.bin", ROOT)),
     ("secrets path outside the repo", None, lambda: pkg.check_secrets_path(pathlib.Path("/tmp/s.bin"), ROOT)),
     ("secrets path inside the cargo home", "inside", secrets_in_cargo_home),

@@ -16,7 +16,9 @@
 #     own device/dma mrs (L5) and claim the hardware IRQ numbers listed in
 #     `irqs` (L4: an undeclared irq, or any irq on a non-driver, is a
 #     violation; L5: the same irq number claimed by two pds); `irqs` is
-#     rejected on any other role except `timer`. `timer` may own device
+#     rejected on any other role except `timer`. A `service` pd may own
+#     device mrs only if each is a console mr (below; L5 as amended by the
+#     M5 plan, C6), and never irqs. `timer` may own device
 #     mrs and irqs like a driver, but its device does not seed taint; it
 #     is exempt from taint only while it maps nothing but its own device
 #     mrs and every channel to it has pp=false on both ends and
@@ -35,13 +37,21 @@
 #
 #   [mrs.<name>]
 #   kind = "device" | "dma" | "secrets" | "data" | "plain"
-#     device: owner = "<driver or timer pd>", phys_addr = <addr>, size = <bytes>
+#     device: owner = "<driver, timer or service pd>", phys_addr = <addr>, size = <bytes>,
+#             console = <bool, default false>
 #       MMIO owned by exactly that driver, page-granular (L5): only the
 #       owner may map it, its `.system` `phys_addr`/`size` must match the
 #       pinned values here exactly (L5), its range must not overlap
 #       another driver's device mr (L5) and must not overlap `[board]
 #       ram` (L5; C7 only allows `phys_addr` on a device mr with "no
 #       overlap with board RAM").
+#       `console = true` marks the one console (M5 plan C6, L5 as amended):
+#       its owner must have role `service`, at most one console mr may be
+#       declared, it must be pinned at the PL011 page (phys_addr 0x9000000,
+#       size 0x1000) and mapped `rw` (Microkit refuses write-only maps; read
+#       is for the TX-FIFO flag). Its owner claims no irq (L4), which with
+#       no receive code in the PD is the no-RX guarantee. A console mr
+#       does not seed taint (L1).
 #     dma: owner = "<driver pd>"
 #       A DMA buffer, mapped only into its owning driver (L5) and never
 #       shared as a `data` region. `setvar region_paddr` may only name a
@@ -99,8 +109,10 @@
 #
 # Design notes (decisions not spelled out by C7 itself, so recorded here):
 #   - "Maps a NIC device" (L1's taint seed) is generalised to "maps any
-#     device-kind mr owned by a non-timer pd": every such device is a NIC
-#     today, so this is equivalent and keeps the rule simple.
+#     device-kind mr owned by a non-timer pd, other than the console": every
+#     such device is a NIC today, so this is equivalent and keeps the rule
+#     simple. The console exemption is keyed to the pinned PL011 page, not
+#     to the flag alone, so a console mr pinned anywhere else seeds taint.
 #   - "x permission on shared maps" is enforced for any mr mapped by more
 #     than one distinct pd in the `.system`, regardless of kind.
 #   - DOCTYPE, entities and duplicate attributes are rejected by the XML
@@ -121,7 +133,8 @@
 #   (passive; `key` takes PPC from `hs` only and maps only `secrets`,
 #   `pqkey` from `pq` only and maps only `pq_secrets`; L2 as amended).
 #   `timer` is exempt as notify-only (L1): it notifies `data`, `hs`,
-#   `ingress` and `pq`, none of which can notify it.
+#   `ingress` and `pq`, none of which can notify it. `audit` (M5) owns the
+#   PL011 page as the only console and writes its lines there.
 
 [pds.eth_out]
 role = "driver"
@@ -184,6 +197,13 @@ kind = "device"
 owner = "timer"
 phys_addr = 0x90d0000
 size = 0x1000
+
+[mrs.uart_mmio]
+kind = "device"
+owner = "audit"
+phys_addr = 0x9000000
+size = 0x1000
+console = true
 
 [mrs.secrets]
 kind = "secrets"

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""Identity and shape of the shipped McEliece code (M4 plan C10), and the
-Verus erasure check (C1).
+"""Identity and shape of the shipped McEliece code (M4 plan C10), the
+Verus erasure check (C1), and the no-debug-printing check (M5 plan C6).
 
   tools/ct-shape --harness BIN --search-path DIR [--checks LIST]
                  [--policy TOML] [ELF ...]
@@ -35,8 +35,18 @@ the function), stopping at panic entries (`core::` functions named
              must first find each ELF's own entry,
              `sel4_microkit::entry::run_main<_, <crate>::init>` (the
              positive control).
+  printing   no symbol of any ELF given as an argument is the DebugPutChar
+             syscall wrapper (rust-sel4's
+             `sel4_sys::syscalls::calls::seL4_DebugPutChar`, or a C
+             `seL4_DebugPutChar`), with the same positive control. A debug
+             build always has it (rust-sel4's panic handler prints through
+             it), so this refuses PDs built against a printing kernel's
+             headers; a release kernel has no such syscall at all (C7). A
+             tripwire, not the boundary: inline `asm!` issuing the syscall
+             or a wrapper under another name is not seen.
 
---checks defaults to all four; tools/package runs identity,forbidden.
+--checks defaults to all five; tools/package runs
+identity,forbidden,shape,printing.
 --print-baseline prints the current shape as TOML on stdout, carrying the
 justification of every entry whose shape is unchanged and leaving the others
 empty (which `shape` refuses). Nothing writes the policy: a human reviews
@@ -70,7 +80,9 @@ SHIM_NAME = re.compile(r"^mce460896::encaps::<")
 SHIM_CARRIER = re.compile(r"^<rosenpass_core::kem::McEliece460896 as rosenpass_core::kem::Encaps<.*>>::encaps::<")
 SHIM_ELF = "pd-pq.elf"
 MEM_STOPS = ("memcpy", "memset", "memmove")
-CHECKS = ("identity", "forbidden", "shape", "erasure")
+CHECKS = ("identity", "forbidden", "shape", "erasure", "printing")
+# The DebugPutChar syscall wrapper, by its demangled name's last segment.
+DEBUG_PUT_CHAR = re.compile(r"(?:^|::)seL4_DebugPutChar$")
 
 BRANCHES = {"b", "bl", "cbz", "cbnz", "tbz", "tbnz"}
 SELECTS = {"csel", "csinc", "csinv", "csneg", "cset", "csetm", "cinc", "cinv", "cneg", "ccmp", "ccmn",
@@ -617,22 +629,39 @@ def print_baseline(binaries: dict, path: pathlib.Path):
 ENTRY_SYMBOL = r"sel4_microkit::entry::run_main(?:::)?<.*, {crate}::init>"
 
 
-def check_erasure(path: pathlib.Path) -> list:
+def demangled_with_control(path: pathlib.Path, check: str):
+    """(demangled names, []) for an ELF whose entry the demangler finds, or
+    (None, the refusal) for one it cannot read or find the entry in."""
     label = path.name
     try:
         syms = elf_symbols(path.read_bytes())
     except OSError as e:
-        return [f"{label}: erasure: cannot read {path}: {e.strerror}"]
+        return None, [f"{label}: {check}: cannot read {path}: {e.strerror}"]
     except (Fail, struct.error, ValueError, IndexError) as e:
-        return [f"{label}: erasure: {e}"]
+        return None, [f"{label}: {check}: {e}"]
     names = demangle_all(s.name for s in syms)
     crate = re.sub(r"\.elf$", "", label).replace("-", "_")
     control = re.compile(ENTRY_SYMBOL.format(crate=re.escape(crate)))
     if not any(control.search(n) for n in names.values()):
-        return [f"{label}: erasure: positive control failed: no symbol demangles to "
-                f"sel4_microkit::entry::run_main<_, {crate}::init>"]
-    return [f"{label}: erasure: {n} is a Verus symbol"
+        return None, [f"{label}: {check}: positive control failed: no symbol demangles to "
+                      f"sel4_microkit::entry::run_main<_, {crate}::init>"]
+    return names, []
+
+
+def check_erasure(path: pathlib.Path) -> list:
+    names, errors = demangled_with_control(path, "erasure")
+    if names is None:
+        return errors
+    return [f"{path.name}: erasure: {n} is a Verus symbol"
             for n in sorted(set(names.values())) if n.startswith(("vstd::", "<vstd::", "verus_builtin"))]
+
+
+def check_printing(path: pathlib.Path) -> list:
+    names, errors = demangled_with_control(path, "printing")
+    if names is None:
+        return errors
+    return [f"{path.name}: printing: {n} is the DebugPutChar syscall wrapper"
+            for n in sorted(set(names.values())) if DEBUG_PUT_CHAR.search(n)]
 
 
 def main() -> int:
@@ -686,6 +715,14 @@ def main() -> int:
                 if path.name not in ROOTS and path.is_file():
                     print(f"CT-SHAPE-SHA256 {hashlib.sha256(path.read_bytes()).hexdigest()} {path.name}")
                 errors += check_erasure(path)
+        if "printing" in checks:
+            # Every PD the system file lists when no ELFs are given (as
+            # tools/package runs it), so none can be left out.
+            paths = a.elfs or [a.search_path / name for name in system_images(a.system)]
+            if not paths:
+                raise Fail("printing: no PD ELFs")
+            for path in paths:
+                errors += check_printing(path)
     except Fail as e:
         errors.append(str(e))
     except subprocess.CalledProcessError as e:

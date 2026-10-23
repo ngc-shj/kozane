@@ -4,8 +4,10 @@ Usage: run.py            (from `make test`)
 
 Generates fresh keys with tools/mksecrets into a temporary directory
 (removed on every exit path), builds the image against that configuration
-and packages it, then re-runs itself inside `unshare -rn` (no NET_ADMIN in
-the container; architecture R5) for six boots:
+and packages it on a release kernel (M5 plan C7: no debug printing; every
+line on the console is `audit`'s, C6), then re-runs itself inside
+`unshare -rn` (no NET_ADMIN in the container; architecture R5) for six
+boots:
 
   1. raw frames: the outside NIC on a `-netdev dgram` socket; ARP, one frame
      per wire::DropReason, a coalesced flood, ARP as the liveness barrier;
@@ -26,7 +28,8 @@ the container; architecture R5) for six boots:
   5. peer binding (M3 plan C7): a deployment whose peer records pair each
      WireGuard key with the other peer's Rosenpass key;
   6. a blob whose public key does not match the configuration: `key`
-     prints the mismatch and halts.
+     stays up Unavailable and `hs`, its caller, audits `KeyUnavailable`
+     with the boot error's code, then halts.
 
 Since M3 (L8) hs refuses every WireGuard initiation without a fresh
 Rosenpass PSK, so each WireGuard peer first runs upstream rosenpass (the VE9
@@ -197,7 +200,8 @@ def check_reason_list_matches_rust():
 # ---------------------------------------------------------------- harness
 
 
-# QEMU's serial console ends lines with "\r\r\n".
+# QEMU's serial console ends lines with "\r\r\n". `audit` prints these for
+# each PD's `Ready` record, and its own.
 READY_LINE = re.compile(r"(eth_out|eth_in|ingress|inner|data|hs|audit|pq): ready\r*\n")
 
 
@@ -1346,14 +1350,35 @@ def test_peer_binding(loader: str, deploy: str, passed: list):
 # ---------------------------------------------------------------- boot 3
 
 
+def key_boot_code(variant: str) -> int:
+    """`BootError::<variant> => <n>,` from key-core's code table (C6)."""
+    src = open(os.path.join(ROOT, "crates/key-core/src/lib.rs")).read()
+    m = re.search(rf"^\s+BootError::{variant} => (\d+),$", src, re.M)
+    if not m:
+        raise Fail(f"BootError::{variant} has no code in crates/key-core/src/lib.rs")
+    return int(m.group(1))
+
+
+def halt_reason(pd: str, name: str) -> int:
+    """`pub const <name>: u32 = <n>;` in the PD's `halt` reason table."""
+    src = open(os.path.join(ROOT, f"crates/pds/{pd}/src/main.rs")).read()
+    m = re.search(rf"^\s+pub const {name}: u32 = (\d+);$", src, re.M)
+    if not m:
+        raise Fail(f"no halt reason {name} in crates/pds/{pd}/src/main.rs")
+    return int(m.group(1))
+
+
 def test_mismatched_blob(loader: str):
+    """Under the release kernel nothing but `audit` prints (C6, C7): `key`
+    stays up Unavailable, and `hs`'s boot-seed call, its first call to
+    `key`, is where the failure shows."""
+    code = key_boot_code("GatewayKeyMismatch")
+    reason = halt_reason("hs", "NO_BOOT_SEED")
     child, con = boot(loader, dgram("n0", free_udp_port(), free_udp_port()),
                       dgram("n1", free_udp_port(), free_udp_port()))
     try:
-        con.wait_for(r"key: secrets: gateway key does not match the configuration", timeout=BOOT_TIMEOUT_S,
-                     strip_ready=True)
-        con.wait_for(r"key: halted", timeout=LINE_TIMEOUT_S, strip_ready=True)
-        con.wait_for(r"MON\|ERROR: faulting PD: key", timeout=LINE_TIMEOUT_S)
+        m = con.wait_for(rf"audit: src=hs KeyUnavailable code={code} lost=\d+\r*\n", timeout=BOOT_TIMEOUT_S)
+        con.wait_for(rf"audit: src=hs Halted reason={reason} lost=\d+\r*\n", since=m.end(), timeout=LINE_TIMEOUT_S)
     finally:
         try:
             with signals_held():
@@ -2437,9 +2462,10 @@ def pd_stack_const(pd: str) -> int:
 def stack_headroom_case(con):
     """C8: pq and pqkey paint their free stack at init (cpu::StackProbe).
     pq reports each deeper mark as an audit record, `StackHighWater
-    bytes=N` (a console line of its own would interleave with audit's);
-    pqkey, which has no audit ring, prints its mark once after the boot
-    KAT. Each must leave STACK_HEADROOM_MIN free at the stack_size the
+    bytes=N`; pqkey, which has no audit ring and no console (M5 plan C6),
+    hands its mark after the boot KAT to pq (PQ_STACK_MARK), which audits
+    it once as `KeyStackHighWater bytes=N`. Each must leave
+    STACK_HEADROOM_MIN free at the stack_size the
     system file gives it, which its STACK_SIZE (the size it paints) must
     equal.
 
@@ -2447,8 +2473,8 @@ def stack_headroom_case(con):
     encaps): a shallower one means the probe is not measuring. Every
     report must parse: a garbled one would drop the deepest figure."""
     reports = {
-        "pq": (r"StackHighWater", r"audit: src=pq StackHighWater bytes=(\d+) ", 10),
-        "pqkey": (r"stack high-water", r"\bpqkey: stack high-water (0x[0-9a-f]+) of 0x[0-9a-f]+", 16),
+        "pq": (r"\bStackHighWater", r"audit: src=pq StackHighWater bytes=(\d+) ", 10),
+        "pqkey": (r"KeyStackHighWater", r"audit: src=pq KeyStackHighWater bytes=(\d+) ", 10),
     }
     for pd, (any_line, line, base) in reports.items():
         every = len(con.count(any_line))
@@ -3002,8 +3028,12 @@ def preflight():
         raise Fail(f"cannot open an AF_PACKET socket inside unshare -rn (VE8): {r.stderr.strip()[-300:]}")
 
 
+# Every image this suite packages and boots is a release one (M5 plan C7).
+MAKE_CONFIG = "MICROKIT_CONFIG=release"
+
+
 def make(*args, env=None):
-    r = subprocess.run(["make", "-C", ROOT, *args], env=env, capture_output=True, text=True)
+    r = subprocess.run(["make", "-C", ROOT, MAKE_CONFIG, *args], env=env, capture_output=True, text=True)
     if r.returncode:
         raise Fail(f"make {' '.join(args)} failed:\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
 
@@ -3022,7 +3052,8 @@ def build(tmp: str) -> tuple:
     make("image", env=env)
     make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin", f"OUT={tmp}/a/pkg",
          env=env)
-    # Only `key`'s blob mismatches: pqkey keeps A's, so `key` is what halts.
+    # Only `key`'s blob mismatches: pqkey keeps A's, so only `key` is
+    # Unavailable.
     make("package", f"SECRETS={tmp}/b/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin", f"OUT={tmp}/b/pkg",
          env=env)
     env_c = {**os.environ, "SECUREOS_CONFIG": os.path.join(tmp, "c/gateway.toml")}

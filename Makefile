@@ -7,6 +7,9 @@ SHELL := bash
 
 BUILD ?= build
 MICROKIT_BOARD := qemu_virt_aarch64
+# Development images print through the debug kernel too; what ships, and
+# what `make test` boots, is `release` (M5 plan C7: tools/package refuses
+# anything else).
 MICROKIT_CONFIG ?= debug
 
 ifndef MICROKIT_SDK
@@ -32,7 +35,10 @@ $(counts):
 	mkdir -p $@
 
 # One cargo invocation per PD: features must not unify across PDs (only
-# eth-out needs a heap). cargo does its own dependency tracking.
+# eth-out needs a heap). cargo does its own dependency tracking. The target
+# dir is per kernel config: the PDs compile against that config's headers
+# (SEL4_INCLUDE_DIRS), so a debug and a release build never share objects;
+# the ELFs land in $(BUILD) for the image built right after them.
 .PHONY: pds
 pds:
 	$(foreach pd,$(pds),$(call build_pd,$(pd));)
@@ -45,7 +51,7 @@ SEL4_INCLUDE_DIRS=$(abspath $(sdk_config_dir)/include) \
 		-Z build-std-features=compiler-builtins-mem \
 		--target $(target) \
 		--release \
-		--target-dir $(BUILD)/target \
+		--target-dir $(BUILD)/target-$(MICROKIT_CONFIG) \
 		--artifact-dir $(BUILD) -Z unstable-options \
 		-p pd-$(1) $(if $(features_$(1)),--features $(features_$(1)))
 endef
@@ -56,12 +62,12 @@ kernel-config:
 	grep -q '^#define CONFIG_KERNEL_MCS  1$$' $(sdk_config_dir)/include/kernel/gen_config.h
 
 # Zero blob for the secrets region: `make image` is never deployable (`key`
-# halts on it); `make package` swaps in a real one (plan C16).
+# is Unavailable on it); `make package` swaps in a real one (plan C16).
 $(BUILD)/secrets-placeholder.bin:
 	mkdir -p $(BUILD)
 	head -c 4096 /dev/zero > $@
 
-# Same for the pqkey secrets region (`pqkey` halts on it).
+# Same for the pqkey secrets region (`pqkey` is Unavailable on it).
 $(BUILD)/pq-secrets-placeholder.bin:
 	mkdir -p $(BUILD)
 	head -c 16384 /dev/zero > $@
@@ -77,15 +83,17 @@ image: pds kernel-config $(BUILD)/secrets-placeholder.bin $(BUILD)/pq-secrets-pl
 		-o $(loader)
 
 # Same system with only the secrets prefill_path changed; tools/package
-# refuses anything else, and refuses non-debug kernels until SC20.
+# refuses anything else, and any kernel but a release one (M5 plan C7):
+# `make package MICROKIT_CONFIG=release ...`.
 ifneq ($(filter package,$(MAKECMDGOALS)),)
 ifeq ($(and $(SECRETS),$(PQ_SECRETS),$(OUT)),)
 $(error package: set SECRETS=<blob> PQ_SECRETS=<blob> OUT=<dir>)
 endif
 endif
-# tools/package also runs tools/ct-shape (identity, forbidden) on the PD ELFs
-# it packages against this harness, and wants a C9 pass record for it on a
-# non-debug kernel (M4 plan C11).
+# tools/package also runs tools/ct-shape (identity, forbidden, shape,
+# printing) on the PD ELFs it packages against this harness, and wants a C9
+# pass record for it on a non-debug kernel (M4 plan C11), so `make ct` must
+# have passed.
 package: image ct-harness
 	tools/package --secrets $(SECRETS) --pq-secrets $(PQ_SECRETS) --out $(OUT) --system $(system) --policy $(policy) \
 		--image $(loader) --gen-config $(sdk_config_dir)/include/kernel/gen_config.h \
@@ -94,8 +102,8 @@ package: image ct-harness
 
 # Boots an image interactively with both NICs as the integration test does
 # (outside on user-net with 51820 forwarded to RUN_PORT, inside on a dgram
-# socket). The default image holds the zero placeholder, so `key` halts;
-# boot a packaged one with LOADER=<dir>/loader.img.
+# socket). The default image holds the zero placeholder, so `key` is
+# Unavailable and `hs` halts; boot a packaged one with LOADER=<dir>/loader.img.
 LOADER ?= $(loader)
 RUN_PORT ?= 51820
 # Build the default image; a packaged LOADER= is booted as is.
@@ -206,8 +214,12 @@ ct: ct-harness | $(counts)
 
 # C10 (tools/ct-shape): the mce460896 closures in pd-pqkey and pd-pq equal
 # the harness's, nothing forbidden in them, their shape equals
-# policy/ct-shape.toml, and no PD ships a Verus symbol (C1 erasure).
-ct-shape: pds ct-harness | $(counts)
+# policy/ct-shape.toml, no PD ships a Verus symbol (C1 erasure), and none
+# references the DebugPutChar syscall (M5 plan C6). On the release PDs,
+# the ones that ship: a debug build always references it (rust-sel4's panic
+# handler prints through it).
+ct-shape: ct-harness | $(counts)
+	$(MAKE) pds MICROKIT_CONFIG=release
 	tools/ct-shape --harness $(ct_harness) --search-path $(BUILD) --system $(system) $(foreach pd,$(pds),$(BUILD)/pd-$(pd).elf) \
 		> $(counts)/ct-shape.log 2>&1 || { cat $(counts)/ct-shape.log; exit 1; }
 	cat $(counts)/ct-shape.log
@@ -276,11 +288,13 @@ pins: | $(counts)
 	python3 tests/tools/test_proof_lock.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES|UNIT-COUNTS-FIXTURES|PROOF-LOCK-FIXTURES)' $(counts)/pins.log > $(counts)/pins
 
-# Builds its own deployment (fresh keys, generated config, package); see run.py.
+# Builds its own deployment (fresh keys, generated config, release package);
+# see run.py. Packaging a release kernel needs the C9 pass record, hence
+# `ct` first (already made earlier in the same `make check`).
 # it_boots (check-selftest only) runs a subset of the boots; such a run
 # prints INTEGRATION-CASES-PARTIAL, which this grep does not take.
 it_boots :=
-test: | $(counts)
+test: ct | $(counts)
 	SECUREOS_IT_BOOTS="$(it_boots)" python3 tests/integration/run.py > $(counts)/test.log 2>&1 \
 		|| { tail -40 $(counts)/test.log; exit 1; }
 	grep '^INTEGRATION-CASES ' $(counts)/test.log > $(counts)/test

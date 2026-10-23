@@ -1,7 +1,7 @@
-"""tools/ct-shape (M4 plan C10, C1 erasure): the normaliser catches a
-one-instruction difference and nothing but address and hash noise passes;
-the closure stops where C10 says; forbidden, shape and erasure each refuse
-their one-change fixture.
+"""tools/ct-shape (M4 plan C10, C1 erasure, M5 plan C6 printing): the
+normaliser catches a one-instruction difference and nothing but address and
+hash noise passes; the closure stops where C10 says; forbidden, shape,
+erasure and printing each refuse their one-change fixture.
 
 The ELFs are assembled from tests/tools/ct_shape_elf.py with the
 aarch64-none-elf toolchain (the dev image's), so objdump and c++filt run as
@@ -214,6 +214,20 @@ def erasure(label="pd-pqkey.elf", **kw):
     return run
 
 
+def printing(label="pd-pqkey.elf", **kw):
+    @with_tree(**kw)
+    def run(search, _harness, _d):
+        return cts.check_printing(search / label)
+    return run
+
+
+@with_tree()
+def printing_control_fails(search, _harness, _d):
+    """An ELF whose entry symbol is another crate's fails the control."""
+    (search / "pd-pq.elf").rename(search / "pd-other.elf")
+    return cts.check_printing(search / "pd-other.elf")
+
+
 @with_tree()
 def erasure_control_fails(search, _harness, _d):
     """An ELF whose entry symbol is another crate's fails the control."""
@@ -222,7 +236,7 @@ def erasure_control_fails(search, _harness, _d):
 
 
 def cli(**kw):
-    """tools/ct-shape end to end, all four checks, against a policy made from
+    """tools/ct-shape end to end, all five checks, against a policy made from
     the unmutated tree: (exit status, the ct-shape: lines, the count)."""
     mutated = kw.pop("mutated", False)
     third = kw.pop("third", False)
@@ -347,6 +361,16 @@ CASES = [
     ("erasure fails when the control cannot find the entry",
      ["pd-other.elf: erasure: positive control failed: no symbol demangles to "
       "sel4_microkit::entry::run_main<_, pd_other::init>"], erasure_control_fails),
+    ("printing passes a PD without the DebugPutChar wrapper", None, printing()),
+    ("printing names the DebugPutChar wrapper",
+     ["pd-pqkey.elf: printing: sel4_sys::syscalls::calls::seL4_DebugPutChar is the DebugPutChar syscall wrapper"],
+     printing(debug_put_char="pd-pqkey.elf")),
+    ("printing fails when the control cannot find the entry",
+     ["pd-other.elf: printing: positive control failed: no symbol demangles to "
+      "sel4_microkit::entry::run_main<_, pd_other::init>"], printing_control_fails),
+    ("the CLI refuses a PD referencing DebugPutChar", None,
+     cli(debug_put_char="pd-pq.elf",
+         want="ct-shape: pd-pq.elf: printing: sel4_sys::syscalls::calls::seL4_DebugPutChar is the DebugPutChar")),
     ("the CLI passes the unmutated tree", None, cli()),
     ("the CLI refuses a mutated ELF", None, cli(mutated=True)),
     ("the CLI refuses McEliece code in a third PD the system file lists", None, cli(third=True)),

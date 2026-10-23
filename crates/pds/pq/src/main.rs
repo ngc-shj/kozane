@@ -11,7 +11,7 @@ use audit_event::{CostHighWater, Event};
 use layout::pq as ch;
 use msgs::{RP_NO_PEER, RpDatagram, RpReply};
 use pdkit::{Audit, Buf, Rx, Take, Tx};
-use pqkey_core::{LABEL_PQ_BOOT_SEED, LABEL_PQ_DECAPS, MAX_WORDS, OK, PQ_DECAPS_REQ_WORDS};
+use pqkey_core::{LABEL_PQ_BOOT_SEED, LABEL_PQ_DECAPS, LABEL_PQ_STACK_MARK, MAX_WORDS, OK, PQ_DECAPS_REQ_WORDS};
 use ring::link::Taken;
 use ring::pass::{any_full, drain, run_passes};
 use rosenpass_core::{
@@ -20,8 +20,8 @@ use rosenpass_core::{
 };
 use rosenpass_wire::{INIT_CONF_LEN, INIT_HELLO_LEN, RESP_HELLO_LEN, SCT_LEN};
 use sel4_microkit::{
-    Channel, ChannelSet, Handler, Infallible, MessageInfo, debug_println, memory_region_symbol, protection_domain,
-    with_msg_regs, with_msg_regs_mut,
+    Channel, ChannelSet, Handler, Infallible, MessageInfo, memory_region_symbol, protection_domain, with_msg_regs,
+    with_msg_regs_mut,
 };
 
 const PQKEY: Channel = Channel::new(ch::CH_PQKEY);
@@ -178,10 +178,21 @@ struct Pq {
 /// checks that this constant matches it).
 const STACK_SIZE: usize = 0x20_000;
 
-
-fn halt(msg: &str) -> ! {
-    debug_println!("pq: {msg}");
-    panic!("pq: halted");
+/// `Halted` reasons (the record's `a`), stable per M5 plan C6.
+mod halt {
+    /// CNTFRQ is 0: no clock to measure handshake cost or age biscuits by.
+    pub const NO_CLOCK: u32 = 1;
+    /// The embedded gateway McEliece public key does not match its rp_hash.
+    pub const GATEWAY_RP_HASH: u32 = 2;
+    /// An embedded peer McEliece public key does not match its rp_hash.
+    pub const PEER_RP_HASH: u32 = 3;
+    /// `pqkey` refused the boot seed (after `KeyUnavailable`, if it is
+    /// Unavailable).
+    pub const NO_BOOT_SEED: u32 = 4;
+    /// RNDR failed while building the responder.
+    pub const RNDR: u32 = 5;
+    /// The responder could not be built for any other reason.
+    pub const INIT_FAILED: u32 = 6;
 }
 
 #[protection_domain]
@@ -190,7 +201,7 @@ fn init() -> Pq {
     let stack = unsafe { cpu::StackProbe::paint(STACK_SIZE) };
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout` (checked by tools/laws and layout tests).
-    let (from_ingress, to_ingress, to_hs, audit) = unsafe {
+    let (from_ingress, to_ingress, to_hs, mut audit) = unsafe {
         (
             pdkit::rx(
                 memory_region_symbol!(ipq_used: *mut u8),
@@ -210,36 +221,43 @@ fn init() -> Pq {
             Audit::new(memory_region_symbol!(audit_pq: *mut u8), Channel::new(ch::CH_AUDIT)),
         )
     };
-    let freq = cpu::checked_frequency(cpu::cntfrq())
-        .unwrap_or_else(|| halt("CNTFRQ is 0; refusing to run without a clock"));
+    let freq = cpu::checked_frequency(cpu::cntfrq()).unwrap_or_else(|| audit.halt(halt::NO_CLOCK));
     // The embedded keys must be the configured ones (M3 plan S8).
     if secret_blob::blake2s(&[SPKM]) != config::GATEWAY_RP_HASH {
-        halt("gateway McEliece public key does not match its rp_hash");
+        audit.halt(halt::GATEWAY_RP_HASH);
     }
-    for (i, (spkt, peer)) in SPKTS.iter().zip(config::PEERS).enumerate() {
-        if secret_blob::blake2s(&[*spkt]) != peer.rp_hash {
-            debug_println!("pq: peer {i} McEliece public key does not match its rp_hash");
-            panic!("pq: halted");
-        }
+    if SPKTS.iter().zip(config::PEERS).any(|(spkt, peer)| secret_blob::blake2s(&[*spkt]) != peer.rp_hash) {
+        audit.halt(halt::PEER_RP_HASH);
     }
-    // Once per boot. If `pqkey` halted at boot this blocks, which still
-    // fails closed: no PSK ever reaches `hs`, so WireGuard is refused.
+    // Once per boot, the first call to `pqkey`: an Unavailable `pqkey` shows
+    // here first and is audited once, as pq then halts. No PSK ever reaches
+    // `hs`, so WireGuard is refused (fail-closed).
     let mut seed = Secret::<KEY_LEN>::zero();
-    if pqkey_call(LABEL_PQ_BOOT_SEED, &[], seed.expose_mut()) != OK {
-        halt("no boot seed from pqkey");
+    let status = pqkey_call(LABEL_PQ_BOOT_SEED, &[], seed.expose_mut());
+    if status != OK {
+        if let Some(code) = pqkey_core::unavailable_code(status) {
+            audit.record(Event::KeyUnavailable { code });
+        }
+        audit.halt(halt::NO_BOOT_SEED);
+    }
+    // pqkey's stack mark after its boot KAT (C8), audited here for it. A
+    // refusal leaves it unreported, which the integration check fails on.
+    let mut mark = [0u8; 8];
+    if pqkey_call(LABEL_PQ_STACK_MARK, &[], &mut mark) == OK {
+        let bytes = u32::try_from(u64::from_le_bytes(mark)).unwrap_or(u32::MAX);
+        audit.record(Event::KeyStackHighWater { bytes });
     }
     let mut rng = Hedged::new(seed, Cpu);
     let mut responder = match Responder::new(SPKM, SPKTS, &mut rng) {
         Ok(r) => r,
-        Err(Error::Rng) => halt("RNDR unavailable"),
-        Err(_) => halt("init failed"),
+        Err(Error::Rng) => audit.halt(halt::RNDR),
+        Err(_) => audit.halt(halt::INIT_FAILED),
     };
-    let mut audit = audit;
     // The first biscuit key; a failure is retried on every timer tick.
     if let Err(e) = responder.tick(cpu::now_ns(), &mut rng) {
         audit.record(reject_event(e));
     }
-    debug_println!("pq: ready");
+    audit.ready();
     Pq {
         from_ingress,
         to_ingress,

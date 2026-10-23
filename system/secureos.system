@@ -14,6 +14,8 @@
     <memory_region name="eth_in_dma" size="0x200_000" page_size="0x200_000" />
     <!-- sp804 timer (patched QEMU virt), SPI 11. -->
     <memory_region name="timer_mmio" size="0x1000" phys_addr="0x90d0000" />
+    <!-- PL011 UART, the only console (M5 plan C6): audit's, transmit only. -->
+    <memory_region name="uart_mmio" size="0x1000" phys_addr="0x9000000" />
     <!-- Static secrets (law L2): zero placeholder here; `make package` swaps
          only this prefill_path for a real blob. -->
     <memory_region name="secrets" size="0x1000" prefill_path="secrets-placeholder.bin" />
@@ -239,6 +241,7 @@
 
     <protection_domain name="audit" priority="50" budget="500" period="10_000" stack_size="0x10_000">
         <program_image path="pd-audit.elf" />
+        <map mr="uart_mmio" vaddr="0x2_000_000" perms="rw" cached="false" setvar_vaddr="uart_mmio_vaddr" />
         <map mr="audit_ingress" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_ingress" />
         <map mr="audit_eth_out" vaddr="0x7_001_000" perms="rw" setvar_vaddr="audit_eth_out" />
         <map mr="audit_eth_in" vaddr="0x7_002_000" perms="rw" setvar_vaddr="audit_eth_in" />

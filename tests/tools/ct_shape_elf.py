@@ -4,7 +4,8 @@
 `program(...)` returns the assembly of a small mce460896-shaped program:
 the two C10 roots, a helper with a branch, a select, an adrp-paired load
 and a register-offset load, a panic entry by property and one by name,
-memcpy, and the PD entry symbol the erasure control looks for. `build`
+memcpy, the PD entry symbol the erasure control looks for and, on request,
+rust-sel4's DebugPutChar syscall wrapper (the printing check's target). `build`
 assembles and links it with the aarch64-none-elf toolchain at a chosen base
 address, so a PD and a "harness" differ in every address and in their crate
 hashes while their code is the same.
@@ -33,6 +34,7 @@ def syms(h: str) -> dict:
         "vstd": f"_RNvNtCs{h}1_4vstd3seq3new",
         "mul": f"_RNvNt{mce}3vec3mul",
         "shim": f"_RINv{mce}6encapsNtCs{h}4_6caller3RngE",
+        "debug_put_char": f"_RNvNtNtCs{h}5_8sel4_sys8syscalls5calls17seL4_DebugPutChar",
     }
 
 
@@ -56,7 +58,7 @@ BM = [
 
 
 def program(h: str, crate: str, filler: int = 0, bm=None, extra=(), vstd: bool = False, mul: bool = False,
-            only_root=None, entry_body=("ret",)) -> str:
+            only_root=None, entry_body=("ret",), debug_put_char: bool = False) -> str:
     """`only_root`: keep one of the two roots ("decaps" or "attempt"), as
     each PD links only its own. `entry_body`: the PD entry's instructions."""
     s = syms(h)
@@ -80,6 +82,8 @@ def program(h: str, crate: str, filler: int = 0, bm=None, extra=(), vstd: bool =
         named.append((s["mul"], ["ret"]))
     if vstd:
         named.append((s["vstd"], ["ret"]))
+    if debug_put_char:
+        named.append((s["debug_put_char"], ["ret"]))
     for sym, body in named:
         out += [f".globl {sym}", f".type {sym}, %function", f"{sym}:"]
         out += [line.format(**names) for line in body]
@@ -101,15 +105,16 @@ def build(d: pathlib.Path, name: str, source: str, base: int) -> pathlib.Path:
 
 
 def tree(d: pathlib.Path, pd_bm=None, pd_extra=(), harness_bm=None, harness_extra=(), vstd: bool = False,
-         harness_mul: bool = False, pd_mul: bool = False, pd_entry=("ret",)):
+         harness_mul: bool = False, pd_mul: bool = False, pd_entry=("ret",), debug_put_char=None):
     """A search path with pd-pq.elf and pd-pqkey.elf, each with its own root
     only, and a harness (with both) built at other addresses with other
-    crate hashes. Returns (search path, harness)."""
+    crate hashes. `debug_put_char` names the PD ELF that also gets the
+    DebugPutChar wrapper. Returns (search path, harness)."""
     search = d / "search"
     search.mkdir()
     for label, crate, root in (("pd-pq.elf", "pd_pq", "attempt"), ("pd-pqkey.elf", "pd_pqkey", "decaps")):
         build(search, label, program("a1", crate, bm=pd_bm, extra=pd_extra, vstd=vstd, mul=pd_mul, only_root=root,
-                                     entry_body=pd_entry), 0x200000)
+                                     entry_body=pd_entry, debug_put_char=label == debug_put_char), 0x200000)
     harness = build(d, "ct-harness", program("b7", "ct_harness", filler=37, bm=harness_bm, extra=harness_extra,
                                                      mul=harness_mul),
                     0x412340)

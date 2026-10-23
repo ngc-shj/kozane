@@ -188,8 +188,30 @@ fn boot_error_messages_are_distinct() {
     for (i, a) in all.iter().enumerate() {
         for b in &all[i + 1..] {
             assert_ne!(a.message(), b.message());
+            assert_ne!(a.code(), b.code());
         }
+        assert!((1..=0xff).contains(&a.code()), "{a:?}");
+        assert_eq!(unavailable_code(unavailable_label(a.code())), Some(a.code()), "{a:?}");
     }
+}
+
+#[test]
+fn no_other_reply_label_reads_as_unavailable() {
+    for label in [OK, ERR_BAD_REQUEST, ERR_RATE_LIMITED, ERR_UNAVAILABLE - 1, ERR_UNAVAILABLE + 0x100] {
+        assert_eq!(unavailable_code(label), None, "{label:#x}");
+    }
+}
+
+#[test]
+fn unavailable_answers_with_the_code_and_no_data() {
+    let code = BootError::KatMismatch.code();
+    let mut reply = [u64::MAX; MAX_WORDS];
+    let (label, n) = unavailable(PQ, code, &mut reply);
+    assert_eq!((unavailable_code(label), n), (Some(code), 0));
+    assert_eq!(reply, [0; MAX_WORDS]);
+    let mut reply = [u64::MAX; MAX_WORDS];
+    assert_eq!(unavailable(None, code, &mut reply), (ERR_BAD_REQUEST, 0));
+    assert_eq!(reply, [0; MAX_WORDS]);
 }
 
 // ---- decapsulation ----
@@ -265,6 +287,17 @@ fn non_zero_trailing_bytes_are_refused_without_spending_the_bucket() {
 }
 
 #[test]
+fn stack_mark_replies_the_recorded_depth_in_one_word() {
+    let r = region_a();
+    let mut o = oracle(&r[..]);
+    o.set_stack_mark(100_096);
+    let mut reply = [u64::MAX; MAX_WORDS];
+    assert_eq!(o.handle(PQ, &mut bucket(), 0, LABEL_PQ_STACK_MARK, &[], &mut reply), (OK, PQ_STACK_MARK_REPLY_WORDS));
+    assert_eq!(reply[0], 100_096);
+    assert_eq!(o.handle(PQ, &mut bucket(), 0, LABEL_PQ_STACK_MARK, &[0], &mut reply), (ERR_BAD_REQUEST, 0));
+}
+
+#[test]
 fn boot_seed_request_takes_no_words() {
     let r = region_a();
     let o = oracle(&r[..]);
@@ -275,7 +308,7 @@ fn boot_seed_request_takes_no_words() {
 // ---- caller table ----
 
 /// Labels outside `Pq`'s row: either side of the table and the largest.
-const OUTSIDE_TABLE: [u64; 3] = [0, 3, u64::MAX];
+const OUTSIDE_TABLE: [u64; 3] = [0, 4, u64::MAX];
 
 #[test]
 fn pq_allowed_labels_succeed() {
@@ -284,7 +317,10 @@ fn pq_allowed_labels_succeed() {
     let mut reply = [0u64; MAX_WORDS];
     assert_eq!(o.handle(PQ, &mut bucket(), 0, LABEL_PQ_DECAPS, &decaps_req(CT_A), &mut reply).0, OK);
     assert_eq!(o.handle(PQ, &mut bucket(), 0, LABEL_PQ_BOOT_SEED, &[], &mut reply).0, OK);
-    assert!(Caller::Pq.allows(LABEL_PQ_DECAPS) && Caller::Pq.allows(LABEL_PQ_BOOT_SEED));
+    assert_eq!(o.handle(PQ, &mut bucket(), 0, LABEL_PQ_STACK_MARK, &[], &mut reply).0, OK);
+    assert!(
+        Caller::Pq.allows(LABEL_PQ_DECAPS) && Caller::Pq.allows(LABEL_PQ_BOOT_SEED) && Caller::Pq.allows(LABEL_PQ_STACK_MARK)
+    );
 }
 
 #[test]

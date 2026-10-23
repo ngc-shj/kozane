@@ -1,9 +1,11 @@
 //! McEliece oracle PD (M3 plan C2, laws L1/L2): passive, device-less, and
 //! the only PD that maps the `pq_secrets` region. Validates it against the
 //! compiled configuration at boot (format, `H(spkm)`, a known-answer
-//! decapsulation) and halts on any mismatch; afterwards answers the
-//! fixed-size requests defined in `pqkey-core`, each caller limited to its
-//! row of the caller → label table (`pq` is the only caller).
+//! decapsulation); afterwards answers the fixed-size requests defined in
+//! `pqkey-core`, each caller limited to its row of the caller → label table
+//! (`pq` is the only caller). A failed boot leaves it Unavailable (M5 plan
+//! C6): no secret held, every call answered with the boot error's code,
+//! which `pq` audits (`pqkey` itself has no audit ring and no console).
 
 #![no_std]
 #![no_main]
@@ -13,8 +15,8 @@ use core::ptr::NonNull;
 use layout::pqkey as ch;
 use pqkey_core::{BootEntropy, Bucket, Caller, ERR_BAD_REQUEST, MAX_WORDS, Oracle, PQ_KEY_BURST, PQ_KEY_INTERVAL_NS};
 use sel4_microkit::{
-    Channel, Handler, Infallible, MessageInfo, debug_println, memory_region_symbol, protection_domain,
-    with_msg_regs, with_msg_regs_mut,
+    Channel, Handler, Infallible, MessageInfo, memory_region_symbol, protection_domain, with_msg_regs,
+    with_msg_regs_mut,
 };
 
 const PQ: Channel = Channel::new(ch::CH_PQ);
@@ -36,20 +38,15 @@ impl BootEntropy for Hw {
     }
 }
 
-struct PqKey {
-    oracle: Oracle<'static>,
-    bucket: Bucket,
+enum PqKey {
+    Ready { oracle: Oracle<'static>, bucket: Bucket },
+    /// The boot failed with `BootError::code` `code`; nothing else is kept.
+    Unavailable { code: u32 },
 }
 
 /// `stack_size` of `pqkey` in system/secureos.system (the integration
 /// suite checks that this constant matches it).
 const STACK_SIZE: usize = 0x20_000;
-
-
-fn halt(msg: &str) -> ! {
-    debug_println!("pqkey: {msg}");
-    panic!("pqkey: halted");
-}
 
 fn region() -> &'static [u8] {
     let p: NonNull<[u8]> = memory_region_symbol!(pq_secrets: *mut [u8], n = secret_blob::pq::REGION_SIZE);
@@ -62,17 +59,18 @@ fn region() -> &'static [u8] {
 fn init() -> PqKey {
     // SAFETY: first thing in init, with STACK_SIZE this PD's stack_size.
     let mut stack = unsafe { cpu::StackProbe::paint(STACK_SIZE) };
-    let oracle =
-        Oracle::boot(region(), &config::GATEWAY_RP_HASH, &mut Hw).unwrap_or_else(|e| halt(e.message()));
-    debug_println!("pqkey: secrets valid");
-    // Once, after the boot KAT's decapsulation: pqkey has no audit ring, and
-    // a console line printed while `pq` handshakes could interleave with
-    // `audit`'s. Later decapsulations (from `pq`'s calls) run a slightly
-    // deeper chain; the 16 KiB headroom covers it (deviation log, C8).
-    if let Some((hw, size)) = stack.deeper() {
-        debug_println!("pqkey: stack high-water {hw:#x} of {size:#x}");
+    let mut oracle = match Oracle::boot(region(), &config::GATEWAY_RP_HASH, &mut Hw) {
+        Ok(oracle) => oracle,
+        Err(e) => return PqKey::Unavailable { code: e.code() },
+    };
+    // Once, after the boot KAT's decapsulation: pqkey has no audit ring, so
+    // `pq` fetches the mark (PQ_STACK_MARK) and audits it. Later
+    // decapsulations (from `pq`'s calls) run a slightly deeper chain; the
+    // 16 KiB headroom covers it (deviation log, C8).
+    if let Some((hw, _size)) = stack.deeper() {
+        oracle.set_stack_mark(hw as u64);
     }
-    PqKey { oracle, bucket: Bucket::new(PQ_KEY_BURST, PQ_KEY_INTERVAL_NS) }
+    PqKey::Ready { oracle, bucket: Bucket::new(PQ_KEY_BURST, PQ_KEY_INTERVAL_NS) }
 }
 
 impl Handler for PqKey {
@@ -90,14 +88,17 @@ impl Handler for PqKey {
             }
         });
         let mut reply = [0u64; MAX_WORDS];
-        let (label, n) = self.oracle.handle(
-            caller(channel),
-            &mut self.bucket,
-            cpu::now_ns(),
-            msg_info.label(),
-            req.get(..count).unwrap_or(&[]),
-            &mut reply,
-        );
+        let (label, n) = match self {
+            PqKey::Ready { oracle, bucket } => oracle.handle(
+                caller(channel),
+                bucket,
+                cpu::now_ns(),
+                msg_info.label(),
+                req.get(..count).unwrap_or(&[]),
+                &mut reply,
+            ),
+            PqKey::Unavailable { code } => pqkey_core::unavailable(caller(channel), *code, &mut reply),
+        };
         // Overwrite every register beyond this reply, so no part of an
         // earlier, longer request or reply is handed back to `pq`. The reply
         // words themselves stay in `pqkey`'s own IPC buffer until the next

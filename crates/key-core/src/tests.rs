@@ -80,37 +80,85 @@ fn peer_count_mismatch_and_bad_format_report_the_blob_error() {
 
 #[test]
 fn boot_error_messages_are_distinct() {
-    // Every BlobError, walked through an exhaustive successor match: a new
-    // variant fails to compile until it gets an arm, and its arm must name
-    // a successor (or end the walk), so leaving it out of the comparison
-    // takes a deliberately wrong arm rather than a forgotten line.
-    let next = |e: BlobError| match e {
-        BlobError::BadMagic => Some(BlobError::BadVersion),
-        BlobError::BadVersion => Some(BlobError::BadPeerCount),
-        BlobError::BadPeerCount => Some(BlobError::BadChecksum),
-        BlobError::BadChecksum => Some(BlobError::NonZeroPadding),
-        BlobError::NonZeroPadding => Some(BlobError::TooSmall),
-        BlobError::TooSmall => None,
-    };
-    let mut all = [BootError::GatewayKeyMismatch; 8];
+    let all = all_boot_errors(blob_successor);
+    for (i, a) in all.iter().enumerate() {
+        for b in &all[i + 1..] {
+            assert_ne!(a.message(), b.message());
+        }
+    }
+}
+
+/// Every BootError: the four plain kinds, then each BlobError reached by
+/// `next`. The walk must visit every BlobError and BootError must have
+/// exactly the five kinds listed, or this fails.
+fn all_boot_errors(next: impl Fn(BlobError) -> Option<BlobError>) -> [BootError; 10] {
+    let mut all = [BootError::GatewayKeyMismatch; 10];
     all[1] = BootError::PeerMismatch;
-    let mut n = 2;
+    all[2] = BootError::RndrUnavailable;
+    all[3] = BootError::SeedDerivation;
+    let mut n = 4;
     let mut e = Some(BlobError::BadMagic);
     while let Some(v) = e {
         all[n] = BootError::Blob(v);
         n += 1;
         e = next(v);
     }
-    assert_eq!(n, all.len(), "every BlobError compared");
-    // The walk visits every variant, and BootError has exactly the three
-    // kinds listed: a variant missing from either fails here.
-    assert_eq!(n - 2, core::mem::variant_count::<BlobError>());
-    assert_eq!(core::mem::variant_count::<BootError>(), 3);
+    assert_eq!(n, all.len(), "every BlobError listed");
+    assert_eq!(n - 4, core::mem::variant_count::<BlobError>());
+    assert_eq!(core::mem::variant_count::<BootError>(), 5);
+    all
+}
+
+/// Every BlobError, walked through an exhaustive successor match: a new
+/// variant fails to compile until it gets an arm, and its arm must name a
+/// successor (or end the walk), so leaving it out of the comparison takes a
+/// deliberately wrong arm rather than a forgotten line.
+fn blob_successor(e: BlobError) -> Option<BlobError> {
+    match e {
+        BlobError::BadMagic => Some(BlobError::BadVersion),
+        BlobError::BadVersion => Some(BlobError::BadPeerCount),
+        BlobError::BadPeerCount => Some(BlobError::BadChecksum),
+        BlobError::BadChecksum => Some(BlobError::NonZeroPadding),
+        BlobError::NonZeroPadding => Some(BlobError::TooSmall),
+        BlobError::TooSmall => None,
+    }
+}
+
+#[test]
+fn boot_error_codes_are_distinct_nonzero_and_fit_the_unavailable_label() {
+    let all = all_boot_errors(blob_successor);
     for (i, a) in all.iter().enumerate() {
+        assert!((1..=0xff).contains(&a.code()), "{a:?}");
+        assert_eq!(unavailable_code(unavailable_label(a.code())), Some(a.code()), "{a:?}");
         for b in &all[i + 1..] {
-            assert_ne!(a.message(), b.message());
+            assert_ne!(a.code(), b.code());
         }
     }
+}
+
+#[test]
+fn no_other_reply_label_reads_as_unavailable() {
+    for label in [OK, ERR_BAD_REQUEST, ERR_ZERO_DH, ERR_RATE_LIMITED, ERR_CRYPTO, ERR_UNAVAILABLE - 1, ERR_UNAVAILABLE + 0x100] {
+        assert_eq!(unavailable_code(label), None, "{label:#x}");
+    }
+}
+
+#[test]
+fn unavailable_answers_every_label_with_the_code_and_no_data() {
+    let code = BootError::GatewayKeyMismatch.code();
+    for label in [LABEL_STATIC_DH, LABEL_BOOT_SEED, 0, u64::MAX] {
+        let mut reply = [u64::MAX; MAX_WORDS];
+        let (got, n) = unavailable(HS, code, &mut reply);
+        assert_eq!((unavailable_code(got), n), (Some(code), 0), "{label}");
+        assert_eq!(reply, [0; MAX_WORDS]);
+    }
+}
+
+#[test]
+fn unavailable_refuses_an_unknown_caller_as_a_bad_request() {
+    let mut reply = [u64::MAX; MAX_WORDS];
+    assert_eq!(unavailable(None, BootError::PeerMismatch.code(), &mut reply), (ERR_BAD_REQUEST, 0));
+    assert_eq!(reply, [0; MAX_WORDS]);
 }
 
 #[test]

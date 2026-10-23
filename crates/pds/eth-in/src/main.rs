@@ -9,7 +9,6 @@ use sel4_microkit::{Channel, memory_region_symbol, protection_domain, var};
 #[protection_domain(heap_size = 256 * 1024)]
 fn init() -> netdrv::Driver {
     netdrv::start(netdrv::Params {
-        name: "eth_in",
         mmio_vaddr: *var!(eth_in_mmio_vaddr: usize = 0),
         mmio_offset: ETH_IN_MMIO_OFFSET,
         dma_vaddr: *var!(eth_in_dma_vaddr: usize = 0),

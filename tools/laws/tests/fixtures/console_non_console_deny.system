@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <memory_region name="uart" size="0x1000" phys_addr="0x9000000" />
+    <memory_region name="nic" size="0x1000" phys_addr="0xa003000" />
+    <protection_domain name="audit" priority="1" budget="1_000" period="10_000">
+        <program_image path="audit.elf" />
+        <map mr="uart" vaddr="0x2000000" perms="rw" cached="false" />
+        <map mr="nic" vaddr="0x2001000" perms="rw" cached="false" />
+    </protection_domain>
+</system>

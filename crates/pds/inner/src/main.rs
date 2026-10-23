@@ -9,7 +9,7 @@ use audit_event::Event;
 use inner_core::{Config, FromLan, ToLan, from_lan, to_lan};
 use layout::inner as ch;
 use pdkit::{Audit, Buf, Rx, Tx};
-use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, debug_println, memory_region_symbol, protection_domain};
+use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, memory_region_symbol, protection_domain};
 
 const ETH_IN: Channel = Channel::new(ch::CH_ETH_IN);
 const DATA: Channel = Channel::new(ch::CH_DATA);
@@ -33,7 +33,7 @@ struct Inner {
 fn init() -> Inner {
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout`; receive data regions are read-only here.
-    let (from_driver, to_driver, to_data, from_data, audit) = unsafe {
+    let (from_driver, to_driver, to_data, from_data, mut audit) = unsafe {
         (
             pdkit::rx(
                 memory_region_symbol!(inner_rx_used: *mut u8),
@@ -62,7 +62,7 @@ fn init() -> Inner {
     for (dst, n) in neighbors.iter_mut().zip(config::NEIGHBORS) {
         *dst = (n.ip, n.mac);
     }
-    debug_println!("inner: ready");
+    audit.ready();
     Inner {
         from_driver,
         to_driver,

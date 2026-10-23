@@ -19,15 +19,18 @@ Both blobs and OUT must resolve outside the repository (and so `build/`)
 and the toolchain caches. OUT must not exist yet: the image is built in a
 fresh 0700 staging directory beside it under umask 077, renamed into place
 only after every check passed, and removed on every failure path.
-Until a release kernel has been booted and tested (SC20, architecture R4)
-only `debug` kernels may be packaged, read from the kernel's own
-gen_config.h rather than a make variable. Independently, a non-debug kernel
-is refused while policy/waivers.toml lists an open waiver (M3 plan,
-Packaging), and a missing or unparsable waiver file refuses any package.
-For every kernel, tools/ct-shape's identity and forbidden checks (M4 plan
-C10 (a), (b)) must pass on the PD ELFs under --search-path against the C9
-harness, and a missing harness refuses; a non-debug kernel also needs the
-C9 pass record `make ct` wrote for that harness (tools/ct_record.py, C11).
+Only `release` kernels are packaged (M5 plan C7, closing SC20 and
+architecture R4 on shipped images), judged from the kernel's own
+gen_config.h rather than a make variable: no CONFIG_DEBUG_BUILD, no
+CONFIG_PRINTING (no debug printing syscall at all), CONFIG_KERNEL_MCS 1 and
+a single node (L11). Independently, a non-debug kernel is refused while
+policy/waivers.toml lists an open waiver (M3 plan, Packaging), and a
+missing or unparsable waiver file refuses any package. For every kernel,
+tools/ct-shape's identity, forbidden, shape and printing checks (M4 plan
+C10 (a), (b), M5 plan C6) must pass on the PD ELFs under --search-path
+against the C9 harness, and a missing harness refuses; a non-debug kernel
+also needs the C9 pass record `make ct` wrote for that harness
+(tools/ct_record.py, C11).
 """
 
 import argparse
@@ -51,6 +54,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 WAIVERS = ROOT / "policy" / "waivers.toml"
 LOCK = ROOT / "Cargo.lock"
 DEBUG_LINE = "#define CONFIG_DEBUG_BUILD  1"
+PRINTING_LINE = "#define CONFIG_PRINTING  1"
+MCS_LINE = "#define CONFIG_KERNEL_MCS  1"
+SINGLE_NODE_LINE = "#define CONFIG_MAX_NUM_NODES  1"
 CT_SHAPE = ROOT / "tools" / "ct-shape"
 CT_POLICY = ROOT / "policy" / "ct-shape.toml"
 # Where build/ct/pass-<key> and the record's inputs are looked up.
@@ -88,15 +94,25 @@ def is_debug(gen_config: str) -> bool:
     return DEBUG_LINE in gen_config.splitlines()
 
 
-def require_debug(gen_config: str) -> list:
-    """The SC20 predicate."""
-    if is_debug(gen_config):
-        return []
-    return ["package: kernel config is not debug; images are dev-only until release kernels are tested (SC20)"]
+def require_release(gen_config: str) -> list:
+    """The C7 predicate (invariant I7.1: no packaged image has a printing
+    kernel). Each clause is reported on its own."""
+    lines = gen_config.splitlines()
+    errors = []
+    if DEBUG_LINE in lines:
+        errors.append("package: kernel config is a debug build (CONFIG_DEBUG_BUILD); "
+                      "only release kernels are packaged (C7)")
+    if PRINTING_LINE in lines:
+        errors.append("package: kernel config has CONFIG_PRINTING; a packaged kernel must not print (C7)")
+    if MCS_LINE not in lines:
+        errors.append("package: kernel config lacks CONFIG_KERNEL_MCS 1 (C7)")
+    if SINGLE_NODE_LINE not in lines:
+        errors.append("package: kernel config is not single-node (CONFIG_MAX_NUM_NODES 1) (C7)")
+    return errors
 
 
 def check_waivers(gen_config: str, path: pathlib.Path) -> list:
-    """Judged on its own, not through require_debug, so the SC20 refusal
+    """Judged on its own, not through require_release, so the C7 refusal
     cannot mask it. The file is read for every kernel: a missing or
     unparsable one refuses even a debug package."""
     try:
@@ -129,11 +145,14 @@ def check_bindings(lock: pathlib.Path, path: pathlib.Path) -> list:
 def run_ct_shape(harness: pathlib.Path, search_path: str, system: str) -> list:
     """C10 (a), (b) and the shape baseline on the ELFs this package ships,
     against the harness C9 ran: the baseline is the static tripwire over
-    paths C9's inputs never reach (R-M6). Each line tools/ct-shape refused
+    paths C9's inputs never reach (R-M6). Also no PD the system file lists
+    references the DebugPutChar syscall wrapper (C6): a PD built against a
+    printing kernel's headers is refused. Each line tools/ct-shape refused
     with, or its output when it failed without one."""
     try:
         r = subprocess.run([str(CT_SHAPE), "--harness", str(harness), "--search-path", search_path,
-                            "--policy", str(CT_POLICY), "--system", system, "--checks", "identity,forbidden,shape"],
+                            "--policy", str(CT_POLICY), "--system", system,
+                            "--checks", "identity,forbidden,shape,printing"],
                            capture_output=True, text=True)
     except OSError as e:
         return [f"package: cannot run tools/ct-shape: {e}"]
@@ -342,7 +361,7 @@ def main() -> int:
     out = pathlib.Path(a.out)
     # All run, so each refusal stays reachable with the others removed.
     gen_config = pathlib.Path(a.gen_config).read_text()
-    errors = require_debug(gen_config) + check_waivers(gen_config, WAIVERS) + check_bindings(LOCK, WAIVERS)
+    errors = require_release(gen_config) + check_waivers(gen_config, WAIVERS) + check_bindings(LOCK, WAIVERS)
     errors += check_ct(gen_config, pathlib.Path(a.harness), a.search_path, a.system)
     if errors:
         print("\n".join(errors))

@@ -26,7 +26,7 @@ use pdkit::{Audit, Buf, Rx, Tx};
 use ring::pass::drain;
 use rp_cookie::RpCookieAdapter;
 use rp_mac::RpMacKey;
-use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, debug_println, memory_region_symbol, protection_domain};
+use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, memory_region_symbol, protection_domain};
 use wg_core::crypto;
 use wg_core::noise::LABEL_MAC1;
 use wg_core::wire::{COOKIE_REPLY_LEN, INITIATION_LEN, INITIATION_MAC1_OFFSET};
@@ -136,16 +136,27 @@ struct Ingress {
     cookie: [u8; COOKIE_REPLY_LEN],
 }
 
-fn halt(msg: &str) -> ! {
-    debug_println!("ingress: {msg}");
-    panic!("ingress: halted");
+/// `Halted` reasons (the record's `a`), stable per M5 plan C6.
+mod halt {
+    /// CNTFRQ is 0: without a clock the cookie secret would never age out.
+    pub const NO_CLOCK: u32 = 1;
+    /// The mac1 key could not be derived.
+    pub const MAC1_KEY: u32 = 2;
+    /// The WireGuard cookie key could not be derived.
+    pub const COOKIE_KEY: u32 = 3;
+    /// The Rosenpass mac key could not be derived.
+    pub const RP_MAC_KEY: u32 = 4;
+    /// RNDR failed: no WireGuard cookie secret.
+    pub const COOKIE_SECRET: u32 = 5;
+    /// RNDR failed: no Rosenpass cookie secret.
+    pub const RP_COOKIE_SECRET: u32 = 6;
 }
 
 #[protection_domain]
 fn init() -> Ingress {
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout`; receive data regions are read-only here.
-    let (from_driver, to_driver, to_hs, from_hs, to_data, from_data, to_pq, from_pq, audit) = unsafe {
+    let (from_driver, to_driver, to_hs, from_hs, to_data, from_data, to_pq, from_pq, mut audit) = unsafe {
         (
             pdkit::rx(
                 memory_region_symbol!(net_rx_used: *mut u8),
@@ -192,25 +203,25 @@ fn init() -> Ingress {
     };
     if cpu::checked_frequency(cpu::cntfrq()).is_none() {
         // Without a clock the cookie secret would never age out (L12).
-        halt("CNTFRQ is 0; refusing to run without a clock");
+        audit.halt(halt::NO_CLOCK);
     }
-    let key = crypto::hash(&[LABEL_MAC1, &config::GATEWAY_PUBLIC]).unwrap_or_else(|_| panic!("ingress: mac1 key"));
-    let mut cookies =
-        CookieAdapter::new(&config::GATEWAY_PUBLIC, cpu::fill_random).unwrap_or_else(|_| halt("cookie key derivation failed"));
+    let key = crypto::hash(&[LABEL_MAC1, &config::GATEWAY_PUBLIC]).unwrap_or_else(|_| audit.halt(halt::MAC1_KEY));
+    let mut cookies = CookieAdapter::new(&config::GATEWAY_PUBLIC, cpu::fill_random)
+        .unwrap_or_else(|_| audit.halt(halt::COOKIE_KEY));
     // Only the 32-byte mac and cookie keys are kept; `spkm` itself is read
     // here once.
     let spkm = config::gateway_rp_public!();
-    let rp_mac = RpMacKey::new(spkm).unwrap_or_else(|_| halt("Rosenpass mac key derivation failed"));
+    let rp_mac = RpMacKey::new(spkm).unwrap_or_else(|_| audit.halt(halt::RP_MAC_KEY));
     let mut rp_cookie = RpCookieAdapter::new(spkm, cpu::fill_random);
     let mut gate = Gate::default();
     if !gate.tick_if_due(&mut cookies, cpu::now_ns(), 0).rotated {
-        halt("RNDR unavailable; no cookie secret");
+        audit.halt(halt::COOKIE_SECRET);
     }
     let mut rp = RpGate::default();
     if !rp.tick_if_due(&mut rp_cookie, cpu::now_ns()).rotated {
-        halt("RNDR unavailable; no Rosenpass cookie secret");
+        audit.halt(halt::RP_COOKIE_SECRET);
     }
-    debug_println!("ingress: ready");
+    audit.ready();
     Ingress {
         from_driver,
         to_driver,

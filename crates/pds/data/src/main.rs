@@ -11,7 +11,7 @@ use layout::data as ch;
 use msgs::ToIngress;
 use pdkit::{Audit, Buf, Rx, Tx};
 use ring::pass::drain;
-use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, debug_println, memory_region_symbol, protection_domain};
+use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, memory_region_symbol, protection_domain};
 
 const INGRESS: Channel = Channel::new(ch::CH_INGRESS);
 const HS: Channel = Channel::new(ch::CH_HS);
@@ -48,16 +48,18 @@ struct DataPd {
     scratch: Buf,
 }
 
+/// `Halted` reasons (the record's `a`), stable per M5 plan C6.
+mod halt {
+    /// CNTFRQ is 0: without a counter frequency no session would ever
+    /// expire (L12).
+    pub const NO_CLOCK: u32 = 1;
+}
+
 #[protection_domain]
 fn init() -> DataPd {
-    if cpu::checked_frequency(cpu::cntfrq()).is_none() {
-        // Without a counter frequency no session would ever expire (L12).
-        debug_println!("data: CNTFRQ is 0; refusing to run without a clock");
-        panic!("data: halted");
-    }
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout`; receive data regions are read-only here.
-    let (from_hs, from_ingress, to_ingress, from_inner, to_inner, audit) = unsafe {
+    let (from_hs, from_ingress, to_ingress, from_inner, to_inner, mut audit) = unsafe {
         (
             pdkit::rx(
                 memory_region_symbol!(hd_used: *mut u8),
@@ -87,7 +89,10 @@ fn init() -> DataPd {
             Audit::new(memory_region_symbol!(audit_data: *mut u8), Channel::new(ch::CH_AUDIT)),
         )
     };
-    debug_println!("data: ready");
+    if cpu::checked_frequency(cpu::cntfrq()).is_none() {
+        audit.halt(halt::NO_CLOCK);
+    }
+    audit.ready();
     DataPd {
         from_hs,
         from_ingress,

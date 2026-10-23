@@ -1,20 +1,68 @@
 //! `audit`: drains event rings from untrusted producers (threat A3) and
 //! prints them. Bounded work per notification; unknown codes share one
 //! counter so a hostile producer cannot flood the log by cycling codes.
+//!
+//! The only console (M5 plan C6): it writes its lines straight to the PL011
+//! transmit FIFO, polling the FIFO-full flag before each byte. It has no
+//! interrupt and no receive path; no PD prints through the kernel, and a
+//! release kernel has no debug printing at all.
 
 #![no_std]
 #![no_main]
 
+use core::fmt::{self, Write};
 use core::ptr::NonNull;
 
 use audit_event::{Decoded, Record, UnknownCodes, decode};
 use layout::{AUDIT_RING_SLOTS, audit as ch};
 use ring::shmem::ShmRing;
 use ring::{Consumer, RingError};
-use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, debug_println, memory_region_symbol, protection_domain};
+use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, memory_region_symbol, protection_domain, var};
 use wire::DropReason;
 
 type AuditRing = ShmRing<Record, AUDIT_RING_SLOTS>;
+
+// PL011 registers (ARM DDI 0183): data and flags. Nothing else is touched.
+const UARTDR: usize = 0x000;
+const UARTFR: usize = 0x018;
+const FR_TXFF: u32 = 1 << 5;
+
+/// The PL011's transmit side.
+struct Uart {
+    base: NonNull<u32>,
+}
+
+impl Uart {
+    fn put(&self, byte: u8) {
+        // SAFETY: `base` is this PD's uncached mapping of the PL011 page (law
+        // L5: mapped into `audit` alone) and both offsets are registers in it.
+        unsafe {
+            while self.base.byte_add(UARTFR).read_volatile() & FR_TXFF != 0 {
+                core::hint::spin_loop();
+            }
+            self.base.byte_add(UARTDR).write_volatile(u32::from(byte));
+        }
+    }
+}
+
+impl Write for Uart {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        for b in s.bytes() {
+            if b == b'\n' {
+                self.put(b'\r');
+            }
+            self.put(b);
+        }
+        Ok(())
+    }
+}
+
+/// One line to the console; formatting into the UART cannot fail.
+macro_rules! println {
+    ($uart:expr, $($arg:tt)*) => {
+        let _ = writeln!($uart, $($arg)*);
+    };
+}
 
 struct Source {
     name: &'static str,
@@ -26,6 +74,7 @@ struct Source {
 struct Audit {
     sources: [Source; 7],
     unknown: UnknownCodes,
+    uart: Uart,
 }
 
 fn source(name: &'static str, channel: usize, region: NonNull<u8>) -> Source {
@@ -36,6 +85,10 @@ fn source(name: &'static str, channel: usize, region: NonNull<u8>) -> Source {
 
 #[protection_domain]
 fn init() -> Audit {
+    let vaddr = *var!(uart_mmio_vaddr: usize = 0);
+    // Without a console nothing could be reported; stop (fail-closed).
+    let base = NonNull::new(vaddr as *mut u32).unwrap_or_else(|| panic!("audit: no uart mapping"));
+    let mut uart = Uart { base };
     let sources = [
         source("ingress", ch::CH_INGRESS, memory_region_symbol!(audit_ingress: *mut u8)),
         source("eth_out", ch::CH_ETH_OUT, memory_region_symbol!(audit_eth_out: *mut u8)),
@@ -45,8 +98,8 @@ fn init() -> Audit {
         source("data", ch::CH_DATA, memory_region_symbol!(audit_data: *mut u8)),
         source("pq", ch::CH_PQ, memory_region_symbol!(audit_pq: *mut u8)),
     ];
-    debug_println!("audit: ready");
-    Audit { sources, unknown: UnknownCodes::new() }
+    println!(uart, "audit: ready");
+    Audit { sources, unknown: UnknownCodes::new(), uart }
 }
 
 fn drop_reason(r: u16) -> Option<DropReason> {
@@ -55,30 +108,53 @@ fn drop_reason(r: u16) -> Option<DropReason> {
 
 impl Audit {
     fn print(&mut self, src: &'static str, r: Record) {
+        let uart = &mut self.uart;
         let named = match decode(r.code) {
+            // The readiness line keeps the form the PDs printed themselves
+            // before C6, which the integration waits read.
+            Decoded::Fixed(audit_event::Event::Ready) => {
+                if r.b == 0 {
+                    println!(uart, "{}: ready", src);
+                } else {
+                    println!(uart, "{}: ready lost={}", src, r.b);
+                }
+                true
+            }
             Decoded::Fixed(ev) => {
-                debug_println!("audit: src={} {} total={} lost={}", src, ev.name(), r.a, r.b);
+                println!(uart, "audit: src={} {} total={} lost={}", src, ev.name(), r.a, r.b);
                 true
             }
             Decoded::FrameDropped(reason) => match drop_reason(reason) {
                 Some(d) => {
-                    debug_println!("audit: src={} FrameDropped({:?}) total={} lost={}", src, d, r.a, r.b);
+                    println!(uart, "audit: src={} FrameDropped({:?}) total={} lost={}", src, d, r.a, r.b);
                     true
                 }
                 None => false,
             },
             Decoded::CostHighWater => {
-                debug_println!("audit: src={} RpCostHighWater us={} lost={}", src, r.a, r.b);
+                println!(uart, "audit: src={} RpCostHighWater us={} lost={}", src, r.a, r.b);
                 true
             }
             Decoded::StackHighWater => {
-                debug_println!("audit: src={} StackHighWater bytes={} lost={}", src, r.a, r.b);
+                println!(uart, "audit: src={} StackHighWater bytes={} lost={}", src, r.a, r.b);
+                true
+            }
+            Decoded::KeyStackHighWater => {
+                println!(uart, "audit: src={} KeyStackHighWater bytes={} lost={}", src, r.a, r.b);
+                true
+            }
+            Decoded::Halted => {
+                println!(uart, "audit: src={} Halted reason={} lost={}", src, r.a, r.b);
+                true
+            }
+            Decoded::KeyUnavailable => {
+                println!(uart, "audit: src={} KeyUnavailable code={} lost={}", src, r.a, r.b);
                 true
             }
             Decoded::Unknown => false,
         };
         if !named && let Some(total) = self.unknown.record() {
-            debug_println!("audit: src={} unknown code={:#06x} unknown_total={}", src, r.code, total);
+            println!(uart, "audit: src={} unknown code={:#06x} unknown_total={}", src, r.code, total);
         }
     }
 }
@@ -103,7 +179,7 @@ impl Handler for Audit {
                     Ok(None) => break,
                     Err(RingError::Corrupt | RingError::Full) => {
                         if !core::mem::replace(&mut src.reported_corrupt, true) {
-                            debug_println!("audit: src={} ring corrupt, ignoring producer", name);
+                            println!(self.uart, "audit: src={} ring corrupt, ignoring producer", name);
                         }
                         break;
                     }

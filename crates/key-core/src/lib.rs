@@ -1,7 +1,7 @@
 //! `key` oracle logic (plan C10, law L2): the only code that touches the
 //! gateway's static WireGuard private key. The PD maps the secrets region
-//! read-only, validates it against the compiled configuration once at boot
-//! (halting on any mismatch), and then answers fixed-size PPC requests:
+//! read-only, validates it against the compiled configuration once at boot,
+//! and then answers fixed-size PPC requests:
 //!
 //! | label        | request (words)        | reply (words)        |
 //! |--------------|------------------------|----------------------|
@@ -15,6 +15,11 @@
 //! three before any budget is spent. Words are little-endian `u64`s, as in
 //! seL4 message registers. WireGuard PSKs come only from Rosenpass (L8);
 //! `key` holds none.
+//!
+//! A boot that fails (`BootError`) leaves the PD up but Unavailable (M5 plan
+//! C6): it holds no secret and answers every call from a known caller with
+//! `unavailable_label(code)` and no data, so `hs` can report the failure
+//! (`key` has no audit ring and no console, L1).
 
 #![no_std]
 #![cfg_attr(test, feature(variant_count))]
@@ -39,6 +44,8 @@ pub const ERR_BAD_REQUEST: u64 = 1;
 pub const ERR_ZERO_DH: u64 = 2;
 pub const ERR_RATE_LIMITED: u64 = 4;
 pub const ERR_CRYPTO: u64 = 5;
+/// `ERR_UNAVAILABLE | code`: the boot failed with `BootError::code` `code`.
+pub const ERR_UNAVAILABLE: u64 = 0x100;
 
 pub const STATIC_DH_REQ_WORDS: usize = 4;
 pub const BOOT_SEED_REQ_WORDS: usize = 0;
@@ -78,16 +85,60 @@ pub enum BootError {
     Blob(BlobError),
     GatewayKeyMismatch,
     PeerMismatch,
+    /// RNDR failed while drawing the boot seed's samples.
+    RndrUnavailable,
+    /// Hashing the boot seed failed.
+    SeedDerivation,
 }
 
 impl BootError {
-    /// Stable text for the boot log, one per failure (plan C10).
+    /// Stable text, one per failure (plan C10).
     pub const fn message(self) -> &'static str {
         match self {
             BootError::Blob(e) => e.message(),
             BootError::GatewayKeyMismatch => "secrets: gateway key does not match the configuration",
             BootError::PeerMismatch => "secrets: peer keys do not match the configuration",
+            BootError::RndrUnavailable => "RNDR unavailable",
+            BootError::SeedDerivation => "boot seed derivation failed",
         }
+    }
+
+    /// Stable code, one per failure, carried by the Unavailable reply label
+    /// and by `hs`'s `KeyUnavailable` audit record (M5 plan C6). Never 0.
+    pub const fn code(self) -> u32 {
+        match self {
+            BootError::Blob(BlobError::BadMagic) => 1,
+            BootError::Blob(BlobError::BadVersion) => 2,
+            BootError::Blob(BlobError::BadPeerCount) => 3,
+            BootError::Blob(BlobError::BadChecksum) => 4,
+            BootError::Blob(BlobError::NonZeroPadding) => 5,
+            BootError::Blob(BlobError::TooSmall) => 6,
+            BootError::GatewayKeyMismatch => 7,
+            BootError::PeerMismatch => 8,
+            BootError::RndrUnavailable => 9,
+            BootError::SeedDerivation => 10,
+        }
+    }
+}
+
+/// The reply label of an Unavailable `key` whose boot failed with `code`.
+pub const fn unavailable_label(code: u32) -> u64 {
+    ERR_UNAVAILABLE | (code as u64 & 0xff)
+}
+
+/// The boot error code an Unavailable reply label carries, if it is one.
+pub const fn unavailable_code(label: u64) -> Option<u32> {
+    if label & !0xff == ERR_UNAVAILABLE { Some((label & 0xff) as u32) } else { None }
+}
+
+/// The answer of an Unavailable `key` (no oracle, no secret): every call from
+/// a known caller gets `unavailable_label(code)`, an unknown caller
+/// `ERR_BAD_REQUEST`; never any data, and `reply` is zeroed.
+pub fn unavailable(caller: Option<Caller>, code: u32, reply: &mut [u64]) -> (u64, usize) {
+    reply.fill(0);
+    match caller {
+        Some(_) => (unavailable_label(code), 0),
+        None => (ERR_BAD_REQUEST, 0),
     }
 }
 

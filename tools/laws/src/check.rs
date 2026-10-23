@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use crate::law::{Finding, LawId};
-use crate::policy::{MrPolicy, Policy, Role};
+use crate::policy::{MrPolicy, PL011_PAGE, Policy, Role};
 use crate::sdf::{Perms, System};
 
 pub fn check(system: &System, policy: &Policy) -> Vec<Finding> {
@@ -19,6 +19,7 @@ pub fn check(system: &System, policy: &Policy) -> Vec<Finding> {
 
     check_secrets_and_taint(system, policy, &tainted, &mut findings);
     check_device_and_dma(system, policy, &mut findings);
+    check_console(system, policy, &mut findings);
     check_dma_setvar_present(system, policy, &mut findings);
     check_irq_duplicates(system, &mut findings);
     check_data_confinement(system, policy, &mut findings);
@@ -175,7 +176,8 @@ fn check_default_deny(system: &System, policy: &Policy, findings: &mut Vec<Findi
 
 /// Pds tainted per L1: seeded by mapping a device mr, propagated over
 /// channels and shared mrs, with the `key` and `timer` exemptions. A
-/// `timer`'s own device page (not a NIC) does not seed taint.
+/// `timer`'s own device page and the PL011 console (neither a NIC) do not
+/// seed taint.
 fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) -> BTreeSet<String> {
     let mut adjacency: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut add_edge = |from: &str, to: &str| {
@@ -246,7 +248,11 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
         .pds
         .iter()
         .filter(|pd| policy.role(&pd.name) != Some(Role::Timer))
-        .filter(|pd| mrs_mapped_by(pd).any(|m| matches!(policy.mrs.get(m.mr.as_str()), Some(MrPolicy::Device { .. }))))
+        .filter(|pd| {
+            mrs_mapped_by(pd).any(|m| {
+                policy.mrs.get(m.mr.as_str()).is_some_and(|mp| matches!(mp, MrPolicy::Device { .. }) && !mp.is_pl011_console())
+            })
+        })
         .map(|pd| pd.name.as_str())
         .collect();
 
@@ -526,6 +532,56 @@ fn check_device_and_dma(system: &System, policy: &Policy, findings: &mut Vec<Fin
                         sv.symbol, sv.region_paddr, pd.name
                     ),
                 )),
+            }
+        }
+    }
+}
+
+/// L5 as amended by the M5 plan (C6): a `service` pd owns no device mr but
+/// a console, at most one console mr exists, it is pinned at the PL011
+/// page, and it is mapped `rw`. Mapping it into another pd is the general
+/// device-ownership finding, and an irq on its owner is L4's.
+fn check_console(system: &System, policy: &Policy, findings: &mut Vec<Finding>) {
+    let consoles: Vec<&str> = policy
+        .mrs
+        .iter()
+        .filter(|(_, mp)| matches!(mp, MrPolicy::Device { console: true, .. }))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    if consoles.len() > 1 {
+        findings.push(Finding::new(
+            LawId::L5,
+            format!("{} console mrs are declared ({}); the PL011 page is the only console", consoles.len(), consoles.join(", ")),
+        ));
+    }
+    for (name, mp) in &policy.mrs {
+        let MrPolicy::Device { owner, phys_addr, size, console } = mp else { continue };
+        if *console && (*phys_addr, *size) != PL011_PAGE {
+            findings.push(Finding::new(
+                LawId::L5,
+                format!(
+                    "console mr '{name}' is pinned at phys_addr={phys_addr:#x}/size={size:#x}, not the PL011 page \
+                     (phys_addr={:#x}/size={:#x})",
+                    PL011_PAGE.0, PL011_PAGE.1
+                ),
+            ));
+        }
+        if !*console && policy.role(owner) == Some(Role::Service) {
+            findings.push(Finding::new(
+                LawId::L5,
+                format!("service pd '{owner}' owns device mr '{name}', which is not a console mr"),
+            ));
+        }
+    }
+    for pd in &system.pds {
+        for m in mrs_mapped_by(pd) {
+            if matches!(policy.mrs.get(m.mr.as_str()), Some(MrPolicy::Device { console: true, .. }))
+                && m.perms != (Perms { r: true, w: true, x: false })
+            {
+                findings.push(Finding::new(
+                    LawId::L5,
+                    format!("console mr '{}' is mapped into pd '{}' with perms other than rw", m.mr, pd.name),
+                ));
             }
         }
     }
