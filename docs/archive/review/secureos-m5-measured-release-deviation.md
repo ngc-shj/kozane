@@ -286,3 +286,64 @@ The comparison and member derivation are fixtured too
     another member's dependency is fresh and the wrapper would not see it.
 - **Stated limit (RM5-3, unchanged).** The Verus-only cfgs and Verus's own
   rustc are not compared. The M4 source scan covers that axis.
+
+## Slice 5 — measured boot under QEMU (C8)
+
+### Result
+
+- **U-Boot:** `make uboot` builds two variants from the image's pinned
+  source, each with `SOURCE_DATE_EPOCH=0`: the shipped one and the measure
+  one. Both come from `support/u-boot/boot.cmd`, through
+  `tools/uboot-config`, so their measurement steps are the same lines. A
+  `verify` step refuses a U-Boot whose final `.config` lost any line of the
+  fragment.
+- **The host model:** `tools/measure.py` is the one host model of the boot
+  command. It holds the descriptor format, the I8.2 checks, the PCR 8 chain
+  and the assembly. `tools/package` and run.py both import it
+  (`MEASURE-FIXTURES 16`).
+- **Packaging outputs:** `tools/package` now also writes `published.img`,
+  `boot.desc`, `secrets.env`, `pq_secrets.env` and `pcr8`. It refuses to
+  publish unless the assembly U-Boot will perform reproduces microkit's
+  packaged image byte for byte (two new fixtures, `PACKAGE-FIXTURES 108`).
+- **Integration:** a new boot, "measured boot", has five cases (U-Boot
+  only, swtpm per boot):
+  - PCR 8 equals the host computation;
+  - a flipped image byte moves it;
+  - a range moved onto the entry code moves it;
+  - a 64-bit-wrapping range is refused on-device;
+  - a range ending exactly at `image_len` is allowed.
+
+  `INTEGRATION-CASES 38`.
+- **Red-proofs** (check-selftest):
+  - `measure-twin`: drop the descriptor extend, and the PCR 8 no longer
+    matches the host twin.
+  - `measure-wrap`: drop the 32-bit field check, and the wrapping range is
+    copied.
+
+### Deviations
+
+- **The environment is compiled in only.** Not in the plan, and found
+  while writing the fragment: `qemu_arm64_defconfig` can load an
+  environment from storage, which would replace the compiled-in boot
+  command and break VE6's premise. The fragment sets `ENV_IS_NOWHERE` and
+  turns every other location off, and `verify` checks that this took.
+  `BOOTDELAY=-2` boots without a key check.
+- **hush semantics the boot command had to work around:**
+  - `a || b; c` parses as `(a || b); c`, so `cmd || REFUSE` would always
+    power off. The generator rewrites it as
+    `if cmd; then true; else REFUSE; fi`.
+  - `setexpr` prints hex without `0x`, and `test` reads a bare value as
+    decimal, so every compare is written `0x$var`.
+  - `setexpr` wraps at 64 bits and `test` compares signed. Every
+    descriptor field must therefore fit in 32 bits before any compare;
+    `measure-wrap` red-proves this check.
+- **Refusal powers off rather than dropping to a prompt.** A prompt would
+  be an input path on the console.
+- **The packaged-image boot stays until slice 7.** The existing 33 cases
+  still boot microkit's packaged image directly. They switch to the U-Boot
+  path once the envelopes are sealed, so the boot path changes once, not
+  twice. Until then the package carries both forms, and `check_images` is
+  kept.
+- **run.py `Console.wait_for` re-checks the text after EOF.** A guest that
+  powers off right after its last line could otherwise be reported as
+  "QEMU exited".

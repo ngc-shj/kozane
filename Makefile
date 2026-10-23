@@ -298,8 +298,9 @@ pins: | $(counts)
 	python3 tests/tools/test_proof_lock.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_verus_pairing.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_mir_gate.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	python3 tests/tools/test_measure.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	tools/verus-pairing >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES|UNIT-COUNTS-FIXTURES|PROOF-LOCK-FIXTURES|VERUS-PAIRING-FIXTURES|VERUS-PAIRED|MIR-GATE-FIXTURES)' $(counts)/pins.log > $(counts)/pins
+	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES|UNIT-COUNTS-FIXTURES|PROOF-LOCK-FIXTURES|VERUS-PAIRING-FIXTURES|VERUS-PAIRED|MIR-GATE-FIXTURES|MEASURE-FIXTURES)' $(counts)/pins.log > $(counts)/pins
 
 # Builds its own deployment (fresh keys, generated config, release package);
 # see run.py. Packaging a release kernel needs the C9 pass record, hence
@@ -307,10 +308,32 @@ pins: | $(counts)
 # it_boots (check-selftest only) runs a subset of the boots; such a run
 # prints INTEGRATION-CASES-PARTIAL, which this grep does not take.
 it_boots :=
-test: ct | $(counts)
+test: ct uboot | $(counts)
 	SECUREOS_IT_BOOTS="$(it_boots)" python3 tests/integration/run.py > $(counts)/test.log 2>&1 \
 		|| { tail -40 $(counts)/test.log; exit 1; }
 	grep '^INTEGRATION-CASES ' $(counts)/test.log > $(counts)/test
+
+# M5 plan C8: U-Boot from the image's pinned source, with the repo's config
+# fragment and the boot command of support/u-boot/boot.cmd compiled in. The
+# measure variant stops after measuring and prints PCR 8 (the C8 acceptance
+# boot); both come from the same command lines (tools/uboot-config).
+uboot_tarball ?= /opt/u-boot/u-boot-2025.01.tar.bz2
+uboot := $(BUILD)/u-boot-shipped/u-boot.bin
+uboot_measure := $(BUILD)/u-boot-measure/u-boot.bin
+.PHONY: uboot
+uboot: $(uboot) $(uboot_measure)
+
+$(BUILD)/u-boot-%/u-boot.bin: support/u-boot/secureos.config support/u-boot/boot.cmd tools/uboot-config $(uboot_tarball)
+	rm -rf $(BUILD)/u-boot-$*
+	mkdir -p $(BUILD)/u-boot-$*
+	tar -xjf $(uboot_tarball) -C $(BUILD)/u-boot-$* --strip-components=1
+	tools/uboot-config $* $(BUILD)/u-boot-$*/secureos.frag
+	env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/u-boot-$* qemu_arm64_defconfig > $(BUILD)/u-boot-$*.log 2>&1
+	cd $(BUILD)/u-boot-$* && scripts/kconfig/merge_config.sh -m .config secureos.frag >> ../u-boot-$*.log 2>&1
+	env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/u-boot-$* olddefconfig >> $(BUILD)/u-boot-$*.log 2>&1
+	tools/uboot-config verify $(BUILD)/u-boot-$*/secureos.frag $(BUILD)/u-boot-$*/.config
+	SOURCE_DATE_EPOCH=0 env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/u-boot-$* -j$$(nproc) >> $(BUILD)/u-boot-$*.log 2>&1 \
+		|| { tail -30 $(BUILD)/u-boot-$*.log; exit 1; }
 
 # M5 plan C4: the MIR each PD ships from a verified crate equals the MIR the
 # proof configuration compiles (tools/mir-gate).

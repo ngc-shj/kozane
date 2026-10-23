@@ -43,6 +43,9 @@ import subprocess
 import sys
 import tempfile
 import xml.etree.ElementTree as ET
+
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+import measure  # noqa: E402  (tools/measure.py, the shared measured-boot model)
 from typing import NamedTuple
 
 sys.dont_write_bytecode = True
@@ -495,11 +498,36 @@ def build(a, blobs: dict, out: pathlib.Path) -> int:
     system.write_text(with_prefill(placeholder_system,
                                    {mr: os.path.abspath(path) for mr, path in blob_args(a).items()}))
     errors += check_systems(placeholder_system, system.read_text())
-    errors += check_images(pathlib.Path(a.image).read_bytes(), loader.read_bytes(), list(blobs.values()))
+    published, packaged = pathlib.Path(a.image).read_bytes(), loader.read_bytes()
+    errors += check_images(published, packaged, list(blobs.values()))
+    if not errors:
+        errors += write_boot_files(published, packaged, blobs, out)
     if errors:
         print("\n".join(errors))
         return 1
     return 0
+
+
+def write_boot_files(published: bytes, packaged: bytes, blobs: dict, out: pathlib.Path) -> list:
+    """The measured-boot inputs (M5 plan C8): the published image, the boot
+    descriptor naming where each envelope goes (where microkit placed its
+    blob, i.e. the system file's prefill ranges), the envelopes, and the PCR
+    8 U-Boot will produce. The assembly U-Boot performs must give back the
+    image microkit built, byte for byte."""
+    ranges = [(packaged.find(blobs[mr]), len(blobs[mr])) for mr in SECRETS_MRS]
+    try:
+        desc = measure.pack(len(published), ranges, expected=ranges)
+        assembled = measure.assemble(published, desc, [blobs[mr] for mr in SECRETS_MRS])
+    except measure.DescriptorError as e:
+        return [f"package: {e}"]
+    if assembled != packaged:
+        return ["package: the boot-time assembly differs from the image microkit built"]
+    (out / "published.img").write_bytes(published)
+    (out / "boot.desc").write_bytes(desc)
+    for mr in SECRETS_MRS:
+        (out / f"{mr}.env").write_bytes(blobs[mr])
+    (out / "pcr8").write_text(measure.expected_pcr8(desc, published).hex() + "\n")
+    return []
 
 
 if __name__ == "__main__":

@@ -148,7 +148,7 @@ CASES_FOR_GATE = {
               "verus-msgs-exact", "verus-ring-mask", "verus-wire-ipv4"},
     "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire"},
     "laws": {"laws", "laws-timer-ingress", "laws-pq-key", "laws-hs-pqkey", "laws-pq-secrets-writable"},
-    "test": {"integration", "integration-count", "integration-residue", "integration-cookie",
+    "test": {"measure-twin", "measure-wrap", "integration", "integration-count", "integration-residue", "integration-cookie",
              "integration-pq-residue", "l8-fallback", "integration-rp-src-meter", "integration-rotation",
              "integration-expiry", "rp-cookie-gate", "integration-expiry-residue"},
     "repro": {"repro-path-leak"},
@@ -538,6 +538,17 @@ CASES = {
                                "PskInstall message still in guest RAM"),
     # L8 end to end: an absent PSK treated as an all-zero one must let a peer
     # without a Rosenpass exchange get a response.
+    # M5 plan C8: U-Boot stops measuring the descriptor, so its PCR 8 no
+    # longer matches the host twin (tools/measure.py) the release computes.
+    "measure-twin": (["test", "it_boots=measured boot"], lambda t: edit(t, "support/u-boot/boot.cmd",
+                                                                       "tpm2 pcr_extend 8 0x6fb00000 || REFUSE\n", ""),
+                     "FAIL [measured boot]: Fail: measured PCR 8"),
+    # S12: without the 32-bit field check, a range whose offset + len wraps
+    # 64 bits passes the signed compares and is copied.
+    "measure-wrap": (["test", "it_boots=measured boot"], lambda t: edit(
+        t, "support/u-boot/boot.cmd",
+        "for v in $o0 $l0 $o1 $l1; do setexpr hi 0x$v / 0x100000000; if test 0x$hi -ne 0; then REFUSE; fi; done\n", ""),
+        "a wrapping range was not refused"),
     "l8-fallback": (["test", "it_boots=wireguard"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                              "            Some(Entry::Absent) | None => Err(PskRefusal::Missing),",
                                              "            Some(Entry::Absent) | None => Ok(FreshPsk(Key32::from_bytes([0; 32]))),"),

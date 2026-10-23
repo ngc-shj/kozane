@@ -705,6 +705,30 @@ IMAGE_BLOBS = [BLOB, PQ_BLOB]
 
 # (name, expected: an error substring, a list of the exact errors, or None
 # for accept; check)
+def boot_files(tamper=False):
+    """write_boot_files (M5 plan C8) on a synthetic image: microkit's packaged
+    image is the published one with each blob at its range."""
+    def run():
+        key, pq = b"K" * 0x100, b"Q" * 0x200
+        published = bytes(0x1000)
+        packaged = bytearray(published)
+        packaged[0x400:0x500] = key
+        packaged[0x800:0xa00] = pq
+        if tamper:
+            packaged[0x10] = 1
+        with tempfile.TemporaryDirectory() as d:
+            out = pathlib.Path(d)
+            errors = pkg.write_boot_files(published, bytes(packaged), {"secrets": key, "pq_secrets": pq}, out)
+            if not errors:
+                desc = (out / "boot.desc").read_bytes()
+                if pkg.measure.parse(desc)[1] != [(0x400, 0x100), (0x800, 0x200)] \
+                        or (out / "pcr8").read_text().strip() != pkg.measure.expected_pcr8(desc, published).hex() \
+                        or (out / "secrets.env").read_bytes() != key or (out / "published.img").read_bytes() != published:
+                    errors = ["boot files have the wrong content"]
+        return errors
+    return run
+
+
 CASES = [
     ("real package accepted", None,
      lambda: pkg.check_systems(SYSTEM, package_system())
@@ -897,6 +921,9 @@ CASES = [
     ("output through a symlink into the repo", "inside", out_case(link_into_repo)),
     ("output directory already exists", "already exists", out_case(existing_out)),
     ("fresh output outside the repo", None, out_case(lambda d: d / "pkg")),
+    ("boot files: the assembly must give back microkit's image", "boot-time assembly differs",
+     boot_files(tamper=True)),
+    ("boot files: descriptor, envelopes, published image and PCR 8 are written", None, boot_files()),
 ]
 
 

@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Writes the U-Boot config fragment (M5 plan C8): support/u-boot/secureos.config
+plus CONFIG_BOOTCOMMAND built from support/u-boot/boot.cmd.
+
+The shipped variant ends by running the system; the `measure` variant (the
+C8 acceptance boot) ends by printing PCR 8 and powering off instead. Both
+come from the same command lines, so the measurement steps cannot drift.
+
+Usage: tools/uboot-config shipped|measure <out>
+       tools/uboot-config verify <fragment> <.config>
+"""
+
+import pathlib
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+REFUSE = "echo secureos: boot refused; poweroff"
+RUN = {
+    "shipped": "dcache flush; dcache off; icache off; go 0x70000000",
+    "measure": "tpm2 pcr_read 8 0x6fb00040; md.b 0x6fb00040 0x20; echo secureos: measured; poweroff",
+}
+
+
+def bootcommand(variant: str) -> str:
+    lines = []
+    for line in (ROOT / "support/u-boot/boot.cmd").read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line == "RUN":
+            line = RUN[variant]
+        elif line.endswith(" || REFUSE"):
+            # hush reads `a || b; c` as `(a || b); c`, so the refusal must be
+            # a branch of its own.
+            line = f"if {line.removesuffix(' || REFUSE')}; then true; else {REFUSE}; fi"
+        elif "then REFUSE; fi" in line:
+            line = line.replace("then REFUSE; fi", f"then {REFUSE}; fi")
+        if "REFUSE" in line:
+            raise SystemExit(f"uboot-config: REFUSE outside `cmd || REFUSE` or `then REFUSE; fi`: {line}")
+        if '"' in line or "\\" in line:
+            raise SystemExit(f"uboot-config: a quote or backslash would break the Kconfig string: {line}")
+        lines.append(line)
+    if lines.count(RUN[variant]) != 1 or lines[-1] != RUN[variant]:
+        raise SystemExit("uboot-config: boot.cmd must end with exactly one RUN line")
+    return "; ".join(lines)
+
+
+def verify(frag: pathlib.Path, config: pathlib.Path) -> list:
+    """Every fragment line holds in the final .config: Kconfig silently drops
+    a value it cannot satisfy, and the boot command and the environment
+    location are what VE6 rests on."""
+    have = set(config.read_text().splitlines())
+    errors = []
+    for line in frag.read_text().splitlines():
+        if line.startswith("CONFIG_") and line not in have:
+            errors.append(f"uboot-config: {config}: missing `{line[:120]}`")
+        elif line.startswith("# CONFIG_") and line.endswith(" is not set"):
+            # Off, whether Kconfig wrote the line or the symbol does not
+            # exist in this configuration at all.
+            symbol = line.removeprefix("# ").removesuffix(" is not set")
+            if any(h.startswith(f"{symbol}=") for h in have):
+                errors.append(f"uboot-config: {config}: {symbol} is set")
+    return errors
+
+
+def main() -> int:
+    if len(sys.argv) == 4 and sys.argv[1] == "verify":
+        errors = verify(pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3]))
+        print("\n".join(errors) if errors else "uboot-config: fragment holds")
+        return 1 if errors else 0
+    if len(sys.argv) != 3 or sys.argv[1] not in RUN:
+        raise SystemExit("usage: tools/uboot-config shipped|measure <out> | verify <frag> <.config>")
+    frag = (ROOT / "support/u-boot/secureos.config").read_text()
+    pathlib.Path(sys.argv[2]).write_text(frag + f'CONFIG_BOOTCOMMAND="{bootcommand(sys.argv[1])}"\n')
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

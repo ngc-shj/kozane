@@ -283,6 +283,15 @@ class Console:
             if m:
                 return m
             if not self.alive:
+                # The last chunk can land between the copy above and the
+                # drain thread seeing EOF (a guest that powers off at once).
+                with self.lock:
+                    text = self.text[since:]
+                if strip_ready:
+                    text = READY_LINE.sub(lambda r: r.group(0) if f"{r.group(1)}: ready" in pattern else "", text)
+                m = rx.search(text)
+                if m:
+                    return m
                 raise Fail(f"QEMU exited while waiting for {pattern!r}")
             time.sleep(0.05)
         raise Fail(f"timed out waiting for {pattern!r}")
@@ -1386,6 +1395,158 @@ def test_mismatched_blob(loader: str):
         except SystemExit:
             kill(child)
             raise
+
+
+# ---------------------------------------------------------------- measured boot (M5 plan C8)
+
+sys.path.insert(0, os.path.join(ROOT, "tools"))
+import measure  # noqa: E402  (the host model of support/u-boot/boot.cmd)
+
+UBOOT_MEASURE = os.path.join(ROOT, "build/u-boot-measure/u-boot.bin")
+SWTPM_SOCKET_WAIT_S = 10.0
+
+
+class Swtpm:
+    """One swtpm per boot, in its own state directory (plan T6): started
+    before QEMU, stopped and its directory removed after, and a directory
+    that survives the removal fails the case."""
+
+    def __init__(self, parent: str):
+        self.dir = tempfile.mkdtemp(prefix="swtpm-", dir=parent)
+        self.sock = os.path.join(self.dir, "ctrl.sock")
+        self.proc = subprocess.Popen(DIE_WITH_PARENT + ["swtpm", "socket", "--tpm2", "--tpmstate",
+                                                        f"dir={self.dir}", "--ctrl", f"type=unixio,path={self.sock}"],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+        deadline = time.monotonic() + SWTPM_SOCKET_WAIT_S
+        while not os.path.exists(self.sock):
+            if self.proc.poll() is not None or time.monotonic() > deadline:
+                self.close()
+                raise Fail("swtpm did not open its control socket")
+            time.sleep(0.05)
+
+    def qemu_args(self) -> list:
+        return ["-chardev", f"socket,id=chrtpm,path={self.sock}", "-tpmdev", "emulator,id=tpm0,chardev=chrtpm",
+                "-device", "tpm-tis-device,tpmdev=tpm0"]
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+        self.proc.wait()
+        shutil.rmtree(self.dir, ignore_errors=True)
+        if os.path.exists(self.dir):
+            raise Fail(f"swtpm state {self.dir} survived its boot")
+
+
+def boot_uboot(uboot: str, files: list, tpm: Swtpm) -> tuple:
+    """QEMU with U-Boot as firmware; `files` are (path, address) pairs, the
+    boot media U-Boot reads (measure.LOAD_*)."""
+    cmd = ["-machine", "virt,virtualization=on", "-cpu", "neoverse-n2", "-m", "size=2G",
+           "-serial", "mon:stdio", "-nographic", "-bios", uboot]
+    for path, addr in files:
+        cmd += ["-device", f"loader,file={path},addr={addr:#x},force-raw=on"]
+    cmd += tpm.qemu_args()
+    child = pexpect.spawn(DIE_WITH_PARENT[0], DIE_WITH_PARENT[1:] + ["qemu-system-aarch64"] + cmd,
+                          encoding="utf-8", timeout=BOOT_TIMEOUT_S)
+    return child, Console(child)
+
+
+PCR_DUMP = re.compile(r"6fb00040:((?: [0-9a-f]{2}){16}).*\r*\n6fb00050:((?: [0-9a-f]{2}){16})")
+
+
+def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: list) -> tuple:
+    """Boots the measure variant on these boot media: (PCR 8 or None, whether
+    U-Boot refused)."""
+    paths = []
+    for name, data in (("published.img", image), ("boot.desc", desc), ("env0", envelopes[0]), ("env1", envelopes[1])):
+        path = os.path.join(scratch, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        paths.append(path)
+    tpm = Swtpm(scratch)
+    try:
+        child, con = boot_uboot(UBOOT_MEASURE, list(zip(paths, (measure.LOAD_IMAGE, measure.LOAD_DESC)
+                                                              + measure.LOAD_ENVELOPES)), tpm)
+        try:
+            m = con.wait_for(r"secureos: (measured|boot refused)\r*\n", timeout=BOOT_TIMEOUT_S)
+            if m.group(1) == "boot refused":
+                return None, True
+            dump = PCR_DUMP.search(con.text, 0, m.start())
+            if not dump:
+                raise Fail("measure variant printed no PCR 8 dump")
+            return bytes.fromhex((dump.group(1) + dump.group(2)).replace(" ", "")), False
+        finally:
+            with signals_held():
+                kill(child)
+    finally:
+        tpm.close()
+
+
+def test_measured_boot(pkg: str, passed: list):
+    """C8: the PCR 8 U-Boot produces is the one tools/measure.py computes
+    from the public release files; it moves with any byte of the image or
+    the descriptor; and the descriptor checks U-Boot runs on-device refuse a
+    wrapping range but allow one ending exactly at image_len."""
+    def read(name):
+        with open(os.path.join(pkg, name), "rb") as f:
+            return f.read()
+    image, desc = read("published.img"), read("boot.desc")
+    envs = [read("secrets.env"), read("pq_secrets.env")]
+    want = measure.expected_pcr8(desc, image)
+    if read("pcr8").decode().strip() != want.hex():
+        raise Fail("package's pcr8 differs from tools/measure.py's")
+    scratch = tempfile.mkdtemp(prefix="measure-", dir=pkg)
+    try:
+        got, refused = measure_boot(pkg, scratch, image, desc, envs)
+        if refused or got != want:
+            raise Fail(f"measured PCR 8 {got and got.hex()} != expected {want.hex()} (refused={refused})")
+        passed.append("measured boot: PCR 8 as computed")
+
+        image_len, ranges = measure.parse(desc)
+        # One byte inside image_len but outside both envelope ranges.
+        at = next(i for i in range(image_len // 2, image_len)
+                  if not any(o <= i < o + n for o, n in ranges))
+        flipped = image[:at] + bytes([image[at] ^ 1]) + image[at + 1:]
+        got, refused = measure_boot(pkg, scratch, flipped, desc, envs)
+        if refused or got == want or got != measure.expected_pcr8(desc, flipped):
+            raise Fail(f"a flipped image byte gave PCR 8 {got and got.hex()} (refused={refused})")
+        passed.append("measured boot: image byte measured")
+
+        # A range moved onto the loader's entry code: still in bounds and
+        # disjoint, so U-Boot accepts and measures it, and PCR 8 is no longer
+        # the release's.
+        (o0, l0), (o1, l1) = ranges
+        if o1 < l0:
+            raise Fail(f"the second envelope range ({o1:#x}) overlaps offset 0; pick another target")
+        tampered = desc[:24] + struct.pack("<Q", 0) + desc[32:]
+        got, refused = measure_boot(pkg, scratch, image, tampered, envs)
+        if refused or got == want:
+            raise Fail(f"a moved range kept PCR 8 {got and got.hex()} (refused={refused})")
+        passed.append("measured boot: descriptor measured")
+
+        # S12: offset + len wraps 64 bits into the image; refused on-device.
+        wrap = desc[:24] + struct.pack("<QQ", 2**64 - 0x10, 0x20) + desc[40:]
+        got, refused = measure_boot(pkg, scratch, image, wrap, envs)
+        if not refused:
+            raise Fail(f"a wrapping range was not refused (PCR 8 {got and got.hex()})")
+        passed.append("measured boot: wrapping range refused")
+
+        # Its allow pair: a range ending exactly at image_len (whichever of
+        # the two can move there without overlapping the other).
+        if image_len - l1 >= o0 + l0:
+            moved_ranges = [(o0, l0), (image_len - l1, l1)]
+        elif image_len - l0 >= o1 + l1:
+            moved_ranges = [(image_len - l0, l0), (o1, l1)]
+        else:
+            raise Fail("neither envelope range can end at image_len without overlap")
+        if measure.check_ranges(image_len, moved_ranges):
+            raise Fail(f"the edge descriptor is not valid on the host: {measure.check_ranges(image_len, moved_ranges)}")
+        edge = desc[:24] + struct.pack("<QQQQ", *moved_ranges[0], *moved_ranges[1]) + desc[56:]
+        got, refused = measure_boot(pkg, scratch, image, edge, envs)
+        if refused or got is None:
+            raise Fail("a range ending exactly at image_len was refused")
+        passed.append("measured boot: range at image_len allowed")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 # ---------------------------------------------------------------- cookie boots (M2.5 plan C6)
@@ -3119,7 +3280,8 @@ def in_netns(good: str, mismatched: str, binding: str, deploy: str) -> int:
              ("cookie boot b", lambda: test_cookie_b(good, deploy, passed)),
              ("rp gate boot", lambda: test_rp_gate(good, deploy, passed)),
              ("peer binding", lambda: test_peer_binding(binding, os.path.join(os.path.dirname(deploy), "c"), passed)),
-             ("mismatched blob halts key", single("mismatched blob", lambda: test_mismatched_blob(mismatched)))]
+             ("mismatched blob halts key", single("mismatched blob", lambda: test_mismatched_blob(mismatched))),
+             ("measured boot", lambda: test_measured_boot(os.path.dirname(good), passed))]
     # check-selftest's red-proofs need only the boot their injection breaks:
     # SECUREOS_IT_BOOTS names those (comma-separated). A filtered run never
     # prints INTEGRATION-CASES, so it can never pass `make check`'s manifest.
