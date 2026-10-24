@@ -50,6 +50,68 @@ fn reason(b: &[u8]) -> DropReason {
     parse_frame(b).unwrap_err()
 }
 
+/// The reason `ingress` drops an outside frame for: `parse_frame`'s, and
+/// for TCP (refused there as NotUdp) `parse_tcp`'s on the re-parse.
+fn outside_reason(b: &[u8]) -> DropReason {
+    match parse_frame(b) {
+        Err(DropReason::NotUdp) => match parse_frame_ip(b) {
+            Ok(Frame { body: Body::Ipv4(p), .. }) => parse_tcp(&p).map_or_else(|r| r, |_| panic!("accepted TCP")),
+            other => panic!("re-parse: {other:?}"),
+        },
+        other => other.unwrap_err(),
+    }
+}
+
+/// An IPv4/TCP datagram from HOST_IP:40000 to GW_IP:443, checksums right,
+/// its data offset what `options` (a multiple of 4 bytes) make it.
+fn tcp_packet(flags: u8, options: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&40000u16.to_be_bytes());
+    seg.extend_from_slice(&443u16.to_be_bytes());
+    seg.extend_from_slice(&0x0102_0304u32.to_be_bytes());
+    seg.extend_from_slice(&0x0a0b_0c0du32.to_be_bytes());
+    seg.push((((TCP_HDR + options.len()) / 4) as u8) << 4);
+    seg.push(flags);
+    seg.extend_from_slice(&64240u16.to_be_bytes());
+    seg.extend_from_slice(&[0, 0, 0, 0]);
+    seg.extend_from_slice(options);
+    seg.extend_from_slice(payload);
+    let mut p = std::vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, IPPROTO_TCP, 0, 0];
+    p.extend_from_slice(&HOST_IP);
+    p.extend_from_slice(&GW_IP);
+    let total = (IPV4_HDR + seg.len()) as u16;
+    p[2..4].copy_from_slice(&total.to_be_bytes());
+    let c = csum_fold(csum_add(0, &p));
+    p[10..12].copy_from_slice(&c.to_be_bytes());
+    p.extend_from_slice(&seg);
+    fix_tcp_csum(&mut p);
+    p
+}
+
+/// Recomputes the TCP checksum of an IPv4/TCP datagram after a mutation.
+fn fix_tcp_csum(p: &mut [u8]) {
+    p[IPV4_HDR + 16] = 0;
+    p[IPV4_HDR + 17] = 0;
+    let seg = &p[IPV4_HDR..];
+    let pseudo = csum_add(csum_add(0, &p[12..16]), &p[16..20]) + u32::from(IPPROTO_TCP) + seg.len() as u32;
+    let c = csum_fold(csum_add(pseudo, seg));
+    p[IPV4_HDR + 16..IPV4_HDR + 18].copy_from_slice(&c.to_be_bytes());
+}
+
+fn tcp(p: &[u8]) -> Result<TcpHeader<'_>, DropReason> {
+    parse_tcp(&parse_ipv4_packet(p).unwrap())
+}
+
+/// The same datagram in an Ethernet frame from HOST_MAC to GW_MAC.
+fn tcp_frame_of(p: &[u8]) -> Vec<u8> {
+    let mut f = Vec::new();
+    f.extend_from_slice(&GW_MAC);
+    f.extend_from_slice(&HOST_MAC);
+    f.extend_from_slice(&ETHERTYPE_IPV4.to_be_bytes());
+    f.extend_from_slice(p);
+    f
+}
+
 #[test]
 fn valid_udp_frame_parses_to_its_fields() {
     let b = udp_frame(b"nonce-123");
@@ -293,14 +355,46 @@ fn frame_for(r: DropReason) -> Option<Vec<u8>> {
             b[ETH_HDR + 12] = 224;
             fix_ip_csum(&mut b);
         }
+        // GRE: a protocol nothing serves (TCP has its own reasons below).
         DropReason::NotUdp => {
-            b[ETH_HDR + 9] = 6;
+            b[ETH_HDR + 9] = 47;
             fix_ip_csum(&mut b);
         }
         DropReason::UdpBadLength => b[ETH_HDR + IPV4_HDR + 5] -= 1,
         DropReason::UdpBadChecksum => *b.last_mut().unwrap() ^= 1,
         // Forwarding only; see `forward_*` tests below.
         DropReason::TtlExpired => return None,
+        DropReason::TcpBadLength => {
+            let mut p = tcp_packet(TCP_SYN, &[], b"");
+            p.truncate(IPV4_HDR + TCP_HDR - 1);
+            p[2..4].copy_from_slice(&((IPV4_HDR + TCP_HDR - 1) as u16).to_be_bytes());
+            p[10] = 0;
+            p[11] = 0;
+            let c = csum_fold(csum_add(0, &p[..IPV4_HDR]));
+            p[10..12].copy_from_slice(&c.to_be_bytes());
+            b = tcp_frame_of(&p);
+        }
+        DropReason::TcpBadOffset => {
+            let mut p = tcp_packet(TCP_SYN, &[], b"");
+            p[IPV4_HDR + 12] = 4 << 4;
+            fix_tcp_csum(&mut p);
+            b = tcp_frame_of(&p);
+        }
+        DropReason::TcpBadChecksum => {
+            let mut p = tcp_packet(TCP_SYN, &[], b"");
+            p[IPV4_HDR + 16] ^= 1;
+            b = tcp_frame_of(&p);
+        }
+        DropReason::TcpBadPort => {
+            let mut p = tcp_packet(TCP_SYN, &[], b"");
+            p[IPV4_HDR..IPV4_HDR + 2].fill(0);
+            fix_tcp_csum(&mut p);
+            b = tcp_frame_of(&p);
+        }
+        DropReason::TcpBadFlags => b = tcp_frame_of(&tcp_packet(TCP_SYN | TCP_FIN, &[], b"")),
+        DropReason::TcpBadOptions => b = tcp_frame_of(&tcp_packet(TCP_SYN, &[2, 1, 0, 0], b"")),
+        // `ingress_core::tls_egress` only.
+        DropReason::TcpEgressRefused => return None,
     }
     Some(b)
 }
@@ -309,9 +403,131 @@ fn frame_for(r: DropReason) -> Option<Vec<u8>> {
 fn every_parser_drop_reason_is_produced_by_its_frame() {
     for &r in DropReason::ALL {
         if let Some(f) = frame_for(r) {
-            assert_eq!(reason(&f), r);
+            assert_eq!(outside_reason(&f), r);
         }
     }
+}
+
+// ---- parse_tcp (M6 plan C2) ----
+
+#[test]
+fn a_tcp_segment_parses_to_its_fields() {
+    let p = tcp_packet(TCP_ACK | TCP_PSH, &[], b"hello");
+    let t = tcp(&p).unwrap();
+    assert_eq!((t.src_port, t.dst_port, t.seq, t.ack), (40000, 443, 0x0102_0304, 0x0a0b_0c0d));
+    assert_eq!((t.data_offset, t.flags, t.window, t.payload), (5, TCP_ACK | TCP_PSH, 64240, &b"hello"[..]));
+    assert!(!t.is_syn_request());
+}
+
+#[test]
+fn a_linux_syn_with_its_options_parses() {
+    // MSS 1460, SACK permitted, timestamps, NOP, window scale 7.
+    let opts = [2, 4, 5, 0xb4, 4, 2, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0, 1, 3, 3, 7];
+    let p = tcp_packet(TCP_SYN, &opts, b"");
+    let t = tcp(&p).unwrap();
+    assert_eq!((t.data_offset, t.payload.len()), (10, 0));
+    assert!(t.is_syn_request());
+    assert!(!tcp(&tcp_packet(TCP_SYN | TCP_ACK, &opts, b"")).unwrap().is_syn_request());
+}
+
+#[test]
+fn tcp_header_length_bound_is_twenty_bytes() {
+    let p = tcp_packet(TCP_ACK, &[], b"");
+    assert_eq!(tcp(&p).map(|t| t.payload.len()), Ok(0));
+    let short = &p[..IPV4_HDR + TCP_HDR - 1];
+    let pkt = Ip4Packet { src: HOST_IP, dst: GW_IP, proto: IPPROTO_TCP, packet: short };
+    assert_eq!(parse_tcp(&pkt), Err(DropReason::TcpBadLength));
+}
+
+#[test]
+fn tcp_segment_length_bound_is_what_a_frame_carries() {
+    let max = MAX_FRAME - ETH_HDR - IPV4_HDR - TCP_HDR;
+    let p = tcp_packet(TCP_ACK, &[], &std::vec![7; max]);
+    assert_eq!(tcp(&p).map(|t| t.payload.len()), Ok(max));
+    let mut long = p.clone();
+    long.push(7);
+    let pkt = Ip4Packet { src: HOST_IP, dst: GW_IP, proto: IPPROTO_TCP, packet: &long };
+    assert_eq!(parse_tcp(&pkt), Err(DropReason::TcpBadLength));
+}
+
+#[test]
+fn tcp_data_offset_bounds_are_five_and_fifteen_words_within_the_segment() {
+    let mut p = tcp_packet(TCP_ACK, &[], b"");
+    p[IPV4_HDR + 12] = 4 << 4;
+    fix_tcp_csum(&mut p);
+    assert_eq!(tcp(&p), Err(DropReason::TcpBadOffset), "4 words");
+    let p = tcp_packet(TCP_ACK, &[1; 40], b"x");
+    let t = tcp(&p).unwrap();
+    assert_eq!((t.data_offset, t.payload), (15, &b"x"[..]), "15 words");
+    // 6 words claimed, 5 present.
+    let mut p = tcp_packet(TCP_ACK, &[], b"");
+    p[IPV4_HDR + 12] = 6 << 4;
+    fix_tcp_csum(&mut p);
+    assert_eq!(tcp(&p), Err(DropReason::TcpBadOffset), "past the segment");
+    // 6 words claimed, exactly 6 present (the 4 data bytes become options).
+    let mut p = tcp_packet(TCP_ACK, &[], &[1, 1, 1, 1]);
+    p[IPV4_HDR + 12] = 6 << 4;
+    fix_tcp_csum(&mut p);
+    assert_eq!(tcp(&p).map(|t| (t.data_offset, t.payload.len())), Ok((6, 0)), "at the segment's end");
+}
+
+#[test]
+fn tcp_checksum_is_checked_on_every_segment() {
+    let good = tcp_packet(TCP_ACK, &[], b"data");
+    assert!(tcp(&good).is_ok());
+    for at in [IPV4_HDR, IPV4_HDR + 13, IPV4_HDR + 16, good.len() - 1] {
+        let mut p = good.clone();
+        p[at] ^= 0x10;
+        assert_eq!(tcp(&p), Err(DropReason::TcpBadChecksum), "byte {at}");
+    }
+    // The pseudo-header binds the addresses: the same segment claimed from
+    // another source fails.
+    let p = parse_ipv4_packet(&good).unwrap();
+    assert_eq!(parse_tcp(&Ip4Packet { src: [10, 0, 2, 3], ..p }), Err(DropReason::TcpBadChecksum));
+}
+
+#[test]
+fn tcp_port_zero_is_refused_on_either_side_and_one_accepted() {
+    for at in [0, 2] {
+        let mut p = tcp_packet(TCP_SYN, &[], b"");
+        p[IPV4_HDR + at..IPV4_HDR + at + 2].copy_from_slice(&0u16.to_be_bytes());
+        fix_tcp_csum(&mut p);
+        assert_eq!(tcp(&p), Err(DropReason::TcpBadPort), "offset {at}");
+        p[IPV4_HDR + at + 1] = 1;
+        fix_tcp_csum(&mut p);
+        assert!(tcp(&p).is_ok(), "port 1 at {at}");
+    }
+}
+
+#[test]
+fn syn_with_fin_or_rst_is_refused_and_other_combinations_accepted() {
+    for flags in [TCP_SYN | TCP_FIN, TCP_SYN | TCP_RST, TCP_SYN | TCP_ACK | TCP_FIN, 0xff] {
+        assert_eq!(tcp(&tcp_packet(flags, &[], b"")), Err(DropReason::TcpBadFlags), "flags {flags:#x}");
+    }
+    for flags in [TCP_SYN, TCP_SYN | TCP_ACK, TCP_FIN | TCP_ACK, TCP_RST, TCP_RST | TCP_ACK, 0] {
+        assert!(tcp(&tcp_packet(flags, &[], b"")).is_ok(), "flags {flags:#x}");
+    }
+}
+
+#[test]
+fn tcp_options_are_walked_by_length() {
+    let ok = |o: &[u8]| tcp(&tcp_packet(TCP_SYN, o, b"")).is_ok();
+    assert!(ok(&[2, 2, 1, 1]), "length 2");
+    assert!(ok(&[1, 1, 2, 2]), "NOPs then length 2");
+    assert!(ok(&[1, 2, 3, 0xee]), "length to the header's end");
+    assert!(ok(&[0, 0xff, 0xff, 0xff]), "anything after end of list");
+    let bad = |o: &[u8]| tcp(&tcp_packet(TCP_SYN, o, b"")).map(|_| ());
+    assert_eq!(bad(&[2, 1, 0, 0]), Err(DropReason::TcpBadOptions), "length 1");
+    assert_eq!(bad(&[2, 0, 0, 0]), Err(DropReason::TcpBadOptions), "length 0");
+    assert_eq!(bad(&[1, 2, 4, 0]), Err(DropReason::TcpBadOptions), "length past the header");
+    assert_eq!(bad(&[1, 1, 1, 8]), Err(DropReason::TcpBadOptions), "kind without a length byte");
+}
+
+#[test]
+fn another_protocol_is_not_tcp() {
+    let b = tcp_packet(TCP_SYN, &[], b"");
+    let p = parse_ipv4_packet(&b).unwrap();
+    assert_eq!(parse_tcp(&Ip4Packet { proto: 17, ..p }), Err(DropReason::NotUdp));
 }
 
 fn ip_with_ttl(ttl: u8) -> Vec<u8> {

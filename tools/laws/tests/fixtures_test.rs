@@ -619,6 +619,21 @@ fn ratio_sum_exactly_at_the_ceiling_cap_is_allowed() {
     assert_allow("ratio_sum_at_ceiling_allow");
 }
 
+/// The M6 split: nine ratios whose rounded float sum is 0.9500000000000001;
+/// summed exactly they are at the cap, and one microsecond more is over.
+#[test]
+fn ratio_sum_at_the_cap_is_allowed_despite_float_drift() {
+    assert_allow("ratio_sum_drift_at_cap_allow");
+}
+
+#[test]
+fn ratio_sum_one_microsecond_over_the_cap_is_l13() {
+    assert_deny_exactly(
+        "ratio_sum_one_us_over_cap_deny",
+        &["L13: tainted pds' summed budget/period ratio 0.950 exceeds the sum cap 0.95"],
+    );
+}
+
 #[test]
 fn ratio_sum_over_the_ceiling_cap_is_l13() {
     assert_deny("ratio_sum_over_ceiling_cap_deny", &["L13"]);

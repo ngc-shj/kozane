@@ -45,6 +45,7 @@ fn cfg(peers: &str) -> String {
 public_key = "{KG}"
 listen_port = 51820
 rp_port = 51819
+https_port = 443
 rp_pub_path = "rp-0.pk"
 rp_hash = "{gw_rp}"
 outside_ip = "10.0.2.15"
@@ -390,4 +391,21 @@ fn compiled_mceliece_keys_match_their_hashes() {
         assert_eq!(secret_blob::blake2s(&[*key]), p.rp_hash);
     }
     assert_ne!(crate::RP_PORT, crate::LISTEN_PORT);
+}
+
+#[test]
+fn https_port_must_be_present_and_non_zero() {
+    let base = cfg(&peer(K1, "\"10.200.0.2/32\""));
+    assert!(err(&base.replace("https_port = 443", "https_port = 0")).contains("https_port must be non-zero"));
+    assert!(err(&base.replace("https_port = 443\n", "")).contains("missing field `https_port`"));
+    assert_eq!(check(&base.replace("https_port = 443", "https_port = 1"), 4).map(|c| c.https_port), Ok(1));
+    // TCP: the same number as a UDP port is no conflict.
+    assert!(check(&base.replace("https_port = 443", "https_port = 51820"), 4).is_ok());
+}
+
+#[test]
+fn https_port_is_rendered_for_the_pds() {
+    let checked = check(&cfg(&peer(K1, "\"10.200.0.2/32\"")), 4).unwrap();
+    assert!(validate::render(&checked, "gw.pk", &[]).contains("pub const HTTPS_PORT: u16 = 443;\n"));
+    assert_ne!(crate::HTTPS_PORT, 0);
 }

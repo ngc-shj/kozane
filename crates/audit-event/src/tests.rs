@@ -182,6 +182,7 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::RpCookieSuppressed
         | Event::Ready => true,
         Event::FrameDropped { .. }
+        | Event::TcpLimited { .. }
         | Event::RpCostHighWater { .. }
         | Event::StackHighWater { .. }
         | Event::Halted { .. }
@@ -508,4 +509,59 @@ fn record_delivered_reports_what_reached_the_ring() {
         (false, false)
     );
     assert!(!pushed, "a coalesced-away event is not offered to the ring");
+}
+
+#[test]
+fn tcp_limited_kinds_are_coalesced_and_counted_apart() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::TcpLimited { kind: TCP_LIMIT_SYN_GLOBAL }, 65, &mut out);
+    run(&mut c, Event::TcpLimited { kind: TCP_LIMIT_SYN_SOURCE }, 1, &mut out);
+    run(&mut c, Event::TcpLimited { kind: TCP_LIMIT_DATA }, 1, &mut out);
+    run(&mut c, Event::FrameDropped { reason: 1 }, 1, &mut out);
+    let got: Vec<_> = out.iter().map(|r| (r.code, r.a)).collect();
+    assert_eq!(
+        got,
+        [
+            (TCP_LIMITED_BASE + 1, 1),
+            (TCP_LIMITED_BASE + 1, 65),
+            (TCP_LIMITED_BASE, 1),
+            (TCP_LIMITED_BASE + 2, 1),
+            (FRAME_DROPPED_BASE + 1, 1),
+        ]
+    );
+}
+
+#[test]
+fn tcp_limited_decodes_inside_its_range_and_clamps_outside() {
+    for k in [TCP_LIMIT_SYN_SOURCE, TCP_LIMIT_SYN_GLOBAL, TCP_LIMIT_DATA] {
+        assert_eq!(decode(Event::TcpLimited { kind: k }.code()), Decoded::TcpLimited(k));
+        assert!(TCP_LIMIT_NAMES.get(usize::from(k)).is_some());
+    }
+    assert_eq!(Event::TcpLimited { kind: 0xffff }.code(), TCP_LIMITED_BASE + 0x1f);
+    assert_eq!(decode(TCP_LIMITED_BASE + 0x1f), Decoded::TcpLimited(0x1f));
+    assert_eq!(decode(TCP_LIMITED_BASE + 0x20), Decoded::Unknown);
+    assert_eq!(decode(TCP_LIMITED_BASE - 1), Decoded::Unknown);
+    assert_eq!(Event::TcpLimited { kind: 0 }.name(), "TcpLimited");
+    assert!(Event::TcpLimited { kind: 0 }.is_coalesced());
+}
+
+#[test]
+fn m6_code_ranges_are_disjoint_from_each_other_and_from_every_other_code() {
+    let ranges = [
+        (FRAME_DROPPED_BASE, 0x40),
+        (TCP_LIMITED_BASE, 0x20),
+        (TLS_REFUSED_BASE, 0x20),
+        (TLS_CLOSED_BASE, 0x20),
+        (HTTP_REFUSED_BASE, 0x20),
+        (TLS_TIMEOUT_BASE, 0x20),
+    ];
+    for (i, (a, n)) in ranges.iter().enumerate() {
+        for (b, m) in &ranges[i + 1..] {
+            assert!(a + n <= *b || b + m <= *a, "{a:#x} overlaps {b:#x}");
+        }
+    }
+    let mut singles: Vec<u16> = Event::FIXED.iter().map(|e| e.code()).collect();
+    singles.extend([COST_HIGH_WATER, STACK_HIGH_WATER, HALTED, KEY_UNAVAILABLE, KEY_STACK_HIGH_WATER]);
+    assert!(singles.iter().all(|c| *c < FRAME_DROPPED_BASE));
 }

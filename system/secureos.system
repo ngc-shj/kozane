@@ -1,6 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  M3a layout (WireGuard responder with a Rosenpass V02 responder). Sizes and channel ids must match
+  M6 layout (WireGuard responder with a Rosenpass V02 responder, and the
+  HTTPS endpoint `tls`). Sizes and channel ids must match
   crates/layout (checked by its tests); laws are checked by tools/laws
   against policy/laws.toml before the Microkit tool runs. Each link is a
   used ring, a free ring and a data region (crates/ring::link).
@@ -82,6 +83,22 @@
     <memory_region name="pqh_used" size="0x1000" />
     <memory_region name="pqh_free" size="0x1000" />
     <memory_region name="pqh_data" size="0x20_000" />
+    <!-- itl: ingress -> tls, vetted TCP to the HTTPS port (IP packets) -->
+    <memory_region name="itl_used" size="0x1000" />
+    <memory_region name="itl_free" size="0x1000" />
+    <memory_region name="itl_data" size="0x20_000" />
+    <!-- tli: tls -> ingress, TCP from the HTTPS port (checked by tls_egress) -->
+    <memory_region name="tli_used" size="0x1000" />
+    <memory_region name="tli_free" size="0x1000" />
+    <memory_region name="tli_data" size="0x20_000" />
+    <!-- tln: tls -> inner, TCP to the backend (plaintext) -->
+    <memory_region name="tln_used" size="0x1000" />
+    <memory_region name="tln_free" size="0x1000" />
+    <memory_region name="tln_data" size="0x20_000" />
+    <!-- ntl: inner -> tls, TCP from the backend (plaintext) -->
+    <memory_region name="ntl_used" size="0x1000" />
+    <memory_region name="ntl_free" size="0x1000" />
+    <memory_region name="ntl_data" size="0x20_000" />
 
     <memory_region name="audit_ingress" size="0x1000" />
     <memory_region name="audit_eth_out" size="0x1000" />
@@ -90,6 +107,7 @@
     <memory_region name="audit_hs" size="0x1000" />
     <memory_region name="audit_data" size="0x1000" />
     <memory_region name="audit_pq" size="0x1000" />
+    <memory_region name="audit_tls" size="0x1000" />
 
     <protection_domain name="eth_out" priority="150" budget="1_000" period="10_000" stack_size="0x10_000">
         <program_image path="pd-eth-out.elf" />
@@ -210,6 +228,12 @@
         <map mr="pqi_free" vaddr="0x6_00f_000" perms="rw" setvar_vaddr="pqi_free" />
         <map mr="ipq_data" vaddr="0x10_600_000" perms="rw" setvar_vaddr="ipq_data" />
         <map mr="pqi_data" vaddr="0x10_700_000" perms="r" setvar_vaddr="pqi_data" />
+        <map mr="itl_used" vaddr="0x6_010_000" perms="rw" setvar_vaddr="itl_used" />
+        <map mr="itl_free" vaddr="0x6_011_000" perms="rw" setvar_vaddr="itl_free" />
+        <map mr="tli_used" vaddr="0x6_012_000" perms="rw" setvar_vaddr="tli_used" />
+        <map mr="tli_free" vaddr="0x6_013_000" perms="rw" setvar_vaddr="tli_free" />
+        <map mr="itl_data" vaddr="0x10_800_000" perms="rw" setvar_vaddr="itl_data" />
+        <map mr="tli_data" vaddr="0x10_900_000" perms="r" setvar_vaddr="tli_data" />
         <map mr="audit_ingress" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_ingress" />
     </protection_domain>
 
@@ -247,7 +271,33 @@
         <map mr="inner_tx_data" vaddr="0x10_100_000" perms="rw" setvar_vaddr="inner_tx_data" />
         <map mr="dn_data" vaddr="0x10_200_000" perms="r" setvar_vaddr="dn_data" />
         <map mr="nd_data" vaddr="0x10_300_000" perms="rw" setvar_vaddr="nd_data" />
+        <map mr="tln_used" vaddr="0x6_008_000" perms="rw" setvar_vaddr="tln_used" />
+        <map mr="tln_free" vaddr="0x6_009_000" perms="rw" setvar_vaddr="tln_free" />
+        <map mr="ntl_used" vaddr="0x6_00a_000" perms="rw" setvar_vaddr="ntl_used" />
+        <map mr="ntl_free" vaddr="0x6_00b_000" perms="rw" setvar_vaddr="ntl_free" />
+        <map mr="tln_data" vaddr="0x10_400_000" perms="r" setvar_vaddr="tln_data" />
+        <map mr="ntl_data" vaddr="0x10_500_000" perms="rw" setvar_vaddr="ntl_data" />
         <map mr="audit_inner" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_inner" />
+    </protection_domain>
+
+    <!-- M6: the HTTPS endpoint (plan C1, C3). TCP via smoltcp on IP packets
+         `ingress` parsed (itl/tli) and, for the backend, `inner` (ntl/tln);
+         calls `key` as `hs` does. Tainted (law L1), 0.05 of the CPU. -->
+    <protection_domain name="tls" priority="100" budget="500" period="10_000" stack_size="0x20_000">
+        <program_image path="pd-tls.elf" />
+        <map mr="itl_used" vaddr="0x6_000_000" perms="rw" setvar_vaddr="itl_used" />
+        <map mr="itl_free" vaddr="0x6_001_000" perms="rw" setvar_vaddr="itl_free" />
+        <map mr="tli_used" vaddr="0x6_002_000" perms="rw" setvar_vaddr="tli_used" />
+        <map mr="tli_free" vaddr="0x6_003_000" perms="rw" setvar_vaddr="tli_free" />
+        <map mr="tln_used" vaddr="0x6_004_000" perms="rw" setvar_vaddr="tln_used" />
+        <map mr="tln_free" vaddr="0x6_005_000" perms="rw" setvar_vaddr="tln_free" />
+        <map mr="ntl_used" vaddr="0x6_006_000" perms="rw" setvar_vaddr="ntl_used" />
+        <map mr="ntl_free" vaddr="0x6_007_000" perms="rw" setvar_vaddr="ntl_free" />
+        <map mr="itl_data" vaddr="0x10_000_000" perms="r" setvar_vaddr="itl_data" />
+        <map mr="tli_data" vaddr="0x10_100_000" perms="rw" setvar_vaddr="tli_data" />
+        <map mr="tln_data" vaddr="0x10_200_000" perms="rw" setvar_vaddr="tln_data" />
+        <map mr="ntl_data" vaddr="0x10_300_000" perms="r" setvar_vaddr="ntl_data" />
+        <map mr="audit_tls" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_tls" />
     </protection_domain>
 
     <protection_domain name="audit" priority="50" budget="500" period="10_000" stack_size="0x10_000">
@@ -260,6 +310,7 @@
         <map mr="audit_hs" vaddr="0x7_004_000" perms="rw" setvar_vaddr="audit_hs" />
         <map mr="audit_data" vaddr="0x7_005_000" perms="rw" setvar_vaddr="audit_data" />
         <map mr="audit_pq" vaddr="0x7_006_000" perms="rw" setvar_vaddr="audit_pq" />
+        <map mr="audit_tls" vaddr="0x7_007_000" perms="rw" setvar_vaddr="audit_tls" />
     </protection_domain>
 
     <channel>
@@ -353,5 +404,25 @@
     <channel>
         <end pd="pqkey" id="3" pp="true" notify="false" />
         <end pd="tpm" id="2" pp="false" notify="false" />
+    </channel>
+    <channel>
+        <end pd="ingress" id="7" />
+        <end pd="tls" id="1" />
+    </channel>
+    <channel>
+        <end pd="tls" id="2" />
+        <end pd="inner" id="4" />
+    </channel>
+    <channel>
+        <end pd="timer" id="5" />
+        <end pd="tls" id="3" notify="false" />
+    </channel>
+    <channel>
+        <end pd="tls" id="4" pp="true" notify="false" />
+        <end pd="key" id="4" pp="false" />
+    </channel>
+    <channel>
+        <end pd="tls" id="5" />
+        <end pd="audit" id="8" />
     </channel>
 </system>

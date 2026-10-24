@@ -44,6 +44,24 @@ pub const COALESCE_EVERY: u32 = 64;
 /// Code ranges. `FRAME_DROPPED_BASE + reason` encodes a `wire::DropReason`.
 pub const FRAME_DROPPED_BASE: u16 = 0x0100;
 const MAX_DROP_REASON: u16 = 0x3f;
+/// `TCP_LIMITED_BASE + kind` (M6 plan C2): which of `ingress`'s TCP
+/// buckets refused a segment to the HTTPS port, one coalesced code each.
+pub const TCP_LIMITED_BASE: u16 = 0x0200;
+const MAX_TCP_LIMIT: u16 = 0x1f;
+/// SYN without ACK over its source's bucket.
+pub const TCP_LIMIT_SYN_SOURCE: u16 = 0;
+/// SYN without ACK over the global SYN bucket.
+pub const TCP_LIMIT_SYN_GLOBAL: u16 = 1;
+/// Any other segment over the global TCP data bucket.
+pub const TCP_LIMIT_DATA: u16 = 2;
+/// `audit`'s names for the kinds, indexed by kind.
+pub const TCP_LIMIT_NAMES: [&str; 3] = ["SynSource", "SynGlobal", "Data"];
+/// Reserved for the `tls` PD's coalesced kinds (M6 plan C10), 32 codes
+/// each, base + reason/stage/status index; not decoded yet.
+pub const TLS_REFUSED_BASE: u16 = 0x0220;
+pub const TLS_CLOSED_BASE: u16 = 0x0240;
+pub const HTTP_REFUSED_BASE: u16 = 0x0260;
+pub const TLS_TIMEOUT_BASE: u16 = 0x0280;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
@@ -51,6 +69,8 @@ pub enum Event {
     UdpEchoed,
     /// `reason` is a `wire::DropReason` discriminant (< 64).
     FrameDropped { reason: u16 },
+    /// `kind` is a `TCP_LIMIT_*` value (< 32).
+    TcpLimited { kind: u16 },
     RingCorrupt,
     RxNoBuffer,
     TxNoBuffer,
@@ -256,11 +276,12 @@ impl Event {
             Event::FrameDropped { reason } => {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
             }
+            Event::TcpLimited { kind } => TCP_LIMITED_BASE | (if kind > MAX_TCP_LIMIT { MAX_TCP_LIMIT } else { kind }),
         }
     }
 
-    /// Every variant except the parameterised `FrameDropped` and the
-    /// value-carrying ones (`Event::value` is `Some`).
+    /// Every variant except the parameterised `FrameDropped` and
+    /// `TcpLimited` and the value-carrying ones (`Event::value` is `Some`).
     pub const FIXED: [Event; 61] = [
         Event::ArpReplied,
         Event::UdpEchoed,
@@ -395,6 +416,7 @@ impl Event {
             Event::KeyUnavailable { .. } => "KeyUnavailable",
             Event::KeyStackHighWater { .. } => "KeyStackHighWater",
             Event::FrameDropped { .. } => "FrameDropped",
+            Event::TcpLimited { .. } => "TcpLimited",
         }
     }
 
@@ -421,6 +443,7 @@ impl Event {
             Event::ArpReplied
             | Event::UdpEchoed
             | Event::FrameDropped { .. }
+            | Event::TcpLimited { .. }
             | Event::RingCorrupt
             | Event::RxNoBuffer
             | Event::TxNoBuffer
@@ -563,6 +586,11 @@ impl Event {
                 let r = if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason };
                 FIXED_SLOTS.saturating_add(r as usize)
             }
+            Event::TcpLimited { kind } => {
+                // TCP_LIMITED_SLOT..TCP_LIMITED_SLOT+32, clamped like `code`.
+                let k = if kind > MAX_TCP_LIMIT { MAX_TCP_LIMIT } else { kind };
+                TCP_LIMITED_SLOT.saturating_add(k as usize)
+            }
         }
     }
 }
@@ -573,7 +601,8 @@ const STACK_HIGH_WATER_SLOT: usize = COST_HIGH_WATER_SLOT + 1;
 const HALTED_SLOT: usize = STACK_HIGH_WATER_SLOT + 1;
 const KEY_UNAVAILABLE_SLOT: usize = HALTED_SLOT + 1;
 const KEY_STACK_HIGH_WATER_SLOT: usize = KEY_UNAVAILABLE_SLOT + 1;
-const SLOTS: usize = KEY_STACK_HIGH_WATER_SLOT + 1;
+const TCP_LIMITED_SLOT: usize = KEY_STACK_HIGH_WATER_SLOT + 1;
+const SLOTS: usize = TCP_LIMITED_SLOT + MAX_TCP_LIMIT as usize + 1;
 
 /// `RpCostHighWater`'s code, the first after the fixed range.
 pub const COST_HIGH_WATER: u16 = 0x0048;
@@ -653,6 +682,8 @@ pub enum Decoded {
     Fixed(Event),
     /// `wire::DropReason` discriminant.
     FrameDropped(u16),
+    /// `TCP_LIMIT_*` value.
+    TcpLimited(u16),
     /// `RpCostHighWater`: the record's `a` is the cost in µs.
     CostHighWater,
     /// `StackHighWater`: the record's `a` is the bytes used.
@@ -684,6 +715,9 @@ pub fn decode(code: u16) -> Decoded {
     }
     if code == KEY_STACK_HIGH_WATER {
         return Decoded::KeyStackHighWater;
+    }
+    if let Some(k) = code.checked_sub(TCP_LIMITED_BASE).filter(|k| *k <= MAX_TCP_LIMIT) {
+        return Decoded::TcpLimited(k);
     }
     match code.checked_sub(FRAME_DROPPED_BASE) {
         Some(r) if r <= MAX_DROP_REASON => Decoded::FrameDropped(r),

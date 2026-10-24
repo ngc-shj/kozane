@@ -13,7 +13,7 @@
 use core::fmt::{self, Write};
 use core::ptr::NonNull;
 
-use audit_event::{Decoded, Record, UnknownCodes, decode};
+use audit_event::{Decoded, Record, TCP_LIMIT_NAMES, UnknownCodes, decode};
 use layout::{AUDIT_RING_SLOTS, audit as ch};
 use ring::shmem::ShmRing;
 use ring::{Consumer, RingError};
@@ -72,7 +72,7 @@ struct Source {
 }
 
 struct Audit {
-    sources: [Source; 7],
+    sources: [Source; 8],
     unknown: UnknownCodes,
     uart: Uart,
 }
@@ -97,6 +97,7 @@ fn init() -> Audit {
         source("hs", ch::CH_HS, memory_region_symbol!(audit_hs: *mut u8)),
         source("data", ch::CH_DATA, memory_region_symbol!(audit_data: *mut u8)),
         source("pq", ch::CH_PQ, memory_region_symbol!(audit_pq: *mut u8)),
+        source("tls", ch::CH_TLS, memory_region_symbol!(audit_tls: *mut u8)),
     ];
     println!(uart, "audit: ready");
     Audit { sources, unknown: UnknownCodes::new(), uart }
@@ -127,6 +128,13 @@ impl Audit {
             Decoded::FrameDropped(reason) => match drop_reason(reason) {
                 Some(d) => {
                     println!(uart, "audit: src={} FrameDropped({:?}) total={} lost={}", src, d, r.a, r.b);
+                    true
+                }
+                None => false,
+            },
+            Decoded::TcpLimited(kind) => match TCP_LIMIT_NAMES.get(usize::from(kind)) {
+                Some(name) => {
+                    println!(uart, "audit: src={} TcpLimited({}) total={} lost={}", src, name, r.a, r.b);
                     true
                 }
                 None => false,

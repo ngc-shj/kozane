@@ -18,6 +18,8 @@ pub struct RawGateway {
     pub listen_port: u16,
     /// Rosenpass arrives on its own port (M3 plan F20).
     pub rp_port: u16,
+    /// The HTTPS endpoint's TCP port on the outside address (M6 plan C11).
+    pub https_port: u16,
     /// The gateway's McEliece public key file (`spkm`), relative to this
     /// file, and its BLAKE2s-256 in hex.
     pub rp_pub_path: String,
@@ -90,6 +92,7 @@ pub struct Checked {
     pub gateway_public: [u8; 32],
     pub listen_port: u16,
     pub rp_port: u16,
+    pub https_port: u16,
     pub gateway_rp: RpKey,
     pub outside_ip: [u8; 4],
     pub outside_mac: [u8; 6],
@@ -297,10 +300,15 @@ pub fn check(text: &str, max_peers: usize, load: &dyn Fn(&str) -> Result<Vec<u8>
     if g.rp_port == g.listen_port {
         return Err("config: rp_port must differ from listen_port".into());
     }
+    // TCP, so it may share a number with the UDP ports.
+    if g.https_port == 0 {
+        return Err("config: https_port must be non-zero".into());
+    }
     Ok(Checked {
         gateway_public,
         listen_port: g.listen_port,
         rp_port: g.rp_port,
+        https_port: g.https_port,
         gateway_rp,
         outside_ip,
         outside_mac: parse_mac(&g.outside_mac)?,
@@ -324,6 +332,7 @@ pub fn render(c: &Checked, gateway_rp_file: &str, peer_rp_files: &[String]) -> S
     s += &format!("pub const GATEWAY_PUBLIC: [u8; 32] = {:?};\n", c.gateway_public);
     s += &format!("pub const LISTEN_PORT: u16 = {};\n", c.listen_port);
     s += &format!("pub const RP_PORT: u16 = {};\n", c.rp_port);
+    s += &format!("pub const HTTPS_PORT: u16 = {};\n", c.https_port);
     s += &format!("pub const RP_PUBLIC_KEY_LEN: usize = {RP_PUBLIC_KEY_LEN};\n");
     s += &format!("pub const GATEWAY_RP_HASH: [u8; 32] = {:?};\n", c.gateway_rp.hash);
     s += &format!("pub const OUTSIDE_IP: [u8; 4] = {:?};\n", c.outside_ip);

@@ -18,6 +18,7 @@ const CFG: Config = Config {
     router_mac: [0x52, 0x55, 10, 0, 2, 2],
     port: 51820,
     rp_port: 9999,
+    https_port: 443,
 };
 
 /// `respond` never panics and never claims more bytes than `out` holds;
@@ -38,6 +39,7 @@ fn respond_is_total_and_bounded() {
         &mut Stub::default(),
         &AnyMac1,
         &mut buckets,
+        &mut TcpGate::<1>::default(),
         kani::any(),
         kani::any(),
         tx_free,
@@ -950,4 +952,107 @@ fn rp_tx_tiers_are_ordered() {
         assert!(rp_tx_allowed(TxTier::Answer, free));
     }
     kani::cover!(rp_tx_allowed(TxTier::Answer, free) && !rp_tx_allowed(TxTier::Unsolicited, free));
+}
+
+// ---- TCP to the HTTPS endpoint (M6 plan C2) ----
+
+/// A TCP gate in any bucket state: both global meters arbitrary, and the
+/// one SYN slot possibly spent by any source.
+fn any_tcp_gate(now: u64) -> TcpGate<1> {
+    let mut g = TcpGate::<1> {
+        syn_global: Meter { budget_ns: kani::any(), last_ns: kani::any() },
+        data: Meter { budget_ns: kani::any(), last_ns: kani::any() },
+        ..TcpGate::default()
+    };
+    if kani::any() {
+        let ip: Ipv4 = kani::any();
+        for _ in 0..SYN_SRC_BURST {
+            g.syn_sources.allow(ip, now);
+        }
+    }
+    g
+}
+
+/// `respond`'s TCP branch over any frame of 0..=64 bytes: what goes to
+/// `tls` is the IPv4 datagram inside the frame, a valid TCP segment from
+/// neither our MAC nor our address to our MAC, address and HTTPS port.
+#[kani::proof]
+#[kani::unwind(66)]
+fn tcp_branch_admits_only_https_to_us() {
+    let buf: [u8; 64] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= 64);
+    let frame = buf.get(..len).unwrap_or(&[]);
+    let now: u64 = kani::any();
+    let mut tcp = any_tcp_gate(now);
+    let mut out = [0u8; 64];
+    let mut cookie = [0u8; COOKIE_REPLY_LEN];
+    let o = respond(
+        &CFG,
+        &mut Gate::default(),
+        &mut Stub::default(),
+        &AnyMac1,
+        &mut Buckets::<1>::default(),
+        &mut tcp,
+        now,
+        kani::any(),
+        kani::any(),
+        frame,
+        &mut out,
+        &mut cookie,
+    );
+    if let Outcome::Tls { packet } = o {
+        assert!(frame.len() >= wire::ETH_HDR + packet.len());
+        assert!(packet == &frame[wire::ETH_HDR..wire::ETH_HDR + packet.len()]);
+        assert!(frame[..6] == CFG.mac && frame[6..12] != CFG.mac);
+        let p = wire::parse_ipv4_packet(packet).unwrap();
+        assert!(p.proto == IPPROTO_TCP && p.dst == CFG.ipv4 && p.src != CFG.ipv4);
+        let t = wire::parse_tcp(&p).unwrap();
+        assert!(t.dst_port == CFG.https_port);
+        kani::cover!(t.is_syn_request());
+        kani::cover!(!t.is_syn_request());
+    }
+    kani::cover!(matches!(o, Outcome::Tls { .. }));
+    kani::cover!(o == Outcome::TcpLimited(TcpLimit::SynSource));
+    kani::cover!(o == Outcome::TcpLimited(TcpLimit::SynGlobal));
+    kani::cover!(o == Outcome::TcpLimited(TcpLimit::Data));
+    kani::cover!(o == Outcome::Dropped(DropReason::TcpBadChecksum));
+}
+
+/// `tls_egress` over any packet of 0..=64 bytes and any TX level: every
+/// accepted packet is framed from our MAC to the router, is a valid IPv4
+/// datagram of at most 1500 bytes carrying a valid TCP segment from our
+/// address and HTTPS port to a remote unicast address, is no SYN without
+/// ACK, and leaves only above `tls`'s TX tier.
+#[kani::proof]
+#[kani::unwind(66)]
+fn tls_egress_accepts_only_conforming_packets() {
+    let buf: [u8; 64] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= 64);
+    let tx_free: usize = kani::any();
+    let r = tls_egress(&CFG, buf.get(..len).unwrap_or(&[]), tx_free);
+    if let Ok(f) = r {
+        assert!(f.eth == EthAddrs { src: CFG.mac, dst: CFG.router_mac });
+        let Body::Ipv4(p) = f.body else { panic!("not an IPv4 body") };
+        assert!(p.packet.len() <= wire::MAX_FRAME - wire::ETH_HDR);
+        assert!(wire::parse_ipv4_packet(p.packet) == Ok(p));
+        assert!(p.proto == IPPROTO_TCP && p.src == CFG.ipv4 && p.dst != CFG.ipv4 && remote_unicast(p.dst));
+        let t = wire::parse_tcp(&p).unwrap();
+        assert!(t.src_port == CFG.https_port && !t.is_syn_request());
+        assert!(rp_tx_allowed(TxTier::Tls, tx_free));
+    }
+    kani::cover!(r.is_ok());
+    kani::cover!(r == Err(EgressRefusal::TxReserve));
+    kani::cover!(r == Err(EgressRefusal::Dropped(DropReason::TcpEgressRefused)));
+}
+
+/// `tls`'s tier: never allowed where an unsolicited reply is refused.
+#[kani::proof]
+fn tls_tier_is_at_or_above_unsolicited() {
+    let free: usize = kani::any();
+    if rp_tx_allowed(TxTier::Tls, free) {
+        assert!(rp_tx_allowed(TxTier::Unsolicited, free));
+    }
+    kani::cover!(rp_tx_allowed(TxTier::Unsolicited, free) && !rp_tx_allowed(TxTier::Tls, free));
 }

@@ -58,6 +58,29 @@ fn check_stack_guard(system: &System, findings: &mut Vec<Finding>) {
     }
 }
 
+/// Σ budget/period, summed as an exact fraction and rounded once: adding
+/// the rounded ratios drifts upwards (the M6 system's 0.1 + ... + 0.05 adds
+/// up to 0.9500000000000001), and a sum exactly at the cap must pass. Falls
+/// back to adding the rounded ratios if the fraction outgrows u128 (many
+/// pairwise coprime periods), which no Microkit system comes near.
+fn ratio_sum(ratios: &[(u64, u64)]) -> f64 {
+    fn gcd(a: u128, b: u128) -> u128 {
+        if b == 0 { a } else { gcd(b, a % b) }
+    }
+    let exact = ratios.iter().try_fold((0u128, 1u128), |(num, den), &(budget, period)| {
+        let (b, p) = (u128::from(budget), u128::from(period));
+        let num = num.checked_mul(p)?.checked_add(b.checked_mul(den)?)?;
+        let den = den.checked_mul(p)?;
+        let g = gcd(num, den).max(1);
+        Some((num / g, den / g))
+    });
+    #[allow(clippy::cast_precision_loss)] // reduced fractions of microsecond budgets stay far below 2^53
+    match exact {
+        Some((num, den)) if den != 0 => num as f64 / den as f64,
+        _ => ratios.iter().map(|&(b, p)| b as f64 / p as f64).sum(),
+    }
+}
+
 fn pd_by_name<'a>(system: &'a System, name: &str) -> Option<&'a crate::sdf::Pd> {
     system.pds.iter().find(|p| p.name == name)
 }
@@ -761,7 +784,7 @@ fn check_availability(system: &System, policy: &Policy, tainted: &BTreeSet<Strin
         }
     }
 
-    let mut ratio_sum = 0.0;
+    let mut ratios = Vec::new();
     for pd in &system.pds {
         if !tainted.contains(&pd.name) {
             continue;
@@ -775,7 +798,7 @@ fn check_availability(system: &System, policy: &Policy, tainted: &BTreeSet<Strin
         }
         #[allow(clippy::cast_precision_loss)] // microsecond budgets/periods fit a f64 mantissa comfortably
         let ratio = pd.budget_us as f64 / pd.period_us as f64;
-        ratio_sum += ratio;
+        ratios.push((pd.budget_us, pd.period_us));
         if ratio > policy.ratio_cap {
             findings.push(Finding::new(
                 LawId::L13,
@@ -783,6 +806,7 @@ fn check_availability(system: &System, policy: &Policy, tainted: &BTreeSet<Strin
             ));
         }
     }
+    let ratio_sum = ratio_sum(&ratios);
     if ratio_sum > policy.ratio_sum_cap {
         findings.push(Finding::new(
             LawId::L13,

@@ -132,8 +132,8 @@
 #     parser itself (exit 2, a parse error), not reported as a law
 #     violation — see tools/laws/src/sdf.rs.
 #
-# Current system (M3a: WireGuard responder with cookies and a Rosenpass V02
-# responder; see system/secureos.system):
+# Current system (M6: WireGuard responder with cookies, a Rosenpass V02
+# responder and the HTTPS endpoint; see system/secureos.system):
 #   `eth_out` and `eth_in` own one virtio-net device each (L5) and seed
 #   taint. `ingress` (outside) and `inner` (inside) parse attacker-
 #   controlled frames; `ingress` also holds the cookie secret, which only
@@ -151,6 +151,12 @@
 #   owns the TIS page and is called by `key` and `pqkey` alone, each over
 #   its one pp channel, to unseal their secrets at boot; it is untainted
 #   and ordered above `key` (L13, and Microkit's callee-above-caller rule).
+#   `tls` (M6) is the HTTPS endpoint: it runs TCP on packets `ingress`
+#   vetted (`itl`/`tli`) and reaches its backend through `inner`
+#   (`tln`/`ntl`, plaintext of a protected session, L3 as amended); it
+#   calls `key` exactly as `hs` does and no other key pd (L2), and is
+#   tainted with role `untrusted_input`, so it runs below `key` and `timer`
+#   (L13 as amended by the M6 plan).
 
 [pds.eth_out]
 role = "driver"
@@ -190,6 +196,9 @@ role = "key"
 
 [pds.tpm]
 role = "tpm"
+
+[pds.tls]
+role = "untrusted_input"
 
 [mrs.eth_out_mmio]
 kind = "device"
@@ -435,6 +444,62 @@ kind = "data"
 producer = "pq"
 consumers = ["hs"]
 
+# itl: ingress -> tls, vetted TCP to the HTTPS port
+[mrs.itl_used]
+kind = "plain"
+shares = { ingress = "rw", tls = "rw" }
+
+[mrs.itl_free]
+kind = "plain"
+shares = { ingress = "rw", tls = "rw" }
+
+[mrs.itl_data]
+kind = "data"
+producer = "ingress"
+consumers = ["tls"]
+
+# tli: tls -> ingress, TCP from the HTTPS port
+[mrs.tli_used]
+kind = "plain"
+shares = { tls = "rw", ingress = "rw" }
+
+[mrs.tli_free]
+kind = "plain"
+shares = { tls = "rw", ingress = "rw" }
+
+[mrs.tli_data]
+kind = "data"
+producer = "tls"
+consumers = ["ingress"]
+
+# tln: tls -> inner, TCP to the backend (plaintext)
+[mrs.tln_used]
+kind = "plain"
+shares = { tls = "rw", inner = "rw" }
+
+[mrs.tln_free]
+kind = "plain"
+shares = { tls = "rw", inner = "rw" }
+
+[mrs.tln_data]
+kind = "data"
+producer = "tls"
+consumers = ["inner"]
+
+# ntl: inner -> tls, TCP from the backend (plaintext)
+[mrs.ntl_used]
+kind = "plain"
+shares = { inner = "rw", tls = "rw" }
+
+[mrs.ntl_free]
+kind = "plain"
+shares = { inner = "rw", tls = "rw" }
+
+[mrs.ntl_data]
+kind = "data"
+producer = "inner"
+consumers = ["tls"]
+
 [mrs.audit_ingress]
 kind = "plain"
 shares = { ingress = "rw", audit = "rw" }
@@ -462,6 +527,10 @@ shares = { data = "rw", audit = "rw" }
 [mrs.audit_pq]
 kind = "plain"
 shares = { pq = "rw", audit = "rw" }
+
+[mrs.audit_tls]
+kind = "plain"
+shares = { tls = "rw", audit = "rw" }
 
 [[channels]]
 between = ["eth_out", "ingress"]
@@ -578,6 +647,31 @@ between = ["pqkey", "tpm"]
 pp = { pqkey = true, tpm = false }
 notify = { pqkey = false, tpm = false }
 
+[[channels]]
+between = ["ingress", "tls"]
+pp = { ingress = false, tls = false }
+notify = { ingress = true, tls = true }
+
+[[channels]]
+between = ["tls", "inner"]
+pp = { tls = false, inner = false }
+notify = { tls = true, inner = true }
+
+[[channels]]
+between = ["timer", "tls"]
+pp = { timer = false, tls = false }
+notify = { timer = true, tls = false }
+
+[[channels]]
+between = ["tls", "key"]
+pp = { tls = true, key = false }
+notify = { tls = false, key = true }
+
+[[channels]]
+between = ["tls", "audit"]
+pp = { tls = false, audit = false }
+notify = { tls = true, audit = true }
+
 [priority]
 # L13: untrusted-input and tunnel PDs run strictly below `key` and `timer`;
 # `tpm`, the key pds' callee, above `key` (M5 plan C9).
@@ -593,11 +687,12 @@ below = [
 
 [budgets]
 # Tainted ratios: drivers, ingress and inner 0.1 each, hs and data 0.2 (crypto),
-# audit 0.05, pq 0.05; sum 0.9, at the cap. pq's measured need is about
-# 0.029 (M3 deviation log, MCE-COST); the cap may rise to the 0.95 ceiling
-# only through the Law amendments table (L13).
+# audit 0.05, pq 0.05, tls 0.05; sum 0.95, at the cap. pq's measured need is
+# about 0.029 (M3 deviation log, MCE-COST). The cap rose 0.90 -> 0.95 for
+# `tls` through the M6 plan's Law amendments table (L13); 0.95 is the hard
+# ceiling, so a further tainted pd means re-planning the split.
 ratio_cap = 0.25
-ratio_sum_cap = 0.9
+ratio_sum_cap = 0.95
 
 [board]
 # qemu_virt_aarch64: 2 GiB RAM starting at 0x4000_0000 (`-m 2G`).

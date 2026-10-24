@@ -13,6 +13,9 @@
 //! keeps only the secret's birth time and decides when crypto may run.
 //! The Rosenpass envelope mac is reached the same way, through `RpMac`, so
 //! this crate stays free of BLAKE2b and the KEMs.
+//!
+//! M6 (plan C2): TCP to the HTTPS port, past its buckets, goes to `tls` as
+//! an IP packet, and `tls_egress` is the one gate for what `tls` sends out.
 
 #![no_std]
 #![deny(
@@ -25,7 +28,7 @@
 )]
 
 use wg_wire::{COOKIE_REPLY_LEN, INITIATION_LEN, INITIATION_MAC2_OFFSET, MSG_INITIATION, MSG_TRANSPORT, TRANSPORT_MIN_LEN};
-use wire::{ArpOp, ArpPacket, Body, DropReason, EmitError, EthAddrs, Frame, Ipv4, Mac, Udp4};
+use wire::{ArpOp, ArpPacket, Body, DropReason, EmitError, EthAddrs, Frame, IPPROTO_TCP, Ipv4, Mac, Udp4};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
@@ -37,6 +40,8 @@ pub struct Config {
     pub port: u16,
     /// Rosenpass's port; nonzero and distinct from `port` (config-validated).
     pub rp_port: u16,
+    /// The HTTPS endpoint's TCP port (`tls`); nonzero (config-validated).
+    pub https_port: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,17 +101,31 @@ pub enum Outcome<'a> {
     BadMac1,
     /// Over the source's budget or, after any cookie check, the forward cap.
     RateLimited,
+    /// TCP to our HTTPS port, within its buckets: `packet` (the IPv4
+    /// datagram, not the frame) goes to `tls` (M6 plan C2).
+    Tls { packet: &'a [u8] },
+    /// TCP to our HTTPS port over one of its buckets.
+    TcpLimited(TcpLimit),
+}
+
+/// Which TCP bucket refused a segment (audited as `TcpLimited`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TcpLimit {
+    SynSource,
+    SynGlobal,
+    Data,
 }
 
 const BROADCAST: Mac = [0xff; 6];
 
 #[allow(clippy::too_many_arguments)] // each argument is an independent input the PD reads per frame (state, crypto, levels, frame); bundling them would only rename the list
-pub fn respond<'a, C: CookieCrypto, M: Mac1, const N: usize>(
+pub fn respond<'a, C: CookieCrypto, M: Mac1, const N: usize, const S: usize>(
     cfg: &Config,
     gate: &mut Gate,
     crypto: &mut C,
     mac1: &M,
     buckets: &mut Buckets<N>,
+    tcp: &mut TcpGate<S>,
     now_ns: u64,
     backlog: usize,
     tx_free: usize,
@@ -116,6 +135,9 @@ pub fn respond<'a, C: CookieCrypto, M: Mac1, const N: usize>(
 ) -> Outcome<'a> {
     let f = match wire::parse_frame(frame) {
         Ok(f) => f,
+        // `parse_frame` and its proof stay ARP and UDP only (M6 plan C2):
+        // TCP is a second parse of what it refused.
+        Err(DropReason::NotUdp) => return tcp.admit(cfg, now_ns, frame),
         Err(r) => return Outcome::Dropped(r),
     };
     match f.body {
@@ -229,7 +251,6 @@ pub fn emit_udp(cfg: &Config, sport: u16, dst: Endpoint, payload: &[u8], out: &m
 /// per `INTERVAL_NS` (the shape of wireguard-go's per-IP limiter).
 pub const BURST: u64 = 5;
 pub const INTERVAL_NS: u64 = 1_000_000_000 / 20;
-const CAPACITY_NS: u64 = BURST * INTERVAL_NS;
 
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
@@ -243,19 +264,22 @@ struct Bucket {
 /// slot or evicts the least recently used one, so a spoofed-source flood
 /// churns budgets rather than exhausting memory; the forward bucket and the
 /// cookie gate bound that case, with `key`'s quota as the audited backstop
-/// (M2.5 plan C3, C5).
+/// (M2.5 plan C3, C5). The burst `B` and interval `I` default to the
+/// initiation limiter's; `tls`'s SYN table has its own (M6 plan C2).
 #[derive(Debug, Clone)]
-pub struct Buckets<const N: usize> {
+pub struct Buckets<const N: usize, const B: u64 = BURST, const I: u64 = INTERVAL_NS> {
     slots: [Option<Bucket>; N],
 }
 
-impl<const N: usize> Default for Buckets<N> {
+impl<const N: usize, const B: u64, const I: u64> Default for Buckets<N, B, I> {
     fn default() -> Self {
         Self { slots: [None; N] }
     }
 }
 
-impl<const N: usize> Buckets<N> {
+impl<const N: usize, const B: u64, const I: u64> Buckets<N, B, I> {
+    const CAPACITY_NS: u64 = B.saturating_mul(I);
+
     pub fn allow(&mut self, ip: Ipv4, now_ns: u64) -> bool {
         let slot = match self.slots.iter().position(|s| s.is_some_and(|b| b.ip == ip)) {
             Some(i) => i,
@@ -268,7 +292,7 @@ impl<const N: usize> Buckets<N> {
                     .min_by_key(|(_, s)| s.map_or(0, |b| b.last_ns.saturating_add(1)))
                     .map_or(0, |(i, _)| i);
                 if let Some(s) = self.slots.get_mut(victim) {
-                    *s = Some(Bucket { ip, budget_ns: CAPACITY_NS, last_ns: now_ns });
+                    *s = Some(Bucket { ip, budget_ns: Self::CAPACITY_NS, last_ns: now_ns });
                 }
                 victim
             }
@@ -278,12 +302,12 @@ impl<const N: usize> Buckets<N> {
         };
         // A clock that goes backwards refills nothing.
         let elapsed = now_ns.saturating_sub(b.last_ns);
-        b.budget_ns = b.budget_ns.saturating_add(elapsed).min(CAPACITY_NS);
+        b.budget_ns = b.budget_ns.saturating_add(elapsed).min(Self::CAPACITY_NS);
         b.last_ns = b.last_ns.max(now_ns);
-        if b.budget_ns < INTERVAL_NS {
+        if b.budget_ns < I {
             return false;
         }
-        b.budget_ns = b.budget_ns.saturating_sub(INTERVAL_NS);
+        b.budget_ns = b.budget_ns.saturating_sub(I);
         true
     }
 }
@@ -322,6 +346,16 @@ const TX_RESERVE: usize = NET_BUFFERS / 2;
 pub const RP_ANSWER_SHARE: usize = 8;
 const _: () = assert!(0 < RP_ANSWER_SHARE && RP_ANSWER_SHARE < NET_BUFFERS - TX_RESERVE, "RP_ANSWER_SHARE out of range");
 
+/// Of the buffers above the reserve, the share `tls`'s segments (M6 plan
+/// C2) leave to everything else: HTTPS takes a TX buffer only where an
+/// unsolicited reply could too, so `hs`, `data` and Rosenpass keep theirs
+/// whatever a flood at 443 makes `tls` send.
+pub const TLS_TX_SHARE: usize = 16;
+const _: () = assert!(
+    TLS_TX_SHARE >= RP_ANSWER_SHARE && TLS_TX_SHARE < NET_BUFFERS - TX_RESERVE,
+    "TLS_TX_SHARE below the Unsolicited tier or out of range"
+);
+
 /// Who may take a TX buffer (M3b plan, "TX tiers").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxTier {
@@ -329,14 +363,18 @@ pub enum TxTier {
     Answer,
     /// Cookie replies (WireGuard and Rosenpass) and ARP replies.
     Unsolicited,
+    /// `tls`'s TCP segments (M6 plan C2).
+    Tls,
 }
 
 /// Whether a reply of `tier` may take a TX buffer with `tx_free` free: an
-/// unsolicited one is never allowed where an answer would be refused (I8).
+/// unsolicited one is never allowed where an answer would be refused (I8),
+/// nor a `tls` segment where an unsolicited reply would be.
 pub fn rp_tx_allowed(tier: TxTier, tx_free: usize) -> bool {
     match tier {
         TxTier::Answer => tx_free > TX_RESERVE,
         TxTier::Unsolicited => tx_free > TX_RESERVE + RP_ANSWER_SHARE,
+        TxTier::Tls => tx_free > TX_RESERVE + TLS_TX_SHARE,
     }
 }
 
@@ -609,6 +647,123 @@ impl Gate {
     pub fn take_expired(&mut self) -> bool {
         self.life.take_expired()
     }
+}
+
+// ---- TCP to the HTTPS endpoint (M6 plan C2) ----
+
+// SYNs: a listener holds a slot for each until its 5 s timeout (smoltcp
+// has no SYN cookies, RM6-7), and each completed handshake costs `tls` and
+// `key` a signature, so new connections are metered per source and
+// globally. A source's burst of 4 at one per 250 ms covers a browser's
+// parallel connections; globally 16 at one per 50 ms (20 per second), the
+// forwarded handshake rate that `key`'s TLS sign bucket is sized against
+// (M6 plan C5).
+pub const SYN_SRC_BURST: u64 = 4;
+pub const SYN_SRC_INTERVAL_NS: u64 = 250_000_000;
+pub const SYN_GLOBAL_BURST: u64 = 16;
+pub const SYN_GLOBAL_INTERVAL_NS: u64 = 50_000_000;
+// Every other segment to the port, globally: a burst of one `itl` ring
+// and 10 000 segments per second, about 14.6 MB/s of 1460-byte segments
+// into `tls` (recorded per F-N11). Spoofed segments spend it too, stalling
+// HTTPS but nothing else (RM6-7).
+pub const TCP_DATA_BURST: u64 = NET_BUFFERS as u64;
+pub const TCP_DATA_INTERVAL_NS: u64 = 100_000;
+
+// A single source can never be allowed more than all sources together.
+const _: () = assert!(SYN_SRC_INTERVAL_NS >= SYN_GLOBAL_INTERVAL_NS, "SYN source rate above global");
+const _: () = assert!(SYN_SRC_BURST <= SYN_GLOBAL_BURST, "SYN source burst above global");
+
+/// `ingress`'s TCP state: SYNs pass a per-source and a global bucket,
+/// every other segment a global data bucket of its own (M6 plan C2, F11).
+#[derive(Debug, Clone, Default)]
+pub struct TcpGate<const N: usize> {
+    syn_sources: Buckets<N, SYN_SRC_BURST, SYN_SRC_INTERVAL_NS>,
+    syn_global: Meter<SYN_GLOBAL_BURST, SYN_GLOBAL_INTERVAL_NS>,
+    data: Meter<TCP_DATA_BURST, TCP_DATA_INTERVAL_NS>,
+}
+
+impl<const N: usize> TcpGate<N> {
+    /// A frame `parse_frame` refused as NotUdp. Only a TCP segment to our
+    /// MAC, address and HTTPS port, from neither our address nor our MAC,
+    /// and within its buckets goes to `tls`; any other TCP has no service
+    /// and any other protocol stays NotUdp.
+    fn admit<'a>(&mut self, cfg: &Config, now_ns: u64, frame: &'a [u8]) -> Outcome<'a> {
+        let f = match wire::parse_frame_ip(frame) {
+            Ok(f) => f,
+            Err(r) => return Outcome::Dropped(r),
+        };
+        let p = match f.body {
+            Body::Ipv4(p) if p.proto == IPPROTO_TCP => p,
+            _ => return Outcome::Dropped(DropReason::NotUdp),
+        };
+        let t = match wire::parse_tcp(&p) {
+            Ok(t) => t,
+            Err(r) => return Outcome::Dropped(r),
+        };
+        if f.eth.dst != cfg.mac
+            || p.dst != cfg.ipv4
+            || t.dst_port != cfg.https_port
+            || p.src == cfg.ipv4
+            || f.eth.src == cfg.mac
+        {
+            return Outcome::NoService;
+        }
+        // The global bucket is spent only when the source's allowed.
+        if t.is_syn_request() {
+            if !self.syn_sources.allow(p.src, now_ns) {
+                return Outcome::TcpLimited(TcpLimit::SynSource);
+            }
+            if !self.syn_global.allow(now_ns) {
+                return Outcome::TcpLimited(TcpLimit::SynGlobal);
+            }
+        } else if !self.data.allow(now_ns) {
+            return Outcome::TcpLimited(TcpLimit::Data);
+        }
+        Outcome::Tls { packet: p.packet }
+    }
+}
+
+/// Why `tls_egress` refused a packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EgressRefusal {
+    /// Malformed, or not TCP from our HTTPS port to a remote unicast
+    /// address (`DropReason::TcpEgressRefused`).
+    Dropped(DropReason),
+    /// No TX buffer above `tls`'s tier.
+    TxReserve,
+}
+
+/// Not unspecified, broadcast, multicast, loopback or reserved (240/4).
+fn remote_unicast(a: Ipv4) -> bool {
+    a != [0; 4] && a != [255; 4] && a[0] & 0xf0 != 0xe0 && a[0] & 0xf0 != 0xf0 && a[0] != 127
+}
+
+/// The one gate for what `tls` sends out (M6 plan C2, F2, S2, S3): a
+/// packet from `tli` leaves only as a valid IPv4/TCP datagram of at most
+/// 1500 bytes, both checksums right, from our address and HTTPS port to a
+/// remote unicast address, never a SYN without ACK (`tls` opens no
+/// connections), framed to the router (no ARP cache), and only while more
+/// than `TX_RESERVE + TLS_TX_SHARE` TX buffers are free.
+pub fn tls_egress<'a>(cfg: &Config, packet: &'a [u8], tx_free: usize) -> Result<Frame<'a>, EgressRefusal> {
+    let refused = EgressRefusal::Dropped(DropReason::TcpEgressRefused);
+    if packet.len() > wire::MAX_FRAME - wire::ETH_HDR {
+        return Err(EgressRefusal::Dropped(DropReason::TooLong));
+    }
+    let p = wire::parse_ipv4_packet(packet).map_err(EgressRefusal::Dropped)?;
+    if p.proto != IPPROTO_TCP {
+        return Err(refused);
+    }
+    let t = wire::parse_tcp(&p).map_err(EgressRefusal::Dropped)?;
+    if p.src != cfg.ipv4 || t.src_port != cfg.https_port || p.dst == cfg.ipv4 || !remote_unicast(p.dst) {
+        return Err(refused);
+    }
+    if t.is_syn_request() {
+        return Err(refused);
+    }
+    if !rp_tx_allowed(TxTier::Tls, tx_free) {
+        return Err(EgressRefusal::TxReserve);
+    }
+    Ok(Frame { eth: EthAddrs { src: cfg.mac, dst: cfg.router_mac }, body: Body::Ipv4(p) })
 }
 
 // ---- Rosenpass (M3 plan C4) ----
@@ -1448,6 +1603,8 @@ pub trait PassIo {
     /// Rosenpass replies from `pq`.
     fn serve_pq(&mut self, max: usize) -> usize;
     fn serve_data(&mut self, max: usize) -> usize;
+    /// TCP segments from `tls`, through `tls_egress`.
+    fn serve_tls(&mut self, max: usize) -> usize;
     fn tick(&mut self);
     fn serve_outside(&mut self, max: usize) -> usize;
     /// Notifies every peer this pass gave work to and flushes audit.
@@ -1462,9 +1619,10 @@ impl<T: PassIo> ring::pass::Pass for Order<'_, T> {
         let n_hs = self.0.serve_hs(PASS_FRAMES);
         let n_pq = self.0.serve_pq(PASS_FRAMES);
         let n_data = self.0.serve_data(PASS_FRAMES);
+        let n_tls = self.0.serve_tls(PASS_FRAMES);
         self.0.tick();
         let n_outside = self.0.serve_outside(PASS_FRAMES);
-        ring::pass::any_full(&[n_hs, n_pq, n_data, n_outside], PASS_FRAMES)
+        ring::pass::any_full(&[n_hs, n_pq, n_data, n_tls, n_outside], PASS_FRAMES)
     }
 
     fn end_pass(&mut self) {
@@ -1472,8 +1630,8 @@ impl<T: PassIo> ring::pass::Pass for Order<'_, T> {
     }
 }
 
-/// The handler loop (plan, "Handler loop"): every pass serves all four
-/// inputs, at most PASS_FRAMES each, runs the tick between `serve_data` and
+/// The handler loop (plan, "Handler loop"): every pass serves all five
+/// inputs, at most PASS_FRAMES each, runs the tick between `serve_tls` and
 /// `serve_outside`, and ends with `end_pass`, so a flood on any input starves
 /// neither the others, nor the tick, nor the peers waiting to be notified.
 pub fn run_passes(io: &mut impl PassIo) {

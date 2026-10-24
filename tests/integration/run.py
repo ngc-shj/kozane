@@ -39,7 +39,10 @@ removed after the boot. The boots:
      TPM's envelopes leave both key PDs Unavailable with the codes the Rust
      tables give; after a sealed boot PCR 8 is capped;
   9. the A7 proxy between QEMU and swtpm: the unmodified relay passes a
-     sealed boot, a flipped Unseal response is refused.
+     sealed boot, a flipped Unseal response is refused;
+ 10. https (M6 plan C3): the outside NIC on the tap; a TCP client in the
+     netns connects to the HTTPS port and gets its bytes echoed by `tls`
+     (until the TLS server replaces the echo).
 
 Since M3 (L8) hs refuses every WireGuard initiation without a fresh
 Rosenpass PSK, so each WireGuard peer first runs upstream rosenpass (the VE9
@@ -140,6 +143,28 @@ def udp_frame(payload=b"abcd") -> bytearray:
     return bytearray(ipv4_udp(PEER_IP, GW_IP, 40000, WG_PORT, payload))
 
 
+TCP_FIN, TCP_SYN, TCP_RST, TCP_ACK = 0x01, 0x02, 0x04, 0x10
+
+
+def ipv4_tcp(flags: int, options=b"", payload=b"", sport=40000, dport=443) -> bytearray:
+    """An IPv4/TCP datagram from PEER_IP to GW_IP, both checksums right."""
+    seg = struct.pack("!HHIIBBHHH", sport, dport, 1, 0, (20 + len(options)) // 4 << 4, flags, 65535, 0, 0)
+    seg += options + payload
+    c = csum(PEER_IP + GW_IP + struct.pack("!BBH", 0, 6, len(seg)) + seg)
+    seg = seg[:16] + struct.pack("!H", c) + seg[18:]
+    return bytearray(ip_hdr(PEER_IP, GW_IP, 6, len(seg)) + seg)
+
+
+def fix_tcp_csum(p: bytearray) -> bytearray:
+    p[36:38] = b"\0\0"
+    p[36:38] = struct.pack("!H", csum(bytes(p[12:20]) + struct.pack("!BBH", 0, 6, len(p) - 20) + bytes(p[20:])))
+    return p
+
+
+def tcp_frame(p: bytearray) -> bytes:
+    return eth(GW_MAC, PEER_MAC, 0x0800, bytes(p))
+
+
 def frame_for(reason: str) -> bytes:
     """One frame per wire::DropReason (mirrors crates/wire tests::frame_for)."""
     f = udp_frame()
@@ -171,12 +196,32 @@ def frame_for(reason: str) -> bytes:
         f[14 + 12] = 224
         fix_ip_csum(f)
     elif reason == "NotUdp":
-        f[14 + 9] = 6
+        # GRE: a protocol nothing serves (TCP has reasons of its own).
+        f[14 + 9] = 47
         fix_ip_csum(f)
     elif reason == "UdpBadLength":
         f[14 + 20 + 5] -= 1
     elif reason == "UdpBadChecksum":
         f[-1] ^= 1
+    elif reason == "TcpBadLength":
+        p = bytearray(ip_hdr(PEER_IP, GW_IP, 6, 19) + bytes(19))
+        return tcp_frame(p)
+    elif reason == "TcpBadOffset":
+        p = ipv4_tcp(TCP_SYN)
+        p[20 + 12] = 4 << 4
+        return tcp_frame(fix_tcp_csum(p))
+    elif reason == "TcpBadChecksum":
+        p = ipv4_tcp(TCP_SYN)
+        p[20 + 16] ^= 1
+        return tcp_frame(p)
+    elif reason == "TcpBadPort":
+        p = ipv4_tcp(TCP_SYN)
+        p[20:22] = b"\0\0"
+        return tcp_frame(fix_tcp_csum(p))
+    elif reason == "TcpBadFlags":
+        return tcp_frame(ipv4_tcp(TCP_SYN | TCP_FIN))
+    elif reason == "TcpBadOptions":
+        return tcp_frame(ipv4_tcp(TCP_SYN, options=bytes([2, 1, 0, 0])))
     else:
         raise Fail(f"no frame for {reason}")
     return bytes(f)
@@ -187,9 +232,13 @@ DROP_REASONS = [
     "TooShort", "TooLong", "EthBadSrc", "UnknownEtherType", "ArpMalformed",
     "ArpBadSender", "Ipv4Version", "Ipv4Options", "Ipv4Fragment", "Ipv4BadLength",
     "Ipv4BadChecksum", "Ipv4BadSrc", "NotUdp", "UdpBadLength", "UdpBadChecksum",
+    "TcpBadLength", "TcpBadOffset", "TcpBadChecksum", "TcpBadPort", "TcpBadFlags", "TcpBadOptions",
 ]
 # Produced by forwarding (wire::forward_ipv4), not by any outside frame.
 FORWARD_ONLY = ["TtlExpired"]
+# Produced by ingress_core::tls_egress on what `tls` sends, not by any
+# outside frame.
+EGRESS_ONLY = ["TcpEgressRefused"]
 
 
 def check_reason_list_matches_rust():
@@ -197,7 +246,8 @@ def check_reason_list_matches_rust():
     block = src[src.index("pub enum DropReason {"):]
     block = block[: block.index("}")]
     rust = re.findall(r"^\s+(\w+) = \d+,", block, re.M)
-    if rust != DROP_REASONS + FORWARD_ONLY:
+    mirror = DROP_REASONS + FORWARD_ONLY + EGRESS_ONLY
+    if sorted(rust) != sorted(mirror) or len(set(mirror)) != len(mirror):
         raise Fail(f"DROP_REASONS out of sync with wire: {rust}")
     # The enum and DropReason::ALL are two lists since M4 (C5) took away the
     # macro that declared both; a variant missing from ALL is invisible to
@@ -214,7 +264,7 @@ def check_reason_list_matches_rust():
 
 # QEMU's serial console ends lines with "\r\r\n". `audit` prints these for
 # each PD's `Ready` record, and its own.
-READY_LINE = re.compile(r"(eth_out|eth_in|ingress|inner|data|hs|audit|pq): ready\r*\n")
+READY_LINE = re.compile(r"(eth_out|eth_in|ingress|inner|data|hs|audit|pq|tls): ready\r*\n")
 
 
 def start_without_stop_signals(thread: threading.Thread):
@@ -3614,6 +3664,66 @@ def test_cookie_b(pkg: "Package", deploy: str, passed: list):
             raise
 
 
+# ---------------------------------------------------------------- https (M6)
+
+
+HTTPS_PORT = 443
+HTTPS_ECHO_BYTES = 4096         # several segments each way
+HTTPS_WAIT_S = 10.0             # connect, echo and FIN, each
+
+
+def https_echo_case(con: Console):
+    """M6 plan C3 (slice 1): a client in the netns, on the tap's address,
+    connects to the HTTPS port, gets its bytes back byte for byte, and its
+    FIN is answered by the server's (the echo closes after it)."""
+    payload = bytes(range(256)) * (HTTPS_ECHO_BYTES // 256)
+    try:
+        s = socket.create_connection((ip_str(GW_IP), HTTPS_PORT), timeout=HTTPS_WAIT_S)
+    except OSError as e:
+        raise Fail(f"https echo: no TCP connection to port {HTTPS_PORT}: {e}") from e
+    with s:
+        s.sendall(payload)
+        got = b""
+        while len(got) < len(payload):
+            chunk = s.recv(65536)
+            if not chunk:
+                raise Fail(f"https echo: closed after {len(got)} of {len(payload)} bytes")
+            got += chunk
+        if got != payload:
+            raise Fail("https echo: the bytes came back changed")
+        s.shutdown(socket.SHUT_WR)
+        if s.recv(1) != b"":
+            raise Fail("https echo: data after the client's FIN instead of the server's FIN")
+    if con.count(r"audit: src=tls unknown code"):
+        raise Fail("https echo: tls raised an audit code audit cannot name")
+
+
+def test_https(pkg: "Package", passed: list):
+    """Boot "https" (M6 plan C3): `tls`'s TCP on the outside tap."""
+    tap = Tap()
+    inside = Wire()
+    try:
+        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"))
+    except BaseException:
+        tap.close()
+        raise
+    try:
+        wait_tap_ready(tap, con)
+        con.wait_for(r"tls: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        https_echo_case(con)
+        passed.append("https tcp echo")
+        print("\nPASS [https tcp echo: connect to the HTTPS port, bytes echoed, FIN answered]")
+    finally:
+        try:
+            with signals_held():
+                kill(child)
+                tap.close()
+        except SystemExit:
+            kill(child)
+            tap.close()
+            raise
+
+
 # ---------------------------------------------------------------- driver
 
 
@@ -3652,7 +3762,7 @@ def check_oracle_not_in_image(loader: str):
 def preflight():
     check_rosenpass_oracle()
     missing = [t for t in ("unshare", "setpriv", "wireguard-go", "wg", "ip", "ping", "qemu-system-aarch64", "swtpm",
-                           "tpm2_createprimary", "tpm2_readpublic")
+                           "tpm2_createprimary", "tpm2_readpublic", "openssl", "curl")
                if not shutil.which(t)]
     if not os.path.isfile(UBOOT):
         raise Fail(f"{UBOOT} is missing; `make uboot` builds it")
@@ -3660,6 +3770,13 @@ def preflight():
         raise Fail(f"missing tools: {missing}")
     if not os.path.exists("/dev/net/tun"):
         raise Fail("/dev/net/tun not available")
+    # M6 (T21): the HTTPS cases' clients must speak X25519MLKEM768.
+    groups = subprocess.run(["openssl", "list", "-tls-groups"], capture_output=True, text=True)
+    if groups.returncode != 0 or "X25519MLKEM768" not in groups.stdout.split(":"):
+        raise Fail(f"openssl has no X25519MLKEM768 group: {groups.stdout.strip()} {groups.stderr.strip()}")
+    curl = subprocess.run(["curl", "--version"], capture_output=True, text=True)
+    if curl.returncode != 0 or not re.search(r"\bOpenSSL/3\.([5-9]|\d{2,})\.", curl.stdout):
+        raise Fail(f"curl does not link OpenSSL 3.5 or later: {curl.stdout.splitlines()[:1]}")
     import cryptography  # noqa: F401  (fail, never skip)
     # The seccomp profile allows exactly CLONE_NEWUSER|CLONE_NEWNET (M2 review T14).
     if subprocess.run(["unshare", "-rn", "true"], capture_output=True).returncode != 0:
@@ -3812,6 +3929,7 @@ def check_harness_matches_config(deploy: str):
         "gateway.outside_router_mac": (g["outside_router_mac"], mac(PEER_MAC)),
         "gateway.listen_port": (g["listen_port"], WG_PORT),
         "gateway.rp_port": (g["rp_port"], RP_PORT),
+        "gateway.https_port": (g["https_port"], HTTPS_PORT),
         "gateway.inside_ip": (g["inside_ip"], ip(INSIDE_IP)),
         "gateway.inside_mac": (g["inside_mac"], mac(INSIDE_MAC)),
         "neighbors[0].ip": (cfg["neighbors"][0]["ip"], ip(HOST_IP)),
@@ -3858,7 +3976,8 @@ def in_netns(tmp: str) -> int:
              ("mismatched blob halts key", single("mismatched blob", lambda: test_mismatched_blob(mismatched))),
              ("measured boot", lambda: test_measured_boot(good.dir, passed)),
              ("sealed boot", lambda: test_sealed(good, foreign, passed)),
-             ("tpm proxy", lambda: test_tpm_proxy(good, passed))]
+             ("tpm proxy", lambda: test_tpm_proxy(good, passed)),
+             ("https", lambda: test_https(good, passed))]
     # check-selftest's red-proofs need only the boot their injection breaks:
     # SECUREOS_IT_BOOTS names those (comma-separated). A filtered run never
     # prints INTEGRATION-CASES, so it can never pass `make check`'s manifest.

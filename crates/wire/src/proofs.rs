@@ -1,4 +1,5 @@
-//! Kani harnesses for `parse_frame`. Run with `cargo kani -p wire`.
+//! Kani harnesses for `parse_frame` and `parse_tcp`. Run with
+//! `cargo kani -p wire`.
 
 use super::*;
 
@@ -40,6 +41,15 @@ fn parse_is_total_and_all_outcomes_reachable() {
             DropReason::UdpBadChecksum => kani::cover!(true),
             // Produced by `forward_ipv4`, never by the parser.
             DropReason::TtlExpired => {}
+            // `parse_tcp`'s (`parse_tcp_checks_every_accepted_header`) and
+            // `ingress_core::tls_egress`'s, never `parse_frame`'s.
+            DropReason::TcpBadLength
+            | DropReason::TcpBadOffset
+            | DropReason::TcpBadChecksum
+            | DropReason::TcpBadPort
+            | DropReason::TcpBadFlags
+            | DropReason::TcpBadOptions
+            | DropReason::TcpEgressRefused => {}
         }
     }
 }
@@ -124,4 +134,41 @@ fn forward_decrements_ttl_and_keeps_the_datagram_valid() {
             assert!(forward_ipv4(input, &mut out) == Err(DropReason::TtlExpired));
         }
     }
+}
+
+/// `parse_tcp` (M6 plan C2) over any segment of 0..=64 bytes behind any
+/// IPv4 header, from any addresses, of any protocol: no panic; an accepted
+/// header is TCP, its data offset is 5..=15 words and within the segment,
+/// the data is the rest of the segment, both ports are nonzero, SYN never
+/// comes with FIN or RST, and the checksum over the pseudo-header holds.
+#[kani::proof]
+#[kani::unwind(66)]
+fn parse_tcp_checks_every_accepted_header() {
+    let buf: [u8; IPV4_HDR + MAX_LEN] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= MAX_LEN);
+    let packet = buf.get(..IPV4_HDR + len).unwrap_or(&[]);
+    let pkt = Ip4Packet { src: kani::any(), dst: kani::any(), proto: kani::any(), packet };
+    let r = parse_tcp(&pkt);
+    if let Ok(t) = r {
+        let segment = &packet[IPV4_HDR..];
+        let header = usize::from(t.data_offset) * 4;
+        assert!(pkt.proto == IPPROTO_TCP);
+        assert!(t.data_offset >= 5 && t.data_offset <= 15 && header <= segment.len());
+        assert!(t.payload.len() == segment.len() - header);
+        assert!(t.src_port != 0 && t.dst_port != 0);
+        assert!(t.flags & TCP_SYN == 0 || t.flags & (TCP_FIN | TCP_RST) == 0);
+        let pseudo = csum_add(csum_add(0, &pkt.src), &pkt.dst) + u32::from(IPPROTO_TCP) + segment.len() as u32;
+        assert!(csum_fold(csum_add(pseudo, segment)) == 0);
+    }
+    kani::cover!(matches!(r, Ok(t) if !t.payload.is_empty()));
+    kani::cover!(matches!(r, Ok(t) if t.data_offset > 5));
+    kani::cover!(matches!(r, Ok(t) if t.is_syn_request()));
+    kani::cover!(r == Err(DropReason::NotUdp));
+    kani::cover!(r == Err(DropReason::TcpBadLength));
+    kani::cover!(r == Err(DropReason::TcpBadOffset));
+    kani::cover!(r == Err(DropReason::TcpBadChecksum));
+    kani::cover!(r == Err(DropReason::TcpBadPort));
+    kani::cover!(r == Err(DropReason::TcpBadFlags));
+    kani::cover!(r == Err(DropReason::TcpBadOptions));
 }

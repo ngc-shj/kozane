@@ -7,6 +7,7 @@
 public_key = "78wdDVL8XdPitWIiZQ7OBEnnlJfytmjgXqe3dz2gyGA="
 listen_port = 51820
 rp_port = 51819
+https_port = 443
 rp_pub_path = "keys/gateway.rp.pk"
 rp_hash = "21f9f2594f944af3571a8de5748b6dc23f57182326d117764b553155af0d3cbc"
 outside_ip = "10.0.2.15"

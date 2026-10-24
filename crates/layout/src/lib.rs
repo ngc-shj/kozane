@@ -28,6 +28,8 @@ pub const ETH_IN_IRQ: usize = 71;
 /// `data`'s stack_size: its handler state, returned by value from init,
 /// lives there (crates/pds/data asserts it fits).
 pub const DATA_STACK_SIZE: usize = 0x20_000;
+/// `tls`'s stack_size, which its stack probe paints.
+pub const TLS_STACK_SIZE: usize = 0x20_000;
 
 /// sp804 on QEMU virt (coliasgroup patch): 1 MHz input clock, SPI 11.
 pub const TIMER_IRQ: usize = 43;
@@ -52,6 +54,7 @@ pub mod ingress {
     pub const CH_DATA: usize = 4;
     pub const CH_TIMER: usize = 5;
     pub const CH_PQ: usize = 6;
+    pub const CH_TLS: usize = 7;
 }
 
 pub mod audit {
@@ -62,6 +65,7 @@ pub mod audit {
     pub const CH_HS: usize = 5;
     pub const CH_DATA: usize = 6;
     pub const CH_PQ: usize = 7;
+    pub const CH_TLS: usize = 8;
 }
 
 #[cfg(test)]
@@ -73,11 +77,13 @@ pub mod timer {
     pub const CH_HS: usize = 2;
     pub const CH_INGRESS: usize = 3;
     pub const CH_PQ: usize = 4;
+    pub const CH_TLS: usize = 5;
 }
 
 pub mod key {
     pub const CH_HS: usize = 1;
     pub const CH_TPM: usize = 3;
+    pub const CH_TLS: usize = 4;
 }
 
 pub mod hs {
@@ -101,6 +107,7 @@ pub mod inner {
     pub const CH_ETH_IN: usize = 1;
     pub const CH_DATA: usize = 2;
     pub const CH_AUDIT: usize = 3;
+    pub const CH_TLS: usize = 4;
 }
 
 /// M3: the Rosenpass responder (plan C3).
@@ -109,6 +116,16 @@ pub mod pq {
     pub const CH_INGRESS: usize = 2;
     pub const CH_HS: usize = 3;
     pub const CH_TIMER: usize = 4;
+    pub const CH_AUDIT: usize = 5;
+}
+
+/// M6: the HTTPS endpoint (plan C1, C3): TCP and TLS on packets `ingress`
+/// vetted, its backend reached through `inner`, its signatures from `key`.
+pub mod tls {
+    pub const CH_INGRESS: usize = 1;
+    pub const CH_INNER: usize = 2;
+    pub const CH_TIMER: usize = 3;
+    pub const CH_KEY: usize = 4;
     pub const CH_AUDIT: usize = 5;
 }
 

@@ -5,6 +5,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# ECDSA P-256 for the TLS signing oracle (M6 plan C5); already locked
+# through tpm2.
+libcrux-p256 = { version = "=0.0.9", default-features = false }
 secret-blob = { path = "../secret-blob" }
 tpm2 = { path = "../tpm2" }
 wg-core = { path = "../wg-core" }
+
+[dev-dependencies]
+# The RFC 6979 nonce's differential test (M6 plan C5), host only. The 0.6
+# line sits on digest 0.11, apart from the digest 0.10 that mce460896's
+# sha3 locks (check-pins P16).
+rfc6979 = "=0.6.0"
+sha2 = "=0.11.1"

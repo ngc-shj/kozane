@@ -21,6 +21,11 @@ struct Inner {
     to_driver: Tx,
     to_data: Tx,
     from_data: Rx,
+    /// The HTTPS backend links (M6 plan C1): `tls`'s segments to the
+    /// backend and the backend's to `tls`. Mapped, nothing forwarded yet
+    /// (the backend routing is plan C4).
+    _from_tls: Rx,
+    _to_tls: Tx,
     audit: Audit,
     neighbors: [([u8; 4], [u8; 6]); MAX_NEIGHBORS],
     neighbor_count: usize,
@@ -33,7 +38,7 @@ struct Inner {
 fn init() -> Inner {
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout`; receive data regions are read-only here.
-    let (from_driver, to_driver, to_data, from_data, mut audit) = unsafe {
+    let (from_driver, to_driver, to_data, from_data, from_tls, to_tls, mut audit) = unsafe {
         (
             pdkit::rx(
                 memory_region_symbol!(inner_rx_used: *mut u8),
@@ -55,6 +60,16 @@ fn init() -> Inner {
                 memory_region_symbol!(dn_free: *mut u8),
                 memory_region_symbol!(dn_data: *mut u8),
             ),
+            pdkit::rx(
+                memory_region_symbol!(tln_used: *mut u8),
+                memory_region_symbol!(tln_free: *mut u8),
+                memory_region_symbol!(tln_data: *mut u8),
+            ),
+            pdkit::tx(
+                memory_region_symbol!(ntl_used: *mut u8),
+                memory_region_symbol!(ntl_free: *mut u8),
+                memory_region_symbol!(ntl_data: *mut u8),
+            ),
             Audit::new(memory_region_symbol!(audit_inner: *mut u8), Channel::new(ch::CH_AUDIT)),
         )
     };
@@ -68,6 +83,8 @@ fn init() -> Inner {
         to_driver,
         to_data,
         from_data,
+        _from_tls: from_tls,
+        _to_tls: to_tls,
         audit,
         neighbors,
         neighbor_count: config::NEIGHBORS.len(),

@@ -1,7 +1,9 @@
 //! `ingress` v2 (plan C14): the outside NIC's only consumer. Answers ARP,
 //! hands vetted initiations to `hs`, transport messages to `data` and
 //! vetted Rosenpass InitHello/InitConf to `pq` (M3 plan C4), and frames
-//! their replies to the peers' endpoints, which it alone tracks.
+//! their replies to the peers' endpoints, which it alone tracks. TCP to
+//! the HTTPS port goes to `tls` as IP packets, and `tls`'s segments leave
+//! only through `tls_egress` (M6 plan C2).
 //! Under load it answers initiations without a valid mac2 with cookie
 //! replies (plan M2.5 C4), so it holds the cookie secret (in `cookie`); a
 //! compromise yields only that, which weakens DoS protection and nothing
@@ -17,8 +19,9 @@ mod rp_mac;
 use audit_event::Event;
 use cookie::CookieAdapter;
 use ingress_core::{
-    Buckets, Config, Endpoint, Gate, Mac1, Outcome, PassIo, PqSync, RP_COOKIE_REPLY_LEN, RP_RECORD_MAX, RpGate, RpKind,
-    RpMac, RpOutcome, SyncOutcome, TxTier, emit_udp, respond, rp_classify, rp_tx_allowed, run_passes,
+    Buckets, Config, EgressRefusal, Endpoint, Gate, Mac1, Outcome, PassIo, PqSync, RP_COOKIE_REPLY_LEN, RP_RECORD_MAX,
+    RpGate, RpKind, RpMac, RpOutcome, SyncOutcome, TcpGate, TcpLimit, TxTier, emit_udp, respond, rp_classify,
+    rp_tx_allowed, run_passes, tls_egress,
 };
 use layout::ingress as ch;
 use msgs::ToIngress;
@@ -35,6 +38,7 @@ const ETH_OUT: Channel = Channel::new(ch::CH_ETH_OUT);
 const HS: Channel = Channel::new(ch::CH_HS);
 const DATA: Channel = Channel::new(ch::CH_DATA);
 const PQ: Channel = Channel::new(ch::CH_PQ);
+const TLS: Channel = Channel::new(ch::CH_TLS);
 const MAX_PEERS: usize = config::MAX_PEERS;
 // The configuration was validated against this bound at build time; the
 // assertion keeps the PD's tables from silently diverging from it.
@@ -85,7 +89,18 @@ const CONFIG: Config = Config {
     router_mac: config::OUTSIDE_ROUTER_MAC,
     port: config::LISTEN_PORT,
     rp_port: config::RP_PORT,
+    https_port: config::HTTPS_PORT,
 };
+
+/// The audit kind of each TCP bucket refusal.
+fn tcp_limited(l: TcpLimit) -> Event {
+    let kind = match l {
+        TcpLimit::SynSource => audit_event::TCP_LIMIT_SYN_SOURCE,
+        TcpLimit::SynGlobal => audit_event::TCP_LIMIT_SYN_GLOBAL,
+        TcpLimit::Data => audit_event::TCP_LIMIT_DATA,
+    };
+    Event::TcpLimited { kind }
+}
 
 /// mac1 = MAC(HASH(LABEL_MAC1 ‖ S_pub), msg[..116]).
 struct GatewayMac1 {
@@ -117,9 +132,12 @@ struct Ingress {
     from_data: Rx,
     to_pq: Tx,
     from_pq: Rx,
+    to_tls: Tx,
+    from_tls: Rx,
     audit: Audit,
     mac1: GatewayMac1,
     buckets: Buckets<BUCKETS>,
+    tcp: TcpGate<BUCKETS>,
     gate: Gate,
     rp_mac: RpMacKey,
     rp: RpGate<BUCKETS>,
@@ -156,7 +174,7 @@ mod halt {
 fn init() -> Ingress {
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout`; receive data regions are read-only here.
-    let (from_driver, to_driver, to_hs, from_hs, to_data, from_data, to_pq, from_pq, mut audit) = unsafe {
+    let (from_driver, to_driver, to_hs, from_hs, to_data, from_data, to_pq, from_pq, to_tls, from_tls, mut audit) = unsafe {
         (
             pdkit::rx(
                 memory_region_symbol!(net_rx_used: *mut u8),
@@ -198,6 +216,16 @@ fn init() -> Ingress {
                 memory_region_symbol!(pqi_free: *mut u8),
                 memory_region_symbol!(pqi_data: *mut u8),
             ),
+            pdkit::tx(
+                memory_region_symbol!(itl_used: *mut u8),
+                memory_region_symbol!(itl_free: *mut u8),
+                memory_region_symbol!(itl_data: *mut u8),
+            ),
+            pdkit::rx(
+                memory_region_symbol!(tli_used: *mut u8),
+                memory_region_symbol!(tli_free: *mut u8),
+                memory_region_symbol!(tli_data: *mut u8),
+            ),
             Audit::new(memory_region_symbol!(audit_ingress: *mut u8), Channel::new(ch::CH_AUDIT)),
         )
     };
@@ -231,9 +259,12 @@ fn init() -> Ingress {
         from_data,
         to_pq,
         from_pq,
+        to_tls,
+        from_tls,
         audit,
         mac1: GatewayMac1 { key },
         buckets: Buckets::default(),
+        tcp: TcpGate::default(),
         gate,
         rp_mac,
         rp,
@@ -256,6 +287,7 @@ struct Wake {
     hs: bool,
     data: bool,
     pq: bool,
+    tls: bool,
 }
 
 impl Wake {
@@ -271,6 +303,9 @@ impl Wake {
         }
         if self.pq {
             PQ.notify();
+        }
+        if self.tls {
+            TLS.notify();
         }
     }
 }
@@ -378,6 +413,7 @@ impl Ingress {
             &mut self.cookies,
             &self.mac1,
             &mut self.buckets,
+            &mut self.tcp,
             now,
             backlog,
             tx_free,
@@ -511,6 +547,15 @@ impl Ingress {
                 self.audit.record(Event::WgRateLimited);
                 None
             }
+            // The IP packet, not the frame (M6 plan C2).
+            Outcome::Tls { packet } => {
+                wake.tls |= pdkit::send(&mut self.to_tls, &mut self.scratch, packet, &mut self.audit);
+                None
+            }
+            Outcome::TcpLimited(l) => {
+                self.audit.record(tcp_limited(l));
+                None
+            }
         };
         let (Some(target), Some(len)) = (target, msg_len) else { return true };
         let msg = self.msg.get(..len).unwrap_or(&[]);
@@ -560,6 +605,31 @@ impl Ingress {
         };
         let (dst, payload) = (Endpoint { ip: r.dst.ip, port: r.dst.port }, *r.msg);
         self.send_to_peer(CONFIG.port, dst, &payload, wake);
+        true
+    }
+
+    fn drain_tls(&mut self, wake: &mut Wake, max: usize) -> usize {
+        drain(max, || self.tls_one(wake))
+    }
+
+    /// Takes one segment from `tls` and frames it through `tls_egress`, the
+    /// only way out for `tls`; `false` when the input is empty.
+    fn tls_one(&mut self, wake: &mut Wake) -> bool {
+        let Some(n) = pdkit::recv(&mut self.from_tls, &mut self.msg, &mut self.audit) else { return false };
+        wake.tls = true;
+        let (_, tx_free) = self.levels();
+        let packet = self.msg.get(..n).unwrap_or(&[]);
+        match tls_egress(&CONFIG, packet, tx_free) {
+            Ok(frame) => match wire::emit(&frame, &mut self.reply) {
+                Ok(len) => {
+                    let f = self.reply.get(..len).unwrap_or(&[]);
+                    wake.driver |= pdkit::send(&mut self.to_driver, &mut self.scratch, f, &mut self.audit);
+                }
+                Err(_) => self.audit.record(Event::TxNoBuffer),
+            },
+            Err(EgressRefusal::Dropped(reason)) => self.audit.record(Event::FrameDropped { reason: reason as u16 }),
+            Err(EgressRefusal::TxReserve) => self.audit.record(Event::TxNoBuffer),
+        }
         true
     }
 
@@ -626,6 +696,10 @@ impl PassIo for Pass<'_> {
 
     fn serve_data(&mut self, max: usize) -> usize {
         self.ingress.drain_data(&mut self.wake, max)
+    }
+
+    fn serve_tls(&mut self, max: usize) -> usize {
+        self.ingress.drain_tls(&mut self.wake, max)
     }
 
     fn tick(&mut self) {

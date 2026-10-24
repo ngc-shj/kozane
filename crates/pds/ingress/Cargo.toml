@@ -17,3 +17,4 @@ rosenpass-core = { path = "../../rosenpass-core" }
 rosenpass-wire = { path = "../../rosenpass-wire" }
 sel4-microkit.workspace = true
 wg-core = { path = "../../wg-core" }
+wire = { path = "../../wire" }

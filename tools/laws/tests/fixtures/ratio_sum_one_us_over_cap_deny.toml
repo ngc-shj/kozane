@@ -1,0 +1,87 @@
+[pds.driver_a]
+role = "driver"
+
+[pds.driver_b]
+role = "driver"
+
+[pds.driver_c]
+role = "driver"
+
+[pds.driver_d]
+role = "driver"
+
+[pds.driver_e]
+role = "driver"
+
+[pds.driver_f]
+role = "driver"
+
+[pds.driver_g]
+role = "driver"
+
+[pds.driver_h]
+role = "driver"
+
+[pds.driver_i]
+role = "driver"
+
+[mrs.device_mr_a]
+kind = "device"
+owner = "driver_a"
+phys_addr = 0x9000000
+size = 0x1000
+
+[mrs.device_mr_b]
+kind = "device"
+owner = "driver_b"
+phys_addr = 0x9002000
+size = 0x1000
+
+[mrs.device_mr_c]
+kind = "device"
+owner = "driver_c"
+phys_addr = 0x9004000
+size = 0x1000
+
+[mrs.device_mr_d]
+kind = "device"
+owner = "driver_d"
+phys_addr = 0x9006000
+size = 0x1000
+
+[mrs.device_mr_e]
+kind = "device"
+owner = "driver_e"
+phys_addr = 0x9008000
+size = 0x1000
+
+[mrs.device_mr_f]
+kind = "device"
+owner = "driver_f"
+phys_addr = 0x900a000
+size = 0x1000
+
+[mrs.device_mr_g]
+kind = "device"
+owner = "driver_g"
+phys_addr = 0x900c000
+size = 0x1000
+
+[mrs.device_mr_h]
+kind = "device"
+owner = "driver_h"
+phys_addr = 0x900e000
+size = 0x1000
+
+[mrs.device_mr_i]
+kind = "device"
+owner = "driver_i"
+phys_addr = 0x9010000
+size = 0x1000
+
+[budgets]
+ratio_cap = 0.25
+ratio_sum_cap = 0.95
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

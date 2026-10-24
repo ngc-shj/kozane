@@ -31,10 +31,12 @@ fn mr_sizes() -> HashMap<String, usize> {
 }
 
 /// Every link (pdkit / ring::link): used ring, free ring, data region.
-const LINKS: [&str; 14] =
-    ["net_rx", "net_tx", "inner_rx", "inner_tx", "ih", "hi", "hd", "id", "di", "dn", "nd", "ipq", "pqi", "pqh"];
-const AUDITS: [&str; 7] =
-    ["audit_ingress", "audit_eth_out", "audit_eth_in", "audit_inner", "audit_hs", "audit_data", "audit_pq"];
+const LINKS: [&str; 18] = [
+    "net_rx", "net_tx", "inner_rx", "inner_tx", "ih", "hi", "hd", "id", "di", "dn", "nd", "ipq", "pqi", "pqh", "itl", "tli",
+    "tln", "ntl",
+];
+const AUDITS: [&str; 8] =
+    ["audit_ingress", "audit_eth_out", "audit_eth_in", "audit_inner", "audit_hs", "audit_data", "audit_pq", "audit_tls"];
 
 #[test]
 fn link_data_regions_match_net_region_size() {
@@ -193,6 +195,11 @@ fn channel_ids_match_layout() {
         (("pq", pq::CH_AUDIT), ("audit", audit::CH_PQ)),
         (("key", key::CH_TPM), ("tpm", tpm::CH_KEY)),
         (("pqkey", pqkey::CH_TPM), ("tpm", tpm::CH_PQKEY)),
+        (("ingress", ingress::CH_TLS), ("tls", tls::CH_INGRESS)),
+        (("tls", tls::CH_INNER), ("inner", inner::CH_TLS)),
+        (("timer", timer::CH_TLS), ("tls", tls::CH_TIMER)),
+        (("tls", tls::CH_KEY), ("key", key::CH_TLS)),
+        (("tls", tls::CH_AUDIT), ("audit", audit::CH_TLS)),
     ];
     for (a, b) in expected {
         assert!(has_channel(a, b), "{a:?} <-> {b:?}");
@@ -222,13 +229,82 @@ fn irqs_match_layout() {
     assert_eq!(irqs_of("timer"), [(TIMER_IRQ, timer::CH_DEVICE)]);
 }
 
-#[test]
-fn data_stack_size_matches_layout() {
+fn pd_attribute(name: &str, attribute: &str) -> Option<String> {
     let text = system_text();
     let doc = roxmltree::Document::parse(&text).expect("parse .system");
     let pd = doc
         .descendants()
-        .find(|n| n.has_tag_name("protection_domain") && n.attribute("name") == Some("data"))
-        .expect("data pd");
-    assert_eq!(parse_num(pd.attribute("stack_size").expect("stack_size")), DATA_STACK_SIZE);
+        .find(|n| n.has_tag_name("protection_domain") && n.attribute("name") == Some(name))
+        .expect("pd");
+    pd.attribute(attribute).map(String::from)
+}
+
+#[test]
+fn data_stack_size_matches_layout() {
+    assert_eq!(parse_num(&pd_attribute("data", "stack_size").expect("stack_size")), DATA_STACK_SIZE);
+}
+
+#[test]
+fn tls_stack_size_matches_layout() {
+    assert_eq!(parse_num(&pd_attribute("tls", "stack_size").expect("stack_size")), TLS_STACK_SIZE);
+}
+
+/// What one `<map>` of `pd` says: (vaddr, perms).
+fn map_of(pd: &str, mr: &str) -> Option<(usize, String)> {
+    let text = system_text();
+    let doc = roxmltree::Document::parse(&text).expect("parse .system");
+    let pd = doc
+        .descendants()
+        .find(|n| n.has_tag_name("protection_domain") && n.attribute("name") == Some(pd))
+        .expect("pd");
+    pd.children().find(|m| m.has_tag_name("map") && m.attribute("mr") == Some(mr)).map(|m| {
+        (parse_num(m.attribute("vaddr").expect("vaddr")), String::from(m.attribute("perms").expect("perms")))
+    })
+}
+
+/// The M6 links (plan C1): each consumer maps the data region read-only,
+/// each producer read-write, and both ends map the used and free rings.
+#[test]
+fn tls_links_are_mapped_by_their_two_ends_only() {
+    for (link, producer, consumer) in
+        [("itl", "ingress", "tls"), ("tli", "tls", "ingress"), ("tln", "tls", "inner"), ("ntl", "inner", "tls")]
+    {
+        assert_eq!(map_of(producer, &std::format!("{link}_data")).map(|m| m.1).as_deref(), Some("rw"), "{link}");
+        assert_eq!(map_of(consumer, &std::format!("{link}_data")).map(|m| m.1).as_deref(), Some("r"), "{link}");
+        for side in ["used", "free"] {
+            for pd in [producer, consumer] {
+                assert!(map_of(pd, &std::format!("{link}_{side}")).is_some(), "{pd} {link}_{side}");
+            }
+        }
+        for pd in ["eth_out", "eth_in", "timer", "tpm", "key", "pqkey", "hs", "pq", "data", "audit"] {
+            assert!(map_of(pd, &std::format!("{link}_data")).is_none(), "{pd} maps {link}_data");
+        }
+    }
+}
+
+/// M6 plan C1: `tls` is an ordinary scheduled PD with its own budget, and
+/// a caller of `key` exactly as `hs` is.
+#[test]
+fn tls_schedule_and_key_channel_match_the_plan() {
+    let attr = |a| pd_attribute("tls", a).expect(a);
+    assert_eq!((parse_num(&attr("priority")), parse_num(&attr("budget")), parse_num(&attr("period"))), (100, 500, 10_000));
+    assert_eq!(pd_attribute("tls", "passive"), None);
+    let text = system_text();
+    let doc = roxmltree::Document::parse(&text).expect("parse .system");
+    let ends = |c: roxmltree::Node| -> std::vec::Vec<(String, Option<String>, Option<String>)> {
+        c.children()
+            .filter(|e| e.has_tag_name("end"))
+            .map(|e| (e.attribute("pd").expect("pd").into(), e.attribute("pp").map(String::from), e.attribute("notify").map(String::from)))
+            .collect()
+    };
+    let channel = |a: &str, b: &str| {
+        doc.descendants()
+            .filter(|n| n.has_tag_name("channel"))
+            .map(ends)
+            .find(|e| e.len() == 2 && e[0].0 == a && e[1].0 == b)
+            .expect("channel")
+    };
+    let hs = channel("hs", "key");
+    let tls = channel("tls", "key");
+    assert_eq!((&tls[0].1, &tls[0].2, &tls[1].1), (&hs[0].1, &hs[0].2, &hs[1].1));
 }

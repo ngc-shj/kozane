@@ -5,7 +5,9 @@
 //! `proofs`, and unbounded by Verus, M4 plan C5). It accepts only the narrow
 //! subset `ingress` needs: no VLANs, no IPv4 options, no fragments.
 //! `parse_frame_ip` is the inside-NIC variant: same rules, but any IPv4
-//! protocol, kept verbatim for forwarding.
+//! protocol, kept verbatim for forwarding. `parse_tcp` reads the TCP
+//! header of a datagram either one accepted (M6 plan C2); it is outside
+//! the Verus proofs, proved by Kani only (SC35).
 //!
 //! Verus proves (M4 plan C5): each entry point accepts exactly the frames
 //! described above; `parse(emit(f))` is semantically `f` (not byte
@@ -124,6 +126,22 @@ pub enum DropReason {
     UdpBadChecksum = 15,
     // Forwarding only: TTL would reach zero (never from the parsers).
     TtlExpired = 16,
+    // `parse_tcp` (M6 plan C2), on a datagram `parse_frame_ip` accepted.
+    /// Shorter than a TCP header, or longer than a frame can carry.
+    TcpBadLength = 17,
+    /// Data offset below 5 words or past the segment's end.
+    TcpBadOffset = 18,
+    TcpBadChecksum = 19,
+    /// Source or destination port 0.
+    TcpBadPort = 20,
+    /// SYN with FIN or RST.
+    TcpBadFlags = 21,
+    /// An option whose length is below 2 or runs past the header.
+    TcpBadOptions = 22,
+    // `ingress_core::tls_egress` only: a packet from `tls` that is not TCP
+    // from the HTTPS port to a remote unicast address (never from the
+    // parsers).
+    TcpEgressRefused = 23,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2120,6 +2138,7 @@ pub fn check(bytes: &[u8]) {
     let mut out = [0u8; MAX_FRAME];
     let _ = check_into(bytes, &mut out);
     let _ = check_ip_into(bytes, &mut out);
+    check_tcp(bytes);
 }
 
 /// `check` with a caller-supplied output buffer (the Kani harness uses a
@@ -2175,7 +2194,143 @@ impl DropReason {
         DropReason::UdpBadLength,
         DropReason::UdpBadChecksum,
         DropReason::TtlExpired,
+        DropReason::TcpBadLength,
+        DropReason::TcpBadOffset,
+        DropReason::TcpBadChecksum,
+        DropReason::TcpBadPort,
+        DropReason::TcpBadFlags,
+        DropReason::TcpBadOptions,
+        DropReason::TcpEgressRefused,
     ];
+}
+
+// --- TCP (M6 plan C2): the header of a segment to or from the HTTPS port.
+// Plain Rust outside verus!{}: `parse_frame` and its spec stay as proved,
+// and this parser is Kani-proved (proofs.rs; SC35 defers its Verus proof). ---
+
+pub const IPPROTO_TCP: u8 = 6;
+pub const TCP_HDR: usize = 20;
+/// The longest TCP header: data offset 15 words.
+pub const TCP_HDR_MAX: usize = 60;
+
+pub const TCP_FIN: u8 = 0x01;
+pub const TCP_SYN: u8 = 0x02;
+pub const TCP_RST: u8 = 0x04;
+pub const TCP_PSH: u8 = 0x08;
+pub const TCP_ACK: u8 = 0x10;
+
+/// A TCP header `parse_tcp` accepted, and the segment's data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpHeader<'a> {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub seq: u32,
+    pub ack: u32,
+    /// Header length in 32-bit words, 5..=15.
+    pub data_offset: u8,
+    /// CWR, ECE, URG, ACK, PSH, RST, SYN, FIN (`TCP_*`); NS and the
+    /// reserved bits are not kept.
+    pub flags: u8,
+    pub window: u16,
+    pub payload: &'a [u8],
+}
+
+impl TcpHeader<'_> {
+    /// SYN without ACK: a connection request, the only segment that makes
+    /// a listener allocate state.
+    pub fn is_syn_request(&self) -> bool {
+        self.flags & (TCP_SYN | TCP_ACK) == TCP_SYN
+    }
+}
+
+/// The TCP header of `pkt`, a datagram `parse_ipv4_packet` (or either frame
+/// parser) accepted: no IPv4 options, so the segment starts at byte 20 and
+/// ends at the total length. Refused: another protocol (`NotUdp`, the
+/// reason `ingress` gives every protocol it does not serve), a data offset
+/// outside 5..=15 or past the segment, a checksum that fails over the
+/// pseudo-header of `pkt`'s addresses (RFC 9293 section 3.1), port 0 on
+/// either side, SYN with FIN or with RST, and options whose lengths do not
+/// tile the header. Options are walked by length only; none is interpreted.
+pub fn parse_tcp<'a>(pkt: &Ip4Packet<'a>) -> Result<TcpHeader<'a>, DropReason> {
+    if pkt.proto != IPPROTO_TCP {
+        return Err(DropReason::NotUdp);
+    }
+    let segment = pkt.packet.get(IPV4_HDR..).ok_or(DropReason::TcpBadLength)?;
+    if segment.len() < TCP_HDR || segment.len() > MAX_FRAME - ETH_HDR - IPV4_HDR {
+        return Err(DropReason::TcpBadLength);
+    }
+    let byte = |at: usize| segment.get(at).copied().ok_or(DropReason::TcpBadLength);
+    let word16 = |at: usize| Ok(u16::from_be_bytes([byte(at)?, byte(at.wrapping_add(1))?]));
+    let word32 = |at: usize| Ok(u32::from(word16(at)?) << 16 | u32::from(word16(at.wrapping_add(2))?));
+    let data_offset = byte(12)? >> 4;
+    let header_len = usize::from(data_offset).wrapping_mul(4);
+    if data_offset < 5 || header_len > segment.len() {
+        return Err(DropReason::TcpBadOffset);
+    }
+    // The segment is at most a frame's length, so `csum_add`'s sum stays
+    // within its bound; the length fits the pseudo-header's 16 bits.
+    let pseudo = csum_add(csum_add(0, &pkt.src), &pkt.dst)
+        .wrapping_add(u32::from(IPPROTO_TCP))
+        .wrapping_add(segment.len() as u32);
+    if csum_fold(csum_add(pseudo, segment)) != 0 {
+        return Err(DropReason::TcpBadChecksum);
+    }
+    let src_port = word16(0)?;
+    let dst_port = word16(2)?;
+    if src_port == 0 || dst_port == 0 {
+        return Err(DropReason::TcpBadPort);
+    }
+    let flags = byte(13)?;
+    if flags & TCP_SYN != 0 && flags & (TCP_FIN | TCP_RST) != 0 {
+        return Err(DropReason::TcpBadFlags);
+    }
+    let options = segment.get(TCP_HDR..header_len).ok_or(DropReason::TcpBadOffset)?;
+    walk_options(options)?;
+    Ok(TcpHeader {
+        src_port,
+        dst_port,
+        seq: word32(4)?,
+        ack: word32(8)?,
+        data_offset,
+        flags,
+        window: word16(14)?,
+        payload: segment.get(header_len..).ok_or(DropReason::TcpBadOffset)?,
+    })
+}
+
+/// `check`'s part for the TCP re-parse `ingress` makes (M6 plan C2): no
+/// panic, and an accepted header lies inside its datagram, the data after
+/// it to the datagram's end.
+#[cfg(any(test, kani))]
+fn check_tcp(bytes: &[u8]) {
+    if let Ok(Frame { body: Body::Ipv4(p), .. }) = parse_frame_ip(bytes)
+        && let Ok(t) = parse_tcp(&p)
+    {
+        let header = IPV4_HDR.wrapping_add(usize::from(t.data_offset).wrapping_mul(4));
+        assert!((5..=15).contains(&t.data_offset));
+        assert!(p.packet.get(header..) == Some(t.payload));
+    }
+}
+
+/// End of option list and no-operation are one byte; every other option is
+/// kind, length (at least 2, counting both), data. After an end of option
+/// list the rest is padding.
+fn walk_options(options: &[u8]) -> Result<(), DropReason> {
+    let mut at = 0usize;
+    while let Some(&kind) = options.get(at) {
+        match kind {
+            0 => return Ok(()),
+            1 => at = at.wrapping_add(1),
+            _ => {
+                let len = usize::from(*options.get(at.wrapping_add(1)).ok_or(DropReason::TcpBadOptions)?);
+                if len < 2 || len > options.len().wrapping_sub(at) {
+                    return Err(DropReason::TcpBadOptions);
+                }
+                at = at.wrapping_add(len);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(kani)]

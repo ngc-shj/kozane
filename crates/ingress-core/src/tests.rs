@@ -14,6 +14,7 @@ const CFG: Config = Config {
     router_mac: [0x52, 0x55, 10, 0, 2, 2],
     port: 51820,
     rp_port: 9999,
+    https_port: 443,
 };
 const PEER_MAC: Mac = [0x52, 0x55, 10, 0, 2, 2];
 const PEER_IP: Ipv4 = [10, 0, 2, 2];
@@ -114,6 +115,7 @@ fn run_tx(frame: &[u8], tx_free: usize) -> Outcome<'_> {
         &mut FakeCrypto::new(true),
         &FakeMac1,
         &mut Buckets::<4>::default(),
+        &mut TcpGate::<4>::default(),
         0,
         0,
         tx_free,
@@ -263,7 +265,7 @@ fn answers_broadcast_arp_request_for_our_ip() {
     let req = arp(ArpOp::Request, [0xff; 6], CFG.ipv4);
     let mut cookie = [0u8; wg_wire::COOKIE_REPLY_LEN];
     let mut crypto = FakeCrypto::new(true);
-    let o = respond(&CFG, &mut Gate::default(), &mut crypto, &FakeMac1, &mut Buckets::<1>::default(), 0, 0, NET_BUFFERS, &req, &mut out, &mut cookie);
+    let o = respond(&CFG, &mut Gate::default(), &mut crypto, &FakeMac1, &mut Buckets::<1>::default(), &mut TcpGate::<1>::default(), 0, 0, NET_BUFFERS, &req, &mut out, &mut cookie);
     let Outcome::ArpReplied(n) = o else { panic!("no reply") };
     let f = wire::parse_frame(&out[..n]).unwrap();
     assert_eq!(f.eth.dst, PEER_MAC);
@@ -740,13 +742,13 @@ fn initiation_has_a_single_constructor() {
 /// and outside; every call is logged in order.
 #[derive(Default)]
 struct FakePass {
-    waiting: [usize; 4],
+    waiting: [usize; 5],
     log: std::vec::Vec<&'static str>,
     maxes: std::vec::Vec<usize>,
 }
 
 impl FakePass {
-    fn queued(waiting: [usize; 4]) -> Self {
+    fn queued(waiting: [usize; 5]) -> Self {
         Self { waiting, ..Self::default() }
     }
 
@@ -773,11 +775,14 @@ impl PassIo for FakePass {
     fn serve_data(&mut self, max: usize) -> usize {
         self.take(2, "data", max)
     }
+    fn serve_tls(&mut self, max: usize) -> usize {
+        self.take(3, "tls", max)
+    }
     fn tick(&mut self) {
         self.log.push("tick");
     }
     fn serve_outside(&mut self, max: usize) -> usize {
-        self.take(3, "outside", max)
+        self.take(4, "outside", max)
     }
     fn end_pass(&mut self) {
         self.log.push("end");
@@ -786,16 +791,16 @@ impl PassIo for FakePass {
 
 #[test]
 fn every_pass_of_an_outside_flood_ends_with_notify_and_flush() {
-    let mut io = FakePass::queued([0, 0, 0, 3 * PASS_FRAMES]);
+    let mut io = FakePass::queued([0, 0, 0, 0, 3 * PASS_FRAMES]);
     run_passes(&mut io);
-    let pass = ["hs", "pq", "data", "tick", "outside", "end"];
+    let pass = ["hs", "pq", "data", "tls", "tick", "outside", "end"];
     // Three full passes, then one that finds the queue empty and breaks.
     assert_eq!(io.log, pass.repeat(4), "each pass must end with end_pass, after every input and the tick");
 }
 
 #[test]
 fn every_input_is_bounded_to_pass_frames() {
-    let mut io = FakePass::queued([PASS_FRAMES + 1; 4]);
+    let mut io = FakePass::queued([PASS_FRAMES + 1; 5]);
     run_passes(&mut io);
     assert!(io.maxes.iter().all(|&m| m == PASS_FRAMES), "inputs must be capped at PASS_FRAMES: {:?}", io.maxes);
     assert_eq!(io.passes(), 2, "a pass below K must break after its end_pass");
@@ -803,8 +808,8 @@ fn every_input_is_bounded_to_pass_frames() {
 
 #[test]
 fn k_on_any_one_input_runs_another_pass() {
-    for input in 0..4 {
-        let mut waiting = [0; 4];
+    for input in 0..5 {
+        let mut waiting = [0; 5];
         waiting[input] = PASS_FRAMES;
         let mut io = FakePass::queued(waiting);
         run_passes(&mut io);
@@ -814,18 +819,287 @@ fn k_on_any_one_input_runs_another_pass() {
 
 #[test]
 fn k_minus_one_on_every_input_is_the_last_pass() {
-    let mut io = FakePass::queued([PASS_FRAMES - 1; 4]);
+    let mut io = FakePass::queued([PASS_FRAMES - 1; 5]);
     run_passes(&mut io);
-    assert_eq!((io.passes(), io.waiting), (1, [0; 4]));
+    assert_eq!((io.passes(), io.waiting), (1, [0; 5]));
 }
 
 #[test]
 fn k_from_data_still_runs_the_tick_and_outside_in_the_same_pass() {
-    let mut io = FakePass::queued([0, 0, 2 * PASS_FRAMES, 1]);
+    let mut io = FakePass::queued([0, 0, 2 * PASS_FRAMES, 0, 1]);
     run_passes(&mut io);
-    let first = &io.log[..6];
-    assert_eq!(first, ["hs", "pq", "data", "tick", "outside", "end"]);
-    assert_eq!(io.waiting[3], 0);
+    let first = &io.log[..7];
+    assert_eq!(first, ["hs", "pq", "data", "tls", "tick", "outside", "end"]);
+    assert_eq!(io.waiting[4], 0);
+}
+
+#[test]
+fn a_tls_flood_still_runs_the_tick_and_outside_in_the_same_pass() {
+    let mut io = FakePass::queued([0, 0, 0, 2 * PASS_FRAMES, 1]);
+    run_passes(&mut io);
+    assert_eq!(&io.log[..7], ["hs", "pq", "data", "tls", "tick", "outside", "end"]);
+    assert_eq!(io.waiting[4], 0);
+}
+
+// ---- TCP to the HTTPS endpoint (M6 plan C2) ----
+
+const HTTPS: u16 = 443;
+
+/// An IPv4/TCP datagram without options, checksums right.
+fn tcp_packet(src: Ipv4, dst: Ipv4, sport: u16, dport: u16, flags: u8, payload: &[u8]) -> Vec<u8> {
+    let mut seg = Vec::new();
+    seg.extend_from_slice(&sport.to_be_bytes());
+    seg.extend_from_slice(&dport.to_be_bytes());
+    seg.extend_from_slice(&7u32.to_be_bytes());
+    seg.extend_from_slice(&9u32.to_be_bytes());
+    seg.extend_from_slice(&[5 << 4, flags, 0xff, 0xff, 0, 0, 0, 0]);
+    seg.extend_from_slice(payload);
+    let mut ip = vec![0x45, 0, 0, 0, 0, 0, 0x40, 0, 64, IPPROTO_TCP, 0, 0];
+    ip.extend_from_slice(&src);
+    ip.extend_from_slice(&dst);
+    ip[2..4].copy_from_slice(&((20 + seg.len()) as u16).to_be_bytes());
+    let c = csum(&ip, 0);
+    ip[10..12].copy_from_slice(&c.to_be_bytes());
+    let pseudo: Vec<u8> = [&src[..], &dst[..], &[0, IPPROTO_TCP], &(seg.len() as u16).to_be_bytes()].concat();
+    let c = csum(&seg, sum16(&pseudo));
+    seg[16..18].copy_from_slice(&c.to_be_bytes());
+    ip.extend_from_slice(&seg);
+    ip
+}
+
+fn sum16(b: &[u8]) -> u32 {
+    b.chunks(2).map(|c| u32::from(c[0]) << 8 | u32::from(*c.get(1).unwrap_or(&0))).sum()
+}
+
+fn csum(b: &[u8], start: u32) -> u16 {
+    let mut s = start + sum16(b);
+    while s > 0xffff {
+        s = (s & 0xffff) + (s >> 16);
+    }
+    !(s as u16)
+}
+
+fn eth_of(src_mac: Mac, dst_mac: Mac, packet: &[u8]) -> Vec<u8> {
+    [&dst_mac[..], &src_mac[..], &wire::ETHERTYPE_IPV4.to_be_bytes(), packet].concat()
+}
+
+/// A segment from PEER to us, to `dport`, with `flags`.
+fn tcp_to(dport: u16, flags: u8) -> Vec<u8> {
+    eth_of(PEER_MAC, CFG.mac, &tcp_packet(PEER_IP, CFG.ipv4, 40000, dport, flags, b"data"))
+}
+
+fn admit(gate: &mut TcpGate<4>, now: u64, frame: &[u8]) -> Outcome<'static> {
+    // Outcomes are compared by kind here; the packet's bytes by the tests
+    // that look at them.
+    match gate.admit(&CFG, now, frame) {
+        Outcome::Tls { .. } => Outcome::Tls { packet: &[] },
+        o => o.into_static(),
+    }
+}
+
+impl Outcome<'_> {
+    /// The outcome without its borrowed bytes, for the kinds TCP yields.
+    fn into_static(self) -> Outcome<'static> {
+        match self {
+            Outcome::Dropped(r) => Outcome::Dropped(r),
+            Outcome::NoService => Outcome::NoService,
+            Outcome::TcpLimited(l) => Outcome::TcpLimited(l),
+            o => panic!("not a TCP outcome: {o:?}"),
+        }
+    }
+}
+
+const TLS: Outcome<'static> = Outcome::Tls { packet: &[] };
+
+#[test]
+fn tcp_to_our_https_port_goes_to_tls_as_the_ip_packet() {
+    let f = tcp_to(HTTPS, wire::TCP_SYN);
+    let o = run(&f);
+    assert_eq!(o, Outcome::Tls { packet: &f[wire::ETH_HDR..] });
+}
+
+#[test]
+fn tcp_to_another_port_or_host_has_no_service() {
+    let mut g = TcpGate::<4>::default();
+    assert_eq!(admit(&mut g, 0, &tcp_to(HTTPS + 1, wire::TCP_SYN)), Outcome::NoService, "other port");
+    let other_ip = eth_of(PEER_MAC, CFG.mac, &tcp_packet(PEER_IP, [10, 0, 2, 16], 40000, HTTPS, wire::TCP_SYN, b""));
+    assert_eq!(admit(&mut g, 0, &other_ip), Outcome::NoService, "other address");
+    let other_mac = eth_of(PEER_MAC, [0x52, 0x54, 0, 0, 0, 1], &tcp_packet(PEER_IP, CFG.ipv4, 40000, HTTPS, wire::TCP_SYN, b""));
+    assert_eq!(admit(&mut g, 0, &other_mac), Outcome::NoService, "other MAC");
+    let from_us = eth_of(PEER_MAC, CFG.mac, &tcp_packet(CFG.ipv4, CFG.ipv4, 40000, HTTPS, wire::TCP_SYN, b""));
+    assert_eq!(admit(&mut g, 0, &from_us), Outcome::NoService, "source address ours");
+    let our_mac = eth_of(CFG.mac, CFG.mac, &tcp_packet(PEER_IP, CFG.ipv4, 40000, HTTPS, wire::TCP_SYN, b""));
+    assert_eq!(admit(&mut g, 0, &our_mac), Outcome::NoService, "source MAC ours");
+    assert_eq!(admit(&mut g, 0, &tcp_to(HTTPS, wire::TCP_SYN)), TLS, "and the allow side");
+}
+
+#[test]
+fn a_bad_tcp_header_is_dropped_with_its_reason() {
+    let mut f = tcp_to(HTTPS, wire::TCP_SYN | wire::TCP_FIN);
+    assert_eq!(run(&f), Outcome::Dropped(DropReason::TcpBadFlags));
+    f = tcp_to(HTTPS, wire::TCP_SYN);
+    let last = f.len() - 1;
+    f[last] ^= 1;
+    assert_eq!(run(&f), Outcome::Dropped(DropReason::TcpBadChecksum));
+}
+
+#[test]
+fn another_protocol_stays_not_udp() {
+    let mut p = tcp_packet(PEER_IP, CFG.ipv4, 40000, HTTPS, wire::TCP_SYN, b"");
+    p[9] = 47;
+    p[10..12].fill(0);
+    let c = csum(&p[..20], 0);
+    p[10..12].copy_from_slice(&c.to_be_bytes());
+    assert_eq!(run(&eth_of(PEER_MAC, CFG.mac, &p)), Outcome::Dropped(DropReason::NotUdp));
+}
+
+#[test]
+fn a_source_gets_its_syn_burst_and_then_is_limited() {
+    let mut g = TcpGate::<4>::default();
+    let syn = tcp_to(HTTPS, wire::TCP_SYN);
+    for i in 0..SYN_SRC_BURST {
+        assert_eq!(admit(&mut g, 0, &syn), TLS, "SYN {i}");
+    }
+    assert_eq!(admit(&mut g, 0, &syn), Outcome::TcpLimited(TcpLimit::SynSource));
+    assert_eq!(admit(&mut g, SYN_SRC_INTERVAL_NS - 1, &syn), Outcome::TcpLimited(TcpLimit::SynSource));
+    assert_eq!(admit(&mut g, SYN_SRC_INTERVAL_NS, &syn), TLS, "one more after its interval");
+}
+
+#[test]
+fn syns_from_many_sources_get_the_global_burst_and_then_are_limited() {
+    let mut g = TcpGate::<64>::default();
+    let syn_from = |n: u8| eth_of(PEER_MAC, CFG.mac, &tcp_packet([10, 0, 9, n], CFG.ipv4, 40000, HTTPS, wire::TCP_SYN, b""));
+    for n in 0..SYN_GLOBAL_BURST as u8 {
+        assert!(matches!(g.admit(&CFG, 0, &syn_from(n)), Outcome::Tls { .. }), "source {n}");
+    }
+    let next = syn_from(200);
+    assert_eq!(g.admit(&CFG, 0, &next), Outcome::TcpLimited(TcpLimit::SynGlobal));
+    assert_eq!(g.admit(&CFG, SYN_GLOBAL_INTERVAL_NS - 1, &next), Outcome::TcpLimited(TcpLimit::SynGlobal));
+    assert!(matches!(g.admit(&CFG, SYN_GLOBAL_INTERVAL_NS, &next), Outcome::Tls { .. }), "one more after its interval");
+}
+
+#[test]
+fn a_source_over_its_syn_bucket_spends_nothing_globally() {
+    let mut g = TcpGate::<4>::default();
+    let syn = tcp_to(HTTPS, wire::TCP_SYN);
+    for _ in 0..SYN_SRC_BURST + 100 {
+        admit(&mut g, 0, &syn);
+    }
+    assert_eq!(g.syn_global.tokens(0), SYN_GLOBAL_BURST - SYN_SRC_BURST);
+}
+
+#[test]
+fn segments_other_than_syns_spend_only_the_data_bucket() {
+    let mut g = TcpGate::<4>::default();
+    let ack = tcp_to(HTTPS, wire::TCP_ACK);
+    let synack = tcp_to(HTTPS, wire::TCP_SYN | wire::TCP_ACK);
+    for i in 0..TCP_DATA_BURST {
+        let f = if i % 2 == 0 { &ack } else { &synack };
+        assert_eq!(admit(&mut g, 0, f), TLS, "segment {i}");
+    }
+    assert_eq!(admit(&mut g, 0, &ack), Outcome::TcpLimited(TcpLimit::Data));
+    assert_eq!(admit(&mut g, TCP_DATA_INTERVAL_NS - 1, &ack), Outcome::TcpLimited(TcpLimit::Data));
+    assert_eq!(admit(&mut g, TCP_DATA_INTERVAL_NS, &ack), TLS);
+    // A data flood leaves new connections their buckets, and vice versa.
+    assert_eq!(admit(&mut g, TCP_DATA_INTERVAL_NS, &tcp_to(HTTPS, wire::TCP_SYN)), TLS);
+    assert_eq!(g.syn_global.tokens(TCP_DATA_INTERVAL_NS), SYN_GLOBAL_BURST - 1);
+}
+
+#[test]
+fn the_syn_table_has_its_own_constants_and_the_initiation_table_keeps_its() {
+    let mut wg = Buckets::<1>::default();
+    let mut syn = Buckets::<1, SYN_SRC_BURST, SYN_SRC_INTERVAL_NS>::default();
+    let granted = |b: &mut dyn FnMut() -> bool| (0..20).filter(|_| b()).count() as u64;
+    assert_eq!(granted(&mut || wg.allow(PEER_IP, 0)), BURST);
+    assert_eq!(granted(&mut || syn.allow(PEER_IP, 0)), SYN_SRC_BURST);
+    assert!(!wg.allow(PEER_IP, INTERVAL_NS - 1) && wg.allow(PEER_IP, INTERVAL_NS));
+}
+
+// ---- tls_egress (M6 plan C2) ----
+
+/// A segment `tls` would send: from us:443 to PEER, ACK set.
+fn from_tls(flags: u8) -> Vec<u8> {
+    tcp_packet(CFG.ipv4, PEER_IP, HTTPS, 40000, flags, b"reply")
+}
+
+const TX_ROOM: usize = NET_BUFFERS / 2 + TLS_TX_SHARE + 1;
+
+#[test]
+fn tls_egress_frames_a_conforming_segment_to_the_router() {
+    let p = from_tls(wire::TCP_ACK | wire::TCP_PSH);
+    let f = tls_egress(&CFG, &p, TX_ROOM).unwrap();
+    assert_eq!(f.eth, EthAddrs { src: CFG.mac, dst: CFG.router_mac });
+    let Body::Ipv4(ip) = f.body else { panic!("not ipv4") };
+    assert_eq!((ip.src, ip.dst, ip.packet), (CFG.ipv4, PEER_IP, &p[..]));
+    let mut out = [0u8; wire::MAX_FRAME];
+    assert_eq!(wire::emit(&f, &mut out), Ok(wire::ETH_HDR + p.len()));
+}
+
+#[test]
+fn tls_egress_allows_syn_ack_fin_and_rst_but_never_a_bare_syn() {
+    for flags in [wire::TCP_SYN | wire::TCP_ACK, wire::TCP_FIN | wire::TCP_ACK, wire::TCP_RST, wire::TCP_RST | wire::TCP_ACK] {
+        assert!(tls_egress(&CFG, &from_tls(flags), TX_ROOM).is_ok(), "flags {flags:#x}");
+    }
+    assert_eq!(tls_egress(&CFG, &from_tls(wire::TCP_SYN), TX_ROOM), Err(EgressRefusal::Dropped(DropReason::TcpEgressRefused)));
+}
+
+#[test]
+fn tls_egress_refuses_every_other_source_port_and_destination() {
+    let refused = Err(EgressRefusal::Dropped(DropReason::TcpEgressRefused));
+    let ack = wire::TCP_ACK;
+    assert_eq!(tls_egress(&CFG, &tcp_packet(PEER_IP, [10, 0, 2, 3], HTTPS, 40000, ack, b""), TX_ROOM), refused, "source not ours");
+    assert_eq!(tls_egress(&CFG, &tcp_packet(CFG.ipv4, PEER_IP, HTTPS + 1, 40000, ack, b""), TX_ROOM), refused, "port");
+    assert_eq!(tls_egress(&CFG, &tcp_packet(CFG.ipv4, CFG.ipv4, HTTPS, 40000, ack, b""), TX_ROOM), refused, "to us");
+    for dst in [[0, 0, 0, 0], [255, 255, 255, 255], [224, 0, 0, 1], [239, 1, 2, 3], [127, 0, 0, 1], [240, 0, 0, 1]] {
+        assert_eq!(tls_egress(&CFG, &tcp_packet(CFG.ipv4, dst, HTTPS, 40000, ack, b""), TX_ROOM), refused, "to {dst:?}");
+    }
+    assert!(tls_egress(&CFG, &tcp_packet(CFG.ipv4, [223, 255, 255, 254], HTTPS, 40000, ack, b""), TX_ROOM).is_ok());
+}
+
+#[test]
+fn tls_egress_refuses_what_is_not_tcp_or_not_valid() {
+    let mut udp = from_tls(wire::TCP_ACK);
+    udp[9] = 17;
+    udp[10..12].fill(0);
+    let c = csum(&udp[..20], 0);
+    udp[10..12].copy_from_slice(&c.to_be_bytes());
+    assert_eq!(tls_egress(&CFG, &udp, TX_ROOM), Err(EgressRefusal::Dropped(DropReason::TcpEgressRefused)));
+    let mut bad = from_tls(wire::TCP_ACK);
+    let last = bad.len() - 1;
+    bad[last] ^= 1;
+    assert_eq!(tls_egress(&CFG, &bad, TX_ROOM), Err(EgressRefusal::Dropped(DropReason::TcpBadChecksum)));
+    let mut bad_ip = from_tls(wire::TCP_ACK);
+    bad_ip[8] ^= 1;
+    assert_eq!(tls_egress(&CFG, &bad_ip, TX_ROOM), Err(EgressRefusal::Dropped(DropReason::Ipv4BadChecksum)));
+}
+
+#[test]
+fn tls_egress_length_bound_is_1500_bytes() {
+    let max = tcp_packet(CFG.ipv4, PEER_IP, HTTPS, 40000, wire::TCP_ACK, &[1; 1460]);
+    assert_eq!(max.len(), 1500);
+    assert!(tls_egress(&CFG, &max, TX_ROOM).is_ok());
+    let mut over = max.clone();
+    over.push(0);
+    assert_eq!(tls_egress(&CFG, &over, TX_ROOM), Err(EgressRefusal::Dropped(DropReason::TooLong)));
+}
+
+#[test]
+fn tls_egress_is_refused_at_its_tier_while_data_and_answers_still_pass() {
+    let p = from_tls(wire::TCP_ACK);
+    let edge = NET_BUFFERS / 2 + TLS_TX_SHARE;
+    assert_eq!(tls_egress(&CFG, &p, edge), Err(EgressRefusal::TxReserve));
+    assert!(tls_egress(&CFG, &p, edge + 1).is_ok());
+    // At that level `hs`/`data` output (no tier) and Rosenpass answers and
+    // unsolicited replies still have their buffers.
+    assert!(rp_tx_allowed(TxTier::Answer, edge));
+    assert!(rp_tx_allowed(TxTier::Unsolicited, edge));
+}
+
+#[test]
+fn a_tls_segment_is_never_allowed_where_an_unsolicited_reply_is_refused() {
+    for free in 0..=NET_BUFFERS {
+        assert!(!rp_tx_allowed(TxTier::Tls, free) || rp_tx_allowed(TxTier::Unsolicited, free), "free {free}");
+    }
 }
 
 // ---- Rosenpass (M3 plan C4) ----
@@ -1930,7 +2204,7 @@ fn a_rosenpass_flood_leaves_the_wireguard_meters_untouched() {
     let f = udp_to(CFG.mac, CFG.ipv4, CFG.rp_port, &h);
     let mut limited = 0;
     for _ in 0..1000 {
-        let o = respond(&CFG, &mut r.gate, &mut r.crypto, &FakeMac1, &mut r.buckets, 0, IDLE, TX_FREE, &f, &mut [0u8; wire::MAX_FRAME], &mut r.out);
+        let o = respond(&CFG, &mut r.gate, &mut r.crypto, &FakeMac1, &mut r.buckets, &mut TcpGate::<4>::default(), 0, IDLE, TX_FREE, &f, &mut [0u8; wire::MAX_FRAME], &mut r.out);
         let Outcome::Rosenpass { src, payload } = o else { panic!("{o:?}") };
         limited += usize::from(rp_drained(&mut g, 0, src, payload) == RpOutcome::RateLimited);
     }
