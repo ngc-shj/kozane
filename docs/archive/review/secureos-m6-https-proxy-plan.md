@@ -259,7 +259,7 @@ walkthroughs are in the Acceptance appendix.
 - Nonce (S7): RFC 6979 §3.2 HMAC-DRBG (HMAC-SHA256, libcrux-hmac) with the
   §3.6 additional input k' = 32 bytes of RNDR; a candidate the sign function
   rejects (k ∉ [1, q−1]) continues step h.3, at most 8 candidates, then
-  `ERR_CRYPTO` (S-N4, F-N6; a retry has probability ≈ 2^-128). K, V, k, k' and the content
+  `ERR_CRYPTO` (S-N4, F-N6; a retry has probability ≈ 2^-32 per candidate, as q lies ≈ 2^224 below 2^256, so all 8 refused ≈ 2^-256; corrected in code review round 1, S3). K, V, k, k' and the content
   buffer are `Secret` types, wiped after each signature; `key`'s stack is
   scrubbed after the call (the `scrub_session_stack` pattern). RNDR failure
   → `ERR_CRYPTO` (L9).
@@ -1323,3 +1323,407 @@ as amended here:
   copied back to gx10; tpm2-wire's changed harnesses alone first.
 - Phase 2 Step 2-4 and 2-5 (self R-check), then Phase 3 review, the final
   solo `make check`, a full selftest after it (z1mn), docs/PLAN.md M6 row.
+
+## Re-plan R2 (2026-10-25, after code review round 1; D3 stop rule on RM6-8; revised after its review rounds 1–6)
+
+**Trigger.** Code review round 1 (T8) made the 8-concurrent probe fail when
+no handshake completes. On the round 1 tree it then failed: 8 of 8
+handshakes from four sources reset at 10.4 s, the handshake timeout. The
+probe had been passing vacuously, since 4209823 printed PASS on the same
+8-of-8 failure. RM6-8 is "D3 if it binds", and it binds. Findings of R2's
+review are cited R2-F*/S*/T*.
+
+**Evidence** (`https flood` boot alone, gx10, no solver on the host, TCG):
+
+| Tree | `tls` budget | 8 concurrent handshakes |
+|---|---|---|
+| 7ce0d18 (slice 5) | 0.05 | all 8 done at 8.19 s, within 1 ms of each other (3.48 s on 2026-10-24) |
+| round 1 | 0.05 | all 8 reset at 10.4 s, together |
+| round 1, data 0.15 / tls 0.10 (experiment only) | 0.10 | all 8 done at 6.43 s, together |
+| round 1, egress after each serve (experiment only), run 1 | 0.05 | 7 done at 2.10–5.81 s, staggered; 1 client read timeout at 25.5 s |
+| same tree, runs 2–4, per-port diagnosis | 0.05 | 24 of 24 done at 1.21–7.70 s, staggered; the stall did not recur |
+
+**Root cause.** `Tls::pass` serves every connection, then sends:
+- `ingress` on both links;
+- `serve(i)` for all `MAX_CONNS`;
+- `poll_egress` once.
+
+It notifies `ingress` only in `end_pass`. A ClientHello costs the hybrid
+exchange plus a `TlsSign` call. The sign alone is 0.4–1.2 s of wall time on
+`tls`'s 0.05, since the passive `tlskey` runs on `tls`'s scheduling context.
+So a pass that meets eight ClientHellos computes all eight flights before
+any leaves. No client can send its Finished until the last flight is
+computed, and the eight complete together or time out together.
+
+This is an availability defect independent of the budget: under load the
+server serves nobody instead of the earliest. Doubling the budget only
+moved the cliff (6.43 s, still in lockstep). It is also the widening D3
+forbids, and it would take 0.05 from the VPN's `data`.
+
+**Decision (C13).** The budget, the L13 split and `MAX_CONNS` stay. The
+pass becomes, in this order:
+
+1. **Ingress** on both links, as today.
+2. **Serve every connection with its ClientHello held back.**
+   - Deferral happens at one point only: the `take_record` call in `proxy`,
+     when the slot `awaits_hello` and does not hold this pass's turn.
+   - Everything else in `serve(i)` still runs for every slot every pass:
+     gone detection, timers (the handshake deadline counts from admission,
+     conn.rs `Phase::Open{Handshake, since}`), the IDLE raise, FIN handling.
+   - Records past a ClientHello (client Finished, application data) are
+     never held back.
+3. **Egress** on both links, then notify `ingress`/`inner` for what was
+   sent: `mem::take` of the link's `sent` flag. Other connections' Finished
+   replies and backend SYNs leave before the expensive step (R2-F3).
+4. **The hello turn.** One eligible slot, if any, has its ClientHello
+   served, then a second egress.
+   - **Eligible:** `Phase::Open{Handshake}`, the session in
+     `AwaitClientHello`, and a complete record buffered. Free and reset slots
+     also sit in `AwaitClientHello`, hence the phase guard (R2-F6).
+   - **Choice:** earliest admission, the smallest Handshake `since`, i.e.
+     earliest deadline first (R2-F2). On a tie, the lowest slot index. A
+     later admission cannot pass an earlier one, so a slot waits at most
+     for the hellos admitted before it, which is fewer than `HS_CAP`
+     (below). A re-armed slot gets a new, larger `since` through `open()`.
+   - **The turn is per connection:** the holder consumes every record of
+     its ClientHello in this serve, until the hello completes or is
+     refused. A non-final fragment never ends the turn (R2-S3, T7).
+   - **A slowloris partial** is never eligible: it holds no complete
+     record.
+   - **Once per pass, after the last egress:** `after_egress` (the RST log
+     and `RstWait` passes) and `halt::after_sign` run here, not after each
+     egress. `outside.rsts`/`inside.rsts` are cleared only at the start of
+     the pass (R2-N3).
+5. **Another pass is due** when `any_full(..)` holds, or when this pass's
+   turn consumed at least one record and an eligible slot is still waiting
+   (`tls_core::conn::pass_due`). `Pass::serve` returns it, so a waiting
+   hello needs no unrelated wakeup (R2-F1, S1, T1).
+   - Each extra pass consumes a record of the holder, from a finite
+     receive buffer.
+   - `end_pass` still notifies and flushes every pass.
+6. **Each `poll_egress` takes a fresh `now()`**, monotonic and
+   non-decreasing, so a flight sent after a 1.2 s sign is not stamped 1.2 s
+   in the past. A stale stamp starts smoltcp's retransmit timer already
+   expired (R2-F4).
+
+The decisions live in `tls-core::conn` as pure functions, with unit tests,
+and the PD applies them:
+- `Slot::awaits_hello`;
+- the turn choice over the slots' (eligible, since) pairs;
+- `pass_due`;
+- the handshake cap at admission (below).
+
+Per-connection egress (R2's first draft) is dropped: once a pass holds at
+most one expensive step, it has no observable effect (R2-F4, T2).
+
+**The handshake cap (R2-F5/N2, S2).** C13 reorders the work; it does not
+reduce it. The last of `n` concurrent handshakes completes, from its
+admission, after about `n` × (hybrid exchange + sign) + RTT + the Finished.
+The measurements already put `n = 8` near the 10 s timeout (8.19 s, 7.70 s).
+So R2 decides the mechanism now and sets its value from C13's measurement:
+- **`HS_CAP`:** connections in the Handshake stage at once.
+  - It is a `tls-core::conn` constant, compile-time asserted to
+    `4 ≤ HS_CAP ≤ MAX_CONNS`.
+  - The floor of 4 has two reasons:
+    - **The ordering predicate needs it** (R2-T-R3-1, round 4 R4-N1).
+      `pass_due` starts the next pass at once, before A's Finished can
+      make its round trip. So the turns of passes 1–3 sign A, B and C,
+      pass 3 also handles A's Finished and sends the backend SYN, and A's
+      request reaches the backend in pass 4's step 3. Only a fourth flight
+      leaves after a receipt.
+    - **It keeps `HS_CAP > MAX_PER_SOURCE` (2)**, so one source cannot hold
+      every handshake place (R2-S6).
+- **Admission:** the check is a pure function with the cap as a parameter,
+  `admit_with_cap(source, now, cap)`. `Table::admit` calls it with
+  `HS_CAP`, so the cap logic is testable whatever value is measured
+  (R2-T-R3-5).
+  - The refusal precedence is fixed: `PerSource`, then `Full`, then
+    `HandshakeCap` (R2-F-R3-3; round 6 R6-M1).
+    - `HandshakeCap` means a free slot was withheld because `cap` slots are
+      in Handshake. With no free slot the refusal is `Full`.
+    - So `HS_CAP = MAX_CONNS` is truly inert, and the existing
+      `table_is_full_at_max_conns` keeps its `Full`.
+  - A refused connection is aborted with a RST, like the existing refusals,
+    and audited as `TlsClosed(HandshakeCap)`. That is a new kind in the
+    closed table: `AdmitRefusal::HandshakeCap` → `Closed::HandshakeCap`,
+    with audit-event's name table and completeness tests.
+- **What the cap is for:** it bounds the latency of the last admitted
+  handshake below `HANDSHAKE_TIMEOUT_NS`, by bounding the queued signing
+  work. A connection keeps its slot from admission, so the cap does not
+  reserve slots for anyone (R2-F-R3-3).
+- **What it costs,** recorded under RM6-7 in the deviation log:
+  - A real-source attacker needs only ⌈`HS_CAP`/`MAX_PER_SOURCE`⌉ sources,
+    not ⌈`MAX_CONNS`/2⌉, to deny all new handshakes with idle connects
+    renewed every 10 s.
+  - A refusal burst holds free slots in Aborting for up to
+    `MAX_RST_PASSES` passes.
+- **The value:**
+  - **Measurement:** the C13 tree's `https flood` boot with the cap inert
+    (`HS_CAP = MAX_CONNS`), 3 runs on each of two hosts with no solver.
+  - **Which runs count** (round 4 R4-N2):
+    - A *complete* run met the completion rule.
+    - A *capacity* run is decided only from what the probe observes
+      (round 5 R5-M1). Admission order is not observable: the ports
+      admitted in one pass share `since` and are ordered by slot index,
+      which the sniffer cannot see. The run must satisfy all of these:
+      - the ordering predicate holds;
+      - every failed port timed out, with no first ServerHello or one
+        among the last k crossings, where k is the number of failed ports;
+      - every port whose first ServerHello crossed before those
+        completed;
+      - no gap between consecutive first ServerHello crossings exceeds
+        twice their median. The predicate guarantees at least 4 crossings,
+        so at least 3 gaps; the median of an even count is the mean of the
+        middle two.
+
+      That is queueing at the inert cap, not a stall. The earliest-deadline
+      order itself is proven by the turn unit tests (re-arrival), not by
+      the probe.
+    - Any other failure is a stall. It goes to diagnosis and feeds
+      nothing.
+  - **`c`:** the largest gap between consecutive first ServerHello
+    crossings, over the complete and capacity runs. The gap includes the
+    other connections' work in its pass, so it is a conservative
+    over-estimate.
+  - **`L`:** the largest last-completion time over the complete runs.
+    It is ∞ if any capacity run occurred.
+  - **The rule:** `HS_CAP = MAX_CONNS` when `L ≤ ⅔ · HANDSHAKE_TIMEOUT_NS`.
+    Otherwise `HS_CAP = min(MAX_CONNS - 1, ⌊(⅔ · HANDSHAKE_TIMEOUT_NS) / c⌋)`,
+    so a failed first rule always yields a real cap (R2-F-R3-2).
+  - **The stop:** a result below 4 is not taken, and neither is a set of
+    six runs with no complete or capacity run. Either is a D3 stop: the
+    re-plan goes back to the budget split (R2-S6, T-R3-1, R4-N1). With
+    `⅔ · HANDSHAKE_TIMEOUT_NS` = 6.67 s, a floor of 4 needs `c ≤ 1.67 s`.
+  - **The record:** the measurement, `c`, `L` and the value go in the
+    deviation log as RM6-8, with each run's classification (complete,
+    capacity, stall) and the observations behind it.
+  - **Measurement versus gate (round 5 R5-M2):**
+    - The measurement runs are not the gate. A capacity run fails the
+      completion rule by design.
+    - The probe therefore prints, on its failing path too, each port's
+      first-ServerHello and completion times and its classification
+      (admitted, refused, failed phase), before it raises.
+    - When the value is `HS_CAP < MAX_CONNS`, the `https flood` gate is run
+      again on the capped tree, 3 times on gx10 and on z1mn. Those runs
+      exercise the admitted, refused and `TlsClosed(HandshakeCap)` checks.
+
+**RST loss at the outside TX tier (R2-S4; round 2 R2-S5, F-N1).** Every
+`tls` segment, RSTs included, goes through `TxTier::Tls`
+(`tx_free > TX_RESERVE + TLS_TX_SHARE`). `tls` counts an abort's RST as
+dispatched once it reaches the `tli` ring and releases the slot, so a RST
+that `ingress` drops under a TX burst is never resent.
+
+No exemption is made. `tls_egress` cannot tie a RST to an admitted
+connection:
+- a compromised `tls` (A3) can emit RSTs to any address;
+- a remote attacker elicits bare RSTs from smoltcp with stray non-SYN
+  segments, at the TCP data meter's rate.
+
+An exempt tier would therefore hand the buffers that keep Rosenpass
+answers, cookie replies and ARP replies to RSTs. That would break I8 and
+its proof (`tls_tier_is_at_or_above_unsolicited`,
+`tls_egress_accepts_only_conforming_packets`).
+
+The loss is recorded as a residual equivalent to a RST lost in the network:
+- a client with data outstanding retransmits and is reset by the re-armed
+  listener's RST;
+- only a client idly waiting for a response waits for its own timeout, and
+  only for a connection that was being aborted.
+
+FIN uses sequence space and smoltcp retransmits it while the socket lives;
+the first draft's claim otherwise was wrong.
+
+Unit tests (ingress-core) pin the tier for a bare RST|ACK:
+- refused at `tx_free == TX_RESERVE + TLS_TX_SHARE`;
+- admitted at `TX_RESERVE + TLS_TX_SHARE + 1`.
+
+**Diagnosis (R2-T5, T6; round 2 R2-T-N2).** There is no audit counter
+line: coalescing prints totals 1, 65, …, and TxNoBuffer is shared by every
+tier. The probe therefore attributes per port:
+- **The phase** a connection failed in: handshake, request write or
+  response read.
+- **That port's segments**, from the sniffer, each way, with timestamps.
+- **The backend's receipt of that client's request.**
+  - Each client adds a marker field, `X-Probe: <client port>`, which
+    http-wire forwards unchanged.
+  - `BackendConn` records the `time.monotonic()` of its first chunk.
+  - The probe is given `backend`.
+
+Audit totals in the record are lower bounds. The reproduction budget is 3
+runs on each of two hosts after C13. A stall's attribution decides what
+happens to it:
+- a cause inside C13 is fixed;
+- any other cause is recorded with a deterministic control, never as
+  flake.
+
+**Probe enforcement and its controls (R2-T2, T3; round 2 R2-T-N1).**
+- **The ordering predicate is judged first.** It covers whatever was
+  observed, before any other check:
+  - "first ServerHello" for a port is the first crossing of the server's
+    segment at seq = ISN+1 whose payload starts `16 03 03 .. .. 02`;
+    retransmits are ignored;
+  - "receipt" is the backend's first-chunk time for that port's marker;
+  - green when some receipt precedes the last first-ServerHello;
+  - red, with the needle "https concurrent probe: no request reached the
+    backend before the last server flight", when there is no receipt at
+    all, or no receipt precedes the last first-ServerHello;
+  - every other failure is raised after this verdict.
+
+  Under lockstep all flights leave before any Finished is processed. Under
+  C13 the gap is milliseconds of RTT against seconds of signing. Neither
+  depends on host load.
+- **Admitted versus refused, per port from the sniffer (R2-T-R3-2,
+  F-R3-1).**
+  - *Refused:* a server RST with no earlier server payload on that port,
+    arriving less than `HANDSHAKE_TIMEOUT_NS` after its SYN. That is a
+    one-sided protocol bound, not a load threshold.
+  - *Admitted:* every other port.
+- **Completion:**
+  - every admitted port completes;
+  - admitted ≥ min(`HS_CAP`, conns), since a straggler admitted after a
+    Finished may lift admitted above `HS_CAP`, so the bound is a minimum;
+  - refused > 0 only when conns > `HS_CAP`;
+  - no `TlsTimeout(Handshake)` line since the mark. An absence is
+    checkable despite coalescing.
+  - An admitted port with no ServerHello fails with its own needle,
+    "https concurrent probe: client N admitted but got no server flight",
+    raised after the ordering verdict.
+- **The refusal audit (R2-T-R3-3):**
+  - `TlsClosed(HandshakeCap) total=1` is expected since the mark if and
+    only if the sniffer counted a refusal.
+  - Refusal counts come only from the sniffer, because coalescing prints
+    1, 65, ….
+  - This depends on the probe being the boot's first `HandshakeCap`
+    producer: case 12's hello flood runs after it. That ordering is
+    recorded next to the probe.
+- Times are printed as RM6-8 data, on the passing and the failing path.
+  No time threshold is asserted.
+
+**Rejected.**
+- **Raising `tls`'s budget** (to 0.10, taking from `data`): it widens the
+  budget and moves the cliff without removing the lockstep. It also cuts
+  the VPN's crypto budget.
+- **A longer HANDSHAKE_TIMEOUT_NS:** it widens the bound the slowloris
+  defence rests on.
+- **Rotation as the turn order:** the deadline counts from admission, so
+  rotation can let the oldest handshake expire while a newer one is
+  served (R2-F2).
+- **Exempting RSTs from the TLS tier,** at the Answer or Unsolicited tier
+  or on a meter: elicited and compromised-`tls` RSTs would take the
+  answer and unsolicited buffers. A first-come meter does not even
+  guarantee the abort's RST (round 2 R2-S5, F-N1).
+- **A half-closed client** (hello plus FIN before its turn) still gets
+  its turn. That is accepted: such clients are bounded by the per-source
+  cap and the SYN limits, and the sign is `tls`'s own budget (R2-F7).
+
+**Acceptance.**
+- **Unit (tls-core):**
+  - `awaits_hello`: true only in Open{Handshake} with AwaitClientHello;
+    still true after the first fragment of a split hello; false for free
+    and reset slots.
+  - The turn: older versus newer, in both index orders; the tie; an
+    ineligible incomplete record; re-arrival (slot 0 re-armed with a newer
+    `since` every pass, while slot 7, older, gets the turn first).
+  - `pass_due`: a deny/allow pair. Due when a record was consumed and an
+    eligible slot waits. Not due when nothing waits, or when the turn
+    consumed nothing (unless `any_full`).
+  - The cap, through `admit_with_cap` with a cap below `MAX_CONNS`:
+    - at `cap` slots in Handshake an admission is refused with
+      `HandshakeCap`;
+    - at `cap - 1` it is admitted;
+    - a slot that leaves Handshake frees a place;
+    - with no free slot the refusal is `Full`, even when `cap` slots are in
+      Handshake;
+    - `PerSource` is returned in preference to both;
+    - with `cap = MAX_CONNS` no admission is ever refused `HandshakeCap`
+      (inertness).
+  - A `tick` regression: a slot in Handshake reaches `Timeout::Handshake`
+    10 s after admission. This is existing behaviour that C13 must not
+    change, not evidence of deferral.
+- **Unit (ingress-core):** the bare RST|ACK pair above. The existing I8
+  proofs stay unchanged.
+- **Selftest, unit gate, one mutation each:**
+  - the turn ignores `since` and takes the lowest eligible index (red: the
+    re-arrival test; the tie test stays green);
+  - `pass_due` is forced false;
+  - the cap check is removed (red: the cap pair).
+- **check-pins:** a rule anchored inside
+  `impl ring::pass::Pass for Pass` in crates/pds/tls/src/main.rs (that file
+  has three `fn serve`; R2-T-R3-4). The rule fails when the anchor is
+  missing, as P18 does. Within the anchor, `serve` must return `any_full(..)`
+  `||` `tls_core::conn::pass_due(..)`.
+  - Deny fixtures: `&&` in place of `||`; a dropped term; a missing anchor.
+  - An allow fixture.
+  - A pins-gate selftest that removes `|| pass_due(..)` from the real
+    main.rs, with the rule's code as its needle.
+
+  Steps 3 and 6 (egress before the turn, a fresh `now()` per egress) are
+  review-only and recorded as such in the deviation log.
+- **Selftest, test gate:** a mutation in crates/pds/tls/src/main.rs that
+  serves every eligible ClientHello in one pass (the lockstep). Its needle
+  is the ordering predicate's, judged first.
+- **Integration (`https flood`):**
+  - the ordering predicate holds, and every admitted handshake completes;
+  - times, sign high-water, the per-hello gaps and the last completion are
+    recorded;
+  - the diagnosis lines are absent.
+
+  It runs 3 times on each of two hosts with no solver: gx10 and z1mn. If
+  the measurement sets `HS_CAP < MAX_CONNS`, those runs are made on the
+  capped tree.
+  mrx33, a third arm64 worker set up 2026-10-25, is excluded from timing
+  gates. It fails cookie boot a ("WgCookieSuppressed during the paired
+  flood") at 4209823 too (2 of 2), so its TCG timing is outside what the
+  existing cases are calibrated for.
+- **Verification environment:** TCG wall time varies with host load (3.48
+  s versus 8.19 s on the same tree). The gate runs only on a host whose
+  process list shows no live cbmc, kani-gate or cargo-kani.
+
+### Go/No-Go additions (R2)
+
+| ID | Subject | Status |
+|---|---|---|
+| C13 | `tls` pass: ClientHello held back, one hello turn per pass (earliest admission), the hello served after an egress, another pass while one waits, fresh egress time; `HS_CAP` at admission (value from measurement); RSTs stay in the TLS tier (residual); the concurrent probe enforced with a first-judged ordering predicate and per-port diagnosis | locked |
+
+### Implementation checklist (R2)
+
+- crates/tls-core/src/conn.rs, conn/proxy.rs:
+  - `Slot::awaits_hello`, the turn choice and `pass_due`;
+  - `HS_CAP` with its admission check, `AdmitRefusal::HandshakeCap` and
+    `Closed::HandshakeCap`;
+  - unit tests;
+  - a `pub` accessor for the Handshake `since`.
+- crates/audit-event: the `HandshakeCap` closed kind, its name, and the
+  completeness tests. Also the pds/tls `names_match` table.
+- crates/pds/tls/src/main.rs:
+  - `Tls::pass` in C13's order;
+  - the held-back hello at `take_record`;
+  - `Pass::serve` returns `any_full || pass_due`;
+  - a fresh `now()` per `poll_egress`;
+  - a notify after each egress that sent;
+  - `after_egress`/`after_sign` once per pass after the last egress.
+- crates/ingress-core/src/tests.rs: the bare RST|ACK tier pair. No change to
+  the tiers or proofs.
+- tests/integration/run.py:
+  - the concurrent probe, with `backend`, the `X-Probe` marker, the
+    first-ServerHello times and the first-judged ordering predicate;
+  - per-port diagnosis and completion of the admitted handshakes;
+  - `BackendConn` first-chunk time;
+  - INTEGRATION-CASES unchanged.
+- tools/check-pins with fixtures; tools/check-selftest (three unit-gate
+  cases, one pins-gate case, one test-gate case).
+- tests/manifest.txt, expected deltas (R2-T-R3-6):
+  - UNIT-TESTS, UNIT-TLS-CORE and UNIT-INGRESS-CORE (+2);
+  - UNIT-AUDIT-EVENT, if its completeness tests gain cases (check-selftest
+    derives AUDIT_EVENT_TESTS from it);
+  - CHECK-PINS-RULES 19 → 20 and CHECK-PINS-FIXTURES (+4);
+  - INTEGRATION-CASES stays 77.
+
+  Case 12's hello flood now also counts `HandshakeCap` refusals as
+  "ended"; that is recorded.
+- Deviation log:
+  - R2's measurements, each run classified (complete, capacity or stall)
+    with its evidence, `HS_CAP`'s value and its derivation, and RM6-8;
+  - the stall's attribution, if one is seen;
+  - the RST-loss residual;
+  - steps 3 and 6 recorded as review-only.

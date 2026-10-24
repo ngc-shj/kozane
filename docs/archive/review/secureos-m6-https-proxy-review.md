@@ -522,3 +522,165 @@ fired D3; R1 moves the TLS signing key into its own key PD.
 
 Saturation: no Critical or Major open in any category, no design finding
 open, the last Minors applied. C12 locked.
+
+## Re-plan R2 review, round 1 (2026-10-25)
+
+R2's first draft proposed two changes: one ClientHello per pass with a rotating index, and an
+outside egress after each connection. Three experts reviewed it.
+
+- **Functionality.**
+  - Major:
+    - F1: a deferred hello schedules no pass.
+    - F2: rotation ignores the admission deadline.
+    - F3: the holder's sign runs before others' Finished.
+    - F4: the egress timestamp is stale, no notify goes out mid-pass, and the effect cannot be pinned.
+    - F5: no capacity contract.
+  - Minor:
+    - F6: the deferral point, the phase guard and the turn unit.
+    - F7: a half-closed client.
+- **Security.**
+  - Major:
+    - S1: silent turn holders, with no follow-up pass.
+  - Minor:
+    - S2: the time bound.
+    - S3: the fragmented hello.
+    - S4: the FIN claim was wrong; an RST is dropped at the TLS tier after the slot is released.
+- **Testing.**
+  - Major:
+    - T1: no follow-up pass.
+    - T2: staggering controls neither change.
+    - T3: a time threshold is flaky both ways.
+    - T4: rotation can't be red-proved without re-arrival.
+    - T5: there is no counter line.
+    - T6: fix-or-record has no repro budget.
+  - Minor:
+    - T7: fragments.
+    - T8: wiring and the host name. mrx33 is a third worker set up the same day, so this needs no change.
+
+All are resolved in R2's revision; each resolution is cited inline as R2-F*/S*/T*:
+
+- earliest-admission turn;
+- the hello served last after an egress;
+- another pass while a hello waits;
+- fresh egress time;
+- per-connection egress dropped;
+- the capacity contract with a trigger;
+- the bare-RST Answer-tier exemption with an R43 bound;
+- per-port diagnosis with backend receipt;
+- the ordering predicate instead of a time threshold;
+- the stated reproduction budget.
+
+Diagnosis runs since round 1: 3 more runs, 24 of 24 handshakes complete; the 25.5 s stall did not
+recur.
+
+## Re-plan R2 review, round 2 (2026-10-25)
+
+- **Functionality.**
+  - Resolved: F1–F4, F6 and F7 (accepted by design).
+  - F5 continuing as N2 (Major): the evidence already breaks the capacity trigger.
+  - New: N1 (Major), the RST exemption breaks I8 and its proofs, and its R43 bound is false. N3 (Minor), where `after_egress` goes. N4 (Minor), step 3 and the wiring are not pinned.
+- **Security.**
+  - Resolved: S1–S3.
+  - New: S5 (Major), the bare-RST exemption. A compromised `tls` can send RSTs to any address, and a remote attacker can elicit them; either takes the answer and unsolicited buffers. Recommended: no exemption, recorded as a residual.
+- **Testing.**
+  - Resolved: T2, T3, T6–T8. T1, T4 and T5 partly resolved.
+  - New: N1 (Major), the test-gate needle depends on host load because other failures fire before the predicate. N2 (Minor), no per-port backend receipt and no ServerHello definition. N3 (Minor), the turn mutation is ambiguous. N4 (Minor), the PD wiring is unpinned. N5 (Minor), the RST pair could not tell the tiers apart.
+
+Resolved in R2's revision (rounds 1–2):
+
+- **RST loss:** no exemption, recorded as a residual, plus a unit pin of the TLS tier for a bare RST|ACK (S5/F-N1; T-N5 adapted).
+- **Capacity:** the `HS_CAP` mechanism is decided now; its value comes from C13's measurement with a stated formula, and refusals are audited `TlsClosed(HandshakeCap)` (F5/N2).
+- **RST bookkeeping:** `after_egress` and `after_sign` run once per pass, after the last egress (F-N3).
+- **Wiring:** a check-pins rule for `Pass::serve`'s `pass_due`; steps 3 and 6 recorded as review-only (F-N4, T-N4).
+- **Ordering predicate:** judged first, over whatever was observed, with every red case defined (T-N1).
+- **Per-port observation:** the `X-Probe` marker, the backend's first-chunk time, and the first ServerHello defined (T-N2).
+- **Turn mutation:** ignore `since`, pick the lowest eligible index (T-N3).
+- **Timeout unit test:** reworded as a `tick` regression.
+
+## Re-plan R2 review, round 3 (2026-10-25)
+
+Every round 2 finding is resolved, apart from part of T-N4 (the check-pins anchor).
+
+New findings:
+
+- **Functionality.**
+  - R3-F1 (Minor): "admitted" cannot be observed.
+  - R3-F2 (Minor): the two `HS_CAP` rules can disagree, and the measurement conditions are not stated.
+  - R3-F3 (Minor): the cap's stated purpose is wrong, its residuals are unrecorded, and the refusal precedence is not set.
+- **Security.**
+  - S6 (Minor): `HS_CAP` has no floor, so a single source could lock out new handshakes.
+- **Testing.**
+  - T-R3-1 (Major): below 3 admitted, the predicate is red on correct code; `c` is sensitive to outliers.
+  - T-R3-2 (Major): "admitted" cannot be observed, and exactly `HS_CAP` admitted is a race.
+  - T-R3-3 (Minor): the coalescing order is an unstated dependency.
+  - T-R3-4 (Minor): main.rs has three `fn serve`, so the check-pins anchor is ambiguous.
+  - T-R3-5 (Minor): the cap test cannot be built when `HS_CAP = MAX_CONNS`.
+  - T-R3-6 (Minor): the manifest deltas are not listed.
+
+Resolved in R2's revision (rounds 1–3):
+
+- **`HS_CAP`:**
+  - a compile-time assert of 3 ≤ `HS_CAP` ≤ `MAX_CONNS`, with both reasons stated;
+  - a result below 3 is a D3 stop;
+  - the value is measured with the cap inert;
+  - `c` and `L` come only from runs that met the completion rule;
+  - `min(MAX_CONNS-1, ⌊⅔T/c⌋)` applies when the first rule fails;
+  - `admit_with_cap` takes the cap as a parameter;
+  - the precedence is PerSource > HandshakeCap > Full;
+  - the purpose is restated as a latency bound;
+  - the residuals (the real-source lockout threshold, refusal slot occupancy) go under RM6-7.
+- **The probe:**
+  - admitted versus refused is classified per port from the sniffer, using a one-sided RST-before-timeout bound;
+  - admitted ≥ min(`HS_CAP`, conns), and no TlsTimeout line;
+  - admitted with no ServerHello gets its own needle;
+  - the refusal audit is expected iff the sniffer saw a refusal, and the ordering dependency is recorded.
+- **check-pins:** anchored in `impl Pass for Pass`, fail-if-missing, with deny fixtures and a pins-gate selftest on the real tree.
+- **Manifest:** the deltas are listed.
+
+## Re-plan R2 review, round 4 (2026-10-25, one verifier, all perspectives)
+
+Round 3 findings:
+
+- Resolved: R3-F1, R3-F3, S6, T-R3-2 to T-R3-6.
+- R3-F2: resolved, but it raised a new problem (N2 below).
+- T-R3-1: continued as R4-N1.
+
+New findings:
+
+- **R4-N1 (Major): the floor of 3 undercounts.** `pass_due` starts pass 2 before A's Finished can come back, so A's request reaches the backend only in pass 4's step 3. The floor is now 4, with the reason restated.
+- **R4-N2 (Major): the cap is undefined exactly when it is needed.** If queueing at the inert cap times out the 8th handshake on every run, every run counts as a stall and no value results. The fix defines a *capacity* run: the predicate holds, ServerHellos cross in admission order with no outlier gap, and the only failures are TlsTimeout(Handshake) on the latest-admitted ports. A capacity run feeds `c` and sets `L = ∞`. Six runs with no complete or capacity run is a D3 stop.
+
+Also changed: the second timing host is z1mn. mrx33 fails cookie boot a at 4209823 as well (2 of 2), which puts it outside the calibrated timing envelope.
+
+## Re-plan R2 review, round 5 (2026-10-25, one verifier)
+
+- **R4-N1 resolved.** The pass count was checked against the code: A's request leaves in pass 4's step 3, and D's flight is the first that can follow a receipt.
+- **R4-N2 partly resolved.** The intent is right; two new findings follow.
+- **R5-M1 (Major): admission order cannot be observed.** Ports admitted in the same pass share `since` and are ordered by slot index. The capacity-run definition is now decided only from observable facts: failed ports are among the last k first-ServerHello crossings, or have none; earlier ports completed; the gap rule is defined, with at least 3 gaps and an even-count median. The earliest-deadline order is left to the unit tests.
+- **R5-M2 (Major): the measurement runs were not separated from the gate.** Three changes:
+  - the probe prints per-port times and classification on its failing path;
+  - a capped tree re-runs the gate 3× on gx10 and z1mn;
+  - the deviation log records each run's classification.
+
+## Re-plan R2 review, round 6 (2026-10-25, final verification)
+
+R5-M1 and R5-M2 are resolved and consistent.
+
+The end-to-end read against the code found one Major. **R6-M1:** the precedence HandshakeCap > Full made `HS_CAP = MAX_CONNS` non-inert, because every new slot opens in Handshake. The existing `table_is_full_at_max_conns` would go red on correct code.
+
+Resolution, as R6-M1's first option and R3-F3's suggested order:
+- The precedence is PerSource > Full > HandshakeCap. HandshakeCap now means a free slot was withheld.
+- The unit tests pin Full with no free slot, and the inertness at `cap = MAX_CONNS`.
+
+Everything else checked clean in this round:
+- the floor-of-4 pass trace;
+- the lockstep mutation, red on both the inert and the capped tree;
+- the boot's case order versus HandshakeCap;
+- the check-pins anchor;
+- the fixture count.
+
+**Saturation call.** No Critical or Major finding is open.
+- R6-M1's fix is the reviewer's own first option, a one-line precedence change together with the restated tests.
+- It touches no other part of R2: the measurement, the probe and the gates are unaffected, because Full and HandshakeCap differ only when no slot is free.
+
+C13 is locked.
