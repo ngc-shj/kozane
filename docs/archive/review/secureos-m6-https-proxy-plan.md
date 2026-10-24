@@ -892,3 +892,42 @@ pattern, `audit-event` coalescing (`FRAME_DROPPED_BASE` pattern),
   protocol 47), boot group `https` with the slice-1 echo case.
 - tools/check-selftest: the four C1 `laws` cases; `CASES_FOR_GATE`.
 - tests/manifest.txt: every changed count.
+
+### Slice 2 (C5, C11)
+
+- crates/secret-blob: v3 layout (`tls_private` after `boot_seed`), `FIXED`
+  80 → 112, `MAX_PEERS` 124 → 123, v2 → `BadVersion`; the Python mirror test
+  asserts Rust body length = tools/package `_key_body` for several peer
+  counts.
+- crates/tpm2 envelope `KEY_MAX_PEERS` 110 → 109; tools/package
+  `_key_body` 80 → 112, `VERSION` 3.
+- crates/key-core: `Caller { Hs, Tls }`, exhaustive `allows()`, per-caller
+  buckets and boot seeds (`BLAKE2s(seed ‖ caller tag)`, `hs` included),
+  `LABEL_TLS_SIGN` = 4, `MAX_WORDS` 8, CertificateVerify content built in
+  `key`, RFC 6979 HMAC-DRBG with k' from RNDR, ≤ 8 candidates,
+  `libcrux_p256::ecdsa_sign_p256_sha2`, Secret types, `TlsKeyError`
+  (17/18) separate from `BootError`, the three compile-time invariants
+  (`SIGN_COST_NS` provisional until measured in slice 3), all C5 unit tests
+  (A.2.5, differential vs `rfc6979` incl. hash ≥ n, rejection branch, cap
+  via seam, two k', RNDR failure, label × caller, code collisions).
+- crates/pds/key: TLS check before the long-lived borrow, wipe [80:112] on
+  failure, stack scrub after the check and after each signature, `CH_TLS`
+  caller mapping, `MAX_WORDS` zeroing.
+- crates/hs-core: invariants per caller; crates/pds/hs:
+  `KeyWaitHighWater` value event (audit-event kind + audit PD name).
+- crates/layout: `TLS_BUDGET_NS`, `PERIOD_NS`, checked against the system
+  file.
+- tools/check-pins: libcrux-p256 lock-entry pin rule with a fixture.
+- crates/config: `tls_ports`, backend, `tls_cert`, `tls_public`; build.rs
+  emits `TLS_PORTS`, `BACKEND`, `TLS_CERT`, `TLS_PUBLIC` and checks the
+  26-byte SPKI prefix + `tls_public` inside the cert; validation of the
+  backend (inside prefix, neighbour) and `TLS_PORTS` bounds, with tests.
+- tools/mksecrets: P-256 scalar, blob v3, `tls.pub`, runs tools/mkcert,
+  config output; a `--tls-scalar-from-other` style option for the
+  TLS-only mismatch package (case 8).
+- tools/mkcert (new, Python `cryptography`): dev CA per C11 (both name
+  forms, pathLen 0, 30 days, key never serialized, `--test-negative`),
+  leaf (EKU serverAuth, KU digitalSignature, CA:false; IP mode empty
+  subject + critical SAN); tests/tools/test_mkcert.py with MKCERT-FIXTURES.
+- run.py: `KEY_CALLERS`, codes 17/18, blob offsets, the packaged boots use
+  v3 blobs; tests/manifest.txt; check-selftest cases for the new controls.
