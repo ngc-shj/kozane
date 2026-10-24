@@ -1,18 +1,22 @@
 //! `inner` (plan C13): the inside NIC's only consumer. Forwards IPv4 from
 //! static neighbors to `data` for the tunnel and frames decrypted packets
 //! for static neighbors. Sees tunnelled plaintext (law L3), no secrets.
+//! Also the HTTPS backend link (M6 plan C4): the backend's segments to
+//! `tls` go to `ntl`, and `tls`'s segments from `tln` leave only towards the
+//! backend; both are proxied plaintext, which this PD sees by design.
 
 #![no_std]
 #![no_main]
 
 use audit_event::Event;
-use inner_core::{Config, FromLan, ToLan, from_lan, to_lan};
+use inner_core::{Config, FromLan, FromTls, TLS_REFUSED, ToLan, from_lan, from_tls, to_lan};
 use layout::inner as ch;
 use pdkit::{Audit, Buf, Rx, Tx};
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, memory_region_symbol, protection_domain};
 
 const ETH_IN: Channel = Channel::new(ch::CH_ETH_IN);
 const DATA: Channel = Channel::new(ch::CH_DATA);
+const TLS: Channel = Channel::new(ch::CH_TLS);
 const MAX_NEIGHBORS: usize = config::MAX_NEIGHBORS;
 const _: () = assert!(config::NEIGHBORS.len() <= MAX_NEIGHBORS);
 
@@ -21,11 +25,10 @@ struct Inner {
     to_driver: Tx,
     to_data: Tx,
     from_data: Rx,
-    /// The HTTPS backend links (M6 plan C1): `tls`'s segments to the
-    /// backend and the backend's to `tls`. Mapped, nothing forwarded yet
-    /// (the backend routing is plan C4).
-    _from_tls: Rx,
-    _to_tls: Tx,
+    /// The HTTPS backend links (M6 plan C1, C4): `tls`'s segments to the
+    /// backend and the backend's to `tls`.
+    from_tls: Rx,
+    to_tls: Tx,
     audit: Audit,
     neighbors: [([u8; 4], [u8; 6]); MAX_NEIGHBORS],
     neighbor_count: usize,
@@ -83,8 +86,8 @@ fn init() -> Inner {
         to_driver,
         to_data,
         from_data,
-        _from_tls: from_tls,
-        _to_tls: to_tls,
+        from_tls,
+        to_tls,
         audit,
         neighbors,
         neighbor_count: config::NEIGHBORS.len(),
@@ -98,10 +101,17 @@ fn init() -> Inner {
 struct Wake {
     driver: bool,
     data: bool,
+    tls: bool,
 }
 
 fn lan_config(neighbors: &[([u8; 4], [u8; 6])]) -> Config<'_> {
-    Config { mac: config::INSIDE_MAC, ipv4: config::INSIDE_IP, neighbors }
+    Config {
+        mac: config::INSIDE_MAC,
+        ipv4: config::INSIDE_IP,
+        neighbors,
+        backend: config::BACKEND,
+        tls_ports: config::TLS_PORTS,
+    }
 }
 
 impl Inner {
@@ -122,6 +132,10 @@ impl Inner {
                 FromLan::Forward(len) => {
                     let p = reply.get(..len).unwrap_or(&[]);
                     wake.data |= pdkit::send(&mut self.to_data, &mut self.scratch, p, &mut self.audit);
+                }
+                FromLan::Tls(len) => {
+                    let p = reply.get(..len).unwrap_or(&[]);
+                    wake.tls |= pdkit::send(&mut self.to_tls, &mut self.scratch, p, &mut self.audit);
                 }
                 FromLan::Dropped(reason) => self.audit.record(Event::FrameDropped { reason: reason as u16 }),
                 FromLan::NotForUs => self.audit.record(Event::NotForUs),
@@ -147,6 +161,26 @@ impl Inner {
             }
         }
     }
+
+    /// `tls`'s segments leave only through `from_tls`, the gate for what
+    /// `tls` can reach inside.
+    fn drain_tls(&mut self, wake: &mut Wake) {
+        while let Some(n) = pdkit::recv(&mut self.from_tls, &mut self.buf, &mut self.audit) {
+            wake.tls = true;
+            let cfg = lan_config(self.neighbors.get(..self.neighbor_count).unwrap_or(&[]));
+            let frame = &mut self.reply;
+            match from_tls(&cfg, self.buf.get(..n).unwrap_or(&[]), frame) {
+                FromTls::Emitted(len) => {
+                    let f = frame.get(..len).unwrap_or(&[]);
+                    wake.driver |= pdkit::send(&mut self.to_driver, &mut self.scratch, f, &mut self.audit);
+                }
+                FromTls::Dropped(reason) => self.audit.record(Event::FrameDropped { reason: reason as u16 }),
+                FromTls::Refused => self.audit.record(Event::FrameDropped { reason: TLS_REFUSED as u16 }),
+                FromTls::UnknownNeighbor => self.audit.record(Event::UnknownNeighbor),
+                FromTls::NoBuffer => self.audit.record(Event::TxNoBuffer),
+            }
+        }
+    }
 }
 
 impl Handler for Inner {
@@ -155,12 +189,16 @@ impl Handler for Inner {
     fn notified(&mut self, _channels: ChannelSet) -> Result<(), Self::Error> {
         let mut wake = Wake::default();
         self.drain_tunnel(&mut wake);
+        self.drain_tls(&mut wake);
         self.drain_lan(&mut wake);
         if wake.driver {
             ETH_IN.notify();
         }
         if wake.data {
             DATA.notify();
+        }
+        if wake.tls {
+            TLS.notify();
         }
         self.audit.flush();
         Ok(())
