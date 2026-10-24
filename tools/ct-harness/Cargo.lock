@@ -185,6 +185,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ct"
+version = "0.1.0"
+
+[[package]]
 name = "ct-harness"
 version = "0.1.0"
 dependencies = [
@@ -1046,6 +1050,7 @@ dependencies = [
 name = "wg-core"
 version = "0.1.0"
 dependencies = [
+ "ct",
  "libcrux-blake2",
  "libcrux-chacha20poly1305",
  "libcrux-curve25519",

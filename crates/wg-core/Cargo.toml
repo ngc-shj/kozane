@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+ct = { path = "../ct" }
 libcrux-blake2 = { version = "=0.0.9", default-features = false }
 libcrux-chacha20poly1305 = { version = "=0.0.10", default-features = false }
 libcrux-curve25519 = { version = "=0.0.9", default-features = false }

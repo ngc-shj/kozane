@@ -5,12 +5,23 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# The constant-time compare for Finished (M6 plan C7, S9).
+ct = { path = "../ct" }
 # Every primitive of the TLS 1.3 profile (M6 plan D1, C7), pinned to the
 # versions the rest of the workspace locks; ML-KEM-768 is its own feature,
-# which the per-PD build keeps out of `pq`.
+# which the per-PD build keeps out of `pq`. HKDF is built on libcrux-hmac:
+# libcrux-hkdf's expand allocates and the `tls` PD has no heap.
 libcrux-chacha20poly1305 = { version = "=0.0.10", default-features = false }
 libcrux-curve25519 = { version = "=0.0.9", default-features = false }
-libcrux-hkdf = { version = "=0.0.9", default-features = false }
 libcrux-hmac = { version = "=0.0.9", default-features = false }
 libcrux-ml-kem = { version = "=0.0.11", default-features = false, features = ["mlkem768"] }
 libcrux-sha2 = { version = "=0.0.9", default-features = false }
+tls-wire = { path = "../tls-wire" }
+# Wiping secret types (L12); featureless, as P16 requires of every member.
+zeroize = { version = "=1.8.1", default-features = false }
+
+[dev-dependencies]
+# The reference the HKDF over libcrux-hmac is checked against (host only).
+libcrux-hkdf = { version = "=0.0.9", default-features = false }
+# The tests' CertificateVerify signer, standing in for `key`'s TlsSign.
+libcrux-p256 = { version = "=0.0.9", default-features = false, features = ["expose-hacl"] }

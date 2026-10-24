@@ -157,3 +157,111 @@ Deviations:
   Slice 1 ran only the `https` and `raw frames` boots. The check now treats
   a garbled report as any occurrence that is not a whole line of some
   producer, and takes each PD's marks from its own lines.
+
+## Slice 3a (C6, C7 host side, C10's conn)
+
+Gates run: make pins/lint/lint-pds/unit/laws/image. Not run (by the
+slice's rules): Kani, Verus, bolero, ct, ct-shape, mir, make test/check,
+check-selftest. The selftest cases added here were red-proved by hand on
+throwaway copies under build/ (the session scratchpad is not mounted in
+the dev container): each failed with its needle.
+
+Lock (one change for the rest of M6, owner decision 2026-10-24):
+
+- **New leaf crate `ct`** holding the repo's `ct_eq`, moved verbatim from
+  `wg_core::crypto`, which re-exports it (`pub use ct::ct_eq`), so tpm2,
+  key-core and wg-core compile unchanged. tls-core depends on `ct`, not on
+  wg-core. tools/ct-harness's own lock gains `ct` (tpm2 → wg-core → ct).
+- Edges added now so Cargo.lock changes once: tls-wire and http-wire
+  dev-dep bolero `=0.13.4`; tls-core → ct, tls-wire, zeroize `=1.8.1`
+  (featureless, P16), dev-deps libcrux-p256 (`expose-hacl`) and
+  libcrux-hkdf; pd-tls → tls-core, tls-wire, http-wire, key-core (labels and
+  words, as pd-hs), wire (reading its own transmitted packets for the abort
+  RST, C8) and zeroize (socket storage wipe). Unused for now; no
+  unused-dependency lint is enforced. No package version changed.
+- **MIR-CRATES 8 → 9 expected**: tls-wire joins kani_crates and is now in
+  pd-tls's dependency closure.
+
+Deviations and decisions:
+
+- **HKDF over libcrux-hmac, not libcrux-hkdf (C7 said libcrux-hkdf).**
+  libcrux-hkdf 0.0.9's expand allocates (`vec!`/`Box`, hacl-rs `alloc`) and
+  the `tls` PD has no heap. Every TLS 1.3 output with SHA-256 is at most one
+  hash long, so HKDF-Expand is its first block T(1) = HMAC(PRK, info ‖ 1);
+  Extract is HMAC(salt, IKM) (RFC 5869). libcrux-hkdf moved to a tls-core
+  dev-dependency and the unit tests compare against it; RFC 8448 and the
+  OpenSSL keylog fixture check the schedule end to end.
+- **Hedged RNG keyed with HMAC-SHA256** (the `pq` pattern over libcrux-hmac,
+  which tls-core already has) rather than BLAKE2b: no blake2 edge.
+- **KeyUpdate must end at a record boundary too** (RFC 8446 section 5.1;
+  C6 listed ClientHello and the client Finished): the read key changes after
+  it. Refused with `NotAtRecordBoundary`.
+- **Our bounds for linear duplicate checks:** at most 64 extensions
+  (`DuplicateExtension` beyond) and 16 key_share entries (`Decode` beyond);
+  real clients send about 20 and 1–3.
+- **`Refusal` lives in tls-wire** (both crates' reasons, 32 codes, the width
+  reserved for `TLS_REFUSED_BASE`); `alert()` maps each, None for the
+  peer's own alert and for input after close. Alerts where RFC 8446 leaves
+  the choice: record version and an over-long handshake message →
+  decode_error; supported-but-no-share (RM6-6) and missing
+  signature_algorithms → handshake_failure; duplicate extension →
+  illegal_parameter.
+- **Anything but a ClientHello is refused from its first byte**, not
+  buffered until complete.
+- **The server flight is one protected record per message** (EE, Cert, CV,
+  Finished), each at most 4 KiB; no middlebox-compatibility CCS from the
+  server (OpenSSL and curl need none).
+- **A plaintext alert after our ServerHello** (a client that could not use
+  it) is `PeerAlert` (not answered); any other plaintext handshake or alert
+  record after the ServerHello is unexpected_message.
+- **early_data's 16 KiB counts the skipped records' bodies** (ciphertext
+  bytes); the unit cases are 16 384 accepted, 16 385 refused.
+- **Sequence numbers:** u64::MAX is never used; application data stops at
+  u64::MAX − 1 so a closing alert always has a nonce.
+- **Close sequencing in `conn`:** close_notify (backend FIN, self-generated
+  response) drains, lingers ≤ 2 s, then aborts; a fatal alert drains then
+  aborts without the linger; backend RST, client close before the response
+  end, errors and every timeout abort at once (wiped first). The backend
+  socket's RST is tracked only once the head stage has opened it (slice 4).
+- **`SCRUB_DEPTH_EXCHANGE` 48 KiB, PROVISIONAL**, not measured: above
+  libcrux ML-KEM-768 encapsulation frames at the PD's opt-level inside the
+  128 KiB stack; the slice-3b ct-harness residue case asserts the painted
+  high-water within it.
+- **The host test client reuses tls-core's schedule and record code**; the
+  RFC 8448 (all SHA-256 values, checked against Python as well) and keylog
+  fixtures check those independently.
+- **check-pins:** P11 becomes `TAG_SETS` (tpm2, key-core, pds/tls: hmac/tag;
+  tls-core: finished/verify_data anchored on handshake.rs; pds/tls also
+  finished/verify_data); P18 the L14 constructor rule (crates/ and tools/);
+  P19 the code-point tripwire in tls-core, narrowed against false
+  positives: two-digit hex only for 0x1d/0x1e (0x17 is application_data,
+  0x18 KeyUpdate, 0x20 the CertificateVerify padding) and decimal byte pairs
+  only for 23–25, 29 and 30 (`0, 32` is a Finished length).
+- **`Table::new` is not `const`** (libcrux's `Sha256::new` is not): slice 3b
+  initializes the PD's table at init.
+- **Fixture capture scripts** in tests/tls/: `capture_client_hellos.py`
+  (raw listener; OpenSSL 3.5.7 s_client and curl 8.14 with and without
+  `X25519MLKEM768`, `-groups X25519`, `-tls1_2`), `der_fixture.py` (five
+  OpenSSL-verified signatures covering each INTEGER shape),
+  `capture_keylog.py` (s_server/s_client through a recording relay, keys
+  and records decrypted by Python `cryptography`; s_client's `k` command
+  needs `-ign_eof` off).
+
+### Slice 3a verification (orchestrator)
+
+- Gates green: pins, lint, lint-pds, unit, laws, ct, ct-shape, mir, bolero
+  (5 targets; the tls-wire seeds had to be in the index for the committed-
+  seed check, and were committed with feb7ec1 by mistake — they belong to
+  this slice); selftest's 18 new cases red with their needles.
+- **Kani harness narrowed:** `client_hello_is_total_and_refused_within_96_bytes`
+  walked 96 symbolic bytes through `client_hello` and again through `walk`;
+  cbmc passed 32 GiB on gx10 and was stopped before the 40 GiB cap. The
+  walker is its own harness, so the ClientHello harness now proves only
+  `client_hello`'s totality over 64 bytes (past the fixed fields into the
+  extension block), covering a refusal decided there.
+- Kani for this slice was still running at commit time (tls-wire on gx10,
+  the full suite after the lock change on z1mn); results are recorded with
+  slice 3b.
+- HKDF is built on libcrux-hmac (T(1) expand) because libcrux-hkdf 0.0.9's
+  expand allocates and `tls` has no heap; checked against libcrux-hkdf in a
+  host test and by RFC 8448.

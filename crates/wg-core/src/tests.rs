@@ -189,13 +189,6 @@ fn initial_chaining_key_and_hash_match_wireguard() {
     );
 }
 
-#[test]
-fn ct_eq_compares_contents_and_length() {
-    assert!(ct_eq(b"abcd", b"abcd"));
-    assert!(!ct_eq(b"abcd", b"abce"));
-    assert!(!ct_eq(b"abcd", b"abc"));
-}
-
 // --- session ---
 
 const T0: u64 = 1_000_000_000_000;

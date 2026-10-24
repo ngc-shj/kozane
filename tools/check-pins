@@ -27,15 +27,19 @@ Rules:
      `Zeroizing<` in rosenpass-core, pqkey-core, pds/pq, pds/pqkey,
      pds/ingress, and on any type in mce460896 but RngError, which keeps its
      secrets in plain arrays (L12, M3 plan S12, M4 plan C11; pqkey-core
-     holds its secrets in `Zeroizing`), and in tpm2 (M5 plan I10.3)
+     holds its secrets in `Zeroizing`), in tpm2 (M5 plan I10.3), and in
+     tls-core, pds/tls and key-core (M6 plan S9)
   P10 no `from_bytes(*` in the secret crates or in hs-core, key-core,
-     data-core, wg-core, tpm2 and the key, hs and data PDs: a dereferenced array is a by-value temporary of
+     data-core, wg-core, tpm2, tls-core and the key, hs, data and tls PDs: a dereferenced array is a by-value temporary of
      the secret left on the stack; `copy_from(&..)` copies in place (L12)
-  P11 no cookie (COOKIE_FILES, M3b plan S3) and no HMAC tag (any source in
-     TAG_CRATE, crates/tpm2: its Unseal response check, M5 plan I10.1)
-     compared with == or !=; every compare goes through ct_eq. A tripwire:
-     the names it reads are lowercase `cookie`/`hmac`/`tag`, and only `==`
-     and `!=` are matched (not `.eq()` or a wrapper)
+  P11 no cookie (COOKIE_FILES, M3b plan S3) and no tag of a TAG_SETS crate
+     (any source in it: tpm2's HMAC tags, its Unseal response check, M5
+     plan I10.1; key-core's and pds/tls's HMAC tags; tls-core's Finished
+     verify_data, M6 plan S9) compared with == or !=; every compare goes
+     through ct_eq. Each set names an anchor file that must exist while its
+     crate does (the file holding the check today). A tripwire: the names
+     it reads are lowercase `cookie`/`hmac`/`tag`/`finished`/`verify_data`,
+     and only `==` and `!=` are matched (not `.eq()` or a wrapper)
   P12 in every crate of the Makefile's verus_crates, the Verus trusted
      constructs equal policy/verus-trusted.toml as a multiset of (file,
      construct, item), by tools/verus_trusted.py's comparison, the one the
@@ -62,6 +66,17 @@ Rules:
      (`SIGN_COST_LIBCRUX_P256`): the sign cost the key-wait invariant uses
      was measured for that code, so a changed entry means re-measuring
      (M6 plan C5, T-R3-10)
+  P18 L14's constructor rule (M6 plan L14, C7): in crates/ and tools/, a
+     `HybridSecret(..)`/`HybridSecret { .. }` construction only inside
+     `exchange_with_randomness` in crates/tls-core/src/hybrid.rs (the body
+     `HybridSecret::exchange` delegates to), no `Self(..)`/`Self { .. }` in
+     that file, no `impl .. for HybridSecret` (From, Default, Clone, ...)
+     and no derive on it
+  P19 a classical key-exchange group's code point in crates/tls-core
+     (L14, S6): secp256r1..secp521r1, x25519, x448, brainpool and ffdhe as
+     a 4-digit hex literal (0x0017, 0x001D, 0x0100), x25519/x448 as 0x1d/0x1e,
+     a byte pair (`0x00, 0x1d`, `0, 29`), a u16-suffixed decimal (`23u16`) or
+     a bare `29`
 
 Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
 fail until they are removed from PENDING; --enforce-pending makes them fail
@@ -79,6 +94,13 @@ that gate made to fail.
 
 P6 and P17 are fail-closed binding checks (Cargo.lock against
 policy/waivers.toml; against key-core's recorded entry).
+P7-P11 and P19 are best-effort tripwires over source text; P19's known
+bypasses: a code point computed (`0x10 + 13`), built from bytes out of
+order, read from configuration, or spelled in a dependency. L14's
+adjudicating control is the type system: `KeySchedule::new` takes only a
+`HybridSecret`, whose field is private and which is not Clone/Copy/Default
+(tls-core's compile_fail doctests); P18 guards the one module that can
+construct it.
 P7-P10 are best-effort tripwires over source text. Known bypasses: a
 hand-written `impl Debug`/`impl Clone` or a macro-generated derive (P9), a
 `use ... as` alias or a renamed dependency key (`package = "getrandom"`)
@@ -104,14 +126,15 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
-RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P17"]
+RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P17",
+         "P18", "P19"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
-               "crates/pds/key", "crates/pds/hs", "crates/pds/data"]
+               "crates/tls-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data", "crates/pds/tls"]
 PENDING: set[str] = set()
 # Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
 SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/ingress",
-                 "crates/mce460896", "crates/tpm2"]
+                 "crates/mce460896", "crates/tpm2", "crates/tls-core", "crates/pds/tls", "crates/key-core"]
 # mce460896's types that hold no secret (P9): every other type there does.
 MCE_PUBLIC_TYPES = {"RngError"}
 # Types that hold a secret under a name of their own, not as Secret<..> (P9,
@@ -120,13 +143,24 @@ SECRET_TYPES = ("Secret<", "Zeroizing<", "CookieSecret")
 # Files that compare cookie values; every compare goes through ct_eq (P11,
 # M3b plan S3). A tripwire over names: a value not named *cookie* escapes it.
 COOKIE_FILES = ["crates/rosenpass-core/src/cookie.rs", "crates/pds/ingress/src/rp_cookie.rs"]
-# Files that compare HMAC tags; every compare goes through ct_eq (P11, M5
-# plan I10.1). The same kind of tripwire, over *hmac*/*tag* names.
-# The crate whose every source file must compare HMAC tags with ct_eq (P11,
-# M5 plan I10.1): the whole crate, so a check that moves out of client.rs
-# stays covered. client.rs, which holds the Unseal check today, must exist.
-TAG_CRATE = "crates/tpm2"
-TAG_ANCHOR = "crates/tpm2/src/client.rs"
+# Crates whose every source file must compare tags with ct_eq (P11): the
+# whole crate, so a check that moves out of its file stays covered; the
+# anchor, the file holding the check today, must exist while the crate
+# does. (crate, anchor, names, what): tpm2's Unseal response HMAC (M5 plan
+# I10.1), key-core's and pds/tls's HMAC tags, and tls-core's Finished,
+# verified in handshake.rs (M6 plan S9, T-N1).
+TAG_SETS = [
+    ("crates/tpm2", "crates/tpm2/src/client.rs", "hmac|tag", "an HMAC tag"),
+    ("crates/key-core", "crates/key-core/src/lib.rs", "hmac|tag", "an HMAC tag"),
+    ("crates/pds/tls", "crates/pds/tls/src/main.rs", "hmac|tag|finished|verify_data", "a tag or Finished"),
+    ("crates/tls-core", "crates/tls-core/src/handshake.rs", "finished|verify_data", "a Finished verify_data"),
+]
+# L14 (P18): the one module, and the one function in it, that construct
+# HybridSecret.
+HYBRID_MODULE = "crates/tls-core/src/hybrid.rs"
+HYBRID_ROOT = "exchange_with_randomness"
+# P19: where the classical code points must not appear.
+CODE_POINT_CRATE = "crates/tls-core"
 
 
 def run_blocks(dockerfile: str):
@@ -338,16 +372,88 @@ def check_cookie_compares(root: pathlib.Path, out: list):
         for m in re.finditer(r"\b\w*cookie\w*\b[\])]*\s*[!=]=(?!=)|[!=]=\s*[&*]?\w*cookie\w*\b", code):
             n = code.count("\n", 0, m.start()) + 1
             out.append(f"P11 {rel}:{n}: a cookie compared with == or !=; use ct_eq")
-    if (root / TAG_CRATE).is_dir() and not (root / TAG_ANCHOR).is_file():
-        out.append(f"P11 {TAG_ANCHOR}: missing; the tag compare tripwire has nothing to check")
-    for rel, text in crate_sources(root, TAG_CRATE):
+    for crate, anchor, names, what in TAG_SETS:
+        if (root / crate).is_dir() and not (root / anchor).is_file():
+            out.append(f"P11 {anchor}: missing; the tag compare tripwire has nothing to check")
+        pattern = re.compile(rf"\b\w*(?:{names})\w*\b[\])]*\s*[!=]=(?!=)|[!=]=\s*[&*]?\w*(?:{names})\w*\b")
+        for rel, text in crate_sources(root, crate):
+            if not rel.endswith(".rs"):
+                continue
+            code = strip_rust_comments(text)
+            unterminated("P11", rel, code, out)
+            for m in pattern.finditer(code):
+                n = code.count("\n", 0, m.start()) + 1
+                out.append(f"P11 {rel}:{n}: {what} compared with == or !=; use ct_eq")
+
+
+def body_span(code: str, name: str):
+    """The [start, end) of fn `name`'s body braces, or None."""
+    m = re.search(rf"\bfn\s+{name}\b", code)
+    if not m:
+        return None
+    start = code.find("{", m.end())
+    depth = 0
+    for i in range(start, len(code)):
+        if code[i] == "{":
+            depth += 1
+        elif code[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return start, i + 1
+    return start, len(code)
+
+
+def check_hybrid_constructors(root: pathlib.Path, out: list):
+    for top in ("crates", "tools"):
+        for rel, text in crate_sources(root, top):
+            if not rel.endswith(".rs"):
+                continue
+            code = strip_rust_comments(text)
+            unterminated("P18", rel, code, out)
+            line = lambda pos: code.count("\n", 0, pos) + 1
+            allowed = body_span(code, HYBRID_ROOT) if rel == HYBRID_MODULE else None
+            for m in re.finditer(r"\bHybridSecret\s*[({]", code):
+                before = code[max(0, m.start() - 40):m.start()]
+                if re.search(r"\b(struct|impl(\s*<[^>]*>)?|for)\s+$", before):
+                    continue
+                if allowed and allowed[0] <= m.start() < allowed[1]:
+                    continue
+                out.append(f"P18 {rel}:{line(m.start())}: HybridSecret constructed outside {HYBRID_ROOT} (L14)")
+            for m in re.finditer(r"\bimpl\b[^{;]*?\bfor\s+(?:[\w:]+::)?HybridSecret\b", code):
+                out.append(f"P18 {rel}:{line(m.start())}: a trait impl for HybridSecret can make or copy one (L14)")
+            for m in re.finditer(r"\bderive\(([^)]*)\)", code):
+                if re.match(r"\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?struct\s+HybridSecret\b", code[m.end() + 1:]):
+                    out.append(f"P18 {rel}:{line(m.start())}: derive({m.group(1)}) on HybridSecret (L14)")
+            if rel == HYBRID_MODULE:
+                for m in re.finditer(r"\bSelf\s*[({]", code):
+                    out.append(f"P18 {rel}:{line(m.start())}: Self(..) constructs HybridSecret outside {HYBRID_ROOT} (L14)")
+    module = root / HYBRID_MODULE
+    if (root / CODE_POINT_CRATE).is_dir() and (not module.is_file() or body_span(module.read_text(), HYBRID_ROOT) is None):
+        out.append(f"P18 {HYBRID_MODULE}: no {HYBRID_ROOT}; the constructor rule has nothing to anchor on")
+
+
+# P19: classical groups (RFC 8446 section 4.2.7, RFC 8734, RFC 7919) as
+# spelled in Rust source.
+CLASSICAL_SPELLINGS = [
+    (re.compile(r"\b0x00_?(?:1[7-9a-f]|2[01])\b", re.I), "a 4-digit hex code point"),
+    (re.compile(r"\b0x01_?0[0-4]\b", re.I), "an ffdhe code point"),
+    (re.compile(r"\b0x1[de]\b", re.I), "x25519/x448's low byte"),
+    (re.compile(r"(?<![\w.])(?:0x0+|0)\s*,\s*(?:0x(?:1[7-9a-f]|2[01])|2[3-59]|30)(?![\w.])", re.I), "a code point's byte pair"),
+    (re.compile(r"(?<![\w.])(?:2[3-9]|3[0-3]|25[6-9]|260)_?u16\b"), "a u16 code point"),
+    (re.compile(r"(?<![\w.])29(?![\w.])"), "x25519's code point"),
+]
+
+
+def check_classical_groups(root: pathlib.Path, out: list):
+    for rel, text in crate_sources(root, CODE_POINT_CRATE):
         if not rel.endswith(".rs"):
             continue
         code = strip_rust_comments(text)
-        unterminated("P11", rel, code, out)
-        for m in re.finditer(r"\b\w*(?:hmac|tag)\w*\b[\])]*\s*[!=]=(?!=)|[!=]=\s*[&*]?\w*(?:hmac|tag)\w*\b", code):
-            n = code.count("\n", 0, m.start()) + 1
-            out.append(f"P11 {rel}:{n}: an HMAC tag compared with == or !=; use ct_eq")
+        unterminated("P19", rel, code, out)
+        for pattern, what in CLASSICAL_SPELLINGS:
+            for m in pattern.finditer(code):
+                n = code.count("\n", 0, m.start()) + 1
+                out.append(f"P19 {rel}:{n}: {what} of a classical group ({m.group(0)!r}); L14 allows X25519MLKEM768 only")
 
 
 def strip_rust_comments(text: str) -> str:
@@ -673,6 +779,8 @@ def main() -> int:
     check_client_requests(root, out)
     check_mce_deps(root, out)
     check_sign_cost_pin(root, out)
+    check_hybrid_constructors(root, out)
+    check_classical_groups(root, out)
     failing = [l for l in out if l.split()[0] not in pending]
     for line in out:
         print(line if line in failing else f"pending {line}")

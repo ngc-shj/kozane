@@ -77,14 +77,9 @@ pub enum CryptoError {
     ZeroDh,
 }
 
-/// Constant-time equality for tags compared in hand-written code.
-pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let diff = a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y));
-    core::hint::black_box(diff) == 0
-}
+/// Constant-time equality, from the shared leaf crate (callers keep this
+/// path).
+pub use ct::ct_eq;
 
 /// HASH(parts[0] || parts[1] || ...).
 pub fn hash(parts: &[&[u8]]) -> Result<[u8; HASH_LEN], CryptoError> {

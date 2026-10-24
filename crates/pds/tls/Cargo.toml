@@ -8,10 +8,22 @@ license.workspace = true
 audit-event = { path = "../../audit-event" }
 config = { path = "../../config" }
 cpu = { path = "../../cpu" }
+# The request head parser and rewrite (M6 plan C9; wired in slice 4).
+http-wire = { path = "../../http-wire" }
+# The TlsSign/BootSeed labels and reply words (M6 plan C5), as pd-hs.
+key-core = { path = "../../key-core" }
 layout = { path = "../../layout" }
 pdkit = { path = "../../pdkit" }
 ring = { path = "../../ring" }
 sel4-microkit.workspace = true
+# The TLS server and its record/handshake codecs (M6 plan C6, C7).
+tls-core = { path = "../../tls-core" }
+tls-wire = { path = "../../tls-wire" }
+# Its own transmitted IPv4/TCP packets are read to observe an abort's RST
+# (M6 plan C8, F-R6-2).
+wire = { path = "../../wire" }
+# Socket storage wiped after an abort (M6 plan C8); featureless (P16).
+zeroize = { version = "=1.8.1", default-features = false }
 # TCP state for the HTTPS endpoint (M6 plan D2): IPv4 over a raw IP
 # medium, TCP sockets only, no `alloc`.
 smoltcp = { version = "=0.14.0", default-features = false, features = ["medium-ip", "proto-ipv4", "socket-tcp"] }

@@ -125,7 +125,8 @@ KANI_HARNESS = (
 CASES_FOR_GATE = {
     "clean-counts": {"stale-counts", "check-propagation"},
     # pins runs the package checker fixtures; package-debug drives the real target.
-    "pins": {"pins", "package-debug", "package-waiver", "package-waiver-removed", "c5-lock-pin", "mkcert-constraints"},
+    "pins": {"pins", "package-debug", "package-waiver", "package-waiver-removed", "c5-lock-pin", "mkcert-constraints",
+             "l14-constructor", "l14-codepoint", "finished-ct-eq"},
     "lint": {"lint"},
     "audit": {"audit"},
     "lint-pds": {"lint-pds"},
@@ -138,7 +139,10 @@ CASES_FOR_GATE = {
              "rp-cookie-offload", "rp-tx-tier", "rp-reply-fifo", "rp-reply-order", "rp-reply-dst", "rp-sync-sticky",
              "mce-fresh-draw", "c2-tcp-checksum", "c2-syn-fin", "c2-tls-egress-src", "c2-tls-tier", "c2-syn-src-bucket",
              "c5-tls-static-dh", "c5-k-prime", "c5-nonce-cap", "c5-cv-content", "c5-tls-boot-fail", "c5-tls-wipe",
-             "c5-d5-codes", "c5-seed-tag", "c5-caller-bucket", "c5-sign-wait", "c5-syn-burst", "c5-syn-interval"},
+             "c5-d5-codes", "c5-seed-tag", "c5-caller-bucket", "c5-sign-wait", "c5-syn-burst", "c5-syn-interval",
+             "l14-clone", "finished-check", "ccs-once", "ccs-after-finished", "key-share-length", "duplicate-extension",
+             "no-key-share-reason", "der-minimal", "early-data-after-connected", "early-data-cap", "conn-timer-activity",
+             "conn-alert-wipe", "conn-timeout-wipe", "conn-rst-exhausted", "tls-rndr"},
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
     "ct": {"ct-barrier", "ct-c1-barrier", "ct-harness-unit", "ct-harness-lint", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms",
@@ -924,6 +928,84 @@ CASES = {
                                                  "pub const TLS_SIGN_INTERVAL_NS: u64 = 1_000_000_000 / 20;",
                                                  "pub const TLS_SIGN_INTERVAL_NS: u64 = 1_000_000_000 / 19;"),
                         "C5: tls can be admitted handshakes faster than key refills its bucket"),
+    # M6 slice 3a (C6, C7, C10; T18, T-N11). L14: HybridSecret has one
+    # constructor (P18) and no Clone (tls-core's compile_fail doctest).
+    "l14-constructor": (["pins"], lambda t: append(t, "crates/tls-core/src/hybrid.rs",
+                                                   "\nimpl HybridSecret {\n    pub fn forge() -> HybridSecret {\n"
+                                                   "        HybridSecret(Secret::zero())\n    }\n}\n"),
+                        "P18 crates/tls-core/src/hybrid.rs"),
+    "l14-clone": (["unit"], lambda t: append(t, "crates/tls-core/src/hybrid.rs",
+                                             "\nimpl Clone for HybridSecret {\n    fn clone(&self) -> Self {\n"
+                                             "        HybridSecret(Secret::copy_from(self.0.as_bytes()))\n    }\n}\n"),
+                  "Test compiled successfully, but it's marked `compile_fail`."),
+    "l14-codepoint": (["pins"], lambda t: append(t, "crates/tls-core/src/lib.rs", "\nconst X25519: u16 = 0x001d;\n"),
+                      "P19 crates/tls-core/src/lib.rs"),
+    # S9: the client Finished compared in constant time; the pins tripwire
+    # and the refusal itself.
+    "finished-ct-eq": (["pins"], lambda t: edit(t, "crates/tls-core/src/handshake.rs",
+                                                "ct::ct_eq(&expected_verify_data, finished)", "expected_verify_data == finished"),
+                       "P11 crates/tls-core/src/handshake.rs"),
+    "finished-check": (["unit"], lambda t: edit(t, "crates/tls-core/src/handshake.rs",
+                                                "    Ok(ct::ct_eq(&expected_verify_data, finished))\n",
+                                                "    let _ = expected_verify_data;\n    Ok(true)\n"),
+                       "---- tests::tampered_finished_is_decrypt_error_and_wipes stdout ----"),
+    "ccs-once": (["unit"], lambda t: edit(t, "crates/tls-core/src/handshake.rs",
+                                          "if self.ccs_seen || !self.reasm.is_empty() {", "if !self.reasm.is_empty() {"),
+                 "---- tests::second_ccs_is_unexpected_message stdout ----"),
+    "ccs-after-finished": (["unit"], lambda t: edit(t, "crates/tls-core/src/handshake.rs",
+                                                    "(State::AwaitClientFinished, ContentType::ChangeCipherSpec) => {",
+                                                    "(State::AwaitClientFinished | State::Connected, ContentType::ChangeCipherSpec) => {"),
+                           "---- tests::ccs_after_finished_is_unexpected_message stdout ----"),
+    "key-share-length": (["unit"], lambda t: edit(t, "crates/tls-wire/src/lib.rs",
+                                                  "pub const CLIENT_SHARE_LEN: usize = 1184 + 32;",
+                                                  "pub const CLIENT_SHARE_LEN: usize = 1184 + 33;"),
+                         "---- tests::key_share_of_1216_is_accepted_and_1215_or_1217_refused stdout ----"),
+    "duplicate-extension": (["unit"], lambda t: edit(t, "crates/tls-wire/src/hello.rs",
+                                                     "        if seen.get(..count).ok_or(Refusal::Internal)?.contains(&ty) {\n"
+                                                     "            return Err(Refusal::DuplicateExtension);\n        }\n", ""),
+                            "---- tests::duplicate_extension_is_refused stdout ----"),
+    "no-key-share-reason": (["unit"], lambda t: edit(t, "crates/tls-wire/src/hello.rs",
+                                                     "let key = found.ok_or(Refusal::NoPqShare)?;",
+                                                     "let key = found.ok_or(Refusal::NoPqGroup)?;"),
+                            "---- tests::pq_group_supported_without_a_share_has_its_own_reason stdout ----"),
+    "der-minimal": (["unit"], lambda t: edit(t, "crates/tls-wire/src/der.rs",
+                                             "    let rest = v.get(first..).ok_or(Refusal::Internal)?;\n",
+                                             "    let rest = v.get(first.min(0)..).ok_or(Refusal::Internal)?;\n"),
+                    "---- tests::der_integers_are_minimal_at_both_length_bounds stdout ----"),
+    # S11g, S-R3-3: early_data is skipped only before Connected and up to
+    # 16 KiB.
+    "early-data-after-connected": (["unit"], lambda t: edit(t, "crates/tls-core/src/handshake.rs",
+                                                            "        self.state == State::AwaitClientFinished\n"
+                                                            "            && self.early_data\n            && !self.deprotected\n",
+                                                            "        self.early_data\n"),
+                                   "---- tests::undecryptable_record_after_connected_is_bad_record_mac stdout ----"),
+    "early-data-cap": (["unit"], lambda t: edit(t, "crates/tls-core/src/handshake.rs",
+                                                ".is_some_and(|t| t <= MAX_EARLY_SKIP)", ".is_some()"),
+                       "---- tests::early_data_over_16_kib_is_bad_record_mac stdout ----"),
+    # C10/T-N11: activity resets no handshake or head timer; alerts and
+    # timeouts wipe the slot; an RST never dispatched still releases it.
+    "conn-timer-activity": (["unit"], lambda t: edit(t, "crates/tls-core/src/conn.rs",
+                                                     "    pub fn activity(&mut self, now: u64) {\n        self.last_activity = now;\n",
+                                                     "    pub fn activity(&mut self, now: u64) {\n        self.last_activity = now;\n"
+                                                     "        if let Phase::Open { stage, .. } = self.phase {\n"
+                                                     "            self.phase = Phase::Open { stage, since: now };\n        }\n"),
+                            "---- tests::activity_does_not_reset_the_handshake_timer stdout ----"),
+    "conn-alert-wipe": (["unit"], lambda t: edit(t, "crates/tls-core/src/conn.rs",
+                                                 "                let written = self.session.fail(refusal, &mut bufs);\n",
+                                                 "                let written = 0;\n"),
+                        "---- tests::an_alert_wipes_the_slot_then_drains_and_aborts stdout ----"),
+    "conn-timeout-wipe": (["unit"], lambda t: edit(t, "crates/tls-core/src/conn.rs",
+                                                   "        self.session.wipe(&mut bufs);\n        self.wipe_buffers();\n"
+                                                   "        self.phase = Phase::Aborting",
+                                                   "        let _ = &mut bufs;\n        self.phase = Phase::Aborting"),
+                          "---- tests::a_timeout_wipes_a_connected_slot stdout ----"),
+    "conn-rst-exhausted": (["unit"], lambda t: edit(t, "crates/tls-core/src/conn.rs",
+                                                    "if dispatched || self.passes >= MAX_RST_PASSES {", "if dispatched {"),
+                           "---- tests::rst_never_dispatched_releases_after_pass_8 stdout ----"),
+    # L9: RNDR failing means no handshake.
+    "tls-rndr": (["unit"], lambda t: edit(t, "crates/tls-core/src/rng.rs",
+                                          "let rndr = self.hw.rndr().ok_or(RngError)?;", "let rndr = self.hw.rndr().unwrap_or(0);"),
+                 "---- tests::tls_rndr_failure_means_no_handshake stdout ----"),
     # T-R3-10: SIGN_COST_NS is bound to libcrux-p256's lock entry; a recorded
     # entry that no longer matches the lock must fail `pins`.
     "c5-lock-pin": (["pins"], lambda t: edit(t, "crates/key-core/src/lib.rs",

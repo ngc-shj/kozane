@@ -360,6 +360,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ct"
+version = "0.1.0"
+
+[[package]]
 name = "ctutils"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -643,6 +647,9 @@ dependencies = [
 [[package]]
 name = "http-wire"
 version = "0.1.0"
+dependencies = [
+ "bolero",
+]
 
 [[package]]
 name = "hybrid-array"
@@ -1254,11 +1261,17 @@ dependencies = [
  "audit-event",
  "config",
  "cpu",
+ "http-wire",
+ "key-core",
  "layout",
  "pdkit",
  "ring",
  "sel4-microkit",
  "smoltcp",
+ "tls-core",
+ "tls-wire",
+ "wire",
+ "zeroize",
 ]
 
 [[package]]
@@ -2077,17 +2090,24 @@ dependencies = [
 name = "tls-core"
 version = "0.1.0"
 dependencies = [
+ "ct",
  "libcrux-chacha20poly1305",
  "libcrux-curve25519",
  "libcrux-hkdf",
  "libcrux-hmac",
  "libcrux-ml-kem",
+ "libcrux-p256",
  "libcrux-sha2",
+ "tls-wire",
+ "zeroize",
 ]
 
 [[package]]
 name = "tls-wire"
 version = "0.1.0"
+dependencies = [
+ "bolero",
+]
 
 [[package]]
 name = "toml"
@@ -2336,6 +2356,7 @@ dependencies = [
 name = "wg-core"
 version = "0.1.0"
 dependencies = [
+ "ct",
  "ingress-core",
  "libcrux-blake2",
  "libcrux-chacha20poly1305",
