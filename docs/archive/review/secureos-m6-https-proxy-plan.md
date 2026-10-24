@@ -989,3 +989,94 @@ pattern, `audit-event` coalescing (`FRAME_DROPPED_BASE` pattern),
 - Probes (C10/D3): CPU time of the handshake at 0.05 over 20 runs and 8
   concurrent; `SIGN_COST_NS` measured (max of 20 × 2), P17 and the
   constant moved together; the stop rule if the per-call wait bound fails.
+
+## Re-plan R1 (2026-10-24, after the slice-3b probe; D3 stop rule)
+
+**Trigger.** The probe measured TlsSignHighWater 0.64–1.72 s. The sign runs
+in the passive `key` on `tls`'s 0.05 budget (≈ 35–85 ms of CPU under TCG),
+so `hs` can wait that long behind it. C5's per-call wait bound needs a
+`tls` budget above the 0.25 per-PD cap, so it cannot hold. Widening
+`HS_KEY_WAIT_MAX_NS` to fit is the workaround D3 forbids.
+
+**Decision (the design it should have).** The TLS signing key leaves `key`
+and gets its own key PD, `tlskey`. That keeps M5's rule of one sealed
+secret per key PD, and it makes `key` hold no TLS secret at all.
+
+- `hs` never shares an endpoint with a TLS signature, so the interference
+  invariant, `KeyWaitHighWater`'s bound and case 12 become structural
+  rather than measured.
+- `tlskey` has one caller (`tls`), so L13's "shared oracles are passive so
+  each caller pays" does not apply. It is **not passive** and runs on its
+  own scheduling context. Signatures then no longer stall `tls`'s budget,
+  and its cost is bounded by its own budget and bucket.
+
+Rejected:
+- Handing the scalar from `key` to `tlskey` at boot over a PPC: no third
+  envelope, but a new secret-transfer path between key PDs.
+- Putting the scalar in `pqkey`: this moves the interference onto `pq`
+  (L8 freshness).
+- Making `key` non-passive: this breaks L13's per-caller accounting for
+  `hs`.
+
+### Contract changes (C5 and C11 are superseded where they conflict)
+
+- **C12 — `tlskey` PD (Critical tier).**
+  - Role `key`. Not passive. Priority 135, above `tls` (100) and below
+    `tpm` (145). Budget 2000/10000. It is untainted, so the budget does not
+    count toward the tainted 0.95 cap; the L13 checker must accept a
+    non-passive key-role PD with exactly one caller.
+  - Maps only `tls_secrets`: a 4096-byte prefill MR holding the sealed
+    envelope.
+  - Callee PPC of `tls` (`pp={tls=true,tlskey=false}`). Caller PPC of `tpm`,
+    exactly like `key`/`pqkey`.
+  - Oracle `tlskey-core`: `TlsSign` (C5's content building, RFC 6979 hedged
+    nonce, ≤ 8 candidates, Secret types, stack scrub — moved from key-core
+    unchanged in substance) and `BootSeed` (for `tls`'s hedged RNG).
+  - Its bucket invariants run against `ingress`'s SYN global bucket, as in
+    C5.
+  - Boot: unseal `Kind::Tls`, validate the blob, check the scalar and that
+    its public point equals `config::TLS_PUBLIC`. Any failure →
+    `Unavailable{code}`, plaintext wiped (the M5 rule), and `tls` audits and
+    halts (D5, now by construction).
+- **Blobs.**
+  - `key`'s blob returns to the M5 v2 layout and version (the v3 TLS field
+    removed): FIXED 80, MAX_PEERS 124, envelope KEY_MAX_PEERS 110,
+    tools/package `_key_body` 80.
+  - New `secret-blob::tls`: magic "SOSTLSK1", version 1, scalar[32],
+    BLAKE2s checksum, zero padding to 4096.
+- **`key`.** `Caller { Hs }` only; TlsSign, the Tls caller, its bucket and
+  seed and the C5 interference invariants are removed. `KeyWaitHighWater`
+  stays as observability. key-core's `MAX_WORDS` returns to 4.
+- **M5 C8/C9/C11 amendments (third envelope).**
+  - The boot descriptor becomes v2: magic "SOSBOOT1", version 2, count 3,
+    three (offset, len) pairs; 80 bytes. U-Boot's boot.cmd, tools/measure.py,
+    the U-Boot build, release verify and every fixture change accordingly.
+    v1 is refused.
+  - `tpm2::envelope::Kind::Tls`.
+  - `tpm2-wire` gate `CLIENTS` 2 → 3, re-proved by its Kani harnesses (run
+    alone, memory-guarded). The cap comes once all three clients are Done
+    or Failed.
+  - tools/package `KINDS`/`SEAL_KINDS` gain TLS. mksecrets writes
+    `tls-secrets.bin`. The release manifest and verify cover three
+    envelopes.
+- **Laws.**
+  - L1/L2: `tlskey` is a key-role PD with a callee-only channel to `tls` and
+    one PPC to `tpm`. `tls` calls exactly one key PD.
+  - L13: a non-passive key-role PD is allowed only with a single caller
+    (checked).
+- **Testing changes.**
+  - Case 12 becomes a structural check: `hs` and `tls` share no key PD,
+    checked by laws. A positive integration sanity check stays: a WireGuard
+    handshake completes during a ClientHello flood.
+  - Case 8 now uses a mismatched TLS blob for `tlskey`.
+  - The scalar count scans for exactly one occurrence, in `tlskey`'s buffer.
+  - The probe re-measures TlsSignHighWater and the handshake margin with
+    `tlskey`'s budget.
+- **Scope.** This replaces slice 3b's key-side wiring. It lands as slice 3c,
+  before slice 4.
+
+### Go/No-Go additions
+
+| ID | Subject | Status |
+|---|---|---|
+| C12 | tlskey PD, its blob and envelope; key reverted; third envelope through M5's chain | pending |
