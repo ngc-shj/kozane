@@ -971,3 +971,11 @@ deviations from the plan:
   out of scope here.
 - **The measure variant reads PCR 8 from `tpm2 pcr_read`'s print (R5-S1)**,
   not from `md.b`, whose output a pending Ctrl-C could cut short.
+
+## Cross-machine reproducibility (recorded 2026-10-24, after M5)
+
+The M5 final tree (32f4494) built on gx10 and on z1mn (Apple Silicon,
+Docker Desktop) from the same dev image (RootFS layers identical), each
+with a cold PD target directory: `loader.img`, `report.txt` and all twelve
+PD ELFs are byte-identical across the two machines (`make image`, 14
+sha256 values compared). U-Boot is outside this check (R5-N1).
