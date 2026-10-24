@@ -931,3 +931,39 @@ pattern, `audit-event` coalescing (`FRAME_DROPPED_BASE` pattern),
   subject + critical SAN); tests/tools/test_mkcert.py with MKCERT-FIXTURES.
 - run.py: `KEY_CALLERS`, codes 17/18, blob offsets, the packaged boots use
   v3 blobs; tests/manifest.txt; check-selftest cases for the new controls.
+
+### Slice 3a (C6, C7 host side)
+
+- crates/tls-wire: records (types, legacy version incl. first-record
+  0x0301, length limits, CCS rules), protected-record inner type and
+  padding (§5.4), handshake framing (span/coalesce, ClientHello and client
+  Finished at record boundaries, ≤ 8 KiB), `client_hello` with every C6
+  extension rule (incl. duplicate key_share groups, supported-but-no-share
+  reason, pre_shared_key last + modes, early_data preconditions), the
+  serializers (ServerHello, EncryptedExtensions, Certificate,
+  CertificateVerify with DER `ECDSA-Sig-Value`, Finished, alerts); Kani
+  harnesses within the stated bounds with `kani::cover!`; bolero target
+  with seed ClientHellos from OpenSSL and curl (capture script committed);
+  allow/deny unit pairs at every bound.
+- crates/tls-core: `HybridSecret::exchange` (ML-KEM-768 ek check,
+  encapsulation, X25519 with a fresh ephemeral, zero check) through a
+  non-generic `exchange_with_randomness` taking randomness as bytes;
+  wiping Secret types for the ephemeral, the randomness and both component
+  secrets; `scrub_session_stack` (`#[inline(never)]`) and
+  `SCRUB_DEPTH_EXCHANGE`; key schedule with private `schedule_from_ikm`
+  (`#[cfg(test)]` reach); record protection (ChaCha20-Poly1305, §5.3
+  nonce, sequence limit); state machine (CCS, KeyUpdate rules, early_data
+  skip with its preconditions, Finished `ct_eq`); `conn` module with an
+  injected clock (timeouts, per-source cap, lifetime, close sequencing and
+  the RST retry/wipe decision, `Slot::is_zeroized()`); hedged RNG from a
+  per-caller seed, RNDR and CNTPCT (the `pq` pattern) behind a trait.
+- Tests: RFC 8448 §3 secrets/Finished; the OpenSSL `s_server` keylog
+  fixture (Python capture script, committed) for keys/IVs/records and
+  `traffic upd`; the host test client (libcrux on the host) driving every
+  C7 refusal path and early_data case; `compile_fail` doctests for
+  `HybridSecret`; conn unit tests.
+- check-pins: L14 constructor rule and the code-point spelling tripwire
+  with fixtures; P9/P10/P11 crate lists and the `tls-core` P11 name set
+  anchored on the Finished file.
+- Makefile: `kani_crates` += tls-wire (and http-wire in slice 4),
+  `bolero_targets` += tls-wire; manifest keys.
