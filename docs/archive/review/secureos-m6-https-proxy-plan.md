@@ -967,3 +967,25 @@ pattern, `audit-event` coalescing (`FRAME_DROPPED_BASE` pattern),
   anchored on the Finished file.
 - Makefile: `kani_crates` += tls-wire (and http-wire in slice 4),
   `bolero_targets` += tls-wire; manifest keys.
+
+### Slice 3b (C7, C8 in the PD; probes)
+
+- crates/pds/tls: TLS over the smoltcp listeners (echo mode removed; the
+  HTTP head is a seam until slice 4 — a connected client gets a fixed
+  response), `Signer` over key's TlsSign PPC (`MAX_WORDS` zeroing), the
+  hedged RNG over key's per-caller boot seed + RNDR + CNTPCT, `tls`'s
+  `KEY_UNAVAILABLE` halt with `KeyUnavailable{code}` (D5), the C8 close
+  order (seal, wipe, transmit; abort, poll, RST observed by the own
+  `Device`, remove, wipe storage, re-create; retry ≤ 8 via
+  `tls-core::conn`), `tls_core::scrub_session_stack` after `exchange` and
+  after TlsSign, audit kinds at their reserved bases.
+- run.py: `tls` in `KEY_CALLERS`; `TlsKeyError` codes; the `https` boot
+  with OpenSSL/curl handshakes (cases 1, 3, 4 of the strategy against the
+  fixed response), the `https-residue` boot (C8 cases 1–3, case 11), case 8
+  (TLS-only key failure), the scalar count, the probe canary.
+- tools/ct-harness: tls-core with `=`-pinned libcrux crates; residue case
+  for `exchange_with_randomness` + scrub (SCRUB_DEPTH_EXCHANGE adjudicated);
+  tools/ct-shape identity-only root class with fixtures and a selftest.
+- Probes (C10/D3): CPU time of the handshake at 0.05 over 20 runs and 8
+  concurrent; `SIGN_COST_NS` measured (max of 20 × 2), P17 and the
+  constant moved together; the stop rule if the per-call wait bound fails.
