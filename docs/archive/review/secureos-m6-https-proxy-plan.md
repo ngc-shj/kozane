@@ -1075,8 +1075,10 @@ as amended here:
 - **Bucket.**
   - `TLS_SIGN_BURST − TLS_BOOT_CALLS ≥ SYN_GLOBAL_BURST`.
   - `TLS_SIGN_INTERVAL_NS ≤ SYN_GLOBAL_INTERVAL_NS`.
-  - `SYN_GLOBAL_*` move to `layout`, shared by ingress-core and
-    tlskey-core, so neither needs the other (R1-F F11).
+  - `SYN_GLOBAL_*` move to a new dependency-free leaf crate `limits`,
+    shared by ingress-core and tlskey-core, so neither needs the other
+    (R1-F F11). Not `layout`: ingress-core's 23 Kani harnesses would re-run
+    on every layout edit (R2-F N6).
 - **Retired with C5's interference bound.** `SIGN_COST_NS`,
   `HS_KEY_WAIT_MAX_NS`'s compile-time use, P17 and `TLS_BUDGET_NS` in
   `layout`. Their purpose was the per-call wait bound, which is now
@@ -1112,15 +1114,21 @@ as amended here:
     - version 2 and count 3;
     - every 32-bit field;
     - each range inside the image and within its slot;
-    - **all three pairs** disjoint;
-    - the zero placeholder for each range.
+    - **all three pairs** disjoint.
+  - The zero placeholder for each range is a host-side check only
+    (measure.check_placeholder in package and release; R2-F N5).
   - Version 1 is refused.
 - **`tpm2::envelope::Kind::Tls`.** `Key` and `Tls` regions are both 4096
   bytes; the kind in the AAD and the distinct blob magic separate them.
 - **tpm PD and gate** (R1-S F3, F F3/F4, T T3/T4).
   - `tpm2-wire` `CLIENTS` = 3.
   - The one-flow rule moves into the `Gate`: a Fresh client gets Busy
-    while **any** other client is Unsealing.
+    while **any** other client is Unsealing (R2-F N1). Busy is decided
+    **after** every validity and ownership refusal (Capped, Finished,
+    Malformed, NotAllowed, NotOwned, Hierarchy), so NotOwned stays
+    reachable for a Fresh attacker. It comes **before** `once()` and the
+    state change, and has no side effects. The PD maps it to `RSP_BUSY`
+    (retried by `tpm2::boot`), never `RSP_REFUSED`.
   - `layout::tpm::CH_TLSKEY` with a `client()` arm.
   - `tpm2::boot::BUSY_TIMEOUT_NS` re-derived for waiting behind two flows,
     from the three key PDs' init budgets (R1-S N1).
@@ -1142,7 +1150,9 @@ as amended here:
 
 ### Laws
 
-- **New rule (R1-T T2).** A key-role PD has **exactly one** pp caller,
+- **New rule (R1-T T2, R2-T N1, R2-F N2), reported under L2.** A key-role
+  PD has **at most one** pp caller (shared means two or more; existing
+  fixtures with zero callers stay valid),
   counted as channels where the peer end is pp=true and the key end
   pp=false, excluding its PPC to `tpm`. Together with the existing "no PD
   calls two key PDs", this makes "no key PD is shared" a checked property.
@@ -1160,10 +1170,13 @@ as amended here:
 - check-pins P9/P10/P11 crate lists += tlskey-core, pds/tlskey; the P11
   anchor for the RFC 6979 HMAC moves.
 - The ct-harness residue covers a `Kind::Tls` open.
-- Manifest keys: UNIT-TLSKEY-CORE (new); LINT-CRATES +1, LINT-PDS +1,
-  REPRO-ARTIFACTS +1; CT-SHAPE-*, CHECK-PINS-*, MEASURE-, PACKAGE-,
-  RELEASE-, UNIT-LAWS, UNIT-FIXTURES-TEST, KANI-TPM2-WIRE, UNIT-TPM2-WIRE,
-  UNIT-SWTPM-INTEROP, INTEGRATION-CASES.
+- Manifest keys (R2-T N6): UNIT-TLSKEY-CORE and UNIT-LIMITS (new);
+  LINT-CRATES, LINT-PDS, REPRO-ARTIFACTS; CT-SHAPE-*, CHECK-PINS-RULES
+  (19 → 18) and -FIXTURES, MEASURE-, PACKAGE-, RELEASE-, RESIDUE-CASES;
+  UNIT-LAWS, UNIT-FIXTURES-TEST, KANI-TPM2-WIRE, UNIT-TPM2-WIRE,
+  UNIT-SWTPM-INTEROP, UNIT-TPM2, UNIT-KEY-CORE, UNIT-SECRET-BLOB,
+  UNIT-MKSECRETS, UNIT-LAYOUT, UNIT-INGRESS-CORE, UNIT-CONFIG,
+  UNIT-RELEASE-TOOL, UNIT-TESTS, INTEGRATION-CASES.
 
 ### Testing (R1-T T2–T13, F F4/F6/F12)
 
@@ -1175,24 +1188,32 @@ as amended here:
 - **tpm2-wire.**
   - Owner and attacker symbolic and distinct, `< CLIENTS`.
   - New harness `the_cap_is_withheld_until_every_client_finishes`.
-  - New harness for the busy rule over three clients.
+  - New harness for the busy rule over three clients, asserting that Busy
+    leaves `once` and `states` unchanged and that the client's later flow
+    succeeds (R2-F N1, R2-T N4); `a_flushed_handle_number_is_usable_by_the_other_client`
+    changes so the owner finishes before the other client starts; the
+    cross-client deny harnesses keep a concurrently started attacker.
   - A `kani::cover!` after every `assume(owner_setup…)`.
   - The fixed tests updated: `command(3, …) == UnknownClient`, the
     three-client cap, `fuzz_one`'s client loop, swtpm_interop's cap test.
   - Each changed harness runs alone under the memory guard first.
-  - Selftest: restoring `1 - client` must fail.
+  - Selftest: restoring the two-client busy form in `gate.rs` must fail a
+    unit test over all six ordered client pairs.
 - **Descriptor.**
   - test_measure: an overlap deny and an adjacent allow for each pair
     (0-1, 0-2, 1-2); out-of-image, wrap and zero-placeholder denies for
     range 2.
   - An 80-byte version-1 descriptor and a v2 with count 2 → "header"; a
     64-byte descriptor → length; v2 count 3 → allow.
-  - Changing each of o2, l2 and reserved changes `expected_pcr8` and the
-    measure-variant PCR.
-  - run.py's measured-boot cases use three envelopes and include one
-    on-device range-2 overlap refusal.
-  - Selftest cases drop boot.cmd's range-2 overlap check and its version
-    compare.
+  - Changing each of o2 and l2 (valid moves) changes `expected_pcr8` and
+    the measure-variant PCR; a non-zero reserved word is refused by both
+    adjudicators (deny fixture; R2-T N7).
+  - run.py's measured-boot cases use three envelopes and include
+    on-device refusals for the 0-2 overlap, the 1-2 overlap and a range-2
+    wrap, batched in one measure-variant boot loop (R2-T N3).
+  - One selftest per dropped boot.cmd line (each pair check, range 2's
+    wrap check, the version compare), each with a failure-only needle
+    naming its case.
 - **Envelopes.**
   - Unit: a real Key envelope parsed as Tls → BadKind, and the reverse.
   - Package fixtures refuse swapped secrets and tls_secrets envelopes in
@@ -1205,15 +1226,20 @@ as amended here:
     mismatch), plaintext wiped each time.
   - `allows()` refusals; a bucket refusal that spends no sign; RNDR
     failure → ERR_CRYPTO.
-  - The seed differs from the scalar and from `key`'s; two blobs with the
-    same scalar and different seeds give different seeds.
+  - With RNDR and CNTPCT fixed behind the `Hw` seam (R2-T N2): the same
+    `boot_seed` gives the same seed, a different `boot_seed` a different
+    one, and a different scalar with the same `boot_seed` the **same**
+    seed (the scalar is not an input); a selftest feeding the scalar into
+    the hash must fail it.
 - **Integration.**
   - Case 8: `tls` halts at init before listening.
   - The scalar count asserts one occurrence in guest RAM; `key`'s blob
     holds no scalar by construction.
-  - Case 12 keeps a numeric assertion: during a ClientHello flood,
-    `KeyWaitHighWater` stays at its no-flood level and a WireGuard
-    handshake completes.
+  - Case 12 is a positive availability check: during a ClientHello flood a
+    WireGuard handshake completes. `KeyWaitHighWater` is recorded, not
+    asserted (drivers at 150 preempt `key`, so its level moves with load;
+    R2-T N5, R2-F N3). The red-proved control is the single-caller law and
+    `laws-hs-tls-share-key`.
   - Boot 6 (bad `key` blob): `tls` does not audit KeyUnavailable and
     reaches ready.
   - The probe keeps its gate (slowest handshake ≤ 1/3 of the timeout; else
@@ -1229,8 +1255,12 @@ as amended here:
     `c5-seed-tag`, `c5-tls-boot-fail`, `c5-tls-wipe`, `c5-lock-pin`, and
     P17's fixtures.
   - Re-anchored: `key-wipe`, `measure-wrap`, `tls-key-halt`. The last
-    targets tls's init halt; the sign-path halt gets its own unit-level
-    proof.
+    targets tls's init halt; the sign-path halt gets a tls-core unit test
+    mapping a `TlsSign` `ERR_UNAVAILABLE` to its halt reason (R2-T N8).
+  - The key/tlskey code-range disjointness is checked by run.py's
+    code-table mirror (no new dependency edge; R2-T N8).
+  - The sealed-boot cap check also waits for `tls` ready (it is ready only
+    after `tlskey`'s init returned BootSeed; R2-F N4).
   - New: `tlskey-wipe` on the case-8 boot.
 
 ### Residual added
@@ -1251,4 +1281,4 @@ as amended here:
 
 | ID | Subject | Status |
 |---|---|---|
-| C12 | tlskey PD, its blob and envelope; key reverted; third envelope through M5's chain; the single-caller law | pending |
+| C12 | tlskey PD, its blob and envelope; key reverted; third envelope through M5's chain; the single-caller law | locked |
