@@ -940,3 +940,361 @@ fn a_sign_answered_unavailable_halts_tls_with_its_code_and_key_unavailable() {
     let reasons = [crate::halt::NO_CLOCK, crate::halt::RNDR, crate::halt::INIT_FAILED, crate::halt::KEY_UNAVAILABLE];
     assert_eq!(reasons, [1, 2, 3, 4]);
 }
+
+// ---------------------------------------------------------------- proxy
+
+/// `connected_slot`'s head stage starts here.
+const HEAD_AT: u64 = 2 * S;
+
+const GET: &[u8] = b"GET /x?y=1 HTTP/1.1\r\nHost: gw.example\r\nKeep-Alive: marker\r\nX-Forwarded-For: 6.6.6.6\r\n\
+Forwarded: for=6.6.6.6\r\nUser-Agent: t\r\n\r\n";
+
+/// `data` as one client record through the proxy.
+fn feed(s: &mut Slot, client: &mut Client, data: &[u8], out: &mut [u8], now: u64) -> Next {
+    let mut ctx = Ctx { cert: CERT, rng: &mut CountingRng::new(1), signer: &mut TestSigner { calls: 0 } };
+    s.client_record(&client.app(data), out, &mut ctx, now)
+}
+
+/// The fake backend: takes what `to_backend` offers, `chunk` bytes at a
+/// time.
+fn pump(s: &mut Slot, backend: &mut Vec<u8>, chunk: usize, now: u64) {
+    loop {
+        let offered = s.to_backend();
+        if offered.is_empty() {
+            return;
+        }
+        let n = offered.len().min(chunk);
+        backend.extend_from_slice(&offered[..n]);
+        s.backend_sent(n, now);
+    }
+}
+
+/// What the client reads from `sent`: each record's type and content.
+fn client_reads(client: &mut Client, sent: &[u8]) -> Vec<(ContentType, Vec<u8>)> {
+    split_records(sent).iter().map(|r| unprotect(&mut client.app_read, r)).collect()
+}
+
+/// `http-wire`'s rewrite of `head` for the client at `A`.
+fn rewritten(head: &[u8]) -> Vec<u8> {
+    let parsed = http_wire::request_head(head).unwrap();
+    let mut out = vec![0u8; http_wire::MAX_REWRITE];
+    let n = http_wire::rewrite(&parsed, A, &mut out).unwrap();
+    out.truncate(n);
+    out
+}
+
+fn outcomes(next: &Next) -> Vec<Outcome> {
+    next.outcomes.iter().collect()
+}
+
+/// A slot whose head `GET` was accepted at 3 s and whose backend
+/// connected at 4 s; nothing pumped yet.
+fn streaming() -> (std::boxed::Box<Slot>, Client, Vec<u8>) {
+    let (mut s, mut client, mut out) = connected_slot();
+    assert!(feed(&mut s, &mut client, GET, &mut out, 3 * S).connect);
+    assert_eq!(s.backend_connected(4 * S), Next::default());
+    assert_eq!(s.stage(), Some(Stage::Streaming));
+    (s, client, out)
+}
+
+/// `request` refused with `status` at head time: the fixed response and
+/// close_notify, no backend connect, the slot wiped and draining.
+fn assert_refused(request: &[u8], status: http_wire::Status) {
+    let (mut s, mut client, mut out) = connected_slot();
+    let next = feed(&mut s, &mut client, request, &mut out, 3 * S);
+    let shown = String::from_utf8_lossy(request);
+    assert!(!next.connect && !next.abort_backend, "{shown}");
+    assert_eq!(outcomes(&next), [Outcome::HttpRefused(status), Outcome::TlsClosed(Closed::SelfResponse)], "{shown}");
+    assert_eq!(
+        client_reads(&mut client, &out[..next.to_client]),
+        [(ContentType::ApplicationData, http_wire::refusal_response(status).to_vec()), (ContentType::Alert, vec![1, 0])],
+        "{shown}"
+    );
+    assert!(next.to_client <= MAX_CLIENT_OUT);
+    assert_eq!(next.action, Action::None);
+    assert!(s.is_zeroized() && s.stage().is_none() && s.to_backend().is_empty(), "{shown}");
+    assert_eq!(s.drained(4 * S), Action::None, "close_notify drains, then the linger");
+}
+
+#[test]
+fn get_reaches_the_backend_as_exactly_the_rewrite() {
+    let (mut s, mut client, mut out) = connected_slot();
+    let next = feed(&mut s, &mut client, GET, &mut out, 3 * S);
+    assert_eq!(next, Next { connect: true, ..Next::default() });
+    assert_eq!(s.stage(), Some(Stage::BackendConnect));
+    assert!(s.to_backend().is_empty() && !s.reads_client(), "nothing moves before the connect");
+    s.backend_connected(4 * S);
+    let mut backend = Vec::new();
+    pump(&mut s, &mut backend, usize::MAX, 4 * S);
+    assert_eq!(backend, rewritten(GET));
+    assert!(!contains(&backend, b"marker") && !contains(&backend, b"6.6.6.6"));
+    assert!(s.reads_client());
+}
+
+#[test]
+fn the_backend_response_streams_to_the_client_unparsed() {
+    let (mut s, mut client, mut out) = streaming();
+    pump(&mut s, &mut Vec::new(), usize::MAX, 4 * S);
+    for part in [&b"HTTP/1.1 200 OK\r\nContent-Length: 999\r\n\r\n"[..], b"not even http", &[0u8; BACKEND_CHUNK]] {
+        let next = s.backend_data(part, &mut out, 5 * S);
+        assert!(next.to_client <= MAX_CLIENT_OUT);
+        assert_eq!(client_reads(&mut client, &out[..next.to_client]), [(ContentType::ApplicationData, part.to_vec())]);
+    }
+    // More than one record's worth is the PD's to split; given whole, it
+    // ends the connection rather than truncating silently.
+    let next = s.backend_data(&[0u8; BACKEND_CHUNK + 1], &mut out, 5 * S);
+    assert_eq!((next.action, outcomes(&next)), (Action::Abort, vec![Outcome::TlsClosed(Closed::Error)]));
+}
+
+#[test]
+fn post_bodies_of_0_1_and_max_body_reach_the_backend_exactly() {
+    for len in [0, 1, http_wire::MAX_BODY] {
+        let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let head = std::format!("POST /up HTTP/1.1\r\nHost: gw\r\nContent-Length: {len}\r\n\r\n");
+        // Bytes past Content-Length (a pipelined request) never go on.
+        let request = [head.as_bytes(), &body, b"GET /smuggled HTTP/1.1\r\n\r\n"].concat();
+        let (mut s, mut client, mut out) = connected_slot();
+        let mut records = request.chunks(tls_wire::MAX_PLAINTEXT);
+        assert!(feed(&mut s, &mut client, records.next().unwrap(), &mut out, 3 * S).connect);
+        s.backend_connected(3 * S);
+        let mut backend = Vec::new();
+        pump(&mut s, &mut backend, usize::MAX, 3 * S);
+        for rec in records {
+            assert!(s.reads_client());
+            assert_eq!(feed(&mut s, &mut client, rec, &mut out, 3 * S), Next::default());
+            assert!(s.to_backend().len() <= tls_wire::MAX_PLAINTEXT);
+            // A backend socket with little room: taken a bit at a time.
+            pump(&mut s, &mut backend, 1000, 3 * S);
+        }
+        assert_eq!(backend, [rewritten(head.as_bytes()), body].concat(), "body of {len}");
+    }
+}
+
+#[test]
+fn a_record_while_bytes_for_the_backend_wait_ends_the_connection() {
+    let (mut s, mut client, mut out) = streaming();
+    assert!(!s.reads_client());
+    let next = feed(&mut s, &mut client, b"x", &mut out, 5 * S);
+    assert_eq!((next.action, next.abort_backend), (Action::Abort, true));
+    assert_eq!(outcomes(&next), [Outcome::TlsClosed(Closed::Error)]);
+    assert!(s.is_zeroized());
+}
+
+#[test]
+fn max_body_plus_one_is_413_at_head_time_without_connect() {
+    let head = std::format!("POST / HTTP/1.1\r\nHost: gw\r\nContent-Length: {}\r\n\r\n", http_wire::MAX_BODY + 1);
+    assert_refused(head.as_bytes(), http_wire::Status::ContentTooLarge);
+}
+
+#[test]
+fn each_smuggling_form_is_refused_with_its_status_and_no_connect() {
+    use http_wire::Status::*;
+    let cases: [(&[u8], http_wire::Status); 10] = [
+        (b"POST / HTTP/1.1\r\nHost: gw\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n", NotImplemented),
+        (b"POST / HTTP/1.1\r\nHost: gw\r\nTransfer-Encoding: chunked\r\nTransfer-encoding: x\r\n\r\n", NotImplemented),
+        (b"POST / HTTP/1.1\r\nHost: gw\r\nContent-Length: 4\r\nContent-Length: 4\r\n\r\n", BadRequest),
+        (b"GET / HTTP/1.1\r\nHost: gw\r\nX-A: a\r\n b\r\n\r\n", BadRequest),
+        (b"GET / HTTP/1.1\r\nHost: gw\r\nConnection: content-length\r\n\r\n", BadRequest),
+        (b"GET / HTTP/1.1\r\nHost: gw\r\nX_Forwarded_For: 1.2.3.4\r\n\r\n", BadRequest),
+        (b"GET / HTTP/1.1\nHost: gw\n\n", BadRequest),
+        (b"POST / HTTP/1.1\r\nHost: gw\r\nExpect: 100-continue\r\n\r\n", ExpectationFailed),
+        (b"CONNECT gw:443 HTTP/1.1\r\nHost: gw:443\r\n\r\n", NotImplemented),
+        (b"GET http://gw/ HTTP/1.1\r\nHost: gw\r\n\r\n", NotImplemented),
+    ];
+    for (request, status) in cases {
+        assert_refused(request, status);
+    }
+}
+
+/// A head of exactly `len` bytes: the request line, Host, one padded
+/// field, the blank line.
+fn head_of(len: usize) -> Vec<u8> {
+    let start = b"GET / HTTP/1.1\r\nHost: gw\r\nX-Pad: ";
+    let pad = len - start.len() - 4;
+    [&start[..], &vec![b'a'; pad], b"\r\n\r\n"].concat()
+}
+
+#[test]
+fn head_over_8_kib_is_431_and_8_kib_is_accepted() {
+    let (mut s, mut client, mut out) = connected_slot();
+    let head = head_of(http_wire::MAX_HEAD);
+    assert_eq!(feed(&mut s, &mut client, &head[..5000], &mut out, 3 * S), Next::default());
+    assert!(feed(&mut s, &mut client, &head[5000..], &mut out, 3 * S).connect);
+
+    // 8193 bytes with no end yet, over two records.
+    let open = &head_of(http_wire::MAX_HEAD + 1)[..http_wire::MAX_HEAD + 1 - 4];
+    let (mut s, mut client, mut out) = connected_slot();
+    assert_eq!(feed(&mut s, &mut client, &open[..5000], &mut out, 3 * S), Next::default());
+    let next = feed(&mut s, &mut client, &[&open[5000..], &b"aaaa"[..]].concat(), &mut out, 3 * S);
+    assert!(!next.connect);
+    assert_eq!(outcomes(&next)[0], Outcome::HttpRefused(http_wire::Status::HeaderFieldsTooLarge));
+    assert_eq!(client_reads(&mut client, &out[..next.to_client])[0].1, http_wire::refusal_response(http_wire::Status::HeaderFieldsTooLarge));
+    assert!(s.is_zeroized());
+}
+
+#[test]
+fn backend_rst_mid_response_resets_the_client_without_close_notify() {
+    let (mut s, _, mut out) = streaming();
+    pump(&mut s, &mut Vec::new(), usize::MAX, 4 * S);
+    s.backend_data(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\npart", &mut out, 5 * S);
+    out.fill(0xaa);
+    let next = s.backend_rst(&mut out, 6 * S);
+    assert_eq!((next.to_client, next.action, next.abort_backend), (0, Action::Abort, true));
+    assert_eq!(outcomes(&next), [Outcome::TlsClosed(Closed::BackendRst)]);
+    assert!(out.iter().all(|&b| b == 0xaa), "no close_notify sealed");
+    assert!(s.is_zeroized());
+    assert_eq!(s.abort_pass(Endpoint::Client, true), Action::None);
+    assert_eq!(s.abort_pass(Endpoint::Backend, true), Action::Release);
+}
+
+#[test]
+fn client_fin_before_the_response_ends_aborts_the_backend() {
+    // While the backend connects, and once the response has started.
+    let (mut s, mut client, mut out) = connected_slot();
+    feed(&mut s, &mut client, GET, &mut out, 3 * S);
+    let next = s.client_fin(4 * S);
+    assert_eq!((next.action, next.abort_backend, next.to_client), (Action::Abort, true, 0));
+    assert_eq!(outcomes(&next), [Outcome::TlsClosed(Closed::ClientClosed)]);
+    assert!(s.is_zeroized());
+
+    let (mut s, _, mut out) = streaming();
+    pump(&mut s, &mut Vec::new(), usize::MAX, 4 * S);
+    s.backend_data(b"HTTP/1.1 200 OK\r\n", &mut out, 5 * S);
+    let next = s.client_fin(6 * S);
+    assert_eq!((next.action, next.abort_backend, next.to_client), (Action::Abort, true, 0));
+    assert_eq!(s.abort_pass(Endpoint::Client, true), Action::None, "the backend's RST is awaited too");
+    assert_eq!(s.abort_pass(Endpoint::Backend, true), Action::Release);
+}
+
+#[test]
+fn client_close_notify_before_the_response_ends_aborts_the_backend() {
+    let (mut s, mut client, mut out) = streaming();
+    pump(&mut s, &mut Vec::new(), usize::MAX, 4 * S);
+    let close_notify = protect(&mut client.app_write, ContentType::Alert, &[1, 0]);
+    let mut ctx = Ctx { cert: CERT, rng: &mut CountingRng::new(1), signer: &mut TestSigner { calls: 0 } };
+    let next = s.client_record(&close_notify, &mut out, &mut ctx, 5 * S);
+    assert_eq!((next.action, next.abort_backend, next.to_client), (Action::Abort, true, 0));
+    assert_eq!(outcomes(&next), [Outcome::TlsClosed(Closed::ClientClosed)]);
+    assert!(s.is_zeroized());
+}
+
+#[test]
+fn clean_backend_fin_sends_close_notify_then_lingers_2_s_then_aborts() {
+    let (mut s, mut client, mut out) = streaming();
+    pump(&mut s, &mut Vec::new(), usize::MAX, 4 * S);
+    let next = s.backend_data(b"HTTP/1.1 204 No Content\r\n\r\n", &mut out, 5 * S);
+    client_reads(&mut client, &out[..next.to_client]);
+    let next = s.backend_fin(&mut out, 6 * S);
+    assert_eq!(client_reads(&mut client, &out[..next.to_client]), [(ContentType::Alert, vec![1, 0])]);
+    assert_eq!((next.action, next.abort_backend), (Action::None, true));
+    assert_eq!(outcomes(&next), [Outcome::TlsClosed(Closed::BackendFin)]);
+    assert!(s.is_zeroized());
+    // The backend's RST goes out while the client's close_notify drains.
+    assert_eq!(s.abort_pass(Endpoint::Backend, true), Action::None);
+    assert_eq!(s.drained(7 * S), Action::None);
+    assert_eq!(s.timers(7 * S + CLOSE_LINGER_NS - 1, &mut out), Next::default());
+    assert_eq!(s.timers(7 * S + CLOSE_LINGER_NS, &mut out), Next { action: Action::Abort, ..Next::default() });
+    assert_eq!(s.abort_pass(Endpoint::Client, true), Action::Release);
+}
+
+#[test]
+fn each_timeout_fires_through_the_proxy_and_wipes() {
+    let mut s = slot_at(0, 0);
+    let mut out = vec![0u8; 16 * 1024];
+    let next = s.timers(HANDSHAKE_TIMEOUT_NS, &mut out);
+    assert_eq!((next.action, outcomes(&next)), (Action::Abort, vec![Outcome::TlsTimeout(Timeout::Handshake)]));
+    assert!(s.is_zeroized());
+
+    // A partial head in the buffer.
+    let (mut s, mut client, mut out) = connected_slot();
+    feed(&mut s, &mut client, b"GET / HTTP/1.1\r\n", &mut out, 3 * S);
+    assert!(!s.is_zeroized());
+    assert_eq!(s.timers(HEAD_AT + HEAD_TIMEOUT_NS - 1, &mut out), Next::default());
+    let next = s.timers(HEAD_AT + HEAD_TIMEOUT_NS, &mut out);
+    assert_eq!((next.action, outcomes(&next)), (Action::Abort, vec![Outcome::TlsTimeout(Timeout::Head)]));
+    assert!(s.is_zeroized());
+
+    // Bytes still waiting for the backend.
+    let (mut s, _, mut out) = streaming();
+    assert!(!s.to_backend().is_empty());
+    let next = s.timers(4 * S + IDLE_TIMEOUT_NS, &mut out);
+    assert_eq!((next.action, next.abort_backend), (Action::Abort, true));
+    assert_eq!(outcomes(&next), [Outcome::TlsTimeout(Timeout::Idle)]);
+    assert!(s.is_zeroized() && s.to_backend().is_empty());
+}
+
+#[test]
+fn activity_does_not_reset_the_head_timer_through_the_proxy() {
+    let (mut s, mut client, mut out) = connected_slot();
+    let mut t = 3 * S;
+    while t < HEAD_AT + HEAD_TIMEOUT_NS {
+        assert_eq!(feed(&mut s, &mut client, b"a", &mut out, t), Next::default());
+        assert_eq!(s.timers(t, &mut out), Next::default());
+        t += S / 2;
+    }
+    let next = s.timers(HEAD_AT + HEAD_TIMEOUT_NS, &mut out);
+    assert_eq!((next.action, outcomes(&next)), (Action::Abort, vec![Outcome::TlsTimeout(Timeout::Head)]));
+    assert!(s.is_zeroized());
+}
+
+#[test]
+fn backend_connect_timeout_answers_502_and_wipes() {
+    let (mut s, mut client, mut out) = connected_slot();
+    assert!(feed(&mut s, &mut client, GET, &mut out, 3 * S).connect);
+    assert_eq!(s.timers(3 * S + BACKEND_CONNECT_TIMEOUT_NS - 1, &mut out), Next::default());
+    let next = s.timers(3 * S + BACKEND_CONNECT_TIMEOUT_NS, &mut out);
+    assert_eq!(
+        outcomes(&next),
+        [Outcome::TlsTimeout(Timeout::BackendConnect), Outcome::BackendUnavailable, Outcome::TlsClosed(Closed::SelfResponse)]
+    );
+    assert_eq!(
+        client_reads(&mut client, &out[..next.to_client]),
+        [(ContentType::ApplicationData, BAD_GATEWAY.to_vec()), (ContentType::Alert, vec![1, 0])]
+    );
+    assert!(next.to_client <= MAX_CLIENT_OUT);
+    assert_eq!((next.action, next.abort_backend, next.connect), (Action::None, true, false));
+    assert!(s.is_zeroized());
+    assert_eq!(s.abort_pass(Endpoint::Backend, false), Action::None);
+    assert_eq!(s.drained(9 * S), Action::None);
+    assert_eq!(s.timers(9 * S + CLOSE_LINGER_NS, &mut out).action, Action::Abort);
+    assert_eq!(s.abort_pass(Endpoint::Client, true), Action::None, "the backend's RST still awaited");
+    assert_eq!(s.abort_pass(Endpoint::Backend, true), Action::Release);
+}
+
+#[test]
+fn a_refused_backend_connect_answers_502() {
+    for fin in [false, true] {
+        let (mut s, mut client, mut out) = connected_slot();
+        feed(&mut s, &mut client, GET, &mut out, 3 * S);
+        let next = if fin { s.backend_fin(&mut out, 4 * S) } else { s.backend_rst(&mut out, 4 * S) };
+        assert_eq!(outcomes(&next), [Outcome::BackendUnavailable, Outcome::TlsClosed(Closed::SelfResponse)]);
+        assert_eq!(client_reads(&mut client, &out[..next.to_client])[0].1, BAD_GATEWAY);
+        assert!(next.abort_backend && s.is_zeroized());
+    }
+}
+
+#[test]
+fn lifetime_ends_a_streaming_connection_with_its_backend() {
+    let (mut s, _, mut out) = streaming();
+    pump(&mut s, &mut Vec::new(), usize::MAX, 4 * S);
+    for t in (10..120).step_by(10) {
+        s.backend_data(b"x", &mut out, t * S);
+        assert_eq!(s.timers(t * S, &mut out), Next::default());
+    }
+    let next = s.timers(LIFETIME_NS, &mut out);
+    assert_eq!((next.action, next.abort_backend), (Action::Abort, true));
+    assert_eq!(outcomes(&next), [Outcome::TlsTimeout(Timeout::Lifetime)]);
+    assert!(s.is_zeroized());
+}
+
+#[test]
+fn events_after_the_close_do_nothing() {
+    let (mut s, mut client, mut out) = streaming();
+    s.client_fin(5 * S);
+    assert_eq!(s.backend_data(b"late", &mut out, 5 * S), Next::default());
+    assert_eq!(s.backend_fin(&mut out, 5 * S), Next::default());
+    assert_eq!(s.backend_rst(&mut out, 5 * S), Next::default());
+    assert_eq!(s.client_fin(5 * S), Next::default());
+    assert_eq!(feed(&mut s, &mut client, b"late", &mut out, 5 * S), Next::default());
+    assert!(s.is_zeroized());
+}

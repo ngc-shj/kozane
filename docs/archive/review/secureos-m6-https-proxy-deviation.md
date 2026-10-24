@@ -603,3 +603,31 @@ Selftest migration:
 - tpm2-wire's six changed or new Kani harnesses were queued on z1mn
   (memory-guarded, alone) at commit time; the full Kani suite follows the
   lock change. Results are recorded with slice 4.
+
+## Slice 4 part 2: C4 and the C10 core merged
+
+Built in parallel worktrees (C4 on wip/m6-inner, the C10 core on
+wip/m6-proxy on top) while slice 3c ran, merged after it. Two trivial
+conflicts (both sides appended); Cargo.lock gains only `tls-core →
+http-wire`. Gates green; selftest c4-{inner-src, inner-port-range,
+tln-dst-ip, tln-dst-port, tln-src-port-range} and proxy-{truncation-rst,
+early-client-fin, 413-no-connect, connect-timeout-wipe} red with their
+needles. inner-core's two new Kani harnesses passed on z1mn.
+
+Decisions recorded from the two reports:
+- C4: inner's refusals of `tln` packets reuse `DropReason::TcpEgressRefused`
+  (the audit line's `src=inner` separates them from ingress's); inbound
+  segments that do not match stay `NoService`.
+- C10: 502 Bad Gateway for every backend-unavailable cause (refused, reset
+  while connecting, 5 s connect timeout), with `BackendUnavailable` and the
+  timeout stage recorded; a backend RST after connect is always a client
+  RST without close_notify; exactly Content-Length body bytes go to the
+  backend and anything after is wiped; the head is wiped as soon as it is
+  rewritten (so c8-head-wipe's mutation must also remove that wipe once
+  the PD drives the proxy); a client half-close aborts both sockets.
+- **http-wire Kani:** the whole-head harness over 32 symbolic field bytes
+  timed out at 90 minutes on z1mn (memory fine). It is split into
+  field-line, request-line and Connection-value harnesses plus a whole-head
+  harness over a fixed request line and 16 field bytes (at most 2 fields).
+  Transfer-Encoding, duplicate Content-Length and Content-Length values are
+  covered by unit tests and bolero. KANI-HTTP-WIRE 4 → 7.

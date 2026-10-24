@@ -138,9 +138,10 @@ pub enum DropReason {
     TcpBadFlags = 21,
     /// An option whose length is below 2 or runs past the header.
     TcpBadOptions = 22,
-    // `ingress_core::tls_egress` only: a packet from `tls` that is not TCP
-    // from the HTTPS port to a remote unicast address (never from the
-    // parsers).
+    // Egress checks of `tls`'s packets only, never the parsers:
+    // `ingress_core::tls_egress` (not TCP from the HTTPS port to a remote
+    // unicast address) and `inner_core::from_tls` (not TCP from a TLS port
+    // to the backend's address and port).
     TcpEgressRefused = 23,
 }
 

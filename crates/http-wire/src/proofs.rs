@@ -3,8 +3,8 @@
 //! `cargo kani -p http-wire`. Heads are walked byte by byte with nested
 //! field loops, and at 96 bytes cbmc passed 38 GiB, so each harness takes
 //! the smallest input that still reaches its covers: the delimiter 32
-//! bytes, the parser a fixed request line and 32 field bytes with at most 3
-//! fields (its field bound is its `N`), the rewrite 40 bytes and 3 fields.
+//! bytes, each part of the head parser alone, and the whole head with a fixed
+//! request line and 16 field bytes (at most 2 fields; the bound is `N`), the rewrite 40 bytes and 3 fields.
 
 use super::*;
 
@@ -44,18 +44,53 @@ fn head_end_finds_the_first_blank_line() {
     kani::cover!(r == Err(HttpRefusal::BareLineEnding));
 }
 
-/// No panic for any head of 0..=96 bytes; every slice of an accepted head
-/// lies within it (the line's parts within the line), its field count is
-/// within the bound and its body length within `MAX_BODY`.
+/// A field line's name and value lie inside the line, and parsing one
+/// never panics. The whole-head harness over 32 symbolic field bytes ran
+/// past 90 minutes, so each part of the head parser gets its own small
+/// harness and the head harness keeps a short field block.
 #[kani::proof]
-#[kani::unwind(34)]
+#[kani::unwind(26)]
+fn field_line_slices_stay_inside() {
+    let buf: [u8; 24] = kani::any();
+    let line = any_bytes(&buf);
+    if let Ok(f) = field_line(line) {
+        assert!(inside(line, f.name) && inside(line, f.value));
+        assert!(!f.name.is_empty());
+        kani::cover!(!f.value.is_empty());
+    }
+}
+
+/// The request line's method and target lie inside it.
+#[kani::proof]
+#[kani::unwind(26)]
+fn request_line_slices_stay_inside() {
+    let buf: [u8; 24] = kani::any();
+    let line = any_bytes(&buf);
+    if let Ok((method, target)) = request_line(line) {
+        assert!(inside(line, method) && inside(line, target));
+        kani::cover!(target.len() > 1);
+    }
+}
+
+/// A Connection value never panics, and naming a field the proxy owns is
+/// refused.
+#[kani::proof]
+#[kani::unwind(22)]
+fn connection_value_is_total() {
+    let buf: [u8; 20] = kani::any();
+    let value = any_bytes(&buf);
+    let r = check_connection(value);
+    kani::cover!(r.is_ok() && !value.is_empty());
+    kani::cover!(r == Err(HttpRefusal::ConnectionNamesProtected));
+}
+
+/// A head (fixed request line, then up to 16 symbolic bytes of fields) is
+/// total, and every slice it returns lies inside it.
+#[kani::proof]
+#[kani::unwind(18)]
 fn head_is_total_and_slices_stay_inside() {
-    // The request line is fixed, so cbmc's state is the field block alone:
-    // 48 symbolic bytes of whole head passed 32 GiB. Content-Length twice
-    // needs 38 bytes, so its refusal is covered by the unit tests and
-    // bolero, not here.
     const LINE: &[u8] = b"GET / HTTP/1.1\r\n";
-    const FIELD_LEN: usize = 32;
+    const FIELD_LEN: usize = 16;
     let fields: [u8; FIELD_LEN] = kani::any();
     let len: usize = kani::any();
     kani::assume(len <= FIELD_LEN);
@@ -63,21 +98,17 @@ fn head_is_total_and_slices_stay_inside() {
     buf[..LINE.len()].copy_from_slice(LINE);
     buf[LINE.len()..LINE.len() + len].copy_from_slice(&fields[..len]);
     let bytes = &buf[..LINE.len() + len];
-    let r = parse::<3>(bytes);
+    let r = parse::<2>(bytes);
     if let Ok(h) = &r {
         assert!(h.bytes.len() == bytes.len() && inside(bytes, h.bytes));
         assert!(inside(bytes, h.line) && inside(h.line, h.method) && inside(h.line, h.target));
         assert!(inside(bytes, h.host) && !h.host.is_empty());
-        assert!(h.headers().len() <= 3 && h.content_length <= MAX_BODY);
+        assert!(h.headers().len() <= 2 && h.content_length <= MAX_BODY);
         for f in h.headers() {
             assert!(inside(bytes, f.line) && inside(f.line, f.name) && inside(f.line, f.value));
         }
     }
     kani::cover!(matches!(&r, Ok(h) if h.headers().len() >= 2));
-    kani::cover!(matches!(&r, Ok(h) if h.content_length > 0));
-    kani::cover!(r == Err(HttpRefusal::TransferEncoding));
-    kani::cover!(r == Err(HttpRefusal::ConnectionNamesProtected));
-    kani::cover!(r == Err(HttpRefusal::TooManyHeaders));
 }
 
 /// Any value of 0..=24 bytes: no overflow (Kani checks every operation),

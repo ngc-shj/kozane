@@ -9,7 +9,8 @@
 //! - [`record`]: ChaCha20-Poly1305 record protection (section 5.2, 5.3).
 //! - [`handshake`]: the server state machine ([`handshake::Session`]).
 //! - [`rng`]: the hedged randomness seam.
-//! - [`conn`]: slots, timeouts, per-source cap, close and wipe sequencing.
+//! - [`conn`]: slots, timeouts, per-source cap, close and wipe sequencing,
+//!   and the proxy flow through them.
 //! - [`halt`]: the PD's halt reasons, and the halt a refused sign ends in.
 
 #![no_std]

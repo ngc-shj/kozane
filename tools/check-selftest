@@ -166,7 +166,9 @@ CASES_FOR_GATE = {
              "l14-clone", "finished-check", "ccs-once", "ccs-after-finished", "key-share-length", "duplicate-extension",
              "no-key-share-reason", "der-minimal", "early-data-after-connected", "early-data-cap", "conn-timer-activity",
              "conn-alert-wipe", "conn-timeout-wipe", "conn-rst-exhausted", "tls-rndr", "conn-reset-session",
-             "c9-te-refusal", "c9-duplicate-cl", "c9-connection-names-cl", "c9-xff-strip", "c9-body-413"},
+             "c9-te-refusal", "c9-duplicate-cl", "c9-connection-names-cl", "c9-xff-strip", "c9-body-413",
+             "c4-inner-src", "c4-inner-port-range", "c4-tln-dst-ip", "c4-tln-dst-port", "c4-tln-src-port-range",
+             "proxy-truncation-rst", "proxy-early-client-fin", "proxy-413-no-connect", "proxy-connect-timeout-wipe"},
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
     "ct": {"ct-barrier", "ct-c1-barrier", "ct-harness-unit", "ct-harness-lint", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms",
@@ -945,6 +947,41 @@ CASES = {
                                                  "        return Err(DropReason::TcpBadChecksum);\n    }\n",
                                                  "    let _ = pseudo;\n"),
                         "---- tests::tcp_checksum_is_checked_on_every_segment stdout ----"),
+    # M6 plan C4: inner routes to tls only the backend's segments to a TLS
+    # port, and lets tls reach only the backend's address and port.
+    "c4-inner-src": (["unit"], lambda t: edit(t, "crates/inner-core/src/lib.rs", "p.src != backend_ip || ", ""),
+                     "---- tests::segment_from_another_inside_host_does_not_reach_tls stdout ----"),
+    "c4-inner-port-range": (["unit"], lambda t: edit(t, "crates/inner-core/src/lib.rs",
+                                                     " || !cfg.is_tls_port(t.dst_port)", ""),
+                            "---- tests::backend_segment_to_a_port_outside_tls_ports_has_no_service stdout ----"),
+    "c4-tln-dst-ip": (["unit"], lambda t: edit(t, "crates/inner-core/src/lib.rs", " || p.dst != backend_ip", ""),
+                      "---- tests::tls_segment_to_another_inside_host_is_refused stdout ----"),
+    "c4-tln-dst-port": (["unit"], lambda t: edit(t, "crates/inner-core/src/lib.rs",
+                                                 " || t.dst_port != backend_port", ""),
+                        "---- tests::tls_segment_to_another_backend_port_is_refused stdout ----"),
+    "c4-tln-src-port-range": (["unit"], lambda t: edit(t, "crates/inner-core/src/lib.rs",
+                                                       " || !cfg.is_tls_port(t.src_port)", ""),
+                              "---- tests::tls_segment_from_a_port_outside_tls_ports_is_refused stdout ----"),
+    # M6 plan C10: the proxy's close rules and its head-time refusal.
+    "proxy-truncation-rst": (["unit"], lambda t: edit(
+        t, "crates/tls-core/src/conn/proxy.rs",
+        "            Some(Stage::Streaming) => slot.end(CloseCause::BackendRst, Closed::BackendRst, now, next),\n",
+        "            Some(Stage::Streaming) => {\n                let (n, action) = slot.close(CloseCause::BackendFin, out, now);\n"
+        "                next.to_client = n;\n                next.action = action;\n            }\n"),
+        "---- tests::backend_rst_mid_response_resets_the_client_without_close_notify stdout ----"),
+    "proxy-early-client-fin": (["unit"], lambda t: edit(
+        t, "crates/tls-core/src/conn/proxy.rs",
+        "        self.driven(|slot, next| slot.end(CloseCause::ClientClosed, Closed::ClientClosed, now, next))\n",
+        "        self.driven(|_, _| {\n            let _ = now;\n        })\n"),
+        "---- tests::client_fin_before_the_response_ends_aborts_the_backend stdout ----"),
+    "proxy-413-no-connect": (["unit"], lambda t: edit(
+        t, "crates/tls-core/src/conn/proxy.rs", "        next.outcomes.push(Outcome::HttpRefused(refused));\n",
+        "        next.connect = true;\n        next.outcomes.push(Outcome::HttpRefused(refused));\n"),
+        "---- tests::max_body_plus_one_is_413_at_head_time_without_connect stdout ----"),
+    "proxy-connect-timeout-wipe": (["unit"], lambda t: edit(
+        t, "crates/tls-core/src/conn/proxy.rs", "                return slot.unavailable(out, now, next);\n",
+        "                let _ = slot.seal_app(BAD_GATEWAY, out);\n                return;\n"),
+        "---- tests::backend_connect_timeout_answers_502_and_wipes stdout ----"),
     # M6 plan C9: each request-head refusal and the forwarding-field strip.
     "c9-te-refusal": (["unit"], lambda t: edit(t, "crates/http-wire/src/lib.rs",
                                                "            return Err(HttpRefusal::TransferEncoding);\n", ""),

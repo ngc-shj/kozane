@@ -2107,6 +2107,7 @@ name = "tls-core"
 version = "0.1.0"
 dependencies = [
  "ct",
+ "http-wire",
  "libcrux-chacha20poly1305",
  "libcrux-curve25519",
  "libcrux-hkdf",
