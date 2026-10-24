@@ -1,0 +1,111 @@
+//! Kani harnesses for the head delimiter, the head parser, the
+//! Content-Length parse and the rewrite (M6 plan C9, T15). Run with
+//! `cargo kani -p http-wire`. Heads are at most 96 bytes with at most 4
+//! fields (the parser's field bound is its `N`); the rewrite harness, whose
+//! dropped-field check nests over the fields, takes 64 bytes and 3 fields.
+
+use super::*;
+
+const MAX_LEN: usize = 96;
+const FIELDS: usize = 4;
+
+fn any_bytes<const L: usize>(buf: &[u8; L]) -> &[u8] {
+    let len: usize = kani::any();
+    kani::assume(len <= L);
+    buf.get(..len).unwrap_or(&[])
+}
+
+fn inside(outer: &[u8], inner: &[u8]) -> bool {
+    let (o, i) = (outer.as_ptr_range(), inner.as_ptr_range());
+    o.start <= i.start && i.end <= o.end
+}
+
+/// No panic; `Some(n)` is the end of the first CRLFCRLF, `None` means
+/// there is none yet and no bare CR or LF either.
+#[kani::proof]
+#[kani::unwind(98)]
+fn head_end_finds_the_first_blank_line() {
+    let buf: [u8; MAX_LEN] = kani::any();
+    let bytes = any_bytes(&buf);
+    let r = head_end(bytes);
+    if let Ok(found) = r {
+        let end = found.unwrap_or(bytes.len());
+        assert!(end <= bytes.len());
+        // No terminator ends before `end`.
+        for i in 4..end {
+            assert!(bytes.get(i - 4..i) != Some(b"\r\n\r\n"));
+        }
+        if let Some(n) = found {
+            assert!(n >= 4 && bytes.get(n - 4..n) == Some(b"\r\n\r\n"));
+        }
+    }
+    kani::cover!(matches!(r, Ok(Some(n)) if n < bytes.len()));
+    kani::cover!(matches!(r, Ok(None)) && !bytes.is_empty());
+    kani::cover!(r == Err(HttpRefusal::BareLineEnding));
+}
+
+/// No panic for any head of 0..=96 bytes; every slice of an accepted head
+/// lies within it (the line's parts within the line), its field count is
+/// within the bound and its body length within `MAX_BODY`.
+#[kani::proof]
+#[kani::unwind(98)]
+fn head_is_total_and_slices_stay_inside() {
+    let buf: [u8; MAX_LEN] = kani::any();
+    let bytes = any_bytes(&buf);
+    let r = parse::<FIELDS>(bytes);
+    if let Ok(h) = &r {
+        assert!(h.bytes.len() == bytes.len() && inside(bytes, h.bytes));
+        assert!(inside(bytes, h.line) && inside(h.line, h.method) && inside(h.line, h.target));
+        assert!(inside(bytes, h.host) && !h.host.is_empty());
+        assert!(h.headers().len() <= FIELDS && h.content_length <= MAX_BODY);
+        for f in h.headers() {
+            assert!(inside(bytes, f.line) && inside(f.line, f.name) && inside(f.line, f.value));
+        }
+    }
+    kani::cover!(matches!(&r, Ok(h) if h.headers().len() >= 2));
+    kani::cover!(matches!(&r, Ok(h) if h.content_length > 0));
+    kani::cover!(r == Err(HttpRefusal::TransferEncoding));
+    kani::cover!(r == Err(HttpRefusal::DuplicateContentLength));
+    kani::cover!(r == Err(HttpRefusal::ConnectionNamesProtected));
+    kani::cover!(r == Err(HttpRefusal::TooManyHeaders));
+}
+
+/// Any value of 0..=24 bytes: no overflow (Kani checks every operation),
+/// and an accepted value is all digits and equals its decimal value
+/// saturated at `MAX_BODY + 1`, so a huge one is refused as too large.
+#[kani::proof]
+#[kani::unwind(26)]
+fn content_length_parse_is_exact_and_saturates() {
+    let buf: [u8; 24] = kani::any();
+    let value = any_bytes(&buf);
+    let r = parse_content_length(value);
+    if let Ok(n) = r {
+        assert!(!value.is_empty() && value.iter().all(u8::is_ascii_digit));
+        // 24 digits stay below 10^24 < u128::MAX.
+        let exact = value.iter().fold(0u128, |v, &d| v * 10 + u128::from(d - b'0'));
+        assert!(n as u128 == exact.min(MAX_BODY as u128 + 1));
+    }
+    kani::cover!(r == Ok(MAX_BODY));
+    kani::cover!(matches!(r, Ok(n) if n > MAX_BODY) && value.len() > 20);
+    kani::cover!(r == Err(HttpRefusal::ContentLength));
+}
+
+/// An accepted head of 0..=64 bytes and at most 3 fields rewrites into a
+/// buffer `REWRITE_GROWTH` bytes larger than the head, starting with the
+/// request line and ending with ours.
+#[kani::proof]
+#[kani::unwind(66)]
+fn rewrite_fits_and_keeps_the_request_line() {
+    let buf: [u8; 64] = kani::any();
+    let bytes = any_bytes(&buf);
+    let Ok(h) = parse::<3>(bytes) else { return };
+    let mut out = [0u8; 64 + REWRITE_GROWTH];
+    let r = rewrite(&h, kani::any(), &mut out);
+    assert!(matches!(r, Ok(n) if n <= bytes.len() + REWRITE_GROWTH));
+    let n = r.unwrap_or(0);
+    let written = out.get(..n).unwrap_or(&[]);
+    assert!(written.starts_with(h.line));
+    assert!(written.ends_with(b"X-Forwarded-Proto: https\r\nConnection: close\r\n\r\n"));
+    kani::cover!(h.headers().iter().any(|f| is_dropped(&h, f.name)));
+    kani::cover!(h.headers().len() >= 2);
+}

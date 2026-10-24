@@ -25,7 +25,7 @@ counts := $(BUILD)/counts
 
 pds := eth-out eth-in ingress audit timer tpm key hs inner data pq pqkey tls
 host_crates := wire ring audit-event ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct
-kani_crates := wire ring ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire
+kani_crates := wire ring ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire
 
 .PHONY: clean-counts
 .PHONY: all image package run test check check-selftest repro mir audit lint lint-pds unit kani verus ct ct-harness ct-shape bolero fuzz-long laws pins manifest kernel-config clean
@@ -244,7 +244,8 @@ bolero_targets := wire/tests::fuzz_parse_never_panics_and_round_trips \
 	wg-wire/tests::fuzz_parsers_never_panic_and_round_trip \
 	rosenpass-wire/tests::fuzz_parsers_never_panic_and_round_trip \
 	tpm2-wire/tests::fuzz_response_parsers_never_panic_and_stay_in_bounds \
-	tls-wire/tests::fuzz_parsers_never_panic_and_stay_in_bounds
+	tls-wire/tests::fuzz_parsers_never_panic_and_stay_in_bounds \
+	http-wire/tests::fuzz_parse_never_panics_and_rewrite_reparses
 
 # Each target must load its committed seed corpus and complete > 0 runs, so
 # a target that silently stops running fails (BOLERO-TARGETS).

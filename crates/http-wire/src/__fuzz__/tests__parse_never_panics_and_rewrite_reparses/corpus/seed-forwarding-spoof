@@ -1,0 +1,11 @@
+GET / HTTP/1.1
+Host: example.com
+X-Forwarded-For: 127.0.0.1
+X-Forwarded-Proto: http
+Forwarded: for=127.0.0.1
+X-Real-IP: 127.0.0.1
+Connection: keep-alive, X-Custom
+X-Custom: 1
+Keep-Alive: timeout=5
+TE: trailers
+

@@ -265,3 +265,29 @@ Deviations and decisions:
 - HKDF is built on libcrux-hmac (T(1) expand) because libcrux-hkdf 0.0.9's
   expand allocates and `tls` has no heap; checked against libcrux-hkdf in a
   host test and by RFC 8448.
+
+## Slice 4 part 1: http-wire (C9)
+
+Implemented in an isolated worktree in parallel with slice 3a and merged
+(crates/http-wire only, plus the bolero target, Makefile, manifest and five
+selftest cases). Gates: pins, lint, unit (UNIT-HTTP-WIRE 64), bolero (6
+targets); selftest c9-{te-refusal, duplicate-cl, connection-names-cl,
+xff-strip, body-413} red with their needles. Kani for its four harnesses was
+running at commit time.
+
+Deviations:
+- **`head_end(bytes) -> Result<Option<usize>, HttpRefusal>`** added: the PD
+  must tell "wait for more" from "refuse"; a bare CR or LF refuses at once,
+  so an LF-only client cannot hold a slot until the timeout.
+- **`rewrite` also drops a bare `Proxy:` field** (httpoxy, CVE-2016-5385);
+  the contract listed only `Proxy-*`.
+- **Stricter than RFC 9110:** Content-Length with a leading zero is refused
+  ("0" alone is fine) so no backend reads it as octal; its parse saturates
+  just above MAX_BODY (any digit count → 413, overflow-free); Host must be a
+  non-empty reg-name or strict IPv6 literal with port 0..65535, no userinfo.
+- 8 KiB head = request line through the blank line's final CRLF (8192
+  accepted, 8193 → 431). 501 covers CONNECT, absolute/authority/asterisk
+  form, any Transfer-Encoding and Upgrade; precedence after all lines pass:
+  missing Host (400), Expect (417), 413.
+- The rewrite Kani harness is bounded at 64 bytes / 3 fields (its dropped-
+  field check nests over the fields), below the plan's 96 B / 4 fields.
