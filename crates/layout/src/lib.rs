@@ -30,6 +30,11 @@ pub const ETH_IN_IRQ: usize = 71;
 pub const DATA_STACK_SIZE: usize = 0x20_000;
 /// `tls`'s stack_size, which its stack probe paints.
 pub const TLS_STACK_SIZE: usize = 0x20_000;
+/// `tls`'s MCS budget and period (system file µs × 1000): a `TLS_SIGN`
+/// runs on this budget, which bounds how long `hs` can wait behind it in
+/// `key` (M6 plan C5, the invariant in `hs-core`).
+pub const TLS_BUDGET_NS: u64 = 500_000;
+pub const PERIOD_NS: u64 = 10_000_000;
 
 /// sp804 on QEMU virt (coliasgroup patch): 1 MHz input clock, SPI 11.
 pub const TIMER_IRQ: usize = 43;

@@ -25,6 +25,9 @@ const TIMER: Channel = Channel::new(ch::CH_TIMER);
 
 /// Connections at once (plan C10), one listener each.
 const MAX_CONNS: usize = 8;
+// One backend source port per connection at least (config validates
+// `TLS_PORTS` against the same bound, plan C3).
+const _: () = assert!(config::TLS_PORTS.1 as usize >= MAX_CONNS);
 const RX_BUF: usize = 16 * 1024;
 const TX_BUF: usize = 8 * 1024;
 /// The largest IP packet either ring carries: Ethernet's.

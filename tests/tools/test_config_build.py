@@ -18,7 +18,8 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 # Case files live in a temporary directory: point the committed key paths
 # (relative to config/) at the repository.
-BASE = (ROOT / "config/gateway.toml").read_text().replace('rp_pub_path = "keys/', f'rp_pub_path = "{ROOT}/config/keys/')
+BASE = (ROOT / "config/gateway.toml").read_text().replace('rp_pub_path = "keys/', f'rp_pub_path = "{ROOT}/config/keys/') \
+    .replace('tls_cert = "keys/', f'tls_cert = "{ROOT}/config/keys/')
 PEER = re.search(r"\[\[peers\]\]\nwg_pub = .*\nrp_pub_path = .*\nrp_hash = .*\nallowed_ips = \[[^\]]*\]\n", BASE).group(0)
 RP_PUBLIC_KEY_LEN = 524160
 
@@ -56,6 +57,9 @@ CASES = [
               hashlib.blake2s(bytes([7]) * RP_PUBLIC_KEY_LEN).hexdigest())),
     ("rp_port equal to listen_port fails the build", "rp_port must differ",
      BASE.replace("rp_port = 51819", "rp_port = 51820")),
+    # M6 plan C11: the certificate must carry tls_public.
+    ("certificate without tls_public fails the build", "does not hold tls_public",
+     re.sub(r'tls_public = "04[0-9a-f]{2}', 'tls_public = "0400', BASE)),
 ]
 
 

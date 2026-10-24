@@ -325,7 +325,7 @@ fn a_key_blob_with_key_max_peers_seals_and_one_more_does_not() {
     let blob = |peers: usize| {
         let mut r = Box::new([0u8; secret_blob::REGION_SIZE]);
         let publics: Vec<[u8; 32]> = (0..peers).map(|i| [i as u8 | 1; 32]).collect();
-        secret_blob::write(&mut r, &[1; 32], &[2; 32], &publics).unwrap();
+        secret_blob::write(&mut r, &[1; 32], &[2; 32], &[6; 32], &publics).unwrap();
         r
     };
     let mut out = vec![0u8; Kind::Key.region_size()];
@@ -838,7 +838,7 @@ fn another_tpms_srk_is_srk_mismatch() {
 #[test]
 fn a_plaintext_blob_is_envelope_invalid_and_reaches_no_tpm_command() {
     let mut blob = Box::new([0u8; secret_blob::REGION_SIZE]);
-    secret_blob::write(&mut blob, &[1; 32], &[2; 32], &[[3; 32]]).unwrap();
+    secret_blob::write(&mut blob, &[1; 32], &[2; 32], &[6; 32], &[[3; 32]]).unwrap();
     let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
     let mut ppc = FakePpc::new(&env);
     let (r, out) = boot_unseal(&blob[..], &mut ppc);

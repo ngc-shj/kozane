@@ -57,6 +57,11 @@ Rules:
      the two is exactly MCE_CLOSURE (M4 plan C7). The lock stands for
      `cargo metadata`: every gate builds --locked, and the fixtures' partial
      trees could not be resolved by cargo.
+  P17 Cargo.lock locks libcrux-p256 exactly once, from the registry, at the
+     version and checksum recorded beside key-core's SIGN_COST_NS
+     (`SIGN_COST_LIBCRUX_P256`): the sign cost the key-wait invariant uses
+     was measured for that code, so a changed entry means re-measuring
+     (M6 plan C5, T-R3-10)
 
 Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
 fail until they are removed from PENDING; --enforce-pending makes them fail
@@ -72,7 +77,8 @@ control for "a failing gate fails `make check`" is tools/check-selftest's
 check-propagation case, which runs the real `make check` once per gate with
 that gate made to fail.
 
-P6 is a fail-closed binding check (Cargo.lock against policy/waivers.toml).
+P6 and P17 are fail-closed binding checks (Cargo.lock against
+policy/waivers.toml; against key-core's recorded entry).
 P7-P10 are best-effort tripwires over source text. Known bypasses: a
 hand-written `impl Debug`/`impl Clone` or a macro-generated derive (P9), a
 `use ... as` alias or a renamed dependency key (`package = "getrandom"`)
@@ -98,7 +104,7 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
-RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16"]
+RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P17"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
                "crates/pds/key", "crates/pds/hs", "crates/pds/data"]
@@ -608,6 +614,38 @@ def check_mce_deps(root: pathlib.Path, out: list):
         out.append(f"P16 Cargo.lock: {key} left mce460896's dependency closure")
 
 
+# P17: where the sign cost and the lock entry it was measured for live.
+SIGN_COST_FILE = "crates/key-core/src/lib.rs"
+SIGN_COST_PIN = re.compile(r'^pub const SIGN_COST_LIBCRUX_P256: &str = "(\S+) ([0-9a-f]{64})";$', re.M)
+
+
+def check_sign_cost_pin(root: pathlib.Path, out: list):
+    # As P11: a tree without key-core (the P7 fixtures') has nothing to bind.
+    if not (root / "crates/key-core").is_dir():
+        return
+    path = root / SIGN_COST_FILE
+    m = SIGN_COST_PIN.search(path.read_text()) if path.is_file() else None
+    if not m:
+        out.append(f"P17 {SIGN_COST_FILE}: no SIGN_COST_LIBCRUX_P256 \"<version> <checksum>\" beside SIGN_COST_NS")
+        return
+    try:
+        lock = tomllib.loads((root / "Cargo.lock").read_text())
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+        out.append(f"P17 Cargo.lock: unreadable ({e}); the sign cost pin cannot be checked")
+        return
+    entries = [p for p in lock.get("package", []) if p.get("name") == "libcrux-p256"]
+    if len(entries) != 1:
+        out.append(f"P17 Cargo.lock: libcrux-p256 locked {len(entries)} times, want once")
+        return
+    p = entries[0]
+    if p.get("source") != REGISTRY:
+        out.append(f"P17 Cargo.lock: libcrux-p256 is not from the crates.io registry")
+    got = (p.get("version"), p.get("checksum"))
+    if got != (m.group(1), m.group(2)):
+        out.append(f"P17 Cargo.lock: libcrux-p256 {got[0]} {got[1]} differs from the entry SIGN_COST_NS was measured "
+                   f"for ({m.group(1)} {m.group(2)}): re-measure SIGN_COST_NS, then update SIGN_COST_LIBCRUX_P256")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
@@ -634,6 +672,7 @@ def main() -> int:
     check_mce_unsafe(root, out)
     check_client_requests(root, out)
     check_mce_deps(root, out)
+    check_sign_cost_pin(root, out)
     failing = [l for l in out if l.split()[0] not in pending]
     for line in out:
         print(line if line in failing else f"pending {line}")

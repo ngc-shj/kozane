@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""Issues the HTTPS endpoint's development certificate (M6 plan C11).
+
+Usage: mkcert --public FILE --name NAME --out DIR [--test-negative]
+
+FILE is the server's P-256 public key as a PEM SubjectPublicKeyInfo
+(`mksecrets` writes it as tls.pub; the private key never leaves the key
+blob). NAME is the name clients connect to: an IPv4 address (IP mode) or a
+DNS name (name mode). DIR must exist; mkcert writes, refusing to replace
+anything:
+
+  devca.pem  a dev CA made for this run alone
+  tls.der    the leaf for NAME, signed by it (DER, as config's tls_cert)
+
+and with --test-negative, for the acceptance tests, two leaves the CA's
+constraints forbid, issued before its key is dropped:
+
+  negative-name.der  another name of the same form
+  negative-form.der  a name of the other form
+
+The CA key is generated in memory and never serialized: no copy of it
+exists once mkcert exits, so the CA can issue nothing else (S8). The CA
+is constrained to NAME in both name forms, so even its key could not
+vouch for another host: critical NameConstraints (name mode: permitted
+dNSName NAME, excluded iPAddress 0.0.0.0/0 and ::/0; IP mode: permitted
+iPAddress NAME/32 and dNSName `invalid` (RFC 6761), excluded ::/0),
+basicConstraints CA:true with pathLen 0, 30 days' validity. The leaf has
+NAME in its SAN, EKU serverAuth, KU digitalSignature and CA:false; in IP
+mode its subject is empty and its SAN critical (RFC 5280 §4.2.1.6), so no
+hostname-like CN meets the dNSName constraint (S-R4-2).
+
+Host tool only (Python `cryptography`); exits non-zero with a message on
+any refusal.
+"""
+
+import argparse
+import datetime
+import ipaddress
+import pathlib
+import re
+import sys
+
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+VALIDITY = datetime.timedelta(days=30)
+CA_NAME = "secureos dev CA"
+# A DNS label (RFC 1123), lowercase; a name has at least one dot-free label.
+LABEL = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
+OUTPUTS = ("devca.pem", "tls.der")
+NEGATIVES = ("negative-name.der", "negative-form.der")
+
+
+class Refused(Exception):
+    pass
+
+
+def parse_name(name: str):
+    """("ip", IPv4Address) or ("dns", name); refuses anything else."""
+    try:
+        return "ip", ipaddress.IPv4Address(name)
+    except ValueError:
+        pass
+    labels = name.split(".")
+    if len(name) > 253 or not all(LABEL.match(l) for l in labels) or labels[-1].isdigit():
+        raise Refused(f"--name {name!r}: neither an IPv4 address nor a lowercase DNS name")
+    return "dns", name
+
+
+def san_entry(form: str, value):
+    return x509.IPAddress(value) if form == "ip" else x509.DNSName(value)
+
+
+def constraints(form: str, value) -> x509.NameConstraints:
+    if form == "dns":
+        return x509.NameConstraints(
+            permitted_subtrees=[x509.DNSName(value)],
+            excluded_subtrees=[x509.IPAddress(ipaddress.IPv4Network("0.0.0.0/0")),
+                               x509.IPAddress(ipaddress.IPv6Network("::/0"))])
+    return x509.NameConstraints(
+        permitted_subtrees=[x509.IPAddress(ipaddress.IPv4Network(f"{value}/32")), x509.DNSName("invalid")],
+        excluded_subtrees=[x509.IPAddress(ipaddress.IPv6Network("::/0"))])
+
+
+def other_names(form: str, value) -> dict:
+    """Leaves the constraints must refuse: another name of the same form,
+    and one of the other form (outside `invalid` in IP mode)."""
+    if form == "ip":
+        other = ipaddress.IPv4Address((int(value) + 1) % 2**32)
+        return {"negative-name.der": ("ip", other), "negative-form.der": ("dns", "gateway.example")}
+    return {"negative-name.der": ("dns", f"not-{value}"), "negative-form.der": ("ip", ipaddress.IPv4Address("192.0.2.1"))}
+
+
+def load_public(path: pathlib.Path) -> ec.EllipticCurvePublicKey:
+    try:
+        key = serialization.load_pem_public_key(path.read_bytes())
+    except (OSError, ValueError) as e:
+        raise Refused(f"--public {path}: {e}")
+    if not isinstance(key, ec.EllipticCurvePublicKey) or not isinstance(key.curve, ec.SECP256R1):
+        raise Refused(f"--public {path}: not a P-256 public key")
+    return key
+
+
+def make_ca(form: str, value, now: datetime.datetime):
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, CA_NAME)])
+    cert = (x509.CertificateBuilder()
+            .subject_name(name).issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now).not_valid_after(now + VALIDITY)
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .add_extension(x509.KeyUsage(digital_signature=False, content_commitment=False, key_encipherment=False,
+                                         data_encipherment=False, key_agreement=False, key_cert_sign=True,
+                                         crl_sign=True, encipher_only=False, decipher_only=False), critical=True)
+            .add_extension(constraints(form, value), critical=True)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+            .sign(key, hashes.SHA256()))
+    return key, cert
+
+
+def make_leaf(ca_key, ca: x509.Certificate, public, form: str, value, now: datetime.datetime) -> x509.Certificate:
+    # IP mode: an empty subject and a critical SAN.
+    subject = x509.Name([]) if form == "ip" else x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, value)])
+    return (x509.CertificateBuilder()
+            .subject_name(subject).issuer_name(ca.subject)
+            .public_key(public)
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now).not_valid_after(now + VALIDITY)
+            .add_extension(x509.SubjectAlternativeName([san_entry(form, value)]), critical=form == "ip")
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(x509.KeyUsage(digital_signature=True, content_commitment=False, key_encipherment=False,
+                                         data_encipherment=False, key_agreement=False, key_cert_sign=False,
+                                         crl_sign=False, encipher_only=False, decipher_only=False), critical=True)
+            .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False)
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(public), critical=False)
+            .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
+            .sign(ca_key, hashes.SHA256()))
+
+
+def issue(public, name: str, negative: bool, now: datetime.datetime = None) -> dict:
+    """{file name: bytes} for every output. The CA key lives only in this
+    call's frame."""
+    form, value = parse_name(name)
+    now = (now or datetime.datetime.now(datetime.timezone.utc)).replace(microsecond=0)
+    ca_key, ca = make_ca(form, value, now)
+    out = {"devca.pem": ca.public_bytes(serialization.Encoding.PEM),
+           "tls.der": make_leaf(ca_key, ca, public, form, value, now).public_bytes(serialization.Encoding.DER)}
+    if negative:
+        for file, (f, v) in other_names(form, value).items():
+            out[file] = make_leaf(ca_key, ca, public, f, v, now).public_bytes(serialization.Encoding.DER)
+    del ca_key
+    return out
+
+
+def write_all(out_dir: pathlib.Path, files: dict):
+    if not out_dir.is_dir():
+        raise Refused(f"--out {out_dir}: not a directory")
+    taken = [f for f in files if (out_dir / f).exists()]
+    if taken:
+        raise Refused(f"--out {out_dir}: {', '.join(taken)} already exist")
+    for f, data in files.items():
+        with open(out_dir / f, "xb") as fh:
+            fh.write(data)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description="dev CA and HTTPS leaf (M6 plan C11)")
+    ap.add_argument("--public", required=True, type=pathlib.Path)
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--out", required=True, type=pathlib.Path)
+    ap.add_argument("--test-negative", action="store_true")
+    args = ap.parse_args(argv)
+    try:
+        write_all(args.out, issue(load_public(args.public), args.name, args.test_negative))
+    except Refused as e:
+        print(f"mkcert: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

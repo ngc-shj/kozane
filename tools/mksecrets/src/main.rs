@@ -1,17 +1,27 @@
-//! Generates a development deployment (plan C16, M3 plan C6): fresh
-//! gateway and peer keys, a gateway config for the build (SECUREOS_CONFIG)
-//! with the McEliece public key files it names, both secrets regions for
-//! `make package` (`secrets.bin` for `key`, `pqkey-secrets.bin` for
-//! `pqkey`), and per peer a client bundle: a wg(8) config without a
-//! PresharedKey (the PSK comes from Rosenpass, L8), a rosenpass(1) config
-//! and the peer's McEliece keypair, the secret key in the liboqs layout
-//! upstream rosenpass reads.
+//! Generates a development deployment (plan C16, M3 plan C6, M6 plan C11):
+//! fresh gateway and peer keys, a gateway config for the build
+//! (SECUREOS_CONFIG) with the McEliece public key files it names, both
+//! secrets regions for `make package` (`secrets.bin` for `key`,
+//! `pqkey-secrets.bin` for `pqkey`), and per peer a client bundle: a wg(8)
+//! config without a PresharedKey (the PSK comes from Rosenpass, L8), a
+//! rosenpass(1) config and the peer's McEliece keypair, the secret key in
+//! the liboqs layout upstream rosenpass reads.
+//!
+//! For HTTPS, in the plan's order: a fresh P-256 scalar goes into the key
+//! blob (v3) and its public key into `tls.pub` (PEM); tools/mkcert issues
+//! a dev CA (`devca.pem`, its key never written) and the leaf (`tls.der`);
+//! the config names the leaf and `tls_public`, and is validated last.
 //!
 //! Usage: mksecrets --template config/gateway.toml --peers N --out DIR
 //!                  [--endpoint HOST:PORT] [--rp-endpoint HOST:PORT]
+//!                  [--tls-name NAME] [--test-negative] [--tls-mismatch-blob]
 //!
 //! The Rosenpass endpoint defaults to the WireGuard endpoint's host with the
-//! template's `rp_port`.
+//! template's `rp_port`. NAME, the HTTPS server's name, defaults to the
+//! template's `outside_ip` (mkcert's IP mode). --test-negative also writes
+//! mkcert's negative leaves; --tls-mismatch-blob also writes
+//! `secrets-tls-mismatch.bin`, this deployment's blob with another TLS
+//! scalar (the TLS-only key failure case, M6 plan D5).
 //!
 //! `mksecrets seal` seals one of those blobs offline into its envelope (M5
 //! plan C11) for one TPM and one expected PCR 8:
@@ -77,6 +87,120 @@ fn random32() -> Result<[u8; 32], String> {
         .map_err(|e| format!("/dev/urandom: {e}"))?;
     Ok(b)
 }
+
+/// A P-256 scalar (big-endian) from /dev/urandom and its uncompressed
+/// point. A draw that is zero or not below the order (≈ 2^-32) is redrawn.
+fn p256_keypair() -> Result<(Secret<32>, [u8; validate::TLS_PUBLIC_LEN]), String> {
+    for _ in 0..8 {
+        let mut scalar = Secret::<32>::zero();
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(scalar.as_mut_bytes()))
+            .map_err(|e| format!("/dev/urandom: {e}"))?;
+        if let Some(xy) = tpm2::crypto::public_point(&scalar) {
+            let mut public = [0x04; validate::TLS_PUBLIC_LEN];
+            public[1..].copy_from_slice(&xy);
+            return Ok((scalar, public));
+        }
+    }
+    Err("/dev/urandom gave no valid P-256 scalar in 8 draws".into())
+}
+
+/// RFC 4648 base64 with padding.
+fn base64(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let n = u32::from(b[0]) << 16 | u32::from(b[1]) << 8 | u32::from(b[2]);
+        for i in 0..4 {
+            if i <= chunk.len() {
+                s.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
+            } else {
+                s.push('=');
+            }
+        }
+    }
+    s
+}
+
+/// The point as a PEM SubjectPublicKeyInfo (`tls.pub`, mkcert's input).
+fn public_key_pem(public: &[u8; validate::TLS_PUBLIC_LEN]) -> String {
+    let mut der = validate::P256_SPKI_PREFIX.to_vec();
+    der.extend_from_slice(public);
+    let b64 = base64(&der);
+    let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
+    for line in b64.as_bytes().chunks(64) {
+        pem.push_str(&String::from_utf8_lossy(line));
+        pem.push('\n');
+    }
+    pem.push_str("-----END PUBLIC KEY-----\n");
+    pem
+}
+
+/// Issues the certificates for `tls.pub` (PEM) and NAME: the files mkcert
+/// writes, by name. Tests stand in for mkcert.
+type Issue<'a> = &'a dyn Fn(&str, &str, bool) -> Result<Vec<(String, Vec<u8>)>, String>;
+
+/// tools/mkcert, run in a private scratch directory that is removed again:
+/// it holds only public material (the CA key never leaves mkcert).
+fn mkcert_issue(public_pem: &str, name: &str, negative: bool) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let mut token = [0u8; 8];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut token))
+        .map_err(|e| format!("/dev/urandom: {e}"))?;
+    let token: String = token.iter().map(|b| format!("{b:02x}")).collect();
+    let dir = std::env::temp_dir().join(format!("mksecrets-mkcert-{token}"));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let issued = mkcert_in(&dir, public_pem, name, negative);
+    let removed = std::fs::remove_dir_all(&dir).map_err(|e| format!("cannot remove {}: {e}", dir.display()));
+    let files = issued?;
+    removed?;
+    Ok(files)
+}
+
+fn mkcert_in(dir: &Path, public_pem: &str, name: &str, negative: bool) -> Result<Vec<(String, Vec<u8>)>, String> {
+    let tool = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/mkcert");
+    let public = dir.join("tls.pub");
+    std::fs::write(&public, public_pem).map_err(|e| format!("{}: {e}", public.display()))?;
+    let out = dir.join("out");
+    std::fs::create_dir(&out).map_err(|e| format!("{}: {e}", out.display()))?;
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(&tool).arg("--public").arg(&public).arg("--name").arg(name).arg("--out").arg(&out);
+    if negative {
+        cmd.arg("--test-negative");
+    }
+    let r = cmd.output().map_err(|e| format!("cannot run {}: {e}", tool.display()))?;
+    if !r.status.success() {
+        return Err(format!("tools/mkcert failed: {}", String::from_utf8_lossy(&r.stderr).trim()));
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&out).map_err(|e| format!("{}: {e}", out.display()))? {
+        let entry = entry.map_err(|e| format!("{}: {e}", out.display()))?;
+        let name = entry.file_name().into_string().map_err(|n| format!("mkcert wrote {n:?}"))?;
+        if !MKCERT_FILES.contains(&name.as_str()) {
+            return Err(format!("tools/mkcert wrote an unexpected file {name:?}"));
+        }
+        files.push((name, std::fs::read(entry.path()).map_err(|e| format!("{}: {e}", entry.path().display()))?));
+    }
+    files.sort();
+    Ok(files)
+}
+
+/// The HTTPS server's certificate options (M6 plan C11).
+struct TlsOptions<'a> {
+    /// The server's name; None: the template's `outside_ip`.
+    name: Option<&'a str>,
+    /// Also issue mkcert's negative leaves.
+    negative: bool,
+    /// Also write this deployment's blob with another TLS scalar.
+    mismatch_blob: bool,
+    issue: Issue<'a>,
+}
+
+/// The certificate files the config and the integration harness name.
+const TLS_CERT: &str = "tls.der";
+const TLS_PUB: &str = "tls.pub";
+/// Everything mkcert may write (tools/mkcert OUTPUTS and NEGATIVES).
+const MKCERT_FILES: [&str; 4] = ["devca.pem", TLS_CERT, "negative-name.der", "negative-form.der"];
 
 fn keypair() -> Result<KeyPair, String> {
     let mut private = random32()?;
@@ -176,6 +300,11 @@ struct PeerBundle {
 struct Deployment {
     config: String,
     blob: Box<[u8; secret_blob::REGION_SIZE]>,
+    /// `blob` with another valid TLS scalar, if asked for.
+    tls_mismatch_blob: Option<Box<[u8; secret_blob::REGION_SIZE]>>,
+    tls_pub_pem: String,
+    /// mkcert's files: `tls.der`, `devca.pem` and any negative leaves.
+    certs: Vec<(String, Vec<u8>)>,
     pq_blob: Box<[u8; pq::REGION_SIZE]>,
     gateway_rp_public: Box<[u8; pq::PK_LEN]>,
     peers: Vec<PeerBundle>,
@@ -201,8 +330,15 @@ fn rosenpass_endpoint(endpoint: &str, rp_endpoint: Option<&str>, rp_port: u16) -
     Ok(format!("{host}:{rp_port}"))
 }
 
-/// Builds every output in memory; nothing touches the disk here.
-fn generate(template: &str, peers: usize, endpoint: &str, rp_endpoint: Option<&str>) -> Result<Deployment, String> {
+/// Builds every output in memory; nothing touches the disk here but
+/// `tls.issue`'s mkcert run, which sees only the public key.
+fn generate(
+    template: &str,
+    peers: usize,
+    endpoint: &str,
+    rp_endpoint: Option<&str>,
+    tls: &TlsOptions<'_>,
+) -> Result<Deployment, String> {
     if peers == 0 || peers > validate::MAX_PEERS {
         return Err(format!("--peers must be 1..={}", validate::MAX_PEERS));
     }
@@ -214,12 +350,19 @@ fn generate(template: &str, peers: usize, endpoint: &str, rp_endpoint: Option<&s
     let gateway_rp = mceliece_keypair(&mut rng)?;
     let peer_keys: Vec<(KeyPair, McEliece)> =
         (0..peers).map(|_| Ok((keypair()?, mceliece_keypair(&mut rng)?))).collect::<Result<_, String>>()?;
+    // The plan's order (F13): the scalar and tls.pub first, then mkcert,
+    // then the config naming the leaf, validated last.
+    let (tls_private, tls_public) = p256_keypair()?;
+    let tls_pub_pem = public_key_pem(&tls_public);
+    let certs = (tls.issue)(&tls_pub_pem, tls.name.unwrap_or(&g.outside_ip), tls.negative)?;
 
     let mut config = format!(
         "# Generated by tools/mksecrets. Public values only.\n\n[gateway]\npublic_key = \"{}\"\n\
          listen_port = {}\nrp_port = {}\nhttps_port = {}\nrp_pub_path = \"{GATEWAY_RP_PUBLIC}\"\nrp_hash = \"{}\"\n\
          outside_ip = \"{}\"\noutside_mac = \"{}\"\noutside_router_mac = \"{}\"\n\
-         inside_ip = \"{}\"\ninside_prefix = \"{}\"\ninside_mac = \"{}\"\n",
+         inside_ip = \"{}\"\ninside_prefix = \"{}\"\ninside_mac = \"{}\"\n\
+         tls_ports = {{ start = {}, count = {} }}\nbackend = {{ ip = \"{}\", port = {} }}\n\
+         tls_cert = \"{TLS_CERT}\"\ntls_public = \"{}\"\n",
         encode_key(&gateway.public),
         g.listen_port,
         g.rp_port,
@@ -230,7 +373,12 @@ fn generate(template: &str, peers: usize, endpoint: &str, rp_endpoint: Option<&s
         g.outside_router_mac,
         g.inside_ip,
         g.inside_prefix,
-        g.inside_mac
+        g.inside_mac,
+        g.tls_ports.start,
+        g.tls_ports.count,
+        g.backend.ip,
+        g.backend.port,
+        tls_public.iter().map(|b| format!("{b:02x}")).collect::<String>()
     );
     for n in &raw.neighbors {
         config.push_str(&format!("\n[[neighbors]]\nip = \"{}\"\nmac = \"{}\"\n", n.ip, n.mac));
@@ -245,6 +393,9 @@ fn generate(template: &str, peers: usize, endpoint: &str, rp_endpoint: Option<&s
         ));
     }
     let load = |name: &str| -> Result<Vec<u8>, String> {
+        if name == TLS_CERT {
+            return certs.iter().find(|(n, _)| n == TLS_CERT).map(|(_, c)| c.clone()).ok_or("mkcert wrote no tls.der".into());
+        }
         let key = if name == GATEWAY_RP_PUBLIC {
             Some(&gateway_rp)
         } else {
@@ -256,8 +407,18 @@ fn generate(template: &str, peers: usize, endpoint: &str, rp_endpoint: Option<&s
 
     let mut blob = zeroed::<{ secret_blob::REGION_SIZE }>()?;
     let wg_publics: Vec<[u8; 32]> = peer_keys.iter().map(|(kp, _)| kp.public).collect();
-    secret_blob::write(&mut blob, &gateway.private, &random32()?, &wg_publics)
+    let boot_seed = random32()?;
+    secret_blob::write(&mut blob, &gateway.private, &boot_seed, tls_private.as_bytes(), &wg_publics)
         .ok_or_else(|| "secrets do not fit the region".to_string())?;
+    let tls_mismatch_blob = if tls.mismatch_blob {
+        let (other, _) = p256_keypair()?;
+        let mut b = zeroed::<{ secret_blob::REGION_SIZE }>()?;
+        secret_blob::write(&mut b, &gateway.private, &boot_seed, other.as_bytes(), &wg_publics)
+            .ok_or_else(|| "secrets do not fit the region".to_string())?;
+        Some(b)
+    } else {
+        None
+    };
 
     let (kat_ct, kat_shk_hash) = mceliece_kat(&gateway_rp.public, &mut rng)?;
     let mut pq_blob = zeroed::<{ pq::REGION_SIZE }>()?;
@@ -295,7 +456,16 @@ fn generate(template: &str, peers: usize, endpoint: &str, rp_endpoint: Option<&s
         pq::liboqs_sk_from_cmr(&mut rp_secret, &rp.secret);
         bundles.push(PeerBundle { wg_conf, rp_toml, rp_public: rp.public, rp_secret });
     }
-    Ok(Deployment { config, blob, pq_blob, gateway_rp_public: gateway_rp.public, peers: bundles })
+    Ok(Deployment {
+        config,
+        blob,
+        tls_mismatch_blob,
+        tls_pub_pem,
+        certs,
+        pq_blob,
+        gateway_rp_public: gateway_rp.public,
+        peers: bundles,
+    })
 }
 
 /// Writes a deployment through `write` into a fresh 0700 staging directory
@@ -417,6 +587,9 @@ fn run(args: &[String]) -> Result<(), String> {
     let mut out = None;
     let mut endpoint = "127.0.0.1:51820".to_string();
     let mut rp_endpoint = None;
+    let mut tls_name = None;
+    let mut negative = false;
+    let mut mismatch_blob = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         let mut value = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
@@ -426,23 +599,34 @@ fn run(args: &[String]) -> Result<(), String> {
             "--out" => out = Some(PathBuf::from(value()?)),
             "--endpoint" => endpoint = value()?,
             "--rp-endpoint" => rp_endpoint = Some(value()?),
+            "--tls-name" => tls_name = Some(value()?),
+            "--test-negative" => negative = true,
+            "--tls-mismatch-blob" => mismatch_blob = true,
             other => return Err(format!("unknown argument {other}")),
         }
     }
     let (Some(template), Some(peers), Some(out)) = (template, peers, out) else {
-        return Err(
-            "usage: mksecrets --template FILE --peers N --out DIR [--endpoint HOST:PORT] [--rp-endpoint HOST:PORT]".into()
-        );
+        return Err("usage: mksecrets --template FILE --peers N --out DIR [--endpoint HOST:PORT] [--rp-endpoint HOST:PORT] \
+                    [--tls-name NAME] [--test-negative] [--tls-mismatch-blob]"
+            .into());
     };
     let dir = check_out_dir(&out, &forbidden_roots()?)?;
     let text = std::fs::read_to_string(&template).map_err(|e| format!("{template}: {e}"))?;
-    let d = generate(&text, peers, &endpoint, rp_endpoint.as_deref())?;
+    let tls = TlsOptions { name: tls_name.as_deref(), negative, mismatch_blob, issue: &mkcert_issue };
+    let d = generate(&text, peers, &endpoint, rp_endpoint.as_deref(), &tls)?;
 
     stage_and_publish(&dir, |stage| {
         write_private(&stage.join("gateway.toml"), d.config.as_bytes())?;
         write_private(&stage.join(GATEWAY_RP_PUBLIC), &d.gateway_rp_public[..])?;
         write_private(&stage.join("secrets.bin"), &d.blob[..])?;
+        if let Some(b) = &d.tls_mismatch_blob {
+            write_private(&stage.join("secrets-tls-mismatch.bin"), &b[..])?;
+        }
         write_private(&stage.join("pqkey-secrets.bin"), &d.pq_blob[..])?;
+        write_private(&stage.join(TLS_PUB), d.tls_pub_pem.as_bytes())?;
+        for (name, bytes) in &d.certs {
+            write_private(&stage.join(name), bytes)?;
+        }
         for (i, p) in d.peers.iter().enumerate() {
             write_private(&stage.join(format!("peer-{i}.conf")), p.wg_conf.as_bytes())?;
             write_private(&stage.join(format!("peer-{i}.rosenpass.toml")), p.rp_toml.as_bytes())?;

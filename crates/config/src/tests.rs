@@ -12,12 +12,39 @@ use std::vec::Vec;
 
 const RP_LEN: usize = validate::RP_PUBLIC_KEY_LEN;
 
+/// `TLS_PUBLIC_HEX` decoded.
+const TLS_PUBLIC: [u8; validate::TLS_PUBLIC_LEN] = {
+    let mut p = [0x11; validate::TLS_PUBLIC_LEN];
+    p[0] = 0x04;
+    p
+};
+const TLS_PUBLIC_HEX: &str = "0411111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111";
+
+/// A stand-in certificate: DER-ish bytes around the SPKI of `public`.
+fn cert_for(public: &[u8], pad: usize) -> Vec<u8> {
+    let mut c = std::vec![0x30, 0x82, 0x01, 0x23];
+    c.extend(std::iter::repeat_n(0xa0, pad));
+    c.extend_from_slice(&validate::P256_SPKI_PREFIX);
+    c.extend_from_slice(public);
+    c.extend_from_slice(&[0xa3, 0x00]);
+    c
+}
+
 /// Key files served from memory: `rp-<n>.pk` is a public key of [n; RP_LEN],
-/// `short.pk` and `long.pk` miss the size by one byte.
+/// `short.pk` and `long.pk` miss the size by one byte; `tls.der` holds
+/// `TLS_PUBLIC`, `other.der` another point, `big.der` is one byte over the
+/// size limit and `noprefix.der` has the point without its SPKI prefix.
 fn load(name: &str) -> Result<Vec<u8>, String> {
+    let mut other = TLS_PUBLIC;
+    other[64] ^= 1;
     match name {
         "short.pk" => Ok(std::vec![1; RP_LEN - 1]),
         "long.pk" => Ok(std::vec![1; RP_LEN + 1]),
+        "tls.der" => Ok(cert_for(&TLS_PUBLIC, 0)),
+        "max.der" => Ok(cert_for(&TLS_PUBLIC, validate::MAX_TLS_CERT - cert_for(&TLS_PUBLIC, 0).len())),
+        "big.der" => Ok(cert_for(&TLS_PUBLIC, validate::MAX_TLS_CERT + 1 - cert_for(&TLS_PUBLIC, 0).len())),
+        "other.der" => Ok(cert_for(&other, 0)),
+        "noprefix.der" => Ok([&[0x30u8, 0x00][..], &TLS_PUBLIC[..]].concat()),
         _ => name
             .strip_prefix("rp-")
             .and_then(|n| n.strip_suffix(".pk"))
@@ -54,6 +81,10 @@ outside_router_mac = "52:55:0a:00:02:02"
 inside_ip = "10.99.0.1"
 inside_prefix = "10.99.0.0/24"
 inside_mac = "52:54:00:12:34:57"
+tls_ports = {{ start = 40000, count = 1024 }}
+backend = {{ ip = "10.99.0.2", port = 8080 }}
+tls_cert = "tls.der"
+tls_public = "{TLS_PUBLIC_HEX}"
 
 [[neighbors]]
 ip = "10.99.0.2"
@@ -408,4 +439,112 @@ fn https_port_is_rendered_for_the_pds() {
     let checked = check(&cfg(&peer(K1, "\"10.200.0.2/32\"")), 4).unwrap();
     assert!(validate::render(&checked, "gw.pk", &[]).contains("pub const HTTPS_PORT: u16 = 443;\n"));
     assert_ne!(crate::HTTPS_PORT, 0);
+}
+
+fn base() -> String {
+    cfg(&peer(K1, "\"10.200.0.2/32\""))
+}
+
+fn with_ports(start: u32, count: u32) -> String {
+    base().replace("tls_ports = { start = 40000, count = 1024 }", &std::format!("tls_ports = {{ start = {start}, count = {count} }}"))
+}
+
+/// M6 plan C3 (F-N-d): start ≠ 0, count ≥ 8, start + count ≤ 65536, each
+/// bound tested on both sides.
+#[test]
+fn tls_ports_start_must_be_non_zero() {
+    assert!(err(&with_ports(0, 1024)).contains("tls_ports.start must be non-zero"));
+    assert_eq!(check(&with_ports(1, 1024), 4).map(|c| c.tls_ports), Ok((1, 1024)));
+}
+
+#[test]
+fn tls_ports_count_must_cover_every_connection() {
+    assert!(err(&with_ports(40000, 7)).contains("tls_ports.count must be at least 8, got 7"));
+    assert_eq!(check(&with_ports(40000, 8), 4).map(|c| c.tls_ports), Ok((40000, 8)));
+}
+
+#[test]
+fn tls_ports_must_end_at_or_before_port_65535() {
+    assert_eq!(check(&with_ports(65528, 8), 4).map(|c| c.tls_ports), Ok((65528, 8)));
+    assert!(err(&with_ports(65529, 8)).contains("tls_ports 65529+8 runs past port 65535"));
+    assert_eq!(check(&with_ports(1, 65535), 4).map(|c| c.tls_ports), Ok((1, 65535)));
+    assert!(err(&with_ports(2, 65535)).contains("runs past port 65535"));
+    assert!(err(&with_ports(u32::MAX, u32::MAX)).contains("runs past port 65535"));
+}
+
+#[test]
+fn tls_ports_and_backend_are_required_fields() {
+    assert!(err(&base().replace("tls_ports = { start = 40000, count = 1024 }\n", "")).contains("missing field `tls_ports`"));
+    assert!(err(&base().replace("backend = { ip = \"10.99.0.2\", port = 8080 }\n", "")).contains("missing field `backend`"));
+    assert!(err(&base().replace("count = 1024 }", "count = 1024, end = 3 }")).contains("unknown field"));
+}
+
+/// M6 plan C4 (F16a): the backend lies in `inside_prefix` and is a
+/// configured neighbor.
+#[test]
+fn backend_must_be_a_configured_inside_neighbor() {
+    let b = |ip: &str| {
+        base().replace("ip = \"10.99.0.2\", port", &std::format!("ip = \"{ip}\", port"))
+            + "\n[[neighbors]]\nip = \"10.99.0.3\"\nmac = \"02:00:00:00:99:03\"\n"
+    };
+    assert_eq!(check(&b("10.99.0.3"), 4).map(|c| c.backend), Ok(([10, 99, 0, 3], 8080)));
+    assert!(err(&b("10.99.0.4")).contains("backend 10.99.0.4 is not a configured neighbor"));
+    assert!(err(&b("10.98.0.2")).contains("backend 10.98.0.2 is outside inside_prefix"));
+    // The gateway's own inside address is in the prefix but no neighbor.
+    assert!(err(&b("10.99.0.1")).contains("is not a configured neighbor"));
+    assert!(err(&b("10.99.0")).contains("config: backend: bad IPv4 address"));
+}
+
+#[test]
+fn backend_port_must_be_non_zero() {
+    assert!(err(&base().replace("port = 8080", "port = 0")).contains("backend port must be non-zero"));
+    assert_eq!(check(&base().replace("port = 8080", "port = 1"), 4).map(|c| c.backend.1), Ok(1));
+}
+
+/// M6 plan C11: the certificate holds the 26-byte P-256 SPKI prefix
+/// followed by `tls_public`.
+#[test]
+fn tls_cert_must_hold_tls_public_as_a_p256_spki() {
+    let c = check(&base(), 4).unwrap();
+    assert_eq!((c.tls_public, c.tls_cert.clone()), (TLS_PUBLIC, cert_for(&TLS_PUBLIC, 0)));
+    let with_cert = |f: &str| base().replace("tls_cert = \"tls.der\"", &std::format!("tls_cert = \"{f}\""));
+    assert!(err(&with_cert("other.der")).contains("does not hold tls_public as a P-256 public key"));
+    assert!(err(&with_cert("noprefix.der")).contains("does not hold tls_public as a P-256 public key"));
+    assert!(err(&with_cert("missing.der")).contains("no such file missing.der"));
+}
+
+#[test]
+fn tls_cert_size_is_bounded() {
+    let with_cert = |f: &str| base().replace("tls_cert = \"tls.der\"", &std::format!("tls_cert = \"{f}\""));
+    assert_eq!(check(&with_cert("max.der"), 4).map(|c| c.tls_cert.len()), Ok(validate::MAX_TLS_CERT));
+    assert!(err(&with_cert("big.der")).contains(&std::format!("{} bytes, at most {}", validate::MAX_TLS_CERT + 1, validate::MAX_TLS_CERT)));
+}
+
+#[test]
+fn tls_public_must_be_an_uncompressed_point_in_hex() {
+    let with_public = |h: &str| base().replace(TLS_PUBLIC_HEX, h);
+    assert!(err(&with_public(&TLS_PUBLIC_HEX[..128])).contains("expected 130 hex digits"));
+    assert!(err(&with_public(&std::format!("{TLS_PUBLIC_HEX}11"))).contains("expected 130 hex digits"));
+    assert!(err(&with_public(&TLS_PUBLIC_HEX.replacen("04", "02", 1))).contains("uncompressed P-256 point"));
+    assert!(err(&with_public(&TLS_PUBLIC_HEX.replacen("11", "1g", 1))).contains("expected 130 hex digits"));
+}
+
+#[test]
+fn tls_outputs_are_rendered_for_the_pds() {
+    let r = validate::render(&check(&base(), 4).unwrap(), "gw.pk", &[]);
+    assert!(r.contains("pub const TLS_PORTS: (u16, u16) = (40000, 1024);\n"));
+    assert!(r.contains("pub const BACKEND: ([u8; 4], u16) = ([10, 99, 0, 2], 8080);\n"));
+    assert!(r.contains(&std::format!("pub const TLS_CERT: &[u8] = &{:?};\n", cert_for(&TLS_PUBLIC, 0))));
+    assert!(r.contains(&std::format!("pub const TLS_PUBLIC: [u8; 65] = {:?};\n", TLS_PUBLIC)));
+}
+
+/// The compiled configuration's certificate holds its public key (the
+/// build-time check, on what the PDs get).
+#[test]
+fn compiled_tls_cert_holds_the_compiled_tls_public() {
+    let mut spki = validate::P256_SPKI_PREFIX.to_vec();
+    spki.extend_from_slice(&crate::TLS_PUBLIC);
+    assert!(crate::TLS_CERT.windows(spki.len()).any(|w| w == spki.as_slice()));
+    assert!(crate::TLS_PORTS.1 >= 8);
+    assert!(crate::NEIGHBORS.iter().any(|n| n.ip == crate::BACKEND.0));
 }

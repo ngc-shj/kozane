@@ -308,13 +308,14 @@ pins: release-tool | $(counts)
 	python3 tests/tools/test_mir_gate.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_measure.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_release.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	python3 tests/tools/test_mkcert.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	cargo clippy --locked --manifest-path tools/release/Cargo.toml --target-dir $(BUILD)/release/target --all-targets -- -D warnings \
 		> $(counts)/release-lint.log 2>&1 || { cat $(counts)/release-lint.log; exit 1; }
 	cargo test --locked --manifest-path tools/release/Cargo.toml --target-dir $(BUILD)/release/target \
 		> $(counts)/release-unit.log 2>&1 || { cat $(counts)/release-unit.log; exit 1; }
 	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-RELEASE-TOOL", n + 0 }' $(counts)/release-unit.log >> $(counts)/pins.log
 	tools/verus-pairing >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES|UNIT-COUNTS-FIXTURES|PROOF-LOCK-FIXTURES|VERUS-PAIRING-FIXTURES|VERUS-PAIRED|MIR-GATE-FIXTURES|MEASURE-FIXTURES|RELEASE-FIXTURES|UNIT-RELEASE-TOOL)' $(counts)/pins.log > $(counts)/pins
+	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES|UNIT-COUNTS-FIXTURES|PROOF-LOCK-FIXTURES|VERUS-PAIRING-FIXTURES|VERUS-PAIRED|MIR-GATE-FIXTURES|MEASURE-FIXTURES|RELEASE-FIXTURES|MKCERT-FIXTURES|UNIT-RELEASE-TOOL)' $(counts)/pins.log > $(counts)/pins
 
 # Builds its own deployment (fresh keys, generated config, release package);
 # see run.py. Packaging a release kernel needs the C9 pass record, hence

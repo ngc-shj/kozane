@@ -151,6 +151,10 @@ impl Audit {
                 println!(uart, "audit: src={} KeyStackHighWater bytes={} lost={}", src, r.a, r.b);
                 true
             }
+            Decoded::KeyWaitHighWater => {
+                println!(uart, "audit: src={} KeyWaitHighWater us={} lost={}", src, r.a, r.b);
+                true
+            }
             Decoded::Halted => {
                 println!(uart, "audit: src={} Halted reason={} lost={}", src, r.a, r.b);
                 true

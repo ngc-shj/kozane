@@ -60,9 +60,9 @@ pub const HEADER_LEN: usize = SEED_AT + 2 + POINT_LEN;
 
 const _: () = assert!(SRK_PUBLIC_AT == 54 && OBJECT_PUBLIC_AT == 188 && SEED_AT == 378 && HEADER_LEN == 448);
 
-/// `key`'s blob: header, gateway private key, boot seed, then 32 bytes per
-/// peer and the checksum (secret_blob's layout).
-const KEY_BLOB_FIXED: usize = 16 + 32 + 32;
+/// `key`'s blob: header, gateway private key, boot seed, TLS scalar, then
+/// 32 bytes per peer and the checksum (secret_blob's layout, version 3).
+const KEY_BLOB_FIXED: usize = 16 + 32 + 32 + 32;
 const KEY_BLOB_PER_PEER: usize = 32;
 const KEY_BLOB_CHECKSUM: usize = 32;
 
@@ -101,7 +101,7 @@ const _: () = assert!(pq::USED_LEN <= Kind::Pq.capacity());
 /// The most peers a sealed `key` blob can carry: fewer than the plaintext
 /// format's `secret_blob::MAX_PEERS`, which fills the whole region.
 pub const KEY_MAX_PEERS: usize = (Kind::Key.capacity() - KEY_BLOB_FIXED - KEY_BLOB_CHECKSUM) / KEY_BLOB_PER_PEER;
-const _: () = assert!(KEY_MAX_PEERS == 110 && KEY_MAX_PEERS < secret_blob::MAX_PEERS);
+const _: () = assert!(KEY_MAX_PEERS == 109 && KEY_MAX_PEERS < secret_blob::MAX_PEERS);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvError {

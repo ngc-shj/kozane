@@ -5,14 +5,16 @@
 //! (validation), `mksecrets` (writing) and the config checks, so each layout
 //! is defined once.
 //!
-//! `key` layout, version 2 (little-endian):
-//!   magic[8] = "SOSSECR1" | version u32 = 2 | peer_count u32
+//! `key` layout, version 3 (little-endian):
+//!   magic[8] = "SOSSECR1" | version u32 = 3 | peer_count u32
 //!   gateway_private[32] | boot_seed[32]
+//!   tls_private[32] (P-256 scalar, big-endian; M6 plan C5)
 //!   peer_count × peer_public_hash[32] = BLAKE2s-256(peer public key)
 //!   checksum[32] = BLAKE2s-256(all preceding bytes)
 //! The region has a fixed size (`REGION_SIZE`); bytes after the checksum are
 //! zero. Version 1 carried a static PSK per peer; it is refused (M3 plan C2,
-//! L8: WireGuard PSKs come only from Rosenpass).
+//! L8: WireGuard PSKs come only from Rosenpass). Version 2 had no TLS key;
+//! it is refused too.
 
 #![no_std]
 #![deny(
@@ -27,10 +29,15 @@
 pub mod pq;
 
 pub const MAGIC: [u8; 8] = *b"SOSSECR1";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 pub const REGION_SIZE: usize = 4096;
 const HEADER: usize = 8 + 4 + 4;
-const FIXED: usize = HEADER + 32 + 32;
+/// Byte offsets of the fixed secrets, pinned numerically by the tests (the
+/// integration harness reads them from a blob file).
+pub const GATEWAY_PRIVATE_AT: usize = HEADER;
+pub const BOOT_SEED_AT: usize = GATEWAY_PRIVATE_AT + 32;
+pub const TLS_PRIVATE_AT: usize = BOOT_SEED_AT + 32;
+const FIXED: usize = TLS_PRIVATE_AT + 32;
 const PER_PEER: usize = 32;
 const CHECKSUM: usize = 32;
 pub const MAX_PEERS: usize = (REGION_SIZE - FIXED - CHECKSUM) / PER_PEER;
@@ -147,16 +154,40 @@ impl<'a> Blob<'a> {
         Ok(Self { bytes, peers })
     }
 
+    /// `parse` on the mutable plaintext, with the TLS scalar judged by
+    /// `tls_ok` in between (M6 plan C5, D5): after the checksum is verified
+    /// and before the long-lived borrow, a scalar `tls_ok` refuses is wiped
+    /// in place, and the checksum is not checked again. Returns the view
+    /// and `tls_ok`'s verdict; on a format error nothing is judged or wiped.
+    pub fn parse_checking_tls(
+        bytes: &'a mut [u8],
+        expected_peers: usize,
+        tls_ok: impl FnOnce(&[u8; 32]) -> bool,
+    ) -> Result<(Self, bool), BlobError> {
+        let ok = tls_ok(Blob::parse(&*bytes, expected_peers)?.tls_private());
+        if !ok {
+            bytes.get_mut(TLS_PRIVATE_AT..FIXED).ok_or(BlobError::TooSmall)?.fill(0);
+        }
+        let bytes: &'a [u8] = bytes;
+        let peers = expected_peers;
+        Ok((Self { bytes, peers }, ok))
+    }
+
     pub fn peer_count(&self) -> usize {
         self.peers
     }
 
     pub fn gateway_private(&self) -> &[u8; 32] {
-        field::<32>(self.bytes, HEADER).unwrap_or(&[0; 32])
+        field::<32>(self.bytes, GATEWAY_PRIVATE_AT).unwrap_or(&[0; 32])
     }
 
     pub fn boot_seed(&self) -> &[u8; 32] {
-        field::<32>(self.bytes, HEADER + 32).unwrap_or(&[0; 32])
+        field::<32>(self.bytes, BOOT_SEED_AT).unwrap_or(&[0; 32])
+    }
+
+    /// The TLS signing scalar; all zero once `parse_checking_tls` wiped it.
+    pub fn tls_private(&self) -> &[u8; 32] {
+        field::<32>(self.bytes, TLS_PRIVATE_AT).unwrap_or(&[0; 32])
     }
 
     /// Hash of peer `i`'s public key.
@@ -170,7 +201,13 @@ impl<'a> Blob<'a> {
 
 /// Writes a region. `peers` are the peers' public keys. Returns the number
 /// of bytes used before zero padding, or None if it does not fit.
-pub fn write(out: &mut [u8; REGION_SIZE], gateway_private: &[u8; 32], boot_seed: &[u8; 32], peers: &[[u8; 32]]) -> Option<usize> {
+pub fn write(
+    out: &mut [u8; REGION_SIZE],
+    gateway_private: &[u8; 32],
+    boot_seed: &[u8; 32],
+    tls_private: &[u8; 32],
+    peers: &[[u8; 32]],
+) -> Option<usize> {
     if peers.is_empty() || peers.len() > MAX_PEERS {
         return None;
     }
@@ -181,6 +218,7 @@ pub fn write(out: &mut [u8; REGION_SIZE], gateway_private: &[u8; 32], boot_seed:
     w.put(&u32::try_from(peers.len()).ok()?.to_le_bytes())?;
     w.put(gateway_private)?;
     w.put(boot_seed)?;
+    w.put(tls_private)?;
     for public in peers {
         w.put(&blake2s(&[public]))?;
     }

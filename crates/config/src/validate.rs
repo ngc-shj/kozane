@@ -32,6 +32,29 @@ pub struct RawGateway {
     /// neighbor lie in it, and no peer's allowed IPs may overlap it.
     pub inside_prefix: String,
     pub inside_mac: String,
+    /// The inside source ports `tls` opens backend connections from (M6
+    /// plan C3): `count` ports from `start`.
+    pub tls_ports: RawPorts,
+    /// Where the HTTPS proxy forwards to: an inside neighbor (M6 plan C4).
+    pub backend: RawBackend,
+    /// The HTTPS server's certificate (DER), relative to this file, and its
+    /// public key: the uncompressed P-256 point in hex (M6 plan C11).
+    pub tls_cert: String,
+    pub tls_public: String,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawPorts {
+    pub start: u32,
+    pub count: u32,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawBackend {
+    pub ip: String,
+    pub port: u16,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -101,6 +124,10 @@ pub struct Checked {
     pub inside_mac: [u8; 6],
     pub neighbors: Vec<([u8; 4], [u8; 6])>,
     pub peers: Vec<CheckedPeer>,
+    pub tls_ports: (u16, u16),
+    pub backend: ([u8; 4], u16),
+    pub tls_cert: Vec<u8>,
+    pub tls_public: [u8; TLS_PUBLIC_LEN],
 }
 
 pub fn decode_key(s: &str) -> Result<[u8; 32], String> {
@@ -138,6 +165,58 @@ pub fn decode_hash(s: &str) -> Result<[u8; 32], String> {
 
 pub fn encode_hash(h: &[u8; 32]) -> String {
     h.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// An uncompressed P-256 point: 0x04 ‖ x ‖ y.
+pub const TLS_PUBLIC_LEN: usize = 65;
+
+/// The DER of a P-256 SubjectPublicKeyInfo up to its point: SEQUENCE {
+/// SEQUENCE { id-ecPublicKey, prime256v1 }, BIT STRING (0 unused bits) }.
+/// The certificate must hold it followed by `tls_public` (M6 plan C11): a
+/// containment check, not a DER parser (R1).
+pub const P256_SPKI_PREFIX: [u8; 26] = [
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d,
+    0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+];
+
+/// Largest certificate accepted: the Certificate handshake message must fit
+/// one of `tls`'s 4 KiB server records with its framing (M6 plan C10). A
+/// dev leaf is about 500 bytes.
+pub const MAX_TLS_CERT: usize = 3072;
+
+/// Fewest backend source ports: one per connection `tls` holds (its
+/// MAX_CONNS, which the PD asserts against `TLS_PORTS`).
+pub const MIN_TLS_PORTS: u32 = 8;
+
+/// The uncompressed P-256 point written as 130 hex digits.
+pub fn decode_tls_public(s: &str) -> Result<[u8; TLS_PUBLIC_LEN], String> {
+    let bad = || format!("config: tls_public {s:?}: expected 130 hex digits of an uncompressed P-256 point (04...)");
+    if s.len() != 2 * TLS_PUBLIC_LEN || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(bad());
+    }
+    let mut out = [0u8; TLS_PUBLIC_LEN];
+    for (o, i) in out.iter_mut().zip((0..s.len()).step_by(2)) {
+        *o = u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| bad())?;
+    }
+    if out[0] != 0x04 {
+        return Err(bad());
+    }
+    Ok(out)
+}
+
+/// Reads the certificate through `load` and checks that it carries
+/// `public` as a P-256 SubjectPublicKeyInfo.
+fn load_tls_cert(path: &str, public: &[u8; TLS_PUBLIC_LEN], load: &dyn Fn(&str) -> Result<Vec<u8>, String>) -> Result<Vec<u8>, String> {
+    let cert = load(path)?;
+    if cert.len() > MAX_TLS_CERT {
+        return Err(format!("config: tls_cert {path}: {} bytes, at most {MAX_TLS_CERT}", cert.len()));
+    }
+    let mut spki = P256_SPKI_PREFIX.to_vec();
+    spki.extend_from_slice(public);
+    if !cert.windows(spki.len()).any(|w| w == spki.as_slice()) {
+        return Err(format!("config: tls_cert {path} does not hold tls_public as a P-256 public key"));
+    }
+    Ok(cert)
 }
 
 /// Size of a Classic McEliece 460896 public key, rendered as `RP_PUBLIC_KEY_LEN`.
@@ -304,6 +383,30 @@ pub fn check(text: &str, max_peers: usize, load: &dyn Fn(&str) -> Result<Vec<u8>
     if g.https_port == 0 {
         return Err("config: https_port must be non-zero".into());
     }
+    let ports = &g.tls_ports;
+    if ports.start == 0 {
+        return Err("config: tls_ports.start must be non-zero".into());
+    }
+    if ports.count < MIN_TLS_PORTS {
+        return Err(format!("config: tls_ports.count must be at least {MIN_TLS_PORTS}, got {}", ports.count));
+    }
+    if u64::from(ports.start) + u64::from(ports.count) > 65536 {
+        return Err(format!("config: tls_ports {}+{} runs past port 65535", ports.start, ports.count));
+    }
+    // start ≥ 1 and start + count ≤ 65536, so both fit a u16.
+    let tls_ports = (ports.start as u16, ports.count as u16);
+    let backend_ip = parse_ip(&g.backend.ip).map_err(|e| format!("config: backend: {e}"))?;
+    if !inside_prefix.contains(backend_ip) {
+        return Err(format!("config: backend {} is outside inside_prefix", g.backend.ip));
+    }
+    if !neighbors.iter().any(|(ip, _)| *ip == backend_ip) {
+        return Err(format!("config: backend {} is not a configured neighbor", g.backend.ip));
+    }
+    if g.backend.port == 0 {
+        return Err("config: backend port must be non-zero".into());
+    }
+    let tls_public = decode_tls_public(&g.tls_public)?;
+    let tls_cert = load_tls_cert(&g.tls_cert, &tls_public, load)?;
     Ok(Checked {
         gateway_public,
         listen_port: g.listen_port,
@@ -317,6 +420,10 @@ pub fn check(text: &str, max_peers: usize, load: &dyn Fn(&str) -> Result<Vec<u8>
         inside_mac: parse_mac(&g.inside_mac)?,
         neighbors,
         peers,
+        tls_ports,
+        backend: (backend_ip, g.backend.port),
+        tls_cert,
+        tls_public,
     })
 }
 
@@ -340,6 +447,14 @@ pub fn render(c: &Checked, gateway_rp_file: &str, peer_rp_files: &[String]) -> S
     s += &format!("pub const OUTSIDE_ROUTER_MAC: [u8; 6] = {:?};\n", c.outside_router_mac);
     s += &format!("pub const INSIDE_IP: [u8; 4] = {:?};\n", c.inside_ip);
     s += &format!("pub const INSIDE_MAC: [u8; 6] = {:?};\n", c.inside_mac);
+    s += "/// Backend source ports for `tls`: (start, count).\n";
+    s += &format!("pub const TLS_PORTS: (u16, u16) = ({}, {});\n", c.tls_ports.0, c.tls_ports.1);
+    s += "/// The HTTPS proxy's backend: (inside IPv4, TCP port).\n";
+    s += &format!("pub const BACKEND: ([u8; 4], u16) = ({:?}, {});\n", c.backend.0, c.backend.1);
+    s += "/// The HTTPS server's certificate, DER.\n";
+    s += &format!("pub const TLS_CERT: &[u8] = &{:?};\n", c.tls_cert);
+    s += "/// The certificate's public key, the uncompressed P-256 point `key` checks its scalar against.\n";
+    s += &format!("pub const TLS_PUBLIC: [u8; {TLS_PUBLIC_LEN}] = {:?};\n", c.tls_public);
     s += "pub const NEIGHBORS: &[Neighbor] = &[\n";
     for (ip, mac) in &c.neighbors {
         s += &format!("    Neighbor {{ ip: {ip:?}, mac: {mac:?} }},\n");

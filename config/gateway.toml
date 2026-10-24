@@ -2,6 +2,9 @@
 # The keys below are placeholders for builds without a deployment config;
 # integration tests generate their own config and secrets (tools/mksecrets).
 # Key files are relative to this file; rp_hash is BLAKE2s-256 of the file.
+# The TLS certificate is a placeholder too: tools/mkcert issued it for
+# 10.0.2.15 to a P-256 key that was discarded, so no blob matches it
+# (`key` reports TlsKeyMismatch; mksecrets writes a matching pair).
 
 [gateway]
 public_key = "78wdDVL8XdPitWIiZQ7OBEnnlJfytmjgXqe3dz2gyGA="
@@ -16,6 +19,12 @@ outside_router_mac = "52:55:0a:00:02:02"
 inside_ip = "10.99.0.1"
 inside_prefix = "10.99.0.0/24"
 inside_mac = "52:54:00:12:34:57"
+# HTTPS proxy (M6 plan C3, C4, C11): backend source ports, the backend (an
+# inside neighbor), the server certificate and its public key.
+tls_ports = { start = 40000, count = 1024 }
+backend = { ip = "10.99.0.2", port = 8080 }
+tls_cert = "keys/tls.der"
+tls_public = "0479fa8395eb4c1695b78fe7fadd6130e94680031e5fea030b57baa7b2a952ccfff79caeeb7b82c74ae6812cb95d58ff5e76ea5a08ea055d824bdd586e29d10720"
 
 [[neighbors]]
 ip = "10.99.0.2"

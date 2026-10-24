@@ -187,7 +187,8 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::StackHighWater { .. }
         | Event::Halted { .. }
         | Event::KeyUnavailable { .. }
-        | Event::KeyStackHighWater { .. } => false,
+        | Event::KeyStackHighWater { .. }
+        | Event::KeyWaitHighWater { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
     assert_eq!(Event::FIXED.len(), 61);
@@ -273,7 +274,8 @@ fn decode_classifies_fixed_dropped_and_unknown_codes() {
     assert_eq!(decode(0x0054), Decoded::Halted);
     assert_eq!(decode(0x0055), Decoded::KeyUnavailable);
     assert_eq!(decode(0x0056), Decoded::KeyStackHighWater);
-    assert_eq!(decode(0x0057), Decoded::Unknown);
+    assert_eq!(decode(0x0057), Decoded::KeyWaitHighWater);
+    assert_eq!(decode(0x0058), Decoded::Unknown);
 }
 
 #[test]
@@ -316,9 +318,25 @@ fn key_stack_high_water_is_its_own_kind_apart_from_the_producers_mark() {
     assert_eq!(decode(KEY_STACK_HIGH_WATER), Decoded::KeyStackHighWater);
 }
 
+/// M6 plan C5 (T-N7): `hs`'s key-wait mark, a value event of its own,
+/// gated like the Rosenpass cost.
+#[test]
+fn key_wait_high_water_carries_microseconds_and_is_gated_like_the_cost() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::KeyWaitHighWater { us: 12_345 }, 65, &mut out);
+    assert_eq!(out.len(), 65);
+    assert!(out.iter().all(|r| (r.code, r.a) == (KEY_WAIT_HIGH_WATER, 12_345)));
+    assert_eq!(decode(KEY_WAIT_HIGH_WATER), Decoded::KeyWaitHighWater);
+    assert_eq!(Event::KeyWaitHighWater { us: 1 }.name(), "KeyWaitHighWater");
+    let mut hw = CostHighWater::key_wait();
+    let got: Vec<Event> = [1_000, 1_100, 1_125, 900].into_iter().filter_map(|us| hw.observe(us)).collect();
+    assert_eq!(got, [Event::KeyWaitHighWater { us: 1_000 }, Event::KeyWaitHighWater { us: 1_125 }]);
+}
+
 #[test]
 fn m5_codes_are_distinct_from_every_other_code() {
-    let m5 = [HALTED, KEY_UNAVAILABLE, KEY_STACK_HIGH_WATER];
+    let m5 = [HALTED, KEY_UNAVAILABLE, KEY_STACK_HIGH_WATER, KEY_WAIT_HIGH_WATER];
     let mut others: Vec<u16> = Event::FIXED.iter().map(|e| e.code()).collect();
     others.extend([COST_HIGH_WATER, STACK_HIGH_WATER]);
     for (i, c) in m5.iter().enumerate() {

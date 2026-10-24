@@ -1457,6 +1457,13 @@ def test_peer_binding(pkg: "Package", deploy: str, passed: list):
 # ---------------------------------------------------------------- boot 3
 
 
+# `key` blob v3's fixed secrets (secret_blob::GATEWAY_PRIVATE_AT and
+# TLS_PRIVATE_AT, pinned numerically by its offsets test): the header, the
+# gateway key, the boot seed, then the TLS scalar (M6 plan C5).
+KEY_BLOB_GATEWAY_PRIVATE = slice(16, 48)
+KEY_BLOB_TLS_PRIVATE = slice(80, 112)
+
+
 def key_boot_code(variant: str) -> int:
     """`BootError::<variant> => <n>,` from key-core's code table (C6)."""
     src = open(os.path.join(ROOT, "crates/key-core/src/lib.rs")).read()
@@ -1488,7 +1495,7 @@ def test_mismatched_blob(pkg: "Package"):
     reason = halt_reason("hs", "NO_BOOT_SEED")
     deploy = os.path.dirname(pkg.dir)
     with open(os.path.join(deploy, "secrets.bin"), "rb") as f:
-        gateway_private = f.read()[16:48]  # secret_blob: the header, then the gateway key
+        gateway_private = f.read()[KEY_BLOB_GATEWAY_PRIVATE]
     with open(os.path.join(os.path.dirname(deploy), "a", "pqkey-secrets.bin"), "rb") as f:
         pq_plain = f.read()[1024:1088]  # inside the McEliece secret key
     if not any(gateway_private) or not any(pq_plain):
@@ -3172,17 +3179,23 @@ def stack_headroom_case(con):
     The mark must also reach the PD's own scrub (pqkey's decaps, pq's
     encaps): a shallower one means the probe is not measuring. Every
     report must parse: a garbled one would drop the deepest figure."""
+    # Several PDs report `StackHighWater` (pq, and tls since M6), so a
+    # garbled report is any occurrence of the name that is not a whole
+    # line of some producer; each PD's marks are then its own lines.
     reports = {
-        "pq": (r"\bStackHighWater", r"audit: src=pq StackHighWater bytes=(\d+) ", 10),
-        "pqkey": (r"KeyStackHighWater", r"audit: src=pq KeyStackHighWater bytes=(\d+) ", 10),
+        "pq": (r"\bStackHighWater", r"audit: src=[a-z_]+ StackHighWater bytes=\d+ ",
+               r"audit: src=pq StackHighWater bytes=(\d+) ", 10),
+        "pqkey": (r"KeyStackHighWater", r"audit: src=pq KeyStackHighWater bytes=\d+ ",
+                  r"audit: src=pq KeyStackHighWater bytes=(\d+) ", 10),
     }
-    for pd, (any_line, line, base) in reports.items():
+    for pd, (any_line, whole_line, line, base) in reports.items():
         every = len(con.count(any_line))
+        whole = len(con.count(whole_line))
         marks = [int(h, base) for h in con.count(line)]
         if not marks:
             raise Fail(f"{pd}: no stack high-water report; the probe reported nothing")
-        if every != len(marks):
-            raise Fail(f"{pd}: {every - len(marks)} of {every} stack high-water reports garbled")
+        if every != whole:
+            raise Fail(f"{pd}: {every - whole} of {every} stack high-water reports garbled")
         size = system_stack_size(pd)
         if pd_stack_const(pd) != size:
             raise Fail(f"{pd}: STACK_SIZE {pd_stack_const(pd)} paints other than the system file's {size}")

@@ -7,7 +7,7 @@
 #![no_std]
 #![no_main]
 
-use audit_event::Event;
+use audit_event::{CostHighWater, Event};
 use hs_core::{Handshaker, HedgedEntropy, KeyCall, KeyClient, Outcome, Peers, PskTable};
 use key_core::MAX_WORDS;
 use layout::hs as ch;
@@ -27,7 +27,18 @@ const MAX_PEERS: usize = config::MAX_PEERS;
 const _: () = assert!(config::PEERS.len() <= MAX_PEERS);
 
 /// `key` over PPC. Request and reply registers are zeroed after each call.
-struct Ppc;
+/// Each call's wall time is measured (M6 plan C5): `key` serves `tls` too,
+/// and a call waits behind a sign in progress; `wait_us` is the longest
+/// since `take_wait_us`.
+struct Ppc {
+    wait_us: Option<u32>,
+}
+
+impl Ppc {
+    fn take_wait_us(&mut self) -> Option<u32> {
+        self.wait_us.take()
+    }
+}
 
 impl KeyCall for Ppc {
     fn call(&mut self, label: u64, req: &[u64], reply: &mut [u64]) -> (u64, usize) {
@@ -39,7 +50,11 @@ impl KeyCall for Ppc {
                 *dst = *src;
             }
         });
+        let start = cpu::cntpct();
         let info = KEY.pp_call(MessageInfo::new(label, req.len()));
+        let us = cpu::ticks_to_ns(cpu::cntpct().saturating_sub(start), cpu::cntfrq()) / 1000;
+        let us = u32::try_from(us).unwrap_or(u32::MAX);
+        self.wait_us = Some(self.wait_us.map_or(us, |w| w.max(us)));
         let n = info.count().min(reply.len()).min(MAX_WORDS);
         with_msg_regs(|mrs| {
             for (dst, src) in reply.iter_mut().zip(mrs.iter().take(n)) {
@@ -69,6 +84,8 @@ struct Hs {
     to_data: Tx,
     audit: Audit,
     key: KeyClient<Ppc>,
+    /// `KeyWaitHighWater`'s gate (M6 plan C5, T-N7).
+    key_wait: CostHighWater,
     entropy: HedgedEntropy<Hw>,
     handshaker: Handshaker<MAX_PEERS>,
     psks: PskTable<MAX_PEERS>,
@@ -125,7 +142,7 @@ fn init() -> Hs {
     if cpu::checked_frequency(cpu::cntfrq()).is_none() {
         audit.halt(halt::NO_CLOCK);
     }
-    let mut key = KeyClient::new(Ppc);
+    let mut key = KeyClient::new(Ppc { wait_us: None });
     let seed = match key.boot_seed() {
         Ok(seed) => seed,
         Err(_) => {
@@ -145,13 +162,14 @@ fn init() -> Hs {
         *dst = p.public;
     }
     audit.ready();
-    Hs {
+    let mut hs = Hs {
         from_pq,
         from_ingress,
         to_ingress,
         to_data,
         audit,
         key,
+        key_wait: CostHighWater::key_wait(),
         entropy: HedgedEntropy::new(seed, Hw),
         handshaker,
         psks: PskTable::new(),
@@ -162,10 +180,21 @@ fn init() -> Hs {
         install: [0; layout::NET_BUF_SIZE],
         response: [0; layout::NET_BUF_SIZE],
         scratch: [0; layout::NET_BUF_SIZE],
-    }
+    };
+    // The boot seed's call: the no-contention baseline.
+    hs.report_key_wait();
+    hs
 }
 
 impl Hs {
+    /// Audits the longest key call since the last report, if it is a new
+    /// high-water mark (`CostHighWater`'s gate).
+    fn report_key_wait(&mut self) {
+        if let Some(us) = self.key.call.take_wait_us() {
+            self.key_wait.observe_with(us, |ev| self.audit.record_delivered(ev));
+        }
+    }
+
     /// Installs every `PskInstall` queued by `pq`. Each is copied out of the
     /// link (which hands the buffer back), then the copy is zeroed; returns
     /// whether any was taken, so `pq` can reclaim and scrub its buffers.
@@ -261,6 +290,7 @@ impl Handler for Hs {
         if to_ingress || consumed {
             INGRESS.notify();
         }
+        self.report_key_wait();
         self.audit.flush();
         Ok(())
     }

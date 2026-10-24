@@ -9,8 +9,8 @@
 //! rate an attacker drives.
 //!
 //! Some kinds carry a value instead of a running total: `RpCostHighWater`'s
-//! `a` is the measured cost in µs (`CostHighWater` gates how often it
-//! fires), the stack marks' `a` is bytes, `Halted`'s a reason code closed
+//! and `KeyWaitHighWater`'s `a` is the measured time in µs (`CostHighWater`
+//! gates how often each fires), the stack marks' `a` is bytes, `Halted`'s a reason code closed
 //! per producer and `KeyUnavailable`'s the key PD's boot error code.
 //!
 //! No kind names its producer: the producer is the audit ring a record
@@ -202,6 +202,11 @@ pub enum Event {
     /// has no audit ring of its own; `bytes` is the record's `a` (never
     /// coalesced; `pq` raises it once, for `pqkey`'s boot mark).
     KeyStackHighWater { bytes: u32 },
+    /// The longest a call into the key PD has taken, wall time, rose to a
+    /// new high-water mark; `us` travels as the record's `a` (never
+    /// coalesced; `CostHighWater` bounds it). `hs` raises it: the runtime
+    /// observable of the key-wait bound (M6 plan C5).
+    KeyWaitHighWater { us: u32 },
 }
 
 impl Event {
@@ -273,6 +278,7 @@ impl Event {
             Event::Halted { .. } => HALTED,
             Event::KeyUnavailable { .. } => KEY_UNAVAILABLE,
             Event::KeyStackHighWater { .. } => KEY_STACK_HIGH_WATER,
+            Event::KeyWaitHighWater { .. } => KEY_WAIT_HIGH_WATER,
             Event::FrameDropped { reason } => {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
             }
@@ -415,6 +421,7 @@ impl Event {
             Event::Halted { .. } => "Halted",
             Event::KeyUnavailable { .. } => "KeyUnavailable",
             Event::KeyStackHighWater { .. } => "KeyStackHighWater",
+            Event::KeyWaitHighWater { .. } => "KeyWaitHighWater",
             Event::FrameDropped { .. } => "FrameDropped",
             Event::TcpLimited { .. } => "TcpLimited",
         }
@@ -439,7 +446,8 @@ impl Event {
             | Event::Ready
             | Event::Halted { .. }
             | Event::KeyUnavailable { .. }
-            | Event::KeyStackHighWater { .. } => false,
+            | Event::KeyStackHighWater { .. }
+            | Event::KeyWaitHighWater { .. } => false,
             Event::ArpReplied
             | Event::UdpEchoed
             | Event::FrameDropped { .. }
@@ -503,6 +511,7 @@ impl Event {
             Event::Halted { reason } => Some(reason),
             Event::KeyUnavailable { code } => Some(code),
             Event::KeyStackHighWater { bytes } => Some(bytes),
+            Event::KeyWaitHighWater { us } => Some(us),
             _ => None,
         }
     }
@@ -581,6 +590,7 @@ impl Event {
             Event::Halted { .. } => HALTED_SLOT,
             Event::KeyUnavailable { .. } => KEY_UNAVAILABLE_SLOT,
             Event::KeyStackHighWater { .. } => KEY_STACK_HIGH_WATER_SLOT,
+            Event::KeyWaitHighWater { .. } => KEY_WAIT_HIGH_WATER_SLOT,
             Event::FrameDropped { reason } => {
                 // FIXED_SLOTS..FIXED_SLOTS+64, clamped like `code`.
                 let r = if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason };
@@ -602,7 +612,8 @@ const HALTED_SLOT: usize = STACK_HIGH_WATER_SLOT + 1;
 const KEY_UNAVAILABLE_SLOT: usize = HALTED_SLOT + 1;
 const KEY_STACK_HIGH_WATER_SLOT: usize = KEY_UNAVAILABLE_SLOT + 1;
 const TCP_LIMITED_SLOT: usize = KEY_STACK_HIGH_WATER_SLOT + 1;
-const SLOTS: usize = TCP_LIMITED_SLOT + MAX_TCP_LIMIT as usize + 1;
+const KEY_WAIT_HIGH_WATER_SLOT: usize = TCP_LIMITED_SLOT + MAX_TCP_LIMIT as usize + 1;
+const SLOTS: usize = KEY_WAIT_HIGH_WATER_SLOT + 1;
 
 /// `RpCostHighWater`'s code, the first after the fixed range.
 pub const COST_HIGH_WATER: u16 = 0x0048;
@@ -612,6 +623,8 @@ pub const STACK_HIGH_WATER: u16 = 0x0052;
 pub const HALTED: u16 = 0x0054;
 pub const KEY_UNAVAILABLE: u16 = 0x0055;
 pub const KEY_STACK_HIGH_WATER: u16 = 0x0056;
+/// M6 plan C5: `hs`'s key-call wait.
+pub const KEY_WAIT_HIGH_WATER: u16 = 0x0057;
 
 /// Per-producer coalescing state.
 pub struct Coalescer {
@@ -694,6 +707,8 @@ pub enum Decoded {
     KeyUnavailable,
     /// `KeyStackHighWater`: the record's `a` is the bytes used.
     KeyStackHighWater,
+    /// `KeyWaitHighWater`: the record's `a` is the wait in µs.
+    KeyWaitHighWater,
     Unknown,
 }
 
@@ -716,6 +731,9 @@ pub fn decode(code: u16) -> Decoded {
     if code == KEY_STACK_HIGH_WATER {
         return Decoded::KeyStackHighWater;
     }
+    if code == KEY_WAIT_HIGH_WATER {
+        return Decoded::KeyWaitHighWater;
+    }
     if let Some(k) = code.checked_sub(TCP_LIMITED_BASE).filter(|k| *k <= MAX_TCP_LIMIT) {
         return Decoded::TcpLimited(k);
     }
@@ -725,20 +743,33 @@ pub fn decode(code: u16) -> Decoded {
     }
 }
 
-/// `pq`'s gate for `RpCostHighWater` (M3 plan VE10): the first
-/// measurement always fires, later ones only when the cost exceeds the
-/// last *emitted* value by at least 1/8. A boot therefore emits at most
-/// about log₁.₁₂₅(max/min) + 1 of them (L10; one more if the first cost
-/// is 0 µs), and the last one emitted is less than 1/8 below the true
-/// maximum. The record carries the exact cost; the rule only gates.
-#[derive(Default)]
+/// `pq`'s gate for `RpCostHighWater` (M3 plan VE10), and `hs`'s for
+/// `KeyWaitHighWater` (M6 plan C5): the first measurement always fires,
+/// later ones only when the cost exceeds the last *emitted* value by at
+/// least 1/8. A boot therefore emits at most about log₁.₁₂₅(max/min) + 1 of
+/// them (L10; one more if the first cost is 0 µs), and the last one emitted
+/// is less than 1/8 below the true maximum. The record carries the exact
+/// cost; the rule only gates.
 pub struct CostHighWater {
     last: Option<u32>,
+    event: fn(u32) -> Event,
+}
+
+impl Default for CostHighWater {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CostHighWater {
+    /// `pq`'s Rosenpass handshake cost.
     pub const fn new() -> Self {
-        Self { last: None }
+        Self { last: None, event: |us| Event::RpCostHighWater { us } }
+    }
+
+    /// `hs`'s wait for a key call.
+    pub const fn key_wait() -> Self {
+        Self { last: None, event: |us| Event::KeyWaitHighWater { us } }
     }
 
     /// The event to record for a handshake that cost `us`, if one is due,
@@ -763,7 +794,7 @@ impl CostHighWater {
             // strict `>` keeps a run of zeros from firing every time.
             Some(last) => us > last && u64::from(us).saturating_mul(8) >= u64::from(last).saturating_mul(9),
         };
-        if due && deliver(Event::RpCostHighWater { us }) {
+        if due && deliver((self.event)(us)) {
             self.last = Some(us);
         }
     }

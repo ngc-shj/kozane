@@ -6,8 +6,9 @@ license.workspace = true
 
 [dependencies]
 # ECDSA P-256 for the TLS signing oracle (M6 plan C5); already locked
-# through tpm2.
-libcrux-p256 = { version = "=0.0.9", default-features = false }
+# through tpm2. `expose-hacl` exports the HACL* sign function itself
+# (features are not in Cargo.lock; it adds no dependency).
+libcrux-p256 = { version = "=0.0.9", default-features = false, features = ["expose-hacl"] }
 secret-blob = { path = "../secret-blob" }
 tpm2 = { path = "../tpm2" }
 wg-core = { path = "../wg-core" }

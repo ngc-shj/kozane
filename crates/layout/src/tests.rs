@@ -287,7 +287,14 @@ fn tls_links_are_mapped_by_their_two_ends_only() {
 #[test]
 fn tls_schedule_and_key_channel_match_the_plan() {
     let attr = |a| pd_attribute("tls", a).expect(a);
-    assert_eq!((parse_num(&attr("priority")), parse_num(&attr("budget")), parse_num(&attr("period"))), (100, 500, 10_000));
+    assert_eq!(parse_num(&attr("priority")), 100);
+    // M6 plan C5: the budget and period the key-wait invariant computes with.
+    assert_eq!(parse_num(&attr("budget")) as u64 * 1000, TLS_BUDGET_NS);
+    assert_eq!(parse_num(&attr("period")) as u64 * 1000, PERIOD_NS);
+    assert_eq!((TLS_BUDGET_NS, PERIOD_NS), (500_000, 10_000_000));
+    // The priority order the invariant relies on: hs's call is queued
+    // ahead of tls's at key's endpoint.
+    assert!(parse_num(&pd_attribute("hs", "priority").expect("hs")) > parse_num(&attr("priority")));
     assert_eq!(pd_attribute("tls", "passive"), None);
     let text = system_text();
     let doc = roxmltree::Document::parse(&text).expect("parse .system");

@@ -125,7 +125,7 @@ KANI_HARNESS = (
 CASES_FOR_GATE = {
     "clean-counts": {"stale-counts", "check-propagation"},
     # pins runs the package checker fixtures; package-debug drives the real target.
-    "pins": {"pins", "package-debug", "package-waiver", "package-waiver-removed"},
+    "pins": {"pins", "package-debug", "package-waiver", "package-waiver-removed", "c5-lock-pin", "mkcert-constraints"},
     "lint": {"lint"},
     "audit": {"audit"},
     "lint-pds": {"lint-pds"},
@@ -136,7 +136,9 @@ CASES_FOR_GATE = {
              "c2-boot-kat", "c4-hello-src", "c4-hello-global", "c4-conf-src", "c4-conf-global", "c4-type-filter",
              "rp-cookie-domain", "rp-legacy-probe", "rp-conf-share", "rp-awaited", "rp-proven-reserve", "rp-sid-binding", "rp-nat",
              "rp-cookie-offload", "rp-tx-tier", "rp-reply-fifo", "rp-reply-order", "rp-reply-dst", "rp-sync-sticky",
-             "mce-fresh-draw", "c2-tcp-checksum", "c2-syn-fin", "c2-tls-egress-src", "c2-tls-tier", "c2-syn-src-bucket"},
+             "mce-fresh-draw", "c2-tcp-checksum", "c2-syn-fin", "c2-tls-egress-src", "c2-tls-tier", "c2-syn-src-bucket",
+             "c5-tls-static-dh", "c5-k-prime", "c5-nonce-cap", "c5-cv-content", "c5-tls-boot-fail", "c5-tls-wipe",
+             "c5-d5-codes", "c5-seed-tag", "c5-caller-bucket", "c5-sign-wait", "c5-syn-burst", "c5-syn-interval"},
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
     "ct": {"ct-barrier", "ct-c1-barrier", "ct-harness-unit", "ct-harness-lint", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms",
@@ -604,12 +606,12 @@ CASES = {
     # Unavailable key keeps the opened blob in guest RAM.
     "key-wipe": (["test", "it_boots=mismatched blob halts key"], lambda t: edit(
         t, "crates/pds/key/src/main.rs",
-        "    Oracle::boot(plain, &config::GATEWAY_PUBLIC, peers, &mut Hw).inspect_err(|_| {\n"
+        "    let booted = Oracle::boot(plain, &config::GATEWAY_PUBLIC, &config::TLS_PUBLIC, peers, &mut Hw).inspect_err(|_| {\n"
         "        // SAFETY: the failed boot's borrow ended with its error, and nothing\n"
         "        // reads the buffer again.\n"
         "        unsafe { &mut *buf }.zeroize();\n"
-        "    })\n",
-        "    let _ = buf;\n    Oracle::boot(plain, &config::GATEWAY_PUBLIC, peers, &mut Hw)\n"),
+        "    });\n",
+        "    let _ = buf;\n    let booted = Oracle::boot(plain, &config::GATEWAY_PUBLIC, &config::TLS_PUBLIC, peers, &mut Hw);\n"),
         "key's opened blob (an Unavailable key must hold no secret) still in guest RAM"),
     # S-BOOT-5 (R3-N2): without AUTOBOOT_KEYED, the Ctrl-C measure_boot sends
     # as U-Boot starts is read by the boot command's first poll, and the
@@ -874,6 +876,65 @@ CASES = {
                                                    "            if !self.syn_sources.allow(p.src, now_ns) {",
                                                    "            if false {"),
                           "---- tests::a_source_gets_its_syn_burst_and_then_is_limited stdout ----"),
+    # M6 plan C5: the TLS signing oracle's controls. The caller table, the
+    # RFC 6979 additional input and candidate cap, the content `key` builds,
+    # D5 (a TLS failure is no boot failure; the refused scalar is wiped; its
+    # codes stay apart), per-caller seeds and buckets, and each operand of
+    # the three compile-time invariants loosened to the first crossing value.
+    "c5-tls-static-dh": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+                                                  "Caller::Tls => matches!(label, LABEL_TLS_SIGN | LABEL_BOOT_SEED),",
+                                                  "Caller::Tls => matches!(label, LABEL_TLS_SIGN | LABEL_BOOT_SEED | LABEL_STATIC_DH),"),
+                         "---- tests::labels_outside_the_tls_row_static_dh_included_are_refused_without_spending_the_bucket stdout ----"),
+    "c5-k-prime": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+                                            "content.as_bytes(), self.blob.tls_private(), extra.as_bytes())",
+                                            "content.as_bytes(), self.blob.tls_private(), &[])"),
+                   "---- tests::two_k_prime_values_give_different_r_for_the_same_hash stdout ----"),
+    "c5-nonce-cap": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+                                              "    for _ in 0..MAX_NONCE_CANDIDATES {", "    for _ in 0..=MAX_NONCE_CANDIDATES {"),
+                     "---- tests::a_sign_function_that_keeps_refusing_stops_at_the_candidate_cap stdout ----"),
+    "c5-cv-content": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+                                               "sign_rfc6979(sign, &mut sig, content.as_bytes(),",
+                                               "sign_rfc6979(sign, &mut sig, &hash,"),
+                      "---- tests::tls_sign_signs_the_server_certificate_verify_content_of_the_hash stdout ----"),
+    "c5-tls-boot-fail": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs", "    Ok(Validated { blob, tls })\n",
+                                                  "    tls.map_err(|_| BootError::GatewayKeyMismatch)?;\n"
+                                                  "    Ok(Validated { blob, tls })\n"),
+                         "---- tests::a_mismatched_tls_key_leaves_hs_working_and_tls_sign_unavailable_with_its_code stdout ----"),
+    "c5-tls-wipe": (["unit"], lambda t: edit(t, "crates/secret-blob/src/lib.rs",
+                                             "            bytes.get_mut(TLS_PRIVATE_AT..FIXED).ok_or(BlobError::TooSmall)?.fill(0);\n",
+                                             "            bytes.get_mut(TLS_PRIVATE_AT..FIXED).ok_or(BlobError::TooSmall)?;\n"),
+                    "---- tests::a_refused_tls_scalar_is_wiped_after_the_checksum_and_the_rest_stays stdout ----"),
+    "c5-d5-codes": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+                                             "            TlsKeyError::Mismatch => 18,", "            TlsKeyError::Mismatch => 16,"),
+                    "---- tests::tls_key_codes_collide_with_no_boot_error_code_and_fit_the_label stdout ----"),
+    "c5-seed-tag": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+                                             "            Caller::Tls => b\"tls\",", "            Caller::Tls => b\"hs\","),
+                    "---- tests::boot_seed_is_derived_per_caller_and_differs_between_callers stdout ----"),
+    "c5-caller-bucket": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+                                                  "            Caller::Tls => &mut self.tls,", "            Caller::Tls => &mut self.hs,"),
+                         "---- tests::each_caller_spends_only_its_own_bucket stdout ----"),
+    "c5-sign-wait": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+                                              "pub const SIGN_COST_NS: u64 = 20_000_000;",
+                                              "pub const SIGN_COST_NS: u64 = 24_500_001;"),
+                     "C5: a sign in progress on tls's budget can hold hs's key call past HS_KEY_WAIT_MAX_NS"),
+    "c5-syn-burst": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+                                              "pub const TLS_SIGN_BURST: u64 = 32;", "pub const TLS_SIGN_BURST: u64 = 16;"),
+                     "C5: the SYN burst ingress admits can exhaust tls's key bucket"),
+    "c5-syn-interval": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+                                                 "pub const TLS_SIGN_INTERVAL_NS: u64 = 1_000_000_000 / 20;",
+                                                 "pub const TLS_SIGN_INTERVAL_NS: u64 = 1_000_000_000 / 19;"),
+                        "C5: tls can be admitted handshakes faster than key refills its bucket"),
+    # T-R3-10: SIGN_COST_NS is bound to libcrux-p256's lock entry; a recorded
+    # entry that no longer matches the lock must fail `pins`.
+    "c5-lock-pin": (["pins"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+                                             '"0.0.9 7489aa205be22524e2f6ddbe006c0c4ff5f1dfc7c17b783e3d02f1cb2a01c605"',
+                                             '"0.0.9 7489aa205be22524e2f6ddbe006c0c4ff5f1dfc7c17b783e3d02f1cb2a01c600"'),
+                    "P17 Cargo.lock: libcrux-p256 0.0.9"),
+    # M6 plan C11: a dev CA without NameConstraints vouches for any name;
+    # the mkcert fixtures (run by `pins`) must catch the leaf for another.
+    "mkcert-constraints": (["pins"], lambda t: edit(t, "tools/mkcert",
+                                                    "            .add_extension(constraints(form, value), critical=True)\n", ""),
+                           "FAIL openssl_refuses_another_name_in_name_mode"),
     # Only release kernels are packaged (M5 plan C7), judged from the
     # kernel's gen_config.h: the default `debug` config is refused. Refused
     # before any secrets are read, so the paths need not exist.

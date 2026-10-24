@@ -92,16 +92,17 @@ class BlobKind(NamedTuple):
     body: object
 
 
-KEY_MAX_PEERS = (4096 - 80 - 32) // 32
+KEY_MAX_PEERS = (4096 - 112 - 32) // 32
 
 
 def _key_body(blob: bytes):
     peers = int.from_bytes(blob[12:16], "little")
-    return 80 + 32 * peers if 1 <= peers <= KEY_MAX_PEERS else None
+    return 112 + 32 * peers if 1 <= peers <= KEY_MAX_PEERS else None
 
 
-# `key` blob v2: header 16 B, gateway key and boot seed, 32 B per peer.
-KEY = BlobKind("secrets", b"SOSSECR1", 2, 4096, _key_body)
+# `key` blob v3: header 16 B, gateway key, boot seed and TLS scalar, 32 B
+# per peer.
+KEY = BlobKind("secrets", b"SOSSECR1", 3, 4096, _key_body)
 # `pqkey` blob v1: header 12 B, McEliece sk 13608 B, then 4 x 32 B and a
 # 188 B ciphertext: the checksum covers [..13904] (secret_blob::pq).
 PQ = BlobKind("pq_secrets", b"SOSPQKY1", 1, 16384, lambda _blob: 13904)

@@ -181,10 +181,11 @@ CASES = [
      lambda t: append(t / "tools/mksecrets/src/main.rs", "\nfn f() { classic_mceliece_rust::x(); }\n")),
     ("allow classic_mceliece_rust in a tool's comment", set(),
      lambda t: append(t / "tools/mksecrets/src/main.rs", "\n// replaced classic_mceliece_rust::decapsulate in M4\n")),
-    ("P6 Cargo.lock without [[package]] tables", {"P6", "P16"},
+    # P16 and P17 fail closed too: neither can find what it binds.
+    ("P6 Cargo.lock without [[package]] tables", {"P6", "P16", "P17"},
      lambda t: (t / "Cargo.lock").write_text("version = 4\n")),
-    ("P6 Cargo.lock not UTF-8", {"P6", "P16"}, lambda t: (t / "Cargo.lock").write_bytes(b"version = 4\n\xff\n")),
-    ("P6 Cargo.lock package without a name", {"P6", "P16"},
+    ("P6 Cargo.lock not UTF-8", {"P6", "P16", "P17"}, lambda t: (t / "Cargo.lock").write_bytes(b"version = 4\n\xff\n")),
+    ("P6 Cargo.lock package without a name", {"P6", "P16", "P17"},
      lambda t: (t / "Cargo.lock").write_text('version = 4\n[[package]]\nversion = "1"\n')),
     ("P6 waivers.toml missing", {"P6"}, lambda t: (t / "policy/waivers.toml").unlink()),
     ("P6 waivers.toml unparsable", {"P6"}, lambda t: edit(t / "policy/waivers.toml", SC23, SC23 + "status = \n")),
@@ -605,6 +606,16 @@ CASES = [
      lambda t: edit(t / "Makefile", "verus_crates :=", "verus_crates =")),
     ("P12 a listed crate without sources", {"P12"},
      lambda t: shutil.rmtree(t / "crates/wg-wire/src")),
+    # P17 (M6 plan C5, T-R3-10): the sign cost is bound to libcrux-p256's
+    # lock entry; a changed checksum or version, or no recorded entry, fails.
+    ("P17 libcrux-p256's lock checksum differs from the recorded one", {"P17"},
+     lambda t: edit(t / "Cargo.lock", 'checksum = "7489aa205be22524e2f6ddbe006c0c4ff5f1dfc7c17b783e3d02f1cb2a01c605"',
+                    'checksum = "7489aa205be22524e2f6ddbe006c0c4ff5f1dfc7c17b783e3d02f1cb2a01c606"')),
+    ("P17 libcrux-p256's lock version differs from the recorded one", {"P17"},
+     lambda t: edit(t / "Cargo.lock", 'name = "libcrux-p256"\nversion = "0.0.9"', 'name = "libcrux-p256"\nversion = "0.0.10"')),
+    ("P17 no recorded libcrux-p256 entry beside SIGN_COST_NS", {"P17"},
+     lambda t: edit(t / "crates/key-core/src/lib.rs", "pub const SIGN_COST_LIBCRUX_P256: &str",
+                    "pub const SIGN_COST_LIBCRUX_P256_GONE: &str")),
     ("P9 a CookieSecret holder without the derive", set(),
      lambda t: append(t / "crates/pds/ingress/src/cookie.rs", "\npub struct Held {\n    secret: CookieSecret,\n}\n")),
 ]

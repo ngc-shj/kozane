@@ -19,11 +19,58 @@ fn encode_key_matches_a_known_wireguard_key() {
     assert_eq!(encode_key(&k), "YBS8Ds6hLNV9RKN63rn+Z7o/7hO6Iwmh1xhxEHInuGg=");
 }
 
+fn unbase64(s: &str) -> Vec<u8> {
+    let mut bits: u32 = 0;
+    let mut n = 0;
+    let mut out = Vec::new();
+    for c in s.bytes().filter(|c| *c != b'=' && *c != b'\n') {
+        bits = (bits << 6) | ALPHABET.iter().position(|a| *a == c).expect("base64") as u32;
+        n += 6;
+        if n >= 8 {
+            n -= 8;
+            out.push((bits >> n) as u8);
+        }
+    }
+    out
+}
+
+/// The DER inside a PEM SubjectPublicKeyInfo.
+fn pem_der(pem: &str) -> Vec<u8> {
+    let body = pem.strip_prefix("-----BEGIN PUBLIC KEY-----\n").and_then(|b| b.strip_suffix("-----END PUBLIC KEY-----\n"));
+    unbase64(body.expect("PEM framing"))
+}
+
+/// One request to the stand-in issuer: (tls.pub, name, negative).
+type Request = (String, String, bool);
+type Asked = std::sync::Mutex<Vec<Request>>;
+type Files = Vec<(String, Vec<u8>)>;
+
+/// mkcert's stand-in: a "certificate" that is the SPKI between two bytes,
+/// which is all config's check reads, and a CA file.
+fn fake_issue(asked: &Asked) -> impl Fn(&str, &str, bool) -> Result<Files, String> + '_ {
+    move |pem: &str, name: &str, negative: bool| {
+        asked.lock().unwrap().push((pem.to_string(), name.to_string(), negative));
+        let cert = [&[0x30u8][..], &pem_der(pem), &[0x00]].concat();
+        Ok(vec![("devca.pem".to_string(), b"ca".to_vec()), ("tls.der".to_string(), cert)])
+    }
+}
+
+fn generated(peers: usize, endpoint: &str, tls_name: Option<&str>, mismatch_blob: bool) -> Result<(Deployment, Vec<Request>), String> {
+    let asked = Asked::default();
+    let d = {
+        let issue = fake_issue(&asked);
+        let tls = TlsOptions { name: tls_name, negative: false, mismatch_blob, issue: &issue };
+        generate(TEMPLATE, peers, endpoint, None, &tls)?
+    };
+    Ok((d, asked.into_inner().unwrap()))
+}
+
 /// One two-peer deployment shared (read-only) by the tests that inspect a
 /// deployment: McEliece keygen dominates their run time in debug builds.
-fn deployment() -> &'static Deployment {
-    static D: std::sync::OnceLock<Deployment> = std::sync::OnceLock::new();
-    D.get_or_init(|| generate(TEMPLATE, 2, "192.0.2.7:51820", None).unwrap_or_else(|e| panic!("{e}")))
+/// It has the TLS-mismatch blob.
+fn deployment() -> &'static (Deployment, Vec<Request>) {
+    static D: std::sync::OnceLock<(Deployment, Vec<Request>)> = std::sync::OnceLock::new();
+    D.get_or_init(|| generated(2, "192.0.2.7:51820", None, true).unwrap_or_else(|e| panic!("{e}")))
 }
 
 /// The deployment's key files, served the way build.rs reads them.
@@ -31,6 +78,9 @@ fn loader(d: &Deployment) -> impl Fn(&str) -> Result<Vec<u8>, String> + '_ {
     move |name: &str| {
         if name == GATEWAY_RP_PUBLIC {
             return Ok(d.gateway_rp_public.to_vec());
+        }
+        if let Some((_, c)) = d.certs.iter().find(|(n, _)| n == name) {
+            return Ok(c.clone());
         }
         (0..d.peers.len())
             .find(|i| peer_rp_public(*i) == name)
@@ -51,7 +101,7 @@ fn decapsulate(sk: &[u8; pq::SK_LEN], ct: &[u8; pq::CT_LEN]) -> [u8; 32] {
 
 #[test]
 fn generated_blob_matches_generated_config() {
-    let d = deployment();
+    let d = &deployment().0;
     let checked = checked(d);
     let blob = secret_blob::Blob::parse(&d.blob[..], 2).unwrap_or_else(|e| panic!("{}", e.message()));
 
@@ -66,7 +116,7 @@ fn generated_blob_matches_generated_config() {
 
 #[test]
 fn pqkey_blob_binds_the_configured_gateway_key_and_its_kat_decapsulates() {
-    let d = deployment();
+    let d = &deployment().0;
     let checked = checked(d);
     let blob = pq::Blob::parse(&d.pq_blob[..]).unwrap_or_else(|e| panic!("{}", e.message()));
     assert_eq!(*blob.spkm_hash(), checked.gateway_rp.hash);
@@ -82,7 +132,7 @@ fn pqkey_blob_binds_the_configured_gateway_key_and_its_kat_decapsulates() {
 
 #[test]
 fn client_mceliece_key_is_exported_in_the_liboqs_layout() {
-    let d = deployment();
+    let d = &deployment().0;
     let checked = checked(d);
     let mut rng = Urandom::open().unwrap();
     for (bundle, peer) in d.peers.iter().zip(&checked.peers) {
@@ -98,7 +148,7 @@ fn client_mceliece_key_is_exported_in_the_liboqs_layout() {
 
 #[test]
 fn peer_config_has_no_preshared_key_and_names_the_gateway() {
-    let d = deployment();
+    let d = &deployment().0;
     let checked = checked(d);
     let conf = &d.peers[0].wg_conf;
     assert!(!conf.contains("PresharedKey ="), "{conf}");
@@ -108,7 +158,7 @@ fn peer_config_has_no_preshared_key_and_names_the_gateway() {
 
 #[test]
 fn rosenpass_config_names_the_bundle_files_and_the_rp_port() {
-    let d = deployment();
+    let d = &deployment().0;
     let t: toml::Table = toml::from_str(&d.peers[1].rp_toml).unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(t["public_key"].as_str(), Some("peer-1.rp.pk"));
     assert_eq!(t["secret_key"].as_str(), Some("peer-1.rp.sk"));
@@ -128,17 +178,18 @@ fn rosenpass_endpoint_defaults_to_the_wireguard_host_and_can_be_overridden() {
 
 #[test]
 fn two_runs_produce_different_keys() {
-    let a = generate(TEMPLATE, 1, "x:1", None).unwrap_or_else(|e| panic!("{e}"));
-    let b = generate(TEMPLATE, 1, "x:1", None).unwrap_or_else(|e| panic!("{e}"));
+    let (a, _) = generated(1, "x:1", None, false).unwrap_or_else(|e| panic!("{e}"));
+    let (b, _) = generated(1, "x:1", None, false).unwrap_or_else(|e| panic!("{e}"));
     assert_ne!(a.blob[..], b.blob[..]);
+    assert_ne!(a.tls_pub_pem, b.tls_pub_pem);
     assert_ne!(a.pq_blob[..], b.pq_blob[..]);
     assert_ne!(a.peers[0].rp_secret[..], b.peers[0].rp_secret[..]);
 }
 
 #[test]
 fn rejects_peer_counts_outside_the_deployable_range() {
-    assert!(generate(TEMPLATE, 0, "x:1", None).is_err());
-    let e = generate(TEMPLATE, validate::MAX_PEERS + 1, "x:1", None).err().unwrap_or_default();
+    assert!(generated(0, "x:1", None, false).is_err());
+    let e = generated(validate::MAX_PEERS + 1, "x:1", None, false).err().unwrap_or_default();
     assert!(e.contains("--peers must be 1..=8"), "{e}");
 }
 
@@ -230,21 +281,38 @@ fn run_writes_both_blobs_the_key_files_and_one_bundle_per_peer() {
     let s = Scratch::new("run");
     let out = s.0.join("deploy");
     let template = format!("{}/../../config/gateway.toml", env!("CARGO_MANIFEST_DIR"));
-    let args: Vec<String> =
-        ["--template", &template, "--peers", "1", "--out", out.to_str().unwrap()].iter().map(|a| a.to_string()).collect();
+    let args: Vec<String> = [
+        "--template",
+        &template,
+        "--peers",
+        "1",
+        "--out",
+        out.to_str().unwrap(),
+        "--test-negative",
+        "--tls-mismatch-blob",
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect();
     run(&args).unwrap_or_else(|e| panic!("{e}"));
     let mut names: Vec<String> =
         std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
     names.sort();
     let want = [
+        "devca.pem",
         "gateway.rp.pk",
         "gateway.toml",
+        "negative-form.der",
+        "negative-name.der",
         "peer-0.conf",
         "peer-0.rosenpass.toml",
         "peer-0.rp.pk",
         "peer-0.rp.sk",
         "pqkey-secrets.bin",
+        "secrets-tls-mismatch.bin",
         "secrets.bin",
+        "tls.der",
+        "tls.pub",
     ];
     assert_eq!(names, want);
     let size = |n: &str| std::fs::metadata(out.join(n)).unwrap().len() as usize;
@@ -351,7 +419,7 @@ const PCR8_HEX: &str = "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a9
 
 /// Both blobs of the shared deployment, written where `seal` reads them.
 fn blob_files(s: &Scratch) -> (PathBuf, PathBuf, PathBuf) {
-    let d = deployment();
+    let d = &deployment().0;
     let dir = s.dir("in");
     let (key, pqb, srk) = (dir.join("secrets.bin"), dir.join("pqkey-secrets.bin"), dir.join("srk.pub"));
     std::fs::write(&key, &d.blob[..]).unwrap();
@@ -411,7 +479,7 @@ fn seal_refuses_a_blob_of_the_other_kind_a_bad_pcr8_and_a_bad_srk_file() {
     let pcr = pcr8(PCR8_HEX).unwrap();
     let e = seal_file(Kind::Key, &pqb, srk_public(&srk).unwrap(), &pcr).unwrap_err();
     assert!(e.contains("a Key blob is 4096"), "{e}");
-    let mut corrupt = deployment().blob.to_vec();
+    let mut corrupt = deployment().0.blob.to_vec();
     corrupt[100] ^= 1;
     let bad = s.dir("bad").join("secrets.bin");
     std::fs::write(&bad, &corrupt).unwrap();
@@ -446,4 +514,96 @@ fn check_envelope_accepts_its_own_pcr8_only() {
     let mut tampered = env.clone();
     tampered[at] ^= 1;
     assert!(envelope_sealed_to(&tampered, Kind::Key, &pcr).is_err());
+}
+
+fn tls_point(private: &[u8; 32]) -> Option<[u8; validate::TLS_PUBLIC_LEN]> {
+    let mut s = Secret::<32>::zero();
+    s.as_mut_bytes().copy_from_slice(private);
+    let xy = tpm2::crypto::public_point(&s)?;
+    let mut p = [0x04; validate::TLS_PUBLIC_LEN];
+    p[1..].copy_from_slice(&xy);
+    Some(p)
+}
+
+/// M6 plan C5, C11: the blob's TLS scalar is the key of the config's
+/// `tls_public`, of `tls.pub` and of what mkcert was handed.
+#[test]
+fn generated_tls_scalar_matches_the_config_tls_pub_and_the_issued_key() {
+    let (d, asked) = deployment();
+    let checked = checked(d);
+    let blob = secret_blob::Blob::parse(&d.blob[..], 2).unwrap_or_else(|e| panic!("{}", e.message()));
+    assert_eq!(tls_point(blob.tls_private()), Some(checked.tls_public));
+    let spki = [&validate::P256_SPKI_PREFIX[..], &checked.tls_public[..]].concat();
+    assert_eq!(pem_der(&d.tls_pub_pem), spki);
+    assert_eq!(asked.len(), 1);
+    assert_eq!(asked[0].0, d.tls_pub_pem);
+    assert!(d.config.contains("tls_cert = \"tls.der\"\n"));
+}
+
+#[test]
+fn tls_name_defaults_to_the_outside_ip_and_can_be_given() {
+    let (_, asked) = deployment();
+    assert_eq!((asked[0].1.as_str(), asked[0].2), ("10.0.2.15", false));
+    let (_, asked) = generated(1, "x:1", Some("gw.example"), false).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(asked[0].1, "gw.example");
+}
+
+/// The TLS-only key failure case (M6 plan D5, case 8): the same deployment
+/// with another valid TLS scalar, everything else equal.
+#[test]
+fn the_tls_mismatch_blob_differs_from_the_blob_in_its_tls_scalar_alone() {
+    let (d, _) = deployment();
+    let checked = checked(d);
+    let other = d.tls_mismatch_blob.as_ref().expect("asked for");
+    let (a, b) = (secret_blob::Blob::parse(&d.blob[..], 2).unwrap(), secret_blob::Blob::parse(&other[..], 2).unwrap());
+    assert_eq!((a.gateway_private(), a.boot_seed()), (b.gateway_private(), b.boot_seed()));
+    assert_eq!((a.peer(0), a.peer(1)), (b.peer(0), b.peer(1)));
+    assert_ne!(a.tls_private(), b.tls_private());
+    let point = tls_point(b.tls_private()).expect("a valid scalar");
+    assert_ne!(point, checked.tls_public);
+}
+
+#[test]
+fn no_tls_mismatch_blob_unless_asked() {
+    let (d, _) = generated(1, "x:1", None, false).unwrap_or_else(|e| panic!("{e}"));
+    assert!(d.tls_mismatch_blob.is_none());
+}
+
+#[test]
+fn config_carries_the_template_tls_ports_and_backend() {
+    let (d, _) = deployment();
+    let checked = checked(d);
+    let template = validate::check(
+        TEMPLATE,
+        validate::MAX_PEERS,
+        &|n: &str| std::fs::read(format!("{}/../../config/{n}", env!("CARGO_MANIFEST_DIR"))).map_err(|e| e.to_string()),
+    )
+    .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!((checked.tls_ports, checked.backend), (template.tls_ports, template.backend));
+}
+
+#[test]
+fn an_issuer_failure_or_a_certificate_for_another_key_fails_the_run() {
+    let fail = |_: &str, _: &str, _: bool| -> Result<Files, String> { Err("mkcert: no".into()) };
+    let tls = TlsOptions { name: None, negative: false, mismatch_blob: false, issue: &fail };
+    assert_eq!(generate(TEMPLATE, 1, "x:1", None, &tls).err(), Some("mkcert: no".into()));
+    let wrong = |_: &str, _: &str, _: bool| -> Result<Files, String> {
+        Ok(vec![("tls.der".to_string(), [&validate::P256_SPKI_PREFIX[..], &[0x04; 65]].concat())])
+    };
+    let tls = TlsOptions { name: None, negative: false, mismatch_blob: false, issue: &wrong };
+    let e = generate(TEMPLATE, 1, "x:1", None, &tls).err().unwrap_or_default();
+    assert!(e.contains("generated config invalid") && e.contains("does not hold tls_public"), "{e}");
+}
+
+/// The real tools/mkcert, as `run` calls it: the leaf it issues for the
+/// PEM mksecrets writes holds that key (the interface between the two).
+#[test]
+fn mkcert_issues_a_leaf_holding_the_written_public_key() {
+    let (_, public) = p256_keypair().unwrap();
+    let files = mkcert_issue(&public_key_pem(&public), "10.0.2.15", true).unwrap_or_else(|e| panic!("{e}"));
+    let names: Vec<&str> = files.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(names, ["devca.pem", "negative-form.der", "negative-name.der", "tls.der"]);
+    let leaf = &files[3].1;
+    let spki = [&validate::P256_SPKI_PREFIX[..], &public[..]].concat();
+    assert!(leaf.windows(spki.len()).any(|w| w == spki.as_slice()));
 }
