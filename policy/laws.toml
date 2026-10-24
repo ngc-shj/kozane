@@ -150,7 +150,7 @@
 #   `secrets`, `pqkey` from `pq` only and maps only `pq_secrets`, `tlskey`
 #   from `tls` only and maps only `tls_secrets`; L2 as amended).
 #   `timer` is exempt as notify-only (L1): it notifies `data`, `hs`,
-#   `ingress` and `pq`, none of which can notify it. `audit` (M5) owns the
+#   `ingress`, `pq` and `tls`, none of which can notify it. `audit` (M5) owns the
 #   PL011 page as the only console and writes its lines there. `tpm` (M5)
 #   owns the TIS page and is called by the three key pds alone, each over
 #   its one pp channel, to unseal their secrets at boot; it is untainted

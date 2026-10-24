@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# The constant-time compare of the boot hashes.
+ct = { path = "../ct" }
 ingress-core = { path = "../ingress-core" }
 mce460896 = { path = "../mce460896" }
 secret-blob = { path = "../secret-blob" }

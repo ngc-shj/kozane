@@ -37,50 +37,9 @@ pub mod schedule;
 pub use hybrid::{HybridSecret, SCRUB_DEPTH_EXCHANGE, exchange_with_randomness, scrub_session_stack};
 pub use tls_wire::{CLIENT_SHARE_LEN, Refusal, SERVER_SHARE_LEN, X25519MLKEM768};
 
-use zeroize::Zeroize;
-
-/// N secret bytes: not `Copy`/`Clone`/`Debug`, zeroized on drop (L12).
-pub struct Secret<const N: usize>([u8; N]);
-
-impl<const N: usize> Secret<N> {
-    pub const fn zero() -> Self {
-        Self([0; N])
-    }
-
-    /// A copy made in place from a borrowed array.
-    pub fn copy_from(bytes: &[u8; N]) -> Self {
-        let mut s = Self::zero();
-        s.0.copy_from_slice(bytes);
-        s
-    }
-
-    pub fn as_bytes(&self) -> &[u8; N] {
-        &self.0
-    }
-
-    pub fn as_mut_bytes(&mut self) -> &mut [u8; N] {
-        &mut self.0
-    }
-
-    pub fn wipe(&mut self) {
-        self.0.zeroize();
-    }
-
-    pub fn is_zero(&self) -> bool {
-        self.0.iter().all(|&b| b == 0)
-    }
-}
-
-impl<const N: usize> Drop for Secret<N> {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
-}
-
-/// Wipes a plaintext buffer with writes the optimizer keeps (L12).
-pub fn wipe(buf: &mut [u8]) {
-    buf.zeroize();
-}
+/// The secret container (not `Copy`/`Clone`/`Debug`, zeroized on drop) and
+/// the plaintext wipe (L12): the workspace's one copy, `secret`'s.
+pub use secret::{Secret, wipe};
 
 #[cfg(test)]
 mod test_client;

@@ -17,8 +17,10 @@ mce460896 = { path = "../../crates/mce460896" }
 secret-blob = { path = "../../crates/secret-blob" }
 tpm2 = { path = "../../crates/tpm2" }
 tpm2-wire = { path = "../../crates/tpm2-wire" }
-# The hybrid exchange and its scrub `tls` ships (M6 plan C7, T-R4-1).
+# The hybrid exchange and its scrub `tls` ships (M6 plan C7, T-R4-1), and
+# the handshake that calls them; tls-wire's constants build its ClientHello.
 tls-core = { path = "../../crates/tls-core" }
+tls-wire = { path = "../../crates/tls-wire" }
 # Every libcrux crate tls-core pulls, at the root lock's version and with
 # tls-core's features only, so that the harness compiles the code the PD
 # ships (T-R5-1). The client side of the residue case (ML-KEM keygen and

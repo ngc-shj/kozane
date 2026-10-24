@@ -174,13 +174,13 @@ CASES_FOR_GATE = {
     "ct": {"ct-barrier", "ct-c1-barrier", "ct-harness-unit", "ct-harness-lint", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms",
            "mce-residue-encaps-scrub", "mce-residue-encaps-depth", "mce-residue-bm", "tpm2-open-residue",
-           "tls-exchange-residue", "tls-exchange-scrub-depth"},
+           "tls-exchange-residue", "tls-exchange-scrub-depth", "tls-hello-scrub"},
     "ct-shape": {"ct-shape", "ct-identity", "verus-erasure", "tls-identity"},
     "verus": {"verus-cache", "verus-trusted", "verus-trusted-item", "verus-no-cheating", "verus-required", "verus-required-site",
               "verus-required-member", "verus-wg-wire-window",
               "verus-wg-wire-roundtrip", "verus-rp-wire-roundtrip",
               "verus-msgs-exact", "verus-ring-mask", "verus-wire-ipv4"},
-    "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire"},
+    "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire", "bolero-tls-wire", "bolero-http-wire"},
     "laws": {"laws", "laws-timer-ingress", "laws-pq-key", "laws-hs-pqkey", "laws-pq-secrets-writable",
              "laws-tls-pqkey", "laws-tls-budget", "laws-tls-priority", "laws-tls-hd", "laws-hs-tls-share-key"},
     "test": {"measure-twin", "measure-wrap", "measure-pair-01", "measure-pair-02", "measure-pair-12",
@@ -275,6 +275,14 @@ CASES = {
                                                   "bolero::check!().for_each(fuzz_one);",
                                                   "bolero::check!().for_each(|b: &[u8]| if b.len() >= 20 { std::eprintln!(\"selftest-bolero-wg-injected\"); panic!() });"),
                        "selftest-bolero-wg-injected"),
+    "bolero-tls-wire": (["bolero"], lambda t: edit(t, "crates/tls-wire/src/tests.rs",
+                                                   "bolero::check!().for_each(fuzz_one);",
+                                                   "bolero::check!().for_each(|b: &[u8]| if b.len() >= 20 { std::eprintln!(\"selftest-bolero-tls-injected\"); panic!() });"),
+                        "selftest-bolero-tls-injected"),
+    "bolero-http-wire": (["bolero"], lambda t: edit(t, "crates/http-wire/src/tests.rs",
+                                                    "bolero::check!().for_each(fuzz_one);",
+                                                    "bolero::check!().for_each(|b: &[u8]| if b.len() >= 20 { std::eprintln!(\"selftest-bolero-http-injected\"); panic!() });"),
+                         "selftest-bolero-http-injected"),
     # Editing a path dependency (wire) must re-prove ingress-core rather than
     # serve the cached pass copied in from the real tree.
     "kani-cache": (["kani", "kani_crates=ingress-core"],
@@ -487,14 +495,24 @@ CASES = {
                           re.compile(r"RESIDUE-HIT kek case=open\.")),
     # The hybrid exchange's stack scrub removed from the residue case
     # (M6 plan C7, T-R4-1): ML-KEM's shared secret and the X25519 secret
-    # stay in libcrux's dead frames. The ct gate runs the harness's case,
-    # not on_hello_record; the production calls (tls-core and the PD) are
-    # the same function, whose code ct-shape binds.
+    # stay in libcrux's dead frames. The production call site has its own
+    # case below (tls-hello-scrub); the function both scrub is the one
+    # ct-shape binds.
     "tls-exchange-residue": (["ct"], lambda t: edit(t, "tools/ct-harness/src/residue.rs",
                                                     "        let r = exchange_with_randomness(&client.share, &client.randomness);\n"
                                                     "        scrub_session_stack();\n",
                                                     "        let r = exchange_with_randomness(&client.share, &client.randomness);\n"),
                              re.compile(r"(?s)(?=.*RESIDUE-HIT kem-ss case=exchange )(?=.*RESIDUE-HIT x-ss case=exchange )")),
+    # The production scrub after the exchange (and the key schedule) in
+    # on_hello_record removed: the residue case driving a ClientHello
+    # through tls-core's Session, which adds no scrub of its own, finds
+    # both component secrets in the dead frames (measured on a scratch
+    # copy: kem-rand, kem-g, kem-ss and x-ss hit in case hello).
+    "tls-hello-scrub": (["ct"], lambda t: edit(t, "crates/tls-core/src/handshake.rs",
+                                               "        let keys = hello_keys(&mut self.transcript, msg.bytes, &ch, bufs.out, ctx.rng);\n"
+                                               "        scrub_session_stack();\n",
+                                               "        let keys = hello_keys(&mut self.transcript, msg.bytes, &ch, bufs.out, ctx.rng);\n"),
+                        re.compile(r"(?s)(?=.*RESIDUE-HIT kem-ss case=hello )(?=.*RESIDUE-HIT x-ss case=hello )")),
     # The shipped scrub cut below the exchange's depth (33 KiB measured):
     # the depth run refuses it, whatever the scan finds.
     "tls-exchange-scrub-depth": (["ct"], lambda t: edit(t, "crates/tls-core/src/hybrid.rs",
@@ -1170,12 +1188,13 @@ CASES = {
                         "assertion failed: names_match()"),
     # M6 plan C12: an Unavailable tlskey halts tls at init, before it
     # listens, with KEY_UNAVAILABLE (after its audit); without that halt,
-    # init stops on INIT_FAILED instead.
+    # init stops on INIT_FAILED instead, which run.py names against the
+    # reason it wants.
     "tls-key-halt": (["test", "it_boots=tls key failure"], lambda t: edit(t, "crates/pds/tls/src/main.rs",
                                                                          "            audit.record(Event::KeyUnavailable { code });\n"
                                                                          "            audit.halt(halt::KEY_UNAVAILABLE)\n",
                                                                          "            audit.record(Event::KeyUnavailable { code });\n"),
-                     "timed out waiting for 'audit: src=tls Halted reason="),
+                     "tls key failure: tls halted with reason="),
     # C8: the head buffer wiped once rewritten (the proxy's early wipe) and
     # on close and release; without both the marker outlives the rewrite
     # and the connection (the barrier SYN that takes the closed slot
@@ -1186,13 +1205,13 @@ CASES = {
                      "marker still in guest RAM"),
     # M6 plan C10 in the PD: the backend socket's free room bounds what the
     # slot hands over; marking more as sent than fitted loses MAX_BODY
-    # (1 << 20) bytes of the POST body (or stalls it until the idle
-    # timeout resets the client).
+    # (1 << 20) bytes of the POST body, or stalls it until the idle
+    # timeout resets the client (run.py names each).
     "proxy-pd-backend-room": (["test", "it_boots=https"], lambda t: edit(
         t, "crates/pds/tls/src/main.rs", "            self.slot.backend_sent(n, self.now);\n",
         "            let _ = n;\n            self.slot.backend_sent(usize::MAX, self.now);\n"),
                               ("https post: the POST body of 1048576 bytes reached the backend as",
-                               "https post 1048576: ")),
+                               "https post: the POST body of 1048576 bytes stalled after ")),
     # The backend's FIN only once every byte before it went to the client
     # (tls-core's `backend_end`; a PD-level mutation breaks the first
     # case before this one, so the decision is red-proved where it lives).

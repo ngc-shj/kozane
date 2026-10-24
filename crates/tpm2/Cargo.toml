@@ -12,6 +12,8 @@ layout = { path = "../layout" }
 libcrux-hmac = { version = "=0.0.9", default-features = false }
 libcrux-p256 = { version = "=0.0.9", default-features = false }
 libcrux-sha2 = { version = "=0.0.9", default-features = false }
+# The shared secret container tpm2 re-exports as `tpm2::Secret` (L12).
+secret = { path = "../secret" }
 secret-blob = { path = "../secret-blob" }
 tpm2-wire = { path = "../tpm2-wire" }
 wg-core = { path = "../wg-core" }

@@ -66,6 +66,12 @@ pub const TLS_CLOSED_BASE: u16 = 0x0240;
 pub const HTTP_REFUSED_BASE: u16 = 0x0260;
 pub const TLS_TIMEOUT_BASE: u16 = 0x0280;
 const MAX_TLS_KIND: u16 = 0x1f;
+/// The one code a `tls` kind's out-of-range value encodes to: outside all
+/// four ranges and every name table, so a bad value is never reported as a
+/// real refusal, close, status or timeout (`TlsRefused` fills all 32 of
+/// its codes, so no in-range code is free to clamp onto). It decodes as
+/// `Decoded::Unknown`, which `audit` prints as an unknown code.
+pub const TLS_KIND_UNKNOWN: u16 = 0x02a0;
 /// `tls_wire::Refusal`'s variants, by code.
 pub const TLS_REFUSED_NAMES: [&str; 32] = [
     "RecordType",
@@ -351,10 +357,10 @@ impl Event {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
             }
             Event::TcpLimited { kind } => TCP_LIMITED_BASE | (if kind > MAX_TCP_LIMIT { MAX_TCP_LIMIT } else { kind }),
-            Event::TlsRefused { reason } => TLS_REFUSED_BASE | clamp_tls(reason),
-            Event::TlsClosed { reason } => TLS_CLOSED_BASE | clamp_tls(reason),
-            Event::HttpRefused { status } => HTTP_REFUSED_BASE | clamp_tls(status),
-            Event::TlsTimeout { stage } => TLS_TIMEOUT_BASE | clamp_tls(stage),
+            Event::TlsRefused { reason } => tls_code(TLS_REFUSED_BASE, reason),
+            Event::TlsClosed { reason } => tls_code(TLS_CLOSED_BASE, reason),
+            Event::HttpRefused { status } => tls_code(HTTP_REFUSED_BASE, status),
+            Event::TlsTimeout { stage } => tls_code(TLS_TIMEOUT_BASE, stage),
         }
     }
 
@@ -679,10 +685,10 @@ impl Event {
             Event::KeyStackHighWater { .. } => KEY_STACK_HIGH_WATER_SLOT,
             Event::KeyWaitHighWater { .. } => KEY_WAIT_HIGH_WATER_SLOT,
             Event::TlsSignHighWater { .. } => TLS_SIGN_HIGH_WATER_SLOT,
-            Event::TlsRefused { reason } => TLS_REFUSED_SLOT.saturating_add(clamp_tls(reason) as usize),
-            Event::TlsClosed { reason } => TLS_CLOSED_SLOT.saturating_add(clamp_tls(reason) as usize),
-            Event::HttpRefused { status } => HTTP_REFUSED_SLOT.saturating_add(clamp_tls(status) as usize),
-            Event::TlsTimeout { stage } => TLS_TIMEOUT_SLOT.saturating_add(clamp_tls(stage) as usize),
+            Event::TlsRefused { reason } => tls_slot(TLS_REFUSED_SLOT, reason),
+            Event::TlsClosed { reason } => tls_slot(TLS_CLOSED_SLOT, reason),
+            Event::HttpRefused { status } => tls_slot(HTTP_REFUSED_SLOT, status),
+            Event::TlsTimeout { stage } => tls_slot(TLS_TIMEOUT_SLOT, stage),
             Event::FrameDropped { reason } => {
                 // FIXED_SLOTS..FIXED_SLOTS+64, clamped like `code`.
                 let r = if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason };
@@ -706,16 +712,24 @@ const KEY_STACK_HIGH_WATER_SLOT: usize = KEY_UNAVAILABLE_SLOT + 1;
 const TCP_LIMITED_SLOT: usize = KEY_STACK_HIGH_WATER_SLOT + 1;
 const KEY_WAIT_HIGH_WATER_SLOT: usize = TCP_LIMITED_SLOT + MAX_TCP_LIMIT as usize + 1;
 const TLS_SIGN_HIGH_WATER_SLOT: usize = KEY_WAIT_HIGH_WATER_SLOT + 1;
-// Each `tls` kind: TLS_*_SLOT..+32, clamped like `code`.
+// Each `tls` kind: TLS_*_SLOT..+32; an out-of-range value of any of them
+// counts in TLS_KIND_UNKNOWN_SLOT, as `code` maps it to TLS_KIND_UNKNOWN.
 const TLS_REFUSED_SLOT: usize = TLS_SIGN_HIGH_WATER_SLOT + 1;
 const TLS_CLOSED_SLOT: usize = TLS_REFUSED_SLOT + MAX_TLS_KIND as usize + 1;
 const HTTP_REFUSED_SLOT: usize = TLS_CLOSED_SLOT + MAX_TLS_KIND as usize + 1;
 const TLS_TIMEOUT_SLOT: usize = HTTP_REFUSED_SLOT + MAX_TLS_KIND as usize + 1;
-const SLOTS: usize = TLS_TIMEOUT_SLOT + MAX_TLS_KIND as usize + 1;
+const TLS_KIND_UNKNOWN_SLOT: usize = TLS_TIMEOUT_SLOT + MAX_TLS_KIND as usize + 1;
+const SLOTS: usize = TLS_KIND_UNKNOWN_SLOT + 1;
 
-/// A `tls` kind's value, clamped into its 32 codes.
-const fn clamp_tls(v: u16) -> u16 {
-    if v > MAX_TLS_KIND { MAX_TLS_KIND } else { v }
+/// A `tls` kind's code: `base + v` inside its 32 codes, else
+/// `TLS_KIND_UNKNOWN` (never clamped onto a real code).
+const fn tls_code(base: u16, v: u16) -> u16 {
+    if v > MAX_TLS_KIND { TLS_KIND_UNKNOWN } else { base | v }
+}
+
+/// A `tls` kind's counter slot, unknown values sharing one as in `tls_code`.
+const fn tls_slot(base: usize, v: u16) -> usize {
+    if v > MAX_TLS_KIND { TLS_KIND_UNKNOWN_SLOT } else { base.saturating_add(v as usize) }
 }
 
 /// `RpCostHighWater`'s code, the first after the fixed range.

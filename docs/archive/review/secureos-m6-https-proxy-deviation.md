@@ -901,3 +901,113 @@ clienthello flood, https syn flood).
   (`wait_delivered`) before the judgment loop.
 - The ct pass record must be refreshed after any tls-core change (the
   harness links tls-core since slice 3b).
+
+## Phase 2 self-check fixes
+
+Not run by the implementer (by the step's rules): Kani, Verus, make
+test/check, QEMU/run.py, check-selftest. The run.py edits and every
+`test`-gate selftest case below are unrun. Root Cargo.lock changes once
+(new package `secret`; edges pqkey-core → ct, rosenpass-core → ct and
+secret, tls-core → secret, tpm2 → secret), so the Kani cache keys change.
+tools/ct-harness/Cargo.lock: package `secret`, tls-core and tpm2 → secret,
+ct-harness → tls-wire.
+
+Decisions:
+
+- **One constant-time compare.** `rosenpass_core::crypto::ct_eq` is
+  `pub use ct::ct_eq` (callers unchanged); pqkey-core's private
+  fixed-size copy is gone, its two boot checks call `ct::ct_eq`. ct's doc
+  names every user, direct and through the wg-core/rosenpass-core
+  re-exports.
+- **One secret container, crate `secret`** (zeroize =1.8.1 only):
+  `Secret<N>` with the union of the three APIs (`zero` const,
+  `from_bytes`, `copy_from`, `as_bytes`/`as_mut_bytes`, rosenpass-core's
+  `expose`/`expose_mut`, `wipe`, `is_zero`, `ZeroizeOnDrop`) and `wipe`.
+  tpm2 and rosenpass-core re-export `Secret`, tls-core `Secret` and `wipe`,
+  so every path callers use still resolves. Not Clone/Copy/Debug is pinned
+  by three compile_fail doctests in the crate. **Deviation:**
+  rosenpass-core's `Secret::ct_eq` method is dropped, not carried over: it
+  had no caller in any tree, and keeping it would give `secret` a ct edge
+  against the leaf's dependency rule (every compare goes through
+  `crypto::ct_eq` on `expose()`). check-pins P9/P10 cover `crates/secret`
+  (SECRET_CRATES), with a fixture each (CHECK-PINS-FIXTURES 255 → 257).
+- **The handshake's scrub now covers the hybrid secret's whole life
+  (essential fix, Critical tier).** The new residue case (below) drove a
+  ClientHello through `Session::on_record` with the old placement (scrub
+  right after `HybridSecret::exchange`) and no scrub after the call: kem-ss,
+  x-ss and kem-g hit at about 9 KiB below the caller. The exchange's frames
+  were clean; the copies came after the scrub: the destructuring move of
+  `exchanged?`, the move into `KeySchedule::new`, and HKDF-Extract's HMAC
+  block over the IKM. In the PD the post-call `scrub_if_sealed` covered
+  them whenever the call sealed records; tls-core itself guaranteed
+  nothing. The exchange, ServerHello and `KeySchedule::new` now run in
+  `handshake::hello_keys` (`#[inline(never)]`), and `on_hello_record` calls
+  `scrub_session_stack()` as soon as it returns, Ok or Err; only the
+  schedule leaves it. Measured depth of the whole ClientHello call below
+  the caller: 50312 bytes, all scrubbed (hello case clean with no scrub
+  after the call). `SCRUB_DEPTH_EXCHANGE` unchanged.
+- **Residue case `hello` (C7 at its production call site).** The same
+  client share and randomness as the `exchange` case, a ClientHello built
+  from tls-wire's constants, the randomness replayed through the `Rng`
+  seam, a fixed public signature; session and buffers on the heap; the
+  harness scrubs nothing after `on_record`. Needles: the `exchange` case's
+  (eph raw and clamped, kem-rand, kem-g, kem-ss, x-ss). Output checked:
+  Flight, every drawn byte consumed, the ServerHello's share equal to the
+  direct exchange's. RESIDUE-CASES 30 → 31. Red-proved on a throwaway
+  copy: without the production scrub, kem-rand, kem-g, kem-ss and x-ss hit
+  in case hello. With the old placement plus a PD-style scrub after the
+  call, removing the production scrub stayed green (the post-call scrub
+  reached the exchange's frames in the harness's layout), which is why the
+  harness adds none.
+- **ct-shape identity: zero-size object symbols name nothing (tool fix).**
+  After the pqkey-core change, pd-pqkey's `mce460896::hash_32b` referenced
+  an unnamed panic Location at 0x2029a8 that the zero-sized static
+  `log::logger::NOP` shares (the linker places a ZST where the next data
+  starts); the normaliser printed `<log::logger::NOP>` against the
+  harness's `<addr>`. A false identity failure from layout, not code.
+  `Binary` no longer takes zero-size OBJECT symbols as labels (they own
+  no bytes); sized symbols and zero-size non-object labels are unchanged.
+  Fixture "a zero-size object symbol names no address" (red without the
+  fix; CT-SHAPE-FIXTURES 64 → 65). **No policy/ct-shape.toml entry
+  changed**: every baseline shape and identity root held (CT-SHAPE-SYMBOLS
+  158); the moved `Secret` drops are inlined or outside the closures.
+- **audit-event: no clamping onto a real code.** `TlsRefused` fills all 32
+  codes of its range, so neither clamping nor capping at 31 variants is
+  possible without merging refusals. A value above 31 of any `tls` kind
+  now encodes to `TLS_KIND_UNKNOWN` (0x02a0, after the four ranges, in no
+  name table) and counts in its own coalescing slot; it decodes as
+  `Decoded::Unknown`, which `audit` prints as an unknown code. Tests: the
+  per-kind check (0x20, 0x21, 0xffff → unknown; 0x1f still the range's
+  last) and the separate count; both red on a scratch copy with the old
+  clamp. Completeness: tls-wire `refusal_all_lists_every_variant_once`
+  and http-wire `status_all_lists_every_variant_once` (an exhaustive
+  position match against ALL's indices and its last). `http_wire::Status::ALL`
+  is new and pd-tls's `names_match` uses it.
+- **run.py.** `tls key failure` waits for any `Halted reason=(\d+)` of
+  `tls` and fails "tls halted with reason=N, want KEY_UNAVAILABLE (M)".
+  The POST loop catches a failed exchange whose backend holds the
+  forwarded head and part of the body and fails "the POST body of N bytes
+  stalled after K bytes at the backend"; any other failure is re-raised as
+  it was. The wrong-CA and wrong-name curls must exit 60
+  (CURLE_PEER_FAILED_VERIFICATION) or print a verification error; else
+  "https a wrong CA|a wrong name: curl failed with exit N, not on
+  certificate verification".
+- `pds/audit`'s `TcpLimited` arm uses `named()` (same line format);
+  laws.toml's comment lists `tls` among `timer`'s notify targets.
+
+Selftest (new): `tls-hello-scrub` (ct; the production
+`scrub_session_stack();` after `hello_keys` removed; regex: both
+"RESIDUE-HIT kem-ss case=hello " and "RESIDUE-HIT x-ss case=hello "),
+`bolero-tls-wire` and `bolero-http-wire` (bolero; injected panic on inputs
+of 20 bytes or more; "selftest-bolero-tls-injected",
+"selftest-bolero-http-injected"; both red on a scratch copy). Changed:
+`tls-key-halt` (needle "tls key failure: tls halted with reason="),
+`proxy-pd-backend-room` (the broad "https post 1048576: " replaced by
+"https post: the POST body of 1048576 bytes stalled after "),
+`tls-exchange-residue` (comment only: the production call site has its own
+case).
+
+Manifest: UNIT-TESTS 1203 → 1213, UNIT-SECRET 7 (new), UNIT-AUDIT-EVENT
+48 → 49, UNIT-TLS-WIRE 55 → 56, UNIT-HTTP-WIRE 64 → 65, LINT-CRATES 29 → 30,
+CHECK-PINS-FIXTURES 255 → 257, CT-SHAPE-FIXTURES 64 → 65, RESIDUE-CASES
+30 → 31.

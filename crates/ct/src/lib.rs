@@ -1,6 +1,9 @@
 //! Constant-time comparison shared by every crate that checks a tag, MAC,
-//! cookie or Finished value in hand-written code (`wg-core`, `tpm2`,
-//! `tlskey-core`, `tls-core`). A leaf crate so a caller gains no other edge.
+//! cookie, hash or Finished value in hand-written code: `wg-core` and
+//! `rosenpass-core` re-export it as `crypto::ct_eq` (`tpm2`, `hs-core`,
+//! `key-core` and the `ingress` PD call it through those), and
+//! `pqkey-core`, `tlskey-core` and `tls-core` call it directly. A leaf crate
+//! so a caller gains no other edge.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -22,7 +25,7 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-#[allow(clippy::indexing_slicing)]
+#[allow(clippy::indexing_slicing)] // tests index fixed-size arrays; the crate itself denies it
 mod tests {
     use super::*;
 

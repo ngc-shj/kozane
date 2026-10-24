@@ -87,6 +87,16 @@ pub enum Status {
 }
 
 impl Status {
+    /// Every variant, in index order (`tls` checks audit-event's table
+    /// against it).
+    pub const ALL: [Status; 5] = [
+        Status::BadRequest,
+        Status::ContentTooLarge,
+        Status::ExpectationFailed,
+        Status::HeaderFieldsTooLarge,
+        Status::NotImplemented,
+    ];
+
     pub const fn code(self) -> u16 {
         match self {
             Status::BadRequest => 400,

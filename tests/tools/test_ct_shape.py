@@ -98,6 +98,19 @@ def anon_differs(**kw):
     return run
 
 
+def zero_size_object_names_nothing():
+    """A zero-sized static shares its address with the unnamed constant
+    laid out after it (pd-pqkey's log::logger::NOP and a panic Location):
+    that address is <addr>, as in an ELF without the static; a sized
+    symbol and a zero-size non-object label still name theirs."""
+    syms = [cts.Sym("log::logger::NOP", 0x1000, 0, "object"), cts.Sym("TABLE", 0x2000, 16, "object"),
+            cts.Sym("__marker", 0x3000, 0, "other")]
+    b = cts.Binary("pd-pqkey.elf", syms, {s.name: s.name for s in syms}, {}, {})
+    got = [b.symbolise(a) for a in (0x1000, 0x2004, 0x3000)]
+    want = ["<addr>", "<TABLE+0x4>", "<__marker>"]
+    return [] if got == want else [f"symbolised {got}, want {want}"]
+
+
 def contained(**kw):
     @with_tree(**kw)
     def run(search, harness, _d):
@@ -358,6 +371,7 @@ MUTATED_SHAPE = "pd-pq.elf: shape: mce460896::bm::bm: 'csel eq' 2 in the binary,
 # (name, expected: None for accept, or the exact list of errors; check)
 CASES = [
     ("address and hash noise alone: identity holds", None, identity()),
+    ("a zero-size object symbol names no address", None, zero_size_object_names_nothing),
     ("the normaliser keeps every non-address operand", None, normalised_bm),
     ("one register changed is caught",
      differs(0x14, CSEL, "csel x0, x9, x2, eq"), identity(harness_bm=bm_with(CSEL, "csel x0, x9, x2, eq"))),

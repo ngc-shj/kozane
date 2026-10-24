@@ -4111,6 +4111,20 @@ def curl(cacert: str, *args: str) -> subprocess.CompletedProcess:
                           capture_output=True, timeout=HTTPS_WAIT_S + 5)
 
 
+CURLE_PEER_FAILED_VERIFICATION = 60
+
+
+def verification_failed(what: str, r: subprocess.CompletedProcess):
+    """A curl run that must have failed on certificate verification: exit
+    60, or the verification error in stderr; any other failure (refused,
+    reset, timed out) proves nothing about verification."""
+    err = r.stderr.decode(errors="replace").strip()
+    if r.returncode != CURLE_PEER_FAILED_VERIFICATION and not re.search(
+            r"certificate verify failed|SSL certificate problem|no alternative certificate subject name", err):
+        raise Fail(f"https {what}: curl failed with exit {r.returncode}, not on certificate verification "
+                   f"(want {CURLE_PEER_FAILED_VERIFICATION}): {err}")
+
+
 def curl_get(cacert: str) -> tuple:
     """A verified GET: (body, time_appconnect - time_connect in s)."""
     r = curl(cacert, "--write-out", "\n@@%{time_connect} %{time_appconnect}", https_url())
@@ -4278,9 +4292,11 @@ def https_handshake_cases(con: Console, deploy: str, other_ca: str, backend: Bac
     wrong_ca = curl(other_ca, https_url())
     if wrong_ca.returncode == 0:
         raise Fail("https: curl accepted the server against another deployment's CA")
+    verification_failed("a wrong CA", wrong_ca)
     wrong_name = curl(ca, "--resolve", f"gateway.example:{HTTPS_PORT}:{ip_str(GW_IP)}", https_url("gateway.example"))
     if wrong_name.returncode == 0:
         raise Fail("https: curl accepted the certificate for a name it does not carry")
+    verification_failed("a wrong name", wrong_name)
     passed.append("https wrong ca or name")
     print("\nPASS [https: a wrong CA and a wrong name each fail curl's verification]")
 
@@ -4348,8 +4364,19 @@ def https_rewrite_case(con: Console, deploy: str, backend: Backend, passed: list
         head = [b"POST /up HTTP/1.1", host, b"Content-Length: %d" % length]
         # Bytes after the body (a pipelined request) must never go on.
         request = b"".join(line + b"\r\n" for line in head) + b"\r\n" + body + b"GET /smuggled HTTP/1.1\r\n\r\n"
-        start = time.monotonic()
-        data, got, _ = backend_exchange(ca, backend, request, f"https post {length}", timeout=lifetime)
+        start, before = time.monotonic(), backend.count()
+        try:
+            data, got, _ = backend_exchange(ca, backend, request, f"https post {length}", timeout=lifetime)
+        except Fail as e:
+            # The body stalled: the backend holds the head and part of the
+            # body, and the exchange failed (the client reset by the idle
+            # timeout, or a wait ran out). Any other failure is its own.
+            seen = backend.conns[before].snapshot()[0] if backend.count() > before else b""
+            fwd = forwarded_head(head)
+            if length > 0 and seen.startswith(fwd) and len(seen) < len(fwd) + length:
+                raise Fail(f"https post: the POST body of {length} bytes stalled after {len(seen) - len(fwd)} bytes "
+                           f"at the backend ({e})") from e
+            raise
         if data != forwarded_head(head) + body:
             raise Fail(f"https post: the POST body of {length} bytes reached the backend as {len(data)} bytes, "
                        "not exactly rewrite's head and the body")
@@ -5483,7 +5510,9 @@ def test_tls_key_failure(pkg: "Package", deploy: str, passed: list):
             raise Fail("tls key failure: tls became ready (it listens) with tlskey Unavailable")
         if int(m.group(1)) != code:
             raise Fail(f"tls key failure: tls audited KeyUnavailable code={m.group(1)}, want Mismatch ({code})")
-        con.wait_for(rf"audit: src=tls Halted reason={reason} lost=\d+\r*\n", since=m.end())
+        h = con.wait_for(r"audit: src=tls Halted reason=(\d+) lost=\d+\r*\n", since=m.end())
+        if int(h.group(1)) != reason:
+            raise Fail(f"tls key failure: tls halted with reason={h.group(1)}, want KEY_UNAVAILABLE ({reason})")
         r = curl(os.path.join(deploy, "devca.pem"), https_url())
         if r.returncode == 0:
             raise Fail("tls key failure: HTTPS completed with tlskey Unavailable")

@@ -88,26 +88,33 @@ fn refusals_map_to_the_c10_statuses() {
 
 #[test]
 fn status_indices_follow_the_audit_order() {
-    let all = [
-        Status::BadRequest,
-        Status::ContentTooLarge,
-        Status::ExpectationFailed,
-        Status::HeaderFieldsTooLarge,
-        Status::NotImplemented,
-    ];
-    let indices: Vec<u16> = all.iter().map(|s| s.index()).collect();
+    let indices: Vec<u16> = Status::ALL.iter().map(|s| s.index()).collect();
     assert_eq!(indices, [0, 1, 2, 3, 4]);
+}
+
+/// `Status::ALL` lists every variant once: `position` is exhaustive, so a
+/// new variant does not compile until it is given the next position, and
+/// the positions must be exactly ALL's indices up to its last.
+#[test]
+fn status_all_lists_every_variant_once() {
+    fn position(s: Status) -> usize {
+        match s {
+            Status::BadRequest => 0,
+            Status::ContentTooLarge => 1,
+            Status::ExpectationFailed => 2,
+            Status::HeaderFieldsTooLarge => 3,
+            Status::NotImplemented => 4,
+        }
+    }
+    for (i, s) in Status::ALL.iter().enumerate() {
+        assert_eq!(position(*s), i, "{s:?}");
+    }
+    assert_eq!(position(Status::NotImplemented) + 1, Status::ALL.len());
 }
 
 #[test]
 fn refusal_responses_are_complete_and_close() {
-    for status in [
-        Status::BadRequest,
-        Status::ContentTooLarge,
-        Status::ExpectationFailed,
-        Status::HeaderFieldsTooLarge,
-        Status::NotImplemented,
-    ] {
+    for status in Status::ALL {
         let text = std::str::from_utf8(refusal_response(status)).unwrap();
         let (head, body) = text.split_once("\r\n\r\n").unwrap();
         assert!(head.starts_with(&std::format!("HTTP/1.1 {} ", status.code())), "{text}");

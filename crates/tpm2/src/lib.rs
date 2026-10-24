@@ -23,34 +23,9 @@ pub mod client;
 pub mod crypto;
 pub mod envelope;
 
-use zeroize::Zeroize;
-
-/// N secret bytes: not `Copy`/`Clone`/`Debug`, zeroized on drop (L12).
-pub struct Secret<const N: usize>([u8; N]);
-
-impl<const N: usize> Secret<N> {
-    pub const fn zero() -> Self {
-        Self([0; N])
-    }
-
-    pub fn as_bytes(&self) -> &[u8; N] {
-        &self.0
-    }
-
-    pub fn as_mut_bytes(&mut self) -> &mut [u8; N] {
-        &mut self.0
-    }
-
-    pub fn wipe(&mut self) {
-        self.0.zeroize();
-    }
-}
-
-impl<const N: usize> Drop for Secret<N> {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
-}
+/// N secret bytes: not `Copy`/`Clone`/`Debug`, zeroized on drop (L12);
+/// the workspace's one container, `secret`'s.
+pub use secret::Secret;
 
 #[cfg(test)]
 mod tests;

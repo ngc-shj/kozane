@@ -123,9 +123,10 @@ pub fn exchange_with_randomness(
 }
 
 /// Zeroes, with volatile writes, [`SCRUB_DEPTH_EXCHANGE`] bytes of stack
-/// below the caller's frame: where the exchange just ran. Called from the
-/// frame that called [`HybridSecret::exchange`] (M6 plan C7, S-R3-2), and
-/// by the PD after its TlsSign call.
+/// below the caller's frame: where the exchange just ran. Called by the
+/// handshake from the frame that called the exchange and the key schedule
+/// (`handshake::hello_keys`, so the hybrid secret's copies are covered
+/// too; M6 plan C7, S-R3-2), and by the PD after its TlsSign call.
 #[inline(never)]
 pub fn scrub_session_stack() {
     let mut area = [0u64; SCRUB_DEPTH_EXCHANGE / 8];

@@ -28,8 +28,9 @@ Rules:
      pds/ingress, and on any type in mce460896 but RngError, which keeps its
      secrets in plain arrays (L12, M3 plan S12, M4 plan C11; pqkey-core
      holds its secrets in `Zeroizing`), in tpm2 (M5 plan I10.3), in
-     tls-core, pds/tls and key-core (M6 plan S9), and in tlskey-core and
-     pds/tlskey (M6 plan C12)
+     tls-core, pds/tls and key-core (M6 plan S9), in tlskey-core and
+     pds/tlskey (M6 plan C12), and in `secret`, which defines the shared
+     `Secret` itself (M6 Phase 2 self-check)
   P10 no `from_bytes(*` in the secret crates or in hs-core, key-core,
      data-core, wg-core, tpm2, tls-core, tlskey-core and the key, hs, data,
      tls and tlskey PDs: a dereferenced array is a by-value temporary of
@@ -136,7 +137,7 @@ PENDING: set[str] = set()
 # Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
 SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/ingress",
                  "crates/mce460896", "crates/tpm2", "crates/tls-core", "crates/pds/tls", "crates/key-core",
-                 "crates/tlskey-core", "crates/pds/tlskey"]
+                 "crates/tlskey-core", "crates/pds/tlskey", "crates/secret"]
 # mce460896's types that hold no secret (P9): every other type there does.
 MCE_PUBLIC_TYPES = {"RngError"}
 # Types that hold a secret under a name of their own, not as Secret<..> (P9,

@@ -652,6 +652,12 @@ CASES = [
      lambda t: append(t / "crates/pds/tls/src/main.rs",
                       "\nfn bad(expected: &[u8; 32], finished: &[u8; 32]) -> bool {\n    finished == expected\n}\n")),
     ("P11 pds/tls's main removed", {"P11"}, lambda t: (t / "crates/pds/tls/src/main.rs").unlink()),
+    # P9/P10 (M6 Phase 2 self-check): the shared `secret` crate joins.
+    ("P9 derive(Clone) on Secret in crates/secret", {"P9"},
+     lambda t: edit(t / "crates/secret/src/lib.rs", "pub struct Secret<const N: usize>([u8; N]);",
+                    "#[derive(Clone)]\npub struct Secret<const N: usize>([u8; N]);")),
+    ("P10 from_bytes(*..) in crates/secret", {"P10"},
+     lambda t: append(t / "crates/secret/src/lib.rs", "\nfn f(k: &[u8; 32]) -> Secret<32> { Secret::from_bytes(*k) }\n")),
     # P18 (M6 plan L14, C7): HybridSecret is made only by exchange.
     ("P18 a second constructor in hybrid.rs", {"P18"},
      lambda t: append(t / "crates/tls-core/src/hybrid.rs",

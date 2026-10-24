@@ -630,26 +630,31 @@ fn tls_kinds_are_coalesced_per_value_and_counted_apart() {
     );
 }
 
-/// One `tls` kind: every named value decodes as itself, larger ones clamp
-/// to the range's last code, and the kind is a coalesced count.
+/// One `tls` kind: every named value decodes as itself, larger ones encode
+/// to `TLS_KIND_UNKNOWN` (never onto the range's last code, a real one for
+/// `TlsRefused`), and the kind is a coalesced count.
 fn check_tls_kind(event: fn(u16) -> Event, decoded: fn(u16) -> Decoded, base: u16, names: &[&str]) {
     assert!(names.len() <= 32);
     for v in 0..u16::try_from(names.len()).unwrap() {
         assert_eq!(decode(event(v).code()), decoded(v));
     }
-    assert_eq!(event(0xffff).code(), base + 0x1f);
+    assert_eq!(event(0x1f).code(), base + 0x1f);
     assert_eq!(decode(base + 0x1f), decoded(0x1f));
+    for v in [0x20, 0x21, 0xffff] {
+        assert_eq!(event(v).code(), TLS_KIND_UNKNOWN, "{v:#x}");
+    }
     assert!(event(0).is_coalesced());
     assert_eq!(event(0).value(), None);
 }
 
 #[test]
-fn tls_kinds_decode_inside_their_ranges_and_clamp_outside() {
+fn tls_kinds_decode_inside_their_ranges_and_go_unknown_outside() {
     check_tls_kind(|v| Event::TlsRefused { reason: v }, Decoded::TlsRefused, TLS_REFUSED_BASE, &TLS_REFUSED_NAMES);
     check_tls_kind(|v| Event::TlsClosed { reason: v }, Decoded::TlsClosed, TLS_CLOSED_BASE, &TLS_CLOSED_NAMES);
     check_tls_kind(|v| Event::HttpRefused { status: v }, Decoded::HttpRefused, HTTP_REFUSED_BASE, &HTTP_REFUSED_NAMES);
     check_tls_kind(|v| Event::TlsTimeout { stage: v }, Decoded::TlsTimeout, TLS_TIMEOUT_BASE, &TLS_TIMEOUT_NAMES);
-    assert_eq!(decode(TLS_TIMEOUT_BASE + 0x20), Decoded::Unknown);
+    assert_eq!(TLS_KIND_UNKNOWN, TLS_TIMEOUT_BASE + 0x20);
+    assert_eq!(decode(TLS_KIND_UNKNOWN), Decoded::Unknown);
     assert_eq!(Event::TlsRefused { reason: 0 }.name(), "TlsRefused");
     assert_eq!(Event::TlsTimeout { stage: 0 }.name(), "TlsTimeout");
 }
@@ -680,4 +685,18 @@ fn backend_unavailable_is_coalesced_on_its_own_counter() {
     let got: Vec<_> = out.iter().map(|r| (r.code, r.a)).collect();
     assert_eq!(got, [(FRAME_DROPPED_BASE, 1), (0x0059, 1), (0x0059, 65)]);
     assert_eq!(Event::BackendUnavailable.name(), "BackendUnavailable");
+}
+
+/// An out-of-range `tls` value is counted on its own, not with the last
+/// real code (`TlsRefused` 31 is `Closed`), whichever kind it came from.
+#[test]
+fn out_of_range_tls_values_are_counted_apart_from_every_real_code() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::TlsRefused { reason: 31 }, 1, &mut out);
+    run(&mut c, Event::TlsRefused { reason: 32 }, 1, &mut out);
+    run(&mut c, Event::TlsTimeout { stage: 0xffff }, 64, &mut out);
+    run(&mut c, Event::TlsRefused { reason: 31 }, 64, &mut out);
+    let got: Vec<_> = out.iter().map(|r| (r.code, r.a)).collect();
+    assert_eq!(got, [(TLS_REFUSED_BASE + 31, 1), (TLS_KIND_UNKNOWN, 1), (TLS_KIND_UNKNOWN, 65), (TLS_REFUSED_BASE + 31, 65)]);
 }

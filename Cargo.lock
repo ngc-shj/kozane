@@ -1379,6 +1379,7 @@ dependencies = [
 name = "pqkey-core"
 version = "0.1.0"
 dependencies = [
+ "ct",
  "ingress-core",
  "mce460896",
  "secret-blob",
@@ -1594,12 +1595,14 @@ dependencies = [
 name = "rosenpass-core"
 version = "0.1.0"
 dependencies = [
+ "ct",
  "ingress-core",
  "libcrux-blake2",
  "libcrux-chacha20poly1305",
  "libcrux-ml-kem",
  "mce460896",
  "rosenpass-wire",
+ "secret",
  "sha3",
  "zeroize",
 ]
@@ -1644,6 +1647,13 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "secret"
+version = "0.1.0"
+dependencies = [
+ "zeroize",
+]
 
 [[package]]
 name = "secret-blob"
@@ -2115,6 +2125,7 @@ dependencies = [
  "libcrux-ml-kem",
  "libcrux-p256",
  "libcrux-sha2",
+ "secret",
  "tls-wire",
  "zeroize",
 ]
@@ -2205,6 +2216,7 @@ dependencies = [
  "libcrux-hmac",
  "libcrux-p256",
  "libcrux-sha2",
+ "secret",
  "secret-blob",
  "tpm2-wire",
  "wg-core",

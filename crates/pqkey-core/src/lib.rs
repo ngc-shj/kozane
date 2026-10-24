@@ -231,11 +231,6 @@ pub fn unavailable(caller: Option<Caller>, code: u32, reply: &mut [u64]) -> (u64
     }
 }
 
-fn ct_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
-    let diff = a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y));
-    core::hint::black_box(diff) == 0
-}
-
 /// Decapsulates `ct` with `sk` read in place: `mce460896::decaps` takes the
 /// key by shared reference, so no copy of it is made (cmr needed a mutable
 /// one, which this used to wipe).
@@ -248,12 +243,12 @@ fn decapsulate(sk: &[u8; pq::SK_LEN], ct: &[u8; pq::CT_LEN], out: &mut [u8; pq::
 /// a/b/c).
 pub fn validate<'a>(region: &'a [u8], spkm_hash: &[u8; 32]) -> Result<Blob<'a>, BootError> {
     let blob = Blob::parse(region).map_err(BootError::Blob)?;
-    if !ct_eq(blob.spkm_hash(), spkm_hash) {
+    if !ct::ct_eq(blob.spkm_hash(), spkm_hash) {
         return Err(BootError::SpkmMismatch);
     }
     let mut shk = Zeroizing::new([0u8; pq::SHK_LEN]);
     decapsulate(blob.secret_key(), blob.kat_ct(), &mut shk);
-    if !ct_eq(&blake2s(&[&shk[..]]), blob.kat_shk_hash()) {
+    if !ct::ct_eq(&blake2s(&[&shk[..]]), blob.kat_shk_hash()) {
         return Err(BootError::KatMismatch);
     }
     Ok(blob)

@@ -33,14 +33,9 @@ pub enum CryptoError {
     Auth,
 }
 
-/// Constant-time equality for tags and ids compared in hand-written code.
-pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let diff = a.iter().zip(b).fold(0u8, |d, (x, y)| d | (x ^ y));
-    core::hint::black_box(diff) == 0
-}
+/// Constant-time equality for tags and ids compared in hand-written code:
+/// the workspace's one compare, re-exported for this crate's callers.
+pub use ct::ct_eq;
 
 /// Keyed BLAKE2b-256 (RustCrypto's `Blake2bMac<U32>`).
 pub fn blake2b(key: &[u8; KEY_LEN], parts: &[&[u8]], out: &mut [u8; KEY_LEN]) -> Result<(), CryptoError> {

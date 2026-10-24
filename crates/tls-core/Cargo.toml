@@ -19,6 +19,9 @@ libcrux-curve25519 = { version = "=0.0.9", default-features = false }
 libcrux-hmac = { version = "=0.0.9", default-features = false }
 libcrux-ml-kem = { version = "=0.0.11", default-features = false, features = ["mlkem768"] }
 libcrux-sha2 = { version = "=0.0.9", default-features = false }
+# The shared secret container and wipe, re-exported as `tls_core::Secret`
+# and `tls_core::wipe` (L12).
+secret = { path = "../secret" }
 tls-wire = { path = "../tls-wire" }
 # Wiping secret types (L12); featureless, as P16 requires of every member.
 zeroize = { version = "=1.8.1", default-features = false }

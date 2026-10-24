@@ -25,7 +25,9 @@ memmove, memcmp and bcmp.
              name, and masks hash noise in symbol names; opcodes, registers
              and every other immediate stay. An anonymous constant
              (`anon.<hash>.<n>`, numbered per codegen unit) is named by its
-             content instead, pointers in it followed (ANON_*). memcmp and
+             content instead, pointers in it followed (ANON_*); a
+             zero-size object symbol (a zero-sized static) names nothing,
+             its address resolved as if it had no symbol. memcmp and
              bcmp are one stop (CMP_LIBCALLS). IDENTITY_ROOTS get this check
              alone: their closures reach libcrux, which stays outside the
              shape baseline (M6 plan RM6-5).
@@ -266,9 +268,14 @@ class Binary:
             for one in n:
                 self.by_name[one].append(a)
         self.data = sorted((s.value, s.size, names[s.name]) for s in syms if s.kind in ("object", "func") and s.size)
+        # A zero-size object (a zero-sized static such as log's NOP logger)
+        # names no bytes: the linker places it where the next data starts,
+        # often an unnamed constant (a panic Location), so as a label it
+        # would name that constant after an unrelated static, in one ELF
+        # and not the other. Such an address is resolved as if it had none.
         labels = collections.defaultdict(set)
         for s in syms:
-            if not s.size and not s.name.startswith("$"):
+            if not s.size and not s.name.startswith("$") and s.kind != "object":
                 labels[s.value].add(names[s.name])
         self.labels = {a: " = ".join(sorted(n)) for a, n in labels.items()}
         self.names = names

@@ -9,7 +9,7 @@
 
 use libcrux_sha2::{Digest, Sha256};
 use tls_wire::framing::Reassembler;
-use tls_wire::hello::client_hello;
+use tls_wire::hello::{ClientHello, client_hello};
 use tls_wire::record::{alert, change_cipher_spec, header, inner_plaintext};
 use tls_wire::{Alert, ContentType, HASH_LEN, MAX_PLAINTEXT, RECORD_HEADER_LEN, Refusal, emit, hs};
 
@@ -115,6 +115,34 @@ pub struct Session {
     peer_closed: bool,
 }
 
+/// The hybrid exchange, the ServerHello (in the clear, into `out`) and the
+/// key schedule from the transcript through it: (the schedule, bytes
+/// written). The ephemeral, the ML-KEM randomness, both component secrets
+/// and every copy of the hybrid secret (the moves, HKDF-Extract's HMAC)
+/// stay in this call's frames, which the caller scrubs; only the schedule
+/// leaves.
+#[inline(never)]
+fn hello_keys<R: Rng>(
+    transcript: &mut Sha256,
+    hello: &[u8],
+    ch: &ClientHello<'_>,
+    out: &mut [u8],
+    rng: &mut R,
+) -> Result<(KeySchedule, usize), Refusal> {
+    let (shared, share) = HybridSecret::exchange(ch.key_share, rng)?;
+    transcript.update(hello);
+    let mut random = [0u8; 32];
+    rng.fill(&mut random).map_err(|_| Refusal::Internal)?;
+    let (sh_head, sh_rest) = out.split_at_mut_checked(RECORD_HEADER_LEN).ok_or(Refusal::Internal)?;
+    let sh_len = emit::server_hello(sh_rest, &random, ch.session_id, &share)?;
+    sh_head.copy_from_slice(&emit::record_header(ContentType::Handshake, sh_len)?);
+    transcript.update(sh_rest.get(..sh_len).ok_or(Refusal::Internal)?);
+    let mut hello_hash = [0u8; HASH_LEN];
+    transcript.finish(&mut hello_hash);
+    let ks = KeySchedule::new(shared, &hello_hash)?;
+    Ok((ks, RECORD_HEADER_LEN.checked_add(sh_len).ok_or(Refusal::Internal)?))
+}
+
 impl Default for Session {
     fn default() -> Self {
         Self::new()
@@ -207,25 +235,17 @@ impl Session {
             return Err(Refusal::NotAtRecordBoundary);
         }
         let ch = client_hello(msg.body)?;
-        let exchanged = HybridSecret::exchange(ch.key_share, ctx.rng);
+        // Every copy of the exchange's secrets and of the hybrid secret is
+        // made in `hello_keys`' frames; the scrub below them runs as soon
+        // as it returns, whatever it returned (M6 plan C7, S-R3-2).
+        let keys = hello_keys(&mut self.transcript, msg.bytes, &ch, bufs.out, ctx.rng);
         scrub_session_stack();
-        let (shared, share) = exchanged?;
-        self.transcript.update(msg.bytes);
+        let (ks, mut written) = keys?;
         self.early_data = ch.early_data;
-
-        let mut random = [0u8; 32];
-        ctx.rng.fill(&mut random).map_err(|_| Refusal::Internal)?;
-        // ServerHello in the clear.
-        let (sh_head, sh_rest) = bufs.out.split_at_mut_checked(RECORD_HEADER_LEN).ok_or(Refusal::Internal)?;
-        let sh_len = emit::server_hello(sh_rest, &random, ch.session_id, &share)?;
-        sh_head.copy_from_slice(&emit::record_header(ContentType::Handshake, sh_len)?);
-        self.transcript.update(sh_rest.get(..sh_len).ok_or(Refusal::Internal)?);
         let msg_len = msg.bytes.len();
         let alpn = ch.alpn;
         self.reasm.consume(msg_len);
-        let mut written = RECORD_HEADER_LEN.checked_add(sh_len).ok_or(Refusal::Internal)?;
 
-        let ks = KeySchedule::new(shared, &self.hash())?;
         let mut hs_write = RecordKey::new(ks.server_handshake())?;
         self.read = RecordKey::new(ks.client_handshake())?;
 

@@ -24,7 +24,7 @@ loader := $(BUILD)/loader.img
 counts := $(BUILD)/counts
 
 pds := eth-out eth-in ingress audit timer tpm key hs inner data pq pqkey tls tlskey
-host_crates := wire ring audit-event ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct limits tlskey-core
+host_crates := wire ring audit-event ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct limits tlskey-core secret
 kani_crates := wire ring ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire
 
 .PHONY: clean-counts

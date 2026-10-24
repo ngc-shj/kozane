@@ -147,13 +147,7 @@ impl Audit {
                 }
                 None => false,
             },
-            Decoded::TcpLimited(kind) => match TCP_LIMIT_NAMES.get(usize::from(kind)) {
-                Some(name) => {
-                    println!(uart, "audit: src={} TcpLimited({}) total={} lost={}", src, name, r.a, r.b);
-                    true
-                }
-                None => false,
-            },
+            Decoded::TcpLimited(kind) => named(uart, src, "TcpLimited", &TCP_LIMIT_NAMES, kind, r),
             Decoded::TlsRefused(v) => named(uart, src, "TlsRefused", &TLS_REFUSED_NAMES, v, r),
             Decoded::TlsClosed(v) => named(uart, src, "TlsClosed", &TLS_CLOSED_NAMES, v, r),
             Decoded::HttpRefused(v) => named(uart, src, "HttpRefused", &HTTP_REFUSED_NAMES, v, r),

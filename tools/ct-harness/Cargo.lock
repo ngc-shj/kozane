@@ -211,6 +211,7 @@ dependencies = [
  "secret-blob",
  "sha3",
  "tls-core",
+ "tls-wire",
  "tpm2",
  "tpm2-wire",
 ]
@@ -822,6 +823,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf54715a573b99ac80df0bc206da022bcd442c974952c7b9720069370852e21f"
 
 [[package]]
+name = "secret"
+version = "0.1.0"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "secret-blob"
 version = "0.1.0"
 dependencies = [
@@ -943,6 +951,7 @@ dependencies = [
  "libcrux-hmac",
  "libcrux-ml-kem",
  "libcrux-sha2",
+ "secret",
  "tls-wire",
  "zeroize",
 ]
@@ -960,6 +969,7 @@ dependencies = [
  "libcrux-hmac",
  "libcrux-p256",
  "libcrux-sha2",
+ "secret",
  "secret-blob",
  "tpm2-wire",
  "wg-core",

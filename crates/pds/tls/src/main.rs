@@ -127,13 +127,7 @@ const fn names_match() -> bool {
     let refused = Refusal::ALL;
     let closed = Closed::ALL;
     let timeouts = Timeout::ALL;
-    let statuses = [
-        Status::BadRequest,
-        Status::ContentTooLarge,
-        Status::ExpectationFailed,
-        Status::HeaderFieldsTooLarge,
-        Status::NotImplemented,
-    ];
+    let statuses = Status::ALL;
     if refused.len() != TLS_REFUSED_NAMES.len()
         || closed.len() != TLS_CLOSED_NAMES.len()
         || timeouts.len() != TLS_TIMEOUT_NAMES.len()

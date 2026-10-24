@@ -16,6 +16,13 @@
 //! both component shared secrets, computed on the client side. A run
 //! without the scrub first measures the exchange's own depth against
 //! `SCRUB_DEPTH_EXCHANGE`, what the scrub covers.
+//!
+//! And the same exchange at its production call site: a ClientHello
+//! carrying that client share through `tls_core::handshake::Session`, the
+//! randomness replayed through the `Rng` seam, so that the scrub
+//! `on_hello_record` runs after `HybridSecret::exchange` is the only one
+//! between the exchange and the scan (the harness adds none), with the
+//! same needles.
 
 use std::collections::{HashMap, HashSet};
 use std::hint::black_box;
@@ -31,8 +38,13 @@ use tpm2::envelope::{self, Envelope, Kind, OPEN_SCRUB_DEPTH, SEAL_ENTROPY_LEN};
 
 use libcrux_ml_kem::mlkem768::{self, MlKem768Ciphertext};
 use sha3::{Digest, Sha3_256, Sha3_512};
+use tls_core::handshake::{self, Buffers, Ctx, RX_BUF_LEN, Session, Signer, TX_BUF_LEN};
 use tls_core::hybrid::EXCHANGE_RANDOMNESS_LEN;
-use tls_core::{CLIENT_SHARE_LEN, SCRUB_DEPTH_EXCHANGE, SERVER_SHARE_LEN, exchange_with_randomness, scrub_session_stack};
+use tls_core::rng::{self, Rng};
+use tls_core::{
+    CLIENT_SHARE_LEN, Refusal, SCRUB_DEPTH_EXCHANGE, SERVER_SHARE_LEN, exchange_with_randomness, scrub_session_stack,
+};
+use tls_wire::{ECDSA_SECP256R1_SHA256, TLS12, TLS13, TLS_CHACHA20_POLY1305_SHA256, X25519MLKEM768, ext, hs};
 
 use crate::stack::OwnedStack;
 use crate::vectors::{self, CLASSES, ENTRIES, SYND_BYTES, SYS_N, Vectors, boxed, h32};
@@ -119,9 +131,9 @@ const MLKEM_CT_LEN: usize = 1088;
 /// Decapsulations (the four classes per entry), encapsulation attempts
 /// (every draw of each stream, the two crafted rejections), the generic
 /// shim once per entry, the envelope open for each blob kind (key, pq and,
-/// since M6 plan C12, tls), and the hybrid exchange (its depth run, then
-/// its scan).
-const CASES: usize = ENTRIES * CLASSES.len() + (1 + 3 + 4) + 2 + ENTRIES + 3 + 2;
+/// since M6 plan C12, tls), the hybrid exchange (its depth run, then its
+/// scan) and the ClientHello through the handshake.
+const CASES: usize = ENTRIES * CLASSES.len() + (1 + 3 + 4) + 2 + ENTRIES + 3 + 2 + 1;
 
 /// 8-byte windows of the secret forms, at every byte offset.
 struct Needles {
@@ -453,6 +465,67 @@ fn exchange_needles(c: &ClientShare, server: &[u8; SERVER_SHARE_LEN]) -> Needles
     n
 }
 
+fn vec8(data: &[u8]) -> Vec<u8> {
+    [&[u8::try_from(data.len()).expect("u8")][..], data].concat()
+}
+
+fn vec16(data: &[u8]) -> Vec<u8> {
+    [&u16::try_from(data.len()).expect("u16").to_be_bytes()[..], data].concat()
+}
+
+fn ext_block(ty: u16, data: &[u8]) -> Vec<u8> {
+    [&ty.to_be_bytes()[..], &vec16(data)].concat()
+}
+
+/// A ClientHello record offering the profile's minimum (the shape of
+/// tls-core's test client) with `share` as its one key share.
+fn client_hello_record(share: &[u8; CLIENT_SHARE_LEN]) -> Vec<u8> {
+    let mut body = TLS12.to_be_bytes().to_vec();
+    body.extend_from_slice(&[0xc1; 32]);
+    body.extend_from_slice(&vec8(&[0x5e; 32]));
+    body.extend_from_slice(&vec16(&TLS_CHACHA20_POLY1305_SHA256.to_be_bytes()));
+    body.extend_from_slice(&vec8(&[0]));
+    let mut exts = ext_block(ext::SUPPORTED_VERSIONS, &vec8(&TLS13.to_be_bytes()));
+    exts.extend(ext_block(ext::SUPPORTED_GROUPS, &vec16(&X25519MLKEM768.to_be_bytes())));
+    let entry = [&X25519MLKEM768.to_be_bytes()[..], &vec16(share)].concat();
+    exts.extend(ext_block(ext::KEY_SHARE, &vec16(&entry)));
+    exts.extend(ext_block(ext::SIGNATURE_ALGORITHMS, &vec16(&ECDSA_SECP256R1_SHA256.to_be_bytes())));
+    body.extend_from_slice(&vec16(&exts));
+    let mut msg = vec![hs::CLIENT_HELLO];
+    msg.extend_from_slice(&u32::try_from(body.len()).expect("u32").to_be_bytes()[1..]);
+    msg.extend_from_slice(&body);
+    let mut record = vec![22, 3, 3];
+    record.extend_from_slice(&u16::try_from(msg.len()).expect("u16").to_be_bytes());
+    record.extend_from_slice(&msg);
+    record
+}
+
+/// The deterministic RNG seam: replays `bytes` from the heap, so the
+/// handshake's exchange draws the residue case's known randomness first.
+struct Replay {
+    bytes: Vec<u8>,
+    at: usize,
+}
+
+impl Rng for Replay {
+    fn fill(&mut self, out: &mut [u8]) -> Result<(), rng::RngError> {
+        let src = self.bytes.get(self.at..self.at + out.len()).ok_or(rng::RngError)?;
+        out.copy_from_slice(src);
+        self.at += out.len();
+        Ok(())
+    }
+}
+
+/// `tlskey`'s TlsSign stand-in: a fixed, public r ‖ s (the flight is not
+/// verified here).
+struct FixedSigner;
+
+impl Signer for FixedSigner {
+    fn sign(&mut self, _: &[u8; 32]) -> Result<[u8; 64], Refusal> {
+        Ok([0x42; 64])
+    }
+}
+
 #[inline(never)]
 fn padded(f: impl FnOnce()) {
     let mut pad = [0u8; PAD];
@@ -657,6 +730,42 @@ pub fn run() -> ! {
     scan.check(
         "exchange output",
         first.iter().any(|&b| b != 0) && first == second,
+    );
+
+    // The same exchange at its production call site: on_hello_record calls
+    // HybridSecret::exchange, then scrub_session_stack, then builds the
+    // flight. Nothing here scrubs after the call, so a missing production
+    // scrub leaves the exchange's secrets in the dead frames below it. The
+    // session and buffers are on the heap, so only frames are scanned.
+    let record = client_hello_record(&client.share);
+    let mut rng = Box::new(Replay {
+        bytes: [&client.randomness[..], &[0x7a; 32][..]].concat(),
+        at: 0,
+    });
+    let mut session = Box::new(Session::new());
+    let (mut rx, mut tx, mut out) = (vec![0u8; RX_BUF_LEN], vec![0u8; TX_BUF_LEN], vec![0u8; 16 * 1024]);
+    let mut step = Box::new(Err(Refusal::Internal));
+    scan.case("hello", FLOOR_EXCHANGE, &needles, || {
+        let mut bufs = Buffers {
+            rx: &mut rx,
+            tx: &mut tx,
+            out: &mut out,
+        };
+        let mut ctx = Ctx {
+            cert: &[0x30, 0x03, 0x02, 0x01, 0x01],
+            rng: &mut *rng,
+            signer: &mut FixedSigner,
+        };
+        *step = session.on_record(&record, &mut bufs, &mut ctx);
+    });
+    // ServerHello first, in the clear, its key share last.
+    let sh_len = usize::from(u16::from_be_bytes([out[3], out[4]]));
+    let sh = &out[5..5 + sh_len];
+    scan.check(
+        "hello output",
+        matches!(*step, Ok(s) if s.event == handshake::Event::Flight)
+            && rng.at == rng.bytes.len()
+            && sh[sh.len() - SERVER_SHARE_LEN..] == first[..],
     );
 
     scan.check(

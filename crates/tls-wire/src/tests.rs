@@ -171,6 +171,54 @@ fn refusal_codes_are_their_index_and_fit_the_audit_width() {
     assert!(Refusal::ALL.len() <= 32);
 }
 
+/// `Refusal::ALL` lists every variant once: `position` is exhaustive, so a
+/// new variant does not compile until it is given the next position, and
+/// the positions must be exactly ALL's indices up to its last (a variant
+/// missing from ALL would encode to audit's unknown code, unnamed).
+#[test]
+fn refusal_all_lists_every_variant_once() {
+    fn position(r: Refusal) -> usize {
+        match r {
+            Refusal::RecordType => 0,
+            Refusal::RecordVersion => 1,
+            Refusal::RecordOverflow => 2,
+            Refusal::BadChangeCipherSpec => 3,
+            Refusal::UnexpectedChangeCipherSpec => 4,
+            Refusal::InnerAllZero => 5,
+            Refusal::InnerType => 6,
+            Refusal::HandshakeTooLong => 7,
+            Refusal::NotAtRecordBoundary => 8,
+            Refusal::UnexpectedMessage => 9,
+            Refusal::Decode => 10,
+            Refusal::LegacyVersion => 11,
+            Refusal::SessionIdTooLong => 12,
+            Refusal::NoChaCha => 13,
+            Refusal::Compression => 14,
+            Refusal::DuplicateExtension => 15,
+            Refusal::NoTls13 => 16,
+            Refusal::NoPqGroup => 17,
+            Refusal::NoPqShare => 18,
+            Refusal::KeyShareLength => 19,
+            Refusal::DuplicateKeyShare => 20,
+            Refusal::NoSignatureAlgorithm => 21,
+            Refusal::NoApplicationProtocol => 22,
+            Refusal::PskNotLast => 23,
+            Refusal::PskWithoutModes => 24,
+            Refusal::BadKeyShare => 25,
+            Refusal::DecryptError => 26,
+            Refusal::BadRecordMac => 27,
+            Refusal::KeyUpdateValue => 28,
+            Refusal::Internal => 29,
+            Refusal::PeerAlert => 30,
+            Refusal::Closed => 31,
+        }
+    }
+    for (i, r) in Refusal::ALL.iter().enumerate() {
+        assert_eq!(position(*r), i, "{r:?}");
+    }
+    assert_eq!(position(Refusal::Closed) + 1, Refusal::ALL.len());
+}
+
 #[test]
 fn refusal_names_are_the_variant_names() {
     for r in Refusal::ALL {

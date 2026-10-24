@@ -27,7 +27,6 @@ pub mod cookie;
 pub mod crypto;
 pub mod kem;
 mod responder;
-mod secret;
 
 pub use crypto::{CryptoError, Domains, KEY_LEN};
 pub use kem::{
@@ -37,6 +36,8 @@ pub use responder::{
     BISCUIT_EPOCH_NS, Conf, Error, KNOWN_RESPONSE_TTL_NS, PendingExport, PskInstall, Responder, Seams, envelope_mac,
     mac_key, peer_id,
 };
+/// The one container for every value derived from ck, a KEM shared secret,
+/// a biscuit plaintext or the RNG (M3 plan S12): `secret`'s.
 pub use secret::Secret;
 
 #[cfg(test)]
