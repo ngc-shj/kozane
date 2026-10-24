@@ -1289,3 +1289,37 @@ as amended here:
 | ID | Subject | Status |
 |---|---|---|
 | C12 | tlskey PD, its blob and envelope; key reverted; third envelope through M5's chain; the single-caller law | locked |
+
+### Slice 4 rest (C4, C10 in the PD)
+
+- Merge wip/m6-inner (C4: inner-core routing both directions, pds/inner
+  `ntl`/`tln`) and wip/m6-proxy (C10 core: `tls-core::conn` proxy events
+  and actions, the tls-core → http-wire edge); regenerate Cargo.lock once.
+- crates/pds/tls: a second smoltcp `Interface`/`SocketSet` for the inside
+  (inside IP, `ntl`/`tln`), eight backend sockets connected from
+  `TLS_PORTS` round-robin on `connect`; drive `client_record`,
+  `client_fin`/`client_gone`, `backend_connected`/`data`/`fin`/`rst`,
+  `timers`, `to_backend`/`backend_sent`; abort and release the backend
+  socket on `abort_backend` with the RST observed on `tln`; record every
+  `Outcome` with its audit code (`BackendUnavailable` kind if missing).
+- c8-head-wipe's mutation also removes the proxy's early head wipe (the
+  head is wiped when rewritten as well as at close).
+- run.py: inside tap with a raw-socket backend logging each connection's
+  peer and bytes (echo for POST); cases 1 (now through the proxy), 2, 5,
+  6, 13; `ip_forward=0`; the `https-residue` barriers move to the backend
+  log as planned (C8); selftest cases from the C4 and C10 reports;
+  manifest.
+
+### Slice 5 (hardening, closing)
+
+- Boot `https-flood`: case 9 (spoofed SYN flood; `TcpLimited{syn_global}`
+  crosses a printed point first; VPN handshake and transport still work)
+  and case 12 (ClientHello flood; a WireGuard handshake completes;
+  `KeyWaitHighWater` recorded).
+- Case 10 (per-source cap with free slots; slot recycling under
+  server-initiated closes; ninth connection RST) and the 8-concurrent
+  handshake probe from four sources (RM6-8 measured; D3 if it binds).
+- Kani: the full suite after the slice-3c lock change on z1mn, the cache
+  copied back to gx10; tpm2-wire's changed harnesses alone first.
+- Phase 2 Step 2-4 and 2-5 (self R-check), then Phase 3 review, the final
+  solo `make check`, a full selftest after it (z1mn), docs/PLAN.md M6 row.
