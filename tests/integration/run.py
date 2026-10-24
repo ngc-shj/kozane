@@ -40,13 +40,21 @@ removed after the boot. The boots:
      Rust tables give; after a sealed boot PCR 8 is capped;
   9. the A7 proxy between QEMU and swtpm: the unmodified relay passes a
      sealed boot, a flipped Unseal response is refused;
- 10. https (M6 plan C3, C7): the outside NIC on the tap; OpenSSL s_client
-     and curl complete X25519MLKEM768 handshakes against the dev CA and get
-     `tls`'s fixed response (the proxy is slice 4); classical-only and TLS
-     1.2-only clients are refused; the probe canary; the TLS scalar count;
- 11. https-residue (M6 plan C8): slowloris first, then a closed
-     connection's secrets, keys and marker absent from guest RAM while a
-     live connection's secret is present;
+ 10. https (M6 plan C3, C7, C9, C10): the outside NIC on the tap, the
+     inside NIC on a second tap whose kernel end is a raw Python backend
+     (each connection's peer and bytes logged; every peer must be the
+     gateway's inside address, so nothing reaches the backend around it); OpenSSL
+     s_client, curl and Python's ssl complete X25519MLKEM768 handshakes
+     against the dev CA and reach the backend through the proxy: the
+     backend sees exactly `rewrite`'s bytes and exact POST bodies, smuggling
+     forms and oversized heads and bodies are refused before it, its RST
+     mid-response reaches the client as a RST without close_notify, a
+     client's early FIN aborts it; classical-only and TLS 1.2-only clients
+     are refused; the probe canary; the TLS scalar count;
+ 11. https-residue (M6 plan C8): slowloris first, then one connection's
+     secrets and marker checked at each backend-logged barrier (head, body
+     after each KeyUpdate) and absent from guest RAM once it closed, while
+     a live connection held in response streaming keeps its secret;
  12. tls key failure (M6 plan C12, case 8): a TLS blob whose scalar does
      not match the certificate, on the same image: `tlskey` is Unavailable,
      `tls` halts at init before it listens, PCR 8 is capped, the VPN still
@@ -77,6 +85,7 @@ import select
 import shutil
 import signal
 import socket
+import ssl
 import struct
 import subprocess
 import sys
@@ -3764,10 +3773,8 @@ def test_cookie_b(pkg: "Package", deploy: str, passed: list):
 HTTPS_PORT = 443
 HTTPS_WAIT_S = 10.0             # one client's connect, handshake and response
 TLS_CONN = "crates/tls-core/src/conn.rs"
-TLS_PD = "crates/pds/tls/src/main.rs"
-# What `tls` answers a complete request head with until the proxy lands
-# (slice 3b): checked against the PD's source below.
-HTTPS_FIXED_BODY = b"secureos tls ok\n"
+TLS_HANDSHAKE = "crates/tls-core/src/handshake.rs"
+HTTP_WIRE = "crates/http-wire/src/lib.rs"
 # The probe (M6 plan C10, D3): sequential handshakes, the slowest of which
 # must stay within a third of the Rust handshake timeout (the canary).
 PROBE_HANDSHAKES = 20
@@ -3778,11 +3785,292 @@ BARRIER_SYN_WAIT_S = 0.5
 # Slowloris: one byte per interval, well inside the handshake timeout.
 SLOWLORIS_INTERVAL_S = 1.0
 SLOWLORIS_SLACK_S = 2 * TIMER_TICK_S + 3.0
+# The https boots' inside NIC (M6 plan T10): a second tap whose kernel end
+# is the backend host (neighbors[0], the configured backend), reached only
+# through `inner`.
+INSIDE_TAP = "tapi0"
+BACKEND_PORT = 8080
+# POST bodies up to this are echoed; a larger one is answered with its
+# SHA-256 (the backend log is what proves the body exact).
+ECHO_MAX = 16 * 1024
 
 
-def check_fixed_body():
-    if HTTPS_FIXED_BODY.decode().replace("\n", "\\n") not in open(os.path.join(ROOT, TLS_PD)).read():
-        raise Fail(f"{TLS_PD} no longer answers with {HTTPS_FIXED_BODY!r}")
+def rust_size(rel: str, name: str) -> int:
+    """`pub const NAME: usize = <integer expression>;` (digits, `*`, `+`,
+    `<<`) from a Rust source."""
+    m = re.search(rf"pub const {name}: usize = ([^;]+);", open(os.path.join(ROOT, rel)).read())
+    if not m or not re.fullmatch(r"[0-9_ *+<]+", m.group(1)):
+        raise Fail(f"{name} not found in {rel} as a plain integer expression")
+    return int(eval(m.group(1)))  # digits and operators only, checked above
+
+
+def backend_body() -> bytes:
+    """What the backend answers a GET with: binary, and six of `tls`'s
+    server records long (several backend chunks, more than the backend
+    socket's receive buffer), so its FIN arrives while bytes before it
+    still wait for room on the client socket."""
+    return hashlib.shake_256(b"secureos backend body").digest(6 * rust_size(TLS_HANDSHAKE, "MAX_SERVER_RECORD") + 123)
+
+
+def backend_response(data: bytes):
+    """The backend's answer once `data` holds a complete request (head and
+    Content-Length body bytes), else None: the GET body, or the POST body
+    echoed (its SHA-256 above ECHO_MAX)."""
+    end = data.find(b"\r\n\r\n")
+    if end < 0:
+        return None
+    head = data[:end + 4]
+    m = re.search(rb"\r\ncontent-length: *(\d+)\r\n", head, re.I)
+    length = int(m.group(1)) if m else 0
+    if len(data) < end + 4 + length:
+        return None
+    if head.startswith(b"POST "):
+        body = data[end + 4:end + 4 + length]
+        payload = body if length <= ECHO_MAX else hashlib.sha256(body).hexdigest().encode()
+    else:
+        payload = backend_body()
+    return (b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\n"
+            b"Connection: close\r\n\r\n" % len(payload)) + payload
+
+
+def forwarded_head(lines: list) -> bytes:
+    """What `rewrite` must send the backend for a head whose kept lines are
+    `lines` (request line first), from a client on the tap's address."""
+    return (b"".join(line + b"\r\n" for line in lines) + b"X-Forwarded-For: " + ip_str(PEER_IP).encode()
+            + b"\r\nX-Forwarded-Proto: https\r\nConnection: close\r\n\r\n")
+
+
+class BackendConn:
+    """One connection the raw backend accepted: its peer, every byte it
+    received, and how it ended ("eof", "reset" when the peer aborted it,
+    "closed" when the test reset it). A thread owns the socket; the test's
+    sends run on that thread, in order."""
+
+    def __init__(self, sock: socket.socket, peer: tuple, auto: bool):
+        self.sock, self.peer, self.auto = sock, peer, auto
+        self.data = bytearray()
+        self.ended = None
+        self.stopped = False
+        self.lock = threading.Lock()
+        self.ops = []
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        start_without_stop_signals(self.thread)
+
+    def _run(self):
+        answered = False
+        try:
+            while self.ended is None and not self.stopped:
+                self._run_ops()
+                if self.ended is not None:
+                    break
+                if not select.select([self.sock], [], [], 0.05)[0]:
+                    continue
+                try:
+                    chunk = self.sock.recv(65536)
+                except ConnectionResetError:
+                    self.ended = "reset"
+                    break
+                if not chunk:
+                    self.ended = "eof"
+                    break
+                with self.lock:
+                    self.data += chunk
+                if self.auto and not answered:
+                    response = backend_response(bytes(self.data))
+                    if response is not None:
+                        answered = True
+                        self.sock.sendall(response)
+                        self.sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            self.ended = self.ended or "error"
+        finally:
+            if self.ended != "closed":
+                self.sock.close()
+            with self.lock:
+                for _, _, done in self.ops:
+                    done.set()
+
+    def _run_ops(self):
+        with self.lock:
+            ops, self.ops = self.ops, []
+        for op, payload, done in ops:
+            try:
+                self.sock.sendall(payload)
+                if op == "finish":
+                    self.sock.shutdown(socket.SHUT_WR)
+                elif op == "reset":
+                    # SO_LINGER 0: close sends RST, not FIN.
+                    self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                    self.sock.close()
+                    self.ended = "closed"
+            finally:
+                done.set()
+
+    def _do(self, op: str, payload: bytes, what: str):
+        done = threading.Event()
+        with self.lock:
+            if self.ended is not None:
+                raise Fail(f"{what}: the backend connection already ended ({self.ended})")
+            self.ops.append((op, payload, done))
+        if not done.wait(HTTPS_WAIT_S) or self.ended == "error":
+            raise Fail(f"{what}: the backend could not send")
+
+    def send(self, payload: bytes, what: str):
+        self._do("send", payload, what)
+
+    def finish(self, payload: bytes, what: str):
+        """`payload`, then FIN."""
+        self._do("finish", payload, what)
+
+    def reset(self, payload: bytes, what: str):
+        """`payload`, then RST (SO_LINGER 0)."""
+        self._do("reset", payload, what)
+
+    def snapshot(self) -> tuple:
+        with self.lock:
+            return bytes(self.data), self.ended
+
+    def wait(self, pred, what: str, timeout: float = HTTPS_WAIT_S) -> bytes:
+        """Until pred(data, ended) holds; the data."""
+        deadline = time.monotonic() + timeout
+        while True:
+            data, ended = self.snapshot()
+            if pred(data, ended):
+                return data
+            if time.monotonic() > deadline:
+                raise Fail(f"{what}: the backend did not see it ({len(data)} bytes so far, ended: {ended})")
+            time.sleep(0.02)
+
+    def close(self):
+        self.stopped = True
+        self.thread.join(1.0)
+
+
+class Backend:
+    """The raw-capture backend (M6 plan T10) on the inside tap: a TCP
+    listener at the configured backend address that logs each connection's
+    peer and raw bytes and answers a complete request with
+    `backend_response`, then FIN, unless the test holds the connection
+    (`hold_next`) to answer it itself."""
+
+    def __init__(self):
+        self.conns = []
+        self.held = 0
+        self.lock = threading.Lock()
+        self.alive = True
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.sock.bind((ip_str(HOST_IP), BACKEND_PORT))
+            self.sock.listen(16)
+            self.sock.settimeout(0.2)
+        except BaseException:
+            self.sock.close()
+            raise
+        self.thread = threading.Thread(target=self._accept, daemon=True)
+        start_without_stop_signals(self.thread)
+
+    def _accept(self):
+        while self.alive:
+            try:
+                sock, peer = self.sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            sock.setblocking(True)
+            with self.lock:
+                auto = self.held == 0
+                self.held = max(0, self.held - 1)
+                self.conns.append(BackendConn(sock, peer, auto))
+
+    def hold_next(self, n: int = 1):
+        """The next `n` connections are answered by the test."""
+        with self.lock:
+            self.held += n
+
+    def count(self) -> int:
+        with self.lock:
+            return len(self.conns)
+
+    def conn(self, i: int, what: str, timeout: float = HTTPS_WAIT_S) -> BackendConn:
+        """Connection number `i` (from 0), once accepted."""
+        deadline = time.monotonic() + timeout
+        while True:
+            with self.lock:
+                if len(self.conns) > i:
+                    return self.conns[i]
+            if time.monotonic() > deadline:
+                raise Fail(f"{what}: no backend connection number {i} (the backend saw {self.count()})")
+            time.sleep(0.02)
+
+    def close(self):
+        self.alive = False
+        self.thread.join(1.0)
+        self.sock.close()
+        with self.lock:
+            conns = list(self.conns)
+        for c in conns:
+            c.close()
+
+
+class InsideTap:
+    """The inside NIC on a second tap in the test netns (the https boots;
+    the VPN boots keep the dgram inside host): the kernel end is the backend
+    host with the configured neighbour address, and the gateway's inside MAC
+    is static, as the outside tap's router side is."""
+
+    def __init__(self):
+        sh("ip", "tuntap", "add", "dev", INSIDE_TAP, "mode", "tap")
+        try:
+            sh("ip", "link", "set", INSIDE_TAP, "address", HOST_MAC.hex(":"))
+            sh("ip", "addr", "add", f"{ip_str(HOST_IP)}/24", "dev", INSIDE_TAP)
+            sh("ip", "link", "set", INSIDE_TAP, "up")
+            sh("ip", "neigh", "replace", ip_str(INSIDE_IP), "lladdr", INSIDE_MAC.hex(":"), "dev", INSIDE_TAP,
+               "nud", "permanent")
+        except BaseException:
+            self.close()
+            raise
+
+    def netdev(self, name: str) -> str:
+        return f"tap,id={name},ifname={INSIDE_TAP},script=no,downscript=no"
+
+    def close(self):
+        subprocess.run(["ip", "link", "del", INSIDE_TAP], capture_output=True)
+
+
+def tls_client(ca: str, timeout: float = HTTPS_WAIT_S) -> ssl.SSLSocket:
+    """A verified TLS 1.3 connection from Python (OpenSSL 3.5's default
+    groups offer X25519MLKEM768 first), for requests whose bytes must be
+    exact."""
+    ctx = ssl.create_default_context(cafile=ca)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+    raw = socket.create_connection((ip_str(GW_IP), HTTPS_PORT), timeout=timeout)
+    try:
+        return ctx.wrap_socket(raw, server_hostname=ip_str(GW_IP))
+    except BaseException:
+        raw.close()
+        raise
+
+
+def read_to_end(s: ssl.SSLSocket) -> bytes:
+    got = bytearray()
+    while True:
+        chunk = s.recv(65536)
+        if not chunk:
+            return bytes(got)
+        got += chunk
+
+
+def tls_exchange(ca: str, request: bytes, what: str, timeout: float = HTTPS_WAIT_S) -> bytes:
+    """`request` over a fresh verified connection, then everything the
+    server sends until its close_notify."""
+    try:
+        with tls_client(ca, timeout) as s:
+            s.sendall(request)
+            return read_to_end(s)
+    except OSError as e:
+        raise Fail(f"{what}: {type(e).__name__}: {e}") from e
 
 
 def https_url(host: str = None) -> str:
@@ -3935,24 +4223,30 @@ def scan_snapshot(mon: Monitor, scratch: str, what: str, absent: dict, present: 
         del ram
 
 
-def https_handshake_cases(con: Console, deploy: str, other_ca: str, passed: list):
-    """M6 plan C7 integration (strategy cases 1, 3 and 4 against the fixed
-    response): s_client and curl complete X25519MLKEM768 handshakes and get
-    the response, curl verifying the chain and the IP name; a wrong CA or
+def https_handshake_cases(con: Console, deploy: str, other_ca: str, backend: Backend, passed: list):
+    """M6 plan C7 integration and strategy cases 1, 3 and 4: s_client and
+    curl complete X25519MLKEM768 handshakes and get the backend's response
+    through the proxy, curl's body byte for byte, curl verifying the chain
+    and the IP name, the backend's peer the inside address; a wrong CA or
     name fails curl; a classical-only client gets handshake_failure and the
     NoPqGroup audit (L14); a TLS 1.2-only client protocol_version."""
     ca = os.path.join(deploy, "devca.pem")
-    check_fixed_body()
+    before = backend.count()
     out = s_client("-groups", "X25519MLKEM768", "-CAfile", ca, "-verify_return_error", data=request_head())
     if not re.search(r"Negotiated TLS1\.3 group: X25519MLKEM768\n", out):
         raise Fail(f"https: s_client did not negotiate X25519MLKEM768:\n{out[-2000:]}")
-    if "Verify return code: 0 (ok)" not in out or HTTPS_FIXED_BODY.decode() not in out:
+    if "Verify return code: 0 (ok)" not in out or "HTTP/1.1 200 OK\r\n" not in out:
         raise Fail(f"https: s_client did not verify the chain or got no response:\n{out[-2000:]}")
     body, _ = curl_get(ca)
-    if not body.endswith(HTTPS_FIXED_BODY):
-        raise Fail(f"https: curl got {body!r}, want the fixed response")
+    if body != backend_body():
+        raise Fail(f"https: curl got a body of {len(body)} bytes, want the backend's {len(backend_body())} "
+                   "byte for byte")
+    peers = {backend.conn(i, "https").peer[0] for i in range(before, before + 2)}
+    if peers != {ip_str(INSIDE_IP)}:
+        raise Fail(f"https: the backend saw peers {sorted(peers)}, want only the inside address {ip_str(INSIDE_IP)}")
     passed.append("https tls handshake")
-    print("\nPASS [https: s_client and curl complete X25519MLKEM768, chain and IP name verified, fixed response]")
+    print("\nPASS [https: s_client and curl complete X25519MLKEM768, chain and IP name verified, the backend's "
+          "body through the proxy]")
 
     wrong_ca = curl(other_ca, https_url())
     if wrong_ca.returncode == 0:
@@ -3980,6 +4274,195 @@ def https_handshake_cases(con: Console, deploy: str, other_ca: str, passed: list
     print("\nPASS [https: a TLS 1.2-only client gets protocol_version, TlsRefused(NoTls13) audited]")
 
 
+def backend_exchange(ca: str, backend: Backend, request: bytes, what: str,
+                     timeout: float = HTTPS_WAIT_S) -> tuple:
+    """`request` through the proxy as one backend connection: (what the
+    backend received, what the client received)."""
+    before = backend.count()
+    got = tls_exchange(ca, request, what, timeout)
+    conn = backend.conn(before, what)
+    data = conn.wait(lambda d, ended: ended is not None, f"{what}: the backend connection's end")
+    if backend.count() != before + 1:
+        raise Fail(f"{what}: the backend saw {backend.count() - before} connections, want 1")
+    return data, got, conn
+
+
+def https_rewrite_case(con: Console, deploy: str, backend: Backend, passed: list):
+    """Strategy case 2 (C9, C10): the backend receives exactly `rewrite`'s
+    bytes — every hop-by-hop and forwarding field gone, X-Forwarded-For the
+    client's address, X-Forwarded-Proto https, Connection: close — from the
+    inside address and a TLS_PORTS port, and the client exactly the
+    backend's response; POST bodies of 0, 1 and MAX_BODY bytes arrive
+    exactly, nothing after them; MAX_BODY + 1 is refused with 413 at head
+    time, before any backend connection."""
+    ca = os.path.join(deploy, "devca.pem")
+    tls_ports = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))["gateway"]["tls_ports"]
+    host = b"Host: " + ip_str(GW_IP).encode()
+    request = (b"GET /path?q=1 HTTP/1.1\r\n" + host + b"\r\nUser-Agent: secureos-it\r\nX-Custom: kept\r\n"
+               b"Connection: keep-alive, X-Hop\r\nX-Hop: dropped\r\nKeep-Alive: timeout=5\r\nTE: trailers\r\n"
+               b"Trailer: X-T\r\nProxy-Authorization: Basic eA==\r\nProxy: http://198.51.100.1/\r\n"
+               b"Forwarded: for=198.51.100.6\r\nX-Forwarded-For: 198.51.100.6\r\nX-Forwarded-Proto: http\r\n"
+               b"X-Real-IP: 198.51.100.6\r\n\r\n")
+    want = forwarded_head([b"GET /path?q=1 HTTP/1.1", host, b"User-Agent: secureos-it", b"X-Custom: kept"])
+    data, got, conn = backend_exchange(ca, backend, request, "https rewrite")
+    if data != want:
+        raise Fail(f"https rewrite: the backend received {data!r}, want exactly {want!r}")
+    if conn.peer[0] != ip_str(INSIDE_IP) or not 0 <= conn.peer[1] - tls_ports["start"] < tls_ports["count"]:
+        raise Fail(f"https rewrite: the backend's peer is {conn.peer}, want {ip_str(INSIDE_IP)} from TLS_PORTS")
+    if got != backend_response(want):
+        raise Fail(f"https rewrite: the client received {len(got)} bytes, want the backend's response exactly")
+    passed.append("https proxy rewrite")
+    print("\nPASS [https rewrite: the backend received exactly rewrite's bytes from the inside address]")
+
+    max_body = rust_size(HTTP_WIRE, "MAX_BODY")
+    lifetime = rust_const(TLS_CONN, "LIFETIME_NS") / NS
+    for length in (0, 1, max_body):
+        body = secrets.token_bytes(length)
+        head = [b"POST /up HTTP/1.1", host, b"Content-Length: %d" % length]
+        # Bytes after the body (a pipelined request) must never go on.
+        request = b"".join(line + b"\r\n" for line in head) + b"\r\n" + body + b"GET /smuggled HTTP/1.1\r\n\r\n"
+        start = time.monotonic()
+        data, got, _ = backend_exchange(ca, backend, request, f"https post {length}", timeout=lifetime)
+        if data != forwarded_head(head) + body:
+            raise Fail(f"https post: the POST body of {length} bytes reached the backend as {len(data)} bytes, "
+                       "not exactly rewrite's head and the body")
+        if got != backend_response(forwarded_head(head) + body):
+            raise Fail(f"https post: the response to the POST of {length} bytes is not the backend's")
+        print(f"\nhttps post: {length} bytes in {time.monotonic() - start:.1f} s", flush=True)
+    passed.append("https post bodies")
+    print(f"\nPASS [https post: bodies of 0, 1 and {max_body} bytes reached the backend exactly]")
+
+    before, mark = backend.count(), con.mark()
+    big = os.path.join(deploy, "post-over-max.bin")
+    with open(big, "wb") as f:
+        f.write(b"x" * (max_body + 1))
+    try:
+        r = curl(ca, "-H", "Expect:", "--data-binary", f"@{big}", "--output", "/dev/null",
+                 "--write-out", "%{http_code}", https_url())
+    finally:
+        os.unlink(big)
+    # curl may also report its upload cut short once the server closed.
+    if r.stdout != b"413":
+        raise Fail(f"https post: MAX_BODY + 1 got status {r.stdout!r} (curl exit {r.returncode}), want 413")
+    con.wait_for(r"audit: src=tls HttpRefused\(413\) total=1 lost=\d+", since=mark)
+    if backend.count() != before:
+        raise Fail("https post: MAX_BODY + 1 reached the backend; 413 must be decided at head time")
+    passed.append("https body 413 at head time")
+    print("\nPASS [https post: MAX_BODY + 1 refused with 413 at head time, no backend connection]")
+
+
+def https_smuggling_cases(deploy: str, backend: Backend, passed: list):
+    """Strategy case 5 (C9): each smuggling or header form gets its status
+    and never reaches the backend: after each, a valid request makes the
+    backend's log grow by exactly that one connection (the barrier). A
+    spoofed Forwarded is not refused: it is forwarded with the field gone."""
+    ca = os.path.join(deploy, "devca.pem")
+    host = b"Host: " + ip_str(GW_IP).encode() + b"\r\n"
+    refused = [
+        ("TE+CL", b"POST / HTTP/1.1\r\n" + host + b"Content-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n", 501),
+        ("duplicate CL", b"POST / HTTP/1.1\r\n" + host + b"Content-Length: 4\r\nContent-Length: 4\r\n\r\n", 400),
+        ("obs-fold", b"GET / HTTP/1.1\r\n" + host + b"X-A: a\r\n b\r\n\r\n", 400),
+        ("Connection: content-length", b"GET / HTTP/1.1\r\n" + host + b"Connection: content-length\r\n\r\n", 400),
+        ("underscore name", b"GET / HTTP/1.1\r\n" + host + b"X_Forwarded_For: 198.51.100.6\r\n\r\n", 400),
+    ]
+    valid = b"GET /barrier HTTP/1.1\r\n" + host + b"\r\n"
+    for name, request, status in refused:
+        before = backend.count()
+        got = tls_exchange(ca, request, f"https smuggling {name}")
+        if not got.startswith(b"HTTP/1.1 %d " % status):
+            raise Fail(f"https smuggling: {name} got {got[:40]!r}, want status {status}")
+        data, _, _ = backend_exchange(ca, backend, valid, f"https smuggling {name} barrier")
+        if backend.count() != before + 1 or not data.startswith(b"GET /barrier "):
+            raise Fail(f"https smuggling: {name} reached the backend")
+    spoofed = b"GET /fwd HTTP/1.1\r\n" + host + b"Forwarded: for=198.51.100.6;proto=http\r\n\r\n"
+    data, got, _ = backend_exchange(ca, backend, spoofed, "https smuggling spoofed Forwarded")
+    if not got.startswith(b"HTTP/1.1 200 ") or b"198.51.100.6" in data or b"orwarded:" in data:
+        raise Fail(f"https smuggling: a spoofed Forwarded reached the backend as {data!r}")
+    passed.append("https smuggling refused")
+    print("\nPASS [https smuggling: TE+CL, duplicate CL, obs-fold, Connection: content-length and an underscore "
+          "name refused before the backend; a spoofed Forwarded stripped]")
+
+
+def head_of(length: int) -> bytes:
+    """A complete request head of exactly `length` bytes."""
+    start = b"GET / HTTP/1.1\r\nHost: " + ip_str(GW_IP).encode() + b"\r\nX-Pad: "
+    return start + b"a" * (length - len(start) - 4) + b"\r\n\r\n"
+
+
+def https_head_limit_case(con: Console, deploy: str, backend: Backend, passed: list):
+    """Strategy case 6 (C9): a head of 8 KiB + 1 is refused with 431 before
+    any backend connection; one of exactly 8 KiB reaches the backend."""
+    ca = os.path.join(deploy, "devca.pem")
+    max_head = rust_size(HTTP_WIRE, "MAX_HEAD")
+    before, mark = backend.count(), con.mark()
+    got = tls_exchange(ca, head_of(max_head + 1), "https head limit")
+    if not got.startswith(b"HTTP/1.1 431 "):
+        raise Fail(f"https head limit: a head of {max_head + 1} bytes got {got[:40]!r}, want 431")
+    con.wait_for(r"audit: src=tls HttpRefused\(431\) total=1 lost=\d+", since=mark)
+    data, got, _ = backend_exchange(ca, backend, head_of(max_head), "https head limit (allow side)")
+    if backend.count() != before + 1 or not got.startswith(b"HTTP/1.1 200 ") or not data.startswith(b"GET / "):
+        raise Fail(f"https head limit: a head of exactly {max_head} bytes did not reach the backend alone")
+    passed.append("https head 431")
+    print(f"\nPASS [https head limit: {max_head + 1} bytes refused with 431, {max_head} bytes proxied]")
+
+
+def https_backend_reset_case(con: Console, deploy: str, backend: Backend, sniffer: Sniffer, passed: list):
+    """Strategy case 13 (C10, T-R3-9, T-N8): the backend resets the
+    connection (SO_LINGER 0) mid-response: s_client sees no close_notify
+    and its read fails with ECONNRESET, and the sniffer sees the server's
+    RST. Then a client's FIN before the response ends: the backend sees
+    its connection aborted."""
+    ca = os.path.join(deploy, "devca.pem")
+    what = "https backend reset"
+    i, start = backend.count(), len(sniffer.since(0))
+    backend.hold_next()
+    c = SClient("-msg", "-groups", "X25519MLKEM768", "-CAfile", ca, "-verify_return_error")
+    try:
+        c.handshake(what)
+        port = client_port(sniffer, start, what)
+        c.send(request_head())
+        conn = backend.conn(i, what)
+        conn.wait(lambda d, _: d.endswith(b"\r\n\r\n"), f"{what}: the request head")
+        conn.send(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\npartial-response", what)
+        c.wait_for(rb"partial-response", f"{what}: the response's start")
+        conn.reset(b"", what)
+        end = c.wait_for(rb"read:errno=(\d+)|<<< [^\n]*Alert[^\n]*close_notify", f"{what}: s_client's read ending")
+        if end.group(1) is None:
+            raise Fail(f"{what}: s_client received close_notify after the backend's RST; the truncation is hidden")
+        if int(end.group(1)) != errno.ECONNRESET:
+            raise Fail(f"{what}: s_client's read failed with errno {end.group(1).decode()}, want ECONNRESET")
+        wait_server_rst(sniffer, start, port, HTTPS_WAIT_S, what)
+    finally:
+        c.close()
+    con.wait_for(r"audit: src=tls TlsClosed\(BackendRst\) total=1 lost=\d+")
+    passed.append("https backend reset truncates")
+    print("\nPASS [https backend reset: no close_notify, ECONNRESET at the client, the server's RST seen]")
+
+    what = "https client fin"
+    i = backend.count()
+    backend.hold_next()
+    try:
+        s = tls_client(ca)
+    except OSError as e:
+        raise Fail(f"{what}: {type(e).__name__}: {e}") from e
+    with s:
+        s.sendall(request_head())
+        conn = backend.conn(i, what)
+        conn.wait(lambda d, _: d.endswith(b"\r\n\r\n"), f"{what}: the request head")
+        conn.send(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\npartial-response", what)
+        got = b""
+        while b"partial-response" not in got:
+            chunk = s.recv(65536)
+            if not chunk:
+                raise Fail(f"{what}: the connection ended before the response's start")
+            got += chunk
+        # A TCP FIN without close_notify (the TLS layer dropped first).
+        s.shutdown(socket.SHUT_WR)
+        conn.wait(lambda _, ended: ended == "reset", f"{what}: the backend's connection aborted")
+    passed.append("https client fin aborts backend")
+    print("\nPASS [https client fin: the backend's connection aborted]")
+
+
 def https_probe_case(con: Console, deploy: str, passed: list):
     """The probe (M6 plan C10, D3) and its canary (T-R3-8, T-N14): every
     handshake of PROBE_HANDSHAKES within a third of the Rust handshake
@@ -3992,8 +4475,8 @@ def https_probe_case(con: Console, deploy: str, passed: list):
     times = []
     for _ in range(PROBE_HANDSHAKES):
         body, t = curl_get(ca)
-        if not body.endswith(HTTPS_FIXED_BODY):
-            raise Fail(f"https probe: curl got {body!r}, want the fixed response")
+        if body != backend_body():
+            raise Fail(f"https probe: curl got a body of {len(body)} bytes, want the backend's")
         times.append(t)
     signs = [int(us) for us in con.count(r"audit: src=tls TlsSignHighWater us=(\d+) ")]
     print(f"\nhttps probe: handshake (appconnect - connect) s: {', '.join(f'{t:.3f}' for t in times)}; "
@@ -4052,31 +4535,41 @@ def tls_stack_headroom_case(con: Console, passed: list):
 
 
 def test_https(pkg: "Package", deploy: str, other_ca: str, passed: list):
-    """Boot "https" (M6 plan C3, C7): `tls`'s TLS 1.3 on the outside tap."""
+    """Boot "https" (M6 plan C3, C7, C9, C10): `tls` on the outside tap,
+    proxying to the raw backend on the inside tap."""
     tap = Tap()
-    inside = Wire()
+    inside = backend = sniffer = None
     monitor = os.path.join(deploy, "monitor.sock")
     try:
+        inside = InsideTap()
+        backend = Backend()
         child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"), monitor)
     except BaseException:
-        tap.close()
+        close_all(backend, inside, tap)
         raise
     try:
+        sniffer = Sniffer(HTTPS_PORT, proto=6)
         wait_tap_ready(tap, con)
         con.wait_for(r"tls: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
         mon = Monitor(monitor)
-        https_handshake_cases(con, deploy, other_ca, passed)
+        https_handshake_cases(con, deploy, other_ca, backend, passed)
+        https_rewrite_case(con, deploy, backend, passed)
+        https_smuggling_cases(deploy, backend, passed)
+        https_head_limit_case(con, deploy, backend, passed)
+        https_backend_reset_case(con, deploy, backend, sniffer, passed)
         https_probe_case(con, deploy, passed)
         tls_stack_headroom_case(con, passed)
         tls_scalar_count_case(mon, deploy, passed)
     finally:
         try:
             with signals_held():
+                close_all(sniffer)
                 kill(child)
-                tap.close()
+                close_all(backend, inside, tap)
         except SystemExit:
+            close_all(sniffer)
             kill(child)
-            tap.close()
+            close_all(backend, inside, tap)
             raise
 
 
@@ -4187,41 +4680,49 @@ def slowloris_case(con: Console, passed: list):
     print(f"\nPASS [slowloris: closed after {time.monotonic() - start:.1f} s, TlsTimeout(Handshake) total=1]")
 
 
-def https_residue_case(con: Console, mon: Monitor, tap: Tap, sniffer: "Sniffer", deploy: str, passed: list):
-    """M6 plan C8 cases 1-3 (T6, T7, T-N2, T-N3, T-R3-2), adapted to slice
-    3b, which has no backend: the host-observed barrier is the fixed
-    response, sent only after `tls` decrypted the head, which connection A
-    sends after `k` (its KeyUpdate) and `K` (KeyUpdate, update requested):
-    so the server read under client secret 2 and wrote the response under
-    server secret 1. The response is followed by close_notify, the slot
-    wiped before either is transmitted; the abort RST, then a fresh SYN from
-    an unused address answered, show the socket released and its storage
-    wiped. Then every handshake and traffic secret of A, their record keys
-    and IVs, and A's marker (a header value only `tls` ever held) are
-    absent, while a live connection B's CLIENT_TRAFFIC_SECRET_0 is present
-    (the control; B holds the slot in the head stage)."""
+def https_residue_case(con: Console, mon: Monitor, tap: Tap, sniffer: "Sniffer", backend: Backend, deploy: str,
+                       passed: list):
+    """M6 plan C8 cases 1-3 (T6, T7, T-N2, T-N3, T-R3-2, T-N4), one
+    connection A whose barriers are the backend's log: a POST head with
+    Content-Length and a `Keep-Alive` marker (a field `rewrite` drops, so
+    only `tls` ever holds it) and part of the body, logged by the backend
+    (the server verified the client Finished and decrypted application
+    data): both handshake secrets gone, CLIENT_TRAFFIC_SECRET_0 present,
+    the marker already gone (the head is wiped once rewritten). Then `k`
+    and more body, logged: client secret 0 gone, client secret 1 present.
+    Then `K` and the rest of the body, logged, and the backend's first
+    response bytes, which `tls` sends after its own KeyUpdate: server
+    secret 0 and client secret 1 gone, server secret 1 and client secret 2
+    present. Then the backend finishes: close_notify, the abort RST, a
+    fresh SYN from an unused address answered (the socket released, its
+    storage wiped); every secret of A, its record keys and IVs, and the
+    marker are gone, while a live connection B, held in response streaming
+    by the backend, has its CLIENT_TRAFFIC_SECRET_0 present (the control)
+    and its own marker gone (rewritten). Neither marker reaches the
+    backend."""
     ca = os.path.join(deploy, "devca.pem")
-    marker = secrets.token_hex(16)
+    marker, marker_b = secrets.token_hex(16), secrets.token_hex(16)
     log_a, log_b = (os.path.join(deploy, f"keylog-{n}.txt") for n in "ab")
+    pmem = os.path.join(deploy, "pmem-residue.bin")
+    idle = rust_const(TLS_CONN, "IDLE_TIMEOUT_NS") / NS
     for p in (log_a, log_b):
         with contextlib.suppress(FileNotFoundError):
             os.unlink(p)
+    # Three body parts; s_client takes a write starting with a command
+    # letter (k, K, Q, R, ...) as a command, so none does.
+    parts = [b"x" * 100, b"y" * 100, b"z" * 100]
     a = b = None
     try:
-        start = len(sniffer.since(0))
+        i, start = backend.count(), len(sniffer.since(0))
+        backend.hold_next()
         a = SClient("-groups", "X25519MLKEM768", "-CAfile", ca, "-verify_return_error", "-keylogfile", log_a)
         a.handshake("residue: connection A")
         port = client_port(sniffer, start, "residue: connection A")
-        a.key_update(b"k", "residue: connection A's KeyUpdate")
-        a.key_update(b"K", "residue: connection A's requested KeyUpdate")
-        a.send(request_head(f"Proxy-Selftest: {marker}\r\n"))
-        a.wait_for(re.escape(HTTPS_FIXED_BODY), "residue: connection A's response (the barrier)")
-        wait_server_rst(sniffer, start, port, rust_const(TLS_CONN, "CLOSE_LINGER_NS") / NS + HTTPS_WAIT_S,
-                        "residue: connection A's abort")
-        barrier_syn(tap, sniffer, "residue")
-        a.close()
-        a = None
-
+        head = (f"POST /residue HTTP/1.1\r\nHost: {ip_str(GW_IP)}\r\nKeep-Alive: {marker}\r\n"
+                f"Content-Length: {sum(map(len, parts))}\r\n\r\n").encode()
+        a.send(head + parts[0])
+        conn_a = backend.conn(i, "residue: connection A")
+        conn_a.wait(lambda d, _: b"\r\n\r\n" in d and d.endswith(parts[0]), "residue: connection A's head logged")
         logged = keylog(log_a)
         need = ("CLIENT_HANDSHAKE_TRAFFIC_SECRET", "SERVER_HANDSHAKE_TRAFFIC_SECRET", "CLIENT_TRAFFIC_SECRET_0",
                 "SERVER_TRAFFIC_SECRET_0")
@@ -4231,62 +4732,114 @@ def https_residue_case(con: Console, mon: Monitor, tap: Tap, sniffer: "Sniffer",
         c1 = hkdf_expand_label(c0, b"traffic upd", 32)
         c2 = hkdf_expand_label(c1, b"traffic upd", 32)
         s1 = hkdf_expand_label(s0, b"traffic upd", 32)
+        handshake = {}
+        for name, label in (("client handshake secret", "CLIENT_HANDSHAKE_TRAFFIC_SECRET"),
+                            ("server handshake secret", "SERVER_HANDSHAKE_TRAFFIC_SECRET")):
+            handshake.update(secret_forms(f"connection A's {name}", logged[label][0]))
+        scan_snapshot(mon, pmem, "residue after the head", {"marker": marker.encode(), **handshake},
+                      {"connection A's client secret 0 (live)": c0})
+        passed.append("https residue handshake secrets")
+        print("\nPASS [https residue: after the head, the handshake secrets and the marker gone, client secret 0 "
+              "held]")
+
+        a.key_update(b"k", "residue: connection A's KeyUpdate")
+        a.send(parts[1])
+        conn_a.wait(lambda d, _: d.endswith(parts[0] + parts[1]), "residue: connection A's body after k logged")
+        scan_snapshot(mon, pmem, "residue after k", secret_forms("connection A's client secret 0", c0),
+                      {"connection A's client secret 1 (live)": c1})
+        passed.append("https residue client key update")
+        print("\nPASS [https residue: after k, client secret 0 gone, client secret 1 held]")
+
+        a.key_update(b"K", "residue: connection A's requested KeyUpdate")
+        a.send(parts[2])
+        conn_a.wait(lambda d, _: d.endswith(b"".join(parts)), "residue: connection A's body after K logged")
+        conn_a.send(b"HTTP/1.1 200 OK\r\nContent-Length: 30\r\n\r\nresidue-part-1", "residue: connection A")
+        a.wait_for(rb"residue-part-1", "residue: connection A's response start (sent under server secret 1)")
+        scan_snapshot(mon, pmem, "residue after K",
+                      {**secret_forms("connection A's server secret 0", s0),
+                       **secret_forms("connection A's client secret 1", c1)},
+                      {"connection A's server secret 1 (live)": s1, "connection A's client secret 2 (live)": c2})
+        passed.append("https residue server key update")
+        print("\nPASS [https residue: after K, server secret 0 and client secret 1 gone, server secret 1 and "
+              "client secret 2 held]")
         # OpenSSL logs the updated secrets too: the derivation checked.
+        logged = keylog(log_a)
         if logged.get("CLIENT_TRAFFIC_SECRET_N") != [c1, c2] or logged.get("SERVER_TRAFFIC_SECRET_N") != [s1]:
             raise Fail("residue: the traffic upd derivation differs from OpenSSL's keylog")
-        absent = {"marker": marker.encode()}
-        for name, secret in (("client handshake secret", logged["CLIENT_HANDSHAKE_TRAFFIC_SECRET"][0]),
-                             ("server handshake secret", logged["SERVER_HANDSHAKE_TRAFFIC_SECRET"][0]),
-                             ("client secret 0", c0), ("client secret 1", c1), ("client secret 2", c2),
-                             ("server secret 0", s0), ("server secret 1", s1)):
-            absent.update(secret_forms(f"connection A's {name}", secret))
 
+        # The control, held in response streaming while A closes.
+        j = backend.count()
+        backend.hold_next()
         b = SClient("-groups", "X25519MLKEM768", "-CAfile", ca, "-verify_return_error", "-keylogfile", log_b)
         b.handshake("residue: connection B")
-        b.send(b"GET / HTTP/1.1\r\n")
+        b.send(request_head(f"Keep-Alive: {marker_b}\r\n"))
+        conn_b = backend.conn(j, "residue: connection B")
+        conn_b.wait(lambda d, _: d.endswith(b"\r\n\r\n"), "residue: connection B's head logged")
+        conn_b.send(b"HTTP/1.1 200 OK\r\nContent-Length: 100000\r\n\r\nresidue-held", "residue: connection B")
+        b.wait_for(rb"residue-held", "residue: connection B's response start")
+        b_since = time.monotonic()
         control = keylog(log_b).get("CLIENT_TRAFFIC_SECRET_0", [None])[0]
         if control is None:
             raise Fail("residue: connection B's keylog has no CLIENT_TRAFFIC_SECRET_0")
-        scan_snapshot(mon, os.path.join(deploy, "pmem-residue.bin"), "residue", absent,
-                      {"connection B's CLIENT_TRAFFIC_SECRET_0 (live)": control})
+
+        conn_a.finish(b"-residue-part-2-", "residue: connection A")
+        wait_server_rst(sniffer, start, port, rust_const(TLS_CONN, "CLOSE_LINGER_NS") / NS + HTTPS_WAIT_S,
+                        "residue: connection A's abort")
+        barrier_syn(tap, sniffer, "residue")
+        a.close()
+        a = None
+        absent = {"marker": marker.encode(), "connection B's marker (rewritten)": marker_b.encode()}
+        for name, secret in (("client secret 0", c0), ("client secret 1", c1), ("client secret 2", c2),
+                             ("server secret 0", s0), ("server secret 1", s1)):
+            absent.update(secret_forms(f"connection A's {name}", secret))
+        absent.update(handshake)
+        if time.monotonic() - b_since >= idle:
+            raise Fail("residue: connection B idled past the idle timeout before the scan; the control "
+                       "would prove nothing")
+        scan_snapshot(mon, pmem, "residue", absent, {"connection B's CLIENT_TRAFFIC_SECRET_0 (live)": control})
+        for name, conn, m in (("A", conn_a, marker), ("B", conn_b, marker_b)):
+            if m.encode() in conn.snapshot()[0]:
+                raise Fail(f"residue: connection {name}'s Keep-Alive marker reached the backend")
     finally:
         close_all(a, b)
         for p in (log_a, log_b):
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(p)
     passed.append("https residue closed connection")
-    print("\nPASS [https residue: a closed connection's secrets, keys and marker gone; a live one's secret held]")
+    print("\nPASS [https residue: a closed connection's secrets, keys and marker gone; a live one's secret held, "
+          "its marker gone]")
 
 
 def test_https_residue(pkg: "Package", deploy: str, passed: list):
     """Boot "https-residue" (M6 plan C8, T-N2): slowloris first, then the
     residue cases."""
     tap = Tap()
-    inside = Wire()
+    inside = backend = sniffer = None
     monitor = os.path.join(deploy, "monitor.sock")
     try:
+        inside = InsideTap()
+        backend = Backend()
         child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"), monitor)
     except BaseException:
-        tap.close()
+        close_all(backend, inside, tap)
         raise
-    sniffer = None
     try:
         sniffer = Sniffer(HTTPS_PORT, proto=6)
         wait_tap_ready(tap, con)
         con.wait_for(r"tls: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
         mon = Monitor(monitor)
         slowloris_case(con, passed)
-        https_residue_case(con, mon, tap, sniffer, deploy, passed)
+        https_residue_case(con, mon, tap, sniffer, backend, deploy, passed)
     finally:
         try:
             with signals_held():
                 close_all(sniffer)
                 kill(child)
-                tap.close()
+                close_all(backend, inside, tap)
         except SystemExit:
             close_all(sniffer)
             kill(child)
-            tap.close()
+            close_all(backend, inside, tap)
             raise
 
 
@@ -4585,6 +5138,8 @@ def check_harness_matches_config(deploy: str):
         "gateway.inside_ip": (g["inside_ip"], ip(INSIDE_IP)),
         "gateway.inside_mac": (g["inside_mac"], mac(INSIDE_MAC)),
         "neighbors[0].ip": (cfg["neighbors"][0]["ip"], ip(HOST_IP)),
+        # The https boots' raw backend plays neighbors[0] on the inside tap.
+        "gateway.backend": (g["backend"], {"ip": ip(HOST_IP), "port": BACKEND_PORT}),
         "neighbors[0].mac": (cfg["neighbors"][0]["mac"], mac(HOST_MAC)),
         "peers[0].allowed_ips": (cfg["peers"][0]["allowed_ips"], ["10.200.0.2/32"]),
         # Case 4 sends from 10.200.0.99 as peer 1, which must not own it.

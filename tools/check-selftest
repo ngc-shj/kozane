@@ -168,7 +168,7 @@ CASES_FOR_GATE = {
              "conn-alert-wipe", "conn-timeout-wipe", "conn-rst-exhausted", "tls-rndr", "conn-reset-session",
              "c9-te-refusal", "c9-duplicate-cl", "c9-connection-names-cl", "c9-xff-strip", "c9-body-413",
              "c4-inner-src", "c4-inner-port-range", "c4-tln-dst-ip", "c4-tln-dst-port", "c4-tln-src-port-range",
-             "proxy-truncation-rst", "proxy-early-client-fin", "proxy-413-no-connect", "proxy-connect-timeout-wipe"},
+             "proxy-truncation-rst", "proxy-early-client-fin", "proxy-413-no-connect", "proxy-connect-timeout-wipe", "proxy-fin-drain"},
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
     "ct": {"ct-barrier", "ct-c1-barrier", "ct-harness-unit", "ct-harness-lint", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms",
@@ -187,7 +187,8 @@ CASES_FOR_GATE = {
              "integration", "integration-count", "integration-residue", "integration-cookie",
              "integration-pq-residue", "l8-fallback", "integration-rp-src-meter", "integration-rotation",
              "integration-expiry", "rp-cookie-gate", "integration-expiry-residue",
-             "tls-key-halt", "c8-head-wipe", "tls-scalar-scrub", "https-probe-canary", "tlskey-wipe"},
+             "tls-key-halt", "c8-head-wipe", "tls-scalar-scrub", "https-probe-canary", "tlskey-wipe",
+             "proxy-pd-backend-room", "proxy-pd-backend-rst"},
     "repro": {"repro-path-leak"},
     "mir": {"mir-target-split", "mir-env-split", "mir-debug-split", "mir-feature-split"},
     "manifest": {"manifest"},
@@ -1169,12 +1170,38 @@ CASES = {
                                                                          "            audit.halt(halt::KEY_UNAVAILABLE)\n",
                                                                          "            audit.record(Event::KeyUnavailable { code });\n"),
                      "timed out waiting for 'audit: src=tls Halted reason="),
-    # C8: the head buffer wiped on close and release; without it the
-    # closed connection's marker outlives it (the live control connection
-    # overwrites only the head's first line).
-    "c8-head-wipe": (["test", "it_boots=https residue"], lambda t: edit(t, "crates/tls-core/src/conn.rs",
-                                                                       "        wipe(&mut self.head);\n", ""),
-                     "residue: marker still in guest RAM"),
+    # C8: the head buffer wiped once rewritten (the proxy's early wipe) and
+    # on close and release; without both the marker outlives the rewrite
+    # and the connection (the barrier SYN that takes the closed slot
+    # writes no head).
+    "c8-head-wipe": (["test", "it_boots=https residue"], lambda t: (
+        edit(t, "crates/tls-core/src/conn.rs", "        wipe(&mut self.head);\n", ""),
+        edit(t, "crates/tls-core/src/conn/proxy.rs", "        wipe(&mut self.head);\n", "")),
+                     "marker still in guest RAM"),
+    # M6 plan C10 in the PD: the backend socket's free room bounds what the
+    # slot hands over; marking more as sent than fitted loses MAX_BODY
+    # (1 << 20) bytes of the POST body (or stalls it until the idle
+    # timeout resets the client).
+    "proxy-pd-backend-room": (["test", "it_boots=https"], lambda t: edit(
+        t, "crates/pds/tls/src/main.rs", "            self.slot.backend_sent(n, self.now);\n",
+        "            let _ = n;\n            self.slot.backend_sent(usize::MAX, self.now);\n"),
+                              ("https post: the POST body of 1048576 bytes reached the backend as",
+                               "https post 1048576: ")),
+    # The backend's FIN only once every byte before it went to the client
+    # (tls-core's `backend_end`; a PD-level mutation breaks the first
+    # case before this one, so the decision is red-proved where it lives).
+    "proxy-fin-drain": (["unit"], lambda t: edit(t, "crates/tls-core/src/conn/proxy.rs",
+                                                 "    if recv_queued > 0 {\n        BackendEnd::Open\n    } else if fin_seen {",
+                                                 "    if fin_seen {"),
+                        "---- tests::backend_end_waits_for_the_receive_queue_to_drain stdout ----"),
+    # The backend's close without a FIN is a truncation (RST, no
+    # close_notify); reported as its FIN, the client sees a clean end.
+    "proxy-pd-backend-rst": (["test", "it_boots=https"], lambda t: edit(
+        t, "crates/pds/tls/src/main.rs",
+        "            // Reset, refused or timed out: closed without a FIN.\n"
+        "            self.slot.backend_rst(self.out, self.now)\n",
+        "            self.slot.backend_fin(self.out, self.now)\n"),
+                             "s_client received close_notify after the backend's RST"),
     # T8: `tlskey` scrubs its stack after each TlsSign; without it the
     # scalar's copies in the dead P-256 frames (HACL's limbs: little-endian)
     # remain.

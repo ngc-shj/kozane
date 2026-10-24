@@ -44,6 +44,32 @@ pub const BAD_GATEWAY: &[u8] =
 /// Most backend bytes one [`Slot::backend_data`] call seals: one record.
 pub const BACKEND_CHUNK: usize = MAX_SERVER_RECORD;
 
+/// How the backend socket has ended, as the PD reports it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackendEnd {
+    /// Still open, or bytes before its end are not all read yet.
+    Open,
+    /// It sent its FIN and every byte before it has been handed over.
+    Fin,
+    /// Closed without a FIN: reset, refused or timed out.
+    Rst,
+}
+
+/// The backend's end, decided only once its receive queue is empty: a FIN
+/// reported while bytes are still queued would cut the response short and
+/// then close it cleanly (C10's truncation rule).
+pub fn backend_end(fin_seen: bool, recv_queued: usize, closed: bool) -> BackendEnd {
+    if recv_queued > 0 {
+        BackendEnd::Open
+    } else if fin_seen {
+        BackendEnd::Fin
+    } else if closed {
+        BackendEnd::Rst
+    } else {
+        BackendEnd::Open
+    }
+}
+
 /// A sealed record's bytes beyond its content: header, inner type, tag.
 const SEALED_OVERHEAD: usize = RECORD_HEADER_LEN + 1 + RECORD_TAG_LEN;
 /// Most bytes one call after the handshake writes to the client: our

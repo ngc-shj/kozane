@@ -265,6 +265,9 @@ pub enum Event {
     /// coalesced; `CostHighWater` bounds it). `hs` raises it: recorded, not
     /// bounded, since `key` serves `hs` alone (M6 plan C5, C12).
     KeyWaitHighWater { us: u32 },
+    /// `tls` could not reach the backend for a request (its connect refused
+    /// or reset, or the connect timeout) and answered 502 (M6 plan C10).
+    BackendUnavailable,
     /// The longest `TlsSign` call into `tlskey`, wall time, rose to a new
     /// high-water mark; `us` travels as the record's `a` (never coalesced;
     /// `CostHighWater` bounds it). `tls` raises it: the signing latency it
@@ -336,6 +339,7 @@ impl Event {
             Event::RpCookieAccepted => 0x0050,
             Event::RpCookieSuppressed => 0x0051,
             Event::Ready => 0x0053,
+            Event::BackendUnavailable => 0x0059,
             Event::RpCostHighWater { .. } => COST_HIGH_WATER,
             Event::StackHighWater { .. } => STACK_HIGH_WATER,
             Event::Halted { .. } => HALTED,
@@ -356,7 +360,7 @@ impl Event {
 
     /// Every variant except the parameterised `FrameDropped`, `TcpLimited`
     /// and `tls` kinds and the value-carrying ones (`Event::value` is `Some`).
-    pub const FIXED: [Event; 61] = [
+    pub const FIXED: [Event; 62] = [
         Event::ArpReplied,
         Event::UdpEchoed,
         Event::RingCorrupt,
@@ -418,6 +422,7 @@ impl Event {
         Event::RpCookieAccepted,
         Event::RpCookieSuppressed,
         Event::Ready,
+        Event::BackendUnavailable,
     ];
 
     /// Display name; exhaustive, so a new variant fails to compile here.
@@ -484,6 +489,7 @@ impl Event {
             Event::RpCookieAccepted => "RpCookieAccepted",
             Event::RpCookieSuppressed => "RpCookieSuppressed",
             Event::Ready => "Ready",
+            Event::BackendUnavailable => "BackendUnavailable",
             Event::RpCostHighWater { .. } => "RpCostHighWater",
             Event::StackHighWater { .. } => "StackHighWater",
             Event::Halted { .. } => "Halted",
@@ -530,6 +536,7 @@ impl Event {
             | Event::TlsClosed { .. }
             | Event::HttpRefused { .. }
             | Event::TlsTimeout { .. }
+            | Event::BackendUnavailable
             | Event::RingCorrupt
             | Event::RxNoBuffer
             | Event::TxNoBuffer
@@ -664,6 +671,7 @@ impl Event {
             Event::RpCookieAccepted => 58,
             Event::RpCookieSuppressed => 59,
             Event::Ready => 60,
+            Event::BackendUnavailable => 61,
             Event::RpCostHighWater { .. } => COST_HIGH_WATER_SLOT,
             Event::StackHighWater { .. } => STACK_HIGH_WATER_SLOT,
             Event::Halted { .. } => HALTED_SLOT,
@@ -689,7 +697,7 @@ impl Event {
     }
 }
 
-const FIXED_SLOTS: usize = 61;
+const FIXED_SLOTS: usize = 62;
 const COST_HIGH_WATER_SLOT: usize = FIXED_SLOTS + MAX_DROP_REASON as usize + 1;
 const STACK_HIGH_WATER_SLOT: usize = COST_HIGH_WATER_SLOT + 1;
 const HALTED_SLOT: usize = STACK_HIGH_WATER_SLOT + 1;

@@ -31,7 +31,7 @@ use crate::wipe;
 
 mod proxy;
 
-pub use proxy::{BACKEND_CHUNK, BAD_GATEWAY, MAX_CLIENT_OUT, Next, Outcome, Outcomes};
+pub use proxy::{BACKEND_CHUNK, BAD_GATEWAY, BackendEnd, MAX_CLIENT_OUT, Next, Outcome, Outcomes, backend_end};
 
 pub const MAX_CONNS: usize = 8;
 /// Connections one source address may hold (S17).
@@ -477,6 +477,13 @@ impl Slot {
             self.reset();
             Action::Release
         }
+    }
+
+    /// The aborted backend socket's RST is still awaited: until it is not,
+    /// the PD keeps the socket in its set and its storage unreleased (the
+    /// same C8 order as the client socket's, on the inside interface).
+    pub fn backend_rst_pending(&self) -> bool {
+        self.backend_rst.pending
     }
 
     /// The timers at `now`. A fired timeout wipes the slot and aborts it

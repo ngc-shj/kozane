@@ -851,6 +851,30 @@ fn an_open_backend_socket_must_see_its_rst_too() {
 }
 
 #[test]
+fn the_backend_rst_stays_pending_until_dispatched_or_its_passes_run_out() {
+    // A clean close aborts the backend while the client drains: the PD
+    // releases the backend socket once this turns false, not at the slot's
+    // release.
+    let (mut s, _, mut out) = streaming();
+    assert!(!s.backend_rst_pending(), "nothing aborted yet");
+    s.backend_fin(&mut out, 5 * S);
+    assert!(s.backend_rst_pending());
+    assert_eq!(s.abort_pass(Endpoint::Backend, false), Action::None);
+    assert!(s.backend_rst_pending());
+    assert_eq!(s.abort_pass(Endpoint::Backend, true), Action::None, "the client still drains");
+    assert!(!s.backend_rst_pending());
+
+    let (mut s, _, _) = streaming();
+    s.client_fin(5 * S);
+    for _ in 1..MAX_RST_PASSES {
+        s.abort_pass(Endpoint::Backend, false);
+        assert!(s.backend_rst_pending());
+    }
+    s.abort_pass(Endpoint::Backend, false);
+    assert!(!s.backend_rst_pending(), "released after pass 8 without its RST");
+}
+
+#[test]
 fn a_released_slot_is_reset_in_place_and_serves_a_new_handshake() {
     let (mut s, _, mut out) = connected_slot();
     assert_eq!(s.close(CloseCause::Error, &mut out, 3 * S), (0, Action::Abort));
@@ -1297,4 +1321,16 @@ fn events_after_the_close_do_nothing() {
     assert_eq!(s.client_fin(5 * S), Next::default());
     assert_eq!(feed(&mut s, &mut client, b"late", &mut out, 5 * S), Next::default());
     assert!(s.is_zeroized());
+}
+
+/// C10: the backend's FIN counts only once its queued bytes are read; a
+/// close without a FIN is a reset.
+#[test]
+fn backend_end_waits_for_the_receive_queue_to_drain() {
+    use crate::conn::{backend_end, BackendEnd};
+    assert_eq!(backend_end(true, 1, false), BackendEnd::Open);
+    assert_eq!(backend_end(true, 0, false), BackendEnd::Fin);
+    assert_eq!(backend_end(true, 1, true), BackendEnd::Open);
+    assert_eq!(backend_end(false, 0, true), BackendEnd::Rst);
+    assert_eq!(backend_end(false, 0, false), BackendEnd::Open);
 }

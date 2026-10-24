@@ -1,12 +1,16 @@
-//! `tls` (M6 plan C1, C3, C7, C8): the HTTPS endpoint. TCP runs in smoltcp
-//! on the IP packets `ingress` vetted (`itl`), and every segment goes back
-//! out through `ingress`'s `tls_egress` (`tli`); eight listeners on the
-//! HTTPS port, each with one connection slot of `tls_core::conn`, which
-//! holds the TLS 1.3 session and decides every timeout, close and wipe.
+//! `tls` (M6 plan C1, C3, C7, C8, C10): the HTTPS reverse proxy. TCP runs
+//! in smoltcp on two interfaces, each polling only its own sockets: the
+//! outside one on the IP packets `ingress` vetted (`itl`), every segment
+//! going back out through `ingress`'s `tls_egress` (`tli`), with eight
+//! listeners on the HTTPS port; the inside one on the backend's segments
+//! `inner` delivers (`ntl`), every segment leaving through `inner`'s check
+//! towards the backend (`tln`), with one backend socket per listener. Each
+//! listener's connection has a slot of `tls_core::conn`, which holds the
+//! TLS 1.3 session and the proxy flow and decides every timeout, close and
+//! wipe; this PD carries its events between the slot and the two sockets.
 //! The server's CertificateVerify is signed by `tlskey` (`TlsSign` over
 //! PPC, M6 plan C12); the randomness is hedged over `tlskey`'s boot seed,
-//! RNDR and CNTPCT. Until the proxy lands (plan C4, C10; slice 4) a complete request
-//! head gets a fixed response, then close_notify. Tainted (law L1).
+//! RNDR and CNTPCT. Tainted (law L1).
 
 #![no_std]
 #![no_main]
@@ -26,22 +30,27 @@ use sel4_microkit::{
 };
 use smoltcp::iface::{Config, Interface, PollIngressSingleResult, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
-use smoltcp::socket::tcp;
+use smoltcp::socket::{AnySocket, tcp};
 use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
-use tls_core::conn::{Action, CloseCause, Closed, Endpoint, HEAD_BUF_LEN, Slot, Stage, Table, Timeout};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address};
+use tls_core::conn::{
+    Action, BACKEND_CHUNK, BackendEnd, Closed, Endpoint, MAX_CLIENT_OUT, Next, Outcome, Slot, Stage, Table, Timeout,
+    backend_end,
+};
 use tls_core::halt;
-use tls_core::handshake::{Ctx, Event as TlsEvent, Signer};
+use tls_core::handshake::{Ctx, Signer};
 use tls_core::rng::{HedgeHw, Hedged, Rng, SEED_LEN};
 use tls_core::{Refusal, Secret};
 use tls_wire::{HASH_LEN, MAX_CIPHERTEXT, RECORD_HEADER_LEN};
 use zeroize::Zeroize;
 
 const INGRESS: Channel = Channel::new(ch::CH_INGRESS);
+const INNER: Channel = Channel::new(ch::CH_INNER);
 const TIMER: Channel = Channel::new(ch::CH_TIMER);
 const TLSKEY: Channel = Channel::new(ch::CH_TLSKEY);
 
-/// Connections at once (plan C10), one listener and one slot each.
+/// Connections at once (plan C10), one listener, one slot and one backend
+/// socket each.
 const MAX_CONNS: usize = tls_core::conn::MAX_CONNS;
 // One backend source port per connection at least (config validates
 // `TLS_PORTS` against the same bound, plan C3).
@@ -54,13 +63,22 @@ const RECORD_BUF: usize = RECORD_HEADER_LEN + MAX_CIPHERTEXT;
 const RX_BUF: usize = 17 * 1024;
 const _: () = assert!(RX_BUF >= RECORD_BUF);
 const TX_BUF: usize = 8 * 1024;
+/// The backend socket's buffers (plan C10, F18): the response arrives in
+/// chunks of at most `BACKEND_CHUNK`, the request leaves as fast as the
+/// backend takes it.
+const BACKEND_RX_BUF: usize = 8 * 1024;
+const BACKEND_TX_BUF: usize = 16 * 1024;
+const _: () = assert!(BACKEND_CHUNK <= BACKEND_RX_BUF);
 /// The records one call writes: at most the server's flight (ServerHello,
 /// then EncryptedExtensions, Certificate, CertificateVerify and Finished,
-/// one record each), which must also fit the empty send buffer.
+/// one record each), which must also fit the empty send buffer; after the
+/// handshake, at most `MAX_CLIENT_OUT`, written only while the send buffer
+/// has that much room.
 const OUT_BUF: usize = 8 * 1024;
 const FLIGHT_MAX: usize = config::TLS_CERT.len() + 2048;
 const _: () = assert!(FLIGHT_MAX <= OUT_BUF && FLIGHT_MAX <= TX_BUF);
-/// The largest IP packet either ring carries: Ethernet's.
+const _: () = assert!(MAX_CLIENT_OUT <= OUT_BUF && MAX_CLIENT_OUT <= TX_BUF);
+/// The largest IP packet either link carries: Ethernet's.
 const MTU: usize = 1500;
 const _: () = assert!(MTU <= layout::NET_BUF_SIZE);
 /// A listener's timeout: a handshake that never completes frees its slot
@@ -68,16 +86,11 @@ const _: () = assert!(MTU <= layout::NET_BUF_SIZE);
 /// so it is raised to the idle timeout once the connection is established.
 const LISTEN_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_TIMEOUT: Duration = Duration::from_secs(tls_core::conn::IDLE_TIMEOUT_NS / 1_000_000_000);
-/// Packets taken from `itl` per pass.
+/// Packets taken from each of `itl` and `ntl` per pass.
 const PASS_PACKETS: usize = layout::NET_BUFFERS;
 /// The static per-connection state (plan C10, F18) is bounded.
 const TLS_STATE_MAX: usize = 1 << 20;
 const _: () = assert!(core::mem::size_of::<Storage>() <= TLS_STATE_MAX);
-
-/// What a complete request head gets until the proxy lands (slice 4).
-const FIXED_RESPONSE: &[u8] =
-    b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 16\r\nConnection: close\r\n\r\nsecureos tls ok\n";
-const _: () = assert!(FIXED_RESPONSE.len() <= tls_core::handshake::MAX_SERVER_RECORD);
 
 // `audit` names the `tls` kinds from audit-event's tables, which cannot see
 // the enums they mirror; checked here, where both are visible.
@@ -160,12 +173,15 @@ const fn names_match() -> bool {
 }
 
 /// Everything too large for the stack, where the handler state lives: the
-/// sockets and their buffers, the connection slots, and the record buffers
-/// a pass works in.
+/// sockets of both interfaces and their buffers, the connection slots, and
+/// the record buffers a pass works in.
 struct Storage {
     sockets: [SocketStorage<'static>; MAX_CONNS],
     rx: [[u8; RX_BUF]; MAX_CONNS],
     tx: [[u8; TX_BUF]; MAX_CONNS],
+    backend_sockets: [SocketStorage<'static>; MAX_CONNS],
+    backend_rx: [[u8; BACKEND_RX_BUF]; MAX_CONNS],
+    backend_tx: [[u8; BACKEND_TX_BUF]; MAX_CONNS],
     /// One record taken off a socket: ciphertext, or a plaintext handshake
     /// or alert record.
     record: [u8; RECORD_BUF],
@@ -180,17 +196,36 @@ struct Storage {
 struct Static(UnsafeCell<Storage>);
 
 // SAFETY: a PD runs one thread; `init` hands each part out once, and the
-// socket buffers are reached again only through `socket_buffers`.
+// socket buffers are reached again only through `socket_buffers` and
+// `backend_buffers`.
 unsafe impl Sync for Static {}
 
 static STORAGE: Static = Static(UnsafeCell::new(Storage {
     sockets: [SocketStorage::EMPTY; MAX_CONNS],
     rx: [[0; RX_BUF]; MAX_CONNS],
     tx: [[0; TX_BUF]; MAX_CONNS],
+    backend_sockets: [SocketStorage::EMPTY; MAX_CONNS],
+    backend_rx: [[0; BACKEND_RX_BUF]; MAX_CONNS],
+    backend_tx: [[0; BACKEND_TX_BUF]; MAX_CONNS],
     record: [0; RECORD_BUF],
     out: [0; OUT_BUF],
     table: MaybeUninit::uninit(),
 }));
+
+/// Entry `i` of a per-listener buffer array in the static, through a raw
+/// place, so no reference to another listener's entry (held by its
+/// socket) is made.
+///
+/// # Safety
+/// `base` points into `STORAGE`; no other reference to entry `i` is live.
+unsafe fn entry<const N: usize>(base: *mut [[u8; N]; MAX_CONNS], i: usize) -> Option<&'static mut [u8; N]> {
+    if i >= MAX_CONNS {
+        return None;
+    }
+    // SAFETY: `i` is in bounds of the array `base` points to; exclusivity
+    // is the caller's.
+    unsafe { Some(&mut *base.cast::<[u8; N]>().add(i)) }
+}
 
 /// Listener `i`'s socket buffers, through the static.
 ///
@@ -198,39 +233,43 @@ static STORAGE: Static = Static(UnsafeCell::new(Storage {
 /// No other reference to them may be live: listener `i`'s socket was never
 /// made or has been removed from its set and dropped.
 unsafe fn socket_buffers(i: usize) -> Option<(&'static mut [u8; RX_BUF], &'static mut [u8; TX_BUF])> {
-    if i >= MAX_CONNS {
-        return None;
-    }
     let s = STORAGE.0.get();
-    // SAFETY: `i` is in bounds; raw places, so no reference to another
-    // listener's buffers (held by its socket) is made; exclusivity of these
-    // two is the caller's.
-    unsafe {
-        let rx = addr_of_mut!((*s).rx).cast::<[u8; RX_BUF]>().add(i);
-        let tx = addr_of_mut!((*s).tx).cast::<[u8; TX_BUF]>().add(i);
-        Some((&mut *rx, &mut *tx))
-    }
+    // SAFETY: the caller's; raw places into the static.
+    unsafe { Some((entry(addr_of_mut!((*s).rx), i)?, entry(addr_of_mut!((*s).tx), i)?)) }
 }
 
-/// The client RSTs this pass's transmits wrote into `tli`, by peer: how an
+/// Listener `i`'s backend socket buffers, through the static.
+///
+/// # Safety
+/// As `socket_buffers`, for listener `i`'s backend socket.
+unsafe fn backend_buffers(i: usize) -> Option<(&'static mut [u8; BACKEND_RX_BUF], &'static mut [u8; BACKEND_TX_BUF])> {
+    let s = STORAGE.0.get();
+    // SAFETY: the caller's; raw places into the static.
+    unsafe { Some((entry(addr_of_mut!((*s).backend_rx), i)?, entry(addr_of_mut!((*s).backend_tx), i)?)) }
+}
+
+/// An address and port: a client, or the backend and our source port.
+type Peer = ([u8; 4], u16);
+
+/// The RSTs this pass's transmits wrote into a link's ring, by peer: how an
 /// aborted socket's RST is observed (M6 plan C8, F-R6-2).
 #[derive(Default)]
 struct RstLog {
-    peers: [([u8; 4], u16); 2 * MAX_CONNS],
+    peers: [Peer; 2 * MAX_CONNS],
     len: usize,
 }
 
 impl RstLog {
     /// A full log drops the entry: its slot waits further passes, at most
     /// `MAX_RST_PASSES` in all.
-    fn push(&mut self, peer: ([u8; 4], u16)) {
+    fn push(&mut self, peer: Peer) {
         if let Some(e) = self.peers.get_mut(self.len) {
             *e = peer;
             self.len += 1;
         }
     }
 
-    fn contains(&self, peer: ([u8; 4], u16)) -> bool {
+    fn contains(&self, peer: Peer) -> bool {
         self.peers.get(..self.len).unwrap_or(&[]).contains(&peer)
     }
 
@@ -239,25 +278,56 @@ impl RstLog {
     }
 }
 
-/// The peer of a RST from the HTTPS port in `packet`, an IP packet smoltcp
-/// built, read with `wire`'s checked parsers.
-fn rst_peer(packet: &[u8]) -> Option<([u8; 4], u16)> {
+/// The client of a RST from the HTTPS port in `packet`, an IP packet
+/// smoltcp built, read with `wire`'s checked parsers.
+fn client_rst(packet: &[u8]) -> Option<Peer> {
     let ip = wire::parse_ipv4_packet(packet).ok()?;
     let tcp = wire::parse_tcp(&ip).ok()?;
     (tcp.flags & wire::TCP_RST != 0 && tcp.src_port == config::HTTPS_PORT).then_some((ip.dst, tcp.dst_port))
 }
 
-/// `itl` and `tli` as smoltcp's device: one IP packet per buffer.
-struct Rings {
+/// The backend and our source port of a RST to the backend in `packet`.
+fn backend_rst(packet: &[u8]) -> Option<Peer> {
+    let ip = wire::parse_ipv4_packet(packet).ok()?;
+    let tcp = wire::parse_tcp(&ip).ok()?;
+    let (backend, port) = config::BACKEND;
+    (tcp.flags & wire::TCP_RST != 0 && ip.dst == backend && tcp.dst_port == port).then_some((ip.dst, tcp.src_port))
+}
+
+/// One ring pair, one IP packet per buffer: `itl`/`tli` outside,
+/// `ntl`/`tln` inside.
+struct Link {
     rx: Rx,
     tx: Tx,
-    audit: Audit,
     packet: Buf,
     staging: Buf,
     scratch: Buf,
-    /// A segment went to `ingress` since it was last notified.
+    /// A segment went to the peer PD since it was last notified.
     sent: bool,
     rsts: RstLog,
+    /// Which transmitted RSTs `rsts` records, and under what peer.
+    rst_peer: fn(&[u8]) -> Option<Peer>,
+}
+
+impl Link {
+    fn new(rx: Rx, tx: Tx, rst_peer: fn(&[u8]) -> Option<Peer>) -> Self {
+        Self {
+            rx,
+            tx,
+            packet: [0; layout::NET_BUF_SIZE],
+            staging: [0; layout::NET_BUF_SIZE],
+            scratch: [0; layout::NET_BUF_SIZE],
+            sent: false,
+            rsts: RstLog::default(),
+            rst_peer,
+        }
+    }
+}
+
+/// A link as smoltcp's device for one poll, with the PD's audit.
+struct Dev<'a> {
+    link: &'a mut Link,
+    audit: &'a mut Audit,
 }
 
 struct RxToken<'a> {
@@ -271,6 +341,7 @@ struct TxToken<'a> {
     audit: &'a mut Audit,
     sent: &'a mut bool,
     rsts: &'a mut RstLog,
+    rst_peer: fn(&[u8]) -> Option<Peer>,
 }
 
 impl phy::RxToken for RxToken<'_> {
@@ -285,8 +356,8 @@ impl phy::TxToken for TxToken<'_> {
         let packet = self.staging.get_mut(..len.min(MTU)).unwrap_or_default();
         let r = f(packet);
         let sent = pdkit::send(self.tx, self.scratch, packet, self.audit);
-        // Only a RST that reached `tli` counts as dispatched.
-        if sent && let Some(peer) = rst_peer(packet) {
+        // Only a RST that reached the ring counts as dispatched.
+        if sent && let Some(peer) = (self.rst_peer)(packet) {
             self.rsts.push(peer);
         }
         *self.sent |= sent;
@@ -294,40 +365,34 @@ impl phy::TxToken for TxToken<'_> {
     }
 }
 
-impl Rings {
+impl Dev<'_> {
     fn tx_token(&mut self) -> TxToken<'_> {
-        TxToken {
-            tx: &mut self.tx,
-            staging: &mut self.staging,
-            scratch: &mut self.scratch,
-            audit: &mut self.audit,
-            sent: &mut self.sent,
-            rsts: &mut self.rsts,
-        }
+        let Link { tx, staging, scratch, sent, rsts, rst_peer, .. } = &mut *self.link;
+        TxToken { tx, staging, scratch, audit: self.audit, sent, rsts, rst_peer: *rst_peer }
     }
 }
 
-impl Device for Rings {
-    type RxToken<'a> = RxToken<'a>;
-    type TxToken<'a> = TxToken<'a>;
+impl Device for Dev<'_> {
+    type RxToken<'a>
+        = RxToken<'a>
+    where
+        Self: 'a;
+    type TxToken<'a>
+        = TxToken<'a>
+    where
+        Self: 'a;
 
     fn receive(&mut self, _: Instant) -> Option<(RxToken<'_>, TxToken<'_>)> {
-        let n = pdkit::recv(&mut self.rx, &mut self.packet, &mut self.audit)?;
-        let packet = self.packet.get(..n).unwrap_or(&[]);
-        let tx = TxToken {
-            tx: &mut self.tx,
-            staging: &mut self.staging,
-            scratch: &mut self.scratch,
-            audit: &mut self.audit,
-            sent: &mut self.sent,
-            rsts: &mut self.rsts,
-        };
+        let Link { rx, tx, packet, staging, scratch, sent, rsts, rst_peer } = &mut *self.link;
+        let n = pdkit::recv(rx, packet, self.audit)?;
+        let packet = packet.get(..n).unwrap_or(&[]);
+        let tx = TxToken { tx, staging, scratch, audit: self.audit, sent, rsts, rst_peer: *rst_peer };
         Some((RxToken { packet }, tx))
     }
 
     /// No buffer free: smoltcp keeps the segment and retransmits it.
     fn transmit(&mut self, _: Instant) -> Option<TxToken<'_>> {
-        match self.tx.free() {
+        match self.link.tx.free() {
             Ok(n) if n > 0 => Some(self.tx_token()),
             Ok(_) => None,
             Err(e) => {
@@ -451,6 +516,21 @@ impl HedgeHw for Hw {
     }
 }
 
+/// One listener's backend socket: opened when the slot asks to connect,
+/// aborted when it says so, released once its RST is out.
+#[derive(Clone, Copy, Default)]
+struct Backend {
+    handle: Option<SocketHandle>,
+    /// Our source port, from `TLS_PORTS`: how its RST is recognised.
+    port: u16,
+    /// The backend's FIN was seen.
+    fin: bool,
+    /// Aborted: the slot awaits its RST.
+    aborting: bool,
+    /// The aborted socket still had a 4-tuple, so a RST is due from it.
+    rst_due: bool,
+}
+
 /// One listener's socket and the connection it holds.
 #[derive(Clone, Copy, Default)]
 struct Listener {
@@ -461,30 +541,31 @@ struct Listener {
     slot: Option<usize>,
     /// The client's address and port, for matching the abort's RST once
     /// smoltcp has forgotten the 4-tuple.
-    peer: ([u8; 4], u16),
+    peer: Peer,
     /// Aborted: the slot is wiped and awaits the socket's RST.
     aborting: bool,
     /// The aborted socket still had a 4-tuple, so a RST is due from it;
     /// without one (the peer's RST or a TCP timeout closed it first)
     /// nothing will be dispatched.
     rst_due: bool,
-    /// Bytes of the request head in the slot's head buffer.
-    head_len: usize,
+    backend: Backend,
 }
 
 struct Tls {
-    rings: Rings,
-    /// The backend links (M6 plan C1): mapped, unused until the inside
-    /// interface and the proxy arrive (plan C3, C4; slice 4).
-    _to_inner: Tx,
-    _from_inner: Rx,
+    outside: Link,
+    inside: Link,
+    audit: Audit,
     iface: Interface,
     sockets: SocketSet<'static>,
+    inside_iface: Interface,
+    backend_sockets: SocketSet<'static>,
     listeners: [Listener; MAX_CONNS],
     table: &'static mut Table,
     record: &'static mut [u8; RECORD_BUF],
     out: &'static mut [u8; OUT_BUF],
     rng: Hedged<Hw>,
+    /// The next backend source port, as an offset into `TLS_PORTS`.
+    next_port: u16,
     /// The longest `TlsSign` since the last report, and its gate.
     sign_us: Option<u32>,
     sign_wait: CostHighWater,
@@ -512,6 +593,39 @@ unsafe fn listener_socket(i: usize) -> Option<tcp::Socket<'static>> {
     s.set_timeout(Some(LISTEN_TIMEOUT));
     s.listen(config::HTTPS_PORT).ok()?;
     Some(s)
+}
+
+/// A socket over listener `i`'s backend buffers, wiped first, connecting
+/// from `port` to the backend.
+///
+/// # Safety
+/// As `backend_buffers`.
+unsafe fn backend_socket(i: usize, iface: &mut Interface, port: u16) -> Option<tcp::Socket<'static>> {
+    // SAFETY: the caller's.
+    let (rx, tx) = unsafe { backend_buffers(i)? };
+    rx.zeroize();
+    tx.zeroize();
+    let mut s = tcp::Socket::new(tcp::SocketBuffer::new(&mut rx[..]), tcp::SocketBuffer::new(&mut tx[..]));
+    s.set_ack_delay(None);
+    s.set_nagle_enabled(false);
+    let (ip, backend_port) = config::BACKEND;
+    let local = IpListenEndpoint { addr: Some(IpAddress::Ipv4(Ipv4Address::from(config::INSIDE_IP))), port };
+    s.connect(iface.context(), (IpAddress::Ipv4(Ipv4Address::from(ip)), backend_port), local).ok()?;
+    Some(s)
+}
+
+/// An interface on a raw IP medium with one address. Every peer is reached
+/// through the PD on the other end of the link (`ingress` frames to the
+/// router, `inner` to the backend's neighbour entry), so the default route's
+/// gateway is never looked up.
+fn interface(dev: &mut Dev<'_>, ours: [u8; 4], seed: u64) -> Option<Interface> {
+    let mut config = Config::new(HardwareAddress::Ip);
+    config.random_seed = seed;
+    let mut iface = Interface::new(config, dev, now());
+    let ours = Ipv4Address::from(ours);
+    let mut added = false;
+    iface.update_ip_addrs(|addrs| added = addrs.push(IpCidr::new(IpAddress::Ipv4(ours), 32)).is_ok());
+    (added && iface.routes_mut().add_default_ipv4_route(ours).is_ok()).then_some(iface)
 }
 
 #[protection_domain]
@@ -553,39 +667,26 @@ fn init() -> Tls {
     // The boot seed is `tls`'s first call to `tlskey`: an Unavailable
     // `tlskey` shows here, audited once, and tls halts before listening.
     let mut rng = Hedged::new(boot_seed(&mut audit), Hw);
-    let mut seed = [0u8; 8];
-    if rng.fill(&mut seed).is_err() {
+    // One ISN seed per interface (smoltcp's PCG32, RM6-7).
+    let (mut seed, mut inside_seed) = ([0u8; 8], [0u8; 8]);
+    if rng.fill(&mut seed).is_err() || rng.fill(&mut inside_seed).is_err() {
         audit.halt(halt::RNDR);
     }
-    let mut rings = Rings {
-        rx,
-        tx,
-        audit,
-        packet: [0; layout::NET_BUF_SIZE],
-        staging: [0; layout::NET_BUF_SIZE],
-        scratch: [0; layout::NET_BUF_SIZE],
-        sent: false,
-        rsts: RstLog::default(),
-    };
-    let mut config = Config::new(HardwareAddress::Ip);
-    config.random_seed = u64::from_le_bytes(seed);
-    let mut iface = Interface::new(config, &mut rings, now());
-    let ours = Ipv4Address::from(config::OUTSIDE_IP);
-    let mut added = false;
-    iface.update_ip_addrs(|addrs| added = addrs.push(IpCidr::new(IpAddress::Ipv4(ours), 32)).is_ok());
-    // Every client is off-link: `ingress` frames every segment to the
-    // router, so the route's gateway is never looked up (raw IP medium).
-    if !added || iface.routes_mut().add_default_ipv4_route(ours).is_err() {
-        rings.audit.halt(halt::INIT_FAILED);
-    }
+    let mut outside = Link::new(rx, tx, client_rst);
+    let mut inside = Link::new(from_inner, to_inner, backend_rst);
+    let iface = interface(&mut Dev { link: &mut outside, audit: &mut audit }, config::OUTSIDE_IP, u64::from_le_bytes(seed));
+    let inside_iface =
+        interface(&mut Dev { link: &mut inside, audit: &mut audit }, config::INSIDE_IP, u64::from_le_bytes(inside_seed));
+    let (Some(iface), Some(inside_iface)) = (iface, inside_iface) else { audit.halt(halt::INIT_FAILED) };
     let st = STORAGE.0.get();
     // SAFETY: init runs once and is the only place these parts of the
-    // storage are handed out; from here the socket set owns the socket
+    // storage are handed out; from here the socket sets own the socket
     // slots, the PD the table and record buffers, for the life of the
     // system. Raw places keep the parts disjoint from the socket buffers.
-    let (slots, record, out, table) = unsafe {
+    let (slots, backend_slots, record, out, table) = unsafe {
         (
             &mut *addr_of_mut!((*st).sockets),
+            &mut *addr_of_mut!((*st).backend_sockets),
             &mut *addr_of_mut!((*st).record),
             &mut *addr_of_mut!((*st).out),
             &mut *addr_of_mut!((*st).table),
@@ -607,35 +708,38 @@ fn init() -> Tls {
         // SAFETY: no socket over listener i's buffers exists yet.
         match unsafe { listener_socket(i) } {
             Some(s) => l.handle = sockets.add(s),
-            None => rings.audit.halt(halt::INIT_FAILED),
+            None => audit.halt(halt::INIT_FAILED),
         }
     }
     // The boot seed's copies in the frames below.
     tls_core::scrub_session_stack();
-    rings.audit.ready();
+    audit.ready();
     let mut tls = Tls {
-        rings,
-        _to_inner: to_inner,
-        _from_inner: from_inner,
+        outside,
+        inside,
+        audit,
         iface,
         sockets,
+        inside_iface,
+        backend_sockets: SocketSet::new(&mut backend_slots[..]),
         listeners,
         table,
         record,
         out,
         rng,
+        next_port: 0,
         sign_us: None,
         sign_wait: CostHighWater::tls_sign(),
         unavailable: None,
         stack,
     };
-    tls.rings.audit.flush();
+    tls.audit.flush();
     tls
 }
 
-/// One whole record from `s` into `buf`, if one is complete. A header that
-/// fails its checks is taken alone, so the session refuses it at once.
-fn take_record<'b>(s: &mut tcp::Socket<'_>, buf: &'b mut [u8; RECORD_BUF]) -> Option<&'b [u8]> {
+/// The length of the next record on `s`, if it is complete. A header that
+/// fails its checks counts alone, so the session refuses it at once.
+fn complete_record(s: &mut tcp::Socket<'_>) -> Option<usize> {
     let mut head = [0u8; RECORD_HEADER_LEN];
     if s.peek_slice(&mut head).ok()? < RECORD_HEADER_LEN {
         return None;
@@ -646,150 +750,376 @@ fn take_record<'b>(s: &mut tcp::Socket<'_>, buf: &'b mut [u8; RECORD_BUF]) -> Op
         Ok(h) => RECORD_HEADER_LEN.saturating_add(h.len),
         Err(_) => RECORD_HEADER_LEN,
     };
-    if s.recv_queue() < len {
-        return None;
-    }
+    (s.recv_queue() >= len).then_some(len)
+}
+
+/// One whole record from `s` into `buf`, if one is complete.
+fn take_record<'b>(s: &mut tcp::Socket<'_>, buf: &'b mut [u8; RECORD_BUF]) -> Option<&'b [u8]> {
+    let len = complete_record(s)?;
     let n = s.recv_slice(buf.get_mut(..len)?).ok()?;
     buf.get(..n)
 }
 
-/// The client has sent its FIN.
+/// The peer has sent its FIN.
 fn fin_received(s: &tcp::Socket<'_>) -> bool {
     matches!(s.state(), tcp::State::CloseWait | tcp::State::LastAck | tcp::State::Closing | tcp::State::TimeWait)
 }
 
-/// Queues `bytes` whole on `s`, or nothing.
-fn send_all(s: &mut tcp::Socket<'_>, bytes: &[u8]) -> bool {
-    s.send_capacity().saturating_sub(s.send_queue()) >= bytes.len() && s.send_slice(bytes) == Ok(bytes.len())
+/// Free room in `s`'s send buffer.
+fn room(s: &tcp::Socket<'_>) -> usize {
+    s.send_capacity().saturating_sub(s.send_queue())
 }
 
-/// What a request head gets until the proxy lands: the fixed response, or
-/// the refusal's status (audited).
-fn response(head: &[u8], audit: &mut Audit) -> Option<&'static [u8]> {
-    let parsed = match http_wire::head_end(head) {
-        Ok(None) => return None,
-        Ok(Some(end)) => http_wire::request_head(head.get(..end).unwrap_or(head)).map(|_| ()),
-        Err(e) => Err(e),
-    };
-    Some(match parsed {
-        Ok(()) => FIXED_RESPONSE,
-        Err(e) => {
-            audit.record(Event::HttpRefused { status: e.status().index() });
-            http_wire::refusal_response(e.status())
+/// Queues `bytes` whole on `s`, or nothing.
+fn send_all(s: &mut tcp::Socket<'_>, bytes: &[u8]) -> bool {
+    room(s) >= bytes.len() && s.send_slice(bytes) == Ok(bytes.len())
+}
+
+fn record_outcome(audit: &mut Audit, o: Outcome) {
+    audit.record(match o {
+        Outcome::TlsRefused(r) => Event::TlsRefused { reason: r.code() },
+        Outcome::TlsClosed(c) => Event::TlsClosed { reason: c.code() },
+        Outcome::HttpRefused(s) => Event::HttpRefused { status: s.index() },
+        Outcome::TlsTimeout(t) => Event::TlsTimeout { stage: t.stage() },
+        Outcome::BackendUnavailable => Event::BackendUnavailable,
+    });
+}
+
+/// After a slot call that sealed records (`to_client` > 0): the record
+/// key's copies in the dead frames of the seal, from the frame that made
+/// the call (inlined, so no frame of its own sits over them).
+#[inline(always)]
+fn scrub_if_sealed(next: &Next) {
+    if next.to_client > 0 {
+        tls_core::scrub_session_stack();
+    }
+}
+
+/// One listener's connection for one pass: its slot, its client socket and
+/// what its backend socket needs.
+struct Conn<'a, 'r> {
+    i: usize,
+    l: &'a mut Listener,
+    client: &'a mut tcp::Socket<'static>,
+    slot: &'a mut Slot,
+    backends: &'a mut SocketSet<'static>,
+    inside_iface: &'a mut Interface,
+    next_port: &'a mut u16,
+    record: &'a mut [u8; RECORD_BUF],
+    out: &'a mut [u8; OUT_BUF],
+    ctx: &'a mut Ctx<'r, Hedged<Hw>, KeySigner<'r>>,
+    audit: &'a mut Audit,
+    now: u64,
+}
+
+impl Conn<'_, '_> {
+    /// The backend socket, while it carries the connection (not aborted).
+    fn backend(&mut self) -> Option<&mut tcp::Socket<'static>> {
+        let h = self.l.backend.handle.filter(|_| !self.l.backend.aborting)?;
+        Some(self.backends.get_mut::<tcp::Socket>(h))
+    }
+
+    /// Carries out what the slot asked, in `Next`'s order. A send that does
+    /// not fit (none should, given the room checks) ends the connection.
+    fn apply(&mut self, next: Next) {
+        let sent = next.to_client == 0 || send_all(self.client, self.out.get(..next.to_client).unwrap_or(&[]));
+        if next.connect {
+            self.connect();
         }
-    })
+        if next.abort_backend {
+            self.abort_backend();
+        }
+        if next.action == Action::Abort {
+            abort(self.l, self.client);
+        }
+        for o in next.outcomes.iter() {
+            record_outcome(self.audit, o);
+        }
+        if !sent {
+            let next = self.slot.error(self.now);
+            self.apply(next);
+        }
+    }
+
+    /// A backend socket from the next free port of `TLS_PORTS`; none can
+    /// be made, the backend is unavailable (502).
+    fn connect(&mut self) {
+        let (start, count) = config::TLS_PORTS;
+        let mut opened = None;
+        for _ in 0..count {
+            let port = start.wrapping_add(*self.next_port % count);
+            *self.next_port = (*self.next_port % count).wrapping_add(1);
+            // A port another backend socket still holds is skipped.
+            let held = |s: &tcp::Socket<'_>| s.local_endpoint().is_some_and(|e| e.port == port);
+            if self.backends.iter().filter_map(|(_, s)| tcp::Socket::downcast(s)).any(held) {
+                continue;
+            }
+            // SAFETY: listener i's backend socket was released (removed and
+            // dropped) before its slot could ask for another connect.
+            opened = unsafe { backend_socket(self.i, self.inside_iface, port) }.map(|s| (self.backends.add(s), port));
+            break;
+        }
+        match opened {
+            Some((handle, port)) => self.l.backend = Backend { handle: Some(handle), port, ..Backend::default() },
+            None => {
+                self.l.backend = Backend::default();
+                let next = self.slot.backend_rst(self.out, self.now);
+                scrub_if_sealed(&next);
+                self.apply(next);
+            }
+        }
+    }
+
+    /// The slot dropped the backend: its socket (if one was made) is
+    /// aborted and its RST awaited from the next transmits of the inside
+    /// interface.
+    fn abort_backend(&mut self) {
+        let b = &mut self.l.backend;
+        b.aborting = true;
+        b.rst_due = false;
+        if let Some(h) = b.handle {
+            let s = self.backends.get_mut::<tcp::Socket>(h);
+            b.rst_due = s.remote_endpoint().is_some();
+            s.abort();
+        }
+    }
+
+    /// A client record may be handed over: always during the handshake
+    /// (its flight fits the empty send buffer), afterwards only with room
+    /// for the most a call writes.
+    fn may_write(&self) -> bool {
+        self.slot.stage() == Some(Stage::Handshake) || room(self.client) >= MAX_CLIENT_OUT
+    }
+
+    /// The connection's events this pass, then its timers.
+    fn serve(&mut self) {
+        // The peer's RST or a TCP timeout closed the socket under the
+        // connection (a RST in SYN-RECEIVED puts it back to Listen, where a
+        // new client must not inherit this slot).
+        let gone = matches!(self.client.state(), tcp::State::Closed | tcp::State::Listen);
+        match self.slot.stage() {
+            Some(_) if gone => {
+                let next = self.slot.client_gone(self.now);
+                self.apply(next);
+            }
+            Some(_) => self.proxy(),
+            // Closing: close_notify or the alert drained, then (after
+            // close_notify) any inbound record, FIN or reset ends the linger.
+            None => {
+                let mut action = Action::None;
+                if self.client.send_queue() == 0 || gone {
+                    action = self.slot.drained(self.now);
+                }
+                if action == Action::None && (self.client.recv_queue() > 0 || fin_received(self.client) || gone) {
+                    action = self.slot.inbound();
+                }
+                self.apply(Next { action, ..Next::default() });
+            }
+        }
+        let next = self.slot.timers(self.now, self.out);
+        scrub_if_sealed(&next);
+        self.apply(next);
+    }
+
+    /// An open connection's events, in the order the flow needs them.
+    fn proxy(&mut self) {
+        if self.slot.stage() == Some(Stage::BackendConnect) && self.backend().is_some_and(|s| s.may_send()) {
+            let next = self.slot.backend_connected(self.now);
+            self.apply(next);
+        }
+        // Client records, each only once the bytes the last one carried for
+        // the backend have gone.
+        loop {
+            self.push_to_backend();
+            if self.slot.stage().is_none() || !self.slot.reads_client() || !self.may_write() {
+                break;
+            }
+            let Some(rec) = take_record(self.client, self.record) else { break };
+            let next = self.slot.client_record(rec, self.out, self.ctx, self.now);
+            // Secrets the session moved (Rust moves are copies that nothing
+            // wipes) and libcrux's frames, below this one.
+            tls_core::scrub_session_stack();
+            self.apply(next);
+        }
+        self.relay_backend();
+        // The client's FIN once its complete records have been read: before
+        // the response ended, so the backend is aborted with it.
+        if self.slot.stage().is_some() && fin_received(self.client) && complete_record(self.client).is_none() {
+            let next = self.slot.client_fin(self.now);
+            self.apply(next);
+        }
+    }
+
+    /// The slot's bytes for the backend into its socket's free room.
+    fn push_to_backend(&mut self) {
+        if self.slot.stage() != Some(Stage::Streaming) {
+            return;
+        }
+        let Some(h) = self.l.backend.handle.filter(|_| !self.l.backend.aborting) else { return };
+        let s = self.backends.get_mut::<tcp::Socket>(h);
+        loop {
+            let data = self.slot.to_backend();
+            if data.is_empty() {
+                return;
+            }
+            let n = s.send_slice(data).unwrap_or(0);
+            if n == 0 {
+                return;
+            }
+            self.slot.backend_sent(n, self.now);
+        }
+    }
+
+    /// The backend's bytes to the client in chunks, while the client socket
+    /// has room for each; then its FIN once every byte before it has gone,
+    /// or its close without one.
+    fn relay_backend(&mut self) {
+        let Some(h) = self.l.backend.handle.filter(|_| !self.l.backend.aborting) else { return };
+        while self.slot.stage() == Some(Stage::Streaming) && room(self.client) >= MAX_CLIENT_OUT {
+            let s = self.backends.get_mut::<tcp::Socket>(h);
+            if !s.can_recv() {
+                break;
+            }
+            let (slot, out, now) = (&mut *self.slot, &mut *self.out, self.now);
+            let next = s.recv(|data| {
+                let n = data.len().min(BACKEND_CHUNK);
+                (n, slot.backend_data(data.get(..n).unwrap_or(&[]), out, now))
+            });
+            match next {
+                Ok(next) => {
+                    scrub_if_sealed(&next);
+                    self.apply(next);
+                }
+                Err(_) => break,
+            }
+        }
+        if !matches!(self.slot.stage(), Some(Stage::BackendConnect | Stage::Streaming))
+            || room(self.client) < MAX_CLIENT_OUT
+        {
+            return;
+        }
+        let s = self.backends.get_mut::<tcp::Socket>(h);
+        self.l.backend.fin |= fin_received(s);
+        let next = match backend_end(self.l.backend.fin, s.recv_queue(), s.state() == tcp::State::Closed) {
+            BackendEnd::Fin => self.slot.backend_fin(self.out, self.now),
+            BackendEnd::Rst => self.slot.backend_rst(self.out, self.now),
+            BackendEnd::Open => return,
+        };
+        scrub_if_sealed(&next);
+        self.apply(next);
+    }
 }
 
 impl Tls {
-    /// One bounded pass: at most PASS_PACKETS segments in, every listener
-    /// served, everything due sent, then the aborted sockets whose RST went
-    /// out (or whose passes ran out) released before the next poll.
-    /// Returns the segments taken.
-    fn pass(&mut self) -> usize {
+    /// One bounded pass: at most PASS_PACKETS segments in on each link,
+    /// every connection served, everything due sent on both, then the
+    /// aborted sockets whose RST went out (or whose passes ran out)
+    /// released before the next poll of their interface. Returns the
+    /// segments taken on each link.
+    fn pass(&mut self) -> (usize, usize) {
         let t = now();
         let now_ns = cpu::now_ns();
-        self.rings.rsts.clear();
+        self.outside.rsts.clear();
+        self.inside.rsts.clear();
+        let mut out_dev = Dev { link: &mut self.outside, audit: &mut self.audit };
         self.iface.poll_maintenance(t);
-        let mut taken = 0;
-        while taken < PASS_PACKETS {
-            match self.iface.poll_ingress_single(t, &mut self.rings, &mut self.sockets) {
-                PollIngressSingleResult::None => break,
-                _ => taken += 1,
-            }
-        }
+        let taken_out = ingress(&mut self.iface, t, &mut out_dev, &mut self.sockets);
+        let mut in_dev = Dev { link: &mut self.inside, audit: &mut self.audit };
+        self.inside_iface.poll_maintenance(t);
+        let taken_in = ingress(&mut self.inside_iface, t, &mut in_dev, &mut self.backend_sockets);
         for i in 0..MAX_CONNS {
             self.serve(i, now_ns);
         }
-        self.iface.poll_egress(t, &mut self.rings, &mut self.sockets);
+        self.iface.poll_egress(t, &mut Dev { link: &mut self.outside, audit: &mut self.audit }, &mut self.sockets);
+        self.inside_iface.poll_egress(
+            t,
+            &mut Dev { link: &mut self.inside, audit: &mut self.audit },
+            &mut self.backend_sockets,
+        );
         for i in 0..MAX_CONNS {
             self.after_egress(i);
         }
         if let Some((code, reason)) = halt::after_sign(self.unavailable.take()) {
-            self.rings.audit.record(Event::KeyUnavailable { code });
-            self.rings.audit.halt(reason);
+            self.audit.record(Event::KeyUnavailable { code });
+            self.audit.halt(reason);
         }
-        taken
+        (taken_out, taken_in)
     }
 
     fn serve(&mut self, i: usize, now_ns: u64) {
-        let Tls { sockets, listeners, table, record, out, rng, rings, sign_us, unavailable, .. } = self;
+        let Tls {
+            sockets, backend_sockets, inside_iface, listeners, table, record, out, rng, audit, sign_us, unavailable, next_port, ..
+        } = self;
         let Some(l) = listeners.get_mut(i) else { return };
         if l.aborting {
             return;
         }
-        let s = sockets.get_mut::<tcp::Socket>(l.handle);
-        let audit = &mut rings.audit;
+        let client = sockets.get_mut::<tcp::Socket>(l.handle);
         let Some(k) = l.slot else {
-            match s.state() {
+            match client.state() {
                 tcp::State::Listen => {}
                 // Closed before it was seen: nothing was admitted on it.
                 tcp::State::Closed => {
-                    if s.listen(config::HTTPS_PORT).is_err() {
+                    if client.listen(config::HTTPS_PORT).is_err() {
                         audit.halt(halt::INIT_FAILED);
                     }
                 }
-                _ => admit(l, s, table, audit, now_ns),
+                _ => admit(l, client, table, audit, now_ns),
             }
             return;
         };
         let Some(slot) = table.slots.get_mut(k) else { return };
-        if s.state() == tcp::State::Established && !l.raised {
-            s.set_timeout(Some(IDLE_TIMEOUT));
+        if client.state() == tcp::State::Established && !l.raised {
+            client.set_timeout(Some(IDLE_TIMEOUT));
             l.raised = true;
         }
-        // The peer's RST or a TCP timeout closed the socket under the
-        // connection (a RST in SYN-RECEIVED puts it back to Listen, where a
-        // new client must not inherit this slot).
-        let gone = matches!(s.state(), tcp::State::Closed | tcp::State::Listen);
-        let mut action = match slot.stage() {
-            Some(_) if gone => {
-                audit.record(Event::TlsClosed { reason: Closed::PeerReset.code() });
-                slot.close(CloseCause::Error, &mut [], now_ns).1
-            }
-            Some(Stage::Handshake | Stage::Head) => {
-                let mut signer = KeySigner { sign_us, unavailable };
-                let mut ctx = Ctx { cert: config::TLS_CERT, rng, signer: &mut signer };
-                read_records(l, s, slot, record, out, &mut ctx, audit, now_ns)
-            }
-            // The backend stages arrive with the proxy (slice 4).
-            Some(Stage::BackendConnect | Stage::Streaming) => Action::None,
-            // Closing: close_notify or the alert drained, then (after
-            // close_notify) any inbound record, FIN or reset ends the linger.
-            None => {
-                let mut a = Action::None;
-                if s.send_queue() == 0 || gone {
-                    a = slot.drained(now_ns);
-                }
-                if a == Action::None && (s.recv_queue() > 0 || fin_received(s) || gone) {
-                    a = slot.inbound();
-                }
-                a
-            }
-        };
-        if action == Action::None {
-            let (a, timeout) = slot.tick(now_ns);
-            if let Some(t) = timeout {
-                audit.record(Event::TlsTimeout { stage: t.stage() });
-            }
-            action = a;
+        let mut signer = KeySigner { sign_us, unavailable };
+        let mut ctx = Ctx { cert: config::TLS_CERT, rng, signer: &mut signer };
+        Conn {
+            i,
+            l,
+            client,
+            slot,
+            backends: backend_sockets,
+            inside_iface,
+            next_port,
+            record,
+            out,
+            ctx: &mut ctx,
+            audit,
+            now: now_ns,
         }
-        if action == Action::Abort {
-            abort(l, s);
-        }
+        .serve();
     }
 
-    /// An aborted socket after the pass's transmits: its RST observed (or
-    /// none due) or its passes used up → removed, its storage wiped through
-    /// the static, the listener re-created, all before the next poll of
-    /// the outside interface (M6 plan C8, F-R5-2).
+    /// After the pass's transmits: an aborted backend socket whose RST was
+    /// observed on `tln` (or none due, or its passes used up) is removed
+    /// and its storage wiped through the static, before the next poll of
+    /// the inside interface; an aborted client socket likewise on `tli`,
+    /// its listener re-created, once the slot is released (both RSTs done;
+    /// M6 plan C8, F-R5-2, F-R7-1).
     fn after_egress(&mut self, i: usize) {
         let Some(l) = self.listeners.get_mut(i) else { return };
-        let Some(k) = l.slot.filter(|_| l.aborting) else { return };
+        let Some(k) = l.slot else { return };
         let Some(slot) = self.table.slots.get_mut(k) else { return };
-        let dispatched = !l.rst_due || self.rings.rsts.contains(l.peer);
-        if slot.abort_pass(Endpoint::Client, dispatched) != Action::Release {
+        let mut released = false;
+        if l.backend.aborting {
+            let dispatched = !l.backend.rst_due || self.inside.rsts.contains((config::BACKEND.0, l.backend.port));
+            released = slot.abort_pass(Endpoint::Backend, dispatched) == Action::Release;
+            if !slot.backend_rst_pending() {
+                release_backend(i, &mut l.backend, &mut self.backend_sockets);
+            }
+        }
+        if !released && l.aborting {
+            let dispatched = !l.rst_due || self.outside.rsts.contains(l.peer);
+            released = slot.abort_pass(Endpoint::Client, dispatched) == Action::Release;
+        }
+        if !released {
             return;
         }
+        // Never left open by a released slot (it aborts the backend before
+        // it can release); a socket left here would hold its storage.
+        release_backend(i, &mut l.backend, &mut self.backend_sockets);
         // The removed socket, and with it its borrow of the buffers, ends
         // here.
         let _ = self.sockets.remove(l.handle);
@@ -797,9 +1127,40 @@ impl Tls {
         // dropped, so nothing else holds its buffers.
         match unsafe { listener_socket(i) } {
             Some(s) => *l = Listener { handle: self.sockets.add(s), ..Listener::default() },
-            None => self.rings.audit.halt(halt::INIT_FAILED),
+            None => self.audit.halt(halt::INIT_FAILED),
         }
     }
+}
+
+/// Up to PASS_PACKETS segments from `dev` into `iface`'s sockets.
+fn ingress(iface: &mut Interface, t: Instant, dev: &mut Dev<'_>, sockets: &mut SocketSet<'static>) -> usize {
+    let mut taken = 0;
+    while taken < PASS_PACKETS {
+        match iface.poll_ingress_single(t, dev, sockets) {
+            PollIngressSingleResult::None => break,
+            _ => taken += 1,
+        }
+    }
+    taken
+}
+
+/// Listener `i`'s backend socket, if it has one, removed from its set and
+/// its storage wiped through the static (M6 plan C8; the backend path has
+/// no value unique to `tls`, so this wipe is reviewed, not red-proved,
+/// T-R7-1).
+fn release_backend(i: usize, b: &mut Backend, sockets: &mut SocketSet<'static>) {
+    if let Some(h) = b.handle.take() {
+        // The removed socket, and with it its borrow of the buffers, ends
+        // here.
+        let _ = sockets.remove(h);
+        // SAFETY: listener i's backend socket was just removed from its set
+        // and dropped, so nothing else holds its buffers.
+        if let Some((rx, tx)) = unsafe { backend_buffers(i) } {
+            rx.zeroize();
+            tx.zeroize();
+        }
+    }
+    *b = Backend::default();
 }
 
 /// A connection leaving Listen gets a slot, or is refused (per-source cap)
@@ -809,7 +1170,6 @@ fn admit(l: &mut Listener, s: &mut tcp::Socket<'_>, table: &mut Table, audit: &m
     let IpAddress::Ipv4(addr) = ep.addr;
     let source = addr.octets();
     l.peer = (source, ep.port);
-    l.head_len = 0;
     match table.admit(source, now_ns) {
         Ok(k) => l.slot = Some(k),
         Err(refusal) => {
@@ -828,83 +1188,6 @@ fn abort(l: &mut Listener, s: &mut tcp::Socket<'_>) {
     l.rst_due = s.remote_endpoint().is_some();
     s.abort();
     l.aborting = l.slot.is_some();
-    l.head_len = 0;
-}
-
-/// Every complete record on `s` through the slot's session, the server's
-/// records into the socket, the head collected; a complete head answered,
-/// then close_notify. Returns the slot's action.
-#[allow(clippy::too_many_arguments)]
-fn read_records<R: Rng, S: Signer>(
-    l: &mut Listener,
-    s: &mut tcp::Socket<'_>,
-    slot: &mut Slot,
-    record: &mut [u8; RECORD_BUF],
-    out: &mut [u8; OUT_BUF],
-    ctx: &mut Ctx<'_, R, S>,
-    audit: &mut Audit,
-    now_ns: u64,
-) -> Action {
-    while slot.stage().is_some() {
-        let Some(rec) = take_record(s, record) else { break };
-        let r = slot.on_record(rec, out, ctx, now_ns);
-        // Secrets the session moved (Rust moves are copies that nothing
-        // wipes) and libcrux's frames, below this one.
-        tls_core::scrub_session_stack();
-        match r {
-            Ok(step) => {
-                if !send_all(s, out.get(..step.written).unwrap_or(&[])) {
-                    audit.record(Event::TlsClosed { reason: Closed::Error.code() });
-                    return slot.close(CloseCause::Error, &mut [], now_ns).1;
-                }
-                match step.event {
-                    TlsEvent::AppData(n) => {
-                        l.head_len = l.head_len.saturating_add(slot.append_head(n, l.head_len));
-                        let head = slot.head.get(..l.head_len.min(HEAD_BUF_LEN)).unwrap_or(&[]);
-                        if let Some(resp) = response(head, audit) {
-                            return respond(s, slot, resp, out, audit, now_ns);
-                        }
-                    }
-                    TlsEvent::CloseNotify => {
-                        audit.record(Event::TlsClosed { reason: Closed::ClientClosed.code() });
-                        return slot.close(CloseCause::ClientClosed, &mut [], now_ns).1;
-                    }
-                    TlsEvent::None | TlsEvent::Flight | TlsEvent::Connected => {}
-                }
-            }
-            Err(failed) => {
-                // The alert is sealed and the slot wiped: transmit, then
-                // drain and abort.
-                audit.record(Event::TlsRefused { reason: failed.refusal.code() });
-                send_all(s, out.get(..failed.written).unwrap_or(&[]));
-                return Action::None;
-            }
-        }
-    }
-    // The client's FIN before a complete head.
-    if slot.stage().is_some() && fin_received(s) {
-        audit.record(Event::TlsClosed { reason: Closed::ClientClosed.code() });
-        return slot.close(CloseCause::ClientClosed, &mut [], now_ns).1;
-    }
-    Action::None
-}
-
-/// The response `tls` generated itself, in full, then close_notify (C10:
-/// sealed into the socket, keys and buffers wiped, then transmitted).
-fn respond(s: &mut tcp::Socket<'_>, slot: &mut Slot, resp: &[u8], out: &mut [u8], audit: &mut Audit, now_ns: u64) -> Action {
-    let sealed = slot.seal_app(resp, out);
-    // The record key's copies in the dead frames of the seal.
-    tls_core::scrub_session_stack();
-    let sent = sealed.is_ok_and(|n| send_all(s, out.get(..n).unwrap_or(&[])));
-    if !sent {
-        audit.record(Event::TlsClosed { reason: Closed::Error.code() });
-        return slot.close(CloseCause::Error, &mut [], now_ns).1;
-    }
-    let (n, action) = slot.close(CloseCause::SelfResponse, out, now_ns);
-    tls_core::scrub_session_stack();
-    audit.record(Event::TlsClosed { reason: Closed::SelfResponse.code() });
-    send_all(s, out.get(..n).unwrap_or(&[]));
-    action
 }
 
 struct Pass<'a> {
@@ -913,37 +1196,40 @@ struct Pass<'a> {
 
 impl ring::pass::Pass for Pass<'_> {
     fn serve(&mut self) -> bool {
-        let n = self.tls.pass();
-        any_full(&[n], PASS_PACKETS)
+        let (outside, inside) = self.tls.pass();
+        any_full(&[outside, inside], PASS_PACKETS)
     }
 
     fn end_pass(&mut self) {
-        if core::mem::take(&mut self.tls.rings.sent) {
+        if core::mem::take(&mut self.tls.outside.sent) {
             INGRESS.notify();
         }
-        self.tls.rings.audit.flush();
+        if core::mem::take(&mut self.tls.inside.sent) {
+            INNER.notify();
+        }
+        self.tls.audit.flush();
     }
 }
 
 impl Handler for Tls {
     type Error = Infallible;
 
-    /// A notification from `ingress` or the 1 Hz timer: both run the
-    /// passes, the timer's for the connection timers and smoltcp's
+    /// A notification from `ingress`, `inner` or the 1 Hz timer: each runs
+    /// the passes, the timer's for the connection timers and smoltcp's
     /// retransmissions and timeouts.
     fn notified(&mut self, channels: ChannelSet) -> Result<(), Self::Error> {
         run_passes(&mut Pass { tls: self });
         if let Some(us) = self.sign_us.take() {
-            let audit = &mut self.rings.audit;
+            let audit = &mut self.audit;
             self.sign_wait.observe_with(us, |ev| audit.record_delivered(ev));
         }
         if channels.contains(TIMER) {
-            let audit = &mut self.rings.audit;
+            let audit = &mut self.audit;
             self.stack.deeper_with(|hw, _| {
                 audit.record_delivered(Event::StackHighWater { bytes: u32::try_from(hw).unwrap_or(u32::MAX) })
             });
         }
-        self.rings.audit.flush();
+        self.audit.flush();
         Ok(())
     }
 }

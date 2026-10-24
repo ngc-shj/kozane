@@ -631,3 +631,165 @@ Decisions recorded from the two reports:
   harness over a fixed request line and 16 field bytes (at most 2 fields).
   Transfer-Encoding, duplicate Content-Length and Content-Length values are
   covered by unit tests and bolero. KANI-HTTP-WIRE 4 → 7.
+
+## Slice 4 part 3: the proxy in the PD (C3 inside, C8, C10)
+
+Gates run by the implementer (each exit 0): make pins, lint, lint-pds,
+unit, laws, image; tests/tools test_check_selftest, test_harness_signals,
+test_stack_headroom. Not run (by the slice's rules): Kani, Verus, make
+test/check, QEMU/run.py, check-selftest, ct, ct-shape, mir, bolero. Every
+integration case and `test`-gate selftest case below is unrun; every one
+of the 192 selftest injections finds its anchor exactly once (checked on a
+copy). Root Cargo.lock unchanged.
+
+Decisions:
+
+- **`BackendUnavailable` is a fixed, coalesced audit kind, code 0x0059**
+  (FIXED 61 → 62, its own counter slot): attacker-drivable (a backend kept
+  down), so coalesced like the other `tls` kinds. `audit` names fixed kinds
+  through `Event::name`; no audit PD change was needed.
+- **`Slot::backend_rst_pending()`** (tls-core, unit-tested): a clean close
+  aborts the backend while the client still drains close_notify, so the PD
+  removes the backend socket and wipes its storage when the backend's RST
+  wait ends, not only at the slot's Release. The decision (dispatched, or
+  eight passes) stays `conn`'s.
+- **One device type over both links.** `Link` holds a ring pair, its
+  buffers and its own RST log; `Dev` lends it to one poll together with
+  the PD's single `Audit` (moved out of the outside device). The outside
+  log records client RSTs from the HTTPS port by client; the inside log
+  records RSTs to the backend by (backend address, our source port).
+- **Inside interface:** `INSIDE_IP`/32 with a default route to itself (as
+  outside: `inner` frames every segment to the backend's neighbour entry);
+  its own ISN seed from the hedged RNG. Backend sockets: rx 8 KiB, tx
+  16 KiB, Nagle and delayed ACK off, no smoltcp timeout (the slot's
+  connect, idle and lifetime timers bound them); the local address is
+  given explicitly.
+- **Ports:** round-robin over `TLS_PORTS`, skipping a port another backend
+  socket still holds. A socket that cannot be made is the backend being
+  unavailable: `backend_rst` in BackendConnect, so 502.
+- **Flow control:** a client record is handed over only while
+  `reads_client()`, and after the handshake only with `MAX_CLIENT_OUT` free
+  on the client socket (during the handshake the flight fits the empty
+  buffer, checked as before). Backend chunks, the backend's FIN and its
+  close without one wait for the same room. `timers` runs every pass,
+  ungated: it writes only in BackendConnect (502), when nothing else is
+  queued; a send that does not fit becomes `error()` (a client RST).
+- **Backend events:** connected = `may_send()` (Established or CloseWait,
+  so a backend that FINs right after connecting ends with close_notify
+  after an empty response rather than a 502); the FIN is remembered when
+  seen; the FIN and a close without one (RST, refused connect, smoltcp
+  timeout: state Closed) are reported only once the receive queue is
+  empty, so bytes received before a RST still reach the client before its
+  RST. The client's FIN is reported only with no complete record waiting.
+- **Stack scrubs:** after every client record (as before), and after every
+  other slot call that sealed records (`to_client` > 0: backend chunks,
+  close_notify, a 502), from the calling frame through an inlined helper.
+  They replace the slice-3b scrubs after the fixed response and its
+  close_notify, which are gone with the fixed-response path.
+- **413 without connect at PD level** has no PD control of its own: the
+  PD opens a backend socket only on `Next.connect`, the head-time decision
+  is `conn`'s (proxy-413-no-connect); the integration case asserts the
+  backend's connection count unchanged. The backend socket's storage wipe
+  stays the declared gap (T-R7-1), one call site (`release_backend`).
+
+run.py:
+
+- **Inside NIC on a tap (`tapi0`) for the https boots only**: the kernel
+  end is the backend host (neighbors[0]: 10.99.0.2, its MAC), the
+  gateway's inside MAC static; `net.ipv4.ip_forward` is read and must be 0
+  (not written). The VPN boots and the tls-key-failure boot keep the dgram
+  inside host. check_harness_matches_config gains `gateway.backend`.
+- **Raw backend:** a listener thread and one thread per connection, which
+  owns the socket; the test's sends, FIN and SO_LINGER-0 reset are queued
+  to that thread (a close from another thread while it blocks in a read
+  would not send the RST). Each connection logs its peer, every byte, and
+  how it ended. Unheld connections get `backend_response` once the request
+  is complete (GET: a 24.7 KB binary body, six server records, so its FIN
+  arrives while earlier bytes still wait for client room; POST: the body
+  echoed, its SHA-256 above 16 KiB), then FIN.
+- **Exact-byte requests from Python's ssl** (OpenSSL 3.5.7's default
+  groups offer an X25519MLKEM768 key share; checked against s_server
+  without HelloRetryRequest), verifying the dev CA and the IP name.
+  s_client and curl stay for case 1 (negotiated group, chain, name), the
+  probe and case 13's `-msg` output.
+- **Case 2:** the backend's bytes compared with a literal of `rewrite`'s
+  output for a head carrying every dropped field kind; POST bodies of 0, 1
+  and MAX_BODY bytes followed by a pipelined request must arrive as
+  exactly the rewritten head and the body (timeout: the 120 s lifetime);
+  MAX_BODY + 1 through curl `-H 'Expect:'` must answer 413 (curl may also
+  report its upload cut short), audit `HttpRefused(413) total=1`, no
+  backend connection.
+- **Case 5:** the spoofed `Forwarded` is not refused (http-wire drops it):
+  its "status" is 200 with the field absent from the backend log. Each
+  refusal is followed by a valid request that must be the backend's only
+  new connection.
+- **Case 6** also has the allow side (a head of exactly 8 KiB proxied).
+- **Case 13:** s_client `-msg` must end its read with `read:errno=104`
+  and print no received close_notify (checked in one wait, so a hidden
+  truncation fails by name), and the sniffer must see the server's RST;
+  the client FIN is a TCP FIN without close_notify (`SSLSocket.shutdown`)
+  after the response started, and the backend must see ECONNRESET.
+- **https-residue barriers on the backend log (C8):** connection A's head
+  (with the Keep-Alive marker) and first body part logged → scan: both
+  handshake secrets and the marker absent (the head is wiped once
+  rewritten), client secret 0 present; `k`, the second part logged → client
+  secret 0 absent, 1 present; `K`, the third part logged and the backend's
+  first response bytes received (sent after our KeyUpdate) → server secret
+  0 and client secret 1 absent, server secret 1 and client secret 2
+  present; then the backend finishes, the abort RST and the barrier SYN →
+  every secret form of A and the marker absent. The control B is opened
+  only after the third scan (its idle timeout and lifetime, read from the
+  Rust source, must not pass before the last scan; checked by name) and
+  held in response streaming. **B's own marker is asserted absent**, not
+  present: with the head wiped at rewrite (part 2's decision) a live
+  connection's marker no longer exists in `tls`, so the "marker present"
+  control the plan describes cannot exist without undoing that wipe; the
+  scan's control is B's CLIENT_TRAFFIC_SECRET_0. Both markers must be
+  absent from the backend log. Body parts avoid s_client's command
+  letters (each write's first byte).
+- **test_harness_signals:** its teardown-on-entry fixture executes every
+  real teardown; its environment gains `backend` and `inside` (None).
+- INTEGRATION-CASES 60 → 70: https proxy rewrite, https post bodies,
+  https body 413 at head time, https smuggling refused, https head 431,
+  https backend reset truncates, https client fin aborts backend, https
+  residue handshake secrets, https residue client key update, https
+  residue server key update.
+
+Selftest (manifest has no per-case key):
+
+- `c8-head-wipe` also removes the proxy's early head wipe; its needle is
+  now "marker still in guest RAM" (the first scan that sees it, any
+  connection).
+- New `test` cases on boot `https` (unproven, QEMU not run):
+  `proxy-pd-backend-room` (the PD marks more as sent than the backend
+  socket took), `proxy-pd-fin-drain` (FIN reported with bytes still
+  queued), `proxy-pd-backend-rst` (a close without FIN reported as a FIN),
+  `proxy-pd-client-fin` (the client's FIN not reported).
+
+Manifest: UNIT-TESTS 1200 → 1202, UNIT-AUDIT-EVENT 47 → 48,
+UNIT-TLS-CORE 94 → 95, INTEGRATION-CASES 60 → 70.
+
+### Slice 4 part 3 verification (orchestrator)
+
+- ct-harness's lock needed the `http-wire` edge the C10 merge added (its
+  own lock); `make package` depends on it.
+- Integration `https` + `https residue`: 21/21 through the proxy (backend
+  bytes exact, POST bodies, 413 at head time, smuggling refusals, 431,
+  backend reset truncation, client FIN abort, residue via backend-log
+  barriers).
+- **The `ip_forward` check is removed.** `/proc/sys` is read-only in the
+  container (in the test netns too), so it can be neither set nor relied
+  on. The control that "nothing reaches the backend around the gateway"
+  is the backend's peer-address assertion (every peer is the inside IP);
+  client and backend share the netns, so a bypass would show another
+  peer.
+- **Two PD-level selftest cases replaced.** `proxy-pd-client-fin` and
+  `proxy-pd-fin-drain` mutated code every normal close uses, so the first
+  case failed before theirs. The early-client-FIN decision is red-proved
+  in tls-core (`proxy-early-client-fin`). The FIN-after-drain decision
+  moved into tls-core as `backend_end`, red-proved by `proxy-fin-drain`.
+  The PD calling these on every close is shown by every integration case
+  that closes normally.
+- `c8-head-wipe` went red with its needle when run alone; its one failure
+  inside a batch was the residue boot's first slowloris connect timing out
+  (not reproduced; to be diagnosed if it recurs).

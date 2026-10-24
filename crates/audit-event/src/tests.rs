@@ -180,7 +180,8 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::RpCookieReplySent
         | Event::RpCookieAccepted
         | Event::RpCookieSuppressed
-        | Event::Ready => true,
+        | Event::Ready
+        | Event::BackendUnavailable => true,
         Event::FrameDropped { .. }
         | Event::TcpLimited { .. }
         | Event::TlsRefused { .. }
@@ -196,7 +197,7 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::TlsSignHighWater { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
-    assert_eq!(Event::FIXED.len(), 61);
+    assert_eq!(Event::FIXED.len(), 62);
 }
 
 #[test]
@@ -281,7 +282,8 @@ fn decode_classifies_fixed_dropped_and_unknown_codes() {
     assert_eq!(decode(0x0056), Decoded::KeyStackHighWater);
     assert_eq!(decode(0x0057), Decoded::KeyWaitHighWater);
     assert_eq!(decode(0x0058), Decoded::TlsSignHighWater);
-    assert_eq!(decode(0x0059), Decoded::Unknown);
+    assert_eq!(decode(0x0059), Decoded::Fixed(Event::BackendUnavailable));
+    assert_eq!(decode(0x005a), Decoded::Unknown);
 }
 
 #[test]
@@ -664,4 +666,18 @@ fn tls_sign_high_water_carries_microseconds_and_is_gated_like_the_cost() {
     let mut hw = CostHighWater::tls_sign();
     let got: Vec<Event> = [1_000, 1_100, 1_125].into_iter().filter_map(|us| hw.observe(us)).collect();
     assert_eq!(got, [Event::TlsSignHighWater { us: 1_000 }, Event::TlsSignHighWater { us: 1_125 }]);
+}
+
+#[test]
+fn backend_unavailable_is_coalesced_on_its_own_counter() {
+    // M6 plan C10: an attacker can drive it (a backend kept down), so it
+    // is coalesced, on a slot of its own (the first drop reason's follows
+    // the fixed ones).
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::FrameDropped { reason: 0 }, 1, &mut out);
+    run(&mut c, Event::BackendUnavailable, 65, &mut out);
+    let got: Vec<_> = out.iter().map(|r| (r.code, r.a)).collect();
+    assert_eq!(got, [(FRAME_DROPPED_BASE, 1), (0x0059, 1), (0x0059, 65)]);
+    assert_eq!(Event::BackendUnavailable.name(), "BackendUnavailable");
 }
