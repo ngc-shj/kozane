@@ -1,6 +1,6 @@
 //! Constant-time comparison shared by every crate that checks a tag, MAC,
 //! cookie or Finished value in hand-written code (`wg-core`, `tpm2`,
-//! `key-core`, `tls-core`). A leaf crate so a caller gains no other edge.
+//! `tlskey-core`, `tls-core`). A leaf crate so a caller gains no other edge.
 
 #![no_std]
 #![forbid(unsafe_code)]

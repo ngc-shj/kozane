@@ -23,8 +23,8 @@ policy := policy/laws.toml
 loader := $(BUILD)/loader.img
 counts := $(BUILD)/counts
 
-pds := eth-out eth-in ingress audit timer tpm key hs inner data pq pqkey tls
-host_crates := wire ring audit-event ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct
+pds := eth-out eth-in ingress audit timer tpm key hs inner data pq pqkey tls tlskey
+host_crates := wire ring audit-event ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct limits tlskey-core
 kani_crates := wire ring ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire
 
 .PHONY: clean-counts
@@ -83,8 +83,14 @@ $(BUILD)/pq-secrets-placeholder.bin:
 	mkdir -p $(BUILD)
 	head -c 16384 /dev/zero > $@
 
+# Same for the tlskey secrets region (`tlskey` is Unavailable on it, and
+# `tls` halts before listening; M6 plan C12).
+$(BUILD)/tls-secrets-placeholder.bin:
+	mkdir -p $(BUILD)
+	head -c 4096 /dev/zero > $@
+
 # The laws checker runs on the exact file handed to the Microkit tool.
-image: pds kernel-config $(BUILD)/secrets-placeholder.bin $(BUILD)/pq-secrets-placeholder.bin
+image: pds kernel-config $(BUILD)/secrets-placeholder.bin $(BUILD)/pq-secrets-placeholder.bin $(BUILD)/tls-secrets-placeholder.bin
 	cargo run --locked -q -p laws -- check --system $(system) --policy $(policy) --search-path $(BUILD)
 	$(MICROKIT_SDK)/bin/microkit $(system) \
 		--search-path $(BUILD) \
@@ -93,14 +99,15 @@ image: pds kernel-config $(BUILD)/secrets-placeholder.bin $(BUILD)/pq-secrets-pl
 		-r $(BUILD)/report.txt \
 		-o $(loader)
 
-# The published image, its boot descriptor and the two blobs sealed to one
-# TPM's SRK and the image's PCR 8 (M5 plan C8, C11); tools/package builds the
-# same system with only the secrets prefill_paths changed and refuses
-# anything else, and any kernel but a release one (M5 plan C7):
+# The published image, its boot descriptor and the three blobs sealed to
+# one TPM's SRK and the image's PCR 8 (M5 plan C8, C11, M6 plan C12);
+# tools/package builds the same system with only the secrets prefill_paths
+# changed and refuses anything else, and any kernel but a release one (M5
+# plan C7):
 # `make package MICROKIT_CONFIG=release ...`.
 ifneq ($(filter package,$(MAKECMDGOALS)),)
-ifeq ($(and $(SECRETS),$(PQ_SECRETS),$(SRK_PUBLIC),$(OUT)),)
-$(error package: set SECRETS=<blob> PQ_SECRETS=<blob> SRK_PUBLIC=<tpm2b_public> OUT=<dir>)
+ifeq ($(and $(SECRETS),$(PQ_SECRETS),$(TLS_SECRETS),$(SRK_PUBLIC),$(OUT)),)
+$(error package: set SECRETS=<blob> PQ_SECRETS=<blob> TLS_SECRETS=<blob> SRK_PUBLIC=<tpm2b_public> OUT=<dir>)
 endif
 endif
 # tools/package also runs tools/ct-shape (identity, forbidden, shape,
@@ -108,7 +115,8 @@ endif
 # pass record for it on a non-debug kernel (M4 plan C11), so `make ct` must
 # have passed.
 package: image ct-harness
-	tools/package --secrets $(SECRETS) --pq-secrets $(PQ_SECRETS) --srk-public $(SRK_PUBLIC) --out $(OUT) \
+	tools/package --secrets $(SECRETS) --pq-secrets $(PQ_SECRETS) --tls-secrets $(TLS_SECRETS) \
+		--srk-public $(SRK_PUBLIC) --out $(OUT) \
 		--system $(system) --policy $(policy) \
 		--image $(loader) --gen-config $(sdk_config_dir)/include/kernel/gen_config.h \
 		--search-path $(BUILD) --board $(MICROKIT_BOARD) --config $(MICROKIT_CONFIG) \
@@ -361,7 +369,7 @@ $(BUILD)/u-boot-%/u-boot.bin: support/u-boot/secureos.config support/u-boot/boot
 # M5 plan C13: hybrid-signed releases with dev keys (residual RM5-1).
 #   make release-keys KEYS=<new dir outside the repo and cache volumes>
 #   make release KEYS=<dir> PKG=<package OUT> OUT=<new dir>
-#   make release-verify PUB=<keys dir> REL=<release dir> [ENVELOPE=<file> KIND=key|pq]
+#   make release-verify PUB=<keys dir> REL=<release dir> [ENVELOPE=<file> KIND=key|pq|tls]
 release_bin := $(BUILD)/release/target/release/release
 .PHONY: release-tool release-keys release release-verify
 release-tool:

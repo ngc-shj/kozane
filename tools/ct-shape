@@ -82,11 +82,11 @@ OBJDUMP = "aarch64-none-elf-objdump"
 CXXFILT = "c++filt"
 
 # (ELF, root): McEliece's two entry points (M4 plan C10), and the envelope
-# open `key` and `pqkey` run on the unsealed KEK (M5 plan I10.3), which the
-# C9 residue harness scans.
+# open the key PDs (`key`, `pqkey` and, since M6 plan C12, `tlskey`) run on
+# the unsealed KEK (M5 plan I10.3), which the C9 residue harness scans.
 OPEN_ROOT = "tpm2::envelope::open_sealed"
 ROOTS = [("pd-pqkey.elf", "mce460896::decaps"), ("pd-pq.elf", "mce460896::encaps_attempt"),
-         ("pd-key.elf", OPEN_ROOT), ("pd-pqkey.elf", OPEN_ROOT)]
+         ("pd-key.elf", OPEN_ROOT), ("pd-pqkey.elf", OPEN_ROOT), ("pd-tlskey.elf", OPEN_ROOT)]
 # Identity-only roots (M6 plan C7, T-R5-1, T-R6-1): the hybrid exchange
 # `tls` ships, by its non-generic inner function, and the stack scrub after
 # it, both scanned by the C9 residue harness. Not forbidden-scanned and not

@@ -1,7 +1,7 @@
 //! The TPM side of sealed secrets (M5 plan C10, C11): the client half of the
 //! salted policy session that unseals an envelope's KEK ([`client`]), the
 //! envelope format with its offline sealing ([`envelope`]), the primitives
-//! both use ([`crypto`]), and the unseal `key` and `pqkey` run at boot over
+//! both use ([`crypto`]), and the unseal the key PDs run at boot over
 //! PPC to `tpm` ([`boot`]). The marshalling and the `tpm` PD's
 //! gate are `tpm2_wire`'s.
 //!

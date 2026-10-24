@@ -1,9 +1,10 @@
 //! TPM driver PD (M5 plan C9, laws L1/L5): passive, untainted, the only PD
-//! that maps the TPM's TIS page (locality 0), and callee of `key` and
-//! `pqkey` alone. Each call carries one TPM command (`layout::tpm`); the
-//! `tpm2_wire` gate decides whether it reaches the device: the allowlist,
-//! per-client handle ownership (L2 between the two key domains), one flow
-//! per client, and the cap of PCR 8 once both clients sent Done or Failed.
+//! that maps the TPM's TIS page (locality 0), and callee of the key PDs
+//! (`key`, `pqkey`, `tlskey`) alone. Each call carries one TPM command
+//! (`layout::tpm`); the `tpm2_wire` gate decides whether it reaches the
+//! device: the allowlist, per-client handle ownership (L2 between the key
+//! domains), one flow per client and one flow at a time (Busy), and the
+//! cap of PCR 8 once every client sent Done or Failed.
 //! The TIS FIFO is polled with bounded CNTPCT timeouts, so a device that
 //! stops answering gets the caller an error reply, never a hang. No audit
 //! channel and no console: what happened shows in the clients' replies.
@@ -17,12 +18,13 @@ use layout::tpm::{self as ipc, MSG_BYTES, MSG_WORDS};
 use sel4_microkit::{
     Channel, Handler, Infallible, MessageInfo, protection_domain, var, with_msg_regs, with_msg_regs_mut,
 };
-use tpm2_wire::gate::{Gate, Refusal, State};
+use tpm2_wire::gate::{CLIENTS, Gate, Refusal};
 
 const _: () = assert!(MSG_BYTES == tpm2_wire::IPC_MSG_BYTES);
 
 const KEY: Channel = Channel::new(ipc::CH_KEY);
 const PQKEY: Channel = Channel::new(ipc::CH_PQKEY);
+const TLSKEY: Channel = Channel::new(ipc::CH_TLSKEY);
 
 /// The gate's client index of each caller.
 fn client(channel: Channel) -> Option<usize> {
@@ -30,10 +32,13 @@ fn client(channel: Channel) -> Option<usize> {
         Some(0)
     } else if channel == PQKEY {
         Some(1)
+    } else if channel == TLSKEY {
+        Some(2)
     } else {
         None
     }
 }
+const _: () = assert!(CLIENTS == 3);
 
 // TIS registers of locality 0 (TCG PC Client Platform TPM Profile, TIS).
 const ACCESS: usize = 0x00;
@@ -185,7 +190,7 @@ impl Tis {
     }
 }
 
-/// RSP_REFUSED's arg.
+/// RSP_REFUSED's arg. Busy is never a refusal: it is answered RSP_BUSY.
 fn refusal_code(r: Refusal) -> usize {
     match r {
         Refusal::UnknownClient => 1,
@@ -196,6 +201,7 @@ fn refusal_code(r: Refusal) -> usize {
         Refusal::Repeated => 6,
         Refusal::NotOwned => 7,
         Refusal::Hierarchy => 8,
+        Refusal::Busy => 9,
     }
 }
 
@@ -232,17 +238,12 @@ impl Tpm {
     }
 
     fn command(&mut self, client: usize, len: usize) -> u64 {
-        // One flow at a time (swtpm, like small TPMs, holds three transient
-        // objects; two flows need four). Only a client that has not started
-        // waits, so a started flow always runs to its end. This can only
-        // refuse more than the gate does, never forward more.
-        let other = 1usize.saturating_sub(client);
-        if self.gate.state(client) == Some(State::Fresh) && self.gate.state(other) == Some(State::Unsealing) {
-            return ipc::label(ipc::RSP_BUSY, 0);
-        }
         let cmd = self.cmd.get(..len).unwrap_or(&[]);
         let fwd = match self.gate.command(client, cmd) {
             Ok(fwd) => fwd,
+            // One flow at a time (the gate's rule, M6 plan C12): the client
+            // has not started and asks again (tpm2::boot), never refused.
+            Err(Refusal::Busy) => return ipc::label(ipc::RSP_BUSY, 0),
             Err(r) => return ipc::label(ipc::RSP_REFUSED, refusal_code(r)),
         };
         match self.tis.transact(cmd, &mut self.rsp) {
@@ -254,7 +255,7 @@ impl Tpm {
         }
     }
 
-    /// Once both clients have finished: the one PCR_Extend the gate issues.
+    /// Once every client has finished: the one PCR_Extend the gate issues.
     /// The gate refuses every Unseal from here whatever the device answers;
     /// the device's PCR 8 is what closes RM5-5's window, so the extend is
     /// confirmed by the TPM's own response and retried on a transient
@@ -312,7 +313,7 @@ impl Handler for Tpm {
             0
         };
         // Every register past the reply is overwritten, so nothing of an
-        // earlier, longer reply (the other client's) is handed back.
+        // earlier, longer reply (another client's) is handed back.
         with_msg_regs_mut(|mrs| {
             for (dst, src) in mrs.iter_mut().zip(words.iter()) {
                 *dst = *src;

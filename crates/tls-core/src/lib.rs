@@ -2,7 +2,7 @@
 //! exchange, the key schedule and record protection over libcrux
 //! primitives only; the handshake state machine; the connection slots with
 //! their timers and close sequencing. The parsing and serializing is
-//! `tls-wire`'s; the PD wires rings, smoltcp and `key` to this.
+//! `tls-wire`'s; the PD wires rings, smoltcp and `tlskey` to this.
 //!
 //! - [`hybrid`]: X25519MLKEM768 ([`HybridSecret`], L14).
 //! - [`schedule`]: RFC 8446 section 7.1 over HKDF-SHA256.
@@ -10,6 +10,7 @@
 //! - [`handshake`]: the server state machine ([`handshake::Session`]).
 //! - [`rng`]: the hedged randomness seam.
 //! - [`conn`]: slots, timeouts, per-source cap, close and wipe sequencing.
+//! - [`halt`]: the PD's halt reasons, and the halt a refused sign ends in.
 
 #![no_std]
 #![deny(
@@ -25,6 +26,7 @@
 extern crate std;
 
 pub mod conn;
+pub mod halt;
 pub mod handshake;
 pub mod hybrid;
 pub mod record;

@@ -12,7 +12,7 @@ publish = false
 
 [dependencies]
 mce460896 = { path = "../../crates/mce460896" }
-# The envelope-open closure `key` and `pqkey` ship (M5 plan I10.3), and
+# The envelope-open closure the key PDs ship (M5 plan I10.3), and
 # what the residue case seals with.
 secret-blob = { path = "../../crates/secret-blob" }
 tpm2 = { path = "../../crates/tpm2" }

@@ -3,8 +3,8 @@
 # [[function]] (C10 (c), the shape baseline): one entry per function of each
 # PD's closure from its mce460896 root, and the encaps shim's carrier in
 # pd-pq; since M5 (I10.3) also of the envelope-open closure
-# (tpm2::envelope::open_sealed) in pd-key and pd-pqkey, which the C9
-# residue harness runs (its CT mode does not: those justifications claim no
+# (tpm2::envelope::open_sealed) in pd-key and pd-pqkey, and since M6 (plan
+# C12) in pd-tlskey, which the C9 residue harness runs (its CT mode does not: those justifications claim no
 # C9 CT run). `shape` is the multiset of the function's conditional instructions
 # (b.<cond>, cbz/cbnz, tbz/tbnz, and the csel/cset/ccmp family with their
 # condition) and of its memory accesses indexed by a register. A change is a
@@ -632,6 +632,126 @@ shape = { "b.ne" = 1, "str [x, x]" = 1 }
 
 [[function]]
 elf = "pd-pqkey.elf"
+name = "wg_core::crypto::aead_open"
+justification = "The AEAD's length checks (ciphertext at least a tag, output large enough) and its error mapping: all public; cinc picks the error variant."
+shape = { "b.cs" = 1, "b.ls" = 1, "cbz" = 1, "cinc eq" = 1 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "<[u8; 32: usize] as zeroize::Zeroize>::zeroize @wg_core = <wg_core::crypto::Key32 as core::ops::drop::Drop>::drop"
+justification = "Key32's wipe on drop (the AEAD key made from the KEK): b.ne is the loop over the 32 public byte positions, strb [x, x] the zero written at that public index."
+shape = { "b.ne" = 1, "strb [x, x]" = 1 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "<[u8]>::fill"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "<wg_core::crypto::Key32>::copy_from"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "core::slice::copy_from_slice_impl::<core::mem::maybe_uninit::MaybeUninit<u8>> = core::slice::copy_from_slice_impl::<u8>"
+justification = "Slice copy over public lengths: b.ne is the length-mismatch check into the panic stop."
+shape = { "b.ne" = 1 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "core::slice::copy_from_slice_impl::<u32> @libcrux_hacl_rs"
+justification = "Slice copy over public lengths: b.ne is the length-mismatch check into the panic stop."
+shape = { "b.ne" = 1 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "libcrux_chacha20poly1305::hacl::aead_chacha20poly1305::decrypt"
+justification = "HACL*-derived ChaCha20-Poly1305 code (libcrux), secret-independent control flow by construction: branches on the public lengths (ciphertext, aad, blocks left), on block counters and into the bounds-check panic stops (b.ls); no register-offset access. b.eq/b.ne also take the tag check's result, computed with the eq_mask helpers (csetm, no branch) and public once computed (the open's outcome)."
+shape = { "b.eq" = 8, "b.ls" = 7, "b.ne" = 1, "cbz" = 1 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "libcrux_chacha20poly1305::hacl::aead_chacha20poly1305::poly1305_do_32"
+justification = "HACL*-derived ChaCha20-Poly1305 code (libcrux), secret-independent control flow by construction: branches on the public lengths (ciphertext, aad, blocks left), on block counters and into the bounds-check panic stops (b.ls); no register-offset access."
+shape = { "cbz" = 2 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "libcrux_chacha20poly1305::hacl::aead_chacha20poly1305::poly1305_padded_32"
+justification = "HACL*-derived ChaCha20-Poly1305 code (libcrux), secret-independent control flow by construction: branches on the public lengths (ciphertext, aad, blocks left), on block counters and into the bounds-check panic stops (b.ls); no register-offset access."
+shape = { "b.cc" = 2, "b.ne" = 1, "cbz" = 3 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "libcrux_chacha20poly1305::hacl::chacha20::chacha20_encrypt"
+justification = "HACL*-derived ChaCha20-Poly1305 code (libcrux), secret-independent control flow by construction: branches on the public lengths (ciphertext, aad, blocks left), on block counters and into the bounds-check panic stops (b.ls); no register-offset access."
+shape = { "b.cc" = 6, "b.ls" = 11, "b.ne" = 1, "cbz" = 2 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "libcrux_chacha20poly1305::hacl::chacha20::chacha20_encrypt_block"
+justification = "One ChaCha20 block: the 32 b.ls are the state-index bounds checks into the panic stop (constant indexes); the rounds themselves are branch-free."
+shape = { "b.ls" = 32 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "libcrux_chacha20poly1305::impl_hacl::decrypt"
+justification = "libcrux's slice wrapper around the HACL* decrypt: cbnz/tbz/b.cs on the public lengths and on the decrypt's error result; csel clamps public lengths."
+shape = { "b.cs" = 2, "cbnz" = 1, "csel hi" = 1, "csel ne" = 1, "tbz" = 2 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "libcrux_hacl_rs::fstar::uint64::eq_mask"
+justification = "The constant-time equality mask: csetm is a select, not a branch."
+shape = { "csetm eq" = 1 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "libcrux_hacl_rs::fstar::uint64::gte_mask"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "libcrux_hacl_rs::fstar::uint8::eq_mask"
+justification = "The constant-time equality mask: csetm is a select, not a branch."
+shape = { "csetm eq" = 1 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "libcrux_poly1305::hacl::mac_poly1305::poly1305_finish"
+justification = "HACL* Poly1305 finalisation: b.ls are bounds checks into the panic stop, b.eq/cbz on public lengths; the limb arithmetic is branch-free."
+shape = { "b.eq" = 2, "b.ls" = 7, "cbz" = 1 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "libcrux_poly1305::hacl::mac_poly1305::poly1305_init"
+justification = "HACL* Poly1305 key setup: b.ls are bounds checks into the panic stop, b.eq on the public key length; the clamping is masks, not branches."
+shape = { "b.eq" = 3, "b.ls" = 8 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "tpm2::envelope::open_core"
+justification = "The KEK copied into the AEAD key and wiped, then Envelope::open (inlined): the region-size and payload-length checks and the AEAD's Ok/Err, all public (the outcome of the open); csel/csinc/csinv select on the same public lengths and result."
+shape = { "b.cc" = 1, "b.ne" = 2, "csel hi" = 1, "csinc ls" = 1, "csinv cc" = 1, "tbz" = 1 }
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "tpm2::envelope::open_sealed"
+justification = "No conditional instruction or register-offset access (an iterator constructor, conversion or wrapper)."
+shape = {}
+
+[[function]]
+elf = "pd-tlskey.elf"
+name = "tpm2::envelope::scrub_stack"
+justification = "The stack scrub after the open (I10.3): b.ne loops over the public scrub depth, str [x, x] writes zero at that public index."
+shape = { "b.ne" = 1, "str [x, x]" = 1 }
+
+[[function]]
+elf = "pd-tlskey.elf"
 name = "wg_core::crypto::aead_open"
 justification = "The AEAD's length checks (ciphertext at least a tag, output large enough) and its error mapping: all public; cinc picks the error variant."
 shape = { "b.cs" = 1, "b.ls" = 1, "cbz" = 1, "cinc eq" = 1 }

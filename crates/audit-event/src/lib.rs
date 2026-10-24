@@ -262,13 +262,13 @@ pub enum Event {
     KeyStackHighWater { bytes: u32 },
     /// The longest a call into the key PD has taken, wall time, rose to a
     /// new high-water mark; `us` travels as the record's `a` (never
-    /// coalesced; `CostHighWater` bounds it). `hs` raises it: the runtime
-    /// observable of the key-wait bound (M6 plan C5).
+    /// coalesced; `CostHighWater` bounds it). `hs` raises it: recorded, not
+    /// bounded, since `key` serves `hs` alone (M6 plan C5, C12).
     KeyWaitHighWater { us: u32 },
-    /// The longest `TlsSign` call into `key`, wall time, rose to a new
+    /// The longest `TlsSign` call into `tlskey`, wall time, rose to a new
     /// high-water mark; `us` travels as the record's `a` (never coalesced;
-    /// `CostHighWater` bounds it). `tls` raises it: the measurement behind
-    /// `key_core::SIGN_COST_NS` (M6 plan C5).
+    /// `CostHighWater` bounds it). `tls` raises it: the signing latency it
+    /// bears on its own budget (M6 plan C12, RM6-8).
     TlsSignHighWater { us: u32 },
 }
 

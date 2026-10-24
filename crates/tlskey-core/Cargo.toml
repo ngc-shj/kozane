@@ -1,0 +1,23 @@
+[package]
+name = "tlskey-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ct = { path = "../ct" }
+# ECDSA P-256 for the TLS signing oracle (M6 plan C5, C12); already locked
+# through tpm2. `expose-hacl` exports the HACL* sign function itself
+# (features are not in Cargo.lock; it adds no dependency).
+libcrux-p256 = { version = "=0.0.9", default-features = false, features = ["expose-hacl"] }
+limits = { path = "../limits" }
+secret-blob = { path = "../secret-blob" }
+tpm2 = { path = "../tpm2" }
+zeroize = { version = "=1.8.1", default-features = false }
+
+[dev-dependencies]
+# The RFC 6979 nonce's differential test (M6 plan C5), host only. The 0.6
+# line sits on digest 0.11, apart from the digest 0.10 that mce460896's
+# sha3 locks (check-pins P16).
+rfc6979 = "=0.6.0"
+sha2 = "=0.11.1"

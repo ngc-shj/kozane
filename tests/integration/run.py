@@ -32,12 +32,12 @@ removed after the boot. The boots:
   5. peer binding (M3 plan C7): a deployment whose peer records pair each
      WireGuard key with the other peer's Rosenpass key;
   6. a blob whose public key does not match the configuration: `key`
-     stays up Unavailable and `hs` and `tls`, its callers, audit
-     `KeyUnavailable` with the boot error's code, then halt;
+     stays up Unavailable and `hs`, its only caller, audits `KeyUnavailable`
+     with the boot error's code, then halts; `tls`, on `tlskey`, gets ready;
   7. measured boot (C8): U-Boot's measure variant against tools/measure.py;
   8. sealed boots (C14): another image, a tampered descriptor and another
-     TPM's envelopes leave both key PDs Unavailable with the codes the Rust
-     tables give; after a sealed boot PCR 8 is capped;
+     TPM's envelopes leave the three key PDs Unavailable with the codes the
+     Rust tables give; after a sealed boot PCR 8 is capped;
   9. the A7 proxy between QEMU and swtpm: the unmodified relay passes a
      sealed boot, a flipped Unseal response is refused;
  10. https (M6 plan C3, C7): the outside NIC on the tap; OpenSSL s_client
@@ -47,9 +47,10 @@ removed after the boot. The boots:
  11. https-residue (M6 plan C8): slowloris first, then a closed
      connection's secrets, keys and marker absent from guest RAM while a
      live connection's secret is present;
- 12. tls key failure (M6 plan D5): a blob whose TLS scalar does not match
-     the certificate, on the same image: `tls` halts after `key` refuses
-     its TlsSign, the VPN still handshakes.
+ 12. tls key failure (M6 plan C12, case 8): a TLS blob whose scalar does
+     not match the certificate, on the same image: `tlskey` is Unavailable,
+     `tls` halts at init before it listens, PCR 8 is capped, the VPN still
+     handshakes.
 
 Since M3 (L8) hs refuses every WireGuard initiation without a fresh
 Rosenpass PSK, so each WireGuard peer first runs upstream rosenpass (the VE9
@@ -1465,11 +1466,12 @@ def test_peer_binding(pkg: "Package", deploy: str, passed: list):
 # ---------------------------------------------------------------- boot 3
 
 
-# `key` blob v3's fixed secrets (secret_blob::GATEWAY_PRIVATE_AT and
-# TLS_PRIVATE_AT, pinned numerically by its offsets test): the header, the
-# gateway key, the boot seed, then the TLS scalar (M6 plan C5).
+# `key` blob v2's gateway key (secret_blob::GATEWAY_PRIVATE_AT, pinned
+# numerically by its offsets test), and the TLS scalar in `tlskey`'s own
+# blob, tls-secrets.bin (secret_blob::tls::TLS_PRIVATE_AT; M6 plan C12):
+# `key`'s blob holds no TLS scalar.
 KEY_BLOB_GATEWAY_PRIVATE = slice(16, 48)
-KEY_BLOB_TLS_PRIVATE = slice(80, 112)
+TLS_BLOB_TLS_PRIVATE = slice(16, 48)
 
 
 def key_boot_code(variant: str) -> int:
@@ -1481,19 +1483,26 @@ def key_boot_code(variant: str) -> int:
     return int(m.group(1))
 
 
+# Where a PD's `halt` reason table lives, if not in the PD itself: `tls`'s
+# is tls-core's (M6 plan C12, its sign-path halt unit-tested there).
+HALT_TABLES = {"tls": "crates/tls-core/src/halt.rs"}
+
+
 def halt_reason(pd: str, name: str) -> int:
     """`pub const <name>: u32 = <n>;` in the PD's `halt` reason table."""
-    src = open(os.path.join(ROOT, f"crates/pds/{pd}/src/main.rs")).read()
-    m = re.search(rf"^\s+pub const {name}: u32 = (\d+);$", src, re.M)
+    rel = HALT_TABLES.get(pd, f"crates/pds/{pd}/src/main.rs")
+    src = open(os.path.join(ROOT, rel)).read()
+    m = re.search(rf"^\s*pub const {name}: u32 = (\d+);$", src, re.M)
     if not m:
-        raise Fail(f"no halt reason {name} in crates/pds/{pd}/src/main.rs")
+        raise Fail(f"no halt reason {name} in {rel}")
     return int(m.group(1))
 
 
 def test_mismatched_blob(pkg: "Package"):
     """Under the release kernel nothing but `audit` prints (C6, C7): `key`
     stays up Unavailable, and `hs`'s boot-seed call, its first call to
-    `key`, is where the failure shows.
+    `key`, is where the failure shows. `tls` calls `tlskey`, not `key` (M6
+    plan C12): it audits no KeyUnavailable and gets ready.
 
     The envelope unseals and opens: only validation fails, after the unseal.
     An Unavailable `key` holds no secret (M5 plan C6), so the opened blob's
@@ -1514,6 +1523,10 @@ def test_mismatched_blob(pkg: "Package"):
     try:
         m = con.wait_for(rf"audit: src=hs KeyUnavailable code={code} lost=\d+\r*\n", timeout=BOOT_TIMEOUT_S)
         con.wait_for(rf"audit: src=hs Halted reason={reason} lost=\d+\r*\n", since=m.end(), timeout=LINE_TIMEOUT_S)
+        m = con.wait_for(r"audit: src=tls KeyUnavailable code=(\d+) lost=\d+\r*\n|tls: ready\r*\n",
+                         timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        if m.group(1) is not None:
+            raise Fail(f"mismatched blob: tls audited KeyUnavailable code={m.group(1)}: it shares key's failure")
         # pq audits pqkey's stack mark only once pqkey's init has returned:
         # before it, pqkey may not yet have unsealed its control plaintext.
         con.wait_for(r"audit: src=pq KeyStackHighWater bytes=", timeout=BOOT_TIMEOUT_S)
@@ -1601,7 +1614,7 @@ class Package:
             return f.read()
 
     def media(self) -> list:
-        names = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env")
+        names = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "tls_secrets.env")
         return list(zip(map(self.path, names), (measure.LOAD_IMAGE, measure.LOAD_DESC) + measure.LOAD_ENVELOPES))
 
 
@@ -1801,7 +1814,8 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
     """Boots the measure variant on these boot media: (PCR 8 or None, whether
     U-Boot refused)."""
     paths = []
-    for name, data in (("published.img", image), ("boot.desc", desc), ("env0", envelopes[0]), ("env1", envelopes[1])):
+    for name, data in (("published.img", image), ("boot.desc", desc),
+                       *((f"env{i}", env) for i, env in enumerate(envelopes))):
         path = os.path.join(scratch, name)
         with open(path, "wb") as f:
             f.write(data)
@@ -1873,12 +1887,14 @@ def test_measured_boot(pkg: str, passed: list):
     """C8: the PCR 8 U-Boot produces is the one tools/measure.py computes
     from the public release files; it moves with any byte of the image or
     the descriptor; and the descriptor checks U-Boot runs on-device refuse a
-    wrapping range but allow one ending exactly at image_len."""
+    wrapping range, each overlapping pair of the three ranges, range 2 past
+    image_len and a version-1 descriptor, but allow a range ending exactly
+    at image_len."""
     def read(name):
         with open(os.path.join(pkg, name), "rb") as f:
             return f.read()
     image, desc = read("published.img"), read("boot.desc")
-    envs = [read("secrets.env"), read("pq_secrets.env")]
+    envs = [read("secrets.env"), read("pq_secrets.env"), read("tls_secrets.env")]
     want = measure.expected_pcr8(desc, image)
     if read("pcr8").decode().strip() != want.hex():
         raise Fail("package's pcr8 differs from tools/measure.py's")
@@ -1890,7 +1906,7 @@ def test_measured_boot(pkg: str, passed: list):
         passed.append("measured boot: PCR 8 as computed")
 
         image_len, ranges = measure.parse(desc)
-        # One byte inside image_len but outside both envelope ranges.
+        # One byte inside image_len but outside every envelope range.
         at = next(i for i in range(image_len // 2, image_len)
                   if not any(o <= i < o + n for o, n in ranges))
         flipped = image[:at] + bytes([image[at] ^ 1]) + image[at + 1:]
@@ -1902,33 +1918,55 @@ def test_measured_boot(pkg: str, passed: list):
         # A range moved onto the loader's entry code: still in bounds and
         # disjoint, so U-Boot accepts and measures it, and PCR 8 is no longer
         # the release's.
-        (o0, l0), (o1, l1) = ranges
-        if o1 < l0:
-            raise Fail(f"the second envelope range ({o1:#x}) overlaps offset 0; pick another target")
+        (o0, l0), (o1, l1), (o2, l2) = ranges
+        if min(o1, o2) < l0:
+            raise Fail(f"another envelope range ({min(o1, o2):#x}) overlaps [0, {l0:#x}); pick another target")
         tampered = desc[:24] + struct.pack("<Q", 0) + desc[32:]
         got, refused = measure_boot(pkg, scratch, image, tampered, envs)
         if refused or got == want:
             raise Fail(f"a moved range kept PCR 8 {got and got.hex()} (refused={refused})")
         passed.append("measured boot: descriptor measured")
 
-        # S12: offset + len wraps 64 bits into the image; refused on-device.
-        wrap = desc[:24] + struct.pack("<QQ", 2**64 - 0x10, 0x20) + desc[40:]
-        got, refused = measure_boot(pkg, scratch, image, wrap, envs)
-        if not refused:
-            raise Fail(f"a wrapping range was not refused (PCR 8 {got and got.hex()})")
-        passed.append("measured boot: wrapping range refused")
+        def with_ranges(moved: list) -> bytes:
+            return desc[:24] + struct.pack("<6Q", *(v for r in moved for v in r)) + desc[72:]
 
-        # Its allow pair: a range ending exactly at image_len (whichever of
-        # the two can move there without overlapping the other).
-        if image_len - l1 >= o0 + l0:
-            moved_ranges = [(o0, l0), (image_len - l1, l1)]
-        elif image_len - l0 >= o1 + l1:
-            moved_ranges = [(image_len - l0, l0), (o1, l1)]
+        # Range 2 moved to run 0x10 past image_len, clear of ranges 0 and 1.
+        past = (image_len - 0x10, 0x20)
+        if max(o0 + l0, o1 + l1) > past[0]:
+            raise Fail("ranges 0 and 1 reach the image's last 0x10 bytes; pick another range-2 target")
+        # On-device refusals, one measure-variant boot each. Every descriptor
+        # but the first is refused by one boot.cmd line alone (one selftest
+        # drops each): a pair's overlap moves one range onto the other of its
+        # pair, which stays disjoint from the third.
+        refusals = (
+            # S12: offset + len wraps 64 bits into the image.
+            ("wrapping range refused", "a wrapping range was not refused",
+             desc[:24] + struct.pack("<QQ", 2**64 - 0x10, 0x20) + desc[40:]),
+            ("0-1 overlap refused", "the 0-1 overlap was not refused", with_ranges([ranges[0], ranges[0], ranges[2]])),
+            ("0-2 overlap refused", "the 0-2 overlap was not refused", with_ranges([ranges[0], ranges[1], ranges[0]])),
+            ("1-2 overlap refused", "the 1-2 overlap was not refused", with_ranges([ranges[0], ranges[1], ranges[1]])),
+            # Within 32 bits, so only the no-wrap form len <= image_len - offset
+            # catches it (offset + len is never computed).
+            ("range 2 wrap refused", "the range-2 wrap was not refused", with_ranges([ranges[0], ranges[1], past])),
+            # M5's version at v2's length: only the version compare catches it.
+            ("version-1 descriptor refused", "the version-1 descriptor was not refused",
+             desc[:8] + struct.pack("<I", 1) + desc[12:]),
+        )
+        for case, missing, bad in refusals:
+            got, refused = measure_boot(pkg, scratch, image, bad, envs)
+            if not refused:
+                raise Fail(f"{missing} (PCR 8 {got and got.hex()})")
+            passed.append(f"measured boot: {case}")
+
+        # Its allow pair: a range ending exactly at image_len (the first of
+        # the three that can move there without overlapping the others).
+        for i, (_, length) in enumerate(ranges):
+            moved_ranges = ranges[:i] + [(image_len - length, length)] + ranges[i + 1:]
+            if not measure.check_ranges(image_len, moved_ranges):
+                break
         else:
-            raise Fail("neither envelope range can end at image_len without overlap")
-        if measure.check_ranges(image_len, moved_ranges):
-            raise Fail(f"the edge descriptor is not valid on the host: {measure.check_ranges(image_len, moved_ranges)}")
-        edge = desc[:24] + struct.pack("<QQQQ", *moved_ranges[0], *moved_ranges[1]) + desc[56:]
+            raise Fail("no envelope range can end at image_len without overlap")
+        edge = with_ranges(moved_ranges)
         got, refused = measure_boot(pkg, scratch, image, edge, envs)
         if refused or got is None:
             raise Fail("a range ending exactly at image_len was refused")
@@ -1940,13 +1978,40 @@ def test_measured_boot(pkg: str, passed: list):
 # ---------------------------------------------------------------- sealed boots (M5 plan C14)
 
 
-def boot_code(crate: str, variant: str) -> int:
-    """`BootError::<variant> => <n>,` from a key PD core's code table (C6)."""
+def code_table(crate: str) -> dict:
+    """A key PD core's code table (C6): `BootError::<variant> => <n>,`, each
+    above the crate's `CODE_BASE` if it has one (tlskey-core's own range,
+    M6 plan C12)."""
     src = open(os.path.join(ROOT, f"crates/{crate}/src/lib.rs")).read()
-    m = re.search(rf"^\s+BootError::{variant} => (\d+),$", src, re.M)
-    if not m:
+    base = re.search(r"^pub const CODE_BASE: u32 = (0x[0-9a-fA-F]+|\d+);$", src, re.M)
+    base = int(base.group(1), 0) if base else 0
+    table = {m.group(1): base | int(m.group(2))
+             for m in re.finditer(r"^\s+BootError::(\w+(?:\(\w+::\w+\))?) => (\d+),$", src, re.M)}
+    if not table:
+        raise Fail(f"no BootError code table in crates/{crate}/src/lib.rs")
+    return table
+
+
+def boot_code(crate: str, variant: str) -> int:
+    """`BootError::<variant>`'s code in a key PD core's table (C6)."""
+    table = code_table(crate)
+    if variant not in table:
         raise Fail(f"BootError::{variant} has no code in crates/{crate}/src/lib.rs")
-    return int(m.group(1))
+    return table[variant]
+
+
+def check_key_code_tables_apart():
+    """M6 plan C12 (R1-S F6, R2-T N8): `key`'s and `tlskey`'s codes are
+    disjoint, so a `KeyUnavailable` code names the key PD that failed; each
+    table's codes are distinct too. The mirror keeps the crates apart (no
+    dependency edge between them)."""
+    key, tlskey = code_table("key-core"), code_table("tlskey-core")
+    for name, table in (("key-core", key), ("tlskey-core", tlskey)):
+        if len(set(table.values())) != len(table):
+            raise Fail(f"key code tables: {name} uses a code twice: {table}")
+    shared = sorted(set(key.values()) & set(tlskey.values()))
+    if shared:
+        raise Fail(f"key code tables: key-core and tlskey-core share codes {shared}")
 
 
 def cap_digest() -> bytes:
@@ -1961,9 +2026,9 @@ def cap_digest() -> bytes:
     return bytes([int(m.group(1), 16)]) * int(n.group(1))
 
 
-# The PDs whose init calls a key PD, and the key PD's code table: `key`
-# has two callers since M6 (C5), and each audits an Unavailable `key`.
-KEY_CALLERS = (("hs", "key-core"), ("tls", "key-core"), ("pq", "pqkey-core"))
+# The PDs whose init calls a key PD, and the key PD's code table: each key
+# PD has one caller (M6 plan C12), which audits it Unavailable.
+KEY_CALLERS = (("hs", "key-core"), ("tls", "tlskey-core"), ("pq", "pqkey-core"))
 
 
 def key_outcomes(con: Console, codes: dict, what: str):
@@ -2009,16 +2074,16 @@ def stop(child):
 
 def test_sealed(good: Package, foreign: Package, passed: list):
     """C14 on the shipped path: the envelopes open only on the image and
-    descriptor they were sealed to, and only on their own TPM; once both key
-    PDs have finished, PCR 8 is capped. The allow side, a sealed boot that
-    reaches its handshakes, is every other boot's."""
+    descriptor they were sealed to, and only on their own TPM; once the three
+    key PDs have finished, PCR 8 is capped. The allow side, a sealed boot
+    that reaches its handshakes, is every other boot's."""
     image, desc = good.read("published.img"), good.read("boot.desc")
     image_len, ranges = measure.parse(desc)
-    refused = {"key-core": "UnsealRefused", "pqkey-core": "UnsealRefused"}
+    refused = {"key-core": "UnsealRefused", "pqkey-core": "UnsealRefused", "tlskey-core": "UnsealRefused"}
     scratch = tempfile.mkdtemp(prefix="sealed-", dir=os.path.dirname(good.dir))
     try:
         # Another image: one byte of audit's text (printed by no case here),
-        # inside image_len and outside both envelope ranges.
+        # inside image_len and outside every envelope range.
         text = b"HandshakePskStale"
         at = image.find(text)
         if image.count(text) != 1 or not at < image_len or any(o <= at < o + n for o, n in ranges):
@@ -2032,7 +2097,7 @@ def test_sealed(good: Package, foreign: Package, passed: list):
         passed.append("sealed boot: another image is refused")
 
         # A tampered descriptor, valid for U-Boot: image_len cut short of the
-        # image (both ranges still inside), so less is measured while the
+        # image (every range still inside), so less is measured while the
         # whole image still runs. PCR 8 differs; the TPM refuses.
         end = max(o + n for o, n in ranges)
         if end >= image_len:
@@ -2049,19 +2114,23 @@ def test_sealed(good: Package, foreign: Package, passed: list):
         # Envelopes sealed to another TPM's SRK, booted on this one (I10.2).
         child, con = sealed_boot(Package(foreign.dir, good.state))
         try:
-            key_outcomes(con, {"key-core": "SrkMismatch", "pqkey-core": "SrkMismatch"}, "foreign TPM")
+            key_outcomes(con, {"key-core": "SrkMismatch", "pqkey-core": "SrkMismatch", "tlskey-core": "SrkMismatch"},
+                         "foreign TPM")
         finally:
             stop(child)
         passed.append("sealed boot: another TPM's envelopes are refused")
 
-        # The cap (T11): once hs and pq are ready both key PDs have sent Done,
-        # and tpm extended PCR 8 with CAP_DIGEST before answering the second.
-        # Read from swtpm after QEMU is gone and before swtpm is stopped.
+        # The cap (T11): once hs, pq and tls are ready the three key PDs have
+        # sent Done (tls is ready only after tlskey's init returned its boot
+        # seed, M6 plan C12), and tpm extended PCR 8 with CAP_DIGEST before
+        # answering the last. Read from swtpm after QEMU is gone and before
+        # swtpm is stopped.
         want = measure.extend(measure.expected_pcr8(desc, image), cap_digest())
         child, con = sealed_boot(good)
         try:
             con.wait_for(r"hs: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
             con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+            con.wait_for(r"tls: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
             # QEMU killed (no CMD_SHUTDOWN reaches swtpm), its TPM kept.
             kill_qemu(child)
             got = read_pcr8(child.tpm)
@@ -2070,7 +2139,7 @@ def test_sealed(good: Package, foreign: Package, passed: list):
         if got != want:
             capped = "uncapped" if got == measure.expected_pcr8(desc, image) else "unexpected"
             raise Fail(f"cap: PCR 8 after the boot is {got.hex()} ({capped}), want {want.hex()}")
-        passed.append("sealed boot: PCR 8 capped after both key PDs")
+        passed.append("sealed boot: PCR 8 capped after the three key PDs")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
@@ -2084,20 +2153,21 @@ def test_tpm_proxy(good: Package, passed: list):
         try:
             con.wait_for(r"hs: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
             con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+            con.wait_for(r"tls: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
         except Fail as e:
             raise Fail(f"A7 proxy: the unmodified relay did not pass a sealed boot ({e}); "
                        f"relay error: {child.proxy.error!r}") from None
-        if child.proxy.unseals != 2:
-            raise Fail(f"A7 proxy: the relay saw {child.proxy.unseals} Unseal responses, want 2")
+        if child.proxy.unseals != 3:
+            raise Fail(f"A7 proxy: the relay saw {child.proxy.unseals} Unseal responses, want 3")
     finally:
         stop(child)
     passed.append("A7 proxy: the unmodified relay passes a sealed boot")
 
-    invalid = {"key-core": "TpmResponseInvalid", "pqkey-core": "TpmResponseInvalid"}
+    invalid = {"key-core": "TpmResponseInvalid", "pqkey-core": "TpmResponseInvalid", "tlskey-core": "TpmResponseInvalid"}
     child, con = sealed_boot(good, flip=True)
     try:
         key_outcomes(con, invalid, "A7 proxy")
-        if child.proxy.flipped != 2 or child.proxy.error is not None:
+        if child.proxy.flipped != 3 or child.proxy.error is not None:
             raise Fail(f"A7 proxy: {child.proxy.flipped} responses flipped, relay error {child.proxy.error!r}")
     finally:
         stop(child)
@@ -3715,16 +3785,6 @@ def check_fixed_body():
         raise Fail(f"{TLS_PD} no longer answers with {HTTPS_FIXED_BODY!r}")
 
 
-def tls_key_code(variant: str) -> int:
-    """`TlsKeyError::<variant> => <n>,` from key-core's code table (M6 plan
-    C5, D5): the codes share BootError's space."""
-    src = open(os.path.join(ROOT, "crates/key-core/src/lib.rs")).read()
-    m = re.search(rf"^\s+TlsKeyError::{variant} => (\d+),$", src, re.M)
-    if not m:
-        raise Fail(f"TlsKeyError::{variant} has no code in crates/key-core/src/lib.rs")
-    return int(m.group(1))
-
-
 def https_url(host: str = None) -> str:
     return f"https://{host or ip_str(GW_IP)}:{HTTPS_PORT}/"
 
@@ -3950,11 +4010,12 @@ def https_probe_case(con: Console, deploy: str, passed: list):
 
 
 def tls_scalar_count_case(mon: Monitor, deploy: str, passed: list):
-    """M6 plan T8, F21: after handshakes the client observed (the probe's),
-    the TLS scalar occurs exactly once big-endian (`key`'s plaintext) and
-    never little-endian (HACL's limbs) in guest RAM."""
-    with open(os.path.join(deploy, "secrets.bin"), "rb") as f:
-        scalar = f.read()[KEY_BLOB_TLS_PRIVATE]
+    """M6 plan T8, F21, C12: after handshakes the client observed (the
+    probe's), the TLS scalar occurs exactly once big-endian (`tlskey`'s
+    plaintext) and never little-endian (HACL's limbs) in guest RAM; `key`'s
+    blob holds none by construction."""
+    with open(os.path.join(deploy, "tls-secrets.bin"), "rb") as f:
+        scalar = f.read()[TLS_BLOB_TLS_PRIVATE]
     if not any(scalar):
         raise Fail("tls scalar count: the needle is all zero")
     scan_snapshot(mon, os.path.join(deploy, "pmem-tls.bin"), "tls scalar count", {}, {},
@@ -4230,22 +4291,27 @@ def test_https_residue(pkg: "Package", deploy: str, passed: list):
 
 
 def test_tls_key_failure(pkg: "Package", deploy: str, passed: list):
-    """M6 plan case 8 (D5, C11, S-N3, T-R3-7): the image with a blob whose
-    TLS scalar is valid but not the certificate's. `key` stays Ready for
-    `hs`; `tls`'s first TlsSign is answered Unavailable, so HTTPS is refused,
-    `tls` audits KeyUnavailable with TlsKeyError::Mismatch's code and halts;
-    the VPN still completes a handshake afterwards. The rejected scalar
-    occurs nowhere in guest RAM (`key` wiped it), while the same blob's
-    gateway key, which `key` holds for `hs`, does (the control)."""
-    with open(os.path.join(deploy, "secrets-tls-mismatch.bin"), "rb") as f:
-        blob = f.read()
-    rejected, gateway_private = blob[KEY_BLOB_TLS_PRIVATE], blob[KEY_BLOB_GATEWAY_PRIVATE]
-    with open(os.path.join(deploy, "secrets.bin"), "rb") as f:
-        if f.read()[KEY_BLOB_TLS_PRIVATE] == rejected:
+    """M6 plan case 8 (C12, C11, S-N3, R1-T T11, T12): the image with a TLS
+    blob whose scalar is valid but not the certificate's. `tlskey` is
+    Unavailable: `tls`'s boot-seed call at init is answered with its
+    Mismatch code, `tls` audits KeyUnavailable and halts before it listens
+    (it never prints ready), so HTTPS is refused; `key` and `pqkey` are
+    untouched and the VPN completes a handshake. The rejected scalar occurs
+    nowhere in guest RAM (`tlskey` wiped its plaintext), while the gateway
+    key `key` holds for `hs` does (the control). Every key PD finished, so
+    PCR 8 reads as capped."""
+    with open(os.path.join(deploy, "tls-secrets-mismatch.bin"), "rb") as f:
+        rejected = f.read()[TLS_BLOB_TLS_PRIVATE]
+    with open(os.path.join(deploy, "tls-secrets.bin"), "rb") as f:
+        if f.read()[TLS_BLOB_TLS_PRIVATE] == rejected:
             raise Fail("tls key failure: the mismatch blob carries the deployment's own TLS scalar")
+    with open(os.path.join(deploy, "secrets.bin"), "rb") as f:
+        gateway_private = f.read()[KEY_BLOB_GATEWAY_PRIVATE]
     if not any(rejected) or not any(gateway_private):
         raise Fail("tls key failure: a needle is all zero; the scan would prove nothing")
-    code, reason = tls_key_code("Mismatch"), halt_reason("tls", "KEY_UNAVAILABLE")
+    code, reason = boot_code("tlskey-core", "Mismatch"), halt_reason("tls", "KEY_UNAVAILABLE")
+    image, desc = pkg.read("published.img"), pkg.read("boot.desc")
+    capped = measure.extend(measure.expected_pcr8(desc, image), cap_digest())
     tap = Tap()
     inside = Wire()
     monitor = os.path.join(deploy, "monitor.sock")
@@ -4257,12 +4323,17 @@ def test_tls_key_failure(pkg: "Package", deploy: str, passed: list):
     rp = py = None
     try:
         wait_tap_ready(tap, con)
-        con.wait_for(r"tls: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        # Failure-only: tls ready means it listened with tlskey Unavailable.
+        m = con.wait_for(r"audit: src=tls KeyUnavailable code=(\d+) lost=\d+\r*\n|tls: ready\r*\n",
+                         timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        if m.group(1) is None:
+            raise Fail("tls key failure: tls became ready (it listens) with tlskey Unavailable")
+        if int(m.group(1)) != code:
+            raise Fail(f"tls key failure: tls audited KeyUnavailable code={m.group(1)}, want Mismatch ({code})")
+        con.wait_for(rf"audit: src=tls Halted reason={reason} lost=\d+\r*\n", since=m.end())
         r = curl(os.path.join(deploy, "devca.pem"), https_url())
         if r.returncode == 0:
-            raise Fail("tls key failure: HTTPS completed with a TLS key key refused")
-        m = con.wait_for(rf"audit: src=tls KeyUnavailable code={code} lost=\d+\r*\n")
-        con.wait_for(rf"audit: src=tls Halted reason={reason} lost=\d+\r*\n", since=m.end())
+            raise Fail("tls key failure: HTTPS completed with tlskey Unavailable")
         cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
         con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
         mark = con.mark()
@@ -4273,8 +4344,15 @@ def test_tls_key_failure(pkg: "Package", deploy: str, passed: list):
         scan_snapshot(Monitor(monitor), os.path.join(deploy, "pmem-tls-key.bin"), "tls key failure",
                       {"the rejected TLS scalar": rejected, "the rejected TLS scalar (little-endian)": rejected[::-1]},
                       {"the gateway key key holds for hs": gateway_private})
+        # QEMU killed (no CMD_SHUTDOWN reaches swtpm), its TPM kept: the cap
+        # came once tlskey sent Failed, after key and pqkey.
+        kill_qemu(child)
+        got = read_pcr8(child.tpm)
+        if got != capped:
+            state = "uncapped" if got == measure.expected_pcr8(desc, image) else "unexpected"
+            raise Fail(f"tls key failure: PCR 8 is {got.hex()} ({state}), want the capped {capped.hex()}")
         passed.append("tls key failure")
-        print("\nPASS [tls key failure: HTTPS refused, tls audited KeyUnavailable and halted, the VPN handshakes]")
+        print("\nPASS [tls key failure: tls halted before listening, HTTPS refused, the VPN handshakes, PCR 8 capped]")
     finally:
         try:
             with signals_held():
@@ -4450,19 +4528,25 @@ def build(tmp: str):
     _, srk_foreign = provision_tpm(tmp, "foreign")
     env = {**os.environ, "SECUREOS_CONFIG": os.path.join(tmp, "a/gateway.toml")}
     make("image", env=env)
-    make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin", f"SRK_PUBLIC={srk_a}",
+    make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
+         f"TLS_SECRETS={tmp}/a/tls-secrets.bin", f"SRK_PUBLIC={srk_a}",
          f"OUT={tmp}/a/pkg", env=env)
-    # Only `key`'s blob mismatches: pqkey keeps A's, so only `key` is
+    # Only `key`'s blob mismatches: pqkey and tlskey keep A's, so only `key` is
     # Unavailable.
-    make("package", f"SECRETS={tmp}/b/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin", f"SRK_PUBLIC={srk_a}",
+    make("package", f"SECRETS={tmp}/b/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
+         f"TLS_SECRETS={tmp}/a/tls-secrets.bin", f"SRK_PUBLIC={srk_a}",
          f"OUT={tmp}/b/pkg", env=env)
     make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
+         f"TLS_SECRETS={tmp}/a/tls-secrets.bin",
          f"SRK_PUBLIC={srk_foreign}", f"OUT={tmp}/a/pkg-foreign", env=env)
-    # Only the TLS scalar differs (M6 plan case 8, D5): `key` stays Ready.
-    make("package", f"SECRETS={tmp}/a/secrets-tls-mismatch.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
+    # Only the TLS blob's scalar differs (M6 plan case 8, C12): `key` and
+    # `pqkey` stay Ready, `tlskey` is Unavailable.
+    make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
+         f"TLS_SECRETS={tmp}/a/tls-secrets-mismatch.bin",
          f"SRK_PUBLIC={srk_a}", f"OUT={tmp}/a/pkg-tls-mismatch", env=env)
     env_c = {**os.environ, "SECUREOS_CONFIG": os.path.join(tmp, "c/gateway.toml")}
-    make("package", f"SECRETS={tmp}/c/secrets.bin", f"PQ_SECRETS={tmp}/c/pqkey-secrets.bin", f"SRK_PUBLIC={srk_c}",
+    make("package", f"SECRETS={tmp}/c/secrets.bin", f"PQ_SECRETS={tmp}/c/pqkey-secrets.bin",
+         f"TLS_SECRETS={tmp}/c/tls-secrets.bin", f"SRK_PUBLIC={srk_c}",
          f"OUT={tmp}/c/pkg", env=env_c)
     for pkg in ("a/pkg", "b/pkg", "a/pkg-foreign", "a/pkg-tls-mismatch", "c/pkg"):
         if sorted(os.listdir(os.path.join(tmp, pkg))) != sorted(PACKAGE_OUTPUTS):
@@ -4471,7 +4555,7 @@ def build(tmp: str):
 
 
 # What tools/package writes: no image with a secret in it (M5 plan C8 F2).
-PACKAGE_OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "pcr8")
+PACKAGE_OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "tls_secrets.env", "pcr8")
 
 
 def packages(tmp: str) -> dict:
@@ -4536,6 +4620,7 @@ def in_netns(tmp: str) -> int:
         return run
 
     cases = [("reason list in sync", single("reason list", check_reason_list_matches_rust)),
+             ("key code tables apart", single("key code tables", check_key_code_tables_apart)),
              ("raw frames", single("raw frames", lambda: test_raw(good))),
              ("wireguard", lambda: test_wireguard(good, deploy, passed)),
              ("cookie boot a", lambda: test_cookie_a(good, deploy, passed)),

@@ -200,8 +200,8 @@ fn open(env: &[u8], kind: Kind, kek: &[u8; 32]) -> (Result<(), EnvError>, Vec<u8
 }
 
 #[test]
-fn sealed_envelope_parses_and_opens_to_the_region_both_kinds() {
-    for (kind, len) in [(Kind::Key, 1000), (Kind::Pq, secret_blob::pq::USED_LEN)] {
+fn sealed_envelope_parses_and_opens_to_the_region_every_kind() {
+    for (kind, len) in [(Kind::Key, 1000), (Kind::Pq, secret_blob::pq::USED_LEN), (Kind::Tls, secret_blob::tls::USED_LEN)] {
         let plain = region(kind, len);
         let env = sealed(kind, &plain, 1);
         let e = Envelope::parse(&env, kind).unwrap();
@@ -212,6 +212,27 @@ fn sealed_envelope_parses_and_opens_to_the_region_both_kinds() {
         assert_eq!(r, Ok(()));
         assert!(out == plain, "{kind:?} did not open to its region");
     }
+}
+
+/// M6 plan C12: `Key` and `Tls` regions are both 4096 bytes, so only the
+/// kind (in the AAD) keeps one PD's real envelope from parsing as the
+/// other's: a sealed `key` blob is refused as `Tls`, and the reverse.
+#[test]
+fn a_key_envelope_is_refused_as_tls_and_a_tls_envelope_as_key() {
+    let mut key = [0u8; secret_blob::REGION_SIZE];
+    secret_blob::write(&mut key, &[1; 32], &[2; 32], &[[3; 32]]).unwrap();
+    let mut tls = [0u8; secret_blob::tls::REGION_SIZE];
+    secret_blob::tls::write(&mut tls, &[4; 32], &[5; 32]).unwrap();
+    let key_env = sealed(Kind::Key, &key, 1);
+    let tls_env = sealed(Kind::Tls, &tls, 2);
+    assert_eq!(key_env.len(), tls_env.len());
+    assert_eq!(Envelope::parse(&key_env, Kind::Tls).err(), Some(EnvError::BadKind));
+    assert_eq!(Envelope::parse(&tls_env, Kind::Key).err(), Some(EnvError::BadKind));
+    // Allow side: each opens as its own kind, to its own blob.
+    let (r, out) = open(&key_env, Kind::Key, &kek(1));
+    assert!(r == Ok(()) && out == key);
+    let (r, out) = open(&tls_env, Kind::Tls, &kek(2));
+    assert!(r == Ok(()) && out == tls);
 }
 
 /// The payload is the region without its trailing zeros: a blob whose last
@@ -325,7 +346,7 @@ fn a_key_blob_with_key_max_peers_seals_and_one_more_does_not() {
     let blob = |peers: usize| {
         let mut r = Box::new([0u8; secret_blob::REGION_SIZE]);
         let publics: Vec<[u8; 32]> = (0..peers).map(|i| [i as u8 | 1; 32]).collect();
-        secret_blob::write(&mut r, &[1; 32], &[2; 32], &[6; 32], &publics).unwrap();
+        secret_blob::write(&mut r, &[1; 32], &[2; 32], &publics).unwrap();
         r
     };
     let mut out = vec![0u8; Kind::Key.region_size()];
@@ -641,7 +662,7 @@ fn every_command_of_the_flow_fits_one_ipc_message() {
 // --- boot: the unseal over PPC to `tpm` (C9) -------------------------------
 
 use layout::tpm as ipc;
-use tpm2_wire::gate::{Gate, State};
+use tpm2_wire::gate::{Gate, Refusal, State};
 
 use super::boot::{self, BUSY_PAUSE_NS, BUSY_TIMEOUT_NS, Transport, UnsealError};
 
@@ -703,6 +724,8 @@ impl Transport for FakePpc {
                 }
                 let fwd = match self.gate.command(0, req) {
                     Ok(fwd) => fwd,
+                    // As the tpm PD answers it (M6 plan C12).
+                    Err(Refusal::Busy) => return (ipc::label(ipc::RSP_BUSY, 0), 0),
                     Err(r) => return (ipc::label(ipc::RSP_REFUSED, r as usize), 0),
                 };
                 let cc = fwd.command_code();
@@ -838,7 +861,7 @@ fn another_tpms_srk_is_srk_mismatch() {
 #[test]
 fn a_plaintext_blob_is_envelope_invalid_and_reaches_no_tpm_command() {
     let mut blob = Box::new([0u8; secret_blob::REGION_SIZE]);
-    secret_blob::write(&mut blob, &[1; 32], &[2; 32], &[6; 32], &[[3; 32]]).unwrap();
+    secret_blob::write(&mut blob, &[1; 32], &[2; 32], &[[3; 32]]).unwrap();
     let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
     let mut ppc = FakePpc::new(&env);
     let (r, out) = boot_unseal(&blob[..], &mut ppc);

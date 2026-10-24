@@ -7,6 +7,7 @@ Prints "RELEASE-FIXTURES <n>" and exits non-zero on any mismatch.
 
 import hashlib
 import pathlib
+import struct
 import subprocess
 import sys
 import tempfile
@@ -17,6 +18,7 @@ import measure  # noqa: E402
 
 RELEASE = [sys.executable, str(ROOT / "tools/release.py")]
 BIN = str(ROOT / "build/release/target/release/release")
+RANGES = [(0x1000, 0x400), (0x2000, 0x800), (0x3000, 0x400)]
 
 
 def run(*args) -> tuple:
@@ -31,13 +33,14 @@ def setup(d: pathlib.Path) -> None:
             raise SystemExit(f"keygen failed: {out}")
     pkg = d / "pkg"
     pkg.mkdir()
-    # Code-like bytes everywhere except the two envelope ranges, which hold
+    # Code-like bytes everywhere except the three envelope ranges, which hold
     # the zero placeholder as a published image does.
     image = bytearray(bytes(range(1, 256)) * 65)[:0x4000]
     image[0x1000:0x1400] = bytes(0x400)
     image[0x2000:0x2800] = bytes(0x800)
+    image[0x3000:0x3400] = bytes(0x400)
     image = bytes(image)
-    desc = measure.pack(len(image), [(0x1000, 0x400), (0x2000, 0x800)])
+    desc = measure.pack(len(image), RANGES)
     (pkg / "published.img").write_bytes(image)
     (pkg / "boot.desc").write_bytes(desc)
     (pkg / "pcr8").write_text(measure.expected_pcr8(desc, image).hex() + "\n")
@@ -168,14 +171,36 @@ def case_verify_placeholder(d):
     return made and rc == 1 and "zero placeholder" in out, out
 
 
-def case_range_over_code(d):
+def case_range_over_code(d, at=0x1000):
     img = bytearray((d / "pkg/published.img").read_bytes())
-    img[0x1000] = 1
+    img[at] = 1
     (d / "pkg/published.img").write_bytes(bytes(img))
     desc = (d / "pkg/boot.desc").read_bytes()
     (d / "pkg/pcr8").write_text(measure.expected_pcr8(desc, bytes(img)).hex() + "\n")
     rc, out = make(d)
     return rc == 1 and "zero placeholder" in out, out
+
+
+def case_range2_over_code(d):
+    ok, out = case_range_over_code(d, at=0x33ff)
+    return ok and "range 2" in out, out
+
+
+def case_v1_descriptor(d):
+    """M5's 64-byte, two-envelope descriptor is refused (M6 plan Re-plan R1)."""
+    image = (d / "pkg/published.img").read_bytes()
+    desc = struct.pack("<8sIIQQQQQQ", measure.MAGIC, 1, 2, len(image), *RANGES[0], *RANGES[1], 0)
+    (d / "pkg/boot.desc").write_bytes(desc)
+    rc, out = make(d)
+    return rc == 1 and "descriptor is 64 bytes, expected 80" in out and not (d / "rel").exists(), out
+
+
+def case_kind_tls(d):
+    """`--kind tls` is a choice: only the --envelope pairing refuses it."""
+    rc, out = verify(d, "keys", "rel", "--kind", "tls")
+    rc2, out2 = verify(d, "keys", "rel", "--kind", "bogus")
+    return rc == 2 and "--envelope and --kind go together" in out and rc2 == 2 and "invalid choice" in out2, \
+        out + out2
 
 
 CASES = [
@@ -192,6 +217,9 @@ CASES = [
     ("a clean release verifies by default, no flag", case_clean_default_verify),
     ("verify refuses a signed range over non-zero image bytes", case_verify_placeholder),
     ("a descriptor range over non-zero image bytes is refused", case_range_over_code),
+    ("a descriptor range 2 over non-zero image bytes is refused", case_range2_over_code),
+    ("a version-1 descriptor is refused", case_v1_descriptor),
+    ("verify takes --kind tls", case_kind_tls),
 ]
 
 

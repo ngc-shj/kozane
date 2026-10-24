@@ -53,7 +53,7 @@ impl Rng for CountingRng {
     }
 }
 
-/// `key`'s TlsSign stand-in: the RFC 8446 section 4.4.3 server content,
+/// `tlskey`'s TlsSign stand-in: the RFC 8446 section 4.4.3 server content,
 /// signed with libcrux-p256.
 pub(crate) struct TestSigner {
     pub(crate) calls: usize,

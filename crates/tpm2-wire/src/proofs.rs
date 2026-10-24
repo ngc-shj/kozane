@@ -1,6 +1,7 @@
 //! Kani harnesses for the response parsers and the `tpm` gate (M5 plan
 //! C9, C10). Run with `cargo kani -p tpm2-wire`. The gate's symbolic state
-//! is kept small: concrete command shapes with symbolic handles and codes.
+//! is kept small: concrete command shapes with symbolic handles, codes and
+//! clients.
 
 use super::gate::{ALLOWED, Gate, Refusal};
 use super::*;
@@ -170,21 +171,59 @@ fn the_owners_flow_is_forwarded() {
     assert!(g.state(client) == Some(gate::State::Done));
 }
 
-/// Deny: client B is refused every handle-carrying command of the flow on
-/// client A's handles, PolicyAuthValue on A's session included.
+/// Two distinct symbolic clients below `CLIENTS`: the owner and the other.
+fn any_two_clients() -> (usize, usize) {
+    let owner: usize = kani::any();
+    let other: usize = kani::any();
+    kani::assume(owner < gate::CLIENTS && other < gate::CLIENTS && owner != other);
+    (owner, other)
+}
+
+/// Deny: a Fresh attacker is refused every handle-carrying command of the
+/// flow on the owner's handles, PolicyAuthValue on its session included.
+/// NotOwned is decided before Busy, so it is what the attacker gets while
+/// the owner's flow is under way (M6 plan C12).
 #[kani::proof]
 #[kani::unwind(12)]
 fn cross_client_handles_are_refused() {
     let (primary, session, object) = (any_transient(), any_policy_session(), any_transient());
     kani::assume(primary != object);
+    let (owner, attacker) = any_two_clients();
     let mut g = Gate::new();
-    kani::assume(owner_setup(&mut g, 0, primary, session, object));
+    kani::assume(owner_setup(&mut g, owner, primary, session, object));
+    kani::cover!(true, "the owner's setup was forwarded");
     let which: u8 = kani::any();
     kani::assume(which <= 8);
     let mut buf = [0u8; MAX_LOAD_CMD_LEN];
     let n = flow_command(&mut buf, which, primary, session, object);
-    let r = g.command(1, buf.get(..n).unwrap_or(&[]));
+    let r = g.command(attacker, buf.get(..n).unwrap_or(&[]));
     assert!(r == Err(Refusal::NotOwned));
+}
+
+/// Deny: an attacker that starts after the owner finished without
+/// flushing, and has a flow of its own under way, is refused the owner's
+/// handles all the same.
+#[kani::proof]
+#[kani::unwind(12)]
+fn a_later_attacker_is_refused_the_unflushed_handles_of_a_finished_owner() {
+    let (primary, session, object) = (any_transient(), any_policy_session(), any_transient());
+    kani::assume(primary != object);
+    let (owner, attacker) = any_two_clients();
+    let mut g = Gate::new();
+    kani::assume(owner_setup(&mut g, owner, primary, session, object));
+    kani::cover!(true, "the owner's setup was forwarded");
+    let ok: bool = kani::any();
+    assert!(g.finish(owner, ok).is_ok());
+    let own = any_transient();
+    kani::assume(own != primary && own != object);
+    let mut buf = [0u8; MAX_LOAD_CMD_LEN];
+    let n = create_primary(&mut buf).unwrap_or(0);
+    assert!(send(&mut g, attacker, buf.get(..n).unwrap_or(&[]), &handle_rsp(own)));
+    assert!(g.state(attacker) == Some(gate::State::Unsealing));
+    let which: u8 = kani::any();
+    kani::assume(which <= 8);
+    let n = flow_command(&mut buf, which, primary, session, object);
+    assert!(g.command(attacker, buf.get(..n).unwrap_or(&[])) == Err(Refusal::NotOwned));
 }
 
 /// Deny: a client that sent Done or Failed is refused any command bytes.
@@ -203,18 +242,51 @@ fn a_finished_client_is_refused() {
     assert!(r == Err(Refusal::Finished));
 }
 
-/// Deny: once both clients are finished the cap is issued, and Unseal is
-/// refused from then on, by either client, even on a handle it owned.
+/// Deny: the cap is withheld while any client has not finished, whichever
+/// subset finished and however; it comes once every client is Done or
+/// Failed.
+#[kani::proof]
+#[kani::unwind(12)]
+fn the_cap_is_withheld_until_every_client_finishes() {
+    let mut g = Gate::new();
+    let mut cap = [0u8; PCR_EXTEND_CMD_LEN];
+    let finished: [bool; gate::CLIENTS] = kani::any();
+    for (client, done) in finished.iter().enumerate() {
+        if *done {
+            let ok: bool = kani::any();
+            assert!(g.finish(client, ok).is_ok());
+        }
+    }
+    let all = finished.iter().all(|f| *f);
+    kani::cover!(!all, "some client has not finished");
+    assert!(g.cap(&mut cap).is_some() == all);
+    assert!(g.is_capped() == all);
+    if !all {
+        for (client, done) in finished.iter().enumerate() {
+            if !*done {
+                assert!(g.finish(client, true).is_ok());
+            }
+        }
+        assert!(g.cap(&mut cap).is_some());
+    }
+}
+
+/// Deny: once every client is finished the cap is issued, and Unseal is
+/// refused from then on, by any client, even on a handle it owned.
 #[kani::proof]
 #[kani::unwind(12)]
 fn unseal_after_the_cap_is_refused() {
     let (primary, session, object) = (any_transient(), any_policy_session(), any_transient());
     kani::assume(primary != object);
+    let owner: usize = kani::any();
+    kani::assume(owner < gate::CLIENTS);
     let mut g = Gate::new();
-    kani::assume(owner_setup(&mut g, 0, primary, session, object));
-    let a: bool = kani::any();
-    let b: bool = kani::any();
-    assert!(g.finish(0, a).is_ok() && g.finish(1, b).is_ok());
+    kani::assume(owner_setup(&mut g, owner, primary, session, object));
+    kani::cover!(true, "the owner's setup was forwarded");
+    for client in 0..gate::CLIENTS {
+        let ok: bool = kani::any();
+        assert!(g.finish(client, ok).is_ok());
+    }
     let mut cap = [0u8; PCR_EXTEND_CMD_LEN];
     assert!(g.cap(&mut cap).is_some());
     assert!(g.is_capped());
@@ -225,22 +297,53 @@ fn unseal_after_the_cap_is_refused() {
     assert!(g.command(client, buf.get(..n).unwrap_or(&[])) == Err(Refusal::Capped));
 }
 
+/// One flow at a time (M6 plan C12): while the owner is Unsealing, a Fresh
+/// client's well-formed first command (CreatePrimary or PCR_Read) is Busy
+/// and leaves the gate, its once-bits and every state, exactly as it was;
+/// once the owner has finished, the same client's whole setup is forwarded.
+#[kani::proof]
+#[kani::unwind(12)]
+fn a_fresh_client_is_busy_without_effect_and_runs_after_the_owner_finishes() {
+    let (owner, other) = any_two_clients();
+    let owner_primary = any_transient();
+    let mut g = Gate::new();
+    let mut buf = [0u8; MAX_LOAD_CMD_LEN];
+    let n = create_primary(&mut buf).unwrap_or(0);
+    assert!(send(&mut g, owner, buf.get(..n).unwrap_or(&[]), &handle_rsp(owner_primary)));
+    let first: bool = kani::any();
+    let n = (if first { create_primary(&mut buf) } else { pcr_read(&mut buf) }).unwrap_or(0);
+    let before = g.clone();
+    assert!(g.command(other, buf.get(..n).unwrap_or(&[])) == Err(Refusal::Busy));
+    assert!(g == before);
+    let ok: bool = kani::any();
+    assert!(g.finish(owner, ok).is_ok());
+    let (primary, session, object) = (any_transient(), any_policy_session(), any_transient());
+    kani::assume(primary != object && primary != owner_primary && object != owner_primary);
+    assert!(owner_setup(&mut g, other, primary, session, object));
+    assert!(g.state(other) == Some(gate::State::Unsealing));
+}
+
 /// Allow: a handle number client A flushed is client B's once the TPM hands
-/// it to B, and no longer A's.
+/// it to B (after A finished: one flow at a time), and a Fresh third client
+/// is refused it as not its own.
 #[kani::proof]
 #[kani::unwind(12)]
 fn a_flushed_handle_number_is_usable_by_the_other_client() {
     let primary = any_transient();
+    let (a, b) = any_two_clients();
+    let third: usize = kani::any();
+    kani::assume(third < gate::CLIENTS && third != a && third != b);
     let mut g = Gate::new();
     let mut buf = [0u8; MAX_LOAD_CMD_LEN];
     let n = create_primary(&mut buf).unwrap_or(0);
-    assert!(send(&mut g, 0, buf.get(..n).unwrap_or(&[]), &handle_rsp(primary)));
+    assert!(send(&mut g, a, buf.get(..n).unwrap_or(&[]), &handle_rsp(primary)));
     let n = flush_context(&mut buf, primary).unwrap_or(0);
-    assert!(send(&mut g, 0, buf.get(..n).unwrap_or(&[]), &OK));
+    assert!(send(&mut g, a, buf.get(..n).unwrap_or(&[]), &OK));
+    assert!(g.finish(a, true).is_ok());
     let n = create_primary(&mut buf).unwrap_or(0);
-    assert!(send(&mut g, 1, buf.get(..n).unwrap_or(&[]), &handle_rsp(primary)));
+    assert!(send(&mut g, b, buf.get(..n).unwrap_or(&[]), &handle_rsp(primary)));
     let n = flow_command(&mut buf, 0, primary, 0, 0);
     let salted = buf.get(..n).unwrap_or(&[]);
-    assert!(g.command(0, salted) == Err(Refusal::NotOwned));
-    assert!(g.command(1, salted).is_ok());
+    assert!(g.command(third, salted) == Err(Refusal::NotOwned));
+    assert!(g.command(b, salted).is_ok());
 }

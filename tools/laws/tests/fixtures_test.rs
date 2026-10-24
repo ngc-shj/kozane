@@ -592,6 +592,20 @@ fn caller_with_pp_channels_to_both_key_pds_is_l2() {
     assert_deny("two_key_caller_of_both_deny", &["L2"]);
 }
 
+/// M6 plan C12: a key pd with two pp callers is shared, so one caller can
+/// delay the other's calls; reported under L2 by this rule alone.
+#[test]
+fn a_key_pd_with_two_pp_callers_is_l2() {
+    assert_deny_exactly("key_shared_by_two_callers_deny", &["L2: key pd 'key' has 2 pp callers, at most one: caller, caller_b"]);
+}
+
+/// Allow side: one pp caller, and the key pd's own PPC to `tpm` is no
+/// caller.
+#[test]
+fn a_key_pd_with_one_pp_caller_and_its_tpm_channel_is_allowed() {
+    assert_allow("key_single_caller_allow");
+}
+
 #[test]
 fn key_pds_mapping_each_others_secrets_is_l2() {
     assert_deny("two_key_swapped_owners_deny", &["L2"]);

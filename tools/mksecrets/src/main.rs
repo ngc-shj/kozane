@@ -1,16 +1,18 @@
 //! Generates a development deployment (plan C16, M3 plan C6, M6 plan C11):
 //! fresh gateway and peer keys, a gateway config for the build
-//! (SECUREOS_CONFIG) with the McEliece public key files it names, both
+//! (SECUREOS_CONFIG) with the McEliece public key files it names, the three
 //! secrets regions for `make package` (`secrets.bin` for `key`,
-//! `pqkey-secrets.bin` for `pqkey`), and per peer a client bundle: a wg(8)
+//! `pqkey-secrets.bin` for `pqkey`, `tls-secrets.bin` for `tlskey`), and per
+//! peer a client bundle: a wg(8)
 //! config without a PresharedKey (the PSK comes from Rosenpass, L8), a
 //! rosenpass(1) config and the peer's McEliece keypair, the secret key in
 //! the liboqs layout upstream rosenpass reads.
 //!
-//! For HTTPS, in the plan's order: a fresh P-256 scalar goes into the key
-//! blob (v3) and its public key into `tls.pub` (PEM); tools/mkcert issues
-//! a dev CA (`devca.pem`, its key never written) and the leaf (`tls.der`);
-//! the config names the leaf and `tls_public`, and is validated last.
+//! For HTTPS, in the plan's order: a fresh P-256 scalar goes into the TLS
+//! blob (M6 plan C12, with its own boot seed, drawn apart from `key`'s) and
+//! its public key into `tls.pub` (PEM); tools/mkcert issues a dev CA
+//! (`devca.pem`, its key never written) and the leaf (`tls.der`); the config
+//! names the leaf and `tls_public`, and is validated last.
 //!
 //! Usage: mksecrets --template config/gateway.toml --peers N --out DIR
 //!                  [--endpoint HOST:PORT] [--rp-endpoint HOST:PORT]
@@ -20,13 +22,13 @@
 //! template's `rp_port`. NAME, the HTTPS server's name, defaults to the
 //! template's `outside_ip` (mkcert's IP mode). --test-negative also writes
 //! mkcert's negative leaves; --tls-mismatch-blob also writes
-//! `secrets-tls-mismatch.bin`, this deployment's blob with another TLS
-//! scalar (the TLS-only key failure case, M6 plan D5).
+//! `tls-secrets-mismatch.bin`, this deployment's TLS blob with another valid
+//! scalar (the TLS key failure case, M6 plan C12 case 8).
 //!
 //! `mksecrets seal` seals one of those blobs offline into its envelope (M5
 //! plan C11) for one TPM and one expected PCR 8:
 //!
-//!   mksecrets seal --kind key|pq --blob FILE --srk-public FILE --pcr8 HEX --out FILE
+//!   mksecrets seal --kind key|pq|tls --blob FILE --srk-public FILE --pcr8 HEX --out FILE
 //!
 //! The SRK public is the TPM2B_PUBLIC `tpm2_readpublic -o` writes for the
 //! SRK (the storage template `tpm2::envelope` pins); PCR 8 is the hex value
@@ -191,7 +193,7 @@ struct TlsOptions<'a> {
     name: Option<&'a str>,
     /// Also issue mkcert's negative leaves.
     negative: bool,
-    /// Also write this deployment's blob with another TLS scalar.
+    /// Also write this deployment's TLS blob with another valid scalar.
     mismatch_blob: bool,
     issue: Issue<'a>,
 }
@@ -300,8 +302,9 @@ struct PeerBundle {
 struct Deployment {
     config: String,
     blob: Box<[u8; secret_blob::REGION_SIZE]>,
-    /// `blob` with another valid TLS scalar, if asked for.
-    tls_mismatch_blob: Option<Box<[u8; secret_blob::REGION_SIZE]>>,
+    tls_blob: Box<[u8; secret_blob::tls::REGION_SIZE]>,
+    /// `tls_blob` with another valid scalar, if asked for.
+    tls_mismatch_blob: Option<Box<[u8; secret_blob::tls::REGION_SIZE]>>,
     tls_pub_pem: String,
     /// mkcert's files: `tls.der`, `devca.pem` and any negative leaves.
     certs: Vec<(String, Vec<u8>)>,
@@ -407,14 +410,18 @@ fn generate(
 
     let mut blob = zeroed::<{ secret_blob::REGION_SIZE }>()?;
     let wg_publics: Vec<[u8; 32]> = peer_keys.iter().map(|(kp, _)| kp.public).collect();
-    let boot_seed = random32()?;
-    secret_blob::write(&mut blob, &gateway.private, &boot_seed, tls_private.as_bytes(), &wg_publics)
+    secret_blob::write(&mut blob, &gateway.private, &random32()?, &wg_publics)
         .ok_or_else(|| "secrets do not fit the region".to_string())?;
+    // The TLS blob's own boot seed, independent of `key`'s (M6 plan C12).
+    let tls_seed = random32()?;
+    let mut tls_blob = zeroed::<{ secret_blob::tls::REGION_SIZE }>()?;
+    secret_blob::tls::write(&mut tls_blob, tls_private.as_bytes(), &tls_seed)
+        .ok_or_else(|| "TLS secrets do not fit the region".to_string())?;
     let tls_mismatch_blob = if tls.mismatch_blob {
         let (other, _) = p256_keypair()?;
-        let mut b = zeroed::<{ secret_blob::REGION_SIZE }>()?;
-        secret_blob::write(&mut b, &gateway.private, &boot_seed, other.as_bytes(), &wg_publics)
-            .ok_or_else(|| "secrets do not fit the region".to_string())?;
+        let mut b = zeroed::<{ secret_blob::tls::REGION_SIZE }>()?;
+        secret_blob::tls::write(&mut b, other.as_bytes(), &tls_seed)
+            .ok_or_else(|| "TLS secrets do not fit the region".to_string())?;
         Some(b)
     } else {
         None
@@ -459,6 +466,7 @@ fn generate(
     Ok(Deployment {
         config,
         blob,
+        tls_blob,
         tls_mismatch_blob,
         tls_pub_pem,
         certs,
@@ -619,8 +627,9 @@ fn run(args: &[String]) -> Result<(), String> {
         write_private(&stage.join("gateway.toml"), d.config.as_bytes())?;
         write_private(&stage.join(GATEWAY_RP_PUBLIC), &d.gateway_rp_public[..])?;
         write_private(&stage.join("secrets.bin"), &d.blob[..])?;
+        write_private(&stage.join("tls-secrets.bin"), &d.tls_blob[..])?;
         if let Some(b) = &d.tls_mismatch_blob {
-            write_private(&stage.join("secrets-tls-mismatch.bin"), &b[..])?;
+            write_private(&stage.join("tls-secrets-mismatch.bin"), &b[..])?;
         }
         write_private(&stage.join("pqkey-secrets.bin"), &d.pq_blob[..])?;
         write_private(&stage.join(TLS_PUB), d.tls_pub_pem.as_bytes())?;
@@ -660,6 +669,16 @@ fn pcr8(hex: &str) -> Result<[u8; 32], String> {
     Ok(out)
 }
 
+/// `--kind`: the envelope kind of each key PD's blob.
+fn parse_kind(name: &str) -> Result<Kind, String> {
+    match name {
+        "key" => Ok(Kind::Key),
+        "pq" => Ok(Kind::Pq),
+        "tls" => Ok(Kind::Tls),
+        other => Err(format!("--kind: {other} is not key, pq or tls")),
+    }
+}
+
 /// Reads exactly the region from `path` into `region`, then checks it is a
 /// blob of its kind (`key`'s peer count is the blob's own).
 fn read_blob(path: &Path, kind: Kind, region: &mut [u8]) -> Result<(), String> {
@@ -675,6 +694,7 @@ fn read_blob(path: &Path, kind: Kind, region: &mut [u8]) -> Result<(), String> {
             secret_blob::Blob::parse(region, peers as usize).map(|_| ())
         }
         Kind::Pq => pq::Blob::parse(region).map(|_| ()),
+        Kind::Tls => secret_blob::tls::Blob::parse(region).map(|_| ()),
     };
     checked.map_err(|e| format!("{}: {}", path.display(), e.message()))
 }
@@ -700,11 +720,7 @@ fn run_seal(args: &[String]) -> Result<(), String> {
         let mut value = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
         match a.as_str() {
             "--kind" => {
-                kind = Some(match value()?.as_str() {
-                    "key" => Kind::Key,
-                    "pq" => Kind::Pq,
-                    other => return Err(format!("--kind: {other} is not key or pq")),
-                })
+                kind = Some(parse_kind(&value()?)?)
             }
             "--blob" => blob = Some(PathBuf::from(value()?)),
             "--srk-public" => srk = Some(PathBuf::from(value()?)),
@@ -714,7 +730,7 @@ fn run_seal(args: &[String]) -> Result<(), String> {
         }
     }
     let (Some(kind), Some(blob), Some(srk), Some(pcr), Some(out)) = (kind, blob, srk, pcr, out) else {
-        return Err("usage: mksecrets seal --kind key|pq --blob FILE --srk-public FILE --pcr8 HEX --out FILE".into());
+        return Err("usage: mksecrets seal --kind key|pq|tls --blob FILE --srk-public FILE --pcr8 HEX --out FILE".into());
     };
     let srk_file = std::fs::read(&srk).map_err(|e| format!("{}: {e}", srk.display()))?;
     let envelope = seal_file(kind, &blob, srk_public(&srk_file)?, &pcr)?;
@@ -743,11 +759,7 @@ fn run_check_envelope(args: &[String]) -> Result<(), String> {
         let mut value = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
         match a.as_str() {
             "--kind" => {
-                kind = Some(match value()?.as_str() {
-                    "key" => Kind::Key,
-                    "pq" => Kind::Pq,
-                    other => return Err(format!("--kind: {other} is not key or pq")),
-                })
+                kind = Some(parse_kind(&value()?)?)
             }
             "--envelope" => envelope = Some(PathBuf::from(value()?)),
             "--pcr8" => pcr = Some(pcr8(&value()?)?),
@@ -755,7 +767,7 @@ fn run_check_envelope(args: &[String]) -> Result<(), String> {
         }
     }
     let (Some(kind), Some(envelope), Some(pcr)) = (kind, envelope, pcr) else {
-        return Err("usage: mksecrets check-envelope --kind key|pq --envelope FILE --pcr8 HEX".into());
+        return Err("usage: mksecrets check-envelope --kind key|pq|tls --envelope FILE --pcr8 HEX".into());
     };
     let bytes = std::fs::read(&envelope).map_err(|e| format!("{}: {e}", envelope.display()))?;
     envelope_sealed_to(&bytes, kind, &pcr)?;

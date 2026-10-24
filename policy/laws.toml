@@ -25,9 +25,12 @@
 #     notify=false on the peer end (L1); a tainted timer is itself an L1
 #     violation. `key` pds hold the static secrets and get the
 #     taint exemption (L1, L2); there may be several, each mapping
-#     exactly its own secrets mr and nothing else, and no pd may hold
-#     pp=true channels to two of them (L2: disjoint secrets and disjoint
-#     callers, M3 plan Law amendments). A `key` pd may have exactly one
+#     exactly its own secrets mr and nothing else, no pd may hold
+#     pp=true channels to two of them, and none has more than one pp
+#     caller: at most one channel whose peer end is pp=true and whose key
+#     end is pp=false (L2: disjoint secrets and disjoint callers, M3 plan
+#     Law amendments; no key pd is shared, M6 plan C12; its PPC to `tpm`
+#     is not a caller). A `key` pd may have exactly one
 #     channel with pp=true on its own end, and it leads to a `tpm` pd (L1
 #     as amended by the M5 plan, C9); that channel is no exemption: taint
 #     crosses it both ways. `tpm` (C9) owns the TIS device mr (below) and
@@ -142,21 +145,22 @@
 #   tunnelled plaintext (L3: the `dn`/`nd` data regions). All of these and
 #   `audit` are tainted. `pq` (M3a) runs the Rosenpass responder on
 #   datagrams relayed by `ingress` and sends each fresh OSK to `hs`; it is
-#   tainted too. `key` and `pqkey` are the taint-exempt secrets holders
-#   (passive; `key` takes PPC from `hs` only and maps only `secrets`,
-#   `pqkey` from `pq` only and maps only `pq_secrets`; L2 as amended).
+#   tainted too. `key`, `pqkey` and `tlskey` are the taint-exempt secrets
+#   holders (passive; `key` takes PPC from `hs` only and maps only
+#   `secrets`, `pqkey` from `pq` only and maps only `pq_secrets`, `tlskey`
+#   from `tls` only and maps only `tls_secrets`; L2 as amended).
 #   `timer` is exempt as notify-only (L1): it notifies `data`, `hs`,
 #   `ingress` and `pq`, none of which can notify it. `audit` (M5) owns the
 #   PL011 page as the only console and writes its lines there. `tpm` (M5)
-#   owns the TIS page and is called by `key` and `pqkey` alone, each over
+#   owns the TIS page and is called by the three key pds alone, each over
 #   its one pp channel, to unseal their secrets at boot; it is untainted
-#   and ordered above `key` (L13, and Microkit's callee-above-caller rule).
+#   and ordered above them (L13, and Microkit's callee-above-caller rule).
 #   `tls` (M6) is the HTTPS endpoint: it runs TCP on packets `ingress`
 #   vetted (`itl`/`tli`) and reaches its backend through `inner`
 #   (`tln`/`ntl`, plaintext of a protected session, L3 as amended); it
-#   calls `key` exactly as `hs` does and no other key pd (L2), and is
-#   tainted with role `untrusted_input`, so it runs below `key` and `timer`
-#   (L13 as amended by the M6 plan).
+#   calls `tlskey` (M6 plan C12) exactly as `hs` calls `key` and no other
+#   key pd (L2), and is tainted with role `untrusted_input`, so it runs
+#   below the key pds and `timer` (L13 as amended by the M6 plan).
 
 [pds.eth_out]
 role = "driver"
@@ -199,6 +203,9 @@ role = "tpm"
 
 [pds.tls]
 role = "untrusted_input"
+
+[pds.tlskey]
+role = "key"
 
 [mrs.eth_out_mmio]
 kind = "device"
@@ -247,6 +254,10 @@ owner = "key"
 [mrs.pq_secrets]
 kind = "secrets"
 owner = "pqkey"
+
+[mrs.tls_secrets]
+kind = "secrets"
+owner = "tlskey"
 
 # net_rx: eth_out -> ingress, outside frames in
 [mrs.net_rx_used]
@@ -663,9 +674,14 @@ pp = { timer = false, tls = false }
 notify = { timer = true, tls = false }
 
 [[channels]]
-between = ["tls", "key"]
-pp = { tls = true, key = false }
-notify = { tls = false, key = true }
+between = ["tls", "tlskey"]
+pp = { tls = true, tlskey = false }
+notify = { tls = false, tlskey = true }
+
+[[channels]]
+between = ["tlskey", "tpm"]
+pp = { tlskey = true, tpm = false }
+notify = { tlskey = false, tpm = false }
 
 [[channels]]
 between = ["tls", "audit"]

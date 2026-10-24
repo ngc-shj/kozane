@@ -30,11 +30,6 @@ pub const ETH_IN_IRQ: usize = 71;
 pub const DATA_STACK_SIZE: usize = 0x20_000;
 /// `tls`'s stack_size, which its stack probe paints.
 pub const TLS_STACK_SIZE: usize = 0x30_000;
-/// `tls`'s MCS budget and period (system file µs × 1000): a `TLS_SIGN`
-/// runs on this budget, which bounds how long `hs` can wait behind it in
-/// `key` (M6 plan C5, the invariant in `hs-core`).
-pub const TLS_BUDGET_NS: u64 = 500_000;
-pub const PERIOD_NS: u64 = 10_000_000;
 
 /// sp804 on QEMU virt (coliasgroup patch): 1 MHz input clock, SPI 11.
 pub const TIMER_IRQ: usize = 43;
@@ -88,7 +83,6 @@ pub mod timer {
 pub mod key {
     pub const CH_HS: usize = 1;
     pub const CH_TPM: usize = 3;
-    pub const CH_TLS: usize = 4;
 }
 
 pub mod hs {
@@ -125,13 +119,20 @@ pub mod pq {
 }
 
 /// M6: the HTTPS endpoint (plan C1, C3): TCP and TLS on packets `ingress`
-/// vetted, its backend reached through `inner`, its signatures from `key`.
+/// vetted, its backend reached through `inner`, its signatures from
+/// `tlskey` (plan C12).
 pub mod tls {
     pub const CH_INGRESS: usize = 1;
     pub const CH_INNER: usize = 2;
     pub const CH_TIMER: usize = 3;
-    pub const CH_KEY: usize = 4;
+    pub const CH_TLSKEY: usize = 4;
     pub const CH_AUDIT: usize = 5;
+}
+
+/// M6: the TLS signing oracle (plan C12), a passive key-role PD.
+pub mod tlskey {
+    pub const CH_TLS: usize = 1;
+    pub const CH_TPM: usize = 3;
 }
 
 /// M3: the McEliece decapsulation oracle (plan C2), a passive key-role PD.
@@ -140,13 +141,14 @@ pub mod pqkey {
     pub const CH_TPM: usize = 3;
 }
 
-/// M5: the TPM driver (plan C9), callee of `key` and `pqkey` only, and its
+/// M5: the TPM driver (plan C9), callee of the key PDs only, and its
 /// PPC protocol. One call carries one TPM command or response in the
 /// message registers, little-endian bytes packed into words, its byte
 /// length in the label: `label = kind << KIND_SHIFT | arg`.
 pub mod tpm {
     pub const CH_KEY: usize = 1;
     pub const CH_PQKEY: usize = 2;
+    pub const CH_TLSKEY: usize = 3;
 
     /// seL4's IPC buffer carries 120 message words.
     pub const MSG_WORDS: usize = 120;
@@ -173,7 +175,7 @@ pub mod tpm {
     pub const RSP_REFUSED: u64 = 2;
     /// The device timed out or broke the TIS protocol; `arg` is the step.
     pub const RSP_DEVICE: u64 = 3;
-    /// The other client's flow is under way: call again later. Only a
+    /// Another client's flow is under way: call again later. Only a
     /// client that has not started is told this.
     pub const RSP_BUSY: u64 = 4;
     /// Not a request of this protocol, or a caller `tpm` does not serve.

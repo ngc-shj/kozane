@@ -153,8 +153,9 @@ def tree(d: pathlib.Path, pd_bm=None, pd_extra=(), harness_bm=None, harness_extr
          harness_encapsulate=None, tls_exchange_extra=(), harness_anon_file="src/hybrid.rs", harness_anon_line=12,
          harness_cmp="bcmp"):
     """A search path with pd-pq.elf and pd-pqkey.elf, each with its own
-    McEliece root only, pqkey and pd-key.elf with the envelope open (key
-    without McEliece), pd-tls.elf with the TLS roots alone, and a harness
+    McEliece root only, pqkey, pd-key.elf and pd-tlskey.elf with the envelope
+    open (key and tlskey without McEliece), pd-tls.elf with the TLS roots
+    alone, and a harness
     (with every root) built at other addresses with other crate hashes,
     other anonymous-constant numbers and bcmp for memcmp.
     `debug_put_char` names the PD ELF that also gets the DebugPutChar
@@ -168,6 +169,8 @@ def tree(d: pathlib.Path, pd_bm=None, pd_extra=(), harness_bm=None, harness_extr
     # The McEliece knobs (bm, extra, mul, entry) are pqkey's and pq's.
     build(search, "pd-key.elf", program("a1", "pd_key", vstd=vstd, debug_put_char=debug_put_char == "pd-key.elf",
                                         mce=False), 0x200000)
+    build(search, "pd-tlskey.elf", program("a1", "pd_tlskey", vstd=vstd,
+                                           debug_put_char=debug_put_char == "pd-tlskey.elf", mce=False), 0x200000)
     build(search, "pd-tls.elf", program("a1", "pd_tls", mce=False, open_root=False, tls=True,
                                         exchange_extra=tls_exchange_extra), 0x200000)
     harness = build(d, "ct-harness", program("b7", "ct_harness", filler=37, bm=harness_bm, extra=harness_extra,

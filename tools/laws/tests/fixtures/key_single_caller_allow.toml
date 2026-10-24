@@ -1,0 +1,39 @@
+[pds.caller]
+role = "service"
+
+[pds.key]
+role = "key"
+
+[pds.tpm]
+role = "tpm"
+
+[mrs.tis]
+kind = "device"
+owner = "tpm"
+phys_addr = 0xc000000
+size = 0x1000
+tpm = true
+
+[mrs.secrets]
+kind = "secrets"
+owner = "key"
+
+[[channels]]
+between = ["caller", "key"]
+pp = { caller = true, key = false }
+notify = { caller = false, key = true }
+
+[[channels]]
+between = ["key", "tpm"]
+pp = { key = true, tpm = false }
+notify = { key = false, tpm = false }
+
+[priority]
+below = [["service", "key"], ["key", "tpm"]]
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

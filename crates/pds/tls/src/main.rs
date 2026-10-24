@@ -3,9 +3,9 @@
 //! out through `ingress`'s `tls_egress` (`tli`); eight listeners on the
 //! HTTPS port, each with one connection slot of `tls_core::conn`, which
 //! holds the TLS 1.3 session and decides every timeout, close and wipe.
-//! The server's CertificateVerify is signed by `key` (`TlsSign` over PPC);
-//! the randomness is hedged over `key`'s boot seed for `tls`, RNDR and
-//! CNTPCT. Until the proxy lands (plan C4, C10; slice 4) a complete request
+//! The server's CertificateVerify is signed by `tlskey` (`TlsSign` over
+//! PPC, M6 plan C12); the randomness is hedged over `tlskey`'s boot seed,
+//! RNDR and CNTPCT. Until the proxy lands (plan C4, C10; slice 4) a complete request
 //! head gets a fixed response, then close_notify. Tainted (law L1).
 
 #![no_std]
@@ -16,7 +16,7 @@ use core::mem::MaybeUninit;
 use core::ptr::addr_of_mut;
 
 use audit_event::{CostHighWater, Event};
-use key_core::{LABEL_BOOT_SEED, LABEL_TLS_SIGN, MAX_WORDS, OK};
+use tlskey_core::{LABEL_BOOT_SEED, LABEL_TLS_SIGN, MAX_WORDS, OK};
 use layout::tls as ch;
 use pdkit::{Audit, Buf, Rx, Tx};
 use ring::pass::{any_full, run_passes};
@@ -30,6 +30,7 @@ use smoltcp::socket::tcp;
 use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 use tls_core::conn::{Action, CloseCause, Closed, Endpoint, HEAD_BUF_LEN, Slot, Stage, Table, Timeout};
+use tls_core::halt;
 use tls_core::handshake::{Ctx, Event as TlsEvent, Signer};
 use tls_core::rng::{HedgeHw, Hedged, Rng, SEED_LEN};
 use tls_core::{Refusal, Secret};
@@ -38,7 +39,7 @@ use zeroize::Zeroize;
 
 const INGRESS: Channel = Channel::new(ch::CH_INGRESS);
 const TIMER: Channel = Channel::new(ch::CH_TIMER);
-const KEY: Channel = Channel::new(ch::CH_KEY);
+const TLSKEY: Channel = Channel::new(ch::CH_TLSKEY);
 
 /// Connections at once (plan C10), one listener and one slot each.
 const MAX_CONNS: usize = tls_core::conn::MAX_CONNS;
@@ -156,20 +157,6 @@ const fn names_match() -> bool {
         i += 1;
     }
     true
-}
-
-/// `Halted` reasons (the record's `a`), stable per M5 plan C6.
-mod halt {
-    /// CNTFRQ is 0: no clock, so no TCP or connection timer would fire.
-    pub const NO_CLOCK: u32 = 1;
-    /// RNDR failed at init: no seed for smoltcp's initial sequence numbers.
-    pub const RNDR: u32 = 2;
-    /// The interface or a listener could not be set up, or `key` refused
-    /// the boot seed for a reason other than Unavailable.
-    pub const INIT_FAILED: u32 = 3;
-    /// `key` answered Unavailable (after `KeyUnavailable`): its boot failed
-    /// (the boot seed) or the TLS key is unusable (`TlsSign`; M6 plan D5).
-    pub const KEY_UNAVAILABLE: u32 = 4;
 }
 
 /// Everything too large for the stack, where the handler state lives: the
@@ -358,20 +345,20 @@ impl Device for Rings {
     }
 }
 
-/// One call into `key` over PPC, as pd-hs's: `req` in the message
-/// registers, at most `reply.len()` reply words copied out, then every
-/// register up to `MAX_WORDS` zeroed. Returns the reply label and the words
-/// copied.
+/// One call into `tlskey` over PPC, as pd-hs's into `key`: `req` in the
+/// message registers, at most `reply.len()` reply words copied out, then
+/// every register up to `MAX_WORDS` zeroed. Returns the reply label and the
+/// words copied.
 fn key_call(label: u64, req: &[u64], reply: &mut [u64]) -> (u64, usize) {
     if req.len() > MAX_WORDS {
-        return (key_core::ERR_BAD_REQUEST, 0);
+        return (tlskey_core::ERR_BAD_REQUEST, 0);
     }
     with_msg_regs_mut(|mrs| {
         for (dst, src) in mrs.iter_mut().zip(req) {
             *dst = *src;
         }
     });
-    let info = KEY.pp_call(MessageInfo::new(label, req.len()));
+    let info = TLSKEY.pp_call(MessageInfo::new(label, req.len()));
     let n = info.count().min(reply.len()).min(MAX_WORDS);
     with_msg_regs(|mrs| {
         for (dst, src) in reply.iter_mut().zip(mrs.iter().take(n)) {
@@ -382,21 +369,22 @@ fn key_call(label: u64, req: &[u64], reply: &mut [u64]) -> (u64, usize) {
     (info.label(), n)
 }
 
-/// `key`'s boot seed for `tls`, the hedged RNG's key (M6 plan C7). An
-/// Unavailable `key` is audited with its code, and `tls` halts (D5).
+/// `tlskey`'s boot seed, the hedged RNG's key (M6 plan C7). An Unavailable
+/// `tlskey` (its unseal, blob or scalar failed) is audited with its code,
+/// and `tls` halts before any listener exists (M6 plan C12).
 fn boot_seed(audit: &mut Audit) -> Secret<SEED_LEN> {
-    let mut reply = [0u64; key_core::BOOT_SEED_REPLY_WORDS];
+    let mut reply = [0u64; tlskey_core::BOOT_SEED_REPLY_WORDS];
     let (label, n) = key_call(LABEL_BOOT_SEED, &[], &mut reply);
     let mut seed = Secret::<SEED_LEN>::zero();
     let ok = label == OK
         && n == reply.len()
-        && key_core::unpack32(&reply).map(|mut b| {
+        && tlskey_core::unpack32(&reply).map(|mut b| {
             seed.as_mut_bytes().copy_from_slice(&b);
             b.zeroize();
         }) == Some(());
     reply.zeroize();
     if !ok {
-        if let Some(code) = key_core::unavailable_code(label) {
+        if let Some(code) = tlskey_core::unavailable_code(label) {
             audit.record(Event::KeyUnavailable { code });
             audit.halt(halt::KEY_UNAVAILABLE)
         }
@@ -405,9 +393,9 @@ fn boot_seed(audit: &mut Audit) -> Secret<SEED_LEN> {
     seed
 }
 
-/// `key`'s `TlsSign` (M6 plan C5) as the handshake's signer. Each call's
-/// wall time is measured, as `hs` measures its key calls: `sign_us` is the
-/// longest since the last report. An Unavailable answer is left in
+/// `tlskey`'s `TlsSign` (M6 plan C5, C12) as the handshake's signer. Each
+/// call's wall time is measured, as `hs` measures its key calls: `sign_us`
+/// is the longest since the last report. An Unavailable answer is left in
 /// `unavailable` for the PD to audit and halt on once the record's call
 /// has returned (and wiped the slot).
 struct KeySigner<'a> {
@@ -427,21 +415,21 @@ impl Signer for KeySigner<'_> {
 impl KeySigner<'_> {
     #[inline(never)]
     fn call(&mut self, transcript_hash: &[u8; HASH_LEN]) -> Result<[u8; 64], Refusal> {
-        let req = key_core::pack32(transcript_hash);
-        let mut reply = [0u64; key_core::TLS_SIGN_REPLY_WORDS];
+        let req = tlskey_core::pack32(transcript_hash);
+        let mut reply = [0u64; tlskey_core::TLS_SIGN_REPLY_WORDS];
         let start = cpu::cntpct();
         let (label, n) = key_call(LABEL_TLS_SIGN, &req, &mut reply);
         let us = cpu::ticks_to_ns(cpu::cntpct().saturating_sub(start), cpu::cntfrq()) / 1000;
         let us = u32::try_from(us).unwrap_or(u32::MAX);
         *self.sign_us = Some(self.sign_us.map_or(us, |w| w.max(us)));
         if label != OK {
-            *self.unavailable = key_core::unavailable_code(label);
+            *self.unavailable = tlskey_core::unavailable_code(label);
             return Err(Refusal::Internal);
         }
         let (r, s) = reply.split_at(4);
         let mut sig = [0u8; 64];
         let (sig_r, sig_s) = sig.split_at_mut(32);
-        match (n == reply.len(), key_core::unpack32(r), key_core::unpack32(s)) {
+        match (n == reply.len(), tlskey_core::unpack32(r), tlskey_core::unpack32(s)) {
             (true, Some(r), Some(s)) => {
                 sig_r.copy_from_slice(&r);
                 sig_s.copy_from_slice(&s);
@@ -500,7 +488,7 @@ struct Tls {
     /// The longest `TlsSign` since the last report, and its gate.
     sign_us: Option<u32>,
     sign_wait: CostHighWater,
-    /// `key` answered a `TlsSign` Unavailable with this code (D5).
+    /// `tlskey` answered a `TlsSign` Unavailable with this code (C12).
     unavailable: Option<u32>,
     stack: cpu::StackProbe,
 }
@@ -562,8 +550,8 @@ fn init() -> Tls {
     if cpu::checked_frequency(cpu::cntfrq()).is_none() {
         audit.halt(halt::NO_CLOCK);
     }
-    // The boot seed is `tls`'s first call to `key`: an Unavailable `key`
-    // shows here first, audited once, as tls then halts.
+    // The boot seed is `tls`'s first call to `tlskey`: an Unavailable
+    // `tlskey` shows here, audited once, and tls halts before listening.
     let mut rng = Hedged::new(boot_seed(&mut audit), Hw);
     let mut seed = [0u8; 8];
     if rng.fill(&mut seed).is_err() {
@@ -716,9 +704,9 @@ impl Tls {
         for i in 0..MAX_CONNS {
             self.after_egress(i);
         }
-        if let Some(code) = self.unavailable.take() {
+        if let Some((code, reason)) = halt::after_sign(self.unavailable.take()) {
             self.rings.audit.record(Event::KeyUnavailable { code });
-            self.rings.audit.halt(halt::KEY_UNAVAILABLE);
+            self.rings.audit.halt(reason);
         }
         taken
     }

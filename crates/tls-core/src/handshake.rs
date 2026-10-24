@@ -30,7 +30,7 @@ pub const TX_BUF_LEN: usize = MAX_SERVER_RECORD + 256;
 /// The rx buffer a protected record is decrypted into.
 pub const RX_BUF_LEN: usize = tls_wire::MAX_CIPHERTEXT;
 
-/// `key`'s TlsSign oracle as the PD reaches it (C5): r ‖ s over the
+/// `tlskey`'s TlsSign oracle as the PD reaches it (C5, C12): r ‖ s over the
 /// server CertificateVerify content of a transcript hash.
 pub trait Signer {
     fn sign(&mut self, transcript_hash: &[u8; HASH_LEN]) -> Result<[u8; 64], Refusal>;

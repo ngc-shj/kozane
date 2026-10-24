@@ -80,7 +80,7 @@ fn every_region_is_a_link_an_audit_ring_or_a_named_singleton() {
         .flat_map(|l| ["used", "free", "data"].map(|s| std::format!("{l}_{s}")))
         .chain(AUDITS.iter().map(|a| String::from(*a)))
         .chain(
-            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "tpm_mmio", "secrets", "pq_secrets"]
+            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "tpm_mmio", "secrets", "pq_secrets", "tls_secrets"]
                 .map(String::from),
         )
         .collect();
@@ -143,6 +143,12 @@ fn pq_secrets_region_holds_one_blob() {
     assert_eq!(mr_sizes()["pq_secrets"], 16384);
 }
 
+#[test]
+fn tls_secrets_region_holds_one_blob() {
+    // Mirrors secret_blob::tls::REGION_SIZE (tlskey maps it whole).
+    assert_eq!(mr_sizes()["tls_secrets"], 4096);
+}
+
 // NET_RING_SLOTS >= NET_BUFFERS is a compile-time assert in ring::link.
 
 /// (pd a, id at a) -> (pd b, id at b) for every channel end pair.
@@ -198,7 +204,8 @@ fn channel_ids_match_layout() {
         (("ingress", ingress::CH_TLS), ("tls", tls::CH_INGRESS)),
         (("tls", tls::CH_INNER), ("inner", inner::CH_TLS)),
         (("timer", timer::CH_TLS), ("tls", tls::CH_TIMER)),
-        (("tls", tls::CH_KEY), ("key", key::CH_TLS)),
+        (("tls", tls::CH_TLSKEY), ("tlskey", tlskey::CH_TLS)),
+        (("tlskey", tlskey::CH_TPM), ("tpm", tpm::CH_TLSKEY)),
         (("tls", tls::CH_AUDIT), ("audit", audit::CH_TLS)),
     ];
     for (a, b) in expected {
@@ -276,25 +283,18 @@ fn tls_links_are_mapped_by_their_two_ends_only() {
                 assert!(map_of(pd, &std::format!("{link}_{side}")).is_some(), "{pd} {link}_{side}");
             }
         }
-        for pd in ["eth_out", "eth_in", "timer", "tpm", "key", "pqkey", "hs", "pq", "data", "audit"] {
+        for pd in ["eth_out", "eth_in", "timer", "tpm", "key", "pqkey", "tlskey", "hs", "pq", "data", "audit"] {
             assert!(map_of(pd, &std::format!("{link}_data")).is_none(), "{pd} maps {link}_data");
         }
     }
 }
 
-/// M6 plan C1: `tls` is an ordinary scheduled PD with its own budget, and
-/// a caller of `key` exactly as `hs` is.
+/// M6 plan C1, C12: `tls` is an ordinary scheduled PD with its own budget,
+/// and a caller of `tlskey` exactly as `hs` is of `key`.
 #[test]
-fn tls_schedule_and_key_channel_match_the_plan() {
+fn tls_schedule_and_tlskey_channel_match_the_plan() {
     let attr = |a| pd_attribute("tls", a).expect(a);
     assert_eq!(parse_num(&attr("priority")), 100);
-    // M6 plan C5: the budget and period the key-wait invariant computes with.
-    assert_eq!(parse_num(&attr("budget")) as u64 * 1000, TLS_BUDGET_NS);
-    assert_eq!(parse_num(&attr("period")) as u64 * 1000, PERIOD_NS);
-    assert_eq!((TLS_BUDGET_NS, PERIOD_NS), (500_000, 10_000_000));
-    // The priority order the invariant relies on: hs's call is queued
-    // ahead of tls's at key's endpoint.
-    assert!(parse_num(&pd_attribute("hs", "priority").expect("hs")) > parse_num(&attr("priority")));
     assert_eq!(pd_attribute("tls", "passive"), None);
     let text = system_text();
     let doc = roxmltree::Document::parse(&text).expect("parse .system");
@@ -312,6 +312,27 @@ fn tls_schedule_and_key_channel_match_the_plan() {
             .expect("channel")
     };
     let hs = channel("hs", "key");
-    let tls = channel("tls", "key");
+    let tls = channel("tls", "tlskey");
     assert_eq!((&tls[0].1, &tls[0].2, &tls[1].1), (&hs[0].1, &hs[0].2, &hs[1].1));
+    let key = channel("key", "tpm");
+    let tlskey = channel("tlskey", "tpm");
+    assert_eq!((&tlskey[0].1, &tlskey[0].2, &tlskey[1].1, &tlskey[1].2), (&key[0].1, &key[0].2, &key[1].1, &key[1].2));
+}
+
+/// M6 plan C12: `tlskey` is passive (every sign runs on `tls`'s scheduling
+/// context), between `tls` and `tpm` in priority, with `key`'s stack, and
+/// maps its own secrets region alone.
+#[test]
+fn tlskey_is_a_passive_key_pd_on_the_planned_schedule() {
+    let attr = |a| pd_attribute("tlskey", a).expect(a);
+    assert_eq!(attr("passive"), "true");
+    assert_eq!(parse_num(&attr("priority")), 135);
+    assert!(parse_num(&pd_attribute("tls", "priority").expect("tls")) < 135);
+    assert!(parse_num(&pd_attribute("tpm", "priority").expect("tpm")) > 135);
+    assert_eq!((parse_num(&attr("budget")), parse_num(&attr("period"))), (2000, 10_000));
+    assert_eq!(parse_num(&attr("stack_size")), parse_num(&pd_attribute("key", "stack_size").expect("key")));
+    assert_eq!(map_of("tlskey", "tls_secrets").map(|m| m.1).as_deref(), Some("r"));
+    for pd in ["key", "pqkey", "tls", "tpm", "hs"] {
+        assert!(map_of(pd, "tls_secrets").is_none(), "{pd} maps tls_secrets");
+    }
 }

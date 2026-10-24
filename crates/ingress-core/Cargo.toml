@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+limits = { path = "../limits" }
 msgs = { path = "../msgs" }
 ring = { path = "../ring" }
 wg-wire = { path = "../wg-wire" }

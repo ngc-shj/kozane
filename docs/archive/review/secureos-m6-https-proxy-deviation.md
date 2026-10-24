@@ -470,3 +470,136 @@ Decisions and deviations:
   The plan is re-planned (amendment "Re-plan R1"): the TLS signing key
   moves out of `key` into its own key PD, so `hs` can no longer wait on a
   TLS signature at all.
+
+## Slice 3c (C12: tlskey, key reverted, third envelope, single-caller law)
+
+Gates run (all exit 0): make pins, lint, lint-pds, unit, laws, image,
+uboot, ct, ct-shape; tests/tools test_measure, test_package, test_release,
+test_ct_shape, test_check_pins, test_check_selftest. Not run (by the
+slice's rules): Kani, Verus, make test/check, QEMU, check-selftest, bolero,
+mir, repro. The tpm2-wire harnesses were type-checked under `--cfg kani`
+against a throwaway shim (deleted). Red-proofs on throwaway copies under
+build/ (deleted): every new or retargeted `unit`/`laws` selftest case fails
+with its needle (c5-tls-static-dh, c5-k-prime, c5-nonce-cap, c5-cv-content,
+c5-d5-codes, c5-syn-burst, c5-syn-interval, c12-gate-busy, c12-seed-scalar,
+c12-envelope-kind, c12-sign-halt, laws-hs-tls-share-key), and every one of
+the 179 injections still finds its anchor exactly once.
+
+Cargo.lock, one change: `limits`, `tlskey-core` and `pd-tlskey` added;
+ingress-core → limits; key-core loses libcrux-p256, rfc6979 and sha2 (they
+move to tlskey-core, which also takes ct, limits, secret-blob, tpm2 and
+zeroize); pd-tls swaps key-core for tlskey-core. No external package
+added or removed. tools/ct-harness/Cargo.lock unchanged.
+
+Decisions:
+
+- **key reverts byte for byte.** key-core, hs-core and pds/key are their
+  pre-slice-2 (M5) sources; key-core's Cargo.toml is M5's. secret-blob's
+  `key` blob is v2 again, keeping the named offsets (GATEWAY_PRIVATE_AT,
+  BOOT_SEED_AT) run.py reads; a v3 blob (with a scalar) is refused by a
+  test. `hs` keeps KeyWaitHighWater (observability, its comment updated).
+- **tlskey's codes:** `CODE_BASE` 0x40; a failure `key` has too keeps
+  `key`'s number above the base (unseal and blob codes, RNDR 0x49);
+  ScalarInvalid 0x47 and Mismatch 0x48 take GatewayKeyMismatch's and
+  PeerMismatch's places; 0x4a stays unused (no seed derivation can fail:
+  the per-boot seed is `secret_blob::blake2s`, infallible). The collision
+  test is in tlskey-core (own range, distinct); disjointness from key-core
+  is run.py's code-table mirror (`check_key_code_tables_apart`, a new
+  single case: no dependency edge between the crates).
+- **The plaintext wipe is tlskey-core's, not the PD's.** `Oracle::boot`
+  takes the region mutably and zeroizes it on any of its failures before
+  returning, so the plan's "plaintext wiped each time" is unit-tested (one
+  test per code); the PD only unseals, calls boot, and scrubs its stack
+  once boot returned (covering the unseal and the scalar check) and after
+  every `TLS_SIGN`-labelled call. `tlskey-wipe` removes that zeroize.
+- **The TLS blob's reserved word** other than zero is `BadVersion` (the
+  header word as a whole), not a new BlobError variant: one would have
+  changed `key`'s and `pqkey`'s code tables.
+- **BootSeed** answers the per-boot seed itself (one caller: no tag), and
+  is charged to the bucket (TLS_BOOT_CALLS 1, as in slice 2).
+  `Bucket::default()` is `tls`'s production bucket.
+- **tls's halt reasons moved to `tls_core::halt`** with `after_sign`, so the
+  sign-path halt (unreachable in practice now that an Unavailable tlskey
+  halts tls at init) keeps a red-provable control: a tls-core unit test and
+  `c12-sign-halt` (R2-T N8). run.py's `halt_reason("tls", …)` reads it
+  there.
+- **Gate:** Busy comes after `check_auth` (the last validity/ownership
+  check) and before `once()`; `Gate` derives Clone/PartialEq/Eq so the unit
+  test and the busy harness compare the whole gate before and after a Busy.
+  `refusal_code` gives Busy 9 for exhaustiveness; the PD answers it
+  RSP_BUSY. tpm2's FakePpc and swtpm_interop's PD model use the gate's Busy
+  (the model now runs three client threads).
+- **BUSY_TIMEOUT_NS** = FLOW_MAX_NS (M5's 120 s for one flow at the smallest
+  key PD budget, pqkey's 0.1) × (CLIENTS − 1) = 240 s.
+- **check-pins:** P17 retired; the rules keep their names (P18, P19 not
+  renumbered), CHECK-PINS-RULES 19 → 18. key-core stays in P9/P10 (it still
+  holds Key32 secrets); P11's key-core set is replaced by tlskey-core's
+  (anchor src/lib.rs) and pds/tlskey's.
+- **ct-shape:** pd-tlskey's 20 baseline entries are pd-key's (identical
+  shapes, justifications carried over); pd-key's own entries did not change
+  (its open_sealed closure is the same). Evidence the sign path left `key`:
+  `nm` finds 0 `ecdsa_sign`/`sign_rfc6979` symbols in pd-key.elf, 3 in
+  pd-tlskey.elf. The "no Verus symbols" check covers pd-tlskey through the
+  Makefile's `pds` list. One fixture added (a call into tlskey's open past
+  its root).
+- **mksecrets:** `tls-secrets.bin` (its boot seed drawn on its own) and,
+  with --tls-mismatch-blob, `tls-secrets-mismatch.bin` (renamed from
+  `secrets-tls-mismatch.bin`: it is a TLS blob now, same boot seed, another
+  valid scalar).
+- **limits:** its tests read ingress-core's source (re-export present, no
+  own definition, the per-source bucket within the global one), as the
+  crate is a dependency-free leaf.
+- **Descriptor chain (delegated part):** the on-device "range-2 wrap"
+  refusal uses (image_len − 0x10, 0x20), which only range 2's
+  `len <= image_len − offset` line refuses (a true 64-bit wrap is the 32-bit
+  loop's, still pinned by range 0's case); on-device refusals for the 0-1
+  overlap and a version-1 descriptor were added so that each dropped
+  boot.cmd line has a case that fails (selftests measure-pair-01/-02/-12,
+  measure-range2-wrap, measure-version); package-waiver gains TLS_SECRETS.
+- **run.py:** KEY_CALLERS (tls → tlskey-core), the code tables read with
+  CODE_BASE, three-key dicts for the sealed and proxy cases, the cap wait
+  and the proxy's relay boot also wait for `tls: ready`, proxy counts 3;
+  boot 6 fails if tls audits KeyUnavailable and waits for its ready; case 8
+  packages a's key blob with the mismatched TLS blob and asserts the init
+  halt before ready (failure-only alternation), HTTPS refused, the VPN
+  handshake, the scan, and PCR 8 read as capped after the boot.
+  INTEGRATION-CASES 54 → 60 (five measure-variant refusals, the code-table
+  case), computed, not run.
+- **Case 12 is not in run.py** (the `https-contention` boot belongs to slice
+  5's hardening boots, with the multi-source probe); its amended form
+  (positive availability only, KeyWaitHighWater recorded) is slice 5's.
+
+Selftest migration:
+
+- Retargeted to tlskey-core: c5-tls-static-dh, c5-k-prime, c5-nonce-cap,
+  c5-cv-content, c5-d5-codes (now the own-range test), c5-syn-burst,
+  c5-syn-interval (needles say C12), tls-scalar-scrub (pds/tlskey).
+- Removed, subject gone: c5-caller-bucket (one caller per key PD),
+  c5-sign-wait (SIGN_COST_NS and the wait invariant retired), c5-seed-tag
+  (no per-caller seed), c5-tls-boot-fail (a TLS failure is tlskey's whole
+  boot failure now, tested per code), c5-tls-wipe (parse_checking_tls gone;
+  the wipe is tlskey-wipe's), c5-lock-pin (P17 retired), and P17's three
+  check-pins fixtures.
+- Re-anchored: key-wipe (M5's key PD), measure-wrap (six-value loop),
+  tls-key-halt (tls's init halt).
+- New: laws-hs-tls-share-key, tlskey-wipe, c12-gate-busy, c12-seed-scalar,
+  c12-envelope-kind, c12-sign-halt, measure-pair-01, measure-pair-02,
+  measure-pair-12, measure-range2-wrap, measure-version.
+
+### Slice 3c verification (orchestrator)
+
+- Gates green (pins, lint, lint-pds, unit, laws, image, uboot, ct,
+  ct-shape; tests/tools suites). Full integration 60/60 on gx10 at the
+  first run: three-envelope measured boot with descriptor v2 (five
+  on-device refusals), case 8 (TLS-only key failure: tls halts before
+  listening, VPN up, rejected scalar absent, PCR 8 capped), TLS interop,
+  residue. Probe: max handshake 1.67 s (limit 3.33 s), TlsSignHighWater
+  up to 1.24 s, now on `tls`'s own budget only.
+- Selftest: 29 new or retargeted cases red with their needles
+  (laws-hs-tls-share-key, c12-*, c5-* retargets, measure-pair-*,
+  measure-range2-wrap, measure-version, measure-wrap, key-wipe,
+  tls-key-halt, c8-head-wipe, tls-scalar-scrub, tlskey-wipe,
+  https-probe-canary, and slice 3b's conn/ct/identity cases).
+- tpm2-wire's six changed or new Kani harnesses were queued on z1mn
+  (memory-guarded, alone) at commit time; the full Kani suite follows the
+  lock change. Results are recorded with slice 4.

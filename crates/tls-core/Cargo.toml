@@ -23,5 +23,5 @@ zeroize = { version = "=1.8.1", default-features = false }
 [dev-dependencies]
 # The reference the HKDF over libcrux-hmac is checked against (host only).
 libcrux-hkdf = { version = "=0.0.9", default-features = false }
-# The tests' CertificateVerify signer, standing in for `key`'s TlsSign.
+# The tests' CertificateVerify signer, standing in for `tlskey`'s TlsSign.
 libcrux-p256 = { version = "=0.0.9", default-features = false, features = ["expose-hacl"] }

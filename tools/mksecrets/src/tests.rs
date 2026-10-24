@@ -277,7 +277,7 @@ fn the_repository_is_a_forbidden_root() {
 }
 
 #[test]
-fn run_writes_both_blobs_the_key_files_and_one_bundle_per_peer() {
+fn run_writes_the_three_blobs_the_key_files_and_one_bundle_per_peer() {
     let s = Scratch::new("run");
     let out = s.0.join("deploy");
     let template = format!("{}/../../config/gateway.toml", env!("CARGO_MANIFEST_DIR"));
@@ -309,8 +309,9 @@ fn run_writes_both_blobs_the_key_files_and_one_bundle_per_peer() {
         "peer-0.rp.pk",
         "peer-0.rp.sk",
         "pqkey-secrets.bin",
-        "secrets-tls-mismatch.bin",
         "secrets.bin",
+        "tls-secrets-mismatch.bin",
+        "tls-secrets.bin",
         "tls.der",
         "tls.pub",
     ];
@@ -318,6 +319,8 @@ fn run_writes_both_blobs_the_key_files_and_one_bundle_per_peer() {
     let size = |n: &str| std::fs::metadata(out.join(n)).unwrap().len() as usize;
     assert_eq!(size("pqkey-secrets.bin"), pq::REGION_SIZE);
     assert_eq!(size("secrets.bin"), secret_blob::REGION_SIZE);
+    assert_eq!(size("tls-secrets.bin"), secret_blob::tls::REGION_SIZE);
+    assert_eq!(size("tls-secrets-mismatch.bin"), secret_blob::tls::REGION_SIZE);
     assert_eq!(size("peer-0.rp.pk"), pq::PK_LEN);
     assert_eq!(size("peer-0.rp.sk"), pq::LIBOQS_SK_LEN);
     // The written config builds against the written key files.
@@ -417,22 +420,25 @@ fn srk_tpm2b() -> Vec<u8> {
 
 const PCR8_HEX: &str = "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b\n";
 
-/// Both blobs of the shared deployment, written where `seal` reads them.
-fn blob_files(s: &Scratch) -> (PathBuf, PathBuf, PathBuf) {
+/// The blobs of the shared deployment (`key`'s, `pqkey`'s, `tlskey`'s),
+/// written where `seal` reads them, and the SRK file.
+fn blob_files(s: &Scratch) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let d = &deployment().0;
     let dir = s.dir("in");
-    let (key, pqb, srk) = (dir.join("secrets.bin"), dir.join("pqkey-secrets.bin"), dir.join("srk.pub"));
+    let (key, pqb, tls, srk) =
+        (dir.join("secrets.bin"), dir.join("pqkey-secrets.bin"), dir.join("tls-secrets.bin"), dir.join("srk.pub"));
     std::fs::write(&key, &d.blob[..]).unwrap();
     std::fs::write(&pqb, &d.pq_blob[..]).unwrap();
+    std::fs::write(&tls, &d.tls_blob[..]).unwrap();
     std::fs::write(&srk, srk_tpm2b()).unwrap();
-    (key, pqb, srk)
+    (key, pqb, tls, srk)
 }
 
 #[test]
 fn seal_writes_envelopes_that_parse_for_their_kind() {
     let s = Scratch::new("seal");
-    let (key, pqb, srk) = blob_files(&s);
-    for (kind, name, blob) in [("key", "secrets.env", &key), ("pq", "pq_secrets.env", &pqb)] {
+    let (key, pqb, tls, srk) = blob_files(&s);
+    for (kind, name, blob) in [("key", "secrets.env", &key), ("pq", "pq_secrets.env", &pqb), ("tls", "tls_secrets.env", &tls)] {
         let out = s.0.join(name);
         let args: Vec<String> = [
             "--kind", kind, "--blob", blob.to_str().unwrap(), "--srk-public", srk.to_str().unwrap(),
@@ -443,7 +449,7 @@ fn seal_writes_envelopes_that_parse_for_their_kind() {
         .collect();
         run_seal(&args).unwrap_or_else(|e| panic!("{e}"));
         let bytes = std::fs::read(&out).unwrap();
-        let kind = if kind == "key" { Kind::Key } else { Kind::Pq };
+        let kind = parse_kind(kind).unwrap();
         let env = tpm2::envelope::Envelope::parse(&bytes, kind).unwrap_or_else(|e| panic!("{e:?}"));
         assert_eq!(env.object_policy(), &tpm2::crypto::policy_digest(&pcr8(PCR8_HEX).unwrap()));
         assert_eq!(env.srk_public(), &srk_tpm2b()[2..]);
@@ -457,7 +463,7 @@ fn seal_writes_envelopes_that_parse_for_their_kind() {
 #[test]
 fn two_seals_of_one_blob_give_different_ciphertexts() {
     let s = Scratch::new("seal-twice");
-    let (key, _, _) = blob_files(&s);
+    let (key, _, _, _) = blob_files(&s);
     let srk = srk_tpm2b();
     let pcr = pcr8(PCR8_HEX).unwrap();
     // The encrypted body without its tag: the tag covers the header, which
@@ -474,11 +480,16 @@ fn two_seals_of_one_blob_give_different_ciphertexts() {
 #[test]
 fn seal_refuses_a_blob_of_the_other_kind_a_bad_pcr8_and_a_bad_srk_file() {
     let s = Scratch::new("seal-refuse");
-    let (key, pqb, _) = blob_files(&s);
+    let (key, pqb, tls, _) = blob_files(&s);
     let srk = srk_tpm2b();
     let pcr = pcr8(PCR8_HEX).unwrap();
     let e = seal_file(Kind::Key, &pqb, srk_public(&srk).unwrap(), &pcr).unwrap_err();
     assert!(e.contains("a Key blob is 4096"), "{e}");
+    // The key and TLS blobs are both 4096 bytes: the magic keeps them apart.
+    let e = seal_file(Kind::Key, &tls, srk_public(&srk).unwrap(), &pcr).unwrap_err();
+    assert!(e.contains("bad magic"), "{e}");
+    let e = seal_file(Kind::Tls, &key, srk_public(&srk).unwrap(), &pcr).unwrap_err();
+    assert!(e.contains("bad magic"), "{e}");
     let mut corrupt = deployment().0.blob.to_vec();
     corrupt[100] ^= 1;
     let bad = s.dir("bad").join("secrets.bin");
@@ -500,7 +511,7 @@ fn seal_refuses_a_blob_of_the_other_kind_a_bad_pcr8_and_a_bad_srk_file() {
 #[test]
 fn check_envelope_accepts_its_own_pcr8_only() {
     let s = Scratch::new("check-envelope");
-    let (key, _, _) = blob_files(&s);
+    let (key, _, tls, _) = blob_files(&s);
     let srk = srk_tpm2b();
     let pcr = pcr8(PCR8_HEX).unwrap();
     let env = seal_file(Kind::Key, &key, srk_public(&srk).unwrap(), &pcr).unwrap();
@@ -509,6 +520,11 @@ fn check_envelope_accepts_its_own_pcr8_only() {
     other[0] ^= 1;
     assert_eq!(envelope_sealed_to(&env, Kind::Key, &other), Err("the envelope's sealed object enforces another PCR 8".into()));
     assert!(envelope_sealed_to(&env, Kind::Pq, &pcr).is_err());
+    // `Key` and `Tls` envelopes have one size: the kind refuses each as the other.
+    assert_eq!(envelope_sealed_to(&env, Kind::Tls, &pcr), Err("envelope: BadKind".into()));
+    let tls_env = seal_file(Kind::Tls, &tls, srk_public(&srk).unwrap(), &pcr).unwrap();
+    assert_eq!(envelope_sealed_to(&tls_env, Kind::Tls, &pcr), Ok(()));
+    assert_eq!(envelope_sealed_to(&tls_env, Kind::Key, &pcr), Err("envelope: BadKind".into()));
     let policy = tpm2::crypto::policy_digest(&pcr);
     let at = env.windows(32).position(|w| w == policy).expect("header policy copy");
     let mut tampered = env.clone();
@@ -525,13 +541,13 @@ fn tls_point(private: &[u8; 32]) -> Option<[u8; validate::TLS_PUBLIC_LEN]> {
     Some(p)
 }
 
-/// M6 plan C5, C11: the blob's TLS scalar is the key of the config's
+/// M6 plan C5, C11, C12: the TLS blob's scalar is the key of the config's
 /// `tls_public`, of `tls.pub` and of what mkcert was handed.
 #[test]
 fn generated_tls_scalar_matches_the_config_tls_pub_and_the_issued_key() {
     let (d, asked) = deployment();
     let checked = checked(d);
-    let blob = secret_blob::Blob::parse(&d.blob[..], 2).unwrap_or_else(|e| panic!("{}", e.message()));
+    let blob = secret_blob::tls::Blob::parse(&d.tls_blob[..]).unwrap_or_else(|e| panic!("{}", e.message()));
     assert_eq!(tls_point(blob.tls_private()), Some(checked.tls_public));
     let spki = [&validate::P256_SPKI_PREFIX[..], &checked.tls_public[..]].concat();
     assert_eq!(pem_der(&d.tls_pub_pem), spki);
@@ -548,19 +564,29 @@ fn tls_name_defaults_to_the_outside_ip_and_can_be_given() {
     assert_eq!(asked[0].1, "gw.example");
 }
 
-/// The TLS-only key failure case (M6 plan D5, case 8): the same deployment
-/// with another valid TLS scalar, everything else equal.
+/// The TLS key failure case (M6 plan C12, case 8): the deployment's TLS
+/// blob with another valid scalar, its boot seed equal.
 #[test]
-fn the_tls_mismatch_blob_differs_from_the_blob_in_its_tls_scalar_alone() {
+fn the_tls_mismatch_blob_differs_from_the_tls_blob_in_its_scalar_alone() {
     let (d, _) = deployment();
     let checked = checked(d);
     let other = d.tls_mismatch_blob.as_ref().expect("asked for");
-    let (a, b) = (secret_blob::Blob::parse(&d.blob[..], 2).unwrap(), secret_blob::Blob::parse(&other[..], 2).unwrap());
-    assert_eq!((a.gateway_private(), a.boot_seed()), (b.gateway_private(), b.boot_seed()));
-    assert_eq!((a.peer(0), a.peer(1)), (b.peer(0), b.peer(1)));
+    let (a, b) = (secret_blob::tls::Blob::parse(&d.tls_blob[..]).unwrap(), secret_blob::tls::Blob::parse(&other[..]).unwrap());
+    assert_eq!(a.boot_seed(), b.boot_seed());
     assert_ne!(a.tls_private(), b.tls_private());
     let point = tls_point(b.tls_private()).expect("a valid scalar");
     assert_ne!(point, checked.tls_public);
+}
+
+/// M6 plan C12: `tlskey`'s boot seed is drawn on its own, and `key`'s blob
+/// holds no TLS scalar.
+#[test]
+fn the_tls_blob_has_its_own_boot_seed_and_the_key_blob_no_tls_scalar() {
+    let (d, _) = deployment();
+    let key = secret_blob::Blob::parse(&d.blob[..], 2).unwrap();
+    let tls = secret_blob::tls::Blob::parse(&d.tls_blob[..]).unwrap();
+    assert_ne!(key.boot_seed(), tls.boot_seed());
+    assert!(!d.blob.windows(32).any(|w| w == tls.tls_private()), "the TLS scalar is in key's blob");
 }
 
 #[test]

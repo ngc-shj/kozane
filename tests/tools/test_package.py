@@ -40,6 +40,11 @@ SYSTEM = """<system>
         <program_image path="pd-pqkey.elf" />
         <map mr="pq_secrets" vaddr="0x8_000_000" perms="r" />
     </protection_domain>
+    <memory_region name="tls_secrets" size="0x1000" prefill_path="tls-placeholder.bin" />
+    <protection_domain name="tlskey" priority="135" passive="true">
+        <program_image path="pd-tlskey.elf" />
+        <map mr="tls_secrets" vaddr="0x8_000_000" perms="r" />
+    </protection_domain>
 </system>"""
 
 
@@ -53,12 +58,15 @@ def le32(n: int) -> bytes:
     return n.to_bytes(4, "little")
 
 
-# `key` blob v3 with one peer; `pqkey` blob v1 (crates/secret-blob).
-KEY_BODY = b"SOSSECR1" + le32(3) + le32(1) + bytes(range(1, 129))
+# `key` blob v2 with one peer; `pqkey` blob v1; `tlskey` blob v1
+# (crates/secret-blob).
+KEY_BODY = b"SOSSECR1" + le32(2) + le32(1) + bytes(range(1, 97))
 BLOB = seal(KEY_BODY, 4096)
 PQ_BODY = b"SOSPQKY1" + le32(1) + bytes((i * 7 + 3) % 256 for i in range(13904 - 12))
 PQ_BLOB = seal(PQ_BODY, 16384)
-BLOBS = {"secrets": BLOB, "pq_secrets": PQ_BLOB}
+TLS_BODY = b"SOSTLSK1" + le32(1) + le32(0) + bytes(range(101, 165))
+TLS_BLOB = seal(TLS_BODY, 4096)
+BLOBS = {"secrets": BLOB, "pq_secrets": PQ_BLOB, "tls_secrets": TLS_BLOB}
 # An SRK TPM2B_PUBLIC as tpm2_readpublic -o writes it (framing only: the
 # template is mksecrets' check).
 SRK = (90).to_bytes(2, "big") + bytes(range(90))
@@ -66,9 +74,11 @@ PAD = bytes(5000)
 KEY_AT = 4 + len(PAD)
 PQ_AT = KEY_AT + len(BLOB) + len(PAD)
 PQ_END = PQ_AT + len(PQ_BLOB)
-PLACEHOLDER_IMG = b"\x7fELF" + PAD + bytes(4096) + PAD + bytes(16384) + PAD
-PACKAGE_IMG = b"\x7fELF" + PAD + BLOB + PAD + PQ_BLOB + PAD
-SPANS = f"{KEY_AT:#x}..{KEY_AT + len(BLOB):#x}, {PQ_AT:#x}..{PQ_END:#x}"
+TLS_AT = PQ_END + len(PAD)
+TLS_END = TLS_AT + len(TLS_BLOB)
+PLACEHOLDER_IMG = b"\x7fELF" + PAD + bytes(4096) + PAD + bytes(16384) + PAD + bytes(4096) + PAD
+PACKAGE_IMG = b"\x7fELF" + PAD + BLOB + PAD + PQ_BLOB + PAD + TLS_BLOB + PAD
+SPANS = f"{KEY_AT:#x}..{KEY_AT + len(BLOB):#x}, {PQ_AT:#x}..{PQ_END:#x}, {TLS_AT:#x}..{TLS_END:#x}"
 GEN_DEBUG = "/* x */\n#define CONFIG_DEBUG_BUILD  1\n#define CONFIG_PRINTING  1\n" \
     "#define CONFIG_KERNEL_MCS  1\n#define CONFIG_MAX_NUM_NODES  1\n"
 GEN_RELEASE = "/* disabled: CONFIG_DEBUG_BUILD */\n/* disabled: CONFIG_PRINTING */\n" \
@@ -148,8 +158,8 @@ class ct_stubs:
         pkg.CT_SHAPE, pkg.CT_POLICY, pkg.CT_ROOT, pkg.valgrind_version = self.saved
 
 
-def package_system(path="/elsewhere/secrets.bin", pq_path="/elsewhere/pq.bin"):
-    return pkg.with_prefill(SYSTEM, {"secrets": path, "pq_secrets": pq_path})
+def package_system(path="/elsewhere/secrets.bin", pq_path="/elsewhere/pq.bin", tls_path="/elsewhere/tls.bin"):
+    return pkg.with_prefill(SYSTEM, {"secrets": path, "pq_secrets": pq_path, "tls_secrets": tls_path})
 
 
 def flip(img: bytes, at: int) -> bytes:
@@ -175,7 +185,7 @@ def waivers_file(text):
     return run
 
 
-def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BLOB, lock_text=LOCK_NO_CMR,
+def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BLOB, tls=TLS_BLOB, lock_text=LOCK_NO_CMR,
                 harness=True, ct_green=True, record=True, real_ct=None, srk=SRK):
     """Runs `main()` with `build` replaced and the waiver file and Cargo.lock
     pointed at scratch ones (None: absent). Returns what it printed (the success line
@@ -205,11 +215,13 @@ def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BL
             stubs = ct_stubs(d, harness_path, green=ct_green, record=record, real=real_ct is not None)
             (d / "secrets.bin").write_bytes(key)
             (d / "pq.bin").write_bytes(pq)
+            (d / "tls.bin").write_bytes(tls)
             (d / "srk.pub").write_bytes(srk)
             (d / "gen_config.h").write_text(gen)
             (d / "secureos.system").write_text(
                 '<system>\n<program_image path="pd-pqkey.elf" />\n<program_image path="pd-pq.elf" />\n'
-                '<program_image path="pd-key.elf" />\n<program_image path="pd-tls.elf" />\n</system>\n')
+                '<program_image path="pd-key.elf" />\n<program_image path="pd-tls.elf" />\n'
+                '<program_image path="pd-tlskey.elf" />\n</system>\n')
             if waivers_text is not None:
                 (d / "waivers.toml").write_text(waivers_text)
             pkg.WAIVERS = d / "waivers.toml"
@@ -223,7 +235,7 @@ def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BL
                 return 0
             pkg.build = fake_build
             sys.argv = ["package", "--secrets", str(d / "secrets.bin"), "--pq-secrets", str(d / "pq.bin"),
-                        "--srk-public", str(d / "srk.pub"), "--out", str(d / "pkg"), "--system", str(d / "secureos.system"), "--policy", "x", "--image", "x",
+                        "--tls-secrets", str(d / "tls.bin"), "--srk-public", str(d / "srk.pub"), "--out", str(d / "pkg"), "--system", str(d / "secureos.system"), "--policy", "x", "--image", "x",
                         "--gen-config", str(d / "gen_config.h"), "--search-path", str(search), "--board", "x",
                         "--config", "x", "--microkit", "x", "--harness", str(harness_path)]
             captured = io.StringIO()
@@ -308,6 +320,7 @@ def run_main(build_result):
             blob = d / "secrets.bin"
             blob.write_bytes(BLOB)
             (d / "pq.bin").write_bytes(PQ_BLOB)
+            (d / "tls.bin").write_bytes(TLS_BLOB)
             (d / "srk.pub").write_bytes(SRK)
             gen = d / "gen_config.h"
             gen.write_text(GEN_RELEASE)
@@ -355,7 +368,7 @@ def run_main(build_result):
 
             pkg.build = fake_build
             sys.argv = ["package", "--secrets", str(blob), "--pq-secrets", str(d / "pq.bin"),
-                        "--srk-public", str(d / "srk.pub"), "--out", str(out), "--system", "x", "--policy", "x",
+                        "--tls-secrets", str(d / "tls.bin"), "--srk-public", str(d / "srk.pub"), "--out", str(out), "--system", "x", "--policy", "x",
                         "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
                         "--config", "x", "--microkit", "x", "--harness", "x"]
             real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
@@ -495,6 +508,7 @@ def staging_in_forbidden_root():
         blob = d / "secrets.bin"
         blob.write_bytes(BLOB)
         (d / "pq.bin").write_bytes(PQ_BLOB)
+        (d / "tls.bin").write_bytes(TLS_BLOB)
         (d / "srk.pub").write_bytes(SRK)
         gen = d / "gen_config.h"
         gen.write_text(GEN_RELEASE)
@@ -502,14 +516,14 @@ def staging_in_forbidden_root():
 
         def roots(repo):
             calls.append(1)
-            # The first three calls are the two blob and the OUT checks; the
-            # fourth is the staging re-check, which now sees `d` as forbidden.
-            return real_roots(repo) + ([d.resolve()] if len(calls) > 3 else [])
+            # The first four calls are the three blob and the OUT checks; the
+            # fifth is the staging re-check, which now sees `d` as forbidden.
+            return real_roots(repo) + ([d.resolve()] if len(calls) > 4 else [])
 
         pkg.forbidden_roots = roots
         pkg.build = lambda *a: built.append(1) or 0
         sys.argv = ["package", "--secrets", str(blob), "--pq-secrets", str(d / "pq.bin"),
-                    "--srk-public", str(d / "srk.pub"), "--out", str(d / "pkg"), "--system", "x", "--policy", "x",
+                    "--tls-secrets", str(d / "tls.bin"), "--srk-public", str(d / "srk.pub"), "--out", str(d / "pkg"), "--system", "x", "--policy", "x",
                     "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
                     "--config", "x", "--microkit", "x", "--harness", "x"]
         out = io.StringIO()
@@ -519,7 +533,7 @@ def staging_in_forbidden_root():
         if status != 1 or built or (d / "pkg").exists() or [p for p in d.iterdir() if p.name.startswith(".pkg.")]:
             errors.append(f"staging in a forbidden root was not refused cleanly (status {status}, built {built})")
         # Refused by the staging re-check itself, not by an earlier check.
-        if "staging directory" not in out.getvalue() or len(calls) != 4:
+        if "staging directory" not in out.getvalue() or len(calls) != 5:
             errors.append(f"refused by another check: {out.getvalue().strip()!r}, {len(calls)} root lookups")
         return errors
     finally:
@@ -608,16 +622,17 @@ def build_case(variant=None):
     zeros, seal writes a fake envelope. The blobs must reach seal only as
     private copies of the checked bytes and never reach microkit, the
     descriptor must name where the stand-ins landed, PCR 8 must be the one
-    measure computes, and OUT must hold the five outputs alone. `variant`
+    measure computes, and OUT must hold the six outputs alone. `variant`
     breaks one step: "tamper" (the .system microkit consumed changes),
     "standin" (the stand-in image differs outside the ranges), "envelope"
-    (seal writes the plaintext), "assembly" (the envelope image is not the
-    assembly). Returns the errors, or build's own output for a variant."""
+    (seal writes the plaintext), "swap" (seal writes the secrets and the
+    tls_secrets envelope each as the other's kind), "assembly" (the envelope
+    image is not the assembly). Returns the errors, or build's own output for a variant."""
     return lambda: _build_case(variant)
 
 
 def envelope(mr: str) -> bytes:
-    kind = pkg.KEY if mr == "secrets" else pkg.PQ
+    kind = {"secrets": pkg.KEY, "pq_secrets": pkg.PQ, "tls_secrets": pkg.TLS}[mr]
     return pkg.ENVELOPE_MAGIC + le32(1) + le32(pkg.SEAL_KINDS[mr][1]) + bytes(range(1, 101)) \
         + bytes(kind.size - 116)
 
@@ -637,18 +652,19 @@ def _build_case(variant):
 
         def fake_run(cmd, check=False, **_):
             if cmd[:2] == ["cargo", "run"] and "mksecrets" in cmd:
-                mr = {"key": "secrets", "pq": "pq_secrets"}[arg(cmd, "--kind")]
+                mr = {"key": "secrets", "pq": "pq_secrets", "tls": "tls_secrets"}[arg(cmd, "--kind")]
                 blob = pathlib.Path(arg(cmd, "--blob"))
                 sealed[mr] = (str(blob), blob.read_bytes(), pathlib.Path(arg(cmd, "--srk-public")).read_bytes(),
                               arg(cmd, "--pcr8"))
-                out = BLOBS[mr] if variant == "envelope" else envelope(mr)
+                swapped = {"secrets": "tls_secrets", "tls_secrets": "secrets"}.get(mr, mr)
+                out = BLOBS[mr] if variant == "envelope" else envelope(swapped if variant == "swap" else mr)
                 pathlib.Path(arg(cmd, "--out")).write_bytes(out)
                 return
             if cmd[0] == "cargo":
                 return
             system = pathlib.Path(cmd[1])
             img = bytearray(PLACEHOLDER_IMG)
-            for mr, at in (("secrets", KEY_AT), ("pq_secrets", PQ_AT)):
+            for mr, at in (("secrets", KEY_AT), ("pq_secrets", PQ_AT), ("tls_secrets", TLS_AT)):
                 prefill = [m.get("prefill_path") for m in pkg.ET.fromstring(system.read_text())
                            .iter("memory_region") if m.get("name") == mr][0]
                 data = pathlib.Path(prefill).read_bytes()
@@ -672,12 +688,12 @@ def _build_case(variant):
         if variant is not None:
             return captured.getvalue().splitlines() if status == 1 else [f"accepted (status {status})"]
         errors = [] if status == 0 else [f"build failed ({status}): {captured.getvalue()}"]
-        if any(data in (BLOB, PQ_BLOB) for data in microkit_saw):
+        if any(data in (BLOB, PQ_BLOB, TLS_BLOB) for data in microkit_saw):
             errors.append("a blob reached microkit")
-        if len(microkit_saw) != 4:
-            errors.append(f"microkit saw {len(microkit_saw)} prefills, want two builds of two")
+        if len(microkit_saw) != 6:
+            errors.append(f"microkit saw {len(microkit_saw)} prefills, want two builds of three")
         desc = (staging / "boot.desc").read_bytes() if (staging / "boot.desc").exists() else b""
-        if desc and pkg.measure.parse(desc)[1] != [(KEY_AT, len(BLOB)), (PQ_AT, len(PQ_BLOB))]:
+        if desc and pkg.measure.parse(desc)[1] != [(KEY_AT, len(BLOB)), (PQ_AT, len(PQ_BLOB)), (TLS_AT, len(TLS_BLOB))]:
             errors.append(f"descriptor ranges {pkg.measure.parse(desc)[1]}")
         for mr in pkg.SECRETS_MRS:
             path, data, srk, pcr8 = sealed.get(mr, ("", b"", b"", ""))
@@ -740,7 +756,7 @@ def outside(at: int) -> list:
     return [f"package: image differs outside the blobs ({at:#x}..{at:#x} vs {SPANS})"]
 
 
-IMAGE_BLOBS = [BLOB, PQ_BLOB]
+IMAGE_BLOBS = [BLOB, PQ_BLOB, TLS_BLOB]
 
 # (name, expected: an error substring, a list of the exact errors, or None
 # for accept; check)
@@ -748,15 +764,16 @@ def assembly(tamper=False):
     """check_assembly (M5 plan C8 F2) on a synthetic image: the image built
     with the envelopes is the published one with each at its range."""
     def run():
-        key, pq = b"K" * 0x100, b"Q" * 0x200
+        key, pq, tls = b"K" * 0x100, b"Q" * 0x200, b"T" * 0x100
         published = bytes(0x1000)
         built = bytearray(published)
         built[0x400:0x500] = key
         built[0x800:0xa00] = pq
+        built[0xc00:0xd00] = tls
         if tamper:
             built[0x10] = 1
-        desc = pkg.measure.pack(len(published), [(0x400, 0x100), (0x800, 0x200)])
-        return pkg.check_assembly(published, desc, [key, pq], bytes(built))
+        desc = pkg.measure.pack(len(published), [(0x400, 0x100), (0x800, 0x200), (0xc00, 0x100)])
+        return pkg.check_assembly(published, desc, [key, pq, tls], bytes(built))
     return run
 
 
@@ -764,9 +781,10 @@ CASES = [
     ("real package accepted", None,
      lambda: pkg.check_systems(SYSTEM, package_system())
      + pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG, IMAGE_BLOBS)
-     + pkg.check_blob(pkg.KEY, BLOB) + pkg.check_blob(pkg.PQ, PQ_BLOB) + pkg.require_release(GEN_RELEASE)),
-    ("both blobs swapped in, in either order", None,
-     lambda: pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG, [PQ_BLOB, BLOB])),
+     + pkg.check_blob(pkg.KEY, BLOB) + pkg.check_blob(pkg.PQ, PQ_BLOB) + pkg.check_blob(pkg.TLS, TLS_BLOB)
+     + pkg.require_release(GEN_RELEASE)),
+    ("all three blobs swapped in, in any order", None,
+     lambda: pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG, [TLS_BLOB, PQ_BLOB, BLOB])),
     ("empty image diff", "identical to the placeholder",
      lambda: pkg.check_images(PLACEHOLDER_IMG, PLACEHOLDER_IMG, IMAGE_BLOBS)),
     ("image diff outside the blob", "differs outside the blob",
@@ -781,10 +799,17 @@ CASES = [
      lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, PQ_AT - 1), IMAGE_BLOBS)),
     ("image diff just past the pq blob", outside(PQ_END),
      lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, PQ_END), IMAGE_BLOBS)),
+    ("image diff just before the tls blob", outside(TLS_AT - 1),
+     lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, TLS_AT - 1), IMAGE_BLOBS)),
+    ("image diff just past the tls blob", outside(TLS_END),
+     lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, TLS_END), IMAGE_BLOBS)),
     ("image diff in the last byte", outside(len(PACKAGE_IMG) - 1),
      lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, len(PACKAGE_IMG) - 1), IMAGE_BLOBS)),
     ("pq blob missing from the image", ["package: 'SOSPQKY1' blob does not appear exactly once in the image"],
      lambda: pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG[:PQ_AT] + bytes(len(PQ_BLOB)) + PACKAGE_IMG[PQ_END:],
+                              IMAGE_BLOBS)),
+    ("tls blob missing from the image", ["package: 'SOSTLSK1' blob does not appear exactly once in the image"],
+     lambda: pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG[:TLS_AT] + bytes(len(TLS_BLOB)) + PACKAGE_IMG[TLS_END:],
                               IMAGE_BLOBS)),
     ("image length changed", "length changed",
      lambda: pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG + b"\0", IMAGE_BLOBS)),
@@ -793,6 +818,9 @@ CASES = [
     ("placeholder not zero under the pq blob",
      [f"package: placeholder image is not zero where a blob lands ({PQ_AT:#x}..{PQ_END:#x})"],
      lambda: pkg.check_images(flip(PLACEHOLDER_IMG, PQ_AT + 200), PACKAGE_IMG, IMAGE_BLOBS)),
+    ("placeholder not zero under the tls blob",
+     [f"package: placeholder image is not zero where a blob lands ({TLS_AT:#x}..{TLS_END:#x})"],
+     lambda: pkg.check_images(flip(PLACEHOLDER_IMG, TLS_AT + 200), PACKAGE_IMG, IMAGE_BLOBS)),
     # A second copy present at the same offset in both images: no extra
     # diff, so only the uniqueness clause can reject it.
     ("blob appears twice", "exactly once",
@@ -802,11 +830,11 @@ CASES = [
     ("all-zero blob", "all zero", lambda: pkg.check_blob(pkg.KEY, bytes(4096))),
     ("short blob", "expected 4096", lambda: pkg.check_blob(pkg.KEY, BLOB[:-1])),
     ("blob without magic", "no SOSSECR1 magic", lambda: pkg.check_blob(pkg.KEY, b"X" + BLOB[1:])),
-    ("key blob version 1", ["package: 'secrets' blob is version 1, expected 3"],
+    ("key blob version 1", ["package: 'secrets' blob is version 1, expected 2"],
      lambda: pkg.check_blob(pkg.KEY, resealed(BLOB, 8, le32(1), len(KEY_BODY)))),
-    # M6 plan C5: a v2 blob (no TLS scalar) is refused.
-    ("key blob version 2", ["package: 'secrets' blob is version 2, expected 3"],
-     lambda: pkg.check_blob(pkg.KEY, resealed(BLOB, 8, le32(2), len(KEY_BODY)))),
+    # M6 plan Re-plan R1: the TLS scalar left `key`, so the v3 blob is refused.
+    ("key blob version 3", ["package: 'secrets' blob is version 3, expected 2"],
+     lambda: pkg.check_blob(pkg.KEY, resealed(BLOB, 8, le32(3), len(KEY_BODY)))),
     ("key blob peer count zero", ["package: 'secrets' blob peer count is out of range"],
      lambda: pkg.check_blob(pkg.KEY, resealed(BLOB, 12, le32(0), len(KEY_BODY)))),
     ("key blob checksum mismatch", ["package: 'secrets' blob checksum mismatch"],
@@ -829,11 +857,40 @@ CASES = [
      lambda: pkg.check_blob(pkg.PQ, flip(PQ_BLOB, 13936))),
     ("short pq blob", ["package: 'pq_secrets' blob is 16383 bytes, expected 16384"],
      lambda: pkg.check_blob(pkg.PQ, PQ_BLOB[:-1])),
-    ("main() packages both blobs", None, main_checks()),
+    # The `tlskey` blob (M6 plan C12): the same size as the `key` blob, told
+    # apart by its magic.
+    ("tls blob accepted", None, lambda: pkg.check_blob(pkg.TLS, TLS_BLOB)),
+    ("tls blob bad magic", ["package: 'tls_secrets' blob has no SOSTLSK1 magic"],
+     lambda: pkg.check_blob(pkg.TLS, b"X" + TLS_BLOB[1:])),
+    ("tls blob version 0", ["package: 'tls_secrets' blob is version 0, expected 1"],
+     lambda: pkg.check_blob(pkg.TLS, resealed(TLS_BLOB, 8, le32(0), len(TLS_BODY)))),
+    ("tls blob version 2", ["package: 'tls_secrets' blob is version 2, expected 1"],
+     lambda: pkg.check_blob(pkg.TLS, resealed(TLS_BLOB, 8, le32(2), len(TLS_BODY)))),
+    ("tls blob non-zero reserved word", ["package: 'tls_secrets' blob has a non-zero reserved word"],
+     lambda: pkg.check_blob(pkg.TLS, resealed(TLS_BLOB, 12, le32(1), len(TLS_BODY)))),
+    ("tls blob checksum mismatch", ["package: 'tls_secrets' blob checksum mismatch"],
+     lambda: pkg.check_blob(pkg.TLS, flip(TLS_BLOB, 79))),
+    ("tls blob checksum field changed", ["package: 'tls_secrets' blob checksum mismatch"],
+     lambda: pkg.check_blob(pkg.TLS, flip(TLS_BLOB, 80))),
+    ("tls blob non-zero padding", ["package: 'tls_secrets' blob has non-zero padding"],
+     lambda: pkg.check_blob(pkg.TLS, flip(TLS_BLOB, 112))),
+    ("short tls blob", ["package: 'tls_secrets' blob is 4095 bytes, expected 4096"],
+     lambda: pkg.check_blob(pkg.TLS, TLS_BLOB[:-1])),
+    ("tls blob in the key's mr", ["package: 'secrets' blob holds a 'tls_secrets' blob (SOSTLSK1)"],
+     lambda: pkg.check_blob(pkg.KEY, TLS_BLOB)),
+    ("key blob in the tls mr", ["package: 'tls_secrets' blob holds a 'secrets' blob (SOSSECR1)"],
+     lambda: pkg.check_blob(pkg.TLS, BLOB)),
+    ("main() packages all three blobs", None, main_checks()),
     ("main() refuses the pq blob given as --secrets",
      ["package: 'secrets' blob holds a 'pq_secrets' blob (SOSPQKY1)",
       "package: 'pq_secrets' blob holds a 'secrets' blob (SOSSECR1)"],
      main_checks(key=PQ_BLOB, pq=BLOB)),
+    ("main() refuses the secrets and tls blobs swapped",
+     ["package: 'secrets' blob holds a 'tls_secrets' blob (SOSTLSK1)",
+      "package: 'tls_secrets' blob holds a 'secrets' blob (SOSSECR1)"],
+     main_checks(key=TLS_BLOB, tls=BLOB)),
+    ("main() refuses a bad tls blob", ["package: 'tls_secrets' blob has a non-zero reserved word"],
+     main_checks(tls=resealed(TLS_BLOB, 12, le32(1), len(TLS_BODY)))),
     ("main() refuses a bad pq blob", ["package: 'pq_secrets' blob checksum mismatch"],
      main_checks(pq=flip(PQ_BLOB, 100))),
     ("other attribute changed", "attributes of <protection_domain>",
@@ -845,6 +902,9 @@ CASES = [
     ("package system without the pq mr's prefill_path",
      ["package: package system needs one 'pq_secrets' mr with a prefill_path"],
      lambda: pkg.check_systems(SYSTEM, package_system().replace('prefill_path="/elsewhere/pq.bin"', 'prefill_path=""'))),
+    ("package system without the tls mr's prefill_path",
+     ["package: package system needs one 'tls_secrets' mr with a prefill_path"],
+     lambda: pkg.check_systems(SYSTEM, package_system().replace('prefill_path="/elsewhere/tls.bin"', 'prefill_path=""'))),
     ("element added", "children",
      lambda: pkg.check_systems(SYSTEM, package_system().replace("</system>", '<memory_region name="x" size="0x1000" /></system>'))),
     # Only release kernels (M5 plan C7), judged from gen_config.h.
@@ -942,15 +1002,19 @@ CASES = [
     ("staging that resolves into a forbidden root is refused", None, staging_in_forbidden_root),
     ("a failed staging removal fails loudly", None, failed_staging_removal_is_reported),
     ("a signal during the staging removal waits for it", None, signal_during_removal_does_not_cut_it_short),
-    ("the blobs are sealed from private copies, never reach microkit, and OUT holds the five outputs", None,
+    ("the blobs are sealed from private copies, never reach microkit, and OUT holds the six outputs", None,
      build_case()),
     ("a consumed .system that differs from the generated one is refused",
      ["package: system/protection_domain[3]: attributes of <protection_domain> changed"], build_case("tamper")),
     ("a stand-in image that differs outside the ranges is refused",
      [f"package: image differs outside the blobs (0x2..0x2 vs {SPANS})"], build_case("standin")),
     ("an envelope that is not sealed is refused",
-     ["package: 'secrets' envelope has no SOSSEAL1 magic", "package: 'pq_secrets' envelope has no SOSSEAL1 magic"],
+     ["package: 'secrets' envelope has no SOSSEAL1 magic", "package: 'pq_secrets' envelope has no SOSSEAL1 magic",
+      "package: 'tls_secrets' envelope has no SOSSEAL1 magic"],
      build_case("envelope")),
+    ("secrets and tls_secrets envelopes sealed as each other's kind are refused",
+     ["package: 'secrets' envelope is not of its mr's kind", "package: 'tls_secrets' envelope is not of its mr's kind"],
+     build_case("swap")),
     ("an envelope image that is not the boot-time assembly is refused",
      ["package: the boot-time assembly differs from the image microkit built with the envelopes"],
      build_case("assembly")),
@@ -973,8 +1037,13 @@ CASES = [
      lambda: pkg.check_envelope(pkg.KEY, envelope("pq_secrets")[:4096])),
     ("a short envelope is refused", ["package: 'pq_secrets' envelope is 16383 bytes, expected 16384"],
      lambda: pkg.check_envelope(pkg.PQ, envelope("pq_secrets")[:-1])),
+    ("a tls envelope in the secrets mr is refused", ["package: 'secrets' envelope is not of its mr's kind"],
+     lambda: pkg.check_envelope(pkg.KEY, envelope("tls_secrets"))),
+    ("a secrets envelope in the tls mr is refused", ["package: 'tls_secrets' envelope is not of its mr's kind"],
+     lambda: pkg.check_envelope(pkg.TLS, envelope("secrets"))),
     ("sealed envelopes of their kinds are accepted", None,
-     lambda: pkg.check_envelope(pkg.KEY, envelope("secrets")) + pkg.check_envelope(pkg.PQ, envelope("pq_secrets"))),
+     lambda: pkg.check_envelope(pkg.KEY, envelope("secrets")) + pkg.check_envelope(pkg.PQ, envelope("pq_secrets"))
+     + pkg.check_envelope(pkg.TLS, envelope("tls_secrets"))),
     ("main() refuses an SRK public that is not a TPM2B_PUBLIC",
      ["package: --srk-public is 91 bytes, not an SRK TPM2B_PUBLIC (2 + 90, as tpm2_readpublic -o writes it)"],
      main_checks(srk=SRK[:-1])),

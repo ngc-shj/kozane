@@ -1,4 +1,4 @@
-//! One unseal as `key` and `pqkey` run it in `init` (M5 plan C9, C11):
+//! One unseal as the key PDs run it in `init` (M5 plan C9, C11):
 //! the [`client`](crate::client) flow over PPC to `tpm`, then the explicit
 //! Done or Failed `tpm` caps PCR 8 after. The PD supplies the transport,
 //! the clock and the random source ([`Transport`]); everything else is
@@ -9,12 +9,12 @@
 //!   on any failure `out` is all zero (I11.1).
 //! - The KEK and the session secrets live in the client and are wiped on
 //!   every path out of it (I10.3).
-//! - `tpm` answers Busy while the other client's flow is under way (swtpm
+//! - `tpm` answers Busy while another client's flow is under way (swtpm
 //!   and small TPMs hold too few objects for two at once). A Busy client
 //!   waits `BUSY_PAUSE_NS` and asks again, for at most `BUSY_TIMEOUT_NS`.
 //! - Done (or Failed) is sent whatever happened, so `tpm` can cap PCR 8
-//!   once both clients have finished. A Done `tpm` does not acknowledge
-//!   leaves the PD without its secrets.
+//!   once every client (`key`, `pqkey`, `tlskey`) has finished. A Done
+//!   `tpm` does not acknowledge leaves the PD without its secrets.
 
 use layout::tpm as ipc;
 
@@ -24,10 +24,14 @@ use crate::envelope::Kind;
 
 /// Between two calls of a client `tpm` answered Busy.
 pub const BUSY_PAUSE_NS: u64 = 10_000_000;
-/// How long a client waits for the other one's flow before giving up:
-/// the other flow's TPM commands plus its P-256 work at its PD's budget
-/// under TCG, with a wide margin.
-pub const BUSY_TIMEOUT_NS: u64 = 120_000_000_000;
+/// The longest one flow holds `tpm`: its TPM commands plus its P-256 work
+/// under TCG at the smallest key PD init budget (`pqkey`'s 0.1; `key`'s and
+/// `tlskey`'s are 0.2), with a wide margin (M5's bound for one flow).
+const FLOW_MAX_NS: u64 = 120_000_000_000;
+/// How long a client waits for the others' flows before giving up: every
+/// other client may be served first (M6 plan C12: two flows of the three).
+pub const BUSY_TIMEOUT_NS: u64 = FLOW_MAX_NS * (tpm2_wire::gate::CLIENTS as u64 - 1);
+const _: () = assert!(BUSY_TIMEOUT_NS == 240_000_000_000);
 /// Fresh draws of the client entropy when the ECDH scalar is unusable
 /// (zero or not below the group order: about 2^-32 per draw).
 const ENTROPY_DRAWS: usize = 4;

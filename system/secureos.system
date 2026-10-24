@@ -26,6 +26,10 @@
     <!-- pqkey's McEliece secrets (law L2, owner pqkey): zero placeholder;
          `make package` swaps this prefill_path too (secret_blob::pq). -->
     <memory_region name="pq_secrets" size="0x4000" prefill_path="pq-secrets-placeholder.bin" />
+    <!-- tlskey's TLS signing key (law L2, owner tlskey; M6 plan C12): zero
+         placeholder; `make package` swaps this prefill_path too
+         (secret_blob::tls). -->
+    <memory_region name="tls_secrets" size="0x1000" prefill_path="tls-secrets-placeholder.bin" />
 
     <!-- net_rx: eth_out -> ingress, outside frames in -->
     <memory_region name="net_rx_used" size="0x1000" />
@@ -146,7 +150,7 @@
     </protection_domain>
 
     <!-- Passive: each command runs on its caller's scheduling context
-         (key's or pqkey's init); above both, as Microkit's PPC rule wants.
+         (a key PD's init); above all three, as Microkit's PPC rule wants.
          Polls the TIS with bounded timeouts; no irq. -->
     <protection_domain name="tpm" priority="145" budget="1_000" period="10_000" passive="true" stack_size="0x10_000">
         <program_image path="pd-tpm.elf" />
@@ -166,6 +170,15 @@
     <protection_domain name="pqkey" priority="130" budget="1_000" period="10_000" passive="true" stack_size="0x20_000">
         <program_image path="pd-pqkey.elf" />
         <map mr="pq_secrets" vaddr="0x2_000_000" perms="r" setvar_vaddr="pq_secrets" />
+    </protection_domain>
+
+    <!-- M6 plan C12: the TLS signing oracle. Passive: every signature runs
+         on tls's scheduling context, so HTTPS never uses more CPU than tls's
+         0.05; this budget only covers init (the unseal). Above tls, below
+         tpm; key's stack (P-256 and its scrub). -->
+    <protection_domain name="tlskey" priority="135" budget="2_000" period="10_000" passive="true" stack_size="0x20_000">
+        <program_image path="pd-tlskey.elf" />
+        <map mr="tls_secrets" vaddr="0x2_000_000" perms="r" setvar_vaddr="tls_secrets" />
     </protection_domain>
 
     <protection_domain name="hs" priority="110" budget="2_000" period="10_000" stack_size="0x20_000">
@@ -282,7 +295,8 @@
 
     <!-- M6: the HTTPS endpoint (plan C1, C3). TCP via smoltcp on IP packets
          `ingress` parsed (itl/tli) and, for the backend, `inner` (ntl/tln);
-         calls `key` as `hs` does. Tainted (law L1), 0.05 of the CPU. -->
+         calls `tlskey` as `hs` calls `key`. Tainted (law L1), 0.05 of the
+         CPU. -->
     <protection_domain name="tls" priority="100" budget="500" period="10_000" stack_size="0x30_000">
         <program_image path="pd-tls.elf" />
         <map mr="itl_used" vaddr="0x6_000_000" perms="rw" setvar_vaddr="itl_used" />
@@ -419,7 +433,11 @@
     </channel>
     <channel>
         <end pd="tls" id="4" pp="true" notify="false" />
-        <end pd="key" id="4" pp="false" />
+        <end pd="tlskey" id="1" pp="false" />
+    </channel>
+    <channel>
+        <end pd="tlskey" id="3" pp="true" notify="false" />
+        <end pd="tpm" id="3" pp="false" notify="false" />
     </channel>
     <channel>
         <end pd="tls" id="5" />

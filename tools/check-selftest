@@ -111,6 +111,29 @@ def two_key_channel(tree: pathlib.Path, caller: str, caller_id: int, callee: str
            f'pp = {{ {caller} = true, {callee} = false }}\nnotify = {{ {caller} = false, {callee} = true }}\n')
 
 
+def share_key_with_tls(tree: pathlib.Path):
+    """`tls` back on `key`'s endpoint (M6 slice 2's shape) and `tlskey`
+    removed with its region, its PPC to `tpm` and their policy entries, so
+    the system is otherwise lawful."""
+    edit(tree, "system/secureos.system", '<end pd="tlskey" id="1" pp="false" />', '<end pd="key" id="4" pp="false" />')
+    edit(tree, "system/secureos.system",
+         '    <channel>\n        <end pd="tlskey" id="3" pp="true" notify="false" />\n'
+         '        <end pd="tpm" id="3" pp="false" notify="false" />\n    </channel>\n', "")
+    text = (tree / "system/secureos.system").read_text()
+    pd = re.search(r'\n\n    <!-- M6 plan C12: the TLS signing oracle\..*?</protection_domain>\n', text, re.S)
+    mr = re.search(r'    <!-- tlskey\'s TLS signing key .*?prefill_path="tls-secrets-placeholder.bin" />\n', text, re.S)
+    if not pd or not mr:
+        raise SystemExit("selftest: tlskey's pd or region not found in the system file")
+    (tree / "system/secureos.system").write_text(text.replace(pd.group(0), "\n").replace(mr.group(0), ""))
+    edit(tree, "policy/laws.toml", '[[channels]]\nbetween = ["tls", "tlskey"]\npp = { tls = true, tlskey = false }\n'
+         'notify = { tls = false, tlskey = true }\n',
+         '[[channels]]\nbetween = ["tls", "key"]\npp = { tls = true, key = false }\nnotify = { tls = false, key = true }\n')
+    edit(tree, "policy/laws.toml", '\n[[channels]]\nbetween = ["tlskey", "tpm"]\npp = { tlskey = true, tpm = false }\n'
+         'notify = { tlskey = false, tpm = false }\n', "")
+    edit(tree, "policy/laws.toml", '\n[pds.tlskey]\nrole = "key"\n', "")
+    edit(tree, "policy/laws.toml", '\n[mrs.tls_secrets]\nkind = "secrets"\nowner = "tlskey"\n', "")
+
+
 MIR_SPLIT = "\n{a}\npub fn selftest_split() -> u32 {{\n    1\n}}\n{b}\npub fn selftest_split() -> u32 {{\n    2\n}}\n"
 MIR_NEEDLE = "mir-gate: wire: shipped MIR differs from the proof build"
 UNIT_TEST = "\n#[test]\nfn selftest_injected_failure() {\n    assert_eq!(1, 2);\n}\n"
@@ -125,7 +148,7 @@ KANI_HARNESS = (
 CASES_FOR_GATE = {
     "clean-counts": {"stale-counts", "check-propagation"},
     # pins runs the package checker fixtures; package-debug drives the real target.
-    "pins": {"pins", "package-debug", "package-waiver", "package-waiver-removed", "c5-lock-pin", "mkcert-constraints",
+    "pins": {"pins", "package-debug", "package-waiver", "package-waiver-removed", "mkcert-constraints",
              "l14-constructor", "l14-codepoint", "finished-ct-eq"},
     "lint": {"lint"},
     "audit": {"audit"},
@@ -138,8 +161,8 @@ CASES_FOR_GATE = {
              "rp-cookie-domain", "rp-legacy-probe", "rp-conf-share", "rp-awaited", "rp-proven-reserve", "rp-sid-binding", "rp-nat",
              "rp-cookie-offload", "rp-tx-tier", "rp-reply-fifo", "rp-reply-order", "rp-reply-dst", "rp-sync-sticky",
              "mce-fresh-draw", "c2-tcp-checksum", "c2-syn-fin", "c2-tls-egress-src", "c2-tls-tier", "c2-syn-src-bucket",
-             "c5-tls-static-dh", "c5-k-prime", "c5-nonce-cap", "c5-cv-content", "c5-tls-boot-fail", "c5-tls-wipe",
-             "c5-d5-codes", "c5-seed-tag", "c5-caller-bucket", "c5-sign-wait", "c5-syn-burst", "c5-syn-interval",
+             "c5-tls-static-dh", "c5-k-prime", "c5-nonce-cap", "c5-cv-content", "c5-d5-codes", "c5-syn-burst",
+             "c5-syn-interval", "c12-gate-busy", "c12-seed-scalar", "c12-envelope-kind", "c12-sign-halt",
              "l14-clone", "finished-check", "ccs-once", "ccs-after-finished", "key-share-length", "duplicate-extension",
              "no-key-share-reason", "der-minimal", "early-data-after-connected", "early-data-cap", "conn-timer-activity",
              "conn-alert-wipe", "conn-timeout-wipe", "conn-rst-exhausted", "tls-rndr", "conn-reset-session",
@@ -156,12 +179,13 @@ CASES_FOR_GATE = {
               "verus-msgs-exact", "verus-ring-mask", "verus-wire-ipv4"},
     "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire"},
     "laws": {"laws", "laws-timer-ingress", "laws-pq-key", "laws-hs-pqkey", "laws-pq-secrets-writable",
-             "laws-tls-pqkey", "laws-tls-budget", "laws-tls-priority", "laws-tls-hd"},
-    "test": {"measure-twin", "measure-wrap", "measure-halt", "measure-poweroff", "measure-ctrlc", "key-wipe", "sealed-pcr-unbound", "sealed-srk-name", "sealed-cap", "tpm-proxy-hmac",
+             "laws-tls-pqkey", "laws-tls-budget", "laws-tls-priority", "laws-tls-hd", "laws-hs-tls-share-key"},
+    "test": {"measure-twin", "measure-wrap", "measure-pair-01", "measure-pair-02", "measure-pair-12",
+             "measure-range2-wrap", "measure-version", "measure-halt", "measure-poweroff", "measure-ctrlc", "key-wipe", "sealed-pcr-unbound", "sealed-srk-name", "sealed-cap", "tpm-proxy-hmac",
              "integration", "integration-count", "integration-residue", "integration-cookie",
              "integration-pq-residue", "l8-fallback", "integration-rp-src-meter", "integration-rotation",
              "integration-expiry", "rp-cookie-gate", "integration-expiry-residue",
-             "tls-key-halt", "c8-head-wipe", "tls-scalar-scrub", "https-probe-canary"},
+             "tls-key-halt", "c8-head-wipe", "tls-scalar-scrub", "https-probe-canary", "tlskey-wipe"},
     "repro": {"repro-path-leak"},
     "mir": {"mir-target-split", "mir-env-split", "mir-debug-split", "mir-feature-split"},
     "manifest": {"manifest"},
@@ -594,8 +618,30 @@ CASES = {
     # 64 bits passes the signed compares and is copied.
     "measure-wrap": (["test", "it_boots=measured boot"], lambda t: edit(
         t, "support/u-boot/boot.cmd",
-        "for v in $o0 $l0 $o1 $l1; do setexpr hi 0x$v / 0x100000000; if test 0x$hi -ne 0; then REFUSE; fi; done\n", ""),
+        "for v in $o0 $l0 $o1 $l1 $o2 $l2; do setexpr hi 0x$v / 0x100000000; if test 0x$hi -ne 0; then REFUSE; fi; done\n",
+        ""),
         "a wrapping range was not refused"),
+    # M6 plan Re-plan R1 (descriptor v2): each pair's disjointness check is
+    # its own control; without one, a range moved onto the other of its pair
+    # (still clear of the third) is measured instead of refused.
+    "measure-pair-01": (["test", "it_boots=measured boot"], lambda t: edit(
+        t, "support/u-boot/boot.cmd", "if test 0x$e0 -gt 0x$o1 && test 0x$e1 -gt 0x$o0; then REFUSE; fi\n", ""),
+        "the 0-1 overlap was not refused"),
+    "measure-pair-02": (["test", "it_boots=measured boot"], lambda t: edit(
+        t, "support/u-boot/boot.cmd", "if test 0x$e0 -gt 0x$o2 && test 0x$e2 -gt 0x$o0; then REFUSE; fi\n", ""),
+        "the 0-2 overlap was not refused"),
+    "measure-pair-12": (["test", "it_boots=measured boot"], lambda t: edit(
+        t, "support/u-boot/boot.cmd", "if test 0x$e1 -gt 0x$o2 && test 0x$e2 -gt 0x$o1; then REFUSE; fi\n", ""),
+        "the 1-2 overlap was not refused"),
+    # Range 2's no-wrap form (len <= image_len - offset): without it, a range
+    # 2 running past image_len within 32 bits is copied.
+    "measure-range2-wrap": (["test", "it_boots=measured boot"], lambda t: edit(
+        t, "support/u-boot/boot.cmd", "setexpr room 0x$img - 0x$o2; if test 0x$l2 -gt 0x$room; then REFUSE; fi\n", ""),
+        "the range-2 wrap was not refused"),
+    # Without the version compare, M5's version 1 at v2's length is measured.
+    "measure-version": (["test", "it_boots=measured boot"], lambda t: edit(
+        t, "support/u-boot/boot.cmd", "setexpr.l ver *0x6ff00008; if test 0x$ver -ne 2; then REFUSE; fi\n", ""),
+        "the version-1 descriptor was not refused"),
     # M5 plan C14. The PCR binding gone from both sides (the seal policy
     # PolicyAuthValue alone, the client skipping PolicyPCR): another image
     # unseals.
@@ -640,12 +686,12 @@ CASES = {
     # Unavailable key keeps the opened blob in guest RAM.
     "key-wipe": (["test", "it_boots=mismatched blob halts key"], lambda t: edit(
         t, "crates/pds/key/src/main.rs",
-        "    let booted = Oracle::boot(plain, &config::GATEWAY_PUBLIC, &config::TLS_PUBLIC, peers, &mut Hw).inspect_err(|_| {\n"
+        "    Oracle::boot(plain, &config::GATEWAY_PUBLIC, peers, &mut Hw).inspect_err(|_| {\n"
         "        // SAFETY: the failed boot's borrow ended with its error, and nothing\n"
         "        // reads the buffer again.\n"
         "        unsafe { &mut *buf }.zeroize();\n"
-        "    });\n",
-        "    let _ = buf;\n    let booted = Oracle::boot(plain, &config::GATEWAY_PUBLIC, &config::TLS_PUBLIC, peers, &mut Hw);\n"),
+        "    })\n",
+        "    let _ = buf;\n    Oracle::boot(plain, &config::GATEWAY_PUBLIC, peers, &mut Hw)\n"),
         "key's opened blob (an Unavailable key must hold no secret) still in guest RAM"),
     # S-BOOT-5 (R3-N2): without AUTOBOOT_KEYED, the Ctrl-C measure_boot sends
     # as U-Boot starts is read by the boot command's first poll, and the
@@ -883,6 +929,10 @@ CASES = {
                                                    '<protection_domain name="tls" priority="100" ',
                                                    '<protection_domain name="tls" priority="140" '),
                           "pd 'tls' (priority 140) must be strictly below pd 'key' (priority 140)"),
+    # M6 plan C12: no key pd is shared. `tls` calls `key` again, `tlskey`
+    # gone with its region and entries, so only the single-caller rule can
+    # object.
+    "laws-hs-tls-share-key": (["laws"], lambda t: share_key_with_tls(t), "key pd 'key' has 2 pp callers, at most one"),
     "laws-tls-hd": (["laws"], lambda t: edit(t, "system/secureos.system",
                                              '        <map mr="audit_tls" vaddr="0x7_000_000" ',
                                              '        <map mr="hd_data" vaddr="0x10_400_000" perms="r" setvar_vaddr="hd_data" />\n'
@@ -928,54 +978,62 @@ CASES = {
                                                    "            if !self.syn_sources.allow(p.src, now_ns) {",
                                                    "            if false {"),
                           "---- tests::a_source_gets_its_syn_burst_and_then_is_limited stdout ----"),
-    # M6 plan C5: the TLS signing oracle's controls. The caller table, the
-    # RFC 6979 additional input and candidate cap, the content `key` builds,
-    # D5 (a TLS failure is no boot failure; the refused scalar is wiped; its
-    # codes stay apart), per-caller seeds and buckets, and each operand of
-    # the three compile-time invariants loosened to the first crossing value.
-    "c5-tls-static-dh": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+    # M6 plan C5 as amended by C12: the TLS signing oracle's controls, now
+    # tlskey-core's. The label table, the RFC 6979 additional input and
+    # candidate cap, the content `tlskey` builds, its code range, and each
+    # operand of the two bucket invariants loosened to the first crossing
+    # value.
+    "c5-tls-static-dh": (["unit"], lambda t: edit(t, "crates/tlskey-core/src/lib.rs",
                                                   "Caller::Tls => matches!(label, LABEL_TLS_SIGN | LABEL_BOOT_SEED),",
-                                                  "Caller::Tls => matches!(label, LABEL_TLS_SIGN | LABEL_BOOT_SEED | LABEL_STATIC_DH),"),
-                         "---- tests::labels_outside_the_tls_row_static_dh_included_are_refused_without_spending_the_bucket stdout ----"),
-    "c5-k-prime": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+                                                  "Caller::Tls => matches!(label, LABEL_TLS_SIGN | LABEL_BOOT_SEED | 1),"),
+                         "---- tests::labels_outside_the_tls_row_are_refused_without_spending_the_bucket stdout ----"),
+    "c5-k-prime": (["unit"], lambda t: edit(t, "crates/tlskey-core/src/lib.rs",
                                             "content.as_bytes(), self.blob.tls_private(), extra.as_bytes())",
                                             "content.as_bytes(), self.blob.tls_private(), &[])"),
                    "---- tests::two_k_prime_values_give_different_r_for_the_same_hash stdout ----"),
-    "c5-nonce-cap": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+    "c5-nonce-cap": (["unit"], lambda t: edit(t, "crates/tlskey-core/src/lib.rs",
                                               "    for _ in 0..MAX_NONCE_CANDIDATES {", "    for _ in 0..=MAX_NONCE_CANDIDATES {"),
                      "---- tests::a_sign_function_that_keeps_refusing_stops_at_the_candidate_cap stdout ----"),
-    "c5-cv-content": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+    "c5-cv-content": (["unit"], lambda t: edit(t, "crates/tlskey-core/src/lib.rs",
                                                "sign_rfc6979(sign, &mut sig, content.as_bytes(),",
                                                "sign_rfc6979(sign, &mut sig, &hash,"),
                       "---- tests::tls_sign_signs_the_server_certificate_verify_content_of_the_hash stdout ----"),
-    "c5-tls-boot-fail": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs", "    Ok(Validated { blob, tls })\n",
-                                                  "    tls.map_err(|_| BootError::GatewayKeyMismatch)?;\n"
-                                                  "    Ok(Validated { blob, tls })\n"),
-                         "---- tests::a_mismatched_tls_key_leaves_hs_working_and_tls_sign_unavailable_with_its_code stdout ----"),
-    "c5-tls-wipe": (["unit"], lambda t: edit(t, "crates/secret-blob/src/lib.rs",
-                                             "            bytes.get_mut(TLS_PRIVATE_AT..FIXED).ok_or(BlobError::TooSmall)?.fill(0);\n",
-                                             "            bytes.get_mut(TLS_PRIVATE_AT..FIXED).ok_or(BlobError::TooSmall)?;\n"),
-                    "---- tests::a_refused_tls_scalar_is_wiped_after_the_checksum_and_the_rest_stays stdout ----"),
-    "c5-d5-codes": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
-                                             "            TlsKeyError::Mismatch => 18,", "            TlsKeyError::Mismatch => 16,"),
-                    "---- tests::tls_key_codes_collide_with_no_boot_error_code_and_fit_the_label stdout ----"),
-    "c5-seed-tag": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
-                                             "            Caller::Tls => b\"tls\",", "            Caller::Tls => b\"hs\","),
-                    "---- tests::boot_seed_is_derived_per_caller_and_differs_between_callers stdout ----"),
-    "c5-caller-bucket": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
-                                                  "            Caller::Tls => &mut self.tls,", "            Caller::Tls => &mut self.hs,"),
-                         "---- tests::each_caller_spends_only_its_own_bucket stdout ----"),
-    "c5-sign-wait": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
-                                              "pub const SIGN_COST_NS: u64 = 20_000_000;",
-                                              "pub const SIGN_COST_NS: u64 = 24_500_001;"),
-                     "C5: a sign in progress on tls's budget can hold hs's key call past HS_KEY_WAIT_MAX_NS"),
-    "c5-syn-burst": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+    "c5-d5-codes": (["unit"], lambda t: edit(t, "crates/tlskey-core/src/lib.rs",
+                                             "                BootError::Mismatch => 8,", "                BootError::Mismatch => 7,"),
+                    "---- tests::boot_error_codes_are_distinct_and_lie_in_tlskeys_own_range stdout ----"),
+    "c5-syn-burst": (["unit"], lambda t: edit(t, "crates/tlskey-core/src/lib.rs",
                                               "pub const TLS_SIGN_BURST: u64 = 32;", "pub const TLS_SIGN_BURST: u64 = 16;"),
-                     "C5: the SYN burst ingress admits can exhaust tls's key bucket"),
-    "c5-syn-interval": (["unit"], lambda t: edit(t, "crates/key-core/src/lib.rs",
+                     "C12: the SYN burst ingress admits can exhaust tlskey's bucket"),
+    "c5-syn-interval": (["unit"], lambda t: edit(t, "crates/tlskey-core/src/lib.rs",
                                                  "pub const TLS_SIGN_INTERVAL_NS: u64 = 1_000_000_000 / 20;",
                                                  "pub const TLS_SIGN_INTERVAL_NS: u64 = 1_000_000_000 / 19;"),
-                        "C5: tls can be admitted handshakes faster than key refills its bucket"),
+                        "C12: tls can be admitted handshakes faster than tlskey refills its bucket"),
+    # M6 plan C12. The one-flow rule as M5's tpm PD had it (the other of two
+    # clients): with a third client, a Fresh client waits only on client
+    # 1 - c, so two flows run at once.
+    "c12-gate-busy": (["unit"], lambda t: edit(
+        t, "crates/tpm2-wire/src/gate.rs",
+        "        if state == State::Fresh && self.states.iter().enumerate().any(|(c, s)| c != client && *s == State::Unsealing) {\n",
+        "        if state == State::Fresh && self.state(1usize.saturating_sub(client)) == Some(State::Unsealing) {\n"),
+                      "---- tests::a_fresh_client_is_busy_while_any_other_is_unsealing_for_every_ordered_pair stdout ----"),
+    # The scalar fed into the per-boot seed (R2-T N2): another scalar under
+    # the same blob seed then hands out another seed.
+    "c12-seed-scalar": (["unit"], lambda t: edit(
+        t, "crates/tlskey-core/src/lib.rs",
+        "secret_blob::blake2s(&[blob.boot_seed(), samples.as_bytes(),",
+        "secret_blob::blake2s(&[blob.boot_seed(), blob.tls_private(), samples.as_bytes(),"),
+                        "---- tests::another_scalar_with_the_same_blob_seed_gives_the_same_boot_seed stdout ----"),
+    # The envelope's kind check gone: `Key` and `Tls` envelopes, one size,
+    # parse as each other.
+    "c12-envelope-kind": (["unit"], lambda t: edit(
+        t, "crates/tpm2/src/envelope.rs",
+        "        if u32_le(bytes, KIND_AT) != Some(kind.code()) {\n            return Err(EnvError::BadKind);\n        }\n", ""),
+                          "---- tests::a_key_envelope_is_refused_as_tls_and_a_tls_envelope_as_key stdout ----"),
+    # The sign-path halt (R2-T N8): a TlsSign answered Unavailable halting
+    # nothing.
+    "c12-sign-halt": (["unit"], lambda t: edit(
+        t, "crates/tls-core/src/halt.rs", "        Some(code) => Some((code, KEY_UNAVAILABLE)),", "        Some(_) => None,"),
+                      "---- tests::a_sign_answered_unavailable_halts_tls_with_its_code_and_key_unavailable stdout ----"),
     # M6 slice 3a (C6, C7, C10; T18, T-N11). L14: HybridSecret has one
     # constructor (P18) and no Clone (tls-core's compile_fail doctest).
     "l14-constructor": (["pins"], lambda t: append(t, "crates/tls-core/src/hybrid.rs",
@@ -1066,10 +1124,13 @@ CASES = {
                                                      '["Handshake", "Head", "BackendConnect", "Idle", "Lifetime"]',
                                                      '["Head", "Handshake", "BackendConnect", "Idle", "Lifetime"]'),
                         "assertion failed: names_match()"),
-    # D5: a TlsSign answered Unavailable halts tls (after its audit).
+    # M6 plan C12: an Unavailable tlskey halts tls at init, before it
+    # listens, with KEY_UNAVAILABLE (after its audit); without that halt,
+    # init stops on INIT_FAILED instead.
     "tls-key-halt": (["test", "it_boots=tls key failure"], lambda t: edit(t, "crates/pds/tls/src/main.rs",
-                                                                         "            self.rings.audit.halt(halt::KEY_UNAVAILABLE);\n        }\n        taken\n",
-                                                                         "        }\n        taken\n"),
+                                                                         "            audit.record(Event::KeyUnavailable { code });\n"
+                                                                         "            audit.halt(halt::KEY_UNAVAILABLE)\n",
+                                                                         "            audit.record(Event::KeyUnavailable { code });\n"),
                      "timed out waiting for 'audit: src=tls Halted reason="),
     # C8: the head buffer wiped on close and release; without it the
     # closed connection's marker outlives it (the live control connection
@@ -1077,9 +1138,10 @@ CASES = {
     "c8-head-wipe": (["test", "it_boots=https residue"], lambda t: edit(t, "crates/tls-core/src/conn.rs",
                                                                        "        wipe(&mut self.head);\n", ""),
                      "residue: marker still in guest RAM"),
-    # T8: `key` scrubs its stack after each TlsSign; without it the scalar's
-    # copies in the dead P-256 frames (HACL's limbs: little-endian) remain.
-    "tls-scalar-scrub": (["test", "it_boots=https"], lambda t: edit(t, "crates/pds/key/src/main.rs",
+    # T8: `tlskey` scrubs its stack after each TlsSign; without it the
+    # scalar's copies in the dead P-256 frames (HACL's limbs: little-endian)
+    # remain.
+    "tls-scalar-scrub": (["test", "it_boots=https"], lambda t: edit(t, "crates/pds/tlskey/src/main.rs",
                                                                    "            scrub_stack();\n        }\n", "        }\n"),
                          re.compile(r"tls scalar count: the TLS scalar \((big|little)-endian\) occurs \d+ time\(s\) "
                                     r"in guest RAM, want exactly")),
@@ -1088,12 +1150,14 @@ CASES = {
                                                                      'limit = rust_const(TLS_CONN, "HANDSHAKE_TIMEOUT_NS") / NS / 3\n',
                                                                      'limit = rust_const(TLS_CONN, "HANDSHAKE_TIMEOUT_NS") / NS / 3e6\n'),
                            "probe margin exceeded"),
-    # T-R3-10: SIGN_COST_NS is bound to libcrux-p256's lock entry; a recorded
-    # entry that no longer matches the lock must fail `pins`.
-    "c5-lock-pin": (["pins"], lambda t: edit(t, "crates/key-core/src/lib.rs",
-                                             '"0.0.9 7489aa205be22524e2f6ddbe006c0c4ff5f1dfc7c17b783e3d02f1cb2a01c605"',
-                                             '"0.0.9 7489aa205be22524e2f6ddbe006c0c4ff5f1dfc7c17b783e3d02f1cb2a01c600"'),
-                    "P17 Cargo.lock: libcrux-p256 0.0.9"),
+    # M6 plan C12 (C6): without the wipe after a refused boot, the
+    # Unavailable tlskey keeps the opened TLS blob (the mismatched scalar)
+    # in guest RAM.
+    "tlskey-wipe": (["test", "it_boots=tls key failure"], lambda t: edit(
+        t, "crates/tlskey-core/src/lib.rs",
+        "            Err(e) => {\n                region.zeroize();\n                return Err(e);\n",
+        "            Err(e) => {\n                return Err(e);\n"),
+                    "tls key failure: the rejected TLS scalar still in guest RAM"),
     # M6 plan C11: a dev CA without NameConstraints vouches for any name;
     # the mkcert fixtures (run by `pins`) must catch the leaf for another.
     "mkcert-constraints": (["pins"], lambda t: edit(t, "tools/mkcert",
@@ -1102,8 +1166,8 @@ CASES = {
     # Only release kernels are packaged (M5 plan C7), judged from the
     # kernel's gen_config.h: the default `debug` config is refused. Refused
     # before any secrets are read, so the paths need not exist.
-    "package-debug": (["package", "SECRETS=/nonexistent/s.bin",
-                       "PQ_SECRETS=/nonexistent/pq.bin", "SRK_PUBLIC=/nonexistent/srk.pub", "OUT=/nonexistent/pkg"],
+    "package-debug": (["package", "SECRETS=/nonexistent/s.bin", "PQ_SECRETS=/nonexistent/pq.bin",
+                       "TLS_SECRETS=/nonexistent/tls.bin", "SRK_PUBLIC=/nonexistent/srk.pub", "OUT=/nonexistent/pkg"],
                       lambda t: None, "package: kernel config is a debug build (CONFIG_DEBUG_BUILD)"),
     # The open-waiver refusal is reported on its own, next to C7's (M3
     # plan, Packaging); the allow-side twin of package-waiver-removed.
@@ -1116,7 +1180,8 @@ CASES = {
     # No waiver is open since M4 closed SC23, so the case opens one in its
     # copy: the refusal names it.
     "package-waiver": (["package", "MICROKIT_CONFIG=release", "SECRETS=/nonexistent/s.bin",
-                        "PQ_SECRETS=/nonexistent/pq.bin", "SRK_PUBLIC=/nonexistent/srk.pub", "OUT=/nonexistent/pkg"],
+                        "PQ_SECRETS=/nonexistent/pq.bin", "TLS_SECRETS=/nonexistent/tls.bin",
+                        "SRK_PUBLIC=/nonexistent/srk.pub", "OUT=/nonexistent/pkg"],
                        lambda t: append(t, "policy/waivers.toml",
                                         '\n[[waivers]]\nid = "SC99"\nowner = "M9"\nstatus = "open"\n'),
                        "waiver SC99 (owner M9) is open"),

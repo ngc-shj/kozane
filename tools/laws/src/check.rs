@@ -370,7 +370,8 @@ fn timer_channel_is_exempt(
 /// L1 (tainted pds map no secret mr) and L2 (M3 plan amendment): every
 /// secrets mr is mapped only by its policy owner and only read-only, each `key`-role pd maps
 /// exactly its own secrets mr and nothing else, `prefill_path` appears
-/// only on secrets mrs, and no pd holds `pp` channels to two key pds.
+/// only on secrets mrs, no pd holds `pp` channels to two key pds, and no
+/// key pd has two `pp` callers (M6 plan C12).
 fn check_secrets_and_taint(
     system: &System,
     policy: &Policy,
@@ -452,6 +453,30 @@ fn check_secrets_and_taint(
             findings.push(Finding::new(
                 LawId::L2,
                 format!("pd '{caller}' has pp channels to more than one key pd: {}", names.join(", ")),
+            ));
+        }
+    }
+
+    // At most one pp caller per key pd (M6 plan C12): with the rule above,
+    // no key pd is shared, so no caller can delay or starve another's calls
+    // into it. A caller is a channel whose peer end is pp=true and whose key
+    // end is pp=false; the key pd's own PPC to `tpm` (pp=true on its end) is
+    // none.
+    let mut callers: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for channel in &system.channels {
+        let [a, b] = &channel.ends;
+        for (key, peer) in [(a, b), (b, a)] {
+            if policy.role(&key.pd) == Some(Role::Key) && peer.pp && !key.pp {
+                callers.entry(key.pd.as_str()).or_default().push(peer.pd.as_str());
+            }
+        }
+    }
+    for (key, mut peers) in callers {
+        if peers.len() > 1 {
+            peers.sort_unstable();
+            findings.push(Finding::new(
+                LawId::L2,
+                format!("key pd '{key}' has {} pp callers, at most one: {}", peers.len(), peers.join(", ")),
             ));
         }
     }

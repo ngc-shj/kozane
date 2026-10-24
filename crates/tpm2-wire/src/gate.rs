@@ -1,6 +1,7 @@
 //! The `tpm` PD's core (M5 plan C9): which client command reaches the
-//! device. `key` and `pqkey` are separate L2 domains that share `tpm` as a
-//! callee, so this is where L2 between them is enforced (S11).
+//! device. `key`, `pqkey` and `tlskey` (M6 plan C12) are separate L2
+//! domains that share `tpm` as a callee, so this is where L2 between them is
+//! enforced (S11).
 //!
 //! - Allowlist by command code: CreatePrimary, StartAuthSession, PolicyPCR,
 //!   PolicyAuthValue, Import, Load, Unseal, FlushContext, PCR_Read.
@@ -14,7 +15,14 @@
 //! - One flow per client per boot: CreatePrimary, StartAuthSession, Load and
 //!   Unseal at most once each. A client that sent Done or Failed is
 //!   refused everything.
-//! - The cap: once both clients are Done or Failed, `cap` yields the one
+//! - One flow at a time (swtpm, like small TPMs, holds three transient
+//!   objects; two flows need four): a Fresh client is told Busy while any
+//!   other client is Unsealing, so a started flow always runs to its end.
+//!   Busy is decided after every validity and ownership refusal (a Fresh
+//!   client owns nothing, so NotOwned stays what it gets on another's
+//!   handle) and before the once-bits and the state change; it changes
+//!   nothing, and the PD answers it RSP_BUSY, which `tpm2::boot` retries.
+//! - The cap: once every client is Done or Failed, `cap` yields the one
 //!   PCR_Extend of PCR 8 the core itself issues; from then on everything is
 //!   refused (the clients already are).
 //!
@@ -28,7 +36,7 @@ use crate::{
     ST_NO_SESSIONS, ST_SESSIONS,
 };
 
-pub const CLIENTS: usize = 2;
+pub const CLIENTS: usize = 3;
 /// Each client owns at most a primary, a session and an object.
 const SLOTS: usize = CLIENTS * 3;
 /// The most sessions one auth area may carry (TPM 2.0 Part 1).
@@ -77,6 +85,9 @@ pub enum Refusal {
     NotOwned,
     /// CreatePrimary outside the owner hierarchy, or a bound session.
     Hierarchy,
+    /// Another client's flow is under way and this one has not started:
+    /// ask again later. Nothing was recorded.
+    Busy,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +129,7 @@ const ONCE_SESSION: u8 = 2;
 const ONCE_LOAD: u8 = 4;
 const ONCE_UNSEAL: u8 = 8;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gate {
     states: [State; CLIENTS],
     once: [u8; CLIENTS],
@@ -264,6 +276,9 @@ impl Gate {
         if sessions {
             self.check_auth(client, &mut r)?;
         }
+        if state == State::Fresh && self.states.iter().enumerate().any(|(c, s)| c != client && *s == State::Unsealing) {
+            return Err(Refusal::Busy);
+        }
         if let Some(bit) = once {
             self.once(client, bit)?;
         }
@@ -328,7 +343,7 @@ impl Gate {
         Ok(())
     }
 
-    /// Once both clients are Done or Failed: the cap's PCR_Extend, exactly
+    /// Once every client is Done or Failed: the cap's PCR_Extend, exactly
     /// once. The core is capped from here on, whatever the device answers.
     pub fn cap(&mut self, out: &mut [u8]) -> Option<usize> {
         if self.capped || !self.states.iter().all(|s| matches!(s, State::Done | State::Failed)) {

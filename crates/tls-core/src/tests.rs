@@ -929,3 +929,14 @@ fn append_head_moves_application_data_into_the_head_buffer_up_to_its_room() {
     assert_eq!(s.append_head(9, 0), 9);
     assert_eq!(&s.head[..9], b"Host: x\r\n");
 }
+
+/// M6 plan C12 (R2-T N8): a `TlsSign` answered Unavailable ends the pass in
+/// `KeyUnavailable` with its code and the KEY_UNAVAILABLE halt; a pass whose
+/// signs were all answered halts nothing.
+#[test]
+fn a_sign_answered_unavailable_halts_tls_with_its_code_and_key_unavailable() {
+    assert_eq!(crate::halt::after_sign(Some(0x48)), Some((0x48, crate::halt::KEY_UNAVAILABLE)));
+    assert_eq!(crate::halt::after_sign(None), None);
+    let reasons = [crate::halt::NO_CLOCK, crate::halt::RNDR, crate::halt::INIT_FAILED, crate::halt::KEY_UNAVAILABLE];
+    assert_eq!(reasons, [1, 2, 3, 4]);
+}

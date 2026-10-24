@@ -653,15 +653,14 @@ impl Gate {
 
 // SYNs: a listener holds a slot for each until its 5 s timeout (smoltcp
 // has no SYN cookies, RM6-7), and each completed handshake costs `tls` and
-// `key` a signature, so new connections are metered per source and
+// `tlskey` a signature, so new connections are metered per source and
 // globally. A source's burst of 4 at one per 250 ms covers a browser's
 // parallel connections; globally 16 at one per 50 ms (20 per second), the
-// forwarded handshake rate that `key`'s TLS sign bucket is sized against
-// (M6 plan C5).
+// forwarded handshake rate that `tlskey`'s sign bucket is sized against
+// (M6 plan C12; the global values live in `limits`, which both share).
 pub const SYN_SRC_BURST: u64 = 4;
 pub const SYN_SRC_INTERVAL_NS: u64 = 250_000_000;
-pub const SYN_GLOBAL_BURST: u64 = 16;
-pub const SYN_GLOBAL_INTERVAL_NS: u64 = 50_000_000;
+pub use limits::{SYN_GLOBAL_BURST, SYN_GLOBAL_INTERVAL_NS};
 // Every other segment to the port, globally: a burst of one `itl` ring
 // and 10 000 segments per second, about 14.6 MB/s of 1460-byte segments
 // into `tls` (recorded per F-N11). Spoofed segments spend it too, stalling

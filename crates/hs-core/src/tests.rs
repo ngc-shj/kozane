@@ -5,7 +5,7 @@ extern crate std;
 use std::collections::BTreeSet;
 
 use super::*;
-use key_core::{Bucket, Buckets, Caller, Entropy as KeyEntropy, Oracle};
+use key_core::{Bucket, Caller, Oracle};
 use wg_core::noise::{CONSTRUCTION, IDENTIFIER, LABEL_MAC1};
 
 use wg_core::wire::{INITIATION_LEN, INITIATION_MAC1_OFFSET, MessageInitiation, MessageResponse, RESPONSE_LEN};
@@ -31,45 +31,28 @@ fn peer_pub() -> [u8; 32] {
 
 fn region() -> [u8; secret_blob::REGION_SIZE] {
     let mut r = [0u8; secret_blob::REGION_SIZE];
-    secret_blob::write(&mut r, clamped(GW_PRIVATE).as_bytes(), &[0x99; 32], &[0x77; 32], &[peer_pub()]).unwrap();
+    secret_blob::write(&mut r, clamped(GW_PRIVATE).as_bytes(), &[0x99; 32], &[peer_pub()]).unwrap();
     r
 }
 
 /// `key` reached directly instead of over PPC.
 struct Direct<'a> {
     oracle: Oracle<'a>,
-    buckets: Buckets,
+    bucket: Bucket,
     calls: usize,
-}
-
-/// `key`'s RNDR, which `hs`'s labels never draw on.
-struct NoEntropy;
-
-impl KeyEntropy for NoEntropy {
-    fn fill_random(&mut self, _: &mut [u8]) -> bool {
-        false
-    }
-
-    fn cntpct(&mut self) -> u64 {
-        0
-    }
 }
 
 impl KeyCall for &mut Direct<'_> {
     fn call(&mut self, label: u64, req: &[u64], reply: &mut [u64]) -> (u64, usize) {
         self.calls += 1;
-        self.oracle.handle(Some(Caller::Hs), &mut self.buckets, 0, &mut NoEntropy, label, req, reply)
+        self.oracle.handle(Some(Caller::Hs), &mut self.bucket, 0, label, req, reply)
     }
 }
 
-/// `key` with `hs`'s bucket at `burst`. The blob's TLS scalar matches no
-/// certificate: `hs` must not notice (M6 plan D5).
-fn direct(r: &mut [u8], burst: u64) -> Direct<'_> {
+fn direct(r: &[u8], burst: u64) -> Direct<'_> {
     let peers = [peer_pub()];
-    let v = key_core::validate(r, &gw_pub(), &[0x04; key_core::TLS_PUBLIC_LEN], peers.iter()).unwrap();
-    assert!(v.tls.is_err());
-    let buckets = Buckets::with(Bucket::new(burst, 1), Bucket::new(0, 1));
-    Direct { oracle: Oracle::new(v, Key32::from_bytes([0x5e; 32])), buckets, calls: 0 }
+    let blob = key_core::validate(r, &gw_pub(), peers.iter()).unwrap();
+    Direct { oracle: Oracle::new(blob, Key32::from_bytes([0x5e; 32])), bucket: Bucket::new(burst, 1), calls: 0 }
 }
 
 struct FakeHw {
@@ -173,8 +156,8 @@ fn handshaker() -> Handshaker<4> {
 
 #[test]
 fn full_handshake_through_the_real_key_oracle() {
-    let mut r = region();
-    let mut d = direct(&mut r, 100);
+    let r = region();
+    let mut d = direct(&r, 100);
     let (init, msg) = Initiator::initiation(ts(1));
     let (mut install, mut response) = ([0u8; 128], [0u8; 128]);
     let peers = [peer_pub()];
@@ -195,8 +178,8 @@ fn full_handshake_through_the_real_key_oracle() {
 
 #[test]
 fn response_does_not_verify_with_another_psk() {
-    let mut r = region();
-    let mut d = direct(&mut r, 100);
+    let r = region();
+    let mut d = direct(&r, 100);
     let (init, msg) = Initiator::initiation(ts(1));
     let (mut install, mut response) = ([0u8; 128], [0u8; 128]);
     let peers = [peer_pub()];
@@ -211,8 +194,8 @@ fn response_does_not_verify_with_another_psk() {
 
 #[test]
 fn key_refusal_rejects_and_records_the_reason() {
-    let mut r = region();
-    let mut d = direct(&mut r, 0);
+    let r = region();
+    let mut d = direct(&r, 0);
     let (_, msg) = Initiator::initiation(ts(1));
     let mut client = KeyClient::new(&mut d);
     let peers = [peer_pub()];
@@ -223,8 +206,8 @@ fn key_refusal_rejects_and_records_the_reason() {
 
 #[test]
 fn bad_mac1_is_rejected_without_calling_key() {
-    let mut r = region();
-    let mut d = direct(&mut r, 100);
+    let r = region();
+    let mut d = direct(&r, 100);
     let (_, mut msg) = Initiator::initiation(ts(1));
     msg[INITIATION_MAC1_OFFSET] ^= 1;
     let peers = [peer_pub()];
@@ -235,8 +218,8 @@ fn bad_mac1_is_rejected_without_calling_key() {
 
 #[test]
 fn unknown_peer_is_rejected_after_one_key_call() {
-    let mut r = region();
-    let mut d = direct(&mut r, 100);
+    let r = region();
+    let mut d = direct(&r, 100);
     let (_, msg) = Initiator::initiation(ts(1));
     let out = handshaker().handle(&input(&msg), 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&[[7; 32]]), &live(), &mut [0; 128], &mut [0; 128]);
     assert_eq!(out, Outcome::Rejected(Reject::UnknownPeer));
@@ -245,16 +228,16 @@ fn unknown_peer_is_rejected_after_one_key_call() {
 
 #[test]
 fn malformed_ingress_message_is_bad_input() {
-    let mut r = region();
-    let mut d = direct(&mut r, 100);
+    let r = region();
+    let mut d = direct(&r, 100);
     let out = handshaker().handle(&[0; 10], 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&[]), &live(), &mut [0; 128], &mut [0; 128]);
     assert_eq!(out, Outcome::BadInput);
 }
 
 #[test]
 fn successive_handshakes_get_distinct_indices() {
-    let mut r = region();
-    let mut d = direct(&mut r, 100);
+    let r = region();
+    let mut d = direct(&r, 100);
     let mut h = handshaker();
     let peers = [peer_pub()];
     let mut seen = BTreeSet::new();
@@ -279,8 +262,8 @@ fn successive_handshakes_get_distinct_indices() {
 
 #[test]
 fn small_install_buffer_is_reported_and_left_zeroed() {
-    let mut r = region();
-    let mut d = direct(&mut r, 100);
+    let r = region();
+    let mut d = direct(&r, 100);
     let (_, msg) = Initiator::initiation(ts(1));
     let mut install = [0xffu8; 20];
     let peers = [peer_pub()];
@@ -347,8 +330,8 @@ fn peer_table_maps_configuration_order() {
 
 #[test]
 fn key_client_dh_matches_the_peer_side_computation() {
-    let mut r = region();
-    let mut d = direct(&mut r, 100);
+    let r = region();
+    let mut d = direct(&r, 100);
     let shared = KeyClient::new(&mut d).dh(&peer_pub()).unwrap();
     let expected = crypto::dh(&clamped(PEER_PRIVATE), &gw_pub()).unwrap();
     assert_eq!(shared.as_bytes(), expected.as_bytes());
@@ -356,8 +339,8 @@ fn key_client_dh_matches_the_peer_side_computation() {
 
 #[test]
 fn rejected_initiations_do_not_use_up_indices() {
-    let mut r = region();
-    let mut d = direct(&mut r, 1000);
+    let r = region();
+    let mut d = direct(&r, 1000);
     let mut h = handshaker();
     let peers = [peer_pub()];
     // Replays of one accepted initiation: authentic but refused.
@@ -394,8 +377,8 @@ fn key_budget_exhaustion_is_audited_distinctly() {
 
 #[test]
 fn exhausted_key_budget_reaches_the_audit_mapping() {
-    let mut r = region();
-    let mut d = direct(&mut r, 0);
+    let r = region();
+    let mut d = direct(&r, 0);
     let (_, msg) = Initiator::initiation(ts(1));
     let mut client = KeyClient::new(&mut d);
     let peers = [peer_pub()];
@@ -419,6 +402,7 @@ fn every_initiation_exit_stays_within_the_key_call_budget() {
     const EPHEMERAL: core::ops::Range<usize> = 8..40;
     const ENC_STATIC: usize = 40;
     const ENC_TIMESTAMP: usize = 88;
+    let r = region();
     let peers = [peer_pub()];
     let mut out_of_range = [[7u8; 32]; 5];
     out_of_range[4] = peer_pub();
@@ -432,8 +416,7 @@ fn every_initiation_exit_stays_within_the_key_call_budget() {
                     peers: &[[u8; 32]],
                     psks: &PskTable<4>,
                     install: &mut [u8]| {
-        let mut r = region();
-        let mut d = direct(&mut r, burst);
+        let mut d = direct(&r, burst);
         let mut e = HedgedEntropy::new(Key32::from_bytes([3; 32]), FakeHw { tick: 0, rndr });
         let out = h.handle(input, now, &mut KeyClient::new(&mut d), &mut e, &Peers(peers), psks, install, &mut [0; 128]);
         (out, d.calls)
@@ -500,8 +483,8 @@ fn every_initiation_exit_stays_within_the_key_call_budget() {
 /// One `handle` with `psks`, a fresh handshaker-independent `key` and the
 /// default entropy; returns the outcome and the install bytes.
 fn handle_with(h: &mut Handshaker<4>, msg: &[u8; INITIATION_LEN], now: u64, peers: &[[u8; 32]], psks: &PskTable<4>) -> (Outcome, [u8; 128], [u8; 128]) {
-    let mut r = region();
-    let mut d = direct(&mut r, 100);
+    let r = region();
+    let mut d = direct(&r, 100);
     let (mut install, mut response) = ([0u8; 128], [0u8; 128]);
     let out = h.handle(&input(msg), now, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(peers), psks, &mut install, &mut response);
     (out, install, response)

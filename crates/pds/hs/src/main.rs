@@ -27,9 +27,10 @@ const MAX_PEERS: usize = config::MAX_PEERS;
 const _: () = assert!(config::PEERS.len() <= MAX_PEERS);
 
 /// `key` over PPC. Request and reply registers are zeroed after each call.
-/// Each call's wall time is measured (M6 plan C5): `key` serves `tls` too,
-/// and a call waits behind a sign in progress; `wait_us` is the longest
-/// since `take_wait_us`.
+/// Each call's wall time is measured (M6 plan C5, kept by C12): `key`
+/// serves `hs` alone, so this is observability, not a bound; drivers above
+/// `key` still move it with load. `wait_us` is the longest since
+/// `take_wait_us`.
 struct Ppc {
     wait_us: Option<u32>,
 }

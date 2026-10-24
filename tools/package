@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Packages a deployment for one TPM (plan C16, M3 plan L6, M5 plan C8,
 C11): the published image (`make image`'s, with the zero placeholders), the
-boot descriptor naming where U-Boot copies each envelope, the two sealed
-envelopes (`key`'s blob for the `secrets` mr, `pqkey`'s for `pq_secrets`),
-and the PCR 8 they are sealed to. No image with a secret in it is written.
+boot descriptor naming where U-Boot copies each envelope, the three sealed
+envelopes (`key`'s blob for the `secrets` mr, `pqkey`'s for `pq_secrets`,
+`tlskey`'s for `tls_secrets`; M6 plan Re-plan R1), and the PCR 8 they are
+sealed to. No image with a secret in it is written.
 
-Usage: package --secrets FILE --pq-secrets FILE --srk-public FILE --out DIR
+Usage: package --secrets FILE --pq-secrets FILE --tls-secrets FILE
+               --srk-public FILE --out DIR
                --system FILE --policy FILE --image LOADER
                --gen-config gen_config.h --search-path DIR --board BOARD
                --config CONFIG --microkit BIN --harness CT_HARNESS
@@ -14,7 +16,7 @@ Usage: package --secrets FILE --pq-secrets FILE --srk-public FILE --out DIR
 writes (mksecrets seal checks it is the storage template). The flow:
 
   1. microkit builds the system with size-correct, random stand-ins as the
-     two prefills: where they land are the envelope ranges;
+     three prefills: where they land are the envelope ranges;
   2. the descriptor names those ranges, and PCR 8 is computed from it and
      the published image (tools/measure.py, what U-Boot will extend);
   3. `mksecrets seal` seals each blob to that SRK and PCR 8, each under a
@@ -24,17 +26,19 @@ writes (mksecrets seal checks it is the storage template). The flow:
      image byte for byte.
 
 Each build is accepted only if, against the placeholder build:
-  - the .system differs in nothing but the two secrets mrs' prefill_path;
+  - the .system differs in nothing but the three secrets mrs' prefill_path;
   - (stand-ins) the images have equal length, differ somewhere, and every
-    differing byte lies inside one of the two places the stand-ins appear,
+    differing byte lies inside one of the three places the stand-ins appear,
     where the placeholder image held zeros;
-and each blob must be a full region of its own kind (magic, version,
-checksum, zero padding), each envelope a sealed envelope of its kind.
-Both blobs and OUT must resolve outside the repository (and so `build/`)
-and the toolchain caches. OUT must not exist yet: everything is built in a
+and each blob must be a full region of its own kind (magic, version, the
+TLS blob's zero reserved word, checksum, zero padding), each envelope a
+sealed envelope of its kind. All three blobs and OUT must resolve outside
+the repository (and so `build/`) and the toolchain caches. OUT must not
+exist yet: everything is built in a
 fresh 0700 staging directory beside it under umask 077, renamed into place
 only after every check passed, and removed on every failure path. OUT holds
-published.img, boot.desc, secrets.env, pq_secrets.env and pcr8.
+published.img, boot.desc, secrets.env, pq_secrets.env, tls_secrets.env and
+pcr8.
 Only `release` kernels are packaged (M5 plan C7, closing SC20 and
 architecture R4 on shipped images), judged from the kernel's own
 gen_config.h rather than a make variable: no CONFIG_DEBUG_BUILD, no
@@ -92,28 +96,31 @@ class BlobKind(NamedTuple):
     body: object
 
 
-KEY_MAX_PEERS = (4096 - 112 - 32) // 32
+KEY_MAX_PEERS = (4096 - 80 - 32) // 32
 
 
 def _key_body(blob: bytes):
     peers = int.from_bytes(blob[12:16], "little")
-    return 112 + 32 * peers if 1 <= peers <= KEY_MAX_PEERS else None
+    return 80 + 32 * peers if 1 <= peers <= KEY_MAX_PEERS else None
 
 
-# `key` blob v3: header 16 B, gateway key, boot seed and TLS scalar, 32 B
-# per peer.
-KEY = BlobKind("secrets", b"SOSSECR1", 3, 4096, _key_body)
+# `key` blob v2: header 16 B, gateway key and boot seed, 32 B per peer.
+KEY = BlobKind("secrets", b"SOSSECR1", 2, 4096, _key_body)
 # `pqkey` blob v1: header 12 B, McEliece sk 13608 B, then 4 x 32 B and a
 # 188 B ciphertext: the checksum covers [..13904] (secret_blob::pq).
 PQ = BlobKind("pq_secrets", b"SOSPQKY1", 1, 16384, lambda _blob: 13904)
-KINDS = (KEY, PQ)
+# `tlskey` blob v1: header 16 B (reserved u32 0 at 12), TLS scalar, boot
+# seed: the checksum covers [..80] (secret_blob::tls).
+TLS = BlobKind("tls_secrets", b"SOSTLSK1", 1, 4096, lambda _blob: 80)
+# In descriptor range order (tools/measure.py).
+KINDS = (KEY, PQ, TLS)
 SECRETS_MRS = tuple(k.mr for k in KINDS)
 # `mksecrets seal --kind` and the envelope's kind code (tpm2::envelope).
-SEAL_KINDS = {"secrets": ("key", 1), "pq_secrets": ("pq", 2)}
+SEAL_KINDS = {"secrets": ("key", 1), "pq_secrets": ("pq", 2), "tls_secrets": ("tls", 3)}
 ENVELOPE_MAGIC = b"SOSSEAL1"
 # tpm2_wire::SRK_PUBLIC_LEN: the SRK's TPMT_PUBLIC (a P-256 point).
 SRK_PUBLIC_LEN = 90
-OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "pcr8")
+OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "tls_secrets.env", "pcr8")
 
 
 def is_debug(gen_config: str) -> bool:
@@ -227,6 +234,8 @@ def check_blob(kind: BlobKind, blob: bytes) -> list:
     version = int.from_bytes(blob[8:12], "little")
     if version != kind.version:
         return [f"{name} is version {version}, expected {kind.version}"]
+    if kind is TLS and any(blob[12:16]):
+        return [f"{name} has a non-zero reserved word"]
     body = kind.body(blob)
     if body is None:
         return [f"{name} peer count is out of range"]
@@ -317,7 +326,7 @@ def _diff_elements(a: ET.Element, b: ET.Element, where: str, errors: list):
 
 def check_systems(placeholder: str, package: str) -> list:
     """The package .system must equal the placeholder one except for the
-    two secrets mrs' prefill_paths, which must be set in both."""
+    three secrets mrs' prefill_paths, which must be set in both."""
     a, b = ET.fromstring(placeholder), ET.fromstring(package)
     errors = []
     _diff_elements(a, b, a.tag, errors)
@@ -399,8 +408,8 @@ def main() -> int:
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(s, exit_on_signal)
     ap = argparse.ArgumentParser()
-    for opt in ("secrets", "pq-secrets", "srk-public", "out", "system", "policy", "image", "gen-config", "search-path", "board",
-                "config", "microkit", "harness"):
+    for opt in ("secrets", "pq-secrets", "tls-secrets", "srk-public", "out", "system", "policy", "image", "gen-config",
+                "search-path", "board", "config", "microkit", "harness"):
         ap.add_argument(f"--{opt}", required=True)
     a = ap.parse_args()
 
@@ -516,7 +525,7 @@ def publish(src: pathlib.Path, dst: pathlib.Path):
 
 def blob_args(a) -> dict:
     """The operator's blob path for each secrets mr."""
-    return {KEY.mr: a.secrets, PQ.mr: a.pq_secrets}
+    return {KEY.mr: a.secrets, PQ.mr: a.pq_secrets, TLS.mr: a.tls_secrets}
 
 
 def microkit(a, system: pathlib.Path, image: pathlib.Path, report: pathlib.Path):
@@ -538,7 +547,7 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
     """Builds in the staging dir `out`. The envelopes are sealed from private
     copies of the blob bytes that were checked (`blobs`, by mr), never from
     the caller's paths again, so swapping a path after the check cannot
-    change what is sealed; the copies go as soon as both are sealed. No
+    change what is sealed; the copies go as soon as all are sealed. No
     microkit run ever sees a blob."""
     placeholder_system = pathlib.Path(a.system).read_text()
     published = pathlib.Path(a.image).read_bytes()

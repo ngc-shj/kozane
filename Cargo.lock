@@ -674,6 +674,7 @@ dependencies = [
 name = "ingress-core"
 version = "0.1.0"
 dependencies = [
+ "limits",
  "msgs",
  "ring",
  "wg-wire",
@@ -735,10 +736,7 @@ dependencies = [
 name = "key-core"
 version = "0.1.0"
 dependencies = [
- "libcrux-p256",
- "rfc6979",
  "secret-blob",
- "sha2 0.11.1",
  "tpm2",
  "wg-core",
 ]
@@ -961,6 +959,10 @@ dependencies = [
  "cfg-if",
  "windows-link",
 ]
+
+[[package]]
+name = "limits"
+version = "0.1.0"
 
 [[package]]
 name = "lock_api"
@@ -1262,7 +1264,6 @@ dependencies = [
  "config",
  "cpu",
  "http-wire",
- "key-core",
  "layout",
  "pdkit",
  "ring",
@@ -1270,7 +1271,22 @@ dependencies = [
  "smoltcp",
  "tls-core",
  "tls-wire",
+ "tlskey-core",
  "wire",
+ "zeroize",
+]
+
+[[package]]
+name = "pd-tlskey"
+version = "0.1.0"
+dependencies = [
+ "config",
+ "cpu",
+ "layout",
+ "secret-blob",
+ "sel4-microkit",
+ "tlskey-core",
+ "tpm2",
  "zeroize",
 ]
 
@@ -2107,6 +2123,20 @@ name = "tls-wire"
 version = "0.1.0"
 dependencies = [
  "bolero",
+]
+
+[[package]]
+name = "tlskey-core"
+version = "0.1.0"
+dependencies = [
+ "ct",
+ "libcrux-p256",
+ "limits",
+ "rfc6979",
+ "secret-blob",
+ "sha2 0.11.1",
+ "tpm2",
+ "zeroize",
 ]
 
 [[package]]

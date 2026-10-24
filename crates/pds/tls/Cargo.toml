@@ -10,8 +10,9 @@ config = { path = "../../config" }
 cpu = { path = "../../cpu" }
 # The request head parser and rewrite (M6 plan C9; wired in slice 4).
 http-wire = { path = "../../http-wire" }
-# The TlsSign/BootSeed labels and reply words (M6 plan C5), as pd-hs.
-key-core = { path = "../../key-core" }
+# The TlsSign/BootSeed labels and reply words (M6 plan C5, C12), as
+# pd-hs uses key-core.
+tlskey-core = { path = "../../tlskey-core" }
 layout = { path = "../../layout" }
 pdkit = { path = "../../pdkit" }
 ring = { path = "../../ring" }

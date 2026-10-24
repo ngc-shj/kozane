@@ -27,15 +27,18 @@ Rules:
      `Zeroizing<` in rosenpass-core, pqkey-core, pds/pq, pds/pqkey,
      pds/ingress, and on any type in mce460896 but RngError, which keeps its
      secrets in plain arrays (L12, M3 plan S12, M4 plan C11; pqkey-core
-     holds its secrets in `Zeroizing`), in tpm2 (M5 plan I10.3), and in
-     tls-core, pds/tls and key-core (M6 plan S9)
+     holds its secrets in `Zeroizing`), in tpm2 (M5 plan I10.3), in
+     tls-core, pds/tls and key-core (M6 plan S9), and in tlskey-core and
+     pds/tlskey (M6 plan C12)
   P10 no `from_bytes(*` in the secret crates or in hs-core, key-core,
-     data-core, wg-core, tpm2, tls-core and the key, hs, data and tls PDs: a dereferenced array is a by-value temporary of
+     data-core, wg-core, tpm2, tls-core, tlskey-core and the key, hs, data,
+     tls and tlskey PDs: a dereferenced array is a by-value temporary of
      the secret left on the stack; `copy_from(&..)` copies in place (L12)
   P11 no cookie (COOKIE_FILES, M3b plan S3) and no tag of a TAG_SETS crate
      (any source in it: tpm2's HMAC tags, its Unseal response check, M5
-     plan I10.1; key-core's and pds/tls's HMAC tags; tls-core's Finished
-     verify_data, M6 plan S9) compared with == or !=; every compare goes
+     plan I10.1; tlskey-core's RFC 6979 HMAC and pds/tlskey's, M6 plan
+     C12; pds/tls's HMAC tags; tls-core's Finished verify_data, M6 plan S9)
+     compared with == or !=; every compare goes
      through ct_eq. Each set names an anchor file that must exist while its
      crate does (the file holding the check today). A tripwire: the names
      it reads are lowercase `cookie`/`hmac`/`tag`/`finished`/`verify_data`,
@@ -61,11 +64,8 @@ Rules:
      the two is exactly MCE_CLOSURE (M4 plan C7). The lock stands for
      `cargo metadata`: every gate builds --locked, and the fixtures' partial
      trees could not be resolved by cargo.
-  P17 Cargo.lock locks libcrux-p256 exactly once, from the registry, at the
-     version and checksum recorded beside key-core's SIGN_COST_NS
-     (`SIGN_COST_LIBCRUX_P256`): the sign cost the key-wait invariant uses
-     was measured for that code, so a changed entry means re-measuring
-     (M6 plan C5, T-R3-10)
+  (P17, the sign cost's lock pin, was retired with C5's key-wait bound:
+     M6 plan C12. The numbers that follow keep their names.)
   P18 L14's constructor rule (M6 plan L14, C7): in crates/ and tools/, a
      `HybridSecret(..)`/`HybridSecret { .. }` construction only inside
      `exchange_with_randomness` in crates/tls-core/src/hybrid.rs (the body
@@ -92,8 +92,8 @@ control for "a failing gate fails `make check`" is tools/check-selftest's
 check-propagation case, which runs the real `make check` once per gate with
 that gate made to fail.
 
-P6 and P17 are fail-closed binding checks (Cargo.lock against
-policy/waivers.toml; against key-core's recorded entry).
+P6 is a fail-closed binding check (Cargo.lock against
+policy/waivers.toml).
 P7-P11 and P19 are best-effort tripwires over source text; P19's known
 bypasses: a code point computed (`0x10 + 13`), built from bytes out of
 order, read from configuration, or spelled in a dependency. L14's
@@ -126,15 +126,17 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
-RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P17",
-         "P18", "P19"]
+RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P18",
+         "P19"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
-               "crates/tls-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data", "crates/pds/tls"]
+               "crates/tls-core", "crates/tlskey-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data",
+               "crates/pds/tls", "crates/pds/tlskey"]
 PENDING: set[str] = set()
 # Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
 SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/ingress",
-                 "crates/mce460896", "crates/tpm2", "crates/tls-core", "crates/pds/tls", "crates/key-core"]
+                 "crates/mce460896", "crates/tpm2", "crates/tls-core", "crates/pds/tls", "crates/key-core",
+                 "crates/tlskey-core", "crates/pds/tlskey"]
 # mce460896's types that hold no secret (P9): every other type there does.
 MCE_PUBLIC_TYPES = {"RngError"}
 # Types that hold a secret under a name of their own, not as Secret<..> (P9,
@@ -147,11 +149,13 @@ COOKIE_FILES = ["crates/rosenpass-core/src/cookie.rs", "crates/pds/ingress/src/r
 # whole crate, so a check that moves out of its file stays covered; the
 # anchor, the file holding the check today, must exist while the crate
 # does. (crate, anchor, names, what): tpm2's Unseal response HMAC (M5 plan
-# I10.1), key-core's and pds/tls's HMAC tags, and tls-core's Finished,
+# I10.1), the RFC 6979 HMAC in tlskey-core and its PD's (M6 plan C12; it
+# was key-core's until then), pds/tls's HMAC tags, and tls-core's Finished,
 # verified in handshake.rs (M6 plan S9, T-N1).
 TAG_SETS = [
     ("crates/tpm2", "crates/tpm2/src/client.rs", "hmac|tag", "an HMAC tag"),
-    ("crates/key-core", "crates/key-core/src/lib.rs", "hmac|tag", "an HMAC tag"),
+    ("crates/tlskey-core", "crates/tlskey-core/src/lib.rs", "hmac|tag", "an HMAC tag"),
+    ("crates/pds/tlskey", "crates/pds/tlskey/src/main.rs", "hmac|tag", "an HMAC tag"),
     ("crates/pds/tls", "crates/pds/tls/src/main.rs", "hmac|tag|finished|verify_data", "a tag or Finished"),
     ("crates/tls-core", "crates/tls-core/src/handshake.rs", "finished|verify_data", "a Finished verify_data"),
 ]
@@ -720,38 +724,6 @@ def check_mce_deps(root: pathlib.Path, out: list):
         out.append(f"P16 Cargo.lock: {key} left mce460896's dependency closure")
 
 
-# P17: where the sign cost and the lock entry it was measured for live.
-SIGN_COST_FILE = "crates/key-core/src/lib.rs"
-SIGN_COST_PIN = re.compile(r'^pub const SIGN_COST_LIBCRUX_P256: &str = "(\S+) ([0-9a-f]{64})";$', re.M)
-
-
-def check_sign_cost_pin(root: pathlib.Path, out: list):
-    # As P11: a tree without key-core (the P7 fixtures') has nothing to bind.
-    if not (root / "crates/key-core").is_dir():
-        return
-    path = root / SIGN_COST_FILE
-    m = SIGN_COST_PIN.search(path.read_text()) if path.is_file() else None
-    if not m:
-        out.append(f"P17 {SIGN_COST_FILE}: no SIGN_COST_LIBCRUX_P256 \"<version> <checksum>\" beside SIGN_COST_NS")
-        return
-    try:
-        lock = tomllib.loads((root / "Cargo.lock").read_text())
-    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
-        out.append(f"P17 Cargo.lock: unreadable ({e}); the sign cost pin cannot be checked")
-        return
-    entries = [p for p in lock.get("package", []) if p.get("name") == "libcrux-p256"]
-    if len(entries) != 1:
-        out.append(f"P17 Cargo.lock: libcrux-p256 locked {len(entries)} times, want once")
-        return
-    p = entries[0]
-    if p.get("source") != REGISTRY:
-        out.append(f"P17 Cargo.lock: libcrux-p256 is not from the crates.io registry")
-    got = (p.get("version"), p.get("checksum"))
-    if got != (m.group(1), m.group(2)):
-        out.append(f"P17 Cargo.lock: libcrux-p256 {got[0]} {got[1]} differs from the entry SIGN_COST_NS was measured "
-                   f"for ({m.group(1)} {m.group(2)}): re-measure SIGN_COST_NS, then update SIGN_COST_LIBCRUX_P256")
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
@@ -778,7 +750,6 @@ def main() -> int:
     check_mce_unsafe(root, out)
     check_client_requests(root, out)
     check_mce_deps(root, out)
-    check_sign_cost_pin(root, out)
     check_hybrid_constructors(root, out)
     check_classical_groups(root, out)
     failing = [l for l in out if l.split()[0] not in pending]

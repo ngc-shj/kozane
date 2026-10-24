@@ -5,7 +5,7 @@ extern crate std;
 use std::vec;
 use std::vec::Vec;
 
-use super::gate::{ALLOWED, CAP_DIGEST, Gate, Refusal, State};
+use super::gate::{ALLOWED, CAP_DIGEST, CLIENTS, Gate, Refusal, State};
 use super::*;
 
 fn hex(s: &str) -> Vec<u8> {
@@ -199,6 +199,7 @@ fn srk_point_and_sealed_policy_accept_only_their_shapes() {
 
 const OWNER: usize = 0;
 const OTHER: usize = 1;
+const THIRD: usize = 2;
 
 fn cmd(f: impl FnOnce(&mut [u8]) -> Option<usize>) -> Vec<u8> {
     let mut buf = [0u8; IPC_MSG_BYTES];
@@ -289,6 +290,8 @@ fn the_other_clients_handles_are_refused_for_every_command() {
 fn unseal_of_an_owned_object_with_the_other_clients_session_is_refused() {
     let mut g = Gate::new();
     setup(&mut g, OWNER, 0x8000_0000, 0x0300_0000, 0x8000_0001);
+    // The owner finishes without flushing: its session is still recorded.
+    g.finish(OWNER, false).unwrap();
     setup(&mut g, OTHER, 0x8000_0002, 0x0300_0001, 0x8000_0003);
     assert_eq!(g.command(OTHER, &unseal_cmd(0x8000_0003, 0x0300_0000)), Err(Refusal::NotOwned));
     assert!(g.command(OTHER, &unseal_cmd(0x8000_0003, 0x0300_0001)).is_ok());
@@ -308,9 +311,13 @@ fn a_flushed_handle_number_belongs_to_whoever_gets_it_next() {
     let mut g = Gate::new();
     forward(&mut g, OWNER, &cmd(create_primary), &handle_rsp(0x8000_0000));
     forward(&mut g, OWNER, &cmd(|b| flush_context(b, 0x8000_0000)), &OK);
+    g.finish(OWNER, true).unwrap();
     forward(&mut g, OTHER, &cmd(create_primary), &handle_rsp(0x8000_0000));
     let salted = cmd(|b| start_auth_session(b, 0x8000_0000, &[1; 32], &[2; POINT_LEN]));
-    assert_eq!(g.command(OWNER, &salted), Err(Refusal::NotOwned));
+    // The finished owner is refused before any ownership lookup; a Fresh
+    // client is refused the reused number as not its own.
+    assert_eq!(g.command(OWNER, &salted), Err(Refusal::Finished));
+    assert_eq!(g.command(THIRD, &salted), Err(Refusal::NotOwned));
     assert!(g.command(OTHER, &salted).is_ok());
 }
 
@@ -343,23 +350,27 @@ fn a_finished_client_is_refused_everything_and_cannot_finish_twice() {
     assert_eq!(g.command(OWNER, &cmd(|b| flush_context(b, 0x8000_0000))), Err(Refusal::Finished));
     assert_eq!(g.command(OWNER, &cmd(pcr_read)), Err(Refusal::Finished));
     assert_eq!(g.finish(OWNER, true), Err(Refusal::Finished));
-    assert_eq!(g.command(2, &cmd(pcr_read)), Err(Refusal::UnknownClient));
+    assert_eq!(g.command(CLIENTS, &cmd(pcr_read)), Err(Refusal::UnknownClient));
+    assert_eq!(CLIENTS, 3);
 }
 
 #[test]
-fn the_cap_comes_once_after_both_clients_finish_and_then_everything_is_refused() {
+fn the_cap_comes_once_after_every_client_finishes_and_then_everything_is_refused() {
     let mut g = Gate::new();
     let mut buf = [0u8; IPC_MSG_BYTES];
     setup(&mut g, OWNER, 0x8000_0000, 0x0300_0000, 0x8000_0001);
     g.finish(OWNER, true).unwrap();
     assert_eq!(g.cap(&mut buf), None);
     g.finish(OTHER, false).unwrap();
+    assert_eq!(g.cap(&mut buf), None, "the third client has not finished");
+    g.finish(THIRD, true).unwrap();
     let n = g.cap(&mut buf).unwrap();
     assert_eq!(buf[..n], cmd(|b| pcr_extend(b, &CAP_DIGEST))[..]);
     assert!(g.is_capped());
     assert_eq!(g.cap(&mut buf), None);
     assert_eq!(g.command(OWNER, &unseal_cmd(0x8000_0001, 0x0300_0000)), Err(Refusal::Capped));
     assert_eq!(g.command(OTHER, &cmd(create_primary)), Err(Refusal::Capped));
+    assert_eq!(g.command(THIRD, &cmd(pcr_read)), Err(Refusal::Capped));
 }
 
 #[test]
@@ -369,12 +380,44 @@ fn a_returned_handle_of_the_wrong_kind_or_already_taken_fails_the_client() {
     assert_eq!(g.state(OWNER), Some(State::Failed));
     let mut g = Gate::new();
     forward(&mut g, OWNER, &cmd(create_primary), &handle_rsp(0x8000_0000));
+    g.finish(OWNER, true).unwrap();
     forward(&mut g, OTHER, &cmd(create_primary), &handle_rsp(0x8000_0000));
     assert_eq!(g.state(OTHER), Some(State::Failed));
-    assert_eq!(g.state(OWNER), Some(State::Unsealing));
+    assert_eq!(g.state(OWNER), Some(State::Done));
     let mut g = Gate::new();
     forward(&mut g, OWNER, &cmd(create_primary), &OK);
     assert_eq!(g.state(OWNER), Some(State::Failed));
+}
+
+/// One flow at a time (M6 plan C12): for every ordered pair of distinct
+/// clients, a Fresh `b` is told Busy while `a` is Unsealing, after every
+/// validity and ownership refusal, with nothing recorded; once `a` has
+/// finished, `b`'s flow runs.
+#[test]
+fn a_fresh_client_is_busy_while_any_other_is_unsealing_for_every_ordered_pair() {
+    let mut pairs = 0;
+    for a in 0..CLIENTS {
+        for b in (0..CLIENTS).filter(|b| *b != a) {
+            pairs += 1;
+            let mut g = Gate::new();
+            forward(&mut g, a, &cmd(create_primary), &handle_rsp(0x8000_0000));
+            let before = g.clone();
+            assert_eq!(g.command(b, &cmd(create_primary)), Err(Refusal::Busy), "{a} -> {b}");
+            assert_eq!(g.command(b, &cmd(pcr_read)), Err(Refusal::Busy), "{a} -> {b}");
+            assert_eq!(g.command(b, &cmd(|x| flush_context(x, 0x8000_0000))), Err(Refusal::NotOwned), "{a} -> {b}");
+            assert_eq!(g.command(b, &cmd(|x| pcr_extend(x, &[0; 32]))), Err(Refusal::NotAllowed), "{a} -> {b}");
+            let mut bound = cmd(create_primary);
+            bound[13] = 0x0C; // the platform hierarchy
+            assert_eq!(g.command(b, &bound), Err(Refusal::Hierarchy), "{a} -> {b}");
+            assert!(g == before, "{a} -> {b}: Busy changed the gate");
+            // The started flow is never Busy.
+            forward(&mut g, a, &cmd(pcr_read), &OK);
+            g.finish(a, true).unwrap();
+            forward(&mut g, b, &cmd(create_primary), &handle_rsp(0x8000_0001));
+            assert_eq!(g.state(b), Some(State::Unsealing), "{a} -> {b}");
+        }
+    }
+    assert_eq!(pairs, 6);
 }
 
 #[test]
@@ -427,7 +470,7 @@ fn fuzz_one(bytes: &[u8]) {
     let _ = parse_pcr_read(bytes);
     let _ = parse_empty(bytes);
     let _ = parse_pcr_extend(bytes);
-    for client in 0..2 {
+    for client in 0..CLIENTS {
         let mut g = Gate::new();
         if let Ok(fwd) = g.command(client, bytes) {
             assert!(ALLOWED.contains(&fwd.command_code()));

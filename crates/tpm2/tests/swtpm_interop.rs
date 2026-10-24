@@ -343,6 +343,8 @@ fn sealed_envelope_unseals_to_the_original_blob_through_the_gate_and_the_cap_fol
     let pq_blob = blob(Kind::Pq, "pq");
     let key_env = seal(Kind::Key, &key_blob, &srk_public, &expected_pcr8(), "seal-key");
     let pq_env = seal(Kind::Pq, &pq_blob, &srk_public, &expected_pcr8(), "seal-pq");
+    let tls_blob = blob(Kind::Tls, "tls");
+    let tls_env = seal(Kind::Tls, &tls_blob, &srk_public, &expected_pcr8(), "seal-tls");
 
     let mut gate = Gate::new();
     let (r, out) = drive(&mut tpm, client(&key_env, Kind::Key, "c-key"), Kind::Key, Some((&mut gate, 0)), pass);
@@ -350,14 +352,21 @@ fn sealed_envelope_unseals_to_the_original_blob_through_the_gate_and_the_cap_fol
     assert!(out == key_blob, "the key envelope did not open to its blob");
     gate.finish(0, true).unwrap();
     let mut buf = [0u8; IPC_MSG_BYTES];
-    assert_eq!(gate.cap(&mut buf), None, "capped before both clients finished");
+    assert_eq!(gate.cap(&mut buf), None, "capped before every client finished");
 
     let (r, out) = drive(&mut tpm, client(&pq_env, Kind::Pq, "c-pq"), Kind::Pq, Some((&mut gate, 1)), pass);
     assert_eq!(r, Ok(()));
     assert!(out == pq_blob, "the pq envelope did not open to its blob");
     gate.finish(1, true).unwrap();
+    assert_eq!(gate.cap(&mut buf), None, "capped before the third client finished");
 
-    let n = gate.cap(&mut buf).expect("cap after both clients are done");
+    // M6 plan C12: `tlskey`'s envelope, the third client.
+    let (r, out) = drive(&mut tpm, client(&tls_env, Kind::Tls, "c-tls"), Kind::Tls, Some((&mut gate, 2)), pass);
+    assert_eq!(r, Ok(()));
+    assert!(out == tls_blob, "the tls envelope did not open to its blob");
+    gate.finish(2, true).unwrap();
+
+    let n = gate.cap(&mut buf).expect("cap after every client is done");
     tpm2_wire::parse_pcr_extend(&tpm.transact(&buf[..n])).unwrap();
     assert_eq!(tpm.pcr8(), extend(&expected_pcr8(), &CAP_DIGEST), "PCR 8 after the cap");
     // After the cap the same envelope no longer unseals, even for a client
@@ -691,9 +700,9 @@ fn two_seals_of_one_blob_differ_and_both_unseal() {
     }
 }
 
-/// The `tpm` PD as crates/pds/tpm runs it (gate, the one-flow-at-a-time
-/// Busy rule, the cap after both clients finished), over swtpm, shared by
-/// two client threads.
+/// The `tpm` PD as crates/pds/tpm runs it (the gate with its
+/// one-flow-at-a-time Busy rule answered RSP_BUSY, the cap after every
+/// client finished), over swtpm, shared by three client threads.
 struct PdModel {
     tpm: Tpm,
     gate: Gate,
@@ -709,15 +718,15 @@ struct PdCall<'m> {
 impl tpm2::boot::Transport for PdCall<'_> {
     fn call(&mut self, label: u64, req: &[u8], rsp: &mut [u8; ipc::MSG_BYTES]) -> (u64, usize) {
         let mut pd = self.pd.lock().unwrap();
-        let other = 1 - self.client;
         match ipc::kind(label) {
             ipc::REQ_COMMAND => {
-                if pd.gate.state(self.client) == Some(State::Fresh) && pd.gate.state(other) == Some(State::Unsealing) {
-                    pd.busy += 1;
-                    return (ipc::label(ipc::RSP_BUSY, 0), 0);
-                }
-                let Ok(fwd) = pd.gate.command(self.client, req) else {
-                    return (ipc::label(ipc::RSP_REFUSED, 1), 0);
+                let fwd = match pd.gate.command(self.client, req) {
+                    Ok(fwd) => fwd,
+                    Err(Refusal::Busy) => {
+                        pd.busy += 1;
+                        return (ipc::label(ipc::RSP_BUSY, 0), 0);
+                    }
+                    Err(_) => return (ipc::label(ipc::RSP_REFUSED, 1), 0),
                 };
                 let r = pd.tpm.transact(req);
                 pd.gate.response(fwd, &r);
@@ -750,10 +759,10 @@ impl tpm2::boot::Transport for PdCall<'_> {
 }
 
 use layout::tpm as ipc;
-use tpm2_wire::gate::State;
+use tpm2_wire::gate::Refusal;
 
 #[test]
-fn both_key_pds_unseal_concurrently_through_the_pd_model_and_pcr8_is_capped() {
+fn every_key_pd_unseals_concurrently_through_the_pd_model_and_pcr8_is_capped() {
     let mut swtpm = Swtpm::start("boot-both", true);
     let mut tpm = swtpm.connect();
     let (srk_public, _) = tpm.srk();
@@ -762,24 +771,29 @@ fn both_key_pds_unseal_concurrently_through_the_pd_model_and_pcr8_is_capped() {
     let pq_blob = blob(Kind::Pq, "pq");
     let key_env = seal(Kind::Key, &key_blob, &srk_public, &expected_pcr8(), "boot-seal-key");
     let pq_env = seal(Kind::Pq, &pq_blob, &srk_public, &expected_pcr8(), "boot-seal-pq");
+    let tls_blob = blob(Kind::Tls, "tls");
+    let tls_env = seal(Kind::Tls, &tls_blob, &srk_public, &expected_pcr8(), "boot-seal-tls");
     let pd = std::sync::Mutex::new(PdModel { tpm, gate: Gate::new(), busy: 0 });
     let start = Instant::now();
     // Two flows at once would need four transient objects (swtpm has
-    // three): the Busy rule serialises them, whichever starts first.
+    // three): the Busy rule serialises the three, whichever starts first.
     let run = |client: usize, env: &[u8], kind: Kind| {
         let mut out = vec![0xAAu8; kind.region_size()];
         let r = tpm2::boot::unseal(&mut PdCall { pd: &pd, client, start }, env, kind, &mut out);
         (r, out)
     };
-    let (key, pq) = std::thread::scope(|s| {
+    let (key, pq, tls) = std::thread::scope(|s| {
         let a = s.spawn(|| run(0, &key_env, Kind::Key));
         let b = s.spawn(|| run(1, &pq_env, Kind::Pq));
-        (a.join().unwrap(), b.join().unwrap())
+        let c = s.spawn(|| run(2, &tls_env, Kind::Tls));
+        (a.join().unwrap(), b.join().unwrap(), c.join().unwrap())
     });
     assert_eq!(key.0, Ok(()));
     assert!(key.1 == key_blob, "key's region");
     assert_eq!(pq.0, Ok(()));
     assert!(pq.1 == pq_blob, "pqkey's region");
+    assert_eq!(tls.0, Ok(()));
+    assert!(tls.1 == tls_blob, "tlskey's region");
     let mut pd = pd.into_inner().unwrap();
     assert!(pd.gate.is_capped());
     assert_eq!(pd.tpm.pcr8(), extend(&expected_pcr8(), &CAP_DIGEST), "PCR 8 after the cap");

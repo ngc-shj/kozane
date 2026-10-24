@@ -3,13 +3,11 @@
 //! C11). At boot it unseals it through `tpm` (its one PPC callee, C9) into
 //! its own memory and validates it against the compiled configuration;
 //! afterwards it answers the fixed-size requests defined in `key-core`,
-//! each caller limited to its row of the caller → label table (`hs` and,
-//! since M6, `tls`). The whole unseal runs in `init`, so no caller reaches
+//! each caller limited to its row of the caller → label table (`hs` is the
+//! only caller). The whole unseal runs in `init`, so no caller reaches
 //! `key` before it is done (S18). A failed boot leaves it Unavailable (M5
 //! plan C6): no secret held, every call answered with the boot error's
 //! code, which `hs` audits (`key` itself has no audit ring and no console).
-//! A TLS scalar that fails its check is wiped and fails only `TLS_SIGN`
-//! (M6 plan D5).
 
 #![no_std]
 #![no_main]
@@ -17,7 +15,7 @@
 use core::cell::UnsafeCell;
 use core::ptr::NonNull;
 
-use key_core::{BootError, Buckets, Caller, ERR_BAD_REQUEST, Entropy, LABEL_TLS_SIGN, MAX_WORDS, Oracle};
+use key_core::{BootEntropy, BootError, Bucket, Caller, ERR_BAD_REQUEST, KEY_BURST, KEY_INTERVAL_NS, MAX_WORDS, Oracle};
 use layout::key as ch;
 use layout::tpm::{self as ipc, MSG_BYTES, MSG_WORDS};
 use sel4_microkit::{
@@ -29,7 +27,6 @@ use tpm2::envelope::Kind;
 use zeroize::Zeroize;
 
 const HS: Channel = Channel::new(ch::CH_HS);
-const TLS: Channel = Channel::new(ch::CH_TLS);
 const TPM: Channel = Channel::new(ch::CH_TPM);
 
 /// `tpm` over PPC (M5 plan C9): one TPM command or response per call, its
@@ -73,25 +70,19 @@ impl Transport for Ppc {
 struct Plaintext(UnsafeCell<[u8; secret_blob::REGION_SIZE]>);
 
 // SAFETY: a PD runs one thread, and only `boot` (once, from init) touches
-// the buffer mutably; afterwards the oracle only reads it.
+// the buffer.
 unsafe impl Sync for Plaintext {}
 
 static PLAINTEXT: Plaintext = Plaintext(UnsafeCell::new([0; secret_blob::REGION_SIZE]));
 
 fn caller(channel: Channel) -> Option<Caller> {
-    if channel == HS {
-        Some(Caller::Hs)
-    } else if channel == TLS {
-        Some(Caller::Tls)
-    } else {
-        None
-    }
+    (channel == HS).then_some(Caller::Hs)
 }
 
-/// The boot seed's and each signature's entropy: RNDR and CNTPCT.
+/// The boot seed's entropy: RNDR and CNTPCT.
 struct Hw;
 
-impl Entropy for Hw {
+impl BootEntropy for Hw {
     fn fill_random(&mut self, out: &mut [u8]) -> bool {
         cpu::fill_random(out)
     }
@@ -102,7 +93,7 @@ impl Entropy for Hw {
 }
 
 enum Key {
-    Ready { oracle: Oracle<'static>, buckets: Buckets },
+    Ready { oracle: Oracle<'static>, bucket: Bucket },
     /// The boot failed with `BootError::code` `code`; nothing else is kept.
     Unavailable { code: u32 },
 }
@@ -119,38 +110,23 @@ fn boot() -> Result<Oracle<'static>, BootError> {
     // SAFETY: init runs once and is the only caller; no other reference to
     // the buffer exists while this one is used.
     tpm2::boot::unseal(&mut Ppc, region(), Kind::Key, unsafe { &mut *buf })?;
-    // SAFETY: as above. The boot checks the TLS scalar on this mutable
-    // plaintext, wiping it in place if refused (M6 plan C5), then borrows
-    // the buffer read-only for the life of the system (the oracle).
-    let plain: &'static mut [u8] = unsafe { &mut *buf };
+    // SAFETY: as above. From here the buffer is only read, for the life of
+    // the system (the oracle borrows it).
+    let plain: &'static [u8] = unsafe { &*buf };
     let peers = config::PEERS.iter().map(|p| &p.public);
     // Every failure after the unseal wipes the plaintext, not only
     // validation's: an Unavailable `key` holds no secret (M5 plan C6).
-    let booted = Oracle::boot(plain, &config::GATEWAY_PUBLIC, &config::TLS_PUBLIC, peers, &mut Hw).inspect_err(|_| {
+    Oracle::boot(plain, &config::GATEWAY_PUBLIC, peers, &mut Hw).inspect_err(|_| {
         // SAFETY: the failed boot's borrow ended with its error, and nothing
         // reads the buffer again.
         unsafe { &mut *buf }.zeroize();
-    });
-    // The TLS check's P-256 frames held the scalar, accepted or refused
-    // (M6 plan C5, F-N-b).
-    scrub_stack();
-    booted
-}
-
-/// Zeroes, with volatile writes, `key_core::SCRUB_DEPTH` bytes of stack
-/// below the caller's frame: where the boot's TLS check or a `TLS_SIGN`
-/// (libcrux's P-256, SHA-256 and HMAC state) just ran. The
-/// `tpm2::boot::scrub_session_stack` pattern.
-#[inline(never)]
-fn scrub_stack() {
-    let mut area = [0u64; key_core::SCRUB_DEPTH / 8];
-    area.zeroize();
+    })
 }
 
 #[protection_domain]
 fn init() -> Key {
     match boot() {
-        Ok(oracle) => Key::Ready { oracle, buckets: Buckets::new() },
+        Ok(oracle) => Key::Ready { oracle, bucket: Bucket::new(KEY_BURST, KEY_INTERVAL_NS) },
         Err(e) => Key::Unavailable { code: e.code() },
     }
 }
@@ -171,27 +147,21 @@ impl Handler for Key {
         });
         let mut reply = [0u64; MAX_WORDS];
         let (label, n) = match self {
-            Key::Ready { oracle, buckets } => oracle.handle(
+            Key::Ready { oracle, bucket } => oracle.handle(
                 caller(channel),
-                buckets,
+                bucket,
                 cpu::now_ns(),
-                &mut Hw,
                 msg_info.label(),
                 req.get(..count).unwrap_or(&[]),
                 &mut reply,
             ),
             Key::Unavailable { code } => key_core::unavailable(caller(channel), *code, &mut reply),
         };
-        if msg_info.label() == LABEL_TLS_SIGN {
-            // The nonce candidates, K, V and the scalar's copies in the
-            // dead P-256/HMAC frames (M6 plan C5), whatever the outcome.
-            scrub_stack();
-        }
-        // Overwrite every register up to MAX_WORDS beyond this reply, so no
-        // part of an earlier, longer reply is handed back to a caller. The
-        // reply words themselves stay in `key`'s own IPC buffer until the
-        // next call; only `key` can read that buffer, and it holds the static
-        // secrets anyway. Callers zero their copy after use.
+        // Overwrite every register beyond this reply, so no part of an
+        // earlier, longer reply is handed back to `hs`. The reply words
+        // themselves stay in `key`'s own IPC buffer until the next call; only
+        // `key` can read that buffer, and it holds the static secrets anyway.
+        // `hs` zeroes its copy after use.
         with_msg_regs_mut(|mrs| {
             for (i, dst) in mrs.iter_mut().take(MAX_WORDS).enumerate() {
                 *dst = if i < n { reply.get(i).copied().unwrap_or(0) } else { 0 };

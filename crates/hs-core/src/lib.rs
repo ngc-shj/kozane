@@ -47,37 +47,6 @@ const _: () = assert!(
 );
 const _: () = assert!(ingress_core::NET_BUFFERS == layout::NET_BUFFERS, "ingress-core NET_BUFFERS differs from layout");
 
-// `tls`'s side of `key` (M6 plan C5: F12, S1, S14). Every handshake
-// `ingress` admits costs `tls` one `TLS_SIGN`, so its bucket must cover the
-// SYNs the global bucket lets through, burst and rate, beside its boot
-// calls; otherwise `key`'s limit, not `ingress`'s, would refuse clients.
-const _: () = assert!(
-    key_core::TLS_SIGN_BURST - key_core::TLS_BOOT_CALLS >= ingress_core::SYN_GLOBAL_BURST,
-    "C5: the SYN burst ingress admits can exhaust tls's key bucket"
-);
-const _: () = assert!(
-    key_core::TLS_SIGN_INTERVAL_NS <= ingress_core::SYN_GLOBAL_INTERVAL_NS,
-    "C5: tls can be admitted handshakes faster than key refills its bucket"
-);
-
-/// The longest one `hs` call into `key` may wait behind `tls` (M6 plan C5):
-/// a tenth of WireGuard's REKEY_TIMEOUT. An initiation costs
-/// `KEY_CALLS_PER_HANDSHAKE` (2) calls, so even both at the bound keep the
-/// response within a fifth of the 5 s after which the initiator retries,
-/// leaving the rest for queueing in `ingress`/`hs` and the network.
-pub const HS_KEY_WAIT_MAX_NS: u64 = wg_core::REKEY_TIMEOUT_NS / 10;
-
-// The wait bound. `tls` is single-threaded and `key`'s endpoint queue is
-// priority-ordered (`hs` 110 > `tls` 100), so an `hs` call waits behind at
-// most the one sign in progress, which runs on `tls`'s scheduling context:
-// SIGN_COST_NS of CPU spread over its budget per period, plus the rest of
-// the period `tls` had already spent when it called (S-N1, F-N7).
-const TLS_SIGN_PERIODS: u64 = key_core::SIGN_COST_NS.div_ceil(layout::TLS_BUDGET_NS) + 1;
-const _: () = assert!(
-    TLS_SIGN_PERIODS * layout::PERIOD_NS <= HS_KEY_WAIT_MAX_NS,
-    "C5: a sign in progress on tls's budget can hold hs's key call past HS_KEY_WAIT_MAX_NS"
-);
-
 /// One synchronous call into `key`: (label, request words) → (reply
 /// label, reply word count). The PD implements it with a PPC; tests with
 /// `key_core::Oracle` directly.

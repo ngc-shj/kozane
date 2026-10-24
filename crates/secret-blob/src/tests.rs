@@ -4,7 +4,7 @@ use super::*;
 
 fn sample() -> [u8; REGION_SIZE] {
     let mut out = [0u8; REGION_SIZE];
-    write(&mut out, &[1; 32], &[2; 32], &[6; 32], &[[3; 32], [5; 32]]).unwrap();
+    write(&mut out, &[1; 32], &[2; 32], &[[3; 32], [5; 32]]).unwrap();
     out
 }
 
@@ -14,7 +14,6 @@ fn round_trip_exposes_fields() {
     let b = Blob::parse(&r, 2).unwrap();
     assert_eq!(b.gateway_private(), &[1; 32]);
     assert_eq!(b.boot_seed(), &[2; 32]);
-    assert_eq!(b.tls_private(), &[6; 32]);
     assert_eq!(b.peer(1), Some(&blake2s(&[&[5u8; 32]])));
     assert_eq!(b.peer(2), None);
 }
@@ -22,54 +21,12 @@ fn round_trip_exposes_fields() {
 #[test]
 fn offsets_are_the_documented_layout() {
     // Pinned numerically: tests/integration/run.py slices blob files by them.
-    assert_eq!([GATEWAY_PRIVATE_AT, BOOT_SEED_AT, TLS_PRIVATE_AT, FIXED], [16, 48, 80, 112]);
+    assert_eq!([GATEWAY_PRIVATE_AT, BOOT_SEED_AT, FIXED], [16, 48, 80]);
     let r = sample();
-    assert_eq!(&r[8..12], &3u32.to_le_bytes());
+    assert_eq!(&r[8..12], &2u32.to_le_bytes());
     assert_eq!(&r[GATEWAY_PRIVATE_AT..BOOT_SEED_AT], &[1; 32]);
-    assert_eq!(&r[BOOT_SEED_AT..TLS_PRIVATE_AT], &[2; 32]);
-    assert_eq!(&r[TLS_PRIVATE_AT..FIXED], &[6; 32]);
+    assert_eq!(&r[BOOT_SEED_AT..FIXED], &[2; 32]);
     assert_eq!(&r[FIXED..FIXED + 32], &blake2s(&[&[3u8; 32]]));
-}
-
-#[test]
-fn a_refused_tls_scalar_is_wiped_after_the_checksum_and_the_rest_stays() {
-    let mut r = sample();
-    let mut seen = [0u8; 32];
-    let (b, ok) = Blob::parse_checking_tls(&mut r, 2, |k| {
-        seen = *k;
-        false
-    })
-    .unwrap();
-    assert_eq!((seen, ok), ([6; 32], false));
-    assert_eq!(b.tls_private(), &[0; 32]);
-    assert_eq!((b.gateway_private(), b.boot_seed()), (&[1; 32], &[2; 32]));
-    assert_eq!(b.peer(1), Some(&blake2s(&[&[5u8; 32]])));
-    // The wipe is in the region itself, which no longer checksums.
-    assert!(r[TLS_PRIVATE_AT..FIXED].iter().all(|x| *x == 0));
-    assert_eq!(Blob::parse(&r, 2).err(), Some(BlobError::BadChecksum));
-}
-
-#[test]
-fn an_accepted_tls_scalar_is_kept() {
-    let mut r = sample();
-    let (b, ok) = Blob::parse_checking_tls(&mut r, 2, |_| true).unwrap();
-    assert!(ok);
-    assert_eq!(b.tls_private(), &[6; 32]);
-    assert!(Blob::parse(&r, 2).is_ok());
-}
-
-#[test]
-fn the_tls_scalar_is_judged_only_after_the_checksum_holds() {
-    let mut r = sample();
-    r[TLS_PRIVATE_AT] ^= 1;
-    let mut judged = false;
-    let e = Blob::parse_checking_tls(&mut r, 2, |_| {
-        judged = true;
-        false
-    });
-    assert_eq!(e.err(), Some(BlobError::BadChecksum));
-    assert!(!judged);
-    assert_eq!(r[TLS_PRIVATE_AT], 6 ^ 1, "nothing wiped on a format error");
 }
 
 #[test]
@@ -78,7 +35,7 @@ fn each_validation_failure_has_its_own_error() {
     r[0] ^= 1;
     assert_eq!(Blob::parse(&r, 2).err(), Some(BlobError::BadMagic));
     let mut r = sample();
-    r[8] = 4;
+    r[8] = 3;
     assert_eq!(Blob::parse(&r, 2).err(), Some(BlobError::BadVersion));
     assert_eq!(Blob::parse(&sample(), 3).err(), Some(BlobError::BadPeerCount));
     let mut r = sample();
@@ -90,15 +47,17 @@ fn each_validation_failure_has_its_own_error() {
     assert_eq!(Blob::parse(&r[..100], 2).err(), Some(BlobError::TooSmall));
 }
 
-/// A well-formed version 2 region: no TLS scalar after the boot seed.
-fn v2_region() -> [u8; REGION_SIZE] {
+/// A well-formed version 3 region (M6 slice 2): a TLS scalar after the
+/// boot seed.
+fn v3_region() -> [u8; REGION_SIZE] {
     let mut r = [0u8; REGION_SIZE];
     let mut body = std::vec::Vec::new();
     body.extend_from_slice(&MAGIC);
-    body.extend_from_slice(&2u32.to_le_bytes());
+    body.extend_from_slice(&3u32.to_le_bytes());
     body.extend_from_slice(&1u32.to_le_bytes());
     body.extend_from_slice(&[1; 32]);
     body.extend_from_slice(&[2; 32]);
+    body.extend_from_slice(&[6; 32]);
     body.extend_from_slice(&blake2s(&[&[3u8; 32]]));
     let sum = blake2s(&[&body]);
     body.extend_from_slice(&sum);
@@ -107,11 +66,12 @@ fn v2_region() -> [u8; REGION_SIZE] {
 }
 
 #[test]
-fn version_2_region_without_a_tls_scalar_is_refused() {
-    assert_eq!(Blob::parse(&v2_region(), 1).err(), Some(BlobError::BadVersion));
-    // Allow side: the same fields as version 3 parse.
+fn version_3_region_with_a_tls_scalar_is_refused() {
+    // The TLS key has its own blob (M6 plan C12); `key` holds none.
+    assert_eq!(Blob::parse(&v3_region(), 1).err(), Some(BlobError::BadVersion));
+    // Allow side: the same fields without the scalar parse as version 2.
     let mut r = [0u8; REGION_SIZE];
-    write(&mut r, &[1; 32], &[2; 32], &[6; 32], &[[3; 32]]).unwrap();
+    write(&mut r, &[1; 32], &[2; 32], &[[3; 32]]).unwrap();
     assert!(Blob::parse(&r, 1).is_ok());
 }
 
@@ -142,20 +102,20 @@ fn peer_entries_hold_only_the_key_hash() {
     // v2 dropped the per-peer PSK: one peer more adds exactly one hash.
     let mut one = [0u8; REGION_SIZE];
     let mut two = [0u8; REGION_SIZE];
-    let a = write(&mut one, &[1; 32], &[2; 32], &[6; 32], &[[3; 32]]).unwrap();
-    let b = write(&mut two, &[1; 32], &[2; 32], &[6; 32], &[[3; 32], [5; 32]]).unwrap();
+    let a = write(&mut one, &[1; 32], &[2; 32], &[[3; 32]]).unwrap();
+    let b = write(&mut two, &[1; 32], &[2; 32], &[[3; 32], [5; 32]]).unwrap();
     assert_eq!(b - a, 32);
-    assert_eq!(a, 8 + 4 + 4 + 32 + 32 + 32 + 32 + 32);
+    assert_eq!(a, 8 + 4 + 4 + 32 + 32 + 32 + 32);
 }
 
 #[test]
 fn writer_bounds_the_peer_count() {
     let mut r = [0u8; REGION_SIZE];
-    assert_eq!(write(&mut r, &[1; 32], &[2; 32], &[6; 32], &[]), None);
+    assert_eq!(write(&mut r, &[1; 32], &[2; 32], &[]), None);
     let many = std::vec![[7u8; 32]; MAX_PEERS + 1];
-    assert_eq!(write(&mut r, &[1; 32], &[2; 32], &[6; 32], &many), None);
-    assert!(write(&mut r, &[1; 32], &[2; 32], &[6; 32], &many[..MAX_PEERS]).is_some());
-    assert_eq!(MAX_PEERS, 123);
+    assert_eq!(write(&mut r, &[1; 32], &[2; 32], &many), None);
+    assert!(write(&mut r, &[1; 32], &[2; 32], &many[..MAX_PEERS]).is_some());
+    assert_eq!(MAX_PEERS, 124);
 }
 
 #[test]
@@ -263,12 +223,79 @@ mod pq_blob {
     }
 }
 
+mod tls_blob {
+    extern crate std;
+
+    use super::super::tls::*;
+    use super::super::{BlobError, blake2s};
+
+    fn sample() -> [u8; REGION_SIZE] {
+        let mut out = [0u8; REGION_SIZE];
+        assert_eq!(write(&mut out, &[0x61; 32], &[0x62; 32]), Some(USED_LEN));
+        out
+    }
+
+    #[test]
+    fn round_trip_exposes_fields() {
+        let r = sample();
+        let b = Blob::parse(&r).unwrap();
+        assert_eq!(b.tls_private(), &[0x61; 32]);
+        assert_eq!(b.boot_seed(), &[0x62; 32]);
+    }
+
+    #[test]
+    fn offsets_are_the_documented_layout() {
+        // Pinned numerically: tests/integration/run.py slices blob files by
+        // them, and tools/package checks the checksum at CHECKSUM_AT.
+        assert_eq!([TLS_PRIVATE_AT, BOOT_SEED_AT, CHECKSUM_AT, USED_LEN], [16, 48, 80, 112]);
+        let r = sample();
+        assert_eq!(&r[..8], b"SOSTLSK1");
+        assert_eq!(&r[8..12], &1u32.to_le_bytes());
+        assert_eq!(&r[12..16], &[0; 4]);
+        assert_eq!(&r[TLS_PRIVATE_AT..BOOT_SEED_AT], &[0x61; 32]);
+        assert_eq!(&r[BOOT_SEED_AT..CHECKSUM_AT], &[0x62; 32]);
+        assert_eq!(&r[CHECKSUM_AT..USED_LEN], &blake2s(&[&r[..CHECKSUM_AT]]));
+        assert!(r[USED_LEN..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn each_validation_failure_has_its_own_error() {
+        let mut r = sample();
+        r[0] ^= 1;
+        assert_eq!(Blob::parse(&r).err(), Some(BlobError::BadMagic));
+        for version in [0u32, 2] {
+            let mut r = sample();
+            r[8..12].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(Blob::parse(&r).err(), Some(BlobError::BadVersion), "version {version}");
+        }
+        let mut r = sample();
+        r[12] = 1;
+        assert_eq!(Blob::parse(&r).err(), Some(BlobError::BadVersion), "reserved");
+        let mut r = sample();
+        r[TLS_PRIVATE_AT + 5] ^= 1;
+        assert_eq!(Blob::parse(&r).err(), Some(BlobError::BadChecksum));
+        let mut r = sample();
+        r[REGION_SIZE - 1] = 1;
+        assert_eq!(Blob::parse(&r).err(), Some(BlobError::NonZeroPadding));
+        assert_eq!(Blob::parse(&r[..REGION_SIZE - 1]).err(), Some(BlobError::TooSmall));
+        assert_eq!(Blob::parse(&[0u8; REGION_SIZE]).err(), Some(BlobError::BadMagic));
+    }
+
+    #[test]
+    fn magics_keep_the_tls_and_key_blobs_apart() {
+        // Both regions are 4096 bytes: only the magic tells them apart.
+        let tls = sample();
+        assert_eq!(super::super::Blob::parse(&tls, 1).err(), Some(BlobError::BadMagic));
+        assert_eq!(Blob::parse(&super::sample()).err(), Some(BlobError::BadMagic));
+    }
+}
+
 extern crate std;
 
-/// tools/package re-implements both layouts in Python; it is checked here
-/// so either side drifting fails `unit`, not only a packaged boot.
+/// tools/package re-implements the three layouts in Python; it is checked
+/// here so either side drifting fails `unit`, not only a packaged boot.
 #[test]
-fn tools_package_mirrors_both_blob_layouts() {
+fn tools_package_mirrors_the_blob_layouts() {
     let package = include_str!("../../../tools/package");
     let ascii = |m: &[u8; 8]| std::string::String::from_utf8(m.to_vec()).unwrap();
     let key = std::format!(
@@ -284,8 +311,17 @@ fn tools_package_mirrors_both_blob_layouts() {
         crate::pq::REGION_SIZE,
         crate::pq::CHECKSUM_OFFSET
     );
+    // The TLS blob's checksum covers a fixed body (M6 plan C12).
+    let tls = std::format!(
+        "TLS = BlobKind(\"tls_secrets\", b\"{}\", {}, {}, lambda _blob: {})",
+        ascii(&crate::tls::MAGIC),
+        crate::tls::VERSION,
+        crate::tls::REGION_SIZE,
+        crate::tls::CHECKSUM_AT
+    );
     assert!(package.contains(&key), "tools/package does not declare: {key}");
     assert!(package.contains(&pq), "tools/package does not declare: {pq}");
+    assert!(package.contains(&tls), "tools/package does not declare: {tls}");
 }
 
 /// The number after `prefix` in tools/package's text, up to `end`.
@@ -307,10 +343,10 @@ fn tools_package_key_body_matches_the_written_body_for_several_peer_counts() {
     assert_eq!(max_fixed, fixed, "KEY_MAX_PEERS and _key_body disagree on the fixed part");
     let py_max_peers = (REGION_SIZE - max_fixed - CHECKSUM) / PER_PEER;
     assert_eq!(py_max_peers, MAX_PEERS);
-    for peers in [1usize, 2, 3, 8, 109, MAX_PEERS] {
+    for peers in [1usize, 2, 3, 8, 110, MAX_PEERS] {
         let mut r = [0u8; REGION_SIZE];
         let publics = std::vec![[7u8; 32]; peers];
-        let used = write(&mut r, &[1; 32], &[2; 32], &[6; 32], &publics).unwrap();
+        let used = write(&mut r, &[1; 32], &[2; 32], &publics).unwrap();
         assert_eq!(used - CHECKSUM, fixed + per_peer * peers, "{peers} peers");
         assert_eq!(body_len(peers), fixed + per_peer * peers, "{peers} peers");
     }
