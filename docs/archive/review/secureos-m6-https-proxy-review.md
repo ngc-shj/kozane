@@ -493,3 +493,32 @@ Recorded Recurring Issue Check (round 7): functionality R3 R7-1(b), R38/R41
 resolved, R50 resolved with R7-1(a), others N/A or checked; testing R49
 R7-1 (prose), R3/R4/R7/R12/R16/R18/R52 resolved, R2/R17/R45/RT3/RT11 watch,
 others OK or N/A.
+
+# Re-plan R1 review (rounds 1–3)
+Date: 2026-10-24
+
+Trigger: the slice-3b probe (TlsSignHighWater 0.64–1.72 s on `tls`'s 0.05)
+fired D3; R1 moves the TLS signing key into its own key PD.
+
+- **Round 1** (security S F1–F6, functionality F1–F12, testing T1–T13):
+  all three experts found the first draft's non-passive `tlskey` wrong
+  (0.2 of tainted-driven CPU outside the 0.95 cap at priority 135, over
+  the VPN). Also found: BootSeed with no source, the tpm PD's two-client
+  arbitration, descriptor v2 details (0x50 hash, all-pair disjointness),
+  gate enrolment, the test migration. R1 rewritten with a **passive**
+  `tlskey` (8fedace).
+- **Round 2:** security: all resolved, two prose Minors (budget stated,
+  RM6-7/8 adversarial rate). Functionality and testing: "exactly one
+  caller" broke ~25 laws fixtures (→ at most one, under L2); Busy order
+  in the gate (after every refusal, before `once()`, no side effects,
+  RSP_BUSY); the seed test needed a fixed Hw seam and scalar
+  independence; per-line boot.cmd red-proofs; case 12 made positive (its
+  numeric bound was timing-fragile); `limits` leaf crate instead of
+  `layout`. Applied (9170f92, bb2ff0e).
+- **Round 3:** functionality and testing: all round-2 findings resolved;
+  three Minors (Fresh attacker, `limits` no_std + a unit test, the
+  flush-reuse harness's ownership check). Applied (7987dc3 and the next
+  commit). Security had no open findings after round 2.
+
+Saturation: no Critical or Major open in any category, no design finding
+open, the last Minors applied. C12 locked.

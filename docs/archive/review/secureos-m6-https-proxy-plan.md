@@ -1193,7 +1193,10 @@ as amended here:
   - New harness for the busy rule over three clients, asserting that Busy
     leaves `once` and `states` unchanged and that the client's later flow
     succeeds (R2-F N1, R2-T N4); `a_flushed_handle_number_is_usable_by_the_other_client`
-    changes so the owner finishes before the other client starts; the
+    changes so the owner finishes before the other client starts, and
+    its "no longer A's" check becomes a Fresh third client refused
+    NotOwned on the reused handle (a Done A gets Finished before any
+    ownership lookup; R3-T R3-1); the
     cross-client deny harnesses use a **Fresh** attacker (NotOwned is
     decided before Busy), plus one that starts after the owner finished
     without flushing (R3-F R3-1).
