@@ -3,11 +3,10 @@
 //! The PD wires smoltcp and the rings to this; every decision about when a
 //! connection's secrets go and when its sockets may be released is here.
 //!
-//! Stages: Handshake → Head → BackendConnect → Streaming. The HTTP head
-//! handling itself (slice 4) is the PD's and `http-wire`'s: it reads
-//! application data into [`Slot::head`] while in [`Stage::Head`] and calls
-//! [`Slot::advance`] when the head is complete and when the backend
-//! connects.
+//! Stages: Handshake → Head → BackendConnect → Streaming. The proxy flow
+//! through them (the head parsed and rewritten by `http-wire`, the backend
+//! connect, the request and response streamed) is [`proxy`]'s, driven by
+//! the PD's events.
 //!
 //! Close: close_notify only after a clean backend FIN or a response `tls`
 //! generated in full ([`CloseCause::BackendFin`],
@@ -19,13 +18,20 @@
 //! reports each poll pass ([`Slot::abort_pass`]) and releases the socket
 //! (removes it, wipes its storage, re-creates the listener) when told. If
 //! the RST never goes out, the slot is released after
-//! [`MAX_RST_PASSES`] passes anyway.
+//! [`MAX_RST_PASSES`] passes anyway. The backend socket is aborted as the
+//! connection leaves its open stages, whatever the cause (after a clean
+//! FIN it has nothing left to carry), and its RST is awaited the same way;
+//! the slot is released once both are done.
 
 use tls_wire::Refusal;
 
 use crate::handshake::{Buffers, Ctx, Event, RX_BUF_LEN, Session, Signer, Step, TX_BUF_LEN};
 use crate::rng::Rng;
 use crate::wipe;
+
+mod proxy;
+
+pub use proxy::{BACKEND_CHUNK, BAD_GATEWAY, MAX_CLIENT_OUT, Next, Outcome, Outcomes};
 
 pub const MAX_CONNS: usize = 8;
 /// Connections one source address may hold (S17).
@@ -94,10 +100,11 @@ pub enum AdmitRefusal {
 }
 
 /// What the PD does next for a slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Action {
+    #[default]
     None,
-    /// Abort the slot's sockets (RST, no close_notify), poll, and report
+    /// Abort the client socket (RST, no close_notify), poll, and report
     /// each pass with [`Slot::abort_pass`].
     Abort,
     /// The RSTs are out, or their passes ran out: remove the sockets, wipe
@@ -228,7 +235,22 @@ enum Phase {
     /// close_notify drained: an inbound record or FIN, or the deadline,
     /// aborts.
     Lingering { until: u64 },
-    Aborting { client: RstWait, backend: RstWait },
+    Aborting { client: RstWait },
+}
+
+/// Bytes still to go to the backend: `[at, end)` of a buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Span {
+    at: usize,
+    end: usize,
+}
+
+impl Span {
+    const EMPTY: Self = Self { at: 0, end: 0 };
+
+    fn is_empty(self) -> bool {
+        self.at >= self.end
+    }
 }
 
 /// A refused record: the alert (if any) is in `out[..written]` and the
@@ -245,7 +267,17 @@ pub struct Slot {
     accepted: u64,
     last_activity: u64,
     close_started: u64,
+    /// A backend socket exists and has not been aborted yet.
     backend_open: bool,
+    backend_rst: RstWait,
+    /// The request head collected so far in [`Slot::head`].
+    head_len: usize,
+    /// Request body bytes still to come from the client and go on.
+    body_left: usize,
+    /// The rewritten head and the body bytes that came with it, in
+    /// [`Slot::rewrite`]; then body bytes in the record buffer.
+    pending_rewrite: Span,
+    pending_rx: Span,
     session: Session,
     rx: [u8; RX_BUF_LEN],
     tx: [u8; TX_BUF_LEN],
@@ -268,6 +300,11 @@ impl Slot {
             last_activity: 0,
             close_started: 0,
             backend_open: false,
+            backend_rst: RstWait::new(false),
+            head_len: 0,
+            body_left: 0,
+            pending_rewrite: Span::EMPTY,
+            pending_rx: Span::EMPTY,
             session: Session::new(),
             rx: [0; RX_BUF_LEN],
             tx: [0; TX_BUF_LEN],
@@ -346,6 +383,7 @@ impl Slot {
             Err(refusal) => {
                 let written = self.session.fail(refusal, &mut bufs);
                 self.wipe_buffers();
+                self.abort_backend();
                 self.close_started = now;
                 self.phase = Phase::Draining { linger: false };
                 Err(Failed { refusal, written })
@@ -380,7 +418,7 @@ impl Slot {
 
     /// Ends the connection for `cause`. A clean end seals close_notify into
     /// `out` (returned length), wipes, and drains; every other cause wipes
-    /// and aborts at once.
+    /// and aborts at once. Either way an open backend socket is aborted.
     pub fn close(&mut self, cause: CloseCause, out: &mut [u8], now: u64) -> (usize, Action) {
         if !matches!(self.phase, Phase::Open { .. }) {
             return (0, Action::None);
@@ -391,6 +429,7 @@ impl Slot {
                 let mut bufs = Buffers { rx: &mut self.rx, tx: &mut self.tx, out };
                 let n = self.session.close(&mut bufs);
                 self.wipe_buffers();
+                self.abort_backend();
                 self.phase = Phase::Draining { linger: true };
                 (n, Action::None)
             }
@@ -419,16 +458,20 @@ impl Slot {
     }
 
     /// One poll pass after an abort, with whether `endpoint`'s RST was
-    /// dispatched in it. Release once every aborted socket's RST went out
-    /// or used up its passes.
+    /// dispatched in it. The backend's passes count from its own abort,
+    /// which may come before the client's (a clean close drains first).
+    /// Release once every aborted socket's RST went out or used up its
+    /// passes.
     pub fn abort_pass(&mut self, endpoint: Endpoint, dispatched: bool) -> Action {
-        let Phase::Aborting { mut client, mut backend } = self.phase else { return Action::None };
-        match endpoint {
-            Endpoint::Client => client.pass(dispatched),
-            Endpoint::Backend => backend.pass(dispatched),
+        if endpoint == Endpoint::Backend {
+            self.backend_rst.pass(dispatched);
         }
-        if client.pending || backend.pending {
-            self.phase = Phase::Aborting { client, backend };
+        let Phase::Aborting { mut client } = self.phase else { return Action::None };
+        if endpoint == Endpoint::Client {
+            client.pass(dispatched);
+        }
+        if client.pending || self.backend_rst.pending {
+            self.phase = Phase::Aborting { client };
             Action::None
         } else {
             self.reset();
@@ -464,11 +507,21 @@ impl Slot {
     }
 
     fn abort(&mut self) -> Action {
+        self.abort_backend();
         let mut bufs = Buffers { rx: &mut self.rx, tx: &mut self.tx, out: &mut [] };
         self.session.wipe(&mut bufs);
         self.wipe_buffers();
-        self.phase = Phase::Aborting { client: RstWait::new(true), backend: RstWait::new(self.backend_open) };
+        self.phase = Phase::Aborting { client: RstWait::new(true) };
         Action::Abort
+    }
+
+    /// The backend socket, if one is open, is to be aborted now; its RST
+    /// is awaited from here.
+    fn abort_backend(&mut self) {
+        if self.backend_open {
+            self.backend_open = false;
+            self.backend_rst = RstWait::new(true);
+        }
     }
 
     /// Free, as [`Slot::new`] makes one, in place: the PD's slots are static
@@ -479,16 +532,22 @@ impl Slot {
         self.accepted = 0;
         self.last_activity = 0;
         self.close_started = 0;
+        self.backend_rst = RstWait::new(false);
         self.backend_open = false;
         self.session.reset();
         self.wipe_buffers();
     }
 
+    /// Every plaintext buffer, and the proxy's places in them.
     fn wipe_buffers(&mut self) {
         wipe(&mut self.rx);
         wipe(&mut self.tx);
         wipe(&mut self.head);
         wipe(&mut self.rewrite);
+        self.head_len = 0;
+        self.body_left = 0;
+        self.pending_rewrite = Span::EMPTY;
+        self.pending_rx = Span::EMPTY;
     }
 
     /// Keys, secrets and every buffer zero (M6 plan C8, T-N15).
@@ -536,7 +595,7 @@ impl Table {
     pub fn refuse(&mut self) -> Option<usize> {
         let (i, slot) = self.slots.iter_mut().enumerate().find(|(_, s)| s.is_free())?;
         slot.reset();
-        slot.phase = Phase::Aborting { client: RstWait::new(true), backend: RstWait::new(false) };
+        slot.phase = Phase::Aborting { client: RstWait::new(true) };
         Some(i)
     }
 }
