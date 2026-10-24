@@ -57,12 +57,17 @@ fn inner_plaintext_is_total_and_in_bounds() {
     }
 }
 
-/// Every extension the walker returns lies inside the block.
+/// Every extension the walker returns lies inside the block. 48 bytes hold
+/// the three extensions the cover needs (about 30 bytes with headers); at
+/// 96 bytes cbmc passed 31 GiB.
 #[kani::proof]
-#[kani::unwind(26)]
+#[kani::unwind(14)]
 fn extension_walker_stays_inside_the_block() {
-    let buf: [u8; MAX_LEN] = kani::any();
-    let block = any_bytes(&buf);
+    const BLOCK_LEN: usize = 48;
+    let buf: [u8; BLOCK_LEN] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= BLOCK_LEN);
+    let block = buf.get(..len).unwrap_or(&[]);
     if let Ok(e) = walk(block) {
         for s in [
             e.supported_versions,
