@@ -160,7 +160,7 @@ CASES_FOR_GATE = {
              "c2-boot-kat", "c4-hello-src", "c4-hello-global", "c4-conf-src", "c4-conf-global", "c4-type-filter",
              "rp-cookie-domain", "rp-legacy-probe", "rp-conf-share", "rp-awaited", "rp-proven-reserve", "rp-sid-binding", "rp-nat",
              "rp-cookie-offload", "rp-tx-tier", "rp-reply-fifo", "rp-reply-order", "rp-reply-dst", "rp-sync-sticky",
-             "mce-fresh-draw", "c2-tcp-checksum", "c2-syn-fin", "c2-tls-egress-src", "c2-tls-tier", "c2-syn-src-bucket",
+             "mce-fresh-draw", "c2-tcp-checksum", "c2-syn-fin", "c2-tls-egress-src", "c2-tls-tier", "c2-syn-src-bucket", "c2-syn-global-bucket",
              "c5-tls-static-dh", "c5-k-prime", "c5-nonce-cap", "c5-cv-content", "c5-d5-codes", "c5-syn-burst",
              "c5-syn-interval", "c12-gate-busy", "c12-seed-scalar", "c12-envelope-kind", "c12-sign-halt",
              "l14-clone", "finished-check", "ccs-once", "ccs-after-finished", "key-share-length", "duplicate-extension",
@@ -168,7 +168,8 @@ CASES_FOR_GATE = {
              "conn-alert-wipe", "conn-timeout-wipe", "conn-rst-exhausted", "tls-rndr", "conn-reset-session",
              "c9-te-refusal", "c9-duplicate-cl", "c9-connection-names-cl", "c9-xff-strip", "c9-body-413",
              "c4-inner-src", "c4-inner-port-range", "c4-tln-dst-ip", "c4-tln-dst-port", "c4-tln-src-port-range",
-             "proxy-truncation-rst", "proxy-early-client-fin", "proxy-413-no-connect", "proxy-connect-timeout-wipe", "proxy-fin-drain"},
+             "proxy-truncation-rst", "proxy-early-client-fin", "proxy-413-no-connect", "proxy-connect-timeout-wipe", "proxy-fin-drain",
+             "conn-per-source-cap"},
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
     "ct": {"ct-barrier", "ct-c1-barrier", "ct-harness-unit", "ct-harness-lint", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms",
@@ -188,7 +189,8 @@ CASES_FOR_GATE = {
              "integration-pq-residue", "l8-fallback", "integration-rp-src-meter", "integration-rotation",
              "integration-expiry", "rp-cookie-gate", "integration-expiry-residue",
              "tls-key-halt", "c8-head-wipe", "tls-scalar-scrub", "https-probe-canary", "tlskey-wipe",
-             "proxy-pd-backend-room", "proxy-pd-backend-rst"},
+             "proxy-pd-backend-room", "proxy-pd-backend-rst", "https-syn-flood", "https-per-source-cap",
+             "https-recycle-abort"},
     "repro": {"repro-path-leak"},
     "mir": {"mir-target-split", "mir-env-split", "mir-debug-split", "mir-feature-split"},
     "manifest": {"manifest"},
@@ -1016,6 +1018,10 @@ CASES = {
                                                    "            if !self.syn_sources.allow(p.src, now_ns) {",
                                                    "            if false {"),
                           "---- tests::a_source_gets_its_syn_burst_and_then_is_limited stdout ----"),
+    "c2-syn-global-bucket": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                      "            if !self.syn_global.allow(now_ns) {",
+                                                      "            if false {"),
+                             "---- tests::syns_from_many_sources_get_the_global_burst_and_then_are_limited stdout ----"),
     # M6 plan C5 as amended by C12: the TLS signing oracle's controls, now
     # tlskey-core's. The label table, the RFC 6979 additional input and
     # candidate cap, the content `tlskey` builds, its code range, and each
@@ -1209,6 +1215,27 @@ CASES = {
                                                                    "            scrub_stack();\n        }\n", "        }\n"),
                          re.compile(r"tls scalar count: the TLS scalar \((big|little)-endian\) occurs \d+ time\(s\) "
                                     r"in guest RAM, want exactly")),
+    # M6 plan case 9 (T-R3-1): without the global SYN bucket the spoofed
+    # flood never draws the TcpLimited(SynGlobal) line the case awaits.
+    "https-syn-flood": (["test", "it_boots=https flood"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                                       "            if !self.syn_global.allow(now_ns) {",
+                                                                       "            if false {"),
+                        "the flood did not cross the global SYN bucket"),
+    # M6 plan case 10: the per-source cap, in tls-core and through the PD.
+    "conn-per-source-cap": (["unit"], lambda t: edit(t, "crates/tls-core/src/conn.rs",
+                                                     "        if held >= MAX_PER_SOURCE {", "        if false {"),
+                            "---- tests::per_source_cap_admits_two_and_another_source_still_gets_a_slot stdout ----"),
+    "https-per-source-cap": (["test", "it_boots=https flood"], lambda t: edit(t, "crates/tls-core/src/conn.rs",
+                                                                            "        if held >= MAX_PER_SOURCE {",
+                                                                            "        if false {"),
+                             "the cap did not refuse it"),
+    # Case 10's recycling (F4, T-R3-4): a server-closed connection ends with
+    # the abort's RST; closed instead, the first cycle's barrier never sees
+    # it.
+    "https-recycle-abort": (["test", "it_boots=https flood"], lambda t: edit(
+        t, "crates/pds/tls/src/main.rs", "    l.rst_due = s.remote_endpoint().is_some();\n    s.abort();\n",
+        "    l.rst_due = s.remote_endpoint().is_some();\n    s.close();\n"),
+                            "the server's abort: no RST from the server to port"),
     # The probe canary (T-R3-8): its bound against the measured handshakes.
     "https-probe-canary": (["test", "it_boots=https"], lambda t: edit(t, "tests/integration/run.py",
                                                                      'limit = rust_const(TLS_CONN, "HANDSHAKE_TIMEOUT_NS") / NS / 3\n',

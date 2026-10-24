@@ -793,3 +793,111 @@ UNIT-TLS-CORE 94 → 95, INTEGRATION-CASES 60 → 70.
 - `c8-head-wipe` went red with its needle when run alone; its one failure
   inside a batch was the residue boot's first slowloris connect timing out
   (not reproduced; to be diagnosed if it recurs).
+
+## Slice 5: hardening cases (cases 9, 10, 12, the concurrent probe)
+
+Not run by the implementer (by the slice's rules): Kani, Verus, make
+test/check, QEMU/run.py, check-selftest. Every integration case and
+`test`-gate selftest case below is unrun. No production code changed;
+root Cargo.lock unchanged.
+
+Boot `https flood` (new), in order: case 10's recycling leg and the ninth
+connection, case 10's per-source cap leg, the concurrent probe, then
+Rosenpass for peer 1 (started after the probe so pq's exchange does not
+overlap the RM6-8 measurement), case 12, case 9 last (its spoofed SYNs hold
+listeners until their timeout).
+
+Decisions:
+
+- **Client sources are kernel sockets** bound to `CLIENT_IPS`
+  (10.0.2.101-105/32 on the tap, removed with it), not spoofed TCP: the
+  gateway frames every reply to the router MAC, so real TCP stacks complete
+  handshakes from distinct sources. Five: MAX_CONNS / MAX_PER_SOURCE fill
+  the table, one more is the ninth connection's (checked against the Rust
+  constants by name). Case 9 uses the spoofing helper: `RpSpoof` is split
+  into `Spoof` (any frames) and `RpSpoof(Spoof)`, behaviour unchanged.
+- **VPN transport in an https boot:** the inside NIC is the backend tap, so
+  its host answers peer 1's ping; a /32 route to peer 1's tunnel address
+  via the gateway's inside address (removed with the tap).
+- **Case 10 order:** the recycling leg runs first, on a fresh table, so a
+  slot that fails to return is attributable; then the cap leg. Every slot
+  used is awaited back (the server's abort RST, after which the PD
+  releases and re-listens in the same pass) before the next leg.
+- **Recycling red-proof differs from the plan.** "Without the abort
+  (TIME-WAIT kept) a cycle fails" cannot hold as written: the cycling
+  client closes after close_notify, so the server is the passive closer
+  (no TIME-WAIT), and the PD re-creates the listener socket on every
+  release, discarding any TCP state. The abort is red-proved by the
+  per-cycle barrier instead: each cycle must see the server's abort RST
+  before the next SYN, and each next SYN must be accepted first time (a
+  refusal fails by name). `https-recycle-abort` replaces the PD's
+  `s.abort()` with `s.close()`; the first cycle's barrier fails. The held
+  connections' idle gaps and age are checked against IDLE_TIMEOUT_NS and
+  LIFETIME_NS by name (T-R4-2).
+- **Per-source refusal shape:** admission happens as the socket leaves
+  Listen, so the abort's RST normally replaces the SYN-ACK
+  (ECONNREFUSED); a reset or EOF before any TLS is accepted too. Either
+  way the sniffer must see the server's RST, `TlsClosed(PerSource)
+  total=1` is awaited and the backend sees nothing; a completed handshake
+  fails ("the cap did not refuse it").
+- **The ninth connection** is refused by smoltcp (no listening socket:
+  RST to the SYN), with no audit: asserted by ECONNREFUSED, the sniffed
+  RST and no backend connection.
+- **Concurrent probe (RM6-8):** MAX_CONNS handshakes from four sources
+  started together, each then fetching the backend's response. No timing
+  gate: per-handshake times, failures (a server handshake timeout under
+  TCG), whether `TlsTimeout(Handshake)` was audited and TlsSignHighWater
+  are printed as RM6-8's measured value for D3. It fails only if a client
+  gets no slot (the probe would not hold MAX_CONNS), a response differs,
+  or a connection ends without the server's RST.
+- **Case 12:** the ClientHello is captured on the tap from one verified
+  Python (OpenSSL 3.5) exchange, reassembled from the sniffed segments.
+  A flood connection counts a flight when the server's first byte is a
+  handshake record (`tls` builds the whole flight, signature included,
+  before sending any of it), then is reset so its slot frees. Overlap:
+  MAX_CONNS flights before the WireGuard handshake starts (bounded by
+  MAX_CONNS × a third of the handshake timeout, the probe's gate, plus
+  10 s) and one more after it completes. An unloaded handshake first
+  proves pq's key reached `hs`; KeyWaitHighWater before and during the
+  flood is printed, not asserted.
+- **Case 9:** 200 SYN/s from 256 spoofed sources: each source well under
+  its SYN refill and the total over twice the global refill (checked by
+  name). The case awaits a `TcpLimited(SynGlobal)` line with total ≥ 65
+  since the flood began (≥ 64 refusals), then, the flood still running and
+  verified at the judgment, a WireGuard handshake and a ping through it.
+- **Two unit-gate selftest cases fill gaps:** the plan has case 9 rely on
+  ingress-core unit red-proofs, but only the per-source SYN bucket had
+  one; and the plan's mutation list names the per-source cap, which had
+  none. Both red-proved on a throwaway copy (needles printed; copy
+  deleted).
+
+Selftest (new): `c2-syn-global-bucket` (unit; "---- tests::syns_from_many_
+sources_get_the_global_burst_and_then_are_limited stdout ----"),
+`conn-per-source-cap` (unit; "---- tests::per_source_cap_admits_two_and_
+another_source_still_gets_a_slot stdout ----"), and on boot `https flood`
+(unproven): `https-syn-flood` (global SYN bucket removed; "the flood did
+not cross the global SYN bucket"), `https-per-source-cap` (cap removed in
+tls-core; "the cap did not refuse it"), `https-recycle-abort` (above;
+"the server's abort: no RST from the server to port").
+
+Manifest: INTEGRATION-CASES 70 → 76 (https slot recycling, https ninth
+connection refused, https per-source cap, https concurrent probe, https
+clienthello flood, https syn flood).
+
+### Slice 5 verification (orchestrator)
+
+- Boot `https flood` 6/6: slot recycling (9 server-closed cycles, 7 held
+  alive), ninth connection RST, per-source cap (TlsClosed(PerSource)),
+  the concurrent probe, the ClientHello flood with a WireGuard handshake,
+  the spoofed SYN flood (TcpLimited(SynGlobal) past 65) with a WireGuard
+  handshake and a tunnel ping. Selftest c2-syn-global-bucket,
+  conn-per-source-cap, https-syn-flood, https-per-source-cap,
+  https-recycle-abort red with their needles.
+- **RM6-8 measured:** eight concurrent handshakes from four sources all
+  completed in 3.48 s under TCG (handshake timeout 10 s); none timed out.
+  D3 does not bind.
+- Case 9's spoofer was judged right after it started (nothing scheduled
+  yet); it now waits for the first second's frames on the tap
+  (`wait_delivered`) before the judgment loop.
+- The ct pass record must be refreshed after any tls-core change (the
+  harness links tls-core since slice 3b).

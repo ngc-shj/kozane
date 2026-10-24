@@ -3014,20 +3014,18 @@ def rp_attribute_cookie(sniffer: Sniffer, i0: int, port: int, spkm: bytes, what:
     raise Fail(f"{what}: no CookieReply to the client opens for one of its InitHellos")
 
 
-class RpSpoof:
-    """Datagrams to the Rosenpass port from (ip, port) sources, at `rate`
-    per second, cycling payloads and sources, on the tap by a helper thread
-    (the shape of `Flood`). A case that relies on the attack calls
-    `verify` at its judgment point: an attack that stopped or fell short
-    fails the case instead of passing it vacuously."""
+class Spoof:
+    """Spoofed frames at `rate` per second, cycling through `frames`, on
+    the tap by a helper thread (the shape of `Flood`). A case that relies
+    on the attack calls `verify` at its judgment point: an attack that
+    stopped or fell short fails the case instead of passing it vacuously."""
 
-    # Delivered datagrams below this share of the scheduled ones fail
+    # Delivered frames below this share of the scheduled ones fail
     # `verify`.
     MIN_DELIVERED = 0.9
 
-    def __init__(self, tap: Tap, payloads: list, sources: list, rate: float):
-        self.frames = [ipv4_udp(ip, GW_IP, port, RP_PORT, payloads[i % len(payloads)])
-                       for i, (ip, port) in enumerate(sources)]
+    def __init__(self, tap: Tap, frames: list, rate: float):
+        self.frames = frames
         self.tap, self.rate = tap, rate
         # `due` counts scheduled sends, `sent` only those the tap took.
         self.due, self.sent, self.dropped = 0, 0, 0
@@ -3079,6 +3077,15 @@ class RpSpoof:
         # Teardown also calls this: it never raises (verify reports).
         self.stopped = True
         self.thread.join(timeout=5)
+
+
+class RpSpoof(Spoof):
+    """Datagrams to the Rosenpass port from (ip, port) sources, cycling
+    payloads and sources."""
+
+    def __init__(self, tap: Tap, payloads: list, sources: list, rate: float):
+        super().__init__(tap, [ipv4_udp(ip, GW_IP, port, RP_PORT, payloads[i % len(payloads)])
+                               for i, (ip, port) in enumerate(sources)], rate)
 
 
 def spoof_ips(n: int) -> list:
@@ -3775,6 +3782,7 @@ HTTPS_WAIT_S = 10.0             # one client's connect, handshake and response
 TLS_CONN = "crates/tls-core/src/conn.rs"
 TLS_HANDSHAKE = "crates/tls-core/src/handshake.rs"
 HTTP_WIRE = "crates/http-wire/src/lib.rs"
+LIMITS = "crates/limits/src/lib.rs"
 # The probe (M6 plan C10, D3): sequential handshakes, the slowest of which
 # must stay within a third of the Rust handshake timeout (the canary).
 PROBE_HANDSHAKES = 20
@@ -3793,6 +3801,23 @@ BACKEND_PORT = 8080
 # POST bodies up to this are echoed; a larger one is answered with its
 # SHA-256 (the backend log is what proves the body exact).
 ECHO_MAX = 16 * 1024
+# The https-flood boot's client addresses on the tap (M6 plan cases 10 and
+# 12, the concurrent probe), each its own source to the per-source cap:
+# MAX_CONNS / MAX_PER_SOURCE of them fill every slot, one more is the
+# ninth connection's (checked against the Rust constants).
+CLIENT_IPS = [bytes([10, 0, 2, 101 + i]) for i in range(5)]
+# Case 10: requests run through the one free slot while the others are
+# held, and the body each held response streams (one byte per cycle).
+RECYCLE_CYCLES = 9
+HELD_BODY_LEN = 64
+HELD_FIRST = 16
+# Case 9: spoofed SYNs from SPOOF_SOURCES addresses, each source well under
+# its own SYN refill (so the refusals are the global bucket's), the total
+# far over the global one; the coalesced line awaited is the first after 64
+# refusals (audit prints totals 1, 65, 129, ...).
+SYN_FLOOD_RATE = 200.0
+SYN_GLOBAL_POINT = 65
+FLOOD_PING_TRIES = 3
 
 
 def rust_size(rel: str, name: str) -> int:
@@ -4039,13 +4064,15 @@ class InsideTap:
         subprocess.run(["ip", "link", "del", INSIDE_TAP], capture_output=True)
 
 
-def tls_client(ca: str, timeout: float = HTTPS_WAIT_S) -> ssl.SSLSocket:
+def tls_client(ca: str, timeout: float = HTTPS_WAIT_S, source: bytes = None) -> ssl.SSLSocket:
     """A verified TLS 1.3 connection from Python (OpenSSL 3.5's default
     groups offer X25519MLKEM768 first), for requests whose bytes must be
-    exact."""
+    exact; from `source` (one of CLIENT_IPS) if given, else the tap's
+    address."""
     ctx = ssl.create_default_context(cafile=ca)
     ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-    raw = socket.create_connection((ip_str(GW_IP), HTTPS_PORT), timeout=timeout)
+    raw = socket.create_connection((ip_str(GW_IP), HTTPS_PORT), timeout=timeout,
+                                   source_address=(ip_str(source), 0) if source else None)
     try:
         return ctx.wrap_socket(raw, server_hostname=ip_str(GW_IP))
     except BaseException:
@@ -4583,25 +4610,32 @@ def tcp_fields(frame: bytes):
     return frame[26:30], sport, frame[30:34], dport, flags, seq
 
 
+def tcp_payload(frame: bytes) -> bytes:
+    """The payload of an IPv4/TCP frame (tcp_fields accepted it)."""
+    total = struct.unpack("!H", frame[16:18])[0]
+    t = 14 + (frame[14] & 0xF) * 4
+    return frame[t + (frame[t + 12] >> 4) * 4:14 + total]
+
+
 def barrier_tcp(src_ip: bytes, sport: int, flags: int, seq: int, ack: int = 0) -> bytes:
-    """A segment from `src_ip` (on the tap's subnet, otherwise unused) to the
-    HTTPS port, framed as the router would."""
+    """A segment from `src_ip` (an address the boot uses for nothing else)
+    to the HTTPS port, framed as the router would."""
     seg = struct.pack("!HHIIBBHHH", sport, HTTPS_PORT, seq, ack, 5 << 4, flags, 65535, 0, 0)
     c = csum(src_ip + GW_IP + struct.pack("!BBH", 0, 6, len(seg)) + seg)
     seg = seg[:16] + struct.pack("!H", c) + seg[18:]
     return eth(GW_MAC, PEER_MAC, 0x0800, ip_hdr(src_ip, GW_IP, 6, len(seg)) + seg)
 
 
-def wait_server_rst(sniffer: "Sniffer", start: int, port: int, timeout: float, what: str):
-    """The server's RST to the client's `port`, seen on the tap after
-    `start`."""
+def wait_server_rst(sniffer: "Sniffer", start: int, port: int, timeout: float, what: str, dst: bytes = None):
+    """The server's RST to the client's `port` (at `dst`, if given), seen
+    on the tap after `start`."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         sniffer.check_drops()
         for _, f, outgoing in sniffer.since(start):
             t = tcp_fields(f)
             if (not outgoing and t and t[0] == GW_IP and t[1] == HTTPS_PORT and t[3] == port
-                    and t[4] & TCP_RST):
+                    and t[4] & TCP_RST and dst in (None, t[2])):
                 return
         time.sleep(0.05)
     raise Fail(f"{what}: no RST from the server to port {port}")
@@ -4838,6 +4872,572 @@ def test_https_residue(pkg: "Package", deploy: str, passed: list):
                 close_all(backend, inside, tap)
         except SystemExit:
             close_all(sniffer)
+            kill(child)
+            close_all(backend, inside, tap)
+            raise
+
+
+def per_source_layout() -> tuple:
+    """(MAX_CONNS, MAX_PER_SOURCE) from tls-core; CLIENT_IPS must fill every
+    slot at the cap and have one source more."""
+    conns, per = rust_usize(TLS_CONN, "MAX_CONNS"), rust_usize(TLS_CONN, "MAX_PER_SOURCE")
+    if conns % per or len(CLIENT_IPS) < conns // per + 1:
+        raise Fail(f"CLIENT_IPS has {len(CLIENT_IPS)} sources; MAX_CONNS {conns} at MAX_PER_SOURCE {per} needs "
+                   f"{conns // per + 1} that fill the table exactly")
+    return conns, per
+
+
+def add_client_ips():
+    """CLIENT_IPS on the tap (removed with it): the gateway answers every
+    address through the router MAC, so kernel sockets bound to these are
+    clients from distinct sources."""
+    for ip in CLIENT_IPS:
+        sh("ip", "addr", "add", f"{ip_str(ip)}/32", "dev", TAP)
+
+
+def route_tunnel_replies():
+    """The inside tap's host answers pings from peer 1's tunnel address
+    through the gateway's inside NIC (removed with the inside tap)."""
+    sh("ip", "route", "add", f"{ip_str(PEER1_IP)}/32", "via", ip_str(INSIDE_IP), "dev", INSIDE_TAP)
+
+
+class HeldConn:
+    """A connection from `source` held in response streaming (M6 plan case
+    10): the backend logged its request and answered a head announcing
+    HELD_BODY_LEN body bytes with the first HELD_FIRST of them, and the
+    client read that much. `tick` sends one more body byte (activity, so
+    the idle timeout does not end it); `finish` sends the rest and FIN, and
+    the client must receive the whole response; `released` waits for the
+    server's abort RST that ends the slot's release."""
+
+    def __init__(self, ca: str, backend: Backend, sniffer: Sniffer, source: bytes, what: str):
+        self.what, self.source = what, source
+        self.head = b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % HELD_BODY_LEN
+        self.body = secrets.token_bytes(HELD_BODY_LEN)
+        self.at = HELD_FIRST
+        self.start = len(sniffer.since(0))
+        i = backend.count()
+        backend.hold_next()
+        try:
+            self.s = tls_client(ca, source=source)
+        except OSError as e:
+            raise Fail(f"{what} from {ip_str(source)}: {type(e).__name__}: {e}") from e
+        try:
+            self.port = self.s.getsockname()[1]
+            self.opened = time.monotonic()
+            self.s.sendall(request_head())
+            self.conn = backend.conn(i, what)
+            self.conn.wait(lambda d, _: d.endswith(b"\r\n\r\n"), f"{what}: the request head")
+            self.conn.send(self.head + self.body[:HELD_FIRST], what)
+            self.got = self._read(len(self.head) + HELD_FIRST)
+            self.last = time.monotonic()
+        except BaseException:
+            self.s.close()
+            raise
+
+    def _read(self, n: int) -> bytes:
+        got = b""
+        try:
+            while len(got) < n:
+                chunk = self.s.recv(65536)
+                if not chunk:
+                    raise Fail(f"{self.what}: the connection ended after {len(got)} of {n} bytes")
+                got += chunk
+        except OSError as e:
+            raise Fail(f"{self.what}: {type(e).__name__}: {e}") from e
+        return got
+
+    def tick(self, idle: float):
+        gap = time.monotonic() - self.last
+        if gap >= idle:
+            raise Fail(f"{self.what}: went {gap:.1f} s without a byte, past the idle timeout; the case would "
+                       "prove nothing")
+        self.conn.send(self.body[self.at:self.at + 1], self.what)
+        self.at += 1
+        self.last = time.monotonic()
+
+    def finish(self, lifetime: float):
+        age = time.monotonic() - self.opened
+        if age >= lifetime:
+            raise Fail(f"{self.what}: {age:.0f} s old, past the connection lifetime; the case would prove nothing")
+        self.conn.finish(self.body[self.at:], self.what)
+        try:
+            got = self.got + read_to_end(self.s)
+        except OSError as e:
+            raise Fail(f"{self.what} did not survive: {type(e).__name__}: {e}") from e
+        if got != self.head + self.body:
+            raise Fail(f"{self.what} received {len(got)} bytes, want its response of "
+                       f"{len(self.head) + HELD_BODY_LEN} bytes byte for byte")
+        self.s.close()
+
+    def released(self, sniffer: Sniffer, linger: float):
+        wait_server_rst(sniffer, self.start, self.port, linger + HTTPS_WAIT_S, f"{self.what}: the slot's release",
+                        dst=self.source)
+
+    def close(self):
+        self.s.close()
+
+
+def https_recycling_case(con: Console, deploy: str, backend: Backend, sniffer: Sniffer, passed: list):
+    """M6 plan case 10, slot recycling and the ninth connection (F4, T-N6,
+    T-R3-4, T-R4-2), first in its boot: MAX_CONNS - 1 connections from four
+    sources held in response streaming; the free slot then serves
+    RECYCLE_CYCLES full requests from the fourth source, each closed by the
+    server (the backend's FIN, close_notify, the abort RST, after which the
+    slot is released) and each accepted on its first SYN, the backend
+    sending every held connection one body byte between cycles so none
+    reaches its idle timeout. With that slot held too, a connection from a
+    fifth source gets the server's RST. Then every held connection, within
+    its idle timeout and lifetime (read from the Rust source), receives its
+    whole response."""
+    ca = os.path.join(deploy, "devca.pem")
+    conns, per = per_source_layout()
+    idle = rust_const(TLS_CONN, "IDLE_TIMEOUT_NS") / NS
+    lifetime = rust_const(TLS_CONN, "LIFETIME_NS") / NS
+    linger = rust_const(TLS_CONN, "CLOSE_LINGER_NS") / NS
+    what = "https slot recycling"
+    want = backend_response(request_head())
+    held = []
+    try:
+        for k in range(conns - 1):
+            held.append(HeldConn(ca, backend, sniffer, CLIENT_IPS[k // per], f"{what}: held connection {k + 1}"))
+        source = CLIENT_IPS[(conns - 1) // per]
+        took = []
+        for c in range(1, RECYCLE_CYCLES + 1):
+            cycle = f"{what}: cycle {c} of {RECYCLE_CYCLES}"
+            start, t0 = len(sniffer.since(0)), time.monotonic()
+            try:
+                s = tls_client(ca, source=source)
+            except ConnectionRefusedError as e:
+                raise Fail(f"{cycle} was refused; the server-closed slot did not return to listening") from e
+            except OSError as e:
+                raise Fail(f"{cycle}: {type(e).__name__}: {e}") from e
+            with s:
+                port = s.getsockname()[1]
+                try:
+                    s.sendall(request_head())
+                    got = read_to_end(s)
+                except OSError as e:
+                    raise Fail(f"{cycle}: {type(e).__name__}: {e}") from e
+            if got != want:
+                raise Fail(f"{cycle}: the client received {len(got)} bytes, want the backend's response exactly")
+            wait_server_rst(sniffer, start, port, linger + HTTPS_WAIT_S, f"{cycle}: the server's abort", dst=source)
+            took.append(time.monotonic() - t0)
+            for h in held:
+                h.tick(idle)
+        print(f"\nhttps slot recycling: cycles took {', '.join(f'{t:.1f}' for t in took)} s", flush=True)
+
+        held.append(HeldConn(ca, backend, sniffer, source, f"{what}: held connection {conns}"))
+        ninth = CLIENT_IPS[conns // per]
+        start, before = len(sniffer.since(0)), backend.count()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        with s:
+            s.settimeout(HTTPS_WAIT_S)
+            s.bind((ip_str(ninth), 0))
+            port = s.getsockname()[1]
+            try:
+                s.connect((ip_str(GW_IP), HTTPS_PORT))
+            except ConnectionRefusedError:
+                pass
+            else:
+                raise Fail(f"https ninth connection: a connection from a fifth source was accepted with all "
+                           f"{conns} slots held")
+        wait_server_rst(sniffer, start, port, HTTPS_WAIT_S, "https ninth connection", dst=ninth)
+        if backend.count() != before:
+            raise Fail("https ninth connection: the refused connection reached the backend")
+        passed.append("https ninth connection refused")
+        print(f"\nPASS [https ninth connection: with {conns} held from {conns // per} sources, a fifth source gets RST]")
+
+        for h in held:
+            h.finish(lifetime)
+        for h in held:
+            h.released(sniffer, linger)
+    finally:
+        close_all(*held)
+    passed.append("https slot recycling")
+    print(f"\nPASS [https slot recycling: {RECYCLE_CYCLES} server-closed requests through the free slot, each "
+          f"accepted; the {conns - 1} held connections alive and answered]")
+
+
+def https_source_cap_case(con: Console, deploy: str, backend: Backend, sniffer: Sniffer, passed: list):
+    """M6 plan case 10, the per-source cap with free slots: two connections
+    from source A held, a third from A refused (the server's RST, audited
+    TlsClosed(PerSource), nothing reaches the backend), one from B accepted
+    and answered (the allow pair)."""
+    ca = os.path.join(deploy, "devca.pem")
+    _, per = per_source_layout()
+    linger = rust_const(TLS_CONN, "CLOSE_LINGER_NS") / NS
+    what = "https per-source cap"
+    a, b = CLIENT_IPS[0], CLIENT_IPS[1]
+    held = []
+    try:
+        for k in range(per):
+            held.append(HeldConn(ca, backend, sniffer, a, f"{what}: held connection {k + 1} from A"))
+        start, before, mark = len(sniffer.since(0)), backend.count(), con.mark()
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        with s:
+            s.settimeout(HTTPS_WAIT_S)
+            s.bind((ip_str(a), 0))
+            port = s.getsockname()[1]
+            try:
+                s.connect((ip_str(GW_IP), HTTPS_PORT))
+                # Connected: the RST may still follow the SYN-ACK, before
+                # any TLS; a completed handshake is the cap's failure.
+                ctx = ssl.create_default_context(cafile=ca)
+                with ctx.wrap_socket(s, server_hostname=ip_str(GW_IP)):
+                    pass
+            except (ConnectionRefusedError, ConnectionResetError, ssl.SSLEOFError):
+                pass
+            else:
+                raise Fail(f"{what}: a connection from a source holding {per} completed a handshake; the cap did not "
+                           "refuse it")
+        wait_server_rst(sniffer, start, port, HTTPS_WAIT_S, f"{what}: the refusal", dst=a)
+        con.wait_for(r"audit: src=tls TlsClosed\(PerSource\) total=1 lost=\d+", since=mark)
+        if backend.count() != before:
+            raise Fail(f"{what}: the refused connection reached the backend")
+
+        start = len(sniffer.since(0))
+        try:
+            with tls_client(ca, source=b) as s:
+                port = s.getsockname()[1]
+                s.sendall(request_head())
+                got = read_to_end(s)
+        except OSError as e:
+            raise Fail(f"{what}: source B: {type(e).__name__}: {e}") from e
+        if got != backend_response(request_head()):
+            raise Fail(f"{what}: source B received {len(got)} bytes, want the backend's response exactly")
+        wait_server_rst(sniffer, start, port, linger + HTTPS_WAIT_S, f"{what}: source B's release", dst=b)
+        for h in held:
+            h.finish(rust_const(TLS_CONN, "LIFETIME_NS") / NS)
+        for h in held:
+            h.released(sniffer, linger)
+    finally:
+        close_all(*held)
+    passed.append("https per-source cap")
+    print(f"\nPASS [https per-source cap: a third connection from a source holding {per} refused with RST and "
+          "TlsClosed(PerSource), another source accepted]")
+
+
+def https_concurrent_probe(con: Console, deploy: str, sniffer: Sniffer, passed: list):
+    """The 8-concurrent probe (M6 plan C10, D3, RM6-8): MAX_CONNS handshakes
+    started together from four sources, each then fetching the backend's
+    response. Every connection must get a slot (else the probe measured
+    fewer); each handshake's time, and whether it failed (a server-side
+    handshake timeout under TCG: sign time × the queue), is recorded, not
+    asserted: RM6-8's measured value for D3."""
+    ca = os.path.join(deploy, "devca.pem")
+    conns, per = per_source_layout()
+    timeout = rust_const(TLS_CONN, "HANDSHAKE_TIMEOUT_NS") / NS
+    linger = rust_const(TLS_CONN, "CLOSE_LINGER_NS") / NS
+    want = backend_response(request_head())
+    results = [None] * conns
+    go = threading.Event()
+    start, mark = len(sniffer.since(0)), con.mark()
+
+    def one(k: int):
+        src = CLIENT_IPS[k // per]
+        try:
+            raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        except OSError as e:
+            results[k] = ("socket", 0.0, 0, repr(e))
+            return
+        with raw:
+            go.wait()
+            try:
+                raw.settimeout(timeout + HTTPS_WAIT_S)
+                raw.bind((ip_str(src), 0))
+                port = raw.getsockname()[1]
+                raw.connect((ip_str(GW_IP), HTTPS_PORT))
+            except OSError as e:
+                results[k] = ("connect", 0.0, 0, f"{type(e).__name__}: {e}")
+                return
+            ctx = ssl.create_default_context(cafile=ca)
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_3
+            t0 = time.monotonic()
+            try:
+                with ctx.wrap_socket(raw, server_hostname=ip_str(GW_IP)) as s:
+                    t = time.monotonic() - t0
+                    s.sendall(request_head())
+                    ok = read_to_end(s) == want
+                results[k] = ("ok" if ok else "body", t, port, "")
+            except OSError as e:
+                results[k] = ("failed", time.monotonic() - t0, port, f"{type(e).__name__}: {e}")
+
+    threads = [threading.Thread(target=one, args=(k,), daemon=True) for k in range(conns)]
+    try:
+        for t in threads:
+            start_without_stop_signals(t)
+        go.set()
+    finally:
+        go.set()
+        deadline = time.monotonic() + 2 * (timeout + HTTPS_WAIT_S)
+        for t in threads:
+            t.join(max(0.0, deadline - time.monotonic()))
+    if any(t.is_alive() for t in threads) or None in results:
+        raise Fail("https concurrent probe: a client thread did not finish with a result")
+    signs = [int(us) for us in con.count(r"audit: src=tls TlsSignHighWater us=(\d+) ", since=mark)]
+    timeouts = con.count(r"audit: src=tls TlsTimeout\(Handshake\) total=\d+ ", since=mark)
+    print("\nhttps concurrent probe (RM6-8): " + "; ".join(
+        f"{ip_str(CLIENT_IPS[k // per])} {r[0]} {r[1]:.3f} s{' ' + r[3] if r[3] else ''}"
+        for k, r in enumerate(results)) + f"; failed {sum(r[0] == 'failed' for r in results)} of {conns}; "
+        f"TlsTimeout(Handshake) audited: {bool(timeouts)}; TlsSignHighWater us since: {signs}", flush=True)
+    for k, r in enumerate(results):
+        if r[0] in ("socket", "connect"):
+            raise Fail(f"https concurrent probe: client {k + 1} got no slot ({r[3]}); the probe did not hold "
+                       f"{conns} at once")
+        if r[0] == "body":
+            raise Fail(f"https concurrent probe: client {k + 1} did not receive the backend's response exactly")
+    for k, r in enumerate(results):
+        wait_server_rst(sniffer, start, r[2], linger + HTTPS_WAIT_S, f"https concurrent probe: client {k + 1}'s release",
+                        dst=CLIENT_IPS[k // per])
+    passed.append("https concurrent probe")
+    print(f"\nPASS [https concurrent probe: {conns} handshakes from {conns // per} sources at once, times recorded]")
+
+
+def capture_client_hello(ca: str, sniffer: Sniffer, what: str) -> bytes:
+    """An OpenSSL ClientHello record as it crossed the tap (M6 plan case
+    12): one verified exchange from the tap's address, its client's first
+    record reassembled from the sniffed segments."""
+    start = len(sniffer.since(0))
+    try:
+        with tls_client(ca) as s:
+            port = s.getsockname()[1]
+            s.sendall(request_head())
+            read_to_end(s)
+    except OSError as e:
+        raise Fail(f"{what}: the capture exchange failed: {type(e).__name__}: {e}") from e
+    sniffer.check_drops()
+    segments, first = {}, None
+    for _, f, outgoing in sniffer.since(start):
+        t = tcp_fields(f)
+        if outgoing and t and t[0] == PEER_IP and t[1] == port and t[3] == HTTPS_PORT:
+            payload = tcp_payload(f)
+            if payload:
+                segments.setdefault(t[5], payload)
+                first = t[5] if first is None else first
+    stream, seq = b"", first
+    while seq in segments and (len(stream) < 5 or len(stream) < 5 + struct.unpack("!H", stream[3:5])[0]):
+        stream += segments[seq]
+        seq = (seq + len(segments[seq])) & 0xFFFFFFFF
+    if len(stream) < 6 or stream[0] != 22 or stream[5] != 1:
+        raise Fail(f"{what}: no ClientHello record among the client's sniffed segments")
+    length = 5 + struct.unpack("!H", stream[3:5])[0]
+    if len(stream) < length:
+        raise Fail(f"{what}: the sniffed ClientHello is incomplete ({len(stream)} of {length} bytes)")
+    return stream[:length]
+
+
+class HelloFlood:
+    """One ClientHello replayed over fresh TCP connections, `per_source` at
+    a time from each of `sources` (kernel sockets, so each completes its
+    TCP handshake), by helper threads. A connection counts a flight once
+    the server's first byte arrives as a handshake record: `tls` builds the
+    whole flight, CertificateVerify's signature included, before sending
+    any of it. Each connection is then reset (SO_LINGER 0) so its slot
+    frees at once. close() shuts any open socket down so the threads end
+    promptly."""
+
+    def __init__(self, hello: bytes, sources: list, per_source: int, wait: float):
+        self.hello, self.wait = hello, wait
+        self.lock = threading.Lock()
+        self.flights = self.refused = self.ended = 0
+        self.socks = set()
+        self.stopped = False
+        self.error = None
+        self.threads = [threading.Thread(target=self._run, args=(src,), daemon=True)
+                        for src in sources for _ in range(per_source)]
+        for t in self.threads:
+            start_without_stop_signals(t)
+
+    def _count(self, field: str):
+        with self.lock:
+            setattr(self, field, getattr(self, field) + 1)
+
+    def _run(self, src: bytes):
+        try:
+            while not self.stopped:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                with self.lock:
+                    self.socks.add(s)
+                try:
+                    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                    s.settimeout(self.wait)
+                    s.bind((ip_str(src), 0))
+                    try:
+                        s.connect((ip_str(GW_IP), HTTPS_PORT))
+                    except ConnectionRefusedError:
+                        # Its previous slot still closing (the per-source
+                        # cap), or every slot taken.
+                        self._count("refused")
+                        continue
+                    s.sendall(self.hello)
+                    self._count("flights" if s.recv(1) == b"\x16" else "ended")
+                except (ConnectionResetError, BrokenPipeError, socket.timeout):
+                    # The handshake timeout's RST, or close() below.
+                    self._count("ended")
+                finally:
+                    with self.lock:
+                        self.socks.discard(s)
+                    s.close()
+        except OSError as e:
+            if not self.stopped:
+                self.error = e
+
+    def counts(self) -> tuple:
+        with self.lock:
+            return self.flights, self.refused, self.ended
+
+    def verify(self, what: str):
+        if self.error is not None:
+            raise Fail(f"{what}: the ClientHello flood failed: {self.error!r}")
+        if not all(t.is_alive() for t in self.threads):
+            raise Fail(f"{what}: the ClientHello flood stopped before the judgment")
+
+    def wait_flights(self, n: int, timeout: float, what: str):
+        deadline = time.monotonic() + timeout
+        while self.counts()[0] < n:
+            self.verify(what)
+            if time.monotonic() > deadline:
+                raise Fail(f"{what}: the ClientHello flood drew {self.counts()[0]} server flights, not {n}, within "
+                           f"{timeout:.0f} s")
+            time.sleep(0.05)
+
+    def close(self):
+        self.stopped = True
+        with self.lock:
+            socks = list(self.socks)
+        for s in socks:
+            with contextlib.suppress(OSError):
+                s.shutdown(socket.SHUT_RDWR)
+        for t in self.threads:
+            t.join(self.wait + 1)
+
+
+def key_waits(con: Console, since: int = 0) -> list:
+    return [int(us) for us in con.count(r"audit: src=hs KeyWaitHighWater us=(\d+) ", since=since)]
+
+
+def https_hello_flood_case(con: Console, deploy: str, sniffer: Sniffer, gw_pub: bytes, rp: Rosenpass, passed: list):
+    """M6 plan case 12 as amended by Re-plan R1 (positive only; R2-T N5,
+    R2-F N3): a WireGuard handshake completes while a replayed OpenSSL
+    ClientHello floods `tls` from four sources, two connections each, so
+    that every one costs a full exchange and a signature. The flood is
+    under way (MAX_CONNS server flights drawn) before the handshake starts
+    and still drawing flights after it completes. KeyWaitHighWater is
+    recorded, not asserted (drivers at 150 preempt `key`)."""
+    ca = os.path.join(deploy, "devca.pem")
+    conns, per = per_source_layout()
+    timeout = rust_const(TLS_CONN, "HANDSHAKE_TIMEOUT_NS") / NS
+    what = "https clienthello flood"
+    peer1 = open(os.path.join(deploy, "peer-1.conf")).read()
+    py = py2 = flood = None
+    try:
+        # Unloaded first: pq's key reached hs (the baseline wait printed).
+        py = py_installed(peer1, gw_pub, rp, time.monotonic() + RP_EXCHANGE_S)
+        baseline = key_waits(con)
+        hello = capture_client_hello(ca, sniffer, what)
+        flood = HelloFlood(hello, CLIENT_IPS[:conns // per], per, timeout + HTTPS_WAIT_S)
+        # Each flight at most a third of the handshake timeout (the probe's
+        # gate), one after another through `tls`.
+        flood.wait_flights(conns, conns * timeout / 3 + LINE_TIMEOUT_S, what)
+        mark = con.mark()
+        py2 = py_installed(peer1, gw_pub, rp, time.monotonic() + RP_EXCHANGE_S)
+        after = flood.counts()[0]
+        flood.wait_flights(after + 1, timeout + LINE_TIMEOUT_S, what)
+        flood.verify(what)
+        flights, refused, ended = flood.counts()
+        print(f"\nhttps clienthello flood: a {len(hello)}-byte ClientHello, {flights} flights, {refused} refused, "
+              f"{ended} ended without one; KeyWaitHighWater us before {baseline}, during {key_waits(con, mark)}",
+              flush=True)
+    finally:
+        close_all(flood, py, py2)
+    passed.append("https clienthello flood")
+    print("\nPASS [https clienthello flood: a WireGuard handshake completes while replayed ClientHellos load tls]")
+
+
+def https_syn_flood_case(con: Console, tap: Tap, deploy: str, gw_pub: bytes, rp: Rosenpass, passed: list):
+    """M6 plan case 9 (S4, T11, T-N5, T-R3-1), last in its boot: spoofed
+    SYNs to the HTTPS port from SPOOF_SOURCES addresses until the
+    TcpLimited(SynGlobal) total crosses a printed point (that line awaited
+    first), then, the flood still running, a WireGuard handshake and a ping
+    through it. Positive availability: HTTPS may refuse new clients
+    meanwhile (RM6-7)."""
+    what = "https syn flood"
+    src_refill = NS / rust_const(INGRESS_CORE, "SYN_SRC_INTERVAL_NS")
+    global_refill = NS / rust_const(LIMITS, "SYN_GLOBAL_INTERVAL_NS")
+    if SYN_FLOOD_RATE / SPOOF_SOURCES >= src_refill or SYN_FLOOD_RATE <= 2 * global_refill:
+        raise Fail(f"{what}: SYN_FLOOD_RATE {SYN_FLOOD_RATE:.0f}/s does not keep each source under its "
+                   f"{src_refill:.0f}/s and the total over twice the global {global_refill:.0f}/s")
+    peer1 = open(os.path.join(deploy, "peer-1.conf")).read()
+    frames = [barrier_tcp(ip, port, TCP_SYN, secrets.randbits(32)) for ip, port in spoof_ips(SPOOF_SOURCES)]
+    mark = con.mark()
+    spoof = py = None
+    try:
+        spoof = Spoof(tap, frames, SYN_FLOOD_RATE)
+        # The first second's frames on the tap before any judgment: `verify`
+        # right after the start would see none scheduled yet.
+        spoof.wait_delivered(int(SYN_FLOOD_RATE), what)
+        deadline = time.monotonic() + SYN_GLOBAL_POINT / (SYN_FLOOD_RATE - global_refill) + LINE_TIMEOUT_S
+        while True:
+            totals = [int(t) for t in con.count(r"audit: src=ingress TcpLimited\(SynGlobal\) total=(\d+) lost=\d+\r*\n",
+                                                since=mark)]
+            if totals and max(totals) >= SYN_GLOBAL_POINT:
+                break
+            spoof.verify(what)
+            if time.monotonic() > deadline:
+                raise Fail(f"{what}: TcpLimited(SynGlobal) never reached total={SYN_GLOBAL_POINT} (lines: {totals}); "
+                           "the flood did not cross the global SYN bucket")
+            time.sleep(0.05)
+        py = py_installed(peer1, gw_pub, rp, time.monotonic() + RP_EXCHANGE_S)
+        if not py_ping(py, FLOOD_PING_TRIES, ident=0x5359):
+            raise Fail(f"{what}: no ping reply through the tunnel during the flood")
+        spoof.verify(what)
+    finally:
+        close_all(py, spoof)
+    passed.append("https syn flood")
+    print(f"\nPASS [https syn flood: TcpLimited(SynGlobal) crossed {SYN_GLOBAL_POINT}; a WireGuard handshake and a ping "
+          "through it during the flood]")
+
+
+def test_https_flood(pkg: "Package", deploy: str, passed: list):
+    """Boot "https flood" (M6 plan cases 9, 10, 12 and the concurrent probe,
+    RM6-4, RM6-7, RM6-8): HTTPS clients from CLIENT_IPS on the outside tap,
+    the raw backend on the inside tap, which also answers pings from peer
+    1's tunnel address. Case 10 first (fresh slots), the probe, then
+    Rosenpass for peer 1, case 12, and the SYN flood last (its spoofed SYNs
+    hold listeners until their timeout)."""
+    tap = Tap()
+    inside = backend = sniffer = rp = None
+    try:
+        add_client_ips()
+        inside = InsideTap()
+        route_tunnel_replies()
+        backend = Backend()
+        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"))
+    except BaseException:
+        close_all(backend, inside, tap)
+        raise
+    try:
+        sniffer = Sniffer(HTTPS_PORT, proto=6)
+        wait_tap_ready(tap, con)
+        con.wait_for(r"tls: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        https_recycling_case(con, deploy, backend, sniffer, passed)
+        https_source_cap_case(con, deploy, backend, sniffer, passed)
+        https_concurrent_probe(con, deploy, sniffer, passed)
+        cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
+        gw_pub = b64(cfg["gateway"]["public_key"])
+        con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        rp = Rosenpass(deploy, 1, f"{ip_str(GW_IP)}:{RP_PORT}")
+        https_hello_flood_case(con, deploy, sniffer, gw_pub, rp, passed)
+        https_syn_flood_case(con, tap, deploy, gw_pub, rp, passed)
+    finally:
+        try:
+            with signals_held():
+                close_all(sniffer, rp)
+                kill(child)
+                close_all(backend, inside, tap)
+        except SystemExit:
+            close_all(sniffer, rp)
             kill(child)
             close_all(backend, inside, tap)
             raise
@@ -5189,6 +5789,7 @@ def in_netns(tmp: str) -> int:
              ("https", lambda: test_https(good, deploy, os.path.join(os.path.dirname(deploy), "b", "devca.pem"),
                                          passed)),
              ("https residue", lambda: test_https_residue(good, deploy, passed)),
+             ("https flood", lambda: test_https_flood(good, deploy, passed)),
              ("tls key failure", lambda: test_tls_key_failure(tls_mismatch, deploy, passed))]
     # check-selftest's red-proofs need only the boot their injection breaks:
     # SECUREOS_IT_BOOTS names those (comma-separated). A filtered run never
