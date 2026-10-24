@@ -1034,7 +1034,9 @@ as amended here:
 ### C12 — `tlskey` PD (Critical tier)
 
 - **PD.** Role `key`, passive, priority 135 (above `tls` 100, below `tpm`
-  145), stack 0x20000 (`key`'s P-256 + scrub depth). Maps only
+  145), budget 2000/10000 (a passive PD's budget pays only for its `init`,
+  the unseal flow; stated like `key`'s and `pqkey`'s, R1-S N1), stack
+  0x20000 (`key`'s P-256 + scrub depth). Maps only
   `tls_secrets`: a 4096-byte prefill MR, `kind="secrets" owner="tlskey"`.
   Channels:
   - a callee PPC of `tls` (`pp={tls=true,tlskey=false}`, `notify={tls=false}`);
@@ -1120,7 +1122,8 @@ as amended here:
   - The one-flow rule moves into the `Gate`: a Fresh client gets Busy
     while **any** other client is Unsealing.
   - `layout::tpm::CH_TLSKEY` with a `client()` arm.
-  - `tpm2::boot::BUSY_TIMEOUT_NS` re-derived for waiting behind two flows.
+  - `tpm2::boot::BUSY_TIMEOUT_NS` re-derived for waiting behind two flows,
+    from the three key PDs' init budgets (R1-S N1).
   - The cap comes once all three clients are Done or Failed.
   - Module docs updated.
   - RM5-5's pre-cap window grows by one flow's duration; no new unseal
@@ -1235,7 +1238,11 @@ as amended here:
 - **RM6-8** Under TCG a signature takes ≈ 0.6–1.7 s of `tls`'s wall time,
   so about `HANDSHAKE_TIMEOUT / sign time` (≈ 5) handshakes can be in
   flight before some time out, and handshakes are sequential through
-  `tls`. This affects HTTPS availability only (VE10); on hardware a P-256
+  `tls`. Adversarially, one valid ClientHello (a replayed key share will
+  do) per sign time denies HTTPS under TCG, bounded only by the per-source
+  cap (RM6-4), because `tlskey`'s bucket admits every forwarded handshake
+  (R1-S N2). This affects HTTPS availability only (VE10); the VPN is
+  unaffected (`tls`'s 0.05 budget bounds it); on hardware a P-256
   signature is well under a millisecond. If it binds in the slice-5 probe,
   D3 applies: re-split inside 0.95 (e.g. pq's measured 0.029 of its 0.05),
   never a budget outside the cap.
