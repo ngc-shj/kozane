@@ -4,7 +4,7 @@
 //! field loops, and at 96 bytes cbmc passed 38 GiB, so each harness takes
 //! the smallest input that still reaches its covers: the delimiter 32
 //! bytes, each part of the head parser alone, and the whole head with a fixed
-//! request line and 16 field bytes (at most 2 fields; the bound is `N`), the rewrite 40 bytes and 3 fields.
+//! request line and 16 field bytes (at most 2 fields; the bound is `N`), the rewrite the same fixed line and 16 field bytes (2 fields).
 
 use super::*;
 
@@ -135,12 +135,22 @@ fn content_length_parse_is_exact_and_saturates() {
 /// buffer `REWRITE_GROWTH` bytes larger than the head, starting with the
 /// request line and ending with ours.
 #[kani::proof]
-#[kani::unwind(42)]
+#[kani::unwind(18)]
 fn rewrite_fits_and_keeps_the_request_line() {
-    let buf: [u8; 40] = kani::any();
-    let bytes = any_bytes(&buf);
-    let Ok(h) = parse::<3>(bytes) else { return };
-    let mut out = [0u8; 40 + REWRITE_GROWTH];
+    // As the head harness: a fixed request line and 16 symbolic field
+    // bytes (40 symbolic bytes of whole head timed out at 90 minutes);
+    // "Host:a\r\nTE:x\r\n\r\n" fits and reaches both covers.
+    const LINE: &[u8] = b"GET / HTTP/1.1\r\n";
+    const FIELD_LEN: usize = 16;
+    let fields: [u8; FIELD_LEN] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len <= FIELD_LEN);
+    let mut buf = [0u8; LINE.len() + FIELD_LEN];
+    buf[..LINE.len()].copy_from_slice(LINE);
+    buf[LINE.len()..LINE.len() + len].copy_from_slice(&fields[..len]);
+    let bytes = &buf[..LINE.len() + len];
+    let Ok(h) = parse::<2>(bytes) else { return };
+    let mut out = [0u8; LINE.len() + FIELD_LEN + REWRITE_GROWTH];
     let r = rewrite(&h, kani::any(), &mut out);
     assert!(matches!(r, Ok(n) if n <= bytes.len() + REWRITE_GROWTH));
     let n = r.unwrap_or(0);
