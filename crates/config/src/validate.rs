@@ -453,7 +453,7 @@ pub fn render(c: &Checked, gateway_rp_file: &str, peer_rp_files: &[String]) -> S
     s += &format!("pub const BACKEND: ([u8; 4], u16) = ({:?}, {});\n", c.backend.0, c.backend.1);
     s += "/// The HTTPS server's certificate, DER.\n";
     s += &format!("pub const TLS_CERT: &[u8] = &{:?};\n", c.tls_cert);
-    s += "/// The certificate's public key, the uncompressed P-256 point `key` checks its scalar against.\n";
+    s += "/// The certificate's public key, the uncompressed P-256 point `tlskey` checks its scalar against.\n";
     s += &format!("pub const TLS_PUBLIC: [u8; {TLS_PUBLIC_LEN}] = {:?};\n", c.tls_public);
     s += "pub const NEIGHBORS: &[Neighbor] = &[\n";
     for (ip, mac) in &c.neighbors {

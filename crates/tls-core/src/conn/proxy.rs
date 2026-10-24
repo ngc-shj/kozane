@@ -55,6 +55,16 @@ pub enum BackendEnd {
     Rst,
 }
 
+/// The admitted client has left its socket: the socket closed under it
+/// (its RST or a TCP timeout), or it now carries another peer. A RST in
+/// SYN-RECEIVED puts a listening socket back to Listen, and a SYN in the
+/// same ingress batch takes it before the PD's pass looks, so the state
+/// alone misses that the slot's peer is gone (M6 code review F1). A
+/// socket with no peer outside Closed and Listen counts as left.
+pub fn client_left<P: PartialEq>(closed_or_listen: bool, current: Option<P>, admitted: P) -> bool {
+    closed_or_listen || current != Some(admitted)
+}
+
 /// The backend's end, decided only once its receive queue is empty: a FIN
 /// reported while bytes are still queued would cut the response short and
 /// then close it cleanly (C10's truncation rule).
@@ -229,9 +239,16 @@ impl Slot {
     }
 
     /// The PD could not carry out what it was asked (a send that did not
-    /// fit): abort.
+    /// fit): abort, also when the unsent bytes were the close_notify or
+    /// alert of a slot already draining or lingering.
     pub fn error(&mut self, now: u64) -> Next {
-        self.driven(|slot, next| slot.end(CloseCause::Error, Closed::Error, now, next))
+        self.driven(|slot, next| match slot.phase {
+            Phase::Draining { .. } | Phase::Lingering { .. } => {
+                next.action = slot.abort();
+                next.outcomes.push(Outcome::TlsClosed(Closed::Error));
+            }
+            _ => slot.end(CloseCause::Error, Closed::Error, now, next),
+        })
     }
 
     /// The backend socket reached Established.

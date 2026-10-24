@@ -32,10 +32,10 @@ use smoltcp::iface::{Config, Interface, PollIngressSingleResult, SocketHandle, S
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::{AnySocket, tcp};
 use smoltcp::time::{Duration, Instant};
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpListenEndpoint, Ipv4Address};
+use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address};
 use tls_core::conn::{
     Action, BACKEND_CHUNK, BackendEnd, Closed, Endpoint, MAX_CLIENT_OUT, Next, Outcome, Slot, Stage, Table, Timeout,
-    backend_end,
+    backend_end, client_left,
 };
 use tls_core::halt;
 use tls_core::handshake::{Ctx, Signer};
@@ -62,7 +62,11 @@ const RECORD_BUF: usize = RECORD_HEADER_LEN + MAX_CIPHERTEXT;
 /// partial one (plan C10's 16 KiB raised to fit; M6 deviation log).
 const RX_BUF: usize = 17 * 1024;
 const _: () = assert!(RX_BUF >= RECORD_BUF);
-const TX_BUF: usize = 8 * 1024;
+/// The send buffer holds two of the largest post-handshake writes, so one
+/// can be queued while the previous is still unacknowledged (plan C10's
+/// 8 KiB raised to fit; M6 deviation log).
+const TX_BUF: usize = 9 * 1024;
+const _: () = assert!(2 * MAX_CLIENT_OUT <= TX_BUF);
 /// The backend socket's buffers (plan C10, F18): the response arrives in
 /// chunks of at most `BACKEND_CHUNK`, the request leaves as fast as the
 /// backend takes it.
@@ -887,10 +891,19 @@ impl Conn<'_, '_> {
 
     /// The connection's events this pass, then its timers.
     fn serve(&mut self) {
-        // The peer's RST or a TCP timeout closed the socket under the
-        // connection (a RST in SYN-RECEIVED puts it back to Listen, where a
-        // new client must not inherit this slot).
-        let gone = matches!(self.client.state(), tcp::State::Closed | tcp::State::Listen);
+        // The admitted client is gone when the peer's RST or a TCP timeout
+        // closed the socket under the connection, or when the socket now
+        // carries another 4-tuple: a RST in SYN-RECEIVED puts it back to
+        // Listen, and a SYN in the same ingress batch takes it before this
+        // pass sees Listen. That client must not inherit the slot, its
+        // source or its per-source count; its connection is aborted, with
+        // the peer retargeted so that the abort's RST to it is the one
+        // awaited.
+        let ep = self.client.remote_endpoint().map(peer_of);
+        let gone = client_left(matches!(self.client.state(), tcp::State::Closed | tcp::State::Listen), ep, self.l.peer);
+        if let Some(ep) = ep {
+            self.l.peer = ep;
+        }
         match self.slot.stage() {
             Some(_) if gone => {
                 let next = self.slot.client_gone(self.now);
@@ -1157,13 +1170,17 @@ fn release_backend(i: usize, b: &mut Backend, sockets: &mut SocketSet<'static>) 
     *b = Backend::default();
 }
 
+fn peer_of(ep: IpEndpoint) -> Peer {
+    let IpAddress::Ipv4(addr) = ep.addr;
+    (addr.octets(), ep.port)
+}
+
 /// A connection leaving Listen gets a slot, or is refused (per-source cap)
 /// and aborted like any other.
 fn admit(l: &mut Listener, s: &mut tcp::Socket<'_>, table: &mut Table, audit: &mut Audit, now_ns: u64) {
     let Some(ep) = s.remote_endpoint() else { return };
-    let IpAddress::Ipv4(addr) = ep.addr;
-    let source = addr.octets();
-    l.peer = (source, ep.port);
+    l.peer = peer_of(ep);
+    let source = l.peer.0;
     match table.admit(source, now_ns) {
         Ok(k) => l.slot = Some(k),
         Err(refusal) => {

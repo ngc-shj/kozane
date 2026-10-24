@@ -38,6 +38,16 @@ def manifest_count(key: str) -> int:
     raise SystemExit(f"selftest: {key} not in tests/manifest.txt")
 
 
+def doctest_line(rel: str, fence: str) -> int:
+    """The line of the one doctest opened by `//! {fence}` in `rel`, as
+    rustdoc names it, so a needle naming the doctest follows the source."""
+    lines = (ROOT / rel).read_text().splitlines()
+    hits = [i + 1 for i, line in enumerate(lines) if line.strip() == f"//! {fence}"]
+    if len(hits) != 1:
+        raise SystemExit(f"selftest: {fence!r} opens {len(hits)} doctests in {rel}")
+    return hits[0]
+
+
 AUDIT_EVENT_TESTS = manifest_count("UNIT-AUDIT-EVENT")
 INTEGRATION_CASES = manifest_count("INTEGRATION-CASES")
 
@@ -168,13 +178,13 @@ CASES_FOR_GATE = {
              "conn-alert-wipe", "conn-timeout-wipe", "conn-rst-exhausted", "tls-rndr", "conn-reset-session",
              "c9-te-refusal", "c9-duplicate-cl", "c9-connection-names-cl", "c9-xff-strip", "c9-body-413",
              "c4-inner-src", "c4-inner-port-range", "c4-tln-dst-ip", "c4-tln-dst-port", "c4-tln-src-port-range",
-             "proxy-truncation-rst", "proxy-early-client-fin", "proxy-413-no-connect", "proxy-connect-timeout-wipe", "proxy-fin-drain",
-             "conn-per-source-cap"},
+             "proxy-truncation-rst", "proxy-early-client-fin", "proxy-413-no-connect", "proxy-connect-timeout-wipe", "proxy-fin-drain", "rst-inherit",
+             "conn-per-source-cap", "c2-tcp-offset", "c2-tls-egress-syn", "s1-inner-tls-tier"},
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
     "ct": {"ct-barrier", "ct-c1-barrier", "ct-harness-unit", "ct-harness-lint", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms",
            "mce-residue-encaps-scrub", "mce-residue-encaps-depth", "mce-residue-bm", "tpm2-open-residue",
-           "tls-exchange-residue", "tls-exchange-scrub-depth", "tls-hello-scrub"},
+           "tls-exchange-residue", "tls-exchange-scrub-depth", "tls-hello-scrub", "tls-hello-scrub-depth", "residue-secret-drop"},
     "ct-shape": {"ct-shape", "ct-identity", "verus-erasure", "tls-identity"},
     "verus": {"verus-cache", "verus-trusted", "verus-trusted-item", "verus-no-cheating", "verus-required", "verus-required-site",
               "verus-required-member", "verus-wg-wire-window",
@@ -190,7 +200,7 @@ CASES_FOR_GATE = {
              "integration-expiry", "rp-cookie-gate", "integration-expiry-residue",
              "tls-key-halt", "c8-head-wipe", "tls-scalar-scrub", "https-probe-canary", "tlskey-wipe",
              "proxy-pd-backend-room", "proxy-pd-backend-rst", "https-syn-flood", "https-per-source-cap",
-             "https-recycle-abort"},
+             "https-recycle-abort", "residue-wipe-state"},
     "repro": {"repro-path-leak"},
     "mir": {"mir-target-split", "mir-env-split", "mir-debug-split", "mir-feature-split"},
     "manifest": {"manifest"},
@@ -516,9 +526,16 @@ CASES = {
     # The shipped scrub cut below the exchange's depth (33 KiB measured):
     # the depth run refuses it, whatever the scan finds.
     "tls-exchange-scrub-depth": (["ct"], lambda t: edit(t, "crates/tls-core/src/hybrid.rs",
-                                                        "pub const SCRUB_DEPTH_EXCHANGE: usize = 48 * 1024;",
+                                                        "pub const SCRUB_DEPTH_EXCHANGE: usize = 52 * 1024;",
                                                         "pub const SCRUB_DEPTH_EXCHANGE: usize = 16 * 1024;"),
                                  "RESIDUE-DEEP exchange-depth: "),
+    # The scrub cut between the exchange's depth (34 040 B measured) and
+    # hello_keys' (35 912 B) at its production call site (code review T5):
+    # only the hello-depth run refuses it.
+    "tls-hello-scrub-depth": (["ct"], lambda t: edit(t, "crates/tls-core/src/hybrid.rs",
+                                                     "pub const SCRUB_DEPTH_EXCHANGE: usize = 52 * 1024;",
+                                                     "pub const SCRUB_DEPTH_EXCHANGE: usize = 34 * 1024;"),
+                              "RESIDUE-DEEP hello-depth: "),
     # The identity and shape gate (M4 plan C10). The ct-barrier mutation
     # changes bm's conditional-instruction multiset; identity stays green
     # because the harness is built from the same source.
@@ -1021,6 +1038,27 @@ CASES = {
                                              "if head.content_length > MAX_BODY {",
                                              "if head.content_length > MAX_BODY.saturating_mul(2) {"),
                     "---- tests::content_length_above_max_body_is_refused_with_413 stdout ----"),
+    # The data-offset rule, with the options' and payload's bounds refusals
+    # (which also refuse an offset past the segment) made lenient, so only
+    # the rule stood between a bad offset and an accepted header.
+    "c2-tcp-offset": (["unit"], lambda t: (
+        edit(t, "crates/wire/src/lib.rs",
+             "    if data_offset < 5 || header_len > segment.len() {\n        return Err(DropReason::TcpBadOffset);\n    }\n", ""),
+        edit(t, "crates/wire/src/lib.rs", "let options = segment.get(TCP_HDR..header_len).ok_or(DropReason::TcpBadOffset)?;",
+             "let options = segment.get(TCP_HDR..header_len).unwrap_or(&[]);"),
+        edit(t, "crates/wire/src/lib.rs", "payload: segment.get(header_len..).ok_or(DropReason::TcpBadOffset)?,",
+             "payload: segment.get(header_len..).unwrap_or(&[]),")),
+                      "---- tests::tcp_data_offset_bounds_are_five_and_fifteen_words_within_the_segment stdout ----"),
+    # tls opens no connections: tls_egress refuses a SYN without ACK.
+    "c2-tls-egress-syn": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                   "    if t.is_syn_request() {\n        return Err(refused);\n    }\n", ""),
+                          "---- tests::tls_egress_allows_syn_ack_fin_and_rst_but_never_a_bare_syn stdout ----"),
+    # Code review S1: tls's segments take an inside TX buffer only above the
+    # reserve and their share (refused at the boundary).
+    "s1-inner-tls-tier": (["unit"], lambda t: edit(t, "crates/inner-core/src/lib.rs",
+                                                   "    if tx_free <= INNER_TX_RESERVE + TLS_TX_SHARE_INSIDE {",
+                                                   "    if tx_free <= INNER_TX_RESERVE {"),
+                          "---- tests::tls_segment_at_its_tier_boundary_is_refused stdout ----"),
     "c2-syn-fin": (["unit"], lambda t: edit(t, "crates/wire/src/lib.rs",
                                             "    if flags & TCP_SYN != 0 && flags & (TCP_FIN | TCP_RST) != 0 {", "    if false {"),
                    "---- tests::syn_with_fin_or_rst_is_refused_and_other_combinations_accepted stdout ----"),
@@ -1105,6 +1143,9 @@ CASES = {
     "l14-clone": (["unit"], lambda t: append(t, "crates/tls-core/src/hybrid.rs",
                                              "\nimpl Clone for HybridSecret {\n    fn clone(&self) -> Self {\n"
                                              "        HybridSecret(Secret::copy_from(self.0.as_bytes()))\n    }\n}\n"),
+                  # The Clone doctest by name, then rustdoc's verdict on it.
+                  f"---- crates/tls-core/src/hybrid.rs - hybrid (line "
+                  f"{doctest_line('crates/tls-core/src/hybrid.rs', '```compile_fail,E0599')}) stdout ----\n"
                   "Test compiled successfully, but it's marked `compile_fail`."),
     "l14-codepoint": (["pins"], lambda t: append(t, "crates/tls-core/src/lib.rs", "\nconst X25519: u16 = 0x001d;\n"),
                       "P19 crates/tls-core/src/lib.rs"),
@@ -1234,6 +1275,27 @@ CASES = {
                                                                    "            scrub_stack();\n        }\n", "        }\n"),
                          re.compile(r"tls scalar count: the TLS scalar \((big|little)-endian\) occurs \d+ time\(s\) "
                                     r"in guest RAM, want exactly")),
+    # Code review F1: without the peer check, a SYN that takes a listener
+    # reset in SYN-RECEIVED in the same ingress batch inherits the admitted
+    # slot. Red-proved where the decision lives: whether the two segments
+    # share a batch under QEMU is timing, so the boot case cannot be.
+    "rst-inherit": (["unit"], lambda t: edit(t, "crates/tls-core/src/conn/proxy.rs",
+                                             "    closed_or_listen || current != Some(admitted)\n",
+                                             "    let _ = (current, admitted);\n    closed_or_listen\n"),
+                    "---- tests::client_left_when_the_socket_carries_another_peer stdout ----"),
+    # C8's drop-time wipe (code review T3): without Secret's zeroize on
+    # drop, a dropped secret stays in memory. The ct gate's `exchange`
+    # residue case sees it first (the hybrid secret's component secrets),
+    # before the https residue boot could, so the case names that gate.
+    "residue-secret-drop": (["ct"], lambda t: edit(
+        t, "crates/secret/src/lib.rs", "    fn drop(&mut self) {\n        self.0.zeroize();\n    }\n",
+        "    fn drop(&mut self) {}\n"),
+                            re.compile(r"(?s)(?=.*RESIDUE-HIT kem-ss case=exchange )(?=.*RESIDUE-HIT x-ss case=exchange )")),
+    # The close wipe of the session's traffic secrets (code review T3):
+    # without it, the closed connection's last secrets outlive it.
+    "residue-wipe-state": (["test", "it_boots=https residue"], lambda t: edit(
+        t, "crates/tls-core/src/handshake.rs", "        self.read_secret.wipe();\n        self.write_secret.wipe();\n", ""),
+                           re.compile(r"residue: connection A's (client|server) secret \d still in guest RAM at 0x")),
     # M6 plan case 9 (T-R3-1): without the global SYN bucket the spoofed
     # flood never draws the TcpLimited(SynGlobal) line the case awaits.
     "https-syn-flood": (["test", "it_boots=https flood"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",

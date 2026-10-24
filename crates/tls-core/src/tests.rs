@@ -1311,6 +1311,24 @@ fn lifetime_ends_a_streaming_connection_with_its_backend() {
     assert!(s.is_zeroized());
 }
 
+/// A send that did not fit aborts a slot whose close_notify (or alert) it
+/// carried, rather than leaving it to linger.
+#[test]
+fn an_error_aborts_a_draining_or_lingering_slot() {
+    let (mut s, _, mut out) = streaming();
+    pump(&mut s, &mut Vec::new(), usize::MAX, 4 * S);
+    s.backend_fin(&mut out, 5 * S);
+    let next = s.error(5 * S);
+    assert_eq!((next.action, outcomes(&next)), (Action::Abort, vec![Outcome::TlsClosed(Closed::Error)]));
+    assert!(s.is_zeroized());
+
+    let (mut s, _, mut out) = streaming();
+    pump(&mut s, &mut Vec::new(), usize::MAX, 4 * S);
+    s.backend_fin(&mut out, 5 * S);
+    assert_eq!(s.drained(6 * S), Action::None);
+    assert_eq!(s.error(6 * S).action, Action::Abort);
+}
+
 #[test]
 fn events_after_the_close_do_nothing() {
     let (mut s, mut client, mut out) = streaming();
@@ -1333,4 +1351,18 @@ fn backend_end_waits_for_the_receive_queue_to_drain() {
     assert_eq!(backend_end(true, 1, true), BackendEnd::Open);
     assert_eq!(backend_end(false, 0, true), BackendEnd::Rst);
     assert_eq!(backend_end(false, 0, false), BackendEnd::Open);
+}
+
+/// Code review F1: a socket that now carries another peer has lost the
+/// admitted client even though its state is open; the same peer (address
+/// and port) keeps it.
+#[test]
+fn client_left_when_the_socket_carries_another_peer() {
+    use crate::conn::client_left;
+    let a = ([10, 0, 2, 78], 52000);
+    assert!(!client_left(false, Some(a), a));
+    assert!(client_left(false, Some(([10, 0, 2, 79], 52001)), a));
+    assert!(client_left(false, Some(([10, 0, 2, 78], 52001)), a));
+    assert!(client_left(false, None, a));
+    assert!(client_left(true, Some(a), a));
 }

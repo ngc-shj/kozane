@@ -3789,6 +3789,9 @@ PROBE_HANDSHAKES = 20
 # An address the residue boot uses for nothing but its barrier SYNs.
 BARRIER_IP = bytes([10, 0, 2, 77])
 BARRIER_SYN_TRIES = 10
+# The reset-and-reuse case (M6 code review F1): two more addresses the
+# residue boot uses for nothing else, and their ports.
+INHERIT_SOURCES = ((bytes([10, 0, 2, 78]), 52000), (bytes([10, 0, 2, 79]), 52001))
 BARRIER_SYN_WAIT_S = 0.5
 # Slowloris: one byte per interval, well inside the handshake timeout.
 SLOWLORIS_INTERVAL_S = 1.0
@@ -4224,6 +4227,39 @@ def hkdf_expand_label(secret: bytes, label: bytes, length: int) -> bytes:
     return hmac.new(secret, info + b"\x01", hashlib.sha256).digest()[:length]
 
 
+# RFC 8448 section 3, "{server} derive write traffic keys for handshake
+# data": the server handshake traffic secret (the PRK) and the AES-128-GCM
+# key and IV the trace expands from it.
+RFC8448_SERVER_HS = bytes.fromhex("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38")
+RFC8448_SERVER_HS_KEY = bytes.fromhex("3fce516009c21727d0f2e4e86ee403bc")
+RFC8448_SERVER_HS_IV = bytes.fromhex("5d313eb2671276ee13000b30")
+# tls-core's keylog fixture: OpenSSL's ChaCha20-Poly1305 secrets with their
+# keys and IVs, under which its recorded records decrypt (tls-core's tests).
+KEYLOG_FIXTURE = os.path.join(ROOT, "crates/tls-core/src/testdata/keylog.txt")
+
+
+def check_secret_forms():
+    """The positive control for the residue needles' key and IV forms (M6
+    code review T10): `hkdf_expand_label` reproduces RFC 8448's key and IV,
+    and every 32-byte ChaCha20 key and IV of the keylog fixture, so a needle
+    derived wrongly cannot pass for one that is absent."""
+    if (hkdf_expand_label(RFC8448_SERVER_HS, b"key", 16), hkdf_expand_label(RFC8448_SERVER_HS, b"iv", 12)) != \
+            (RFC8448_SERVER_HS_KEY, RFC8448_SERVER_HS_IV):
+        raise Fail("residue: hkdf_expand_label differs from RFC 8448's handshake key and IV")
+    fixture = {}
+    for line in open(KEYLOG_FIXTURE):
+        f = line.split()
+        if f and f[0] in ("SECRET", "KEY", "IV"):
+            fixture[f[0], f[1]] = bytes.fromhex(f[2])
+    names = [n for kind, n in fixture if kind == "SECRET"]
+    if not names:
+        raise Fail(f"residue: {KEYLOG_FIXTURE} has no secrets; the key and IV forms are unchecked")
+    for n in names:
+        forms = secret_forms(n, fixture["SECRET", n])
+        if (forms[f"{n} key"], forms[f"{n} iv"]) != (fixture["KEY", n], fixture["IV", n]):
+            raise Fail(f"residue: the key or IV derived from {n} differs from the keylog fixture's")
+
+
 def keylog(path: str) -> dict:
     """label -> secrets (in order) from an SSLKEYLOGFILE of one connection."""
     out = {}
@@ -4532,6 +4568,9 @@ def https_probe_case(con: Console, deploy: str, passed: list):
         if body != backend_body():
             raise Fail(f"https probe: curl got a body of {len(body)} bytes, want the backend's")
         times.append(t)
+    # A high-water line is emitted only when a sign exceeds every earlier
+    # one, so the probe's own signs may print none; the boot's last line is
+    # the maximum over all of them, the probe's included (code review T9).
     signs = [int(us) for us in con.count(r"audit: src=tls TlsSignHighWater us=(\d+) ")]
     print(f"\nhttps probe: handshake (appconnect - connect) s: {', '.join(f'{t:.3f}' for t in times)}; "
           f"max {max(times):.3f}, limit {limit:.3f}; TlsSignHighWater us: {signs}", flush=True)
@@ -4701,20 +4740,49 @@ def client_port(sniffer: "Sniffer", start: int, what: str) -> int:
     raise Fail(f"{what}: no SYN from the client seen")
 
 
-def slowloris_case(con: Console, passed: list):
+def connect_diagnosis(con: Console, sniffer: "Sniffer", start: int) -> str:
+    """What a failed connect to the HTTPS port left behind (M6 code review
+    T4): whether its SYNs crossed the tap and what the gateway answered,
+    the sniffer's drops, and the TcpLimited and TlsClosed audits since
+    boot. Read once, after the failure: no retry, no wait."""
+    syns, answers = [], []
+    for _, f, outgoing in sniffer.since(start):
+        t = tcp_fields(f)
+        if not t:
+            continue
+        names = "|".join(n for n, bit in (("SYN", TCP_SYN), ("ACK", TCP_ACK), ("RST", TCP_RST), ("FIN", TCP_FIN))
+                         if t[4] & bit) or "none"
+        if outgoing and t[0] == PEER_IP and t[3] == HTTPS_PORT:
+            syns.append(f"{names} from port {t[1]}")
+        elif not outgoing and t[0] == GW_IP and t[1] == HTTPS_PORT:
+            answers.append(f"{names} to port {t[3]}")
+    try:
+        sniffer.check_drops()
+        drops = "no sniffer drops"
+    except Fail as e:
+        drops = str(e)
+    audits = con.count(r"audit: src=\w+ (?:TcpLimited|TlsClosed)\(\w+\) total=\d+ lost=\d+")
+    return (f"segments to the HTTPS port on the tap: {syns or 'none'}; the gateway's answers: {answers or 'none'}; "
+            f"{drops}; TcpLimited/TlsClosed audits since boot: {audits or 'none'}")
+
+
+def slowloris_case(con: Console, sniffer: "Sniffer", passed: list):
     """M6 plan case 11 (T12, T-N2, T-R3-1), first in its boot so no earlier
     case raises the code: one byte of a ClientHello record per interval,
     shorter than the handshake timeout, until past it; the connection ends
     (EOF or RST) no later than the timeout plus slack (bounded from above
-    only), and the TlsTimeout(Handshake) line has total=1."""
+    only), and the TlsTimeout(Handshake) line has total=1. A connect that
+    fails names what the tap and the audit saw of it."""
     timeout = rust_const(TLS_CONN, "HANDSHAKE_TIMEOUT_NS") / NS
     # A ClientHello record header announcing 512 bytes, then its handshake
     # header and filler: never complete at this rate.
     trickle = bytes([22, 3, 1, 2, 0, 1, 0, 1, 252]) + b"\0" * 64
+    sniffed = len(sniffer.since(0))
     try:
         s = socket.create_connection((ip_str(GW_IP), HTTPS_PORT), timeout=HTTPS_WAIT_S)
     except OSError as e:
-        raise Fail(f"slowloris: no TCP connection to port {HTTPS_PORT}: {e}") from e
+        raise Fail(f"slowloris: no TCP connection to port {HTTPS_PORT}: {e}; "
+                   f"{connect_diagnosis(con, sniffer, sniffed)}") from e
     start = time.monotonic()
     ended = False
     with s:
@@ -4741,6 +4809,56 @@ def slowloris_case(con: Console, passed: list):
     print(f"\nPASS [slowloris: closed after {time.monotonic() - start:.1f} s, TlsTimeout(Handshake) total=1]")
 
 
+def https_rst_inherit_case(con: Console, tap: Tap, sniffer: "Sniffer", backend: Backend, passed: list):
+    """M6 code review F1: a connection reset in SYN-RECEIVED, then another
+    client's SYN. p1's SYN is answered (admitted: its slot, source and
+    per-source count held); then p1's RST (seq ISN + 1) and p2's SYN, from
+    another address, back to back. Whether QEMU hands both to one ingress
+    batch is timing, so the case judges what holds either way: p1's slot
+    ends with TlsClosed(PeerReset) (inherited, it would end only at the
+    handshake timeout), and no backend connection opens. One batch: p2 is
+    aborted (a RST to it). Two: p2 is a fresh admission, answered, and is
+    reset here. The decision itself is red-proved at unit level
+    (`client_left`). Second in its boot, after slowloris, so its PeerReset
+    is the boot's first (total=1, an emitted line)."""
+    what = "https rst inherit"
+    (ip1, port1), (ip2, port2) = INHERIT_SOURCES
+    isn1, isn2 = secrets.randbits(32), secrets.randbits(32)
+    mark, start, conns = con.mark(), len(sniffer.since(0)), backend.count()
+    tap.send(barrier_tcp(ip1, port1, TCP_SYN, isn1))
+    deadline = time.monotonic() + HTTPS_WAIT_S
+    while not any(not outgoing and t and t[2] == ip1 and t[3] == port1 and t[4] & (TCP_SYN | TCP_ACK) == TCP_SYN | TCP_ACK
+                  for _, f, outgoing in sniffer.since(start) for t in (tcp_fields(f),)):
+        if time.monotonic() > deadline:
+            raise Fail(f"{what}: p1's SYN unanswered")
+        sniffer.check_drops()
+        time.sleep(0.02)
+    burst = len(sniffer.since(0))
+    tap.send(barrier_tcp(ip1, port1, TCP_RST, (isn1 + 1) & 0xFFFFFFFF))
+    tap.send(barrier_tcp(ip2, port2, TCP_SYN, isn2))
+    try:
+        con.wait_for(r"audit: src=tls TlsClosed\(PeerReset\) total=\d+ lost=\d+", since=mark)
+    except Fail as e:
+        raise Fail(f"{what}: p1's slot did not end on its reset (p2 inherited it?): {e}") from e
+
+    def to_p2(flags: int) -> bool:
+        return any(not outgoing and t and t[2] == ip2 and t[3] == port2 and t[4] & flags == flags
+                   for _, f, outgoing in sniffer.since(burst) for t in (tcp_fields(f),))
+    deadline = time.monotonic() + HTTPS_WAIT_S
+    while not (to_p2(TCP_RST) or to_p2(TCP_SYN | TCP_ACK)):
+        if time.monotonic() > deadline:
+            raise Fail(f"{what}: p2's SYN got neither a RST nor a SYN-ACK")
+        sniffer.check_drops()
+        time.sleep(0.02)
+    batch = "one batch, p2 aborted" if to_p2(TCP_RST) else "two batches, p2 admitted afresh"
+    if not to_p2(TCP_RST):
+        tap.send(barrier_tcp(ip2, port2, TCP_RST, (isn2 + 1) & 0xFFFFFFFF))
+    if backend.count() != conns:
+        raise Fail(f"{what}: a backend connection opened for the reset client's listener")
+    passed.append("https rst inherit")
+    print(f"\nPASS [https rst inherit: p1's slot ended on its reset, no backend connection ({batch})]")
+
+
 def https_residue_case(con: Console, mon: Monitor, tap: Tap, sniffer: "Sniffer", backend: Backend, deploy: str,
                        passed: list):
     """M6 plan C8 cases 1-3 (T6, T7, T-N2, T-N3, T-R3-2, T-N4), one
@@ -4761,6 +4879,7 @@ def https_residue_case(con: Console, mon: Monitor, tap: Tap, sniffer: "Sniffer",
     by the backend, has its CLIENT_TRAFFIC_SECRET_0 present (the control)
     and its own marker gone (rewritten). Neither marker reaches the
     backend."""
+    check_secret_forms()
     ca = os.path.join(deploy, "devca.pem")
     marker, marker_b = secrets.token_hex(16), secrets.token_hex(16)
     log_a, log_b = (os.path.join(deploy, f"keylog-{n}.txt") for n in "ab")
@@ -4872,8 +4991,8 @@ def https_residue_case(con: Console, mon: Monitor, tap: Tap, sniffer: "Sniffer",
 
 
 def test_https_residue(pkg: "Package", deploy: str, passed: list):
-    """Boot "https-residue" (M6 plan C8, T-N2): slowloris first, then the
-    residue cases."""
+    """Boot "https-residue" (M6 plan C8, T-N2): slowloris first, the
+    reset-and-reuse case (code review F1), then the residue cases."""
     tap = Tap()
     inside = backend = sniffer = None
     monitor = os.path.join(deploy, "monitor.sock")
@@ -4889,7 +5008,8 @@ def test_https_residue(pkg: "Package", deploy: str, passed: list):
         wait_tap_ready(tap, con)
         con.wait_for(r"tls: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
         mon = Monitor(monitor)
-        slowloris_case(con, passed)
+        slowloris_case(con, sniffer, passed)
+        https_rst_inherit_case(con, tap, sniffer, backend, passed)
         https_residue_case(con, mon, tap, sniffer, backend, deploy, passed)
     finally:
         try:
@@ -5151,7 +5271,10 @@ def https_concurrent_probe(con: Console, deploy: str, sniffer: Sniffer, passed: 
     response. Every connection must get a slot (else the probe measured
     fewer); each handshake's time, and whether it failed (a server-side
     handshake timeout under TCG: sign time × the queue), is recorded, not
-    asserted: RM6-8's measured value for D3."""
+    asserted: RM6-8's measured value for D3. A failed handshake with a
+    TlsTimeout(Handshake) audited since the start is named a D3 breach in
+    the record; none completing at all fails the probe, which then measured
+    nothing (T8)."""
     ca = os.path.join(deploy, "devca.pem")
     conns, per = per_source_layout()
     timeout = rust_const(TLS_CONN, "HANDSHAKE_TIMEOUT_NS") / NS
@@ -5208,6 +5331,13 @@ def https_concurrent_probe(con: Console, deploy: str, sniffer: Sniffer, passed: 
         f"{ip_str(CLIENT_IPS[k // per])} {r[0]} {r[1]:.3f} s{' ' + r[3] if r[3] else ''}"
         for k, r in enumerate(results)) + f"; failed {sum(r[0] == 'failed' for r in results)} of {conns}; "
         f"TlsTimeout(Handshake) audited: {bool(timeouts)}; TlsSignHighWater us since: {signs}", flush=True)
+    failed = sum(r[0] == "failed" for r in results)
+    breach = f"D3 breach: {failed} of {conns} handshakes failed with TlsTimeout(Handshake) audited since the start"
+    if not any(r[0] in ("ok", "body") for r in results):
+        raise Fail(f"https concurrent probe: no handshake of {conns} completed; the probe measured nothing"
+                   + (f" ({breach})" if timeouts else ""))
+    if failed and timeouts:
+        print(f"\nhttps concurrent probe (RM6-8): {breach}", flush=True)
     for k, r in enumerate(results):
         if r[0] in ("socket", "connect"):
             raise Fail(f"https concurrent probe: client {k + 1} got no slot ({r[3]}); the probe did not hold "

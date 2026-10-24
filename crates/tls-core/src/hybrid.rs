@@ -8,23 +8,23 @@
 //! takes, and [`HybridSecret::exchange`] (through its non-generic inner
 //! function) the only way to make one:
 //!
-//! ```compile_fail
-//! fn twice(s: &tls_core::HybridSecret) -> tls_core::HybridSecret {
-//!     s.clone()
+//! ```compile_fail,E0599
+//! fn twice(s: tls_core::HybridSecret) -> (tls_core::HybridSecret, tls_core::HybridSecret) {
+//!     (s.clone(), s)
 //! }
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0382
 //! fn twice(s: tls_core::HybridSecret) -> (tls_core::HybridSecret, tls_core::HybridSecret) {
 //!     (s, s)
 //! }
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0423
 //! let forged = tls_core::HybridSecret(tls_core::Secret::<64>::zero());
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0277
 //! let forged: tls_core::HybridSecret = Default::default();
 //! ```
 
@@ -45,11 +45,13 @@ pub const EXCHANGE_RANDOMNESS_LEN: usize = 2 * 32;
 
 /// Bytes of stack [`scrub_session_stack`] zeroes below its caller: the
 /// ML-KEM encapsulation and X25519 frames that held the randomness, the
-/// ephemeral and both component secrets. PROVISIONAL (M6 deviation log,
-/// slice 3a): chosen well above libcrux's ML-KEM-768 encapsulation frames
-/// at the PD's opt-level inside the 128 KiB `tls` stack; the ct-harness
-/// residue case (slice 3b) asserts the painted high-water stays within it.
-pub const SCRUB_DEPTH_EXCHANGE: usize = 48 * 1024;
+/// ephemeral and both component secrets, and (from `on_hello_record`)
+/// `handshake::hello_keys`' frames around them. Measured by the ct-harness
+/// at the PD's opt-level (M6 code review T5): `hello_keys` 35 912 bytes
+/// below its caller, the exchange alone 34 040; 52 KiB keeps about 30 %
+/// headroom over the deeper, inside the 192 KiB `tls` stack. The residue
+/// mode's `exchange-depth` and `hello-depth` runs fail above it.
+pub const SCRUB_DEPTH_EXCHANGE: usize = 52 * 1024;
 
 /// The X25519MLKEM768 shared secret: not `Copy`/`Clone`/`Debug`, wiped on
 /// drop, made only by [`HybridSecret::exchange`] (the L14 adjudicating

@@ -1198,6 +1198,7 @@ dependencies = [
  "inner-core",
  "layout",
  "pdkit",
+ "ring",
  "sel4-microkit",
 ]
 

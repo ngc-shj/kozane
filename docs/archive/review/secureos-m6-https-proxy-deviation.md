@@ -289,8 +289,12 @@ Deviations:
   accepted, 8193 → 431). 501 covers CONNECT, absolute/authority/asterisk
   form, any Transfer-Encoding and Upgrade; precedence after all lines pass:
   missing Host (400), Expect (417), 413.
-- The rewrite Kani harness is bounded at 64 bytes / 3 fields (its dropped-
-  field check nests over the fields), below the plan's 96 B / 4 fields.
+- The rewrite Kani harness is bounded at a fixed request line
+  (`GET / HTTP/1.1`), at most 16 symbolic field bytes and at most 2 fields
+  (its dropped-field check nests over the fields; 40 symbolic bytes of whole
+  head timed out at 90 minutes), below the plan's 96 B / 4 fields. (This
+  entry said 64 B / 3 fields, an earlier bound; corrected in code review
+  round 1, T6.)
 
 ## Slice 3b (C7, C8 in the PD; probes)
 
@@ -1011,3 +1015,141 @@ Manifest: UNIT-TESTS 1203 → 1213, UNIT-SECRET 7 (new), UNIT-AUDIT-EVENT
 48 → 49, UNIT-TLS-WIRE 55 → 56, UNIT-HTTP-WIRE 64 → 65, LINT-CRATES 29 → 30,
 CHECK-PINS-FIXTURES 255 → 257, CT-SHAPE-FIXTURES 64 → 65, RESIDUE-CASES
 30 → 31.
+
+## Phase 3 round 1 fixes
+
+Code review round 1 (docs/archive/review/secureos-m6-https-proxy-code-review.md).
+Gates run by the implementer: make pins/lint/lint-pds/unit/laws/image/ct/
+ct-shape/bolero/mir. Not run (by the round's rules): Kani, Verus, make
+test/check, check-selftest. Unit- and ct-gate selftest cases below were
+red-proved on a throwaway copy; `test`-gate cases are written but unrun.
+
+- **F1, a reset listener's new client (security).** smoltcp puts a socket
+  reset in SYN-RECEIVED back to Listen, and a SYN in the same ingress batch
+  takes it again before the pass's `serve` sees Listen; the new client
+  inherited the admitted slot, its source (X-Forwarded-For) and its
+  per-source count. `Conn::serve` now treats the client as gone also when
+  the socket's remote endpoint is not the admitted `l.peer` (address and
+  port), or is None outside Closed/Listen, and retargets `l.peer` to the
+  current endpoint first, so the abort's RST to the new client is the one
+  `after_egress` awaits. Normal handshakes are unchanged (the endpoint
+  equals the admitted one). The comment that claimed Listen alone caught it
+  is rewritten. Integration case `https rst inherit` (residue boot, after
+  slowloris so its PeerReset line is the boot's first, total=1): SYN from
+  10.0.2.78:52000 answered, then its RST (seq ISN + 1) and a SYN from
+  10.0.2.79:52001 in one burst; wants a RST to 52001, TlsClosed(PeerReset)
+  and no backend connection. If the two segments were taken in different
+  passes the case fails naming whether p2 got a SYN-ACK. Selftest
+  `https-rst-inherit` (endpoint check removed).
+- **F2.** `Slot::error` on a Draining or Lingering slot (the unsent bytes
+  were its close_notify or alert) aborts it, with TlsClosed(Error), instead
+  of doing nothing until the linger or idle bound.
+- **F3.** A ClientHello with more than `MAX_EXTENSIONS` extensions is
+  `Refusal::Decode`, not `DuplicateExtension`.
+- **F4.** Stale `key`/`TlsKeyMismatch`/128 KiB references now name `tlskey`,
+  its `Mismatch` (code 8) and the 192 KiB stack.
+- **F5, `TX_BUF` 8 → 9 KiB (C10 said 8 KiB).** The client send buffer holds
+  two `MAX_CLIENT_OUT` (4169 B) writes, so a record can be queued while the
+  previous one is unacknowledged; asserted (`2 * MAX_CLIENT_OUT <= TX_BUF`).
+  +8 KiB static over eight connections, inside `TLS_STATE_MAX` (1 MiB,
+  asserted).
+- **S1, the inside TX tier.** `inner_core::from_tls` takes the inside TX
+  ring's free count and refuses (`FromTls::TxReserve`, audited as
+  `TxNoBuffer`, as `ingress` audits its `TxReserve`) unless more than
+  `INNER_TX_RESERVE` (NET_BUFFERS / 2) + `TLS_TX_SHARE_INSIDE` (16) buffers
+  are free, refusing at equality; the share is asserted inside the range at
+  compile time, and inner-core's own `NET_BUFFERS` is asserted equal to
+  layout's in pd-inner. pd-inner's `drain_tls` takes at most `TLS_DRAIN`
+  (layout::NET_BUFFERS) segments per notification through `ring::pass::drain`
+  (pd-inner now depends on `ring`): `tls` runs at `inner`'s priority and can
+  refill `tln` while it is drained. The bound is `drain`'s, red-proved by
+  `unbounded-drain`; a PD-constant mutation needs QEMU, so no separate
+  unit-level case exists for it. Unit pair at the boundary; selftest
+  `s1-inner-tls-tier`. The inner-core Kani harness passes a symbolic
+  `tx_free` (unrun here).
+- **S2, check-pins P20.** `exchange_with_randomness` may be named only in
+  hybrid.rs, tls-core's unit tests (src/tests.rs, which call it with fixed
+  randomness) and tools/ct-harness/, plus tls-core's `pub use hybrid::{..}`
+  re-export. Three deny fixtures (a call in pds/tls, an aliased import in
+  tls-core, a call beside the re-export) and two allow fixtures (the
+  harness and a comment; tls-core's tests); the two unterminated-literal
+  fixtures now also expect P20, which lexes every source it reads.
+- **S3.** The RFC 6979 candidate refusal probability is ≈ 2^-32 per
+  candidate (P-256's order lies ≈ 2^224 below 2^256), ≈ 2^-256 for the
+  8-candidate cap; code and plan corrected.
+- **S4.** `rewrite` drops True-Client-IP, X-Client-IP, X-Cluster-Client-IP,
+  CF-Connecting-IP, Fastly-Client-IP, X-Original-Forwarded-For and
+  Client-IP. Unit pair: each (either case) rewrites byte for byte as the
+  head without it; `X-Client-IP-Hint` passes unchanged. The rewrite Kani
+  harness's dropped-field loop grows from 8 to 15 names (unrun here).
+- **S5.** mkcert's docstring: a permitted dNSName subtree is NAME and its
+  subdomains.
+- **T1.** MIR-CRATES 9 → 10: `make mir` checks http-wire since its Kani
+  enrolment.
+- **T2.** Selftest `c2-tcp-offset` (the data-offset rule removed and the
+  options/payload `get` refusals made lenient, so the named test reddens)
+  and `c2-tls-egress-syn` (tls_egress's bare-SYN refusal removed).
+- **T3.** Selftest `residue-secret-drop` (`Secret`'s drop-time zeroize
+  removed) and `residue-wipe-state` (the read/write traffic secret wipes in
+  `wipe_state` removed), both on the residue boot, needles only the scan's
+  absence failure prints; the live controls are asserted first.
+- **T4.** A failed slowloris connect names the SYNs that crossed the tap,
+  the gateway's answers, the sniffer's drops and the TcpLimited/TlsClosed
+  audits since boot; no retry or wait.
+- **T5, `SCRUB_DEPTH_EXCHANGE` 48 → 52 KiB (measured).** `hello_keys` is
+  `pub` (doc: for the ct-harness only) and the residue mode's `hello-depth`
+  run calls it from the closure frame with no scrub after: 35 912 B below
+  that frame against 34 040 B for the exchange alone, 27 % headroom under
+  48 KiB, so the constant is 52 KiB (31 %). The `tls` stack high-water was
+  128 752 B of 196 608 B in the last https boot (s4p), so the 4 KiB stays
+  well inside STACK_HEADROOM_MIN. No scrub cost was documented, so none is
+  re-measured. RESIDUE-CASES 31 → 32; selftest `tls-hello-scrub-depth`
+  (constant 34 KiB: only `hello-depth` exceeds it); `tls-exchange-scrub-depth`'s
+  anchor follows the new value.
+- **T6.** The rewrite harness's doc and this log's Slice 4 part 1 entry
+  state its real bounds (fixed request line, ≤ 16 symbolic field bytes,
+  ≤ 2 fields); the harness body is unchanged.
+- **T7.** compile_fail doctests carry their error codes, each checked by
+  compiling: E0599 (clone; the doctest now clones an owned value, since
+  `.clone()` on a reference clones the reference and fails as E0308),
+  E0382 (moved twice), E0423 (private constructor), E0277 (Default in
+  tls-core, Debug in secret). `l14-clone`'s needle names the Clone doctest
+  by its line, read from the source.
+- **T8, T9.** The concurrent probe fails when no handshake completed and
+  records a D3 breach when a handshake failed with TlsTimeout(Handshake)
+  audited since its start. T9 was tried and rejected: TlsSignHighWater
+  prints only on a new maximum, so a since-mark window over the sequential
+  probe was empty on the gate run; the whole-boot maximum is the measurement.
+- **T10.** `check_secret_forms`, run first in the residue case: run.py's
+  `hkdf_expand_label` reproduces RFC 8448 section 3's server handshake key
+  and IV (checked against the RFC text) and every ChaCha20 key and IV of
+  tls-core's keylog fixture.
+- **T11, integration cost.** Guest-RAM snapshots (2 GiB each) per https
+  boot, from the code: https 1 (tls scalar count), https residue 4,
+  https flood 0, tls key failure 1. Wall time per boot is not in the logs
+  (build/s4p-it.log, build/s5-it.log carry no timestamps; their mtimes give
+  only end times), so it is not recorded.
+- **Environment.** M7 is QEMU-only (owner, 2026-10-24): VE10 (board timing:
+  throughput and handshake under real hardware) and VE11 (RNDR quality on a
+  board) cannot be verified in M6 or M7 and become residuals RM6-9 (VE10)
+  and RM6-10 (VE11), open until a board exists; VE9 (browser/WebPKI) stays
+  blocked-deferred.
+
+#### Round 1 gate runs: VPN boots failing under a concurrent solver
+
+Three `make test` runs of the round 1 tree failed in VPN boots that this
+round did not touch:
+
+- gx10: cookie boot a, "no ping reply through peer 2's session".
+- gx10: rp gate boot, "the spoofed endpoint got no CookieReply under load".
+- z1mn: rp gate boot, the same message.
+
+Each of those runs shared its host with a cbmc process. On gx10 it was a
+superseded http-wire harness loop that an earlier kill had missed; it ran
+for 3 h. On z1mn it was the full Kani suite. A fourth run on gx10, started
+after that loop was gone and with no solver on the host, passed both boots;
+it then failed in the https boot on the T9 change, recorded under T9.
+
+These rp and cookie cases are timing-sensitive (M3b). Integration runs
+therefore share a host with no solver. Before a run, the host's process
+list is checked for cbmc, kani-gate and cargo-kani.

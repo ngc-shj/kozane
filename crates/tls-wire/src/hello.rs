@@ -42,8 +42,8 @@ pub struct Extensions<'a> {
 
 /// Walks an extensions block (the bytes inside its two-byte length) by
 /// length: each extension lies within the block, a type seen twice is
-/// refused, as is a block of more than [`MAX_EXTENSIONS`]; pre_shared_key
-/// must be last (section 4.2.11). Unknown types are skipped.
+/// refused, a block of more than [`MAX_EXTENSIONS`] is a decode error;
+/// pre_shared_key must be last (section 4.2.11). Unknown types are skipped.
 pub fn walk(block: &[u8]) -> Result<Extensions<'_>, Refusal> {
     let mut r = Reader::new(block);
     let mut seen = [0u16; MAX_EXTENSIONS];
@@ -58,7 +58,8 @@ pub fn walk(block: &[u8]) -> Result<Extensions<'_>, Refusal> {
         if seen.get(..count).ok_or(Refusal::Internal)?.contains(&ty) {
             return Err(Refusal::DuplicateExtension);
         }
-        *seen.get_mut(count).ok_or(Refusal::DuplicateExtension)? = ty;
+        // A block over the cap is malformed for this profile, not a repeat.
+        *seen.get_mut(count).ok_or(Refusal::Decode)? = ty;
         count = count.saturating_add(1);
         match ty {
             ext::SUPPORTED_VERSIONS => out.supported_versions = Some(data),

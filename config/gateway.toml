@@ -4,7 +4,7 @@
 # Key files are relative to this file; rp_hash is BLAKE2s-256 of the file.
 # The TLS certificate is a placeholder too: tools/mkcert issued it for
 # 10.0.2.15 to a P-256 key that was discarded, so no blob matches it
-# (`key` reports TlsKeyMismatch; mksecrets writes a matching pair).
+# (`tlskey` refuses it as Mismatch, code 8; mksecrets writes a matching pair).
 
 [gateway]
 public_key = "78wdDVL8XdPitWIiZQ7OBEnnlJfytmjgXqe3dz2gyGA="

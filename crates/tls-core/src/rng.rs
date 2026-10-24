@@ -20,13 +20,13 @@ pub trait HedgeHw {
     fn counter(&mut self) -> u64;
 }
 
-/// Bytes of the boot seed `key` returns to `tls` (its per-caller seed).
+/// Bytes of the boot seed `tlskey` returns to `tls` (M6 plan C12).
 pub const SEED_LEN: usize = 32;
 const BLOCK: usize = 32;
 
 /// The hedged source (the `pq` pattern, `rosenpass_core::kem::Hedged`):
-/// each 32-byte block is HMAC-SHA256 keyed with `key`'s per-caller boot
-/// seed over a draw counter, CNTPCT and RNDR, so it stays unpredictable if
+/// each 32-byte block is HMAC-SHA256 keyed with `tlskey`'s boot seed
+/// over a draw counter, CNTPCT and RNDR, so it stays unpredictable if
 /// either the seed or RNDR is sound, and never repeats within a boot. A
 /// failed RNDR read, or a draw counter that would wrap, fails the draw.
 pub struct Hedged<H: HedgeHw> {

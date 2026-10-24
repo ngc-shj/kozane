@@ -21,8 +21,9 @@ constraints forbid, issued before its key is dropped:
 The CA key is generated in memory and never serialized: no copy of it
 exists once mkcert exits, so the CA can issue nothing else (S8). The CA
 is constrained to NAME in both name forms, so even its key could not
-vouch for another host: critical NameConstraints (name mode: permitted
-dNSName NAME, excluded iPAddress 0.0.0.0/0 and ::/0; IP mode: permitted
+vouch for a host outside it: critical NameConstraints (name mode: permitted
+dNSName NAME, which RFC 5280 §4.2.1.10 reads as NAME and its subdomains;
+excluded iPAddress 0.0.0.0/0 and ::/0; IP mode: permitted
 iPAddress NAME/32 and dNSName `invalid` (RFC 6761), excluded ::/0),
 basicConstraints CA:true with pathLen 0, 30 days' validity. The leaf has
 NAME in its SAN, EKU serverAuth, KU digitalSignature and CA:false; in IP

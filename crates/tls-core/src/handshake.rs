@@ -120,9 +120,11 @@ pub struct Session {
 /// written). The ephemeral, the ML-KEM randomness, both component secrets
 /// and every copy of the hybrid secret (the moves, HKDF-Extract's HMAC)
 /// stay in this call's frames, which the caller scrubs; only the schedule
-/// leaves.
+/// leaves. Public only for the ct-harness, whose `hello-depth` run checks
+/// that these frames lie within the scrub (M6 code review T5); the
+/// handshake is its one production caller.
 #[inline(never)]
-fn hello_keys<R: Rng>(
+pub fn hello_keys<R: Rng>(
     transcript: &mut Sha256,
     hello: &[u8],
     ch: &ClientHello<'_>,

@@ -263,7 +263,7 @@ fn to_backend(sport: u16) -> Vec<u8> {
 }
 
 fn out_of_tls(packet: &[u8]) -> FromTls {
-    from_tls(&CFG, packet, &mut [0u8; MAX_FRAME])
+    from_tls(&CFG, packet, NET_BUFFERS, &mut [0u8; MAX_FRAME])
 }
 
 #[test]
@@ -353,7 +353,7 @@ fn backend_segment_larger_than_the_output_is_dropped_not_panicked() {
 fn tls_syn_to_the_backend_leaves_framed_to_its_mac_unchanged() {
     let p = to_backend(TLS_START + 7);
     let mut out = [0u8; MAX_FRAME];
-    let FromTls::Emitted(n) = from_tls(&CFG, &p, &mut out) else { panic!("not emitted") };
+    let FromTls::Emitted(n) = from_tls(&CFG, &p, NET_BUFFERS, &mut out) else { panic!("not emitted") };
     assert_eq!(&out[..6], &HOST_MAC);
     assert_eq!(&out[6..12], &GW_MAC);
     assert_eq!(&out[wire::ETH_HDR..n], &p[..]);
@@ -365,7 +365,7 @@ fn tls_segment_with_ttl_one_still_leaves() {
     let mut p = to_backend(TLS_START);
     set_ttl(&mut p, 1);
     let mut out = [0u8; MAX_FRAME];
-    let FromTls::Emitted(n) = from_tls(&CFG, &p, &mut out) else { panic!("not emitted") };
+    let FromTls::Emitted(n) = from_tls(&CFG, &p, NET_BUFFERS, &mut out) else { panic!("not emitted") };
     assert_eq!(&out[wire::ETH_HDR..n], &p[..]);
 }
 
@@ -428,10 +428,25 @@ fn oversized_tls_packet_is_dropped() {
 #[test]
 fn backend_that_is_not_a_neighbor_is_unknown() {
     let cfg = Config { neighbors: &[(OTHER_HOST_IP, OTHER_HOST_MAC)], ..CFG };
-    assert_eq!(from_tls(&cfg, &to_backend(TLS_START), &mut [0u8; MAX_FRAME]), FromTls::UnknownNeighbor);
+    assert_eq!(from_tls(&cfg, &to_backend(TLS_START), NET_BUFFERS, &mut [0u8; MAX_FRAME]), FromTls::UnknownNeighbor);
 }
 
 #[test]
 fn small_output_buffer_for_tls_is_reported_not_panicked() {
-    assert_eq!(from_tls(&CFG, &to_backend(TLS_START), &mut [0u8; 20]), FromTls::NoBuffer);
+    assert_eq!(from_tls(&CFG, &to_backend(TLS_START), NET_BUFFERS, &mut [0u8; 20]), FromTls::NoBuffer);
+}
+
+/// S1 (M6 code review): `tls`'s segments take an inside TX buffer only
+/// above the reserve and their share; at the boundary itself they are
+/// refused, one buffer above it they leave.
+#[test]
+fn tls_segment_at_its_tier_boundary_is_refused() {
+    let edge = INNER_TX_RESERVE + TLS_TX_SHARE_INSIDE;
+    assert_eq!(from_tls(&CFG, &to_backend(TLS_START), edge, &mut [0u8; MAX_FRAME]), FromTls::TxReserve);
+}
+
+#[test]
+fn tls_segment_one_buffer_above_its_tier_leaves() {
+    let edge = INNER_TX_RESERVE + TLS_TX_SHARE_INSIDE;
+    assert!(matches!(from_tls(&CFG, &to_backend(TLS_START), edge + 1, &mut [0u8; MAX_FRAME]), FromTls::Emitted(_)));
 }

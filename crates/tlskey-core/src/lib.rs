@@ -376,8 +376,10 @@ impl Drbg {
 }
 
 /// Candidates tried before `TLS_SIGN` gives up with `ERR_CRYPTO`. A
-/// candidate outside [1, n−1], or one giving r = 0 or s = 0, has
-/// probability about 2^-128, so a second is already never expected.
+/// candidate is refused with probability about 2^-32: P-256's order n lies
+/// about 2^224 below 2^256, so a 256-bit candidate is at least n that
+/// often (r = 0 or s = 0 is negligible beside it). Eight refused in a row,
+/// the cap, has probability about 2^-256.
 pub const MAX_NONCE_CANDIDATES: usize = 8;
 
 /// The ECDSA P-256/SHA-256 sign function: (signature r ‖ s, message,

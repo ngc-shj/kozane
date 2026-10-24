@@ -63,8 +63,11 @@ const PROTECTED: [&[u8]; 6] = [
 ];
 /// Dropped by `rewrite` besides the fields `Connection` names. `Proxy`
 /// is not hop-by-hop, but CGI-style backends read it as `HTTP_PROXY`
-/// (httpoxy, CVE-2016-5385), so it goes with `Proxy-*`.
-const DROPPED: [&[u8]; 8] = [
+/// (httpoxy, CVE-2016-5385), so it goes with `Proxy-*`. The client-address
+/// fields CDNs and proxies set (from `Forwarded` on) go too: a backend that
+/// trusts any of them would take the client's word for its address, which
+/// only `X-Forwarded-For` carries (M6 code review S4).
+const DROPPED: [&[u8]; 15] = [
     b"proxy",
     b"connection",
     b"keep-alive",
@@ -73,6 +76,13 @@ const DROPPED: [&[u8]; 8] = [
     b"upgrade",
     b"forwarded",
     b"x-real-ip",
+    b"true-client-ip",
+    b"x-client-ip",
+    b"x-cluster-client-ip",
+    b"cf-connecting-ip",
+    b"fastly-client-ip",
+    b"x-original-forwarded-for",
+    b"client-ip",
 ];
 const DROPPED_PREFIXES: [&[u8]; 2] = [b"proxy-", b"x-forwarded-"];
 
@@ -611,7 +621,8 @@ fn trim_ows(s: &[u8]) -> &[u8] {
 /// Writes the head the backend sees into `out`: the request line verbatim;
 /// the field lines verbatim minus `Connection` and the fields it names,
 /// `Keep-Alive`, `Proxy` and `Proxy-*`, `TE`, `Trailer`, `Upgrade`, `Forwarded`,
-/// `X-Real-IP` and `X-Forwarded-*`; then `X-Forwarded-For: <client_ip>`,
+/// `X-Real-IP`, the other client-address fields of `DROPPED` and
+/// `X-Forwarded-*`; then `X-Forwarded-For: <client_ip>`,
 /// `X-Forwarded-Proto: https`, `Connection: close` and the blank line.
 /// Returns the length written; `MAX_REWRITE` bytes always suffice.
 pub fn rewrite<const N: usize>(head: &Head<'_, N>, client_ip: [u8; 4], out: &mut [u8]) -> Result<usize, HttpRefusal> {

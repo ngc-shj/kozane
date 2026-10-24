@@ -31,7 +31,7 @@ use crate::wipe;
 
 mod proxy;
 
-pub use proxy::{BACKEND_CHUNK, BAD_GATEWAY, BackendEnd, MAX_CLIENT_OUT, Next, Outcome, Outcomes, backend_end};
+pub use proxy::{BACKEND_CHUNK, BAD_GATEWAY, BackendEnd, MAX_CLIENT_OUT, Next, Outcome, Outcomes, backend_end, client_left};
 
 pub const MAX_CONNS: usize = 8;
 /// Connections one source address may hold (S17).

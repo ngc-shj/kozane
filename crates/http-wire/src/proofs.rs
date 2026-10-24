@@ -131,9 +131,10 @@ fn content_length_parse_is_exact_and_saturates() {
     kani::cover!(r == Err(HttpRefusal::ContentLength));
 }
 
-/// An accepted head of 0..=64 bytes and at most 3 fields rewrites into a
-/// buffer `REWRITE_GROWTH` bytes larger than the head, starting with the
-/// request line and ending with ours.
+/// An accepted head of the fixed request line `GET / HTTP/1.1` and at most
+/// 16 symbolic field bytes, parsed with room for at most 2 fields, rewrites
+/// into a buffer `REWRITE_GROWTH` bytes larger than the head, starting with
+/// the request line and ending with ours.
 #[kani::proof]
 #[kani::unwind(18)]
 fn rewrite_fits_and_keeps_the_request_line() {

@@ -5,19 +5,19 @@
 //!
 //! [`Secret`] is not `Clone`, `Copy` or `Debug`:
 //!
-//! ```compile_fail
-//! fn twice(s: &secret::Secret<32>) -> secret::Secret<32> {
-//!     s.clone()
+//! ```compile_fail,E0599
+//! fn twice(s: secret::Secret<32>) -> (secret::Secret<32>, secret::Secret<32>) {
+//!     (s.clone(), s)
 //! }
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0382
 //! fn twice(s: secret::Secret<32>) -> (secret::Secret<32>, secret::Secret<32>) {
 //!     (s, s)
 //! }
 //! ```
 //!
-//! ```compile_fail
+//! ```compile_fail,E0277
 //! fn show(s: &secret::Secret<32>) -> String {
 //!     format!("{s:?}")
 //! }

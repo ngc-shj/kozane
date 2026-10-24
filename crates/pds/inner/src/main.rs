@@ -12,6 +12,7 @@ use audit_event::Event;
 use inner_core::{Config, FromLan, FromTls, TLS_REFUSED, ToLan, from_lan, from_tls, to_lan};
 use layout::inner as ch;
 use pdkit::{Audit, Buf, Rx, Tx};
+use ring::pass::drain;
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, memory_region_symbol, protection_domain};
 
 const ETH_IN: Channel = Channel::new(ch::CH_ETH_IN);
@@ -19,6 +20,12 @@ const DATA: Channel = Channel::new(ch::CH_DATA);
 const TLS: Channel = Channel::new(ch::CH_TLS);
 const MAX_NEIGHBORS: usize = config::MAX_NEIGHBORS;
 const _: () = assert!(config::NEIGHBORS.len() <= MAX_NEIGHBORS);
+const _: () = assert!(inner_core::NET_BUFFERS == layout::NET_BUFFERS, "inner-core NET_BUFFERS differs from layout");
+/// Segments taken from `tln` per notification (M6 code review S1): `tls`
+/// runs at this PD's priority and can refill the ring while it is drained,
+/// so the drain is bounded rather than run until empty. What is left waits
+/// for the next notification; `tls` retransmits what the tier refused.
+const TLS_DRAIN: usize = layout::NET_BUFFERS;
 
 struct Inner {
     from_driver: Rx,
@@ -162,24 +169,36 @@ impl Inner {
         }
     }
 
-    /// `tls`'s segments leave only through `from_tls`, the gate for what
-    /// `tls` can reach inside.
+    /// `tls`'s segments, at most `TLS_DRAIN` of them.
     fn drain_tls(&mut self, wake: &mut Wake) {
-        while let Some(n) = pdkit::recv(&mut self.from_tls, &mut self.buf, &mut self.audit) {
-            wake.tls = true;
-            let cfg = lan_config(self.neighbors.get(..self.neighbor_count).unwrap_or(&[]));
-            let frame = &mut self.reply;
-            match from_tls(&cfg, self.buf.get(..n).unwrap_or(&[]), frame) {
-                FromTls::Emitted(len) => {
-                    let f = frame.get(..len).unwrap_or(&[]);
-                    wake.driver |= pdkit::send(&mut self.to_driver, &mut self.scratch, f, &mut self.audit);
-                }
-                FromTls::Dropped(reason) => self.audit.record(Event::FrameDropped { reason: reason as u16 }),
-                FromTls::Refused => self.audit.record(Event::FrameDropped { reason: TLS_REFUSED as u16 }),
-                FromTls::UnknownNeighbor => self.audit.record(Event::UnknownNeighbor),
-                FromTls::NoBuffer => self.audit.record(Event::TxNoBuffer),
+        drain(TLS_DRAIN, || self.tls_one(wake));
+    }
+
+    /// One of `tls`'s segments, which leaves only through `from_tls`, the
+    /// gate for what `tls` can reach inside; `false` when `tln` is empty.
+    fn tls_one(&mut self, wake: &mut Wake) -> bool {
+        let Some(n) = pdkit::recv(&mut self.from_tls, &mut self.buf, &mut self.audit) else { return false };
+        wake.tls = true;
+        let tx_free = match self.to_driver.free() {
+            Ok(n) => n,
+            Err(e) => {
+                self.audit.link_error(e);
+                0
             }
+        };
+        let cfg = lan_config(self.neighbors.get(..self.neighbor_count).unwrap_or(&[]));
+        let frame = &mut self.reply;
+        match from_tls(&cfg, self.buf.get(..n).unwrap_or(&[]), tx_free, frame) {
+            FromTls::Emitted(len) => {
+                let f = frame.get(..len).unwrap_or(&[]);
+                wake.driver |= pdkit::send(&mut self.to_driver, &mut self.scratch, f, &mut self.audit);
+            }
+            FromTls::Dropped(reason) => self.audit.record(Event::FrameDropped { reason: reason as u16 }),
+            FromTls::Refused => self.audit.record(Event::FrameDropped { reason: TLS_REFUSED as u16 }),
+            FromTls::UnknownNeighbor => self.audit.record(Event::UnknownNeighbor),
+            FromTls::NoBuffer | FromTls::TxReserve => self.audit.record(Event::TxNoBuffer),
         }
+        true
     }
 }
 

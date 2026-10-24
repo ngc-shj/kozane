@@ -476,7 +476,7 @@ fn more_than_64_extensions_are_refused() {
     }
     assert_eq!(parse(&ch), Ok(()));
     let ch = ch.push(0x6fff, vec![]);
-    assert_eq!(parse(&ch), Err(Refusal::DuplicateExtension));
+    assert_eq!(parse(&ch), Err(Refusal::Decode));
 }
 
 #[test]

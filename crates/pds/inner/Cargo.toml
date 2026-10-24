@@ -10,4 +10,5 @@ config = { path = "../../config" }
 inner-core = { path = "../../inner-core" }
 layout = { path = "../../layout" }
 pdkit = { path = "../../pdkit" }
+ring = { path = "../../ring" }
 sel4-microkit.workspace = true

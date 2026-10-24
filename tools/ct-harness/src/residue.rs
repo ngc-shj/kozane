@@ -132,8 +132,9 @@ const MLKEM_CT_LEN: usize = 1088;
 /// (every draw of each stream, the two crafted rejections), the generic
 /// shim once per entry, the envelope open for each blob kind (key, pq and,
 /// since M6 plan C12, tls), the hybrid exchange (its depth run, then its
-/// scan) and the ClientHello through the handshake.
-const CASES: usize = ENTRIES * CLASSES.len() + (1 + 3 + 4) + 2 + ENTRIES + 3 + 2 + 1;
+/// scan), the ClientHello's keys at their call site (a depth run) and the
+/// ClientHello through the handshake.
+const CASES: usize = ENTRIES * CLASSES.len() + (1 + 3 + 4) + 2 + ENTRIES + 3 + 2 + 1 + 1;
 
 /// 8-byte windows of the secret forms, at every byte offset.
 struct Needles {
@@ -732,12 +733,31 @@ pub fn run() -> ! {
         first.iter().any(|&b| b != 0) && first == second,
     );
 
+    // What the production scrub after `hello_keys` must cover (M6 code
+    // review T5): its frames (the exchange, the ServerHello, the key
+    // schedule and every copy of the hybrid secret) below the frame that
+    // called it, here the closure's as on_hello_record's in the PD, with no
+    // scrub after it.
+    let record = client_hello_record(&client.share);
+    let hello = &record[5..];
+    let ch = tls_wire::hello::client_hello(&hello[4..]).expect("the residue case's ClientHello");
+    let mut depth_rng = Box::new(Replay {
+        bytes: [&client.randomness[..], &[0x7a; 32][..]].concat(),
+        at: 0,
+    });
+    let mut depth_out = vec![0u8; 16 * 1024];
+    let mut keyed = Box::new(false);
+    scan.ceiling("hello-depth", SCRUB_DEPTH_EXCHANGE, || {
+        let mut transcript = libcrux_sha2::Sha256::new();
+        *keyed = handshake::hello_keys(&mut transcript, hello, &ch, &mut depth_out, &mut *depth_rng).is_ok();
+    });
+    scan.check("hello-depth keys", *keyed && depth_rng.at == depth_rng.bytes.len());
+
     // The same exchange at its production call site: on_hello_record calls
     // HybridSecret::exchange, then scrub_session_stack, then builds the
     // flight. Nothing here scrubs after the call, so a missing production
     // scrub leaves the exchange's secrets in the dead frames below it. The
     // session and buffers are on the heap, so only frames are scanned.
-    let record = client_hello_record(&client.share);
     let mut rng = Box::new(Replay {
         bytes: [&client.randomness[..], &[0x7a; 32][..]].concat(),
         at: 0,

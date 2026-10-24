@@ -375,7 +375,7 @@ CASES = [
     ("P12 external_body after a raw C string", {"P12"},
      lambda t: edit(t / "crates/wg-wire/src/replay.rs", "#[inline]\nfn below_window(", "const C: &core::ffi::CStr = cr#\"\"\"#;\n#[verifier::external_body]\n" + "#[inline]\nfn below_window(")),
     # P18 lexes every crate and tool source too.
-    ("P12 an unterminated string", {"P12", "P13", "P18"},
+    ("P12 an unterminated string", {"P12", "P13", "P18", "P20"},
      lambda t: append(t / "crates/wg-wire/src/replay.rs", '\nconst S: &str = "never closed;\n')),
     ("allow a nested block comment", set(),
      lambda t: append(t / "crates/wg-wire/src/replay.rs", "\n/* outer /* inner */ still a comment */\n")),
@@ -409,7 +409,7 @@ CASES = [
     ("P14 unsafe after a URL string on its line", {"P14"},
      lambda t: append(t / "crates/mce460896/src/gf.rs",
                       '\nconst U: &str = "https://x"; pub fn g(p: *const u8) -> u8 { unsafe { *p } }\n')),
-    ("an unterminated string in mce460896 fails every rule that lexes it", {"P9", "P10", "P13", "P14", "P18"},
+    ("an unterminated string in mce460896 fails every rule that lexes it", {"P9", "P10", "P13", "P14", "P18", "P20"},
      lambda t: append(t / "crates/mce460896/src/gf.rs", '\nconst S: &str = "never closed;\n')),
     ("P12 a crate outside verus_crates depending on vstd", {"P12"},
      lambda t: edit(t / "Cargo.lock", 'name = "mce460896"\nversion = "0.1.0"\ndependencies = [\n',
@@ -702,6 +702,23 @@ CASES = [
     ("allow a classical code point in a comment or outside tls-core", set(),
      lambda t: (append(t / "crates/tls-core/src/lib.rs", "\n// x25519 is 0x001d; refused by tls-wire\n"),
                 append(t / "crates/tls-wire/src/lib.rs", "\nconst G: u16 = 0x001d;\n"))),
+    # P20 (M6 code review S2): the caller-randomness exchange stays with
+    # its shim, tls-core's tests and the ct-harness.
+    ("P20 exchange_with_randomness called in pds/tls", {"P20"},
+     lambda t: append(t / "crates/pds/tls/src/main.rs",
+                      "\nfn ex(s: &[u8; 1216]) {\n    let _ = tls_core::exchange_with_randomness(s, &[0; 64]);\n}\n")),
+    ("P20 exchange_with_randomness imported under an alias in tls-core", {"P20"},
+     lambda t: append(t / "crates/tls-core/src/handshake.rs", "\nuse crate::hybrid::exchange_with_randomness as ex;\n")),
+    ("P20 exchange_with_randomness called in tls-core's lib beside the re-export", {"P20"},
+     lambda t: append(t / "crates/tls-core/src/lib.rs",
+                      "\nfn ex(s: &[u8; 1216]) {\n    let _ = hybrid::exchange_with_randomness(s, &[0; 64]);\n}\n")),
+    ("allow exchange_with_randomness in the ct-harness and in comments", set(),
+     lambda t: (append(t / "tools/ct-harness/src/residue.rs",
+                       "\nfn again(s: &[u8; 1216]) {\n    let _ = exchange_with_randomness(s, &[0; 64]);\n}\n"),
+                append(t / "crates/pds/tls/src/main.rs", "\n// exchange_with_randomness is the harness's root.\n"))),
+    ("allow exchange_with_randomness in tls-core's tests", set(),
+     lambda t: append(t / "crates/tls-core/src/tests.rs",
+                      "\nfn again(s: &[u8; 1216]) {\n    let _ = exchange_with_randomness(s, &[0; 64]);\n}\n")),
 ]
 
 

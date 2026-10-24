@@ -543,6 +543,40 @@ Connection: close\r\n\
     assert_eq!(rewritten(bytes, [192, 0, 2, 7]), expected);
 }
 
+/// The client-address fields a CDN or proxy sets (S4): each one dropped, so
+/// the head with it rewrites byte for byte as the head without it.
+const CLIENT_ADDRESS_FIELDS: [&str; 7] = [
+    "True-Client-IP",
+    "X-Client-IP",
+    "X-Cluster-Client-IP",
+    "CF-Connecting-IP",
+    "Fastly-Client-IP",
+    "X-Original-Forwarded-For",
+    "Client-IP",
+];
+
+#[test]
+fn rewrite_drops_each_client_address_field() {
+    let plain = rewritten(&req("Accept: */*\r\n"), [192, 0, 2, 7]);
+    for field in CLIENT_ADDRESS_FIELDS {
+        let with = req(&std::format!("{field}: 127.0.0.1\r\nAccept: */*\r\n"));
+        assert_eq!(rewritten(&with, [192, 0, 2, 7]), plain, "{field}");
+        let lower = req(&std::format!("{}: 127.0.0.1\r\nAccept: */*\r\n", field.to_ascii_lowercase()));
+        assert_eq!(rewritten(&lower, [192, 0, 2, 7]), plain, "{field} in lower case");
+    }
+}
+
+/// The allow side: a custom field whose name only extends one of them
+/// passes unchanged, in its place.
+#[test]
+fn rewrite_keeps_a_custom_field_that_only_resembles_a_client_address_field() {
+    let fields = "X-Client-IP-Hint: 127.0.0.1\r\nAccept: */*\r\n";
+    let expected = std::format!(
+        "GET / HTTP/1.1\r\nHost: example.com\r\n{fields}X-Forwarded-For: 192.0.2.7\r\nX-Forwarded-Proto: https\r\nConnection: close\r\n\r\n"
+    );
+    assert_eq!(rewritten(&req(fields), [192, 0, 2, 7]), expected.as_bytes());
+}
+
 #[test]
 fn rewrite_passes_ordinary_fields_unchanged() {
     let fields = "User-Agent: curl/8.11.1\r\nX-Custom:\tvalue  \r\nCookie: a=b; c=d\r\nX-Forwarded: kept\r\nProxyish: kept\r\n";
@@ -671,7 +705,7 @@ fn fuzz_one(bytes: &[u8]) {
         assert_eq!(count(&again, name), 1);
     }
     for f in again.headers() {
-        for dropped in [&b"keep-alive"[..], b"te", b"trailer", b"forwarded", b"x-real-ip"] {
+        for dropped in [&b"keep-alive"[..], b"te", b"trailer", b"forwarded", b"x-real-ip", b"true-client-ip", b"client-ip"] {
             assert!(!f.name.eq_ignore_ascii_case(dropped));
         }
     }

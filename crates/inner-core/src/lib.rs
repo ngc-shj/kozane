@@ -99,7 +99,26 @@ pub enum FromTls {
     UnknownNeighbor,
     /// `out` cannot hold the frame.
     NoBuffer,
+    /// Valid and for the backend, but no TX buffer above `tls`'s tier.
+    TxReserve,
 }
+
+/// Buffers per network ring. Equal to `layout::NET_BUFFERS`, which this
+/// crate does not depend on; the inner PD asserts the two equal.
+pub const NET_BUFFERS: usize = 64;
+/// The inside TX buffers `tls`'s segments never take: they stay for the
+/// tunnel's packets to the LAN and ARP replies (M6 code review S1, as
+/// `ingress`'s `TX_RESERVE` outside).
+const INNER_TX_RESERVE: usize = NET_BUFFERS / 2;
+/// Of the buffers above the reserve, the share `tls`'s segments leave to
+/// everything else, so a flood at 443 that makes `tls` talk to the backend
+/// cannot take the inside NIC's TX ring from the tunnel (ingress's
+/// `TLS_TX_SHARE` outside).
+pub const TLS_TX_SHARE_INSIDE: usize = 16;
+const _: () = assert!(
+    0 < TLS_TX_SHARE_INSIDE && TLS_TX_SHARE_INSIDE < NET_BUFFERS - INNER_TX_RESERVE,
+    "TLS_TX_SHARE_INSIDE out of range"
+);
 
 /// The audit reason for `FromTls::Refused`: the one `ingress` gives a
 /// refused `tls` segment (plan C2); the audit line's source PD tells the
@@ -202,8 +221,10 @@ pub fn to_lan(cfg: &Config<'_>, packet: &[u8], out: &mut [u8]) -> ToLan {
 /// from `tln` leaves only as a valid IPv4/TCP datagram of at most 1500
 /// bytes, both checksums right, from our address and one of `tls`'s ports
 /// to exactly the backend's address and port, framed to the backend's
-/// static MAC. `tls` is the origin, so the TTL is left alone.
-pub fn from_tls(cfg: &Config<'_>, packet: &[u8], out: &mut [u8]) -> FromTls {
+/// static MAC, and only while more than `INNER_TX_RESERVE +
+/// TLS_TX_SHARE_INSIDE` of the inside TX buffers are free (`tx_free`).
+/// `tls` is the origin, so the TTL is left alone.
+pub fn from_tls(cfg: &Config<'_>, packet: &[u8], tx_free: usize, out: &mut [u8]) -> FromTls {
     if packet.len() > wire::MAX_FRAME - wire::ETH_HDR {
         return FromTls::Dropped(DropReason::TooLong);
     }
@@ -225,6 +246,9 @@ pub fn from_tls(cfg: &Config<'_>, packet: &[u8], out: &mut [u8]) -> FromTls {
     let Some(dst) = cfg.neighbor_mac(&p.dst) else {
         return FromTls::UnknownNeighbor;
     };
+    if tx_free <= INNER_TX_RESERVE + TLS_TX_SHARE_INSIDE {
+        return FromTls::TxReserve;
+    }
     let frame = Frame { eth: EthAddrs { src: cfg.mac, dst }, body: Body::Ipv4(p) };
     match wire::emit(&frame, out) {
         Ok(n) => FromTls::Emitted(n),
@@ -337,7 +361,7 @@ mod proofs {
         kani::assume(len <= 64);
         let packet = buf.get(..len).unwrap_or(&[]);
         let mut out = [0u8; 80];
-        let o = from_tls(&CFG, packet, &mut out);
+        let o = from_tls(&CFG, packet, kani::any(), &mut out);
         if let FromTls::Emitted(n) = o {
             assert!(n <= out.len() && n >= wire::ETH_HDR + 40);
             let ip = &out[wire::ETH_HDR..n];

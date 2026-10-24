@@ -78,6 +78,12 @@ Rules:
      a 4-digit hex literal (0x0017, 0x001D, 0x0100), x25519/x448 as 0x1d/0x1e,
      a byte pair (`0x00, 0x1d`, `0, 29`), a u16-suffixed decimal (`23u16`) or
      a bare `29`
+  P20 `exchange_with_randomness`, the exchange that takes its randomness
+     from the caller, named in crates/ or tools/ (*.rs) only in
+     crates/tls-core/src/hybrid.rs (its definition and the RNG-drawing
+     shim), tls-core's unit tests (src/tests.rs) and tools/ct-harness/,
+     plus tls-core's `pub use hybrid::{..}` re-export (M6 code review S2):
+     production randomness comes only through `HybridSecret::exchange`
 
 Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
 fail until they are removed from PENDING; --enforce-pending makes them fail
@@ -95,6 +101,8 @@ that gate made to fail.
 
 P6 is a fail-closed binding check (Cargo.lock against
 policy/waivers.toml).
+P20 is a tripwire over names: a dependency re-exporting the function under
+another name escapes it.
 P7-P11 and P19 are best-effort tripwires over source text; P19's known
 bypasses: a code point computed (`0x10 + 13`), built from bytes out of
 order, read from configuration, or spelled in a dependency. L14's
@@ -128,7 +136,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P18",
-         "P19"]
+         "P19", "P20"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
                "crates/tls-core", "crates/tlskey-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data",
@@ -166,6 +174,10 @@ HYBRID_MODULE = "crates/tls-core/src/hybrid.rs"
 HYBRID_ROOT = "exchange_with_randomness"
 # P19: where the classical code points must not appear.
 CODE_POINT_CRATE = "crates/tls-core"
+# P20: where the caller-randomness exchange may be named, and the one
+# re-export of it.
+EXCHANGE_ALLOWED = ("crates/tls-core/src/hybrid.rs", "crates/tls-core/src/tests.rs", "tools/ct-harness/")
+EXCHANGE_REEXPORT = "crates/tls-core/src/lib.rs"
 
 
 def run_blocks(dockerfile: str):
@@ -435,6 +447,21 @@ def check_hybrid_constructors(root: pathlib.Path, out: list):
     module = root / HYBRID_MODULE
     if (root / CODE_POINT_CRATE).is_dir() and (not module.is_file() or body_span(module.read_text(), HYBRID_ROOT) is None):
         out.append(f"P18 {HYBRID_MODULE}: no {HYBRID_ROOT}; the constructor rule has nothing to anchor on")
+
+
+def check_exchange_callers(root: pathlib.Path, out: list):
+    for top in ("crates", "tools"):
+        for rel, text in crate_sources(root, top):
+            if not rel.endswith(".rs") or rel.startswith(EXCHANGE_ALLOWED):
+                continue
+            code = strip_rust_comments(text)
+            unterminated("P20", rel, code, out)
+            if rel == EXCHANGE_REEXPORT:
+                code = re.sub(r"\bpub\s+use\s+hybrid::\{[^}]*\}\s*;", lambda m: re.sub(r"[^\n]", " ", m.group(0)), code)
+            for m in re.finditer(r"\bexchange_with_randomness\b", code):
+                n = code.count("\n", 0, m.start()) + 1
+                out.append(f"P20 {rel}:{n}: exchange_with_randomness named outside hybrid.rs, tls-core's tests and "
+                           "tools/ct-harness; randomness comes through HybridSecret::exchange (S2)")
 
 
 # P19: classical groups (RFC 8446 section 4.2.7, RFC 8734, RFC 7919) as
@@ -753,6 +780,7 @@ def main() -> int:
     check_mce_deps(root, out)
     check_hybrid_constructors(root, out)
     check_classical_groups(root, out)
+    check_exchange_callers(root, out)
     failing = [l for l in out if l.split()[0] not in pending]
     for line in out:
         print(line if line in failing else f"pending {line}")
