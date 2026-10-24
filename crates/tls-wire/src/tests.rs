@@ -172,6 +172,13 @@ fn refusal_codes_are_their_index_and_fit_the_audit_width() {
 }
 
 #[test]
+fn refusal_names_are_the_variant_names() {
+    for r in Refusal::ALL {
+        assert_eq!(r.name(), std::format!("{r:?}"));
+    }
+}
+
+#[test]
 fn every_refusal_but_the_peers_own_answers_with_an_alert() {
     for r in Refusal::ALL {
         assert_eq!(r.alert().is_none(), matches!(r, Refusal::PeerAlert | Refusal::Closed), "{r:?}");

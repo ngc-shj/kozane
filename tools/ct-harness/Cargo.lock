@@ -194,9 +194,23 @@ version = "0.1.0"
 dependencies = [
  "keccak",
  "libc",
+ "libcrux-chacha20poly1305",
+ "libcrux-curve25519",
+ "libcrux-hacl-rs",
+ "libcrux-hmac",
+ "libcrux-intrinsics",
+ "libcrux-macros",
+ "libcrux-ml-kem",
+ "libcrux-platform",
+ "libcrux-poly1305",
+ "libcrux-secrets",
+ "libcrux-sha2",
+ "libcrux-sha3",
+ "libcrux-traits",
  "mce460896",
  "secret-blob",
  "sha3",
+ "tls-core",
  "tpm2",
  "tpm2-wire",
 ]
@@ -500,6 +514,20 @@ checksum = "2afdd4da30d6e23f76bd6f3ad61be5c773720349eef3e791f8b79cfea3fe1436"
 dependencies = [
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "libcrux-ml-kem"
+version = "0.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ceed00367748ec0b545bc4a7b0521f8c9fd476d02484340f0a95b0f45f828cd"
+dependencies = [
+ "hax-lib 0.4.2",
+ "libcrux-intrinsics",
+ "libcrux-platform",
+ "libcrux-secrets",
+ "libcrux-sha3",
+ "libcrux-traits",
 ]
 
 [[package]]
@@ -899,6 +927,24 @@ dependencies = [
  "quote",
  "syn 2.0.119",
 ]
+
+[[package]]
+name = "tls-core"
+version = "0.1.0"
+dependencies = [
+ "ct",
+ "libcrux-chacha20poly1305",
+ "libcrux-curve25519",
+ "libcrux-hmac",
+ "libcrux-ml-kem",
+ "libcrux-sha2",
+ "tls-wire",
+ "zeroize",
+]
+
+[[package]]
+name = "tls-wire"
+version = "0.1.0"
 
 [[package]]
 name = "tpm2"

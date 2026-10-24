@@ -7,6 +7,15 @@
 //! The same scan covers the envelope-open closure `key` and `pqkey` ship
 //! (M5 plan I10.3): `tpm2::envelope::open_sealed` on an envelope sealed
 //! here under a known KEK, its needles the KEK and the opened blob.
+//!
+//! And the hybrid key exchange `tls` ships (M6 plan C7, T-R4-1):
+//! `tls_core::exchange_with_randomness` with known randomness, answering a
+//! client share made here, then `tls_core::scrub_session_stack` from the
+//! same frame. Its needles are the X25519 ephemeral (raw and clamped), the
+//! ML-KEM encapsulation randomness and the G state derived from it, and
+//! both component shared secrets, computed on the client side. A run
+//! without the scrub first measures the exchange's own depth against
+//! `SCRUB_DEPTH_EXCHANGE`, what the scrub covers.
 
 use std::collections::{HashMap, HashSet};
 use std::hint::black_box;
@@ -20,12 +29,17 @@ use mce460896::{
 use tpm2::Secret;
 use tpm2::envelope::{self, Envelope, Kind, OPEN_SCRUB_DEPTH, SEAL_ENTROPY_LEN};
 
+use libcrux_ml_kem::mlkem768::{self, MlKem768Ciphertext};
+use sha3::{Digest, Sha3_256, Sha3_512};
+use tls_core::hybrid::EXCHANGE_RANDOMNESS_LEN;
+use tls_core::{CLIENT_SHARE_LEN, SCRUB_DEPTH_EXCHANGE, SERVER_SHARE_LEN, exchange_with_randomness, scrub_session_stack};
+
 use crate::stack::OwnedStack;
 use crate::vectors::{self, CLASSES, ENTRIES, SYND_BYTES, SYS_N, Vectors, boxed, h32};
 use crate::vg;
 
 /// The needle forms; a hit line names one.
-const FORMS: [&str; 12] = [
+const FORMS: [&str; 17] = [
     "rand",
     "e-bytes",
     "ind",
@@ -38,6 +52,11 @@ const FORMS: [&str; 12] = [
     "ss",
     "kek",
     "plain",
+    "eph",
+    "kem-rand",
+    "kem-g",
+    "kem-ss",
+    "x-ss",
 ];
 #[derive(Clone, Copy)]
 enum Form {
@@ -53,6 +72,11 @@ enum Form {
     Ss,
     Kek,
     Plain,
+    Eph,
+    KemRand,
+    KemG,
+    KemSs,
+    XSs,
 }
 
 /// The stack each call runs on, and the padding frame between the
@@ -81,14 +105,26 @@ const _: () = assert!(
     "the open's scrub must cover the painted-depth floor"
 );
 
+/// The hybrid exchange's floor: what `exchange_with_randomness` disturbs
+/// with or without the scrub, about half its own peak on this build
+/// (33 KiB, the `exchange-depth` run).
+const FLOOR_EXCHANGE: usize = 16 * 1024;
+const _: () = assert!(
+    SCRUB_DEPTH_EXCHANGE >= FLOOR_EXCHANGE,
+    "the exchange's scrub must cover the painted-depth floor"
+);
+
+const MLKEM_CT_LEN: usize = 1088;
+
 /// Decapsulations (the four classes per entry), encapsulation attempts
 /// (every draw of each stream, the two crafted rejections), the generic
-/// shim once per entry, and the envelope open for each blob kind.
-const CASES: usize = ENTRIES * CLASSES.len() + (1 + 3 + 4) + 2 + ENTRIES + 2;
+/// shim once per entry, the envelope open for each blob kind, and the
+/// hybrid exchange (its depth run, then its scan).
+const CASES: usize = ENTRIES * CLASSES.len() + (1 + 3 + 4) + 2 + ENTRIES + 2 + 2;
 
 /// 8-byte windows of the secret forms, at every byte offset.
 struct Needles {
-    windows: HashMap<u64, u16>,
+    windows: HashMap<u64, u32>,
     public: HashSet<u64>,
 }
 
@@ -111,7 +147,7 @@ impl Needles {
             *self
                 .windows
                 .entry(u64::from_le_bytes(w.try_into().expect("8")))
-                .or_insert(0) |= 1 << form as u16;
+                .or_insert(0) |= 1 << form as u32;
         }
     }
 
@@ -339,6 +375,83 @@ fn sealed_envelope(kind: Kind, len: usize) -> (Vec<u8>, Box<Secret<32>>, Vec<u8>
     (env, kek, plain)
 }
 
+/// A client share made here from fixed seeds (an ML-KEM-768 encapsulation
+/// key, then an X25519 public key), the server's randomness, and the
+/// client's two secret keys, to compute the component secrets with.
+struct ClientShare {
+    share: Box<[u8; CLIENT_SHARE_LEN]>,
+    randomness: Box<[u8; EXCHANGE_RANDOMNESS_LEN]>,
+    kem: mlkem768::MlKem768KeyPair,
+    x_sk: [u8; 32],
+}
+
+fn client_share() -> ClientShare {
+    let kem = mlkem768::generate_key_pair(stream(b"tls-client-kem", 64).try_into().expect("64"));
+    let x_sk: [u8; 32] = stream(b"tls-client-x25519", 32).try_into().expect("32");
+    let mut x_pk = [0u8; 32];
+    libcrux_curve25519::secret_to_public(&mut x_pk, &x_sk);
+    let mut share = Box::new([0u8; CLIENT_SHARE_LEN]);
+    share[..CLIENT_SHARE_LEN - 32].copy_from_slice(kem.pk());
+    share[CLIENT_SHARE_LEN - 32..].copy_from_slice(&x_pk);
+    let randomness = Box::new(stream(b"tls-exchange", EXCHANGE_RANDOMNESS_LEN).try_into().expect("64"));
+    ClientShare {
+        share,
+        randomness,
+        kem,
+        x_sk,
+    }
+}
+
+/// SHA3-512's state after its one permutation of the 64-byte `msg` (rate
+/// 72, domain 0x06). Checked against `sha3`: its first 64 bytes are the
+/// digest.
+fn sha3_512_state(msg: &[u8]) -> [u64; 25] {
+    let mut block = [0u8; 72];
+    block[..64].copy_from_slice(msg);
+    block[64] = 0x06;
+    block[71] |= 0x80;
+    let mut st = [0u64; 25];
+    for (lane, c) in st.iter_mut().zip(block.chunks(8)) {
+        *lane = u64::from_le_bytes(c.try_into().expect("8"));
+    }
+    keccak::f1600(&mut st);
+    assert_eq!(
+        words_to_bytes(&st)[..64],
+        Sha3_512::digest(msg)[..],
+        "sponge model differs from sha3"
+    );
+    st
+}
+
+/// The exchange's needles, from the server share it answered with: the
+/// ephemeral as drawn and clamped, the encapsulation randomness m, G's
+/// state over m ‖ H(ek) (K ‖ r and the rest of the sponge), K as the
+/// client decapsulates it, and the X25519 secret as the client computes
+/// it.
+fn exchange_needles(c: &ClientShare, server: &[u8; SERVER_SHARE_LEN]) -> Needles {
+    let mut n = Needles::new();
+    n.public(server);
+    let (m, scalar) = c.randomness.split_at(32);
+    n.add(Form::Eph, scalar);
+    let mut clamped: [u8; 32] = scalar.try_into().expect("32");
+    libcrux_curve25519::clamp(&mut clamped);
+    n.add(Form::Eph, &clamped);
+
+    n.add(Form::KemRand, m);
+    let g = sha3_512_state(&[m, &Sha3_256::digest(c.kem.pk())[..]].concat());
+    n.add_words(Form::KemG, &g);
+    let (ct, x_pk) = server.split_at(MLKEM_CT_LEN);
+    let ct = MlKem768Ciphertext::try_from(ct).expect("ciphertext");
+    let kem_ss = mlkem768::decapsulate(c.kem.private_key(), &ct);
+    assert_eq!(words_to_bytes(&g)[..32], kem_ss[..], "exchange needle derivation");
+    n.add(Form::KemSs, &kem_ss);
+
+    let mut x_ss = [0u8; 32];
+    assert!(libcrux_curve25519::ecdh(&mut x_ss, x_pk.try_into().expect("32"), &c.x_sk).is_ok(), "X25519");
+    n.add(Form::XSs, &x_ss);
+    n
+}
+
 #[inline(never)]
 fn padded(f: impl FnOnce()) {
     let mut pad = [0u8; PAD];
@@ -382,6 +495,19 @@ impl Scan {
                 "RESIDUE-HIT {} case={name} windows={count} depth={at}",
                 FORMS[f]
             );
+            self.failed = true;
+        }
+        self.cases += 1;
+    }
+
+    /// Runs `f`, with no scrub after it, and fails if it disturbed more
+    /// stack below the pad than `limit`: what the scrub following it must
+    /// cover.
+    fn ceiling(&mut self, name: &str, limit: usize, f: impl FnOnce() + Send) {
+        let used = self.run(f).saturating_sub(self.base);
+        println!("RESIDUE-DEPTH {name} {used}");
+        if used > limit {
+            println!("RESIDUE-DEEP {name}: {used} bytes below the pad, the scrub covers {limit}");
             self.failed = true;
         }
         self.cases += 1;
@@ -505,6 +631,33 @@ pub fn run() -> ! {
             result.is_ok() && out == plain && kek.as_bytes().iter().all(|b| *b == 0),
         );
     }
+
+    // The hybrid exchange (C7): without the scrub, within its depth; with
+    // it, called from the frame that called the exchange, nothing left.
+    // The result is dropped in place, wiping the secret it holds, before
+    // the scan.
+    let client = client_share();
+    let mut first = Box::new([0u8; SERVER_SHARE_LEN]);
+    scan.ceiling("exchange-depth", SCRUB_DEPTH_EXCHANGE, || {
+        let r = exchange_with_randomness(&client.share, &client.randomness);
+        if let Ok((_, share)) = &r {
+            first.copy_from_slice(share);
+        }
+    });
+    let needles = exchange_needles(&client, &first);
+    let mut second = Box::new([0u8; SERVER_SHARE_LEN]);
+    scan.case("exchange", FLOOR_EXCHANGE, &needles, || {
+        let r = exchange_with_randomness(&client.share, &client.randomness);
+        scrub_session_stack();
+        if let Ok((_, share)) = &r {
+            second.copy_from_slice(share);
+        }
+    });
+    scan.check(
+        "exchange output",
+        first.iter().any(|&b| b != 0) && first == second,
+    );
+
     scan.check(
         &format!("{} cases run, {CASES} planned", scan.cases),
         scan.cases == CASES,

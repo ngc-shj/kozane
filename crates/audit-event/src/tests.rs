@@ -183,12 +183,17 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::Ready => true,
         Event::FrameDropped { .. }
         | Event::TcpLimited { .. }
+        | Event::TlsRefused { .. }
+        | Event::TlsClosed { .. }
+        | Event::HttpRefused { .. }
+        | Event::TlsTimeout { .. }
         | Event::RpCostHighWater { .. }
         | Event::StackHighWater { .. }
         | Event::Halted { .. }
         | Event::KeyUnavailable { .. }
         | Event::KeyStackHighWater { .. }
-        | Event::KeyWaitHighWater { .. } => false,
+        | Event::KeyWaitHighWater { .. }
+        | Event::TlsSignHighWater { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
     assert_eq!(Event::FIXED.len(), 61);
@@ -275,7 +280,8 @@ fn decode_classifies_fixed_dropped_and_unknown_codes() {
     assert_eq!(decode(0x0055), Decoded::KeyUnavailable);
     assert_eq!(decode(0x0056), Decoded::KeyStackHighWater);
     assert_eq!(decode(0x0057), Decoded::KeyWaitHighWater);
-    assert_eq!(decode(0x0058), Decoded::Unknown);
+    assert_eq!(decode(0x0058), Decoded::TlsSignHighWater);
+    assert_eq!(decode(0x0059), Decoded::Unknown);
 }
 
 #[test]
@@ -558,7 +564,7 @@ fn tcp_limited_decodes_inside_its_range_and_clamps_outside() {
     }
     assert_eq!(Event::TcpLimited { kind: 0xffff }.code(), TCP_LIMITED_BASE + 0x1f);
     assert_eq!(decode(TCP_LIMITED_BASE + 0x1f), Decoded::TcpLimited(0x1f));
-    assert_eq!(decode(TCP_LIMITED_BASE + 0x20), Decoded::Unknown);
+    assert_eq!(decode(TCP_LIMITED_BASE + 0x20), Decoded::TlsRefused(0));
     assert_eq!(decode(TCP_LIMITED_BASE - 1), Decoded::Unknown);
     assert_eq!(Event::TcpLimited { kind: 0 }.name(), "TcpLimited");
     assert!(Event::TcpLimited { kind: 0 }.is_coalesced());
@@ -580,6 +586,82 @@ fn m6_code_ranges_are_disjoint_from_each_other_and_from_every_other_code() {
         }
     }
     let mut singles: Vec<u16> = Event::FIXED.iter().map(|e| e.code()).collect();
-    singles.extend([COST_HIGH_WATER, STACK_HIGH_WATER, HALTED, KEY_UNAVAILABLE, KEY_STACK_HIGH_WATER]);
+    singles.extend([
+        COST_HIGH_WATER,
+        STACK_HIGH_WATER,
+        HALTED,
+        KEY_UNAVAILABLE,
+        KEY_STACK_HIGH_WATER,
+        KEY_WAIT_HIGH_WATER,
+        TLS_SIGN_HIGH_WATER,
+    ]);
     assert!(singles.iter().all(|c| *c < FRAME_DROPPED_BASE));
+    for (i, c) in singles.iter().enumerate() {
+        assert!(!singles[i + 1..].contains(c), "{c:#x} twice");
+    }
+}
+
+/// M6 plan C10: each `tls` kind is coalesced per value, apart from the
+/// others and from `FrameDropped`.
+#[test]
+fn tls_kinds_are_coalesced_per_value_and_counted_apart() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::TlsRefused { reason: 17 }, 65, &mut out);
+    run(&mut c, Event::TlsRefused { reason: 16 }, 1, &mut out);
+    run(&mut c, Event::TlsClosed { reason: 17 }, 1, &mut out);
+    run(&mut c, Event::HttpRefused { status: 1 }, 1, &mut out);
+    run(&mut c, Event::TlsTimeout { stage: 0 }, 2, &mut out);
+    run(&mut c, Event::FrameDropped { reason: 17 }, 1, &mut out);
+    let got: Vec<_> = out.iter().map(|r| (r.code, r.a)).collect();
+    assert_eq!(
+        got,
+        [
+            (TLS_REFUSED_BASE + 17, 1),
+            (TLS_REFUSED_BASE + 17, 65),
+            (TLS_REFUSED_BASE + 16, 1),
+            (TLS_CLOSED_BASE + 17, 1),
+            (HTTP_REFUSED_BASE + 1, 1),
+            (TLS_TIMEOUT_BASE, 1),
+            (FRAME_DROPPED_BASE + 17, 1),
+        ]
+    );
+}
+
+/// One `tls` kind: every named value decodes as itself, larger ones clamp
+/// to the range's last code, and the kind is a coalesced count.
+fn check_tls_kind(event: fn(u16) -> Event, decoded: fn(u16) -> Decoded, base: u16, names: &[&str]) {
+    assert!(names.len() <= 32);
+    for v in 0..u16::try_from(names.len()).unwrap() {
+        assert_eq!(decode(event(v).code()), decoded(v));
+    }
+    assert_eq!(event(0xffff).code(), base + 0x1f);
+    assert_eq!(decode(base + 0x1f), decoded(0x1f));
+    assert!(event(0).is_coalesced());
+    assert_eq!(event(0).value(), None);
+}
+
+#[test]
+fn tls_kinds_decode_inside_their_ranges_and_clamp_outside() {
+    check_tls_kind(|v| Event::TlsRefused { reason: v }, Decoded::TlsRefused, TLS_REFUSED_BASE, &TLS_REFUSED_NAMES);
+    check_tls_kind(|v| Event::TlsClosed { reason: v }, Decoded::TlsClosed, TLS_CLOSED_BASE, &TLS_CLOSED_NAMES);
+    check_tls_kind(|v| Event::HttpRefused { status: v }, Decoded::HttpRefused, HTTP_REFUSED_BASE, &HTTP_REFUSED_NAMES);
+    check_tls_kind(|v| Event::TlsTimeout { stage: v }, Decoded::TlsTimeout, TLS_TIMEOUT_BASE, &TLS_TIMEOUT_NAMES);
+    assert_eq!(decode(TLS_TIMEOUT_BASE + 0x20), Decoded::Unknown);
+    assert_eq!(Event::TlsRefused { reason: 0 }.name(), "TlsRefused");
+    assert_eq!(Event::TlsTimeout { stage: 0 }.name(), "TlsTimeout");
+}
+
+/// M6 plan C5: `tls`'s sign time, a value event gated like the key wait.
+#[test]
+fn tls_sign_high_water_carries_microseconds_and_is_gated_like_the_cost() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::TlsSignHighWater { us: 4_321 }, 65, &mut out);
+    assert_eq!(out.len(), 65);
+    assert!(out.iter().all(|r| (r.code, r.a) == (TLS_SIGN_HIGH_WATER, 4_321)));
+    assert_eq!(Event::TlsSignHighWater { us: 1 }.name(), "TlsSignHighWater");
+    let mut hw = CostHighWater::tls_sign();
+    let got: Vec<Event> = [1_000, 1_100, 1_125].into_iter().filter_map(|us| hw.observe(us)).collect();
+    assert_eq!(got, [Event::TlsSignHighWater { us: 1_000 }, Event::TlsSignHighWater { us: 1_125 }]);
 }

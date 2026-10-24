@@ -13,7 +13,10 @@
 use core::fmt::{self, Write};
 use core::ptr::NonNull;
 
-use audit_event::{Decoded, Record, TCP_LIMIT_NAMES, UnknownCodes, decode};
+use audit_event::{
+    Decoded, HTTP_REFUSED_NAMES, Record, TCP_LIMIT_NAMES, TLS_CLOSED_NAMES, TLS_REFUSED_NAMES, TLS_TIMEOUT_NAMES,
+    UnknownCodes, decode,
+};
 use layout::{AUDIT_RING_SLOTS, audit as ch};
 use ring::shmem::ShmRing;
 use ring::{Consumer, RingError};
@@ -107,6 +110,18 @@ fn drop_reason(r: u16) -> Option<DropReason> {
     DropReason::ALL.iter().copied().find(|d| *d as u16 == r)
 }
 
+/// A coalesced kind whose value has a name in `names`: its line, or false
+/// (an unnamed value counts as an unknown code).
+fn named(uart: &mut Uart, src: &str, kind: &str, names: &[&str], v: u16, r: Record) -> bool {
+    match names.get(usize::from(v)) {
+        Some(name) => {
+            println!(uart, "audit: src={} {}({}) total={} lost={}", src, kind, name, r.a, r.b);
+            true
+        }
+        None => false,
+    }
+}
+
 impl Audit {
     fn print(&mut self, src: &'static str, r: Record) {
         let uart = &mut self.uart;
@@ -139,6 +154,14 @@ impl Audit {
                 }
                 None => false,
             },
+            Decoded::TlsRefused(v) => named(uart, src, "TlsRefused", &TLS_REFUSED_NAMES, v, r),
+            Decoded::TlsClosed(v) => named(uart, src, "TlsClosed", &TLS_CLOSED_NAMES, v, r),
+            Decoded::HttpRefused(v) => named(uart, src, "HttpRefused", &HTTP_REFUSED_NAMES, v, r),
+            Decoded::TlsTimeout(v) => named(uart, src, "TlsTimeout", &TLS_TIMEOUT_NAMES, v, r),
+            Decoded::TlsSignHighWater => {
+                println!(uart, "audit: src={} TlsSignHighWater us={} lost={}", src, r.a, r.b);
+                true
+            }
             Decoded::CostHighWater => {
                 println!(uart, "audit: src={} RpCostHighWater us={} lost={}", src, r.a, r.b);
                 true

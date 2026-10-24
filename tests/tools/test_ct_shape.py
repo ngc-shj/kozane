@@ -1,7 +1,8 @@
 """tools/ct-shape (M4 plan C10, C1 erasure, M5 plan C6 printing): the
 normaliser catches a one-instruction difference and nothing but address and
 hash noise passes; the closure stops where C10 says; forbidden, shape,
-erasure and printing each refuse their one-change fixture.
+erasure and printing each refuse their one-change fixture; the TLS roots
+(M6 plan C7) are held to identity alone.
 
 The ELFs are assembled from tests/tools/ct_shape_elf.py with the
 aarch64-none-elf toolchain (the dev image's), so objdump and c++filt run as
@@ -14,6 +15,7 @@ Prints "CT-SHAPE-FIXTURES <n>" and exits non-zero on any mismatch.
 import importlib.machinery
 import importlib.util
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -30,6 +32,8 @@ cts = importlib.util.module_from_spec(spec)
 loader.exec_module(cts)
 
 BM = "mce460896::bm::bm"
+EXCHANGE, TLS_SCRUB = (root for _, root in cts.IDENTITY_ROOTS)
+ENCAPSULATE = "libcrux_ml_kem::mlkem768::encapsulate"
 
 
 def with_tree(**kw):
@@ -56,6 +60,41 @@ def identity(**kw):
     def run(search, harness, _d):
         binaries, h = load(search, harness)
         return cts.check_identity(binaries["pd-pqkey.elf"], h, "mce460896::decaps")
+    return run
+
+
+def tls_identity(root=EXCHANGE, **kw):
+    @with_tree(**kw)
+    def run(search, harness, _d):
+        binaries, h = load(search, harness)
+        return cts.check_identity(binaries["pd-tls.elf"], h, root)
+    return run
+
+
+@with_tree()
+def renumbered_and_aliased(search, harness, _d):
+    """The PD and the harness name the anonymous Location differently
+    (anon.2, anon.9) and call memcmp and bcmp: identity holds."""
+    binaries, h = load(search, harness)
+    pd = binaries["pd-tls.elf"]
+    names = [sorted(n for _, _, n in b.data if n.startswith("anon.")) for b in (pd, h)]
+    errors = [] if names == [["anon.1", "anon.2"], ["anon.7", "anon.9"]] else [f"anon names {names}"]
+    if "bcmp" not in "".join(f"{m} {o}" for _, m, o in h.body(h.by_name[ENCAPSULATE][0])):
+        errors.append("the harness does not call bcmp")
+    return errors + cts.check_identity(pd, h, EXCHANGE)
+
+
+def anon_differs(**kw):
+    """One error: the libcrux function's anonymous constant differs, each
+    side named by a content digest."""
+    @with_tree(**kw)
+    def run(search, harness, _d):
+        binaries, h = load(search, harness)
+        errors = cts.check_identity(binaries["pd-tls.elf"], h, EXCHANGE)
+        m = re.fullmatch(rf"pd-tls\.elf: identity: {re.escape(ENCAPSULATE)} differs from the harness: "
+                         r"\+0xc 'adr x0, <(anon#[0-9a-f]{16})>' here, 'adr x0, <(anon#[0-9a-f]{16})>' in the harness",
+                         errors[0]) if len(errors) == 1 else None
+        return [] if m and m.group(1) != m.group(2) else [f"errors {errors}"]
     return run
 
 
@@ -102,7 +141,7 @@ def listed_image_missing():
 
 
 SYSTEM_TWO = ('<program_image path="pd-pqkey.elf" />\n<program_image path="pd-pq.elf" />\n'
-              '<program_image path="pd-key.elf" />\n')
+              '<program_image path="pd-key.elf" />\n<program_image path="pd-tls.elf" />\n')
 
 
 def bm_with(old: str, new: str) -> list:
@@ -284,7 +323,7 @@ def cli(**kw):
                 want_third = "ct-shape: pd-ingress.elf: identity: mce460896::decaps is McEliece code in a PD outside"
                 return [] if r.returncode == 1 and any(l.startswith(want_third) for l in lines) \
                     else [f"exit {r.returncode}: {lines}"]
-            return [] if (r.returncode, lines) == ((1, lines) if mutated else (0, ["CT-SHAPE-SYMBOLS 10"])) \
+            return [] if (r.returncode, lines) == ((1, lines) if mutated else (0, ["CT-SHAPE-SYMBOLS 13"])) \
                 and (not mutated or len(lines) == 2) else [f"exit {r.returncode}: {lines}"]
         finally:
             shutil.rmtree(d)
@@ -294,6 +333,20 @@ def cli(**kw):
 def make_never_writes_the_baseline():
     text = (ROOT / "Makefile").read_text()
     return ["the Makefile calls --print-baseline"] if "print-baseline" in text else []
+
+
+@with_tree()
+def identity_roots_unshaped(search, harness, d):
+    """The TLS roots' closures get no shape entry: the printed baseline
+    names none of their functions, and with an mce460896 entry dropped
+    check_shape refuses that one alone, not the libcrux function absent
+    from the baseline."""
+    errors = shape_policy(search, harness, d,
+                          lambda t: t.replace('elf = "pd-pqkey.elf"\nname = "mce460896::scrub_stack"',
+                                              'elf = "pd-pqkey.elf"\nname = "mce460896::gone"'))
+    text = (d / "ct-shape.toml").read_text()
+    leaked = [f"{name} is in the baseline" for name in (EXCHANGE, TLS_SCRUB, ENCAPSULATE) if name in text]
+    return leaked + errors
 
 
 CSEL = "csel x0, x9, x1, eq"
@@ -322,6 +375,33 @@ CASES = [
      ["pd-pqkey.elf: identity: stop core::slice::index::slice_index_fail is reached from mce460896::decaps "
       "only in the harness", differs(0x24, None, "bl <core::slice::index::slice_index_fail>")[0]],
      identity(harness_extra=["bl {fail}"])),
+    ("the TLS exchange root's closure equals the harness's", None, tls_identity()),
+    ("the TLS scrub root's closure equals the harness's", None, tls_identity(TLS_SCRUB)),
+    ("a differing libcrux function in the TLS closure fails identity",
+     [f"pd-tls.elf: identity: {ENCAPSULATE} differs from the harness: +0x8 'csel x0, x9, x2, ne' here, "
+      "'csel x0, x9, x2, eq' in the harness"],
+     tls_identity(harness_encapsulate=[line.replace(", ne", ", eq") for line in elf.ENCAPSULATE])),
+    ("anonymous-constant renumbering and the memcmp/bcmp alias alone: identity holds", None,
+     renumbered_and_aliased),
+    ("an anonymous constant of other content fails identity", None, anon_differs(harness_anon_line=13)),
+    ("an anonymous constant pointing at another file name fails identity", None,
+     anon_differs(harness_anon_file="src/hybrid.rx")),
+    ("a call to another function in memcmp's place fails identity",
+     [f"pd-tls.elf: identity: stop memcmp|bcmp is reached from {EXCHANGE} only in this ELF",
+      f"pd-tls.elf: identity: {ENCAPSULATE} differs from the harness: +0x10 'bl <memcmp|bcmp>' here, "
+      "'bl <memcpy>' in the harness"],
+     tls_identity(harness_cmp="memcpy")),
+    ("the TLS exchange shim is excluded from identity by name",
+     ["pd-tls.elf: identity: closure of tls_core::hybrid::exchange_with_randomness: the excluded shim "
+      "<tls_core::hybrid::HybridSecret>::exchange::<caller::Rng> is reached",
+      "pd-tls.elf: identity: tls_core::hybrid::exchange_with_randomness differs from the harness: "
+      "+0x8 'bl <<tls_core::hybrid::HybridSecret>::exchange::<caller::Rng>>' here, "
+      "'ldp x29, x30, [sp], #16' in the harness"],
+     tls_identity(tls_exchange_extra=["bl {tls_shim}"])),
+    ("a libcrux function absent from the shape baseline fails no TLS root; an mce460896 one still fails",
+     ["pd-pqkey.elf: shape: mce460896::scrub_stack is not in ct-shape.toml",
+      "pd-pqkey.elf: shape: mce460896::gone is listed in ct-shape.toml but not in the closure"],
+     identity_roots_unshaped),
     ("McEliece code is reached only through the root", None, contained()),
     ("an mce460896 function outside the root's closure is caught",
      ["pd-pqkey.elf: identity: mce460896::vec::mul is McEliece code outside the closure of mce460896::decaps"],
@@ -352,6 +432,7 @@ CASES = [
     ("a blr is forbidden", [f"pd-pqkey.elf: forbidden: {BM}+0x24: blr x3"], forbidden(["blr x3"])),
     ("a call to memcmp is forbidden", [f"pd-pqkey.elf: forbidden: {BM}+0x24: a call to memcmp"],
      forbidden(["bl memcmp"])),
+    ("a call to bcmp is forbidden", [f"pd-pqkey.elf: forbidden: {BM}+0x24: a call to bcmp"], forbidden(["bl bcmp"])),
     ("an aliased memcpy is a closure stop", None, aliased_memcpy_stop),
     ("a call to an aliased memcmp is forbidden",
      ["t: forbidden: mce460896::f+0x0: a call to compiler_builtins::mem::memcmp = memcmp"], aliased_memcmp),
@@ -391,6 +472,9 @@ CASES = [
          want="ct-shape: pd-pq.elf: printing: sel4_sys::syscalls::calls::seL4_DebugPutChar is the DebugPutChar")),
     ("the CLI passes the unmutated tree", None, cli()),
     ("the CLI refuses a mutated ELF", None, cli(mutated=True)),
+    ("the CLI refuses a differing TLS closure", None,
+     cli(harness_encapsulate=[line.replace(", ne", ", eq") for line in elf.ENCAPSULATE],
+         want=f"ct-shape: pd-tls.elf: identity: {ENCAPSULATE} differs from the harness")),
     ("the CLI refuses McEliece code in a third PD the system file lists", None, cli(third=True)),
     ("the CLI reads a single-quoted program_image too", None, cli(third="single")),
     ("an unreadable system file fails", None, cli(system_text=False, want="secureos.system: No such file")),
@@ -399,7 +483,8 @@ CASES = [
     ("a program_image without a path fails", None,
      cli(system_text="<program_image />\n", want="a program_image without a path")),
     ("a system file without a root's image fails", None,
-     cli(system_text='<program_image path="pd-pqkey.elf" />\n', want="no program_image pd-key.elf, pd-pq.elf")),
+     cli(system_text='<program_image path="pd-pqkey.elf" />\n',
+         want="no program_image pd-key.elf, pd-pq.elf, pd-tls.elf")),
     ("a PD the system file lists but the search path lacks fails",
      ["pd-gone.elf: identity: cannot read <search>/pd-gone.elf: No such file or directory"],
      lambda: [e.replace(e[e.index("read ") + 5:e.index("/pd-gone")], "<search>") for e in listed_image_missing()()]),

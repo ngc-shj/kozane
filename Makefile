@@ -197,9 +197,13 @@ verus: | $(counts)
 # The C9 harness (M4 plan C9, deviation M-1): the PD's codegen on a linux
 # target (support/targets/aarch64-ct-harness.json), build-std, linked by
 # rust-lld so that C10 can compare its code with the PDs'. Its own lock.
+# The repository's crates are path dependencies outside its workspace, so
+# rustc sees their sources by absolute path; remapped to the relative path
+# a PD's workspace build records, so that a panic Location an identity root
+# references names the same file in both (M6 plan C7).
 ct_harness := $(BUILD)/ct/target/aarch64-ct-harness/release/ct-harness
 ct-harness:
-	RUSTFLAGS="-Zunstable-options -Clinker-flavor=gnu-lld-cc -Clink-self-contained=+linker" \
+	RUSTFLAGS="-Zunstable-options -Clinker-flavor=gnu-lld-cc -Clink-self-contained=+linker --remap-path-prefix=$(CURDIR)/=" \
 	cargo build --locked --release \
 		--manifest-path tools/ct-harness/Cargo.toml \
 		-Zjson-target-spec -Z build-std=std,panic_abort \

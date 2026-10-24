@@ -32,22 +32,29 @@ removed after the boot. The boots:
   5. peer binding (M3 plan C7): a deployment whose peer records pair each
      WireGuard key with the other peer's Rosenpass key;
   6. a blob whose public key does not match the configuration: `key`
-     stays up Unavailable and `hs`, its caller, audits `KeyUnavailable`
-     with the boot error's code, then halts;
+     stays up Unavailable and `hs` and `tls`, its callers, audit
+     `KeyUnavailable` with the boot error's code, then halt;
   7. measured boot (C8): U-Boot's measure variant against tools/measure.py;
   8. sealed boots (C14): another image, a tampered descriptor and another
      TPM's envelopes leave both key PDs Unavailable with the codes the Rust
      tables give; after a sealed boot PCR 8 is capped;
   9. the A7 proxy between QEMU and swtpm: the unmodified relay passes a
      sealed boot, a flipped Unseal response is refused;
- 10. https (M6 plan C3): the outside NIC on the tap; a TCP client in the
-     netns connects to the HTTPS port and gets its bytes echoed by `tls`
-     (until the TLS server replaces the echo).
+ 10. https (M6 plan C3, C7): the outside NIC on the tap; OpenSSL s_client
+     and curl complete X25519MLKEM768 handshakes against the dev CA and get
+     `tls`'s fixed response (the proxy is slice 4); classical-only and TLS
+     1.2-only clients are refused; the probe canary; the TLS scalar count;
+ 11. https-residue (M6 plan C8): slowloris first, then a closed
+     connection's secrets, keys and marker absent from guest RAM while a
+     live connection's secret is present;
+ 12. tls key failure (M6 plan D5): a blob whose TLS scalar does not match
+     the certificate, on the same image: `tls` halts after `key` refuses
+     its TlsSign, the VPN still handshakes.
 
 Since M3 (L8) hs refuses every WireGuard initiation without a fresh
 Rosenpass PSK, so each WireGuard peer first runs upstream rosenpass (the VE9
-oracle in the dev image) and its key_out is the PresharedKey. Boots 1 and
-6 to 9 run no Rosenpass.
+oracle in the dev image) and its key_out is the PresharedKey. Boots 1, 6 to
+9, 10 and 11 run no Rosenpass.
 
 Missing prerequisites fail the run; nothing is skipped.
 """
@@ -59,6 +66,7 @@ import contextlib
 import ctypes
 import errno
 import hashlib
+import hmac
 import json
 import math
 import os
@@ -1953,8 +1961,9 @@ def cap_digest() -> bytes:
     return bytes([int(m.group(1), 16)]) * int(n.group(1))
 
 
-# The PDs whose init calls a key PD, and the key PD's code table.
-KEY_CALLERS = (("hs", "key-core"), ("pq", "pqkey-core"))
+# The PDs whose init calls a key PD, and the key PD's code table: `key`
+# has two callers since M6 (C5), and each audits an Unavailable `key`.
+KEY_CALLERS = (("hs", "key-core"), ("tls", "key-core"), ("pq", "pqkey-core"))
 
 
 def key_outcomes(con: Console, codes: dict, what: str):
@@ -2276,13 +2285,14 @@ def udp_fields(frame: bytes):
     return frame[26:30], sport, frame[30:34], dport, frame[u + 8:u + ulen]
 
 
-def udp_filter(port: int) -> bytes:
-    """Classic BPF: unfragmented IPv4/UDP to or from `port`."""
+def udp_filter(port: int, proto: int = 17) -> bytes:
+    """Classic BPF: unfragmented IPv4/UDP (or `proto`: TCP) to or from
+    `port`."""
     prog = [
         (0x28, 0, 0, 12),       # ldh [12]
         (0x15, 0, 9, 0x0800),   # IPv4, else drop
         (0x30, 0, 0, 23),       # ldb [23]
-        (0x15, 0, 7, 17),       # UDP, else drop
+        (0x15, 0, 7, proto),    # UDP (TCP), else drop
         (0x28, 0, 0, 20),       # ldh [20]
         (0x45, 5, 0, 0x1FFF),   # a fragment: drop
         (0xB1, 0, 0, 14),       # x = IP header length
@@ -2297,11 +2307,12 @@ def udp_filter(port: int) -> bytes:
 
 
 class Sniffer:
-    """AF_PACKET on the tap keeping only UDP to and from one port (classic
-    BPF, enlarged SO_RCVBUF). A kernel-side drop (PACKET_STATISTICS) aborts
-    the case, so a lost frame never reads as an attribution failure."""
+    """AF_PACKET on the tap keeping only UDP (or TCP, `proto` 6) to and from
+    one port (classic BPF, enlarged SO_RCVBUF). A kernel-side drop
+    (PACKET_STATISTICS) aborts the case, so a lost frame never reads as an
+    attribution failure."""
 
-    def __init__(self, port: int):
+    def __init__(self, port: int, proto: int = 17):
         self.frames = []  # (monotonic, frame, outgoing)
         self.lock = threading.Lock()
         self.drops = 0
@@ -2310,7 +2321,7 @@ class Sniffer:
         self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, 0)
         try:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, SNIFF_RCVBUF)
-            prog = udp_filter(port)
+            prog = udp_filter(port, proto)
             buf = ctypes.create_string_buffer(prog, len(prog))
             self.sock.setsockopt(socket.SOL_SOCKET, SO_ATTACH_FILTER,
                                  struct.pack("HL", len(prog) // 8, ctypes.addressof(buf)))
@@ -3681,57 +3692,597 @@ def test_cookie_b(pkg: "Package", deploy: str, passed: list):
 
 
 HTTPS_PORT = 443
-HTTPS_ECHO_BYTES = 4096         # several segments each way
-HTTPS_WAIT_S = 10.0             # connect, echo and FIN, each
+HTTPS_WAIT_S = 10.0             # one client's connect, handshake and response
+TLS_CONN = "crates/tls-core/src/conn.rs"
+TLS_PD = "crates/pds/tls/src/main.rs"
+# What `tls` answers a complete request head with until the proxy lands
+# (slice 3b): checked against the PD's source below.
+HTTPS_FIXED_BODY = b"secureos tls ok\n"
+# The probe (M6 plan C10, D3): sequential handshakes, the slowest of which
+# must stay within a third of the Rust handshake timeout (the canary).
+PROBE_HANDSHAKES = 20
+# An address the residue boot uses for nothing but its barrier SYNs.
+BARRIER_IP = bytes([10, 0, 2, 77])
+BARRIER_SYN_TRIES = 10
+BARRIER_SYN_WAIT_S = 0.5
+# Slowloris: one byte per interval, well inside the handshake timeout.
+SLOWLORIS_INTERVAL_S = 1.0
+SLOWLORIS_SLACK_S = 2 * TIMER_TICK_S + 3.0
 
 
-def https_echo_case(con: Console):
-    """M6 plan C3 (slice 1): a client in the netns, on the tap's address,
-    connects to the HTTPS port, gets its bytes back byte for byte, and its
-    FIN is answered by the server's (the echo closes after it)."""
-    payload = bytes(range(256)) * (HTTPS_ECHO_BYTES // 256)
+def check_fixed_body():
+    if HTTPS_FIXED_BODY.decode().replace("\n", "\\n") not in open(os.path.join(ROOT, TLS_PD)).read():
+        raise Fail(f"{TLS_PD} no longer answers with {HTTPS_FIXED_BODY!r}")
+
+
+def tls_key_code(variant: str) -> int:
+    """`TlsKeyError::<variant> => <n>,` from key-core's code table (M6 plan
+    C5, D5): the codes share BootError's space."""
+    src = open(os.path.join(ROOT, "crates/key-core/src/lib.rs")).read()
+    m = re.search(rf"^\s+TlsKeyError::{variant} => (\d+),$", src, re.M)
+    if not m:
+        raise Fail(f"TlsKeyError::{variant} has no code in crates/key-core/src/lib.rs")
+    return int(m.group(1))
+
+
+def https_url(host: str = None) -> str:
+    return f"https://{host or ip_str(GW_IP)}:{HTTPS_PORT}/"
+
+
+def curl(cacert: str, *args: str) -> subprocess.CompletedProcess:
+    """curl offering X25519MLKEM768 only, verifying against `cacert`."""
+    return subprocess.run(["curl", "--silent", "--show-error", "--max-time", str(HTTPS_WAIT_S),
+                           "--curves", "X25519MLKEM768", "--cacert", cacert, *args],
+                          capture_output=True, timeout=HTTPS_WAIT_S + 5)
+
+
+def curl_get(cacert: str) -> tuple:
+    """A verified GET: (body, time_appconnect - time_connect in s)."""
+    r = curl(cacert, "--write-out", "\n@@%{time_connect} %{time_appconnect}", https_url())
+    if r.returncode != 0:
+        raise Fail(f"https: curl failed ({r.returncode}): {r.stderr.decode(errors='replace').strip()}")
+    body, _, timing = r.stdout.rpartition(b"\n@@")
+    connect, appconnect = (float(x) for x in timing.split())
+    return body, appconnect - connect
+
+
+def s_client(*args: str, data: bytes = b"") -> str:
+    """One s_client run to its end: `data` sent, then (with -ign_eof) its
+    output until the server closes."""
     try:
-        s = socket.create_connection((ip_str(GW_IP), HTTPS_PORT), timeout=HTTPS_WAIT_S)
-    except OSError as e:
-        raise Fail(f"https echo: no TCP connection to port {HTTPS_PORT}: {e}") from e
-    with s:
-        s.sendall(payload)
-        got = b""
-        while len(got) < len(payload):
-            chunk = s.recv(65536)
+        r = subprocess.run(["openssl", "s_client", "-connect", f"{ip_str(GW_IP)}:{HTTPS_PORT}", "-ign_eof", *args],
+                           input=data, capture_output=True, timeout=HTTPS_WAIT_S + 5)
+    except subprocess.TimeoutExpired as e:
+        raise Fail(f"https: s_client {' '.join(args)} did not finish") from e
+    return (r.stdout + r.stderr).decode(errors="replace")
+
+
+def request_head(extra: str = "") -> bytes:
+    return f"GET / HTTP/1.1\r\nHost: {ip_str(GW_IP)}\r\n{extra}\r\n".encode()
+
+
+class SClient:
+    """An interactive s_client (commands on: `k`/`K` send KeyUpdate), its
+    output read by a helper thread; killed by close()."""
+
+    def __init__(self, *args: str):
+        self.out = b""
+        self.lock = threading.Lock()
+        self.proc = subprocess.Popen(DIE_WITH_PARENT + ["openssl", "s_client", "-connect",
+                                                        f"{ip_str(GW_IP)}:{HTTPS_PORT}", *args],
+                                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        start_without_stop_signals(threading.Thread(target=self._drain, daemon=True))
+
+    def _drain(self):
+        while True:
+            try:
+                chunk = os.read(self.proc.stdout.fileno(), 65536)
+            except OSError:
+                return
             if not chunk:
-                raise Fail(f"https echo: closed after {len(got)} of {len(payload)} bytes")
-            got += chunk
-        if got != payload:
-            raise Fail("https echo: the bytes came back changed")
-        s.shutdown(socket.SHUT_WR)
-        if s.recv(1) != b"":
-            raise Fail("https echo: data after the client's FIN instead of the server's FIN")
-    if con.count(r"audit: src=tls unknown code"):
-        raise Fail("https echo: tls raised an audit code audit cannot name")
+                return
+            with self.lock:
+                self.out += chunk
+
+    def wait_for(self, pattern: bytes, what: str, timeout: float = HTTPS_WAIT_S) -> re.Match:
+        deadline = time.monotonic() + timeout
+        while True:
+            with self.lock:
+                m = re.search(pattern, self.out)
+            if m:
+                return m
+            if time.monotonic() > deadline:
+                raise Fail(f"{what}: s_client did not print {pattern!r}")
+            time.sleep(0.05)
+
+    def handshake(self, what: str):
+        m = self.wait_for(rb"Verify return code: (\d+)", what)
+        if m.group(1) != b"0":
+            raise Fail(f"{what}: s_client verify return code {m.group(1).decode()}")
+
+    def send(self, data: bytes):
+        self.proc.stdin.write(data)
+        self.proc.stdin.flush()
+
+    def key_update(self, cmd: bytes, what: str):
+        """One KeyUpdate (s_client reads a command per stdin read, so each
+        waits for the previous one's KEYUPDATE line)."""
+        with self.lock:
+            n = self.out.count(b"KEYUPDATE")
+        self.send(cmd + b"\n")
+        deadline = time.monotonic() + HTTPS_WAIT_S
+        while True:
+            with self.lock:
+                if self.out.count(b"KEYUPDATE") > n:
+                    return
+            if time.monotonic() > deadline:
+                raise Fail(f"{what}: s_client did not send it")
+            time.sleep(0.05)
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+        self.proc.wait()
+        with contextlib.suppress(OSError):
+            self.proc.stdin.close()
 
 
-def test_https(pkg: "Package", passed: list):
-    """Boot "https" (M6 plan C3): `tls`'s TCP on the outside tap."""
+def hkdf_expand_label(secret: bytes, label: bytes, length: int) -> bytes:
+    """RFC 8446 section 7.1 with SHA-256, empty context; one HMAC block is
+    every output this suite needs."""
+    full = b"tls13 " + label
+    info = struct.pack("!H", length) + bytes([len(full)]) + full + b"\x00"
+    return hmac.new(secret, info + b"\x01", hashlib.sha256).digest()[:length]
+
+
+def keylog(path: str) -> dict:
+    """label -> secrets (in order) from an SSLKEYLOGFILE of one connection."""
+    out = {}
+    for line in open(path):
+        parts = line.split()
+        if len(parts) == 3 and not line.startswith("#"):
+            out.setdefault(parts[0], []).append(bytes.fromhex(parts[2]))
+    return out
+
+
+def secret_forms(name: str, secret: bytes) -> dict:
+    """A traffic secret and the ChaCha20-Poly1305 record key and IV it gives
+    (RFC 8446 section 7.3): every stored form `tls` derives from it."""
+    return {name: secret, f"{name} key": hkdf_expand_label(secret, b"key", 32),
+            f"{name} iv": hkdf_expand_label(secret, b"iv", 12)}
+
+
+def scan_snapshot(mon: Monitor, scratch: str, what: str, absent: dict, present: dict, counts: dict = None):
+    """One snapshot of all of guest RAM: each `absent` needle occurs nowhere,
+    each `present` one (the controls: the scan covers the memory that would
+    hold the needles) occurs, and each `counts` needle exactly as often as
+    given."""
+    base, size = GUEST_RAM
+    ram = mon.pmem(base, size, scratch)
+    try:
+        for name, needle in present.items():
+            if ram.find(needle) < 0:
+                raise Fail(f"{what}: {name} not found in guest RAM; the scan proves nothing")
+        for name, (needle, want) in (counts or {}).items():
+            n = ram.count(needle)
+            if n != want:
+                raise Fail(f"{what}: {name} occurs {n} time(s) in guest RAM, want exactly {want}")
+        for name, needle in absent.items():
+            at = ram.find(needle)
+            if at >= 0:
+                raise Fail(f"{what}: {name} still in guest RAM at {base + at:#x}")
+    finally:
+        del ram
+
+
+def https_handshake_cases(con: Console, deploy: str, other_ca: str, passed: list):
+    """M6 plan C7 integration (strategy cases 1, 3 and 4 against the fixed
+    response): s_client and curl complete X25519MLKEM768 handshakes and get
+    the response, curl verifying the chain and the IP name; a wrong CA or
+    name fails curl; a classical-only client gets handshake_failure and the
+    NoPqGroup audit (L14); a TLS 1.2-only client protocol_version."""
+    ca = os.path.join(deploy, "devca.pem")
+    check_fixed_body()
+    out = s_client("-groups", "X25519MLKEM768", "-CAfile", ca, "-verify_return_error", data=request_head())
+    if not re.search(r"Negotiated TLS1\.3 group: X25519MLKEM768\n", out):
+        raise Fail(f"https: s_client did not negotiate X25519MLKEM768:\n{out[-2000:]}")
+    if "Verify return code: 0 (ok)" not in out or HTTPS_FIXED_BODY.decode() not in out:
+        raise Fail(f"https: s_client did not verify the chain or got no response:\n{out[-2000:]}")
+    body, _ = curl_get(ca)
+    if not body.endswith(HTTPS_FIXED_BODY):
+        raise Fail(f"https: curl got {body!r}, want the fixed response")
+    passed.append("https tls handshake")
+    print("\nPASS [https: s_client and curl complete X25519MLKEM768, chain and IP name verified, fixed response]")
+
+    wrong_ca = curl(other_ca, https_url())
+    if wrong_ca.returncode == 0:
+        raise Fail("https: curl accepted the server against another deployment's CA")
+    wrong_name = curl(ca, "--resolve", f"gateway.example:{HTTPS_PORT}:{ip_str(GW_IP)}", https_url("gateway.example"))
+    if wrong_name.returncode == 0:
+        raise Fail("https: curl accepted the certificate for a name it does not carry")
+    passed.append("https wrong ca or name")
+    print("\nPASS [https: a wrong CA and a wrong name each fail curl's verification]")
+
+    mark = con.mark()
+    out = s_client("-groups", "X25519", data=request_head())
+    if not re.search(r"alert handshake failure|SSL alert number 40\b", out):
+        raise Fail(f"https: a classical-only client did not get handshake_failure:\n{out[-2000:]}")
+    con.wait_for(r"audit: src=tls TlsRefused\(NoPqGroup\) total=1 lost=\d+", since=mark)
+    passed.append("https no pq group")
+    print("\nPASS [https: -groups X25519 gets handshake_failure, TlsRefused(NoPqGroup) audited (L14)]")
+
+    mark = con.mark()
+    out = s_client("-tls1_2", data=request_head())
+    if not re.search(r"alert protocol version|SSL alert number 70\b", out):
+        raise Fail(f"https: a TLS 1.2-only client did not get protocol_version:\n{out[-2000:]}")
+    con.wait_for(r"audit: src=tls TlsRefused\(NoTls13\) total=1 lost=\d+", since=mark)
+    passed.append("https tls 1.2 refused")
+    print("\nPASS [https: a TLS 1.2-only client gets protocol_version, TlsRefused(NoTls13) audited]")
+
+
+def https_probe_case(con: Console, deploy: str, passed: list):
+    """The probe (M6 plan C10, D3) and its canary (T-R3-8, T-N14): every
+    handshake of PROBE_HANDSHAKES within a third of the Rust handshake
+    timeout, so an eroded margin on a slower host fails by name rather than
+    as a flaky timeout. Records the times and `tls`'s TlsSign high-water
+    (the SIGN_COST_NS measurement)."""
+    ca = os.path.join(deploy, "devca.pem")
+    limit = rust_const(TLS_CONN, "HANDSHAKE_TIMEOUT_NS") / NS / 3
+    mark = con.mark()
+    times = []
+    for _ in range(PROBE_HANDSHAKES):
+        body, t = curl_get(ca)
+        if not body.endswith(HTTPS_FIXED_BODY):
+            raise Fail(f"https probe: curl got {body!r}, want the fixed response")
+        times.append(t)
+    signs = [int(us) for us in con.count(r"audit: src=tls TlsSignHighWater us=(\d+) ")]
+    print(f"\nhttps probe: handshake (appconnect - connect) s: {', '.join(f'{t:.3f}' for t in times)}; "
+          f"max {max(times):.3f}, limit {limit:.3f}; TlsSignHighWater us: {signs}", flush=True)
+    if not signs:
+        raise Fail("https probe: tls never audited TlsSignHighWater")
+    if max(times) > limit:
+        raise Fail(f"https probe: probe margin exceeded: a handshake took {max(times):.3f} s, "
+                   f"above a third of HANDSHAKE_TIMEOUT_NS ({limit:.3f} s)")
+    if con.count(r"audit: src=tls unknown code", since=mark):
+        raise Fail("https probe: tls raised an audit code audit cannot name")
+    passed.append("https probe canary")
+    print("\nPASS [https probe: every handshake within a third of the handshake timeout]")
+
+
+def tls_scalar_count_case(mon: Monitor, deploy: str, passed: list):
+    """M6 plan T8, F21: after handshakes the client observed (the probe's),
+    the TLS scalar occurs exactly once big-endian (`key`'s plaintext) and
+    never little-endian (HACL's limbs) in guest RAM."""
+    with open(os.path.join(deploy, "secrets.bin"), "rb") as f:
+        scalar = f.read()[KEY_BLOB_TLS_PRIVATE]
+    if not any(scalar):
+        raise Fail("tls scalar count: the needle is all zero")
+    scan_snapshot(mon, os.path.join(deploy, "pmem-tls.bin"), "tls scalar count", {}, {},
+                  {"the TLS scalar (big-endian)": (scalar, 1), "the TLS scalar (little-endian)": (scalar[::-1], 0)})
+    passed.append("tls scalar count")
+    print("\nPASS [tls scalar: once big-endian, never little-endian in guest RAM]")
+
+
+def tls_stack_headroom_case(con: Console, passed: list):
+    """The C8 headroom rule (M4) for `tls`: after the probe's handshakes its
+    StackHighWater reaches at least the exchange's scrub depth (else the
+    probe is not measuring) and leaves STACK_HEADROOM_MIN of the system
+    file's stack_size free. Marks are audited on timer ticks."""
+    text = open(os.path.join(ROOT, "crates/tls-core/src/hybrid.rs")).read()
+    m = re.search(r"pub const SCRUB_DEPTH_EXCHANGE: usize = (\d+) \* 1024;", text)
+    if not m:
+        raise Fail("SCRUB_DEPTH_EXCHANGE not found in crates/tls-core/src/hybrid.rs")
+    floor, size = int(m.group(1)) * 1024, system_stack_size("tls")
+    deadline = time.monotonic() + 3 * TIMER_TICK_S
+    while True:
+        marks = [int(b) for b in con.count(r"audit: src=tls StackHighWater bytes=(\d+) ")]
+        if marks and max(marks) >= floor:
+            break
+        if time.monotonic() > deadline:
+            raise Fail(f"tls: stack high-water {max(marks, default=0)} B is below its scrub depth {floor}; "
+                       "the probe is not measuring")
+        time.sleep(0.1)
+    hw = max(marks)
+    print(f"\ntls: stack high-water {hw} B of {size} B, {size - hw} B free", flush=True)
+    if size - hw < STACK_HEADROOM_MIN:
+        raise Fail(f"tls: {size - hw} B of stack free, want at least {STACK_HEADROOM_MIN}")
+    passed.append("tls stack headroom")
+    print("\nPASS [tls stack: reaches the exchange scrub, headroom kept]")
+
+
+def test_https(pkg: "Package", deploy: str, other_ca: str, passed: list):
+    """Boot "https" (M6 plan C3, C7): `tls`'s TLS 1.3 on the outside tap."""
     tap = Tap()
     inside = Wire()
+    monitor = os.path.join(deploy, "monitor.sock")
     try:
-        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"))
+        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"), monitor)
     except BaseException:
         tap.close()
         raise
     try:
         wait_tap_ready(tap, con)
         con.wait_for(r"tls: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
-        https_echo_case(con)
-        passed.append("https tcp echo")
-        print("\nPASS [https tcp echo: connect to the HTTPS port, bytes echoed, FIN answered]")
+        mon = Monitor(monitor)
+        https_handshake_cases(con, deploy, other_ca, passed)
+        https_probe_case(con, deploy, passed)
+        tls_stack_headroom_case(con, passed)
+        tls_scalar_count_case(mon, deploy, passed)
     finally:
         try:
             with signals_held():
                 kill(child)
                 tap.close()
         except SystemExit:
+            kill(child)
+            tap.close()
+            raise
+
+
+def tcp_fields(frame: bytes):
+    """(src ip, sport, dst ip, dport, flags, seq) of an IPv4/TCP frame, or
+    None."""
+    if len(frame) < 54 or frame[12:14] != b"\x08\x00" or frame[23] != 6:
+        return None
+    t = 14 + (frame[14] & 0xF) * 4
+    sport, dport, seq, _, _, flags = struct.unpack("!HHIIBB", frame[t:t + 14])
+    return frame[26:30], sport, frame[30:34], dport, flags, seq
+
+
+def barrier_tcp(src_ip: bytes, sport: int, flags: int, seq: int, ack: int = 0) -> bytes:
+    """A segment from `src_ip` (on the tap's subnet, otherwise unused) to the
+    HTTPS port, framed as the router would."""
+    seg = struct.pack("!HHIIBBHHH", sport, HTTPS_PORT, seq, ack, 5 << 4, flags, 65535, 0, 0)
+    c = csum(src_ip + GW_IP + struct.pack("!BBH", 0, 6, len(seg)) + seg)
+    seg = seg[:16] + struct.pack("!H", c) + seg[18:]
+    return eth(GW_MAC, PEER_MAC, 0x0800, ip_hdr(src_ip, GW_IP, 6, len(seg)) + seg)
+
+
+def wait_server_rst(sniffer: "Sniffer", start: int, port: int, timeout: float, what: str):
+    """The server's RST to the client's `port`, seen on the tap after
+    `start`."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sniffer.check_drops()
+        for _, f, outgoing in sniffer.since(start):
+            t = tcp_fields(f)
+            if (not outgoing and t and t[0] == GW_IP and t[1] == HTTPS_PORT and t[3] == port
+                    and t[4] & TCP_RST):
+                return
+        time.sleep(0.05)
+    raise Fail(f"{what}: no RST from the server to port {port}")
+
+
+def barrier_syn(tap: Tap, sniffer: "Sniffer", what: str):
+    """The C8 barrier (T-R3-3, T-R5-3): a SYN to the HTTPS port from an
+    address the boot uses for nothing else, retried a bounded number of
+    times, answered (SYN-ACK or RST). `tls` handles it in a later pass than
+    the one that sent the abort RST, so that socket's release (storage
+    wiped) is done. A SYN-ACK is reset so the listener is free again."""
+    for i in range(BARRIER_SYN_TRIES):
+        start = len(sniffer.since(0))
+        sport, isn = 50000 + i, secrets.randbits(32)
+        tap.send(barrier_tcp(BARRIER_IP, sport, TCP_SYN, isn))
+        deadline = time.monotonic() + BARRIER_SYN_WAIT_S
+        while time.monotonic() < deadline:
+            sniffer.check_drops()
+            for _, f, outgoing in sniffer.since(start):
+                t = tcp_fields(f)
+                if not outgoing and t and t[2] == BARRIER_IP and t[3] == sport and t[4] & (TCP_SYN | TCP_RST):
+                    if t[4] & TCP_SYN:
+                        tap.send(barrier_tcp(BARRIER_IP, sport, TCP_RST, (isn + 1) & 0xFFFFFFFF))
+                    return
+            time.sleep(0.02)
+    raise Fail(f"{what}: barrier SYN unanswered")
+
+
+def client_port(sniffer: "Sniffer", start: int, what: str) -> int:
+    """The source port of the first SYN to the HTTPS port from the tap's
+    address after `start`."""
+    for _, f, outgoing in sniffer.since(start):
+        t = tcp_fields(f)
+        if outgoing and t and t[0] == PEER_IP and t[3] == HTTPS_PORT and t[4] & (TCP_SYN | TCP_ACK) == TCP_SYN:
+            return t[1]
+    raise Fail(f"{what}: no SYN from the client seen")
+
+
+def slowloris_case(con: Console, passed: list):
+    """M6 plan case 11 (T12, T-N2, T-R3-1), first in its boot so no earlier
+    case raises the code: one byte of a ClientHello record per interval,
+    shorter than the handshake timeout, until past it; the connection ends
+    (EOF or RST) no later than the timeout plus slack (bounded from above
+    only), and the TlsTimeout(Handshake) line has total=1."""
+    timeout = rust_const(TLS_CONN, "HANDSHAKE_TIMEOUT_NS") / NS
+    # A ClientHello record header announcing 512 bytes, then its handshake
+    # header and filler: never complete at this rate.
+    trickle = bytes([22, 3, 1, 2, 0, 1, 0, 1, 252]) + b"\0" * 64
+    try:
+        s = socket.create_connection((ip_str(GW_IP), HTTPS_PORT), timeout=HTTPS_WAIT_S)
+    except OSError as e:
+        raise Fail(f"slowloris: no TCP connection to port {HTTPS_PORT}: {e}") from e
+    start = time.monotonic()
+    ended = False
+    with s:
+        s.settimeout(SLOWLORIS_INTERVAL_S)
+        for b in trickle:
+            if time.monotonic() - start > timeout + SLOWLORIS_SLACK_S:
+                break
+            try:
+                s.send(bytes([b]))
+                if s.recv(1) == b"":
+                    ended = True
+                    break
+            except socket.timeout:
+                continue
+            except OSError:
+                # RST (ECONNRESET) or a send after it (EPIPE).
+                ended = True
+                break
+    if not ended:
+        raise Fail(f"slowloris: still open {time.monotonic() - start:.1f} s after connecting "
+                   f"(handshake timeout {timeout:.0f} s)")
+    con.wait_for(r"audit: src=tls TlsTimeout\(Handshake\) total=1 lost=\d+", timeout=LINE_TIMEOUT_S)
+    passed.append("https slowloris")
+    print(f"\nPASS [slowloris: closed after {time.monotonic() - start:.1f} s, TlsTimeout(Handshake) total=1]")
+
+
+def https_residue_case(con: Console, mon: Monitor, tap: Tap, sniffer: "Sniffer", deploy: str, passed: list):
+    """M6 plan C8 cases 1-3 (T6, T7, T-N2, T-N3, T-R3-2), adapted to slice
+    3b, which has no backend: the host-observed barrier is the fixed
+    response, sent only after `tls` decrypted the head, which connection A
+    sends after `k` (its KeyUpdate) and `K` (KeyUpdate, update requested):
+    so the server read under client secret 2 and wrote the response under
+    server secret 1. The response is followed by close_notify, the slot
+    wiped before either is transmitted; the abort RST, then a fresh SYN from
+    an unused address answered, show the socket released and its storage
+    wiped. Then every handshake and traffic secret of A, their record keys
+    and IVs, and A's marker (a header value only `tls` ever held) are
+    absent, while a live connection B's CLIENT_TRAFFIC_SECRET_0 is present
+    (the control; B holds the slot in the head stage)."""
+    ca = os.path.join(deploy, "devca.pem")
+    marker = secrets.token_hex(16)
+    log_a, log_b = (os.path.join(deploy, f"keylog-{n}.txt") for n in "ab")
+    for p in (log_a, log_b):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(p)
+    a = b = None
+    try:
+        start = len(sniffer.since(0))
+        a = SClient("-groups", "X25519MLKEM768", "-CAfile", ca, "-verify_return_error", "-keylogfile", log_a)
+        a.handshake("residue: connection A")
+        port = client_port(sniffer, start, "residue: connection A")
+        a.key_update(b"k", "residue: connection A's KeyUpdate")
+        a.key_update(b"K", "residue: connection A's requested KeyUpdate")
+        a.send(request_head(f"Proxy-Selftest: {marker}\r\n"))
+        a.wait_for(re.escape(HTTPS_FIXED_BODY), "residue: connection A's response (the barrier)")
+        wait_server_rst(sniffer, start, port, rust_const(TLS_CONN, "CLOSE_LINGER_NS") / NS + HTTPS_WAIT_S,
+                        "residue: connection A's abort")
+        barrier_syn(tap, sniffer, "residue")
+        a.close()
+        a = None
+
+        logged = keylog(log_a)
+        need = ("CLIENT_HANDSHAKE_TRAFFIC_SECRET", "SERVER_HANDSHAKE_TRAFFIC_SECRET", "CLIENT_TRAFFIC_SECRET_0",
+                "SERVER_TRAFFIC_SECRET_0")
+        if any(len(logged.get(k, [])) != 1 for k in need):
+            raise Fail(f"residue: connection A's keylog lacks one of {need}: {sorted(logged)}")
+        c0, s0 = logged["CLIENT_TRAFFIC_SECRET_0"][0], logged["SERVER_TRAFFIC_SECRET_0"][0]
+        c1 = hkdf_expand_label(c0, b"traffic upd", 32)
+        c2 = hkdf_expand_label(c1, b"traffic upd", 32)
+        s1 = hkdf_expand_label(s0, b"traffic upd", 32)
+        # OpenSSL logs the updated secrets too: the derivation checked.
+        if logged.get("CLIENT_TRAFFIC_SECRET_N") != [c1, c2] or logged.get("SERVER_TRAFFIC_SECRET_N") != [s1]:
+            raise Fail("residue: the traffic upd derivation differs from OpenSSL's keylog")
+        absent = {"marker": marker.encode()}
+        for name, secret in (("client handshake secret", logged["CLIENT_HANDSHAKE_TRAFFIC_SECRET"][0]),
+                             ("server handshake secret", logged["SERVER_HANDSHAKE_TRAFFIC_SECRET"][0]),
+                             ("client secret 0", c0), ("client secret 1", c1), ("client secret 2", c2),
+                             ("server secret 0", s0), ("server secret 1", s1)):
+            absent.update(secret_forms(f"connection A's {name}", secret))
+
+        b = SClient("-groups", "X25519MLKEM768", "-CAfile", ca, "-verify_return_error", "-keylogfile", log_b)
+        b.handshake("residue: connection B")
+        b.send(b"GET / HTTP/1.1\r\n")
+        control = keylog(log_b).get("CLIENT_TRAFFIC_SECRET_0", [None])[0]
+        if control is None:
+            raise Fail("residue: connection B's keylog has no CLIENT_TRAFFIC_SECRET_0")
+        scan_snapshot(mon, os.path.join(deploy, "pmem-residue.bin"), "residue", absent,
+                      {"connection B's CLIENT_TRAFFIC_SECRET_0 (live)": control})
+    finally:
+        close_all(a, b)
+        for p in (log_a, log_b):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(p)
+    passed.append("https residue closed connection")
+    print("\nPASS [https residue: a closed connection's secrets, keys and marker gone; a live one's secret held]")
+
+
+def test_https_residue(pkg: "Package", deploy: str, passed: list):
+    """Boot "https-residue" (M6 plan C8, T-N2): slowloris first, then the
+    residue cases."""
+    tap = Tap()
+    inside = Wire()
+    monitor = os.path.join(deploy, "monitor.sock")
+    try:
+        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"), monitor)
+    except BaseException:
+        tap.close()
+        raise
+    sniffer = None
+    try:
+        sniffer = Sniffer(HTTPS_PORT, proto=6)
+        wait_tap_ready(tap, con)
+        con.wait_for(r"tls: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        mon = Monitor(monitor)
+        slowloris_case(con, passed)
+        https_residue_case(con, mon, tap, sniffer, deploy, passed)
+    finally:
+        try:
+            with signals_held():
+                close_all(sniffer)
+                kill(child)
+                tap.close()
+        except SystemExit:
+            close_all(sniffer)
+            kill(child)
+            tap.close()
+            raise
+
+
+def test_tls_key_failure(pkg: "Package", deploy: str, passed: list):
+    """M6 plan case 8 (D5, C11, S-N3, T-R3-7): the image with a blob whose
+    TLS scalar is valid but not the certificate's. `key` stays Ready for
+    `hs`; `tls`'s first TlsSign is answered Unavailable, so HTTPS is refused,
+    `tls` audits KeyUnavailable with TlsKeyError::Mismatch's code and halts;
+    the VPN still completes a handshake afterwards. The rejected scalar
+    occurs nowhere in guest RAM (`key` wiped it), while the same blob's
+    gateway key, which `key` holds for `hs`, does (the control)."""
+    with open(os.path.join(deploy, "secrets-tls-mismatch.bin"), "rb") as f:
+        blob = f.read()
+    rejected, gateway_private = blob[KEY_BLOB_TLS_PRIVATE], blob[KEY_BLOB_GATEWAY_PRIVATE]
+    with open(os.path.join(deploy, "secrets.bin"), "rb") as f:
+        if f.read()[KEY_BLOB_TLS_PRIVATE] == rejected:
+            raise Fail("tls key failure: the mismatch blob carries the deployment's own TLS scalar")
+    if not any(rejected) or not any(gateway_private):
+        raise Fail("tls key failure: a needle is all zero; the scan would prove nothing")
+    code, reason = tls_key_code("Mismatch"), halt_reason("tls", "KEY_UNAVAILABLE")
+    tap = Tap()
+    inside = Wire()
+    monitor = os.path.join(deploy, "monitor.sock")
+    try:
+        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"), monitor)
+    except BaseException:
+        tap.close()
+        raise
+    rp = py = None
+    try:
+        wait_tap_ready(tap, con)
+        con.wait_for(r"tls: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        r = curl(os.path.join(deploy, "devca.pem"), https_url())
+        if r.returncode == 0:
+            raise Fail("tls key failure: HTTPS completed with a TLS key key refused")
+        m = con.wait_for(rf"audit: src=tls KeyUnavailable code={code} lost=\d+\r*\n")
+        con.wait_for(rf"audit: src=tls Halted reason={reason} lost=\d+\r*\n", since=m.end())
+        cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
+        con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        mark = con.mark()
+        rp = Rosenpass(deploy, 0, f"{ip_str(GW_IP)}:{RP_PORT}")
+        py = py_installed(open(os.path.join(deploy, "peer-0.conf")).read(), b64(cfg["gateway"]["public_key"]), rp,
+                          time.monotonic() + RP_EXCHANGE_S)
+        con.wait_for(r"audit: src=hs HandshakeOk total=1 ", since=mark)
+        scan_snapshot(Monitor(monitor), os.path.join(deploy, "pmem-tls-key.bin"), "tls key failure",
+                      {"the rejected TLS scalar": rejected, "the rejected TLS scalar (little-endian)": rejected[::-1]},
+                      {"the gateway key key holds for hs": gateway_private})
+        passed.append("tls key failure")
+        print("\nPASS [tls key failure: HTTPS refused, tls audited KeyUnavailable and halted, the VPN handshakes]")
+    finally:
+        try:
+            with signals_held():
+                close_all(rp, py)
+                kill(child)
+                tap.close()
+        except SystemExit:
+            close_all(rp, py)
             kill(child)
             tap.close()
             raise
@@ -3889,10 +4440,10 @@ def build(tmp: str):
     case) and C (two peers with their Rosenpass keys swapped, its own image
     and TPM: the peer binding case). A is packaged a second time, sealed to
     a third TPM that never boots (the foreign-TPM case)."""
-    for name, peers in (("a", "3"), ("b", "3"), ("c", "2")):
+    for name, peers, extra in (("a", "3", ["--tls-mismatch-blob"]), ("b", "3", []), ("c", "2", [])):
         subprocess.run(["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "--template",
                         os.path.join(ROOT, "config/gateway.toml"), "--peers", peers, "--out",
-                        os.path.join(tmp, name)], check=True, cwd=ROOT)
+                        os.path.join(tmp, name), *extra], check=True, cwd=ROOT)
     swap_rp_records(os.path.join(tmp, "c/gateway.toml"))
     _, srk_a = provision_tpm(tmp, "a")
     _, srk_c = provision_tpm(tmp, "c")
@@ -3907,10 +4458,13 @@ def build(tmp: str):
          f"OUT={tmp}/b/pkg", env=env)
     make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
          f"SRK_PUBLIC={srk_foreign}", f"OUT={tmp}/a/pkg-foreign", env=env)
+    # Only the TLS scalar differs (M6 plan case 8, D5): `key` stays Ready.
+    make("package", f"SECRETS={tmp}/a/secrets-tls-mismatch.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
+         f"SRK_PUBLIC={srk_a}", f"OUT={tmp}/a/pkg-tls-mismatch", env=env)
     env_c = {**os.environ, "SECUREOS_CONFIG": os.path.join(tmp, "c/gateway.toml")}
     make("package", f"SECRETS={tmp}/c/secrets.bin", f"PQ_SECRETS={tmp}/c/pqkey-secrets.bin", f"SRK_PUBLIC={srk_c}",
          f"OUT={tmp}/c/pkg", env=env_c)
-    for pkg in ("a/pkg", "b/pkg", "a/pkg-foreign", "c/pkg"):
+    for pkg in ("a/pkg", "b/pkg", "a/pkg-foreign", "a/pkg-tls-mismatch", "c/pkg"):
         if sorted(os.listdir(os.path.join(tmp, pkg))) != sorted(PACKAGE_OUTPUTS):
             raise Fail(f"{pkg} holds {sorted(os.listdir(os.path.join(tmp, pkg)))}, want {sorted(PACKAGE_OUTPUTS)}")
         check_oracle_not_in_image(os.path.join(tmp, pkg, "published.img"))
@@ -3925,7 +4479,8 @@ def packages(tmp: str) -> dict:
     return {"good": Package(os.path.join(tmp, "a/pkg"), os.path.join(tmp, "tpm-a")),
             "mismatched": Package(os.path.join(tmp, "b/pkg"), os.path.join(tmp, "tpm-a")),
             "binding": Package(os.path.join(tmp, "c/pkg"), os.path.join(tmp, "tpm-c")),
-            "foreign": Package(os.path.join(tmp, "a/pkg-foreign"), os.path.join(tmp, "tpm-foreign"))}
+            "foreign": Package(os.path.join(tmp, "a/pkg-foreign"), os.path.join(tmp, "tpm-foreign")),
+            "tls_mismatch": Package(os.path.join(tmp, "a/pkg-tls-mismatch"), os.path.join(tmp, "tpm-a"))}
 
 
 def check_harness_matches_config(deploy: str):
@@ -3962,6 +4517,7 @@ def in_netns(tmp: str) -> int:
     guard_thread_starts()
     pkgs = packages(tmp)
     good, mismatched, binding, foreign = pkgs["good"], pkgs["mismatched"], pkgs["binding"], pkgs["foreign"]
+    tls_mismatch = pkgs["tls_mismatch"]
     deploy = os.path.join(tmp, "a")
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     try:
@@ -3990,7 +4546,10 @@ def in_netns(tmp: str) -> int:
              ("measured boot", lambda: test_measured_boot(good.dir, passed)),
              ("sealed boot", lambda: test_sealed(good, foreign, passed)),
              ("tpm proxy", lambda: test_tpm_proxy(good, passed)),
-             ("https", lambda: test_https(good, passed))]
+             ("https", lambda: test_https(good, deploy, os.path.join(os.path.dirname(deploy), "b", "devca.pem"),
+                                         passed)),
+             ("https residue", lambda: test_https_residue(good, deploy, passed)),
+             ("tls key failure", lambda: test_tls_key_failure(tls_mismatch, deploy, passed))]
     # check-selftest's red-proofs need only the boot their injection breaks:
     # SECUREOS_IT_BOOTS names those (comma-separated). A filtered run never
     # prints INTEGRATION-CASES, so it can never pass `make check`'s manifest.

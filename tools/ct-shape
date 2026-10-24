@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
 """Identity and shape of the shipped McEliece code (M4 plan C10) and of the
-envelope-open closure (M5 plan I10.3), the Verus erasure check (C1), and
-the no-debug-printing check (M5 plan C6).
+envelope-open closure (M5 plan I10.3), identity of the TLS hybrid exchange
+and its scrub (M6 plan C7), the Verus erasure check (C1), and the
+no-debug-printing check (M5 plan C6).
 
   tools/ct-shape --harness BIN --search-path DIR [--checks LIST]
                  [--policy TOML] [ELF ...]
   tools/ct-shape --harness BIN --search-path DIR --print-baseline
 
 For each root in ROOTS (a PD ELF under --search-path and the mce460896 or
-tpm2 envelope-open function it ships), the call-graph closure is derived
-from the ELF by
+tpm2 envelope-open function it ships), and in IDENTITY_ROOTS, the
+call-graph closure is derived from the ELF by
 following `bl` and tail-call `b <sym>` edges (any direct branch that leaves
 the function), stopping at panic entries (`core::` functions named
 `*_fail` / `*_failed`, `core::panicking::` itself, or that never return: no
-`ret`, ending in a call into `core::panicking::`) and at memcpy, memset and
-memmove.
+`ret`, ending in a call into `core::panicking::`) and at memcpy, memset,
+memmove, memcmp and bcmp.
 
   identity   the same root's closure in the C9 harness (--harness) is the
              same set of functions (stops included), and each function's
@@ -22,7 +23,12 @@ memmove.
              only address operands (direct branch targets, adr/adrp, literal
              loads and the lo12 immediate paired with an adrp) by what they
              name, and masks hash noise in symbol names; opcodes, registers
-             and every other immediate stay.
+             and every other immediate stay. An anonymous constant
+             (`anon.<hash>.<n>`, numbered per codegen unit) is named by its
+             content instead, pointers in it followed (ANON_*). memcmp and
+             bcmp are one stop (CMP_LIBCALLS). IDENTITY_ROOTS get this check
+             alone: their closures reach libcrux, which stays outside the
+             shape baseline (M6 plan RM6-5).
   forbidden  no udiv/sdiv, br/blr, call to memcmp/bcmp, or valgrind
              client-request preamble (`ror x12, x12, #3` and the three
              rotations after it) in those closures.
@@ -81,7 +87,14 @@ CXXFILT = "c++filt"
 OPEN_ROOT = "tpm2::envelope::open_sealed"
 ROOTS = [("pd-pqkey.elf", "mce460896::decaps"), ("pd-pq.elf", "mce460896::encaps_attempt"),
          ("pd-key.elf", OPEN_ROOT), ("pd-pqkey.elf", OPEN_ROOT)]
-ROOT_ELFS = sorted({label for label, _ in ROOTS})
+# Identity-only roots (M6 plan C7, T-R5-1, T-R6-1): the hybrid exchange
+# `tls` ships, by its non-generic inner function, and the stack scrub after
+# it, both scanned by the C9 residue harness. Not forbidden-scanned and not
+# shape-baselined: libcrux, which their closures reach, stays outside the
+# policy.
+IDENTITY_ROOTS = [("pd-tls.elf", "tls_core::hybrid::exchange_with_randomness"),
+                  ("pd-tls.elf", "tls_core::hybrid::scrub_session_stack")]
+ROOT_ELFS = sorted({label for label, _ in ROOTS + IDENTITY_ROOTS})
 MCE_ELFS = sorted({label for label, root in ROOTS if root.startswith("mce460896::")})
 # The generic `encaps` shim is excluded from identity by name (C7 I8). It is
 # shape-baselined in pd-pq; where it was inlined into its only caller (it is,
@@ -89,7 +102,19 @@ MCE_ELFS = sorted({label for label, root in ROOTS if root.startswith("mce460896:
 SHIM_NAME = re.compile(r"^mce460896::encaps::<")
 SHIM_CARRIER = re.compile(r"^<rosenpass_core::kem::McEliece460896 as rosenpass_core::kem::Encaps<.*>>::encaps::<")
 SHIM_ELF = "pd-pq.elf"
+# The RNG-generic shim over the exchange root, excluded from identity by
+# name the same way (M6 plan C7).
+TLS_SHIM_NAME = re.compile(r"^<tls_core::hybrid::HybridSecret>::exchange::<")
 MEM_STOPS = ("memcpy", "memset", "memmove")
+# LLVM turns a memcmp whose result is only compared with zero into bcmp
+# where the target's C library has one: the harness's linux-gnu target, not
+# the PDs' bare-metal one. No rustc option turns that off short of
+# `no_builtins`, which would change the codegen identity compares, so the
+# two are one stop: the call site is otherwise the same, and neither body
+# is compared (the PD links compiler_builtins', the harness glibc's, as for
+# memcpy). A call to either stays forbidden in the C10 closures.
+CMP_LIBCALLS = ("memcmp", "bcmp")
+CMP_STOP = "memcmp|bcmp"
 CHECKS = ("identity", "forbidden", "shape", "erasure", "printing")
 # The DebugPutChar syscall wrapper, by its demangled name's last segment.
 DEBUG_PUT_CHAR = re.compile(r"(?:^|::)seL4_DebugPutChar$")
@@ -184,6 +209,12 @@ def demangle_all(names) -> dict:
     return result
 
 
+def libcall_name(name: str) -> str:
+    """A function's name as identity compares it: memcmp and bcmp (merged
+    aliases included) are CMP_STOP."""
+    return CMP_STOP if any(n in CMP_LIBCALLS for n in name.split(" = ")) else name
+
+
 def normalise_name(name: str) -> str:
     """Masks hash noise: crate disambiguators (`[hex]`, which is what the v0
     `Cs<hash>_` demangles to), legacy `::h<hash>`, anonymous-constant
@@ -218,8 +249,11 @@ class Binary:
     """One ELF's functions (by start address; merged aliases share one, named
     `a = b`), data symbols and instructions."""
 
-    def __init__(self, label: str, syms: list, names: dict, insns: dict, plt: dict, sha256: str = ""):
-        self.label, self.insns, self.plt, self.sha256 = label, insns, plt, sha256
+    def __init__(self, label: str, syms: list, names: dict, insns: dict, plt: dict, sha256: str = "",
+                 memory: list = ()):
+        """`memory`: (address, bytes) of each allocated section with file
+        contents, for ANON content."""
+        self.label, self.insns, self.plt, self.sha256, self.memory = label, insns, plt, sha256, list(memory)
         funcs = collections.defaultdict(set)
         self.sizes = {}
         for s in syms:
@@ -254,31 +288,85 @@ class Binary:
         insns, plt = parse_objdump(out)
         if not insns:
             raise Fail(f"{label}: {OBJDUMP} disassembled nothing")
-        return cls(label, syms, demangle_all(s.name for s in syms), insns, plt, hashlib.sha256(data).hexdigest())
+        return cls(label, syms, demangle_all(s.name for s in syms), insns, plt, hashlib.sha256(data).hexdigest(),
+                   elf_memory(data))
 
     def function_name(self, addr: int):
         return self.funcs.get(addr, self.plt.get(addr))
 
     def symbolise(self, addr: int) -> str:
         """An address operand, by what it names; an address no symbol covers
-        (a merged string, say) is masked as <addr>."""
+        (a merged string, say) is masked as <addr>, an anonymous constant
+        named by its content."""
         name = self.function_name(addr)
         if name is not None:
-            return f"<{name}>"
+            return f"<{libcall_name(name)}>"
         if addr in self.labels:
             return f"<{self.labels[addr]}>"
         i = bisect.bisect_right(self.data, (addr, float("inf"), "")) - 1
         if i >= 0:
             start, size, name = self.data[i]
             if start <= addr < start + size:
+                if ANON_NAME.match(name):
+                    name = self.anon_content(start, size, ANON_DEPTH) or name
                 return f"<{name}+{addr - start:#x}>" if addr != start else f"<{name}>"
         return "<addr>"
+
+    def read(self, addr: int, size: int):
+        for base, data in self.memory:
+            if base <= addr and addr + size <= base + len(data):
+                return data[addr - base:addr - base + size]
+        return None
+
+    def anon_content(self, start: int, size: int, depth: int):
+        """`anon#<digest>` of the constant's bytes, each 8-byte word that
+        is the start of a sized symbol replaced by what that symbol is
+        named (its content, if anonymous too, `depth` levels down); None
+        when its bytes are not in the file (the caller keeps the name, so
+        a renumbering then fails rather than passes)."""
+        data = self.read(start, size)
+        if data is None:
+            return None
+        starts = {s: (n, z) for s, z, n in self.data}
+        parts = []
+        for off in range(0, size, 8):
+            word = data[off:off + 8]
+            target = starts.get(int.from_bytes(word, "little")) if len(word) == 8 and depth > 0 else None
+            if target is None:
+                parts.append(word.hex())
+            else:
+                name, z = target
+                inner = self.anon_content(int.from_bytes(word, "little"), z, depth - 1) \
+                    if ANON_NAME.match(name) else None
+                parts.append(f"<{inner or name}>")
+        return "anon#" + hashlib.sha256(" ".join(parts).encode()).hexdigest()[:16]
 
     def body(self, addr: int) -> list:
         size = self.sizes.get(addr, 0)
         if size <= 0:
             raise Fail(f"{self.label}: {self.funcs.get(addr, hex(addr))} has no size")
         return [(a, *self.insns[a]) for a in range(addr, addr + size, 4) if a in self.insns]
+
+
+# An anonymous constant (a panic Location, its file name, a message): rustc
+# numbers them per codegen unit, so the PD and the harness give the same
+# constant different numbers. Its content is what the code depends on; a
+# Location's file pointer is followed to the file name (two levels cover
+# Location -> string).
+ANON_NAME = re.compile(r"^anon\.\d+$")
+ANON_DEPTH = 2
+
+
+def elf_memory(data: bytes) -> list:
+    """(address, bytes) of each SHF_ALLOC section with file contents."""
+    shoff, = struct.unpack_from("<Q", data, 40)
+    shentsize, shnum = struct.unpack_from("<HH", data, 58)
+    out = []
+    for i in range(shnum):
+        _name, kind, flags, addr, offset, size = struct.unpack_from("<IIQQQQ", data, shoff + i * shentsize)
+        if flags & 2 and kind != 8 and addr:  # SHF_ALLOC, not SHT_NOBITS
+            out.append((addr, data[offset:offset + size]))
+    return out
 
 
 ADDR_OPERAND = re.compile(r"(?:^|(?<=, ))([0-9a-f]+)(?: <[^>]*>)?$")
@@ -378,10 +466,11 @@ def closure(binary: Binary, root: str):
         if name is None:
             problems.append(f"a branch to {addr:#x}, which starts no function")
             continue
-        if addr in binary.plt or any(n in MEM_STOPS for n in name.split(" = ")) or is_panic_entry(binary, addr):
-            stops.add(name)
+        if addr in binary.plt or any(n in MEM_STOPS + CMP_LIBCALLS for n in name.split(" = ")) \
+                or is_panic_entry(binary, addr):
+            stops.add(libcall_name(name))
             continue
-        if SHIM_NAME.match(name):
+        if SHIM_NAME.match(name) or TLS_SHIM_NAME.match(name):
             problems.append(f"the excluded shim {name} is reached")
             continue
         if name in nodes:
@@ -727,6 +816,12 @@ def main() -> int:
             scanned[label].update(nodes)
             symbols += len(nodes)
             print(f"CT-SHAPE-CLOSURE {label} {root}: {len(nodes)} functions, {len(stops)} stops")
+        for label, root in IDENTITY_ROOTS:
+            nodes, stops, _ = closure(binaries[label], root)
+            if "identity" in checks:
+                errors += check_identity(binaries[label], harness, root)
+            symbols += len(nodes)
+            print(f"CT-SHAPE-CLOSURE {label} {root}: {len(nodes)} functions, {len(stops)} stops, identity only")
         if "forbidden" in checks:
             for label, nodes in scanned.items():
                 errors += check_forbidden(binaries[label], nodes, divides)

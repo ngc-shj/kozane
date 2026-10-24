@@ -129,7 +129,7 @@ CASES_FOR_GATE = {
              "l14-constructor", "l14-codepoint", "finished-ct-eq"},
     "lint": {"lint"},
     "audit": {"audit"},
-    "lint-pds": {"lint-pds"},
+    "lint-pds": {"lint-pds", "tls-audit-names"},
     "unit": {"unit", "c5-forward-burst", "c5-backlog", "c5-interval", "c5-key-calls",
              "arrival-interval-order", "arrival-burst-order", "late-notify", "unbounded-drain",
              "rotate-before-max-age", "net-buffers-equal", "l8-stale", "l8-expiry-tick", "l8-order",
@@ -142,13 +142,14 @@ CASES_FOR_GATE = {
              "c5-d5-codes", "c5-seed-tag", "c5-caller-bucket", "c5-sign-wait", "c5-syn-burst", "c5-syn-interval",
              "l14-clone", "finished-check", "ccs-once", "ccs-after-finished", "key-share-length", "duplicate-extension",
              "no-key-share-reason", "der-minimal", "early-data-after-connected", "early-data-cap", "conn-timer-activity",
-             "conn-alert-wipe", "conn-timeout-wipe", "conn-rst-exhausted", "tls-rndr",
+             "conn-alert-wipe", "conn-timeout-wipe", "conn-rst-exhausted", "tls-rndr", "conn-reset-session",
              "c9-te-refusal", "c9-duplicate-cl", "c9-connection-names-cl", "c9-xff-strip", "c9-body-413"},
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
     "ct": {"ct-barrier", "ct-c1-barrier", "ct-harness-unit", "ct-harness-lint", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms",
-           "mce-residue-encaps-scrub", "mce-residue-encaps-depth", "mce-residue-bm", "tpm2-open-residue"},
-    "ct-shape": {"ct-shape", "ct-identity", "verus-erasure"},
+           "mce-residue-encaps-scrub", "mce-residue-encaps-depth", "mce-residue-bm", "tpm2-open-residue",
+           "tls-exchange-residue", "tls-exchange-scrub-depth"},
+    "ct-shape": {"ct-shape", "ct-identity", "verus-erasure", "tls-identity"},
     "verus": {"verus-cache", "verus-trusted", "verus-trusted-item", "verus-no-cheating", "verus-required", "verus-required-site",
               "verus-required-member", "verus-wg-wire-window",
               "verus-wg-wire-roundtrip", "verus-rp-wire-roundtrip",
@@ -159,7 +160,8 @@ CASES_FOR_GATE = {
     "test": {"measure-twin", "measure-wrap", "measure-halt", "measure-poweroff", "measure-ctrlc", "key-wipe", "sealed-pcr-unbound", "sealed-srk-name", "sealed-cap", "tpm-proxy-hmac",
              "integration", "integration-count", "integration-residue", "integration-cookie",
              "integration-pq-residue", "l8-fallback", "integration-rp-src-meter", "integration-rotation",
-             "integration-expiry", "rp-cookie-gate", "integration-expiry-residue"},
+             "integration-expiry", "rp-cookie-gate", "integration-expiry-residue",
+             "tls-key-halt", "c8-head-wipe", "tls-scalar-scrub", "https-probe-canary"},
     "repro": {"repro-path-leak"},
     "mir": {"mir-target-split", "mir-env-split", "mir-debug-split", "mir-feature-split"},
     "manifest": {"manifest"},
@@ -454,6 +456,22 @@ CASES = {
                                                  "    let r = open_core(envelope, kek, out);\n    scrub_stack();\n    r\n",
                                                  "    open_core(envelope, kek, out)\n"),
                           re.compile(r"RESIDUE-HIT kek case=open\.")),
+    # The hybrid exchange's stack scrub removed from the residue case
+    # (M6 plan C7, T-R4-1): ML-KEM's shared secret and the X25519 secret
+    # stay in libcrux's dead frames. The ct gate runs the harness's case,
+    # not on_hello_record; the production calls (tls-core and the PD) are
+    # the same function, whose code ct-shape binds.
+    "tls-exchange-residue": (["ct"], lambda t: edit(t, "tools/ct-harness/src/residue.rs",
+                                                    "        let r = exchange_with_randomness(&client.share, &client.randomness);\n"
+                                                    "        scrub_session_stack();\n",
+                                                    "        let r = exchange_with_randomness(&client.share, &client.randomness);\n"),
+                             re.compile(r"(?s)(?=.*RESIDUE-HIT kem-ss case=exchange )(?=.*RESIDUE-HIT x-ss case=exchange )")),
+    # The shipped scrub cut below the exchange's depth (33 KiB measured):
+    # the depth run refuses it, whatever the scan finds.
+    "tls-exchange-scrub-depth": (["ct"], lambda t: edit(t, "crates/tls-core/src/hybrid.rs",
+                                                        "pub const SCRUB_DEPTH_EXCHANGE: usize = 48 * 1024;",
+                                                        "pub const SCRUB_DEPTH_EXCHANGE: usize = 16 * 1024;"),
+                                 "RESIDUE-DEEP exchange-depth: "),
     # The identity and shape gate (M4 plan C10). The ct-barrier mutation
     # changes bm's conditional-instruction multiset; identity stays green
     # because the harness is built from the same source.
@@ -468,6 +486,17 @@ CASES = {
                                                  "\tRUSTFLAGS=\"-Zunstable-options --remap-path-prefix=$(CURDIR)=/secureos"
                                                  " $(if $(filter pq,$(1)),-Copt-level=3)\" \\\n\tcargo build --locked \\\n"),
                     "ct-shape: pd-pq.elf: identity: mce460896::"),
+    # The TLS identity root (M6 plan C7, T-R5-1): the exchange's code in
+    # pd-tls differs from the harness's (a statement compiled only for the
+    # PD's target, whose os is "none"; the harness's is linux).
+    "tls-identity": (["ct-shape"], lambda t: edit(t, "crates/tls-core/src/hybrid.rs",
+                                                  ") -> Result<(HybridSecret, [u8; SERVER_SHARE_LEN]), Refusal> {\n"
+                                                  "    let (ek, peer) =",
+                                                  ") -> Result<(HybridSecret, [u8; SERVER_SHARE_LEN]), Refusal> {\n"
+                                                  "    #[cfg(target_os = \"none\")]\n"
+                                                  "    let _ = core::hint::black_box(0u8);\n"
+                                                  "    let (ek, peer) ="),
+                     "ct-shape: pd-tls.elf: identity: tls_core::hybrid::exchange_with_randomness differs from the harness"),
     # Verus's exec library reaching a shipped PD: wire (which already
     # depends on vstd) calls a vstd exec function from parse_frame, which
     # the eth PDs reach.
@@ -1025,6 +1054,40 @@ CASES = {
     "tls-rndr": (["unit"], lambda t: edit(t, "crates/tls-core/src/rng.rs",
                                           "let rndr = self.hw.rndr().ok_or(RngError)?;", "let rndr = self.hw.rndr().unwrap_or(0);"),
                  "---- tests::tls_rndr_failure_means_no_handshake stdout ----"),
+    # The PD's slots are reset in place (too large to rebuild on its stack):
+    # a released slot whose session is not reset refuses the next client.
+    "conn-reset-session": (["unit"], lambda t: edit(t, "crates/tls-core/src/conn.rs",
+                                                    "        self.backend_open = false;\n        self.session.reset();\n",
+                                                    "        self.backend_open = false;\n"),
+                           "---- tests::a_released_slot_is_reset_in_place_and_serves_a_new_handshake stdout ----"),
+    # audit-event's name tables mirror enums it cannot see; `tls` checks
+    # them at compile time (two timeout names swapped).
+    "tls-audit-names": (["lint-pds"], lambda t: edit(t, "crates/audit-event/src/lib.rs",
+                                                     '["Handshake", "Head", "BackendConnect", "Idle", "Lifetime"]',
+                                                     '["Head", "Handshake", "BackendConnect", "Idle", "Lifetime"]'),
+                        "assertion failed: names_match()"),
+    # D5: a TlsSign answered Unavailable halts tls (after its audit).
+    "tls-key-halt": (["test", "it_boots=tls key failure"], lambda t: edit(t, "crates/pds/tls/src/main.rs",
+                                                                         "            self.rings.audit.halt(halt::KEY_UNAVAILABLE);\n        }\n        taken\n",
+                                                                         "        }\n        taken\n"),
+                     "timed out waiting for 'audit: src=tls Halted reason="),
+    # C8: the head buffer wiped on close and release; without it the
+    # closed connection's marker outlives it (the live control connection
+    # overwrites only the head's first line).
+    "c8-head-wipe": (["test", "it_boots=https residue"], lambda t: edit(t, "crates/tls-core/src/conn.rs",
+                                                                       "        wipe(&mut self.head);\n", ""),
+                     "residue: marker still in guest RAM"),
+    # T8: `key` scrubs its stack after each TlsSign; without it the scalar's
+    # copies in the dead P-256 frames (HACL's limbs: little-endian) remain.
+    "tls-scalar-scrub": (["test", "it_boots=https"], lambda t: edit(t, "crates/pds/key/src/main.rs",
+                                                                   "            scrub_stack();\n        }\n", "        }\n"),
+                         re.compile(r"tls scalar count: the TLS scalar \((big|little)-endian\) occurs \d+ time\(s\) "
+                                    r"in guest RAM, want exactly")),
+    # The probe canary (T-R3-8): its bound against the measured handshakes.
+    "https-probe-canary": (["test", "it_boots=https"], lambda t: edit(t, "tests/integration/run.py",
+                                                                     'limit = rust_const(TLS_CONN, "HANDSHAKE_TIMEOUT_NS") / NS / 3\n',
+                                                                     'limit = rust_const(TLS_CONN, "HANDSHAKE_TIMEOUT_NS") / NS / 3e6\n'),
+                           "probe margin exceeded"),
     # T-R3-10: SIGN_COST_NS is bound to libcrux-p256's lock entry; a recorded
     # entry that no longer matches the lock must fail `pins`.
     "c5-lock-pin": (["pins"], lambda t: edit(t, "crates/key-core/src/lib.rs",

@@ -29,7 +29,7 @@ pub const ETH_IN_IRQ: usize = 71;
 /// lives there (crates/pds/data asserts it fits).
 pub const DATA_STACK_SIZE: usize = 0x20_000;
 /// `tls`'s stack_size, which its stack probe paints.
-pub const TLS_STACK_SIZE: usize = 0x20_000;
+pub const TLS_STACK_SIZE: usize = 0x30_000;
 /// `tls`'s MCS budget and period (system file µs × 1000): a `TLS_SIGN`
 /// runs on this budget, which bounds how long `hs` can wait behind it in
 /// `key` (M6 plan C5, the invariant in `hs-core`).

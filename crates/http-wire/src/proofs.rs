@@ -1,12 +1,13 @@
 //! Kani harnesses for the head delimiter, the head parser, the
 //! Content-Length parse and the rewrite (M6 plan C9, T15). Run with
-//! `cargo kani -p http-wire`. Heads are at most 96 bytes with at most 4
-//! fields (the parser's field bound is its `N`); the rewrite harness, whose
-//! dropped-field check nests over the fields, takes 64 bytes and 3 fields.
+//! `cargo kani -p http-wire`. Heads are walked byte by byte with nested
+//! field loops, and at 96 bytes cbmc passed 38 GiB, so each harness takes
+//! the smallest input that still reaches its covers: the delimiter 32
+//! bytes, the parser 48 bytes with at most 4 fields (its field bound is its
+//! `N`), the rewrite 40 bytes and 3 fields.
 
 use super::*;
 
-const MAX_LEN: usize = 96;
 const FIELDS: usize = 4;
 
 fn any_bytes<const L: usize>(buf: &[u8; L]) -> &[u8] {
@@ -23,9 +24,9 @@ fn inside(outer: &[u8], inner: &[u8]) -> bool {
 /// No panic; `Some(n)` is the end of the first CRLFCRLF, `None` means
 /// there is none yet and no bare CR or LF either.
 #[kani::proof]
-#[kani::unwind(98)]
+#[kani::unwind(34)]
 fn head_end_finds_the_first_blank_line() {
-    let buf: [u8; MAX_LEN] = kani::any();
+    let buf: [u8; 32] = kani::any();
     let bytes = any_bytes(&buf);
     let r = head_end(bytes);
     if let Ok(found) = r {
@@ -48,9 +49,9 @@ fn head_end_finds_the_first_blank_line() {
 /// lies within it (the line's parts within the line), its field count is
 /// within the bound and its body length within `MAX_BODY`.
 #[kani::proof]
-#[kani::unwind(98)]
+#[kani::unwind(50)]
 fn head_is_total_and_slices_stay_inside() {
-    let buf: [u8; MAX_LEN] = kani::any();
+    let buf: [u8; 48] = kani::any();
     let bytes = any_bytes(&buf);
     let r = parse::<FIELDS>(bytes);
     if let Ok(h) = &r {
@@ -94,12 +95,12 @@ fn content_length_parse_is_exact_and_saturates() {
 /// buffer `REWRITE_GROWTH` bytes larger than the head, starting with the
 /// request line and ending with ours.
 #[kani::proof]
-#[kani::unwind(66)]
+#[kani::unwind(42)]
 fn rewrite_fits_and_keeps_the_request_line() {
-    let buf: [u8; 64] = kani::any();
+    let buf: [u8; 40] = kani::any();
     let bytes = any_bytes(&buf);
     let Ok(h) = parse::<3>(bytes) else { return };
-    let mut out = [0u8; 64 + REWRITE_GROWTH];
+    let mut out = [0u8; 40 + REWRITE_GROWTH];
     let r = rewrite(&h, kani::any(), &mut out);
     assert!(matches!(r, Ok(n) if n <= bytes.len() + REWRITE_GROWTH));
     let n = r.unwrap_or(0);

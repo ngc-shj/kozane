@@ -163,6 +163,7 @@ pub fn verdict_residue(status: i32, out: &str) -> Vec<String> {
         [
             "RESIDUE-HIT",
             "RESIDUE-SHALLOW",
+            "RESIDUE-DEEP",
             "RESIDUE-FAIL",
             "RESIDUE-UNDER-VALGRIND",
         ]
@@ -316,5 +317,11 @@ mod tests {
                 .any(|w| w.starts_with("RESIDUE-HIT ss"))
         );
         assert!(!verdict_residue(0, "RESIDUE-CASES 2\nRESIDUE-DONE 1\n").is_empty());
+        let deep = "RESIDUE-CASES 1\nRESIDUE-DEEP x: 9 bytes below the pad, the scrub covers 8\nRESIDUE-FAILED\n";
+        assert!(
+            verdict_residue(1, deep)
+                .iter()
+                .any(|w| w.starts_with("RESIDUE-DEEP x"))
+        );
     }
 }

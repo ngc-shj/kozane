@@ -65,6 +65,26 @@ pub enum Timeout {
     Lifetime = 4,
 }
 
+impl Timeout {
+    /// Every variant, in stage order.
+    pub const ALL: [Timeout; 5] = [Self::Handshake, Self::Head, Self::BackendConnect, Self::Idle, Self::Lifetime];
+
+    pub const fn stage(self) -> u16 {
+        self as u16
+    }
+
+    /// The name `audit` prints (`tls` checks audit-event's table).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Handshake => "Handshake",
+            Self::Head => "Head",
+            Self::BackendConnect => "BackendConnect",
+            Self::Idle => "Idle",
+            Self::Lifetime => "Lifetime",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmitRefusal {
     /// Every slot is taken.
@@ -99,6 +119,74 @@ pub enum CloseCause {
     ClientClosed,
     /// An error after the response started.
     Error,
+}
+
+/// Why `tls` ended a connection, audited as `TLS_CLOSED_BASE + code`: a
+/// [`CloseCause`], an [`AdmitRefusal`], or the client socket closed under
+/// the connection by the peer's RST or a TCP timeout (`PeerReset`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Closed {
+    BackendFin,
+    SelfResponse,
+    BackendRst,
+    ClientClosed,
+    Error,
+    SlotsFull,
+    PerSource,
+    PeerReset,
+}
+
+impl Closed {
+    /// Every variant, in code order.
+    pub const ALL: [Closed; 8] = [
+        Self::BackendFin,
+        Self::SelfResponse,
+        Self::BackendRst,
+        Self::ClientClosed,
+        Self::Error,
+        Self::SlotsFull,
+        Self::PerSource,
+        Self::PeerReset,
+    ];
+
+    pub const fn code(self) -> u16 {
+        self as u16
+    }
+
+    /// The name `audit` prints (`tls` checks audit-event's table).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::BackendFin => "BackendFin",
+            Self::SelfResponse => "SelfResponse",
+            Self::BackendRst => "BackendRst",
+            Self::ClientClosed => "ClientClosed",
+            Self::Error => "Error",
+            Self::SlotsFull => "SlotsFull",
+            Self::PerSource => "PerSource",
+            Self::PeerReset => "PeerReset",
+        }
+    }
+}
+
+impl From<CloseCause> for Closed {
+    fn from(c: CloseCause) -> Self {
+        match c {
+            CloseCause::BackendFin => Self::BackendFin,
+            CloseCause::SelfResponse => Self::SelfResponse,
+            CloseCause::BackendRst => Self::BackendRst,
+            CloseCause::ClientClosed => Self::ClientClosed,
+            CloseCause::Error => Self::Error,
+        }
+    }
+}
+
+impl From<AdmitRefusal> for Closed {
+    fn from(r: AdmitRefusal) -> Self {
+        match r {
+            AdmitRefusal::Full => Self::SlotsFull,
+            AdmitRefusal::PerSource => Self::PerSource,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,7 +292,7 @@ impl Slot {
     }
 
     pub(crate) fn open(&mut self, source: [u8; 4], now: u64) {
-        *self = Self::new();
+        self.reset();
         self.phase = Phase::Open { stage: Stage::Handshake, since: now };
         self.source = source;
         self.accepted = now;
@@ -276,6 +364,20 @@ impl Slot {
         self.rx.get(..n).unwrap_or(&[])
     }
 
+    /// Moves the application data an `AppData(n)` step left into
+    /// [`Slot::head`] at `at`, as far as the head buffer has room, and wipes
+    /// it from the record buffer. Returns the bytes moved.
+    pub fn append_head(&mut self, n: usize, at: usize) -> usize {
+        let data = self.rx.get_mut(..n).unwrap_or(&mut []);
+        let room = self.head.get_mut(at..).unwrap_or(&mut []);
+        let moved = data.len().min(room.len());
+        if let (Some(dst), Some(src)) = (room.get_mut(..moved), data.get(..moved)) {
+            dst.copy_from_slice(src);
+        }
+        wipe(data);
+        moved
+    }
+
     /// Ends the connection for `cause`. A clean end seals close_notify into
     /// `out` (returned length), wipes, and drains; every other cause wipes
     /// and aborts at once.
@@ -329,7 +431,7 @@ impl Slot {
             self.phase = Phase::Aborting { client, backend };
             Action::None
         } else {
-            *self = Self::new();
+            self.reset();
             Action::Release
         }
     }
@@ -367,6 +469,19 @@ impl Slot {
         self.wipe_buffers();
         self.phase = Phase::Aborting { client: RstWait::new(true), backend: RstWait::new(self.backend_open) };
         Action::Abort
+    }
+
+    /// Free, as [`Slot::new`] makes one, in place: the PD's slots are static
+    /// and too large to rebuild on its stack.
+    fn reset(&mut self) {
+        self.phase = Phase::Free;
+        self.source = [0; 4];
+        self.accepted = 0;
+        self.last_activity = 0;
+        self.close_started = 0;
+        self.backend_open = false;
+        self.session.reset();
+        self.wipe_buffers();
     }
 
     fn wipe_buffers(&mut self) {
@@ -411,6 +526,18 @@ impl Table {
         let (i, slot) = self.slots.iter_mut().enumerate().find(|(_, s)| s.is_free()).ok_or(AdmitRefusal::Full)?;
         slot.open(source, now);
         Ok(i)
+    }
+
+    /// A free slot taken straight into the abort sequence, for a connection
+    /// refused at admission: it holds no session and no source (it counts
+    /// toward no cap), only the client socket's RST to await, so the
+    /// refused socket is released like every other aborted one (M6 plan
+    /// C8). None when every slot is taken.
+    pub fn refuse(&mut self) -> Option<usize> {
+        let (i, slot) = self.slots.iter_mut().enumerate().find(|(_, s)| s.is_free())?;
+        slot.reset();
+        slot.phase = Phase::Aborting { client: RstWait::new(true), backend: RstWait::new(false) };
+        Some(i)
     }
 }
 

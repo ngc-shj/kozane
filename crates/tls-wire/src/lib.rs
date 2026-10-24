@@ -286,6 +286,45 @@ impl Refusal {
     pub const fn code(self) -> u16 {
         self as u16
     }
+
+    /// The variant's name, as `audit` prints it (`tls` asserts at compile
+    /// time that audit-event's table matches).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::RecordType => "RecordType",
+            Self::RecordVersion => "RecordVersion",
+            Self::RecordOverflow => "RecordOverflow",
+            Self::BadChangeCipherSpec => "BadChangeCipherSpec",
+            Self::UnexpectedChangeCipherSpec => "UnexpectedChangeCipherSpec",
+            Self::InnerAllZero => "InnerAllZero",
+            Self::InnerType => "InnerType",
+            Self::HandshakeTooLong => "HandshakeTooLong",
+            Self::NotAtRecordBoundary => "NotAtRecordBoundary",
+            Self::UnexpectedMessage => "UnexpectedMessage",
+            Self::Decode => "Decode",
+            Self::LegacyVersion => "LegacyVersion",
+            Self::SessionIdTooLong => "SessionIdTooLong",
+            Self::NoChaCha => "NoChaCha",
+            Self::Compression => "Compression",
+            Self::DuplicateExtension => "DuplicateExtension",
+            Self::NoTls13 => "NoTls13",
+            Self::NoPqGroup => "NoPqGroup",
+            Self::NoPqShare => "NoPqShare",
+            Self::KeyShareLength => "KeyShareLength",
+            Self::DuplicateKeyShare => "DuplicateKeyShare",
+            Self::NoSignatureAlgorithm => "NoSignatureAlgorithm",
+            Self::NoApplicationProtocol => "NoApplicationProtocol",
+            Self::PskNotLast => "PskNotLast",
+            Self::PskWithoutModes => "PskWithoutModes",
+            Self::BadKeyShare => "BadKeyShare",
+            Self::DecryptError => "DecryptError",
+            Self::BadRecordMac => "BadRecordMac",
+            Self::KeyUpdateValue => "KeyUpdateValue",
+            Self::Internal => "Internal",
+            Self::PeerAlert => "PeerAlert",
+            Self::Closed => "Closed",
+        }
+    }
 }
 
 #[cfg(kani)]

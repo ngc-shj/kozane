@@ -8,9 +8,9 @@
 //! every occurrence; producers raise them only on state edges, never at a
 //! rate an attacker drives.
 //!
-//! Some kinds carry a value instead of a running total: `RpCostHighWater`'s
-//! and `KeyWaitHighWater`'s `a` is the measured time in µs (`CostHighWater`
-//! gates how often each fires), the stack marks' `a` is bytes, `Halted`'s a reason code closed
+//! Some kinds carry a value instead of a running total: `RpCostHighWater`'s,
+//! `KeyWaitHighWater`'s and `TlsSignHighWater`'s `a` is the measured time in
+//! µs (`CostHighWater` gates how often each fires), the stack marks' `a` is bytes, `Halted`'s a reason code closed
 //! per producer and `KeyUnavailable`'s the key PD's boot error code.
 //!
 //! No kind names its producer: the producer is the audit ring a record
@@ -56,12 +56,58 @@ pub const TCP_LIMIT_SYN_GLOBAL: u16 = 1;
 pub const TCP_LIMIT_DATA: u16 = 2;
 /// `audit`'s names for the kinds, indexed by kind.
 pub const TCP_LIMIT_NAMES: [&str; 3] = ["SynSource", "SynGlobal", "Data"];
-/// Reserved for the `tls` PD's coalesced kinds (M6 plan C10), 32 codes
-/// each, base + reason/stage/status index; not decoded yet.
+/// The `tls` PD's coalesced kinds (M6 plan C10), 32 codes each: base +
+/// `tls_wire::Refusal::code`, `tls_core::conn::Closed::code`,
+/// `http_wire::Status::index` and `tls_core::conn::Timeout` respectively.
+/// The name tables below are `audit`'s; `tls` asserts at compile time that
+/// they match those enums (this crate depends on none of them).
 pub const TLS_REFUSED_BASE: u16 = 0x0220;
 pub const TLS_CLOSED_BASE: u16 = 0x0240;
 pub const HTTP_REFUSED_BASE: u16 = 0x0260;
 pub const TLS_TIMEOUT_BASE: u16 = 0x0280;
+const MAX_TLS_KIND: u16 = 0x1f;
+/// `tls_wire::Refusal`'s variants, by code.
+pub const TLS_REFUSED_NAMES: [&str; 32] = [
+    "RecordType",
+    "RecordVersion",
+    "RecordOverflow",
+    "BadChangeCipherSpec",
+    "UnexpectedChangeCipherSpec",
+    "InnerAllZero",
+    "InnerType",
+    "HandshakeTooLong",
+    "NotAtRecordBoundary",
+    "UnexpectedMessage",
+    "Decode",
+    "LegacyVersion",
+    "SessionIdTooLong",
+    "NoChaCha",
+    "Compression",
+    "DuplicateExtension",
+    "NoTls13",
+    "NoPqGroup",
+    "NoPqShare",
+    "KeyShareLength",
+    "DuplicateKeyShare",
+    "NoSignatureAlgorithm",
+    "NoApplicationProtocol",
+    "PskNotLast",
+    "PskWithoutModes",
+    "BadKeyShare",
+    "DecryptError",
+    "BadRecordMac",
+    "KeyUpdateValue",
+    "Internal",
+    "PeerAlert",
+    "Closed",
+];
+/// `tls_core::conn::Closed`'s variants, by code.
+pub const TLS_CLOSED_NAMES: [&str; 8] =
+    ["BackendFin", "SelfResponse", "BackendRst", "ClientClosed", "Error", "SlotsFull", "PerSource", "PeerReset"];
+/// `http_wire::Status` by index: the status codes.
+pub const HTTP_REFUSED_NAMES: [&str; 5] = ["400", "413", "417", "431", "501"];
+/// `tls_core::conn::Timeout`'s variants, by stage.
+pub const TLS_TIMEOUT_NAMES: [&str; 5] = ["Handshake", "Head", "BackendConnect", "Idle", "Lifetime"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
@@ -71,6 +117,18 @@ pub enum Event {
     FrameDropped { reason: u16 },
     /// `kind` is a `TCP_LIMIT_*` value (< 32).
     TcpLimited { kind: u16 },
+    /// `tls` refused a connection's record or handshake; `reason` is a
+    /// `tls_wire::Refusal` code (< 32).
+    TlsRefused { reason: u16 },
+    /// `tls` ended a connection; `reason` is a `tls_core::conn::Closed`
+    /// code (< 32).
+    TlsClosed { reason: u16 },
+    /// `tls` answered a request head with a refusal status; `status` is an
+    /// `http_wire::Status` index (< 32).
+    HttpRefused { status: u16 },
+    /// A `tls` connection timer fired; `stage` is a
+    /// `tls_core::conn::Timeout` (< 32).
+    TlsTimeout { stage: u16 },
     RingCorrupt,
     RxNoBuffer,
     TxNoBuffer,
@@ -207,6 +265,11 @@ pub enum Event {
     /// coalesced; `CostHighWater` bounds it). `hs` raises it: the runtime
     /// observable of the key-wait bound (M6 plan C5).
     KeyWaitHighWater { us: u32 },
+    /// The longest `TlsSign` call into `key`, wall time, rose to a new
+    /// high-water mark; `us` travels as the record's `a` (never coalesced;
+    /// `CostHighWater` bounds it). `tls` raises it: the measurement behind
+    /// `key_core::SIGN_COST_NS` (M6 plan C5).
+    TlsSignHighWater { us: u32 },
 }
 
 impl Event {
@@ -279,15 +342,20 @@ impl Event {
             Event::KeyUnavailable { .. } => KEY_UNAVAILABLE,
             Event::KeyStackHighWater { .. } => KEY_STACK_HIGH_WATER,
             Event::KeyWaitHighWater { .. } => KEY_WAIT_HIGH_WATER,
+            Event::TlsSignHighWater { .. } => TLS_SIGN_HIGH_WATER,
             Event::FrameDropped { reason } => {
                 FRAME_DROPPED_BASE | (if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason })
             }
             Event::TcpLimited { kind } => TCP_LIMITED_BASE | (if kind > MAX_TCP_LIMIT { MAX_TCP_LIMIT } else { kind }),
+            Event::TlsRefused { reason } => TLS_REFUSED_BASE | clamp_tls(reason),
+            Event::TlsClosed { reason } => TLS_CLOSED_BASE | clamp_tls(reason),
+            Event::HttpRefused { status } => HTTP_REFUSED_BASE | clamp_tls(status),
+            Event::TlsTimeout { stage } => TLS_TIMEOUT_BASE | clamp_tls(stage),
         }
     }
 
-    /// Every variant except the parameterised `FrameDropped` and
-    /// `TcpLimited` and the value-carrying ones (`Event::value` is `Some`).
+    /// Every variant except the parameterised `FrameDropped`, `TcpLimited`
+    /// and `tls` kinds and the value-carrying ones (`Event::value` is `Some`).
     pub const FIXED: [Event; 61] = [
         Event::ArpReplied,
         Event::UdpEchoed,
@@ -422,8 +490,13 @@ impl Event {
             Event::KeyUnavailable { .. } => "KeyUnavailable",
             Event::KeyStackHighWater { .. } => "KeyStackHighWater",
             Event::KeyWaitHighWater { .. } => "KeyWaitHighWater",
+            Event::TlsSignHighWater { .. } => "TlsSignHighWater",
             Event::FrameDropped { .. } => "FrameDropped",
             Event::TcpLimited { .. } => "TcpLimited",
+            Event::TlsRefused { .. } => "TlsRefused",
+            Event::TlsClosed { .. } => "TlsClosed",
+            Event::HttpRefused { .. } => "HttpRefused",
+            Event::TlsTimeout { .. } => "TlsTimeout",
         }
     }
 
@@ -447,11 +520,16 @@ impl Event {
             | Event::Halted { .. }
             | Event::KeyUnavailable { .. }
             | Event::KeyStackHighWater { .. }
-            | Event::KeyWaitHighWater { .. } => false,
+            | Event::KeyWaitHighWater { .. }
+            | Event::TlsSignHighWater { .. } => false,
             Event::ArpReplied
             | Event::UdpEchoed
             | Event::FrameDropped { .. }
             | Event::TcpLimited { .. }
+            | Event::TlsRefused { .. }
+            | Event::TlsClosed { .. }
+            | Event::HttpRefused { .. }
+            | Event::TlsTimeout { .. }
             | Event::RingCorrupt
             | Event::RxNoBuffer
             | Event::TxNoBuffer
@@ -512,6 +590,7 @@ impl Event {
             Event::KeyUnavailable { code } => Some(code),
             Event::KeyStackHighWater { bytes } => Some(bytes),
             Event::KeyWaitHighWater { us } => Some(us),
+            Event::TlsSignHighWater { us } => Some(us),
             _ => None,
         }
     }
@@ -591,6 +670,11 @@ impl Event {
             Event::KeyUnavailable { .. } => KEY_UNAVAILABLE_SLOT,
             Event::KeyStackHighWater { .. } => KEY_STACK_HIGH_WATER_SLOT,
             Event::KeyWaitHighWater { .. } => KEY_WAIT_HIGH_WATER_SLOT,
+            Event::TlsSignHighWater { .. } => TLS_SIGN_HIGH_WATER_SLOT,
+            Event::TlsRefused { reason } => TLS_REFUSED_SLOT.saturating_add(clamp_tls(reason) as usize),
+            Event::TlsClosed { reason } => TLS_CLOSED_SLOT.saturating_add(clamp_tls(reason) as usize),
+            Event::HttpRefused { status } => HTTP_REFUSED_SLOT.saturating_add(clamp_tls(status) as usize),
+            Event::TlsTimeout { stage } => TLS_TIMEOUT_SLOT.saturating_add(clamp_tls(stage) as usize),
             Event::FrameDropped { reason } => {
                 // FIXED_SLOTS..FIXED_SLOTS+64, clamped like `code`.
                 let r = if reason > MAX_DROP_REASON { MAX_DROP_REASON } else { reason };
@@ -613,7 +697,18 @@ const KEY_UNAVAILABLE_SLOT: usize = HALTED_SLOT + 1;
 const KEY_STACK_HIGH_WATER_SLOT: usize = KEY_UNAVAILABLE_SLOT + 1;
 const TCP_LIMITED_SLOT: usize = KEY_STACK_HIGH_WATER_SLOT + 1;
 const KEY_WAIT_HIGH_WATER_SLOT: usize = TCP_LIMITED_SLOT + MAX_TCP_LIMIT as usize + 1;
-const SLOTS: usize = KEY_WAIT_HIGH_WATER_SLOT + 1;
+const TLS_SIGN_HIGH_WATER_SLOT: usize = KEY_WAIT_HIGH_WATER_SLOT + 1;
+// Each `tls` kind: TLS_*_SLOT..+32, clamped like `code`.
+const TLS_REFUSED_SLOT: usize = TLS_SIGN_HIGH_WATER_SLOT + 1;
+const TLS_CLOSED_SLOT: usize = TLS_REFUSED_SLOT + MAX_TLS_KIND as usize + 1;
+const HTTP_REFUSED_SLOT: usize = TLS_CLOSED_SLOT + MAX_TLS_KIND as usize + 1;
+const TLS_TIMEOUT_SLOT: usize = HTTP_REFUSED_SLOT + MAX_TLS_KIND as usize + 1;
+const SLOTS: usize = TLS_TIMEOUT_SLOT + MAX_TLS_KIND as usize + 1;
+
+/// A `tls` kind's value, clamped into its 32 codes.
+const fn clamp_tls(v: u16) -> u16 {
+    if v > MAX_TLS_KIND { MAX_TLS_KIND } else { v }
+}
 
 /// `RpCostHighWater`'s code, the first after the fixed range.
 pub const COST_HIGH_WATER: u16 = 0x0048;
@@ -625,6 +720,8 @@ pub const KEY_UNAVAILABLE: u16 = 0x0055;
 pub const KEY_STACK_HIGH_WATER: u16 = 0x0056;
 /// M6 plan C5: `hs`'s key-call wait.
 pub const KEY_WAIT_HIGH_WATER: u16 = 0x0057;
+/// M6 plan C5: `tls`'s `TlsSign` call time.
+pub const TLS_SIGN_HIGH_WATER: u16 = 0x0058;
 
 /// Per-producer coalescing state.
 pub struct Coalescer {
@@ -709,6 +806,16 @@ pub enum Decoded {
     KeyStackHighWater,
     /// `KeyWaitHighWater`: the record's `a` is the wait in µs.
     KeyWaitHighWater,
+    /// `TlsSignHighWater`: the record's `a` is the call's time in µs.
+    TlsSignHighWater,
+    /// `tls_wire::Refusal` code.
+    TlsRefused(u16),
+    /// `tls_core::conn::Closed` code.
+    TlsClosed(u16),
+    /// `http_wire::Status` index.
+    HttpRefused(u16),
+    /// `tls_core::conn::Timeout` stage.
+    TlsTimeout(u16),
     Unknown,
 }
 
@@ -734,8 +841,24 @@ pub fn decode(code: u16) -> Decoded {
     if code == KEY_WAIT_HIGH_WATER {
         return Decoded::KeyWaitHighWater;
     }
+    if code == TLS_SIGN_HIGH_WATER {
+        return Decoded::TlsSignHighWater;
+    }
     if let Some(k) = code.checked_sub(TCP_LIMITED_BASE).filter(|k| *k <= MAX_TCP_LIMIT) {
         return Decoded::TcpLimited(k);
+    }
+    let tls_kind = |base: u16| code.checked_sub(base).filter(|v| *v <= MAX_TLS_KIND);
+    if let Some(v) = tls_kind(TLS_REFUSED_BASE) {
+        return Decoded::TlsRefused(v);
+    }
+    if let Some(v) = tls_kind(TLS_CLOSED_BASE) {
+        return Decoded::TlsClosed(v);
+    }
+    if let Some(v) = tls_kind(HTTP_REFUSED_BASE) {
+        return Decoded::HttpRefused(v);
+    }
+    if let Some(v) = tls_kind(TLS_TIMEOUT_BASE) {
+        return Decoded::TlsTimeout(v);
     }
     match code.checked_sub(FRAME_DROPPED_BASE) {
         Some(r) if r <= MAX_DROP_REASON => Decoded::FrameDropped(r),
@@ -743,8 +866,8 @@ pub fn decode(code: u16) -> Decoded {
     }
 }
 
-/// `pq`'s gate for `RpCostHighWater` (M3 plan VE10), and `hs`'s for
-/// `KeyWaitHighWater` (M6 plan C5): the first measurement always fires,
+/// `pq`'s gate for `RpCostHighWater` (M3 plan VE10), `hs`'s for
+/// `KeyWaitHighWater` and `tls`'s for `TlsSignHighWater` (M6 plan C5): the first measurement always fires,
 /// later ones only when the cost exceeds the last *emitted* value by at
 /// least 1/8. A boot therefore emits at most about log₁.₁₂₅(max/min) + 1 of
 /// them (L10; one more if the first cost is 0 µs), and the last one emitted
@@ -770,6 +893,11 @@ impl CostHighWater {
     /// `hs`'s wait for a key call.
     pub const fn key_wait() -> Self {
         Self { last: None, event: |us| Event::KeyWaitHighWater { us } }
+    }
+
+    /// `tls`'s time for a `TlsSign` call.
+    pub const fn tls_sign() -> Self {
+        Self { last: None, event: |us| Event::TlsSignHighWater { us } }
     }
 
     /// The event to record for a handshake that cost `us`, if one is due,

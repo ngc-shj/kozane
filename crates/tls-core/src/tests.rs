@@ -849,3 +849,83 @@ fn an_open_backend_socket_must_see_its_rst_too() {
     assert_eq!(s.abort_pass(Endpoint::Backend, false), Action::None);
     assert_eq!(s.abort_pass(Endpoint::Backend, true), Action::Release);
 }
+
+#[test]
+fn a_released_slot_is_reset_in_place_and_serves_a_new_handshake() {
+    let (mut s, _, mut out) = connected_slot();
+    assert_eq!(s.close(CloseCause::Error, &mut out, 3 * S), (0, Action::Abort));
+    assert_eq!(s.abort_pass(Endpoint::Client, true), Action::Release);
+    assert!(s.is_free() && s.source() == [0; 4]);
+    s.open(B, 4 * S);
+    let mut client = Client::new(12);
+    let mut ctx = Ctx { cert: CERT, rng: &mut CountingRng::new(2), signer: &mut TestSigner { calls: 0 } };
+    let ch = record(ContentType::Handshake, &client.client_hello(Offer::default()));
+    let step = s.on_record(&ch, &mut out, &mut ctx, 5 * S).unwrap();
+    client.read_flight(&out[..step.written]);
+    assert_eq!(s.on_record(&client.finished(), &mut out, &mut ctx, 5 * S).unwrap().event, Event::Connected);
+}
+
+#[test]
+fn a_refused_connection_holds_a_slot_only_until_its_rst() {
+    with_table(|t| {
+        t.admit(A, 0).unwrap();
+        let i = t.refuse().unwrap();
+        assert!(!t.slots[i].is_free() && t.slots[i].stage().is_none());
+        // It carries no source: A's second connection is still admitted.
+        assert!(t.admit(A, 0).is_ok());
+        assert_eq!(t.slots[i].abort_pass(Endpoint::Client, false), Action::None);
+        assert_eq!(t.slots[i].abort_pass(Endpoint::Client, true), Action::Release);
+        assert!(t.slots[i].is_free());
+    });
+}
+
+#[test]
+fn a_refused_connection_whose_rst_never_goes_out_is_released_after_pass_8() {
+    with_table(|t| {
+        let i = t.refuse().unwrap();
+        for _ in 1..MAX_RST_PASSES {
+            assert_eq!(t.slots[i].abort_pass(Endpoint::Client, false), Action::None);
+        }
+        assert_eq!(t.slots[i].abort_pass(Endpoint::Client, false), Action::Release);
+    });
+}
+
+#[test]
+fn refuse_finds_no_slot_in_a_full_table() {
+    with_table(|t| {
+        for i in 0..MAX_CONNS {
+            t.admit([10, 0, 1, u8::try_from(i).unwrap()], 0).unwrap();
+        }
+        assert_eq!(t.refuse(), None);
+    });
+}
+
+#[test]
+fn closed_and_timeout_codes_are_their_index_and_names_their_variants() {
+    for (i, c) in Closed::ALL.iter().enumerate() {
+        assert_eq!(usize::from(c.code()), i);
+        assert_eq!(c.name(), std::format!("{c:?}"));
+    }
+    for (i, t) in Timeout::ALL.iter().enumerate() {
+        assert_eq!(usize::from(t.stage()), i);
+        assert_eq!(t.name(), std::format!("{t:?}"));
+    }
+    assert!(Closed::ALL.len() <= 32 && Timeout::ALL.len() <= 32);
+    assert_eq!(Closed::from(CloseCause::SelfResponse), Closed::SelfResponse);
+    assert_eq!(Closed::from(AdmitRefusal::PerSource), Closed::PerSource);
+}
+
+#[test]
+fn append_head_moves_application_data_into_the_head_buffer_up_to_its_room() {
+    let (mut s, mut client, mut out) = connected_slot();
+    let mut ctx = Ctx { cert: CERT, rng: &mut CountingRng::new(1), signer: &mut TestSigner { calls: 0 } };
+    let step = s.on_record(&client.app(b"GET / HTTP/1.1\r\n"), &mut out, &mut ctx, 3 * S).unwrap();
+    assert_eq!(step.event, Event::AppData(16));
+    assert_eq!(s.append_head(16, HEAD_BUF_LEN - 4), 4);
+    assert_eq!(&s.head[HEAD_BUF_LEN - 4..], b"GET ");
+    assert!(s.app_data(16).iter().all(|&b| b == 0), "the moved plaintext is wiped from the record buffer");
+    let step = s.on_record(&client.app(b"Host: x\r\n"), &mut out, &mut ctx, 3 * S).unwrap();
+    assert_eq!(step.event, Event::AppData(9));
+    assert_eq!(s.append_head(9, 0), 9);
+    assert_eq!(&s.head[..9], b"Host: x\r\n");
+}

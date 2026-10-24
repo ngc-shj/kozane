@@ -17,6 +17,25 @@ mce460896 = { path = "../../crates/mce460896" }
 secret-blob = { path = "../../crates/secret-blob" }
 tpm2 = { path = "../../crates/tpm2" }
 tpm2-wire = { path = "../../crates/tpm2-wire" }
+# The hybrid exchange and its scrub `tls` ships (M6 plan C7, T-R4-1).
+tls-core = { path = "../../crates/tls-core" }
+# Every libcrux crate tls-core pulls, at the root lock's version and with
+# tls-core's features only, so that the harness compiles the code the PD
+# ships (T-R5-1). The client side of the residue case (ML-KEM keygen and
+# decapsulation, X25519) calls the first two directly.
+libcrux-ml-kem = { version = "=0.0.11", default-features = false, features = ["mlkem768"] }
+libcrux-curve25519 = { version = "=0.0.9", default-features = false }
+libcrux-chacha20poly1305 = { version = "=0.0.10", default-features = false }
+libcrux-hacl-rs = { version = "=0.0.6", default-features = false }
+libcrux-hmac = { version = "=0.0.9", default-features = false }
+libcrux-intrinsics = { version = "=0.0.9", default-features = false }
+libcrux-macros = { version = "=0.0.4", default-features = false }
+libcrux-platform = { version = "=0.0.4", default-features = false }
+libcrux-poly1305 = { version = "=0.0.7", default-features = false }
+libcrux-secrets = { version = "=0.0.7", default-features = false }
+libcrux-sha2 = { version = "=0.0.9", default-features = false }
+libcrux-sha3 = { version = "=0.0.11", default-features = false }
+libcrux-traits = { version = "=0.0.9", default-features = false }
 # The same versions mce460896 resolves to in the root lock: the expected
 # values (sha3) and the residue scan's keccak-state needles (keccak).
 sha3 = { version = "=0.10.9", default-features = false }

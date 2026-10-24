@@ -209,7 +209,7 @@ def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BL
             (d / "gen_config.h").write_text(gen)
             (d / "secureos.system").write_text(
                 '<system>\n<program_image path="pd-pqkey.elf" />\n<program_image path="pd-pq.elf" />\n'
-                '<program_image path="pd-key.elf" />\n</system>\n')
+                '<program_image path="pd-key.elf" />\n<program_image path="pd-tls.elf" />\n</system>\n')
             if waivers_text is not None:
                 (d / "waivers.toml").write_text(waivers_text)
             pkg.WAIVERS = d / "waivers.toml"

@@ -291,3 +291,182 @@ Deviations:
   missing Host (400), Expect (417), 413.
 - The rewrite Kani harness is bounded at 64 bytes / 3 fields (its dropped-
   field check nests over the fields), below the plan's 96 B / 4 fields.
+
+## Slice 3b (C7, C8 in the PD; probes)
+
+Gates run by the implementer: make pins/lint/lint-pds/unit/laws/image/ct/
+ct-shape. Not run (by the slice's rules): Kani, Verus, bolero, make
+test/check, check-selftest; every integration case and every `test`-gate
+selftest case below is unrun. Hand red-proofs on throwaway copies under
+build/: conn-reset-session and tls-audit-names red with their needles; the
+ct cases as recorded by the ct-harness work below. Root Cargo.lock
+unchanged; tools/ct-harness/Cargo.lock gains libcrux-ml-kem 0.0.11,
+tls-core and tls-wire.
+
+Decisions and deviations:
+
+- **One slot per listener, admission at SYN-RECEIVED.** The PD maps each
+  of its eight listeners to the `conn` slot it admitted (MAX_CONNS is
+  `tls_core::conn::MAX_CONNS`), so `Table::admit`'s `Full` cannot occur. A
+  per-source refusal still needs the C8 abort sequence, so `conn` gained
+  `Table::refuse`: a free slot straight into Aborting (no session, no
+  source, only the client RST awaited), released by the same
+  `abort_pass` decision as every other abort.
+- **The slots are reset in place.** `Slot::open`/`abort_pass` built a
+  fresh `Slot::new()` (about 47 KiB) by value; `Table::new` (370 KiB)
+  cannot be built on a 128 KiB stack at all. `Session::reset` and
+  `Slot::reset` now zero and re-initialise in place (same state as `new`,
+  unit-tested by a released slot serving a second handshake); the PD writes
+  its static table slot by slot at init.
+- **The PD reads whole records; socket rx 17 KiB (C10 said 16 KiB).** A
+  record is taken off the socket only once complete (`peek_slice` of the
+  header, then `recv_queue` ≥ 5 + length), into one PD-wide record buffer;
+  the socket's receive buffer therefore holds the largest record (16 645
+  bytes). This saves a per-connection 16 KiB reassembly buffer. A header
+  that fails its checks is handed over alone, so the session refuses it at
+  once. The server's records go through one 8 KiB PD-wide `out` buffer;
+  `FLIGHT_MAX` (certificate + 2 KiB) is asserted within it and within the
+  empty send buffer. Static state is asserted ≤ `TLS_STATE_MAX` (1 MiB,
+  defined in the PD).
+- **`Slot::append_head`** moves an AppData step's plaintext into the head
+  buffer and wipes it from the record buffer (the head and record buffers
+  were both reachable only through `&self`/`pub` fields).
+- **Abort RST observed by the PD's own transmit path:** `TxToken::consume`
+  parses every packet that reached `tli` with `wire::parse_ipv4_packet` and
+  `parse_tcp` and logs (peer address, port) of each RST from the HTTPS
+  port, per pass. After the pass's egress poll each aborting listener
+  reports `abort_pass(Client, dispatched)`; on Release the socket is
+  removed, its buffers zeroed through the static (raw places, never a
+  reference to another listener's buffers) and a new listener made, before
+  the next poll. `dispatched` is also true when the socket had no 4-tuple
+  left at abort time (the peer's RST, a TCP timeout, or a RST in
+  SYN-RECEIVED that put it back to Listen): smoltcp has nothing to send
+  then, and waiting eight passes would only delay the release. A socket
+  found in Listen with a slot is treated as reset, so a new client never
+  inherits a slot.
+- **No integration observable for the RST observation or the client
+  socket's storage wipe** (as T-R7-1 for the backend): the socket buffers
+  hold ciphertext only, and the interface answers any later segment for a
+  forgotten 4-tuple with its own RST, so removing the observation would
+  leave every barrier green. The decision is `conn`'s (unit-tested:
+  conn-rst-exhausted and the dispatched-on-pass-k tests); the PD's call
+  sites are the reviewed part. Likewise the zeroing of the message
+  registers after `TlsSign`/`BootSeed` (mirroring pd-hs) has no gate that
+  can see it: the boot seed is legitimately live in the hedged RNG.
+- **Stack scrubs:** besides the two the plan names (after `exchange`, in
+  tls-core, and after each `TlsSign`, in the PD's signer), the PD scrubs
+  after every `Slot::on_record` and after sealing its response and
+  close_notify. Rust moves of `Secret`s (`HybridSecret` out of the
+  exchange's `Result`, the schedule's secrets, KeyUpdate's replacements)
+  are copies nothing wipes, and the record keys' copies sit in libcrux's
+  dead ChaCha20-Poly1305 frames; the closed-connection residue case would
+  otherwise rest on what later calls happen to overwrite. Also once at the
+  end of init (the boot seed's copies).
+- **`TlsSignHighWater` (0x0058)**, a value event gated by
+  `CostHighWater::tls_sign()`, carries the longest `TlsSign` wall time
+  (CNTPCT around the PPC) since the last report. run.py prints it with the
+  probe's handshake times; SIGN_COST_NS and P17's entry are moved together
+  from that measurement by the orchestrator (C5).
+- **Audit kinds decoded:** `TlsRefused(<Refusal>)`, `TlsClosed(<reason>)`,
+  `HttpRefused(<status>)`, `TlsTimeout(<stage>)`, coalesced per value like
+  `FrameDropped`. TLS_CLOSED's reasons are the new `conn::Closed`:
+  the five `CloseCause`s, `SlotsFull`, `PerSource` and `PeerReset`. The
+  name tables live in audit-event (which depends on none of the enums,
+  and adding the edge would change the root lock); the PD asserts at
+  compile time that each table matches its enum (`Refusal::name`,
+  `Closed::name`, `Timeout::name`, `Status::code`).
+- **`tls` halt table:** NO_CLOCK 1, RNDR 2, INIT_FAILED 3, KEY_UNAVAILABLE
+  4. A `TlsSign` answered Unavailable refuses that handshake (internal_error,
+  slot wiped), then at the end of the pass `tls` audits `KeyUnavailable`
+  and halts. `tls` does not probe `TlsSign` at init: it would spend a
+  bucket token the C5 invariants do not budget, so the failure shows at the
+  first HTTPS handshake (case 8 drives one).
+- **run.py, slice 3b adaptation of the C8 barriers (no backend yet):** the
+  host-observed barrier for cases 1/2 is the fixed response on connection
+  A, which A requests only after `k` and `K`, so it proves the server read
+  under client secret 2 and wrote under server secret 1; the response and
+  close_notify are queued, and the slot wiped, in the same step. Case 3's
+  barrier is the plan's (the abort RST, then a SYN from 10.0.2.77
+  answered). With no streaming backend, a closed connection's secrets
+  cannot be checked "present" before its close; the cases therefore become
+  one scan: every handshake and traffic secret of A (client 0-2, server
+  0-1, Python HKDF-Expand-Label checked against OpenSSL's keylog N lines),
+  their record keys and IVs, and A's marker (a `Proxy-Selftest` header:
+  s_client takes a line starting with `k`/`K` as a command, so the
+  `Keep-Alive` marker of slice 4 cannot be typed through it) are absent,
+  while a live connection B's CLIENT_TRAFFIC_SECRET_0 is present. B holds
+  its slot in the head stage, so the scan must finish within the 10 s head
+  timeout (a slow host fails the control by name, never passes falsely).
+- **run.py, other boots:** `https` (handshake cases with s_client and
+  curl, a wrong CA from deployment B and a wrong name via `--resolve`,
+  NoPqGroup, NoTls13, 20 probe handshakes with the canary, `tls`'s stack
+  headroom (the M4 C8 rule, reaching the exchange scrub), the scalar
+  count), `https residue` (slowloris first, then the residue case) and
+  `tls key failure` (deployment A's `--tls-mismatch-blob` packaged on A's
+  image and TPM; HTTPS attempt, tls's KeyUnavailable code 18 and Halted 4,
+  a Rosenpass + WireGuard handshake on the tap, the rejected scalar absent
+  in both byte orders while the blob's gateway key is present).
+  INTEGRATION-CASES 45 → 54 (the echo case goes, ten come).
+- **Probe:** only the sequential 20 are run here; the 8 concurrent
+  handshakes of C10 need four source addresses (MAX_PER_SOURCE 2) and stay
+  with slice 5's hardening boots.
+- **ct-harness residue mode (T-R4-1):** tls-core joins tools/ct-harness
+  with every libcrux crate it pulls `=`-pinned to the root lock (ml-kem
+  0.0.11 with `mlkem768` only, curve25519 0.0.9, chacha20poly1305 0.0.10,
+  hacl-rs 0.0.6, hmac 0.0.9, intrinsics 0.0.9, macros 0.0.4, platform
+  0.0.4, poly1305 0.0.7, secrets 0.0.7, sha2 0.0.9, sha3 0.0.11, traits
+  0.0.9). Two runs on the painted stack: `exchange-depth` (no scrub; fails
+  `RESIDUE-DEEP` above `SCRUB_DEPTH_EXCHANGE`) measured 34 040 B, so the
+  provisional 48 KiB stands; `exchange` (exchange then the scrub from the
+  same frame, the result dropped in place) with needles for the X25519
+  ephemeral (raw and clamped), the ML-KEM randomness m, the SHA3-512 G state
+  over m ‖ H(ek) (holding K ‖ r), the ML-KEM shared secret (from the
+  client's decapsulation, checked equal to G's K) and the X25519 secret.
+  RESIDUE-CASES 27 → 29. libcrux-internal forms with no public function to
+  compute them (the message polynomial, noise vectors, X25519 limbs) are not
+  needles: a declared gap.
+- **ct-shape identity-only roots (T-R6-1):** (pd-tls,
+  `tls_core::hybrid::exchange_with_randomness`) and (pd-tls,
+  `tls_core::hybrid::scrub_session_stack`) get the identity check only (no
+  contained, forbidden or shape check, not in the shape subjects, so libcrux
+  stays out of the baseline); the RNG-generic `HybridSecret::exchange` shim
+  is excluded by name (the McEliece `encaps` precedent). CT-SHAPE-SYMBOLS
+  99 → 138 (38 for the exchange's closure, 1 for the scrub). Three build
+  artefacts surfaced and were fixed where they arise: anonymous rodata
+  labels (`<anon.N>`, numbered per object) are now named by a digest of
+  their bytes, pointers in them to symbols followed two levels (a panic
+  Location's file, line and column are compared); LLVM's memcmp → bcmp
+  rewrite on the harness's linux target (no switch short of `no_builtins`,
+  which would change all libcalls) makes memcmp and bcmp one closure stop,
+  like memcpy, while the forbidden check still sees raw names; and the
+  harness recorded absolute source paths for the repo's crates (path
+  dependencies outside its workspace), so the `ct-harness` recipe remaps
+  `$(CURDIR)/` away. CT-SHAPE-FIXTURES 52 → 63.
+- **Selftest cases added:** ct: tls-exchange-residue,
+  tls-exchange-scrub-depth; ct-shape: tls-identity; unit:
+  conn-reset-session; lint-pds: tls-audit-names; test: tls-key-halt,
+  c8-head-wipe, tls-scalar-scrub, https-probe-canary (the four `test`
+  cases unproven: QEMU is not run here; tls-scalar-scrub assumes HACL's
+  limbs survive in key's dead frames without its scrub).
+
+### Slice 3b verification (orchestrator) and the D3 stop rule
+
+- Gates green (pins, lint, lint-pds, unit, laws, image, ct, ct-shape);
+  integration boots `https`, `https residue`, `tls key failure` all pass:
+  OpenSSL and curl complete TLS 1.3 with X25519MLKEM768 against the dev
+  CA, wrong CA/name refused, classical-only → handshake_failure (L14),
+  TLS 1.2 → protocol_version, residue cases clean with a live control,
+  slowloris closed at 10.1 s, the TLS-only key failure leaves the VPN up.
+- **`tls` stack raised 0x20000 → 0x30000.** The high-water was 116 KiB
+  (ML-KEM-768 work on the stack), leaving 14.7 KiB free against the
+  16 KiB rule; now 80 KiB free.
+- **Probe:** handshake (curl appconnect − connect) max 2.05 s over 20, limit
+  3.33 s. **TlsSignHighWater 0.64–1.72 s** — the sign runs in the passive
+  `key` on `tls`'s 0.05 budget, about 35–85 ms of CPU under TCG.
+- **D3 stop rule fires.** C5's per-call wait `(ceil(SIGN_COST/TLS_BUDGET)+1)
+  × PERIOD ≤ HS_KEY_WAIT_MAX_NS` cannot hold: with SIGN_COST ≈ 85 ms × 2 it
+  needs a `tls` budget above the 0.25 per-PD cap. Widening
+  HS_KEY_WAIT_MAX_NS to fit would be the workaround the rule forbids.
+  The plan is re-planned (amendment "Re-plan R1"): the TLS signing key
+  moves out of `key` into its own key PD, so `hs` can no longer wait on a
+  TLS signature at all.

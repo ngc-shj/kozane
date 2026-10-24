@@ -440,6 +440,22 @@ impl Session {
 
     /// Every secret, key and buffer of the connection zeroed; Closed.
     pub fn wipe(&mut self, bufs: &mut Buffers<'_>) {
+        self.wipe_state();
+        wipe(bufs.rx);
+        wipe(bufs.tx);
+    }
+
+    /// A fresh session in place, as [`Session::new`] makes one, with every
+    /// key and secret of the old one zeroed: the PD's slots are static and
+    /// too large to rebuild on its stack.
+    pub fn reset(&mut self) {
+        self.wipe_state();
+        self.state = State::AwaitClientHello;
+        self.first_record = true;
+        self.peer_closed = false;
+    }
+
+    fn wipe_state(&mut self) {
         self.read.wipe();
         self.write.wipe();
         self.read_secret.wipe();
@@ -454,8 +470,6 @@ impl Session {
         self.deprotected = false;
         self.update_requested = false;
         self.state = State::Closed;
-        wipe(bufs.rx);
-        wipe(bufs.tx);
     }
 
     /// No key, secret or handshake byte left, and Closed (the wipe's check).
