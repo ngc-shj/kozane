@@ -1078,7 +1078,9 @@ as amended here:
   - `SYN_GLOBAL_*` move to a new dependency-free leaf crate `limits`,
     shared by ingress-core and tlskey-core, so neither needs the other
     (R1-F F11). Not `layout`: ingress-core's 23 Kani harnesses would re-run
-    on every layout edit (R2-F N6).
+    on every layout edit (R2-F N6). `limits` is `#![no_std]`, in
+    `host_crates`, with a unit test pinning both values against
+    ingress-core's source-bucket asserts (R3-F R3-2).
 - **Retired with C5's interference bound.** `SIGN_COST_NS`,
   `HS_KEY_WAIT_MAX_NS`'s compile-time use, P17 and `TLS_BUDGET_NS` in
   `layout`. Their purpose was the per-call wait bound, which is now
@@ -1192,7 +1194,9 @@ as amended here:
     leaves `once` and `states` unchanged and that the client's later flow
     succeeds (R2-F N1, R2-T N4); `a_flushed_handle_number_is_usable_by_the_other_client`
     changes so the owner finishes before the other client starts; the
-    cross-client deny harnesses keep a concurrently started attacker.
+    cross-client deny harnesses use a **Fresh** attacker (NotOwned is
+    decided before Busy), plus one that starts after the owner finished
+    without flushing (R3-F R3-1).
   - A `kani::cover!` after every `assume(owner_setup…)`.
   - The fixed tests updated: `command(3, …) == UnknownClient`, the
     three-client cap, `fuzz_one`'s client loop, swtpm_interop's cap test.
