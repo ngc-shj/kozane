@@ -38,6 +38,9 @@ pub const MAX_HEAD: usize = 8 * 1024;
 pub const MAX_HEADERS: usize = 32;
 /// Largest request body; a larger `Content-Length` is refused at head time.
 pub const MAX_BODY: usize = 1 << 20;
+/// The longest `Connection` value accepted. Real ones are a few tokens; the
+/// bound is also what the `next_option` step harness covers (Re-plan R3).
+pub const MAX_CONNECTION_VALUE: usize = 1024;
 /// Most bytes `rewrite`'s output exceeds its head by: our three field lines
 /// with the longest address, less nothing (every other line is copied or
 /// dropped, never grown).
@@ -192,7 +195,8 @@ pub enum HttpRefusal {
     /// A Host value that is not `host [":" port]` (RFC 3986 authority, no
     /// userinfo).
     Host,
-    /// A `Connection` element that is not a token.
+    /// A `Connection` element that is not a token, or a `Connection` value
+    /// longer than `MAX_CONNECTION_VALUE`.
     ConnectionOption,
     /// `Connection` names Content-Length, Transfer-Encoding, Host or a
     /// field `rewrite` sets.
@@ -474,37 +478,53 @@ fn parse_content_length(value: &[u8]) -> Result<usize, HttpRefusal> {
 /// Every element a token, none of them `PROTECTED` (RFC 9110 section 7.6.1
 /// lists may hold empty elements).
 fn check_connection(value: &[u8]) -> Result<(), HttpRefusal> {
-    for option in options(value) {
-        if !is_token(option) {
-            return Err(HttpRefusal::ConnectionOption);
-        }
-        if PROTECTED.iter().any(|p| option.eq_ignore_ascii_case(p)) {
-            return Err(HttpRefusal::ConnectionNamesProtected);
-        }
+    if value.len() > MAX_CONNECTION_VALUE {
+        return Err(HttpRefusal::ConnectionOption);
+    }
+    let mut rest = value;
+    while let Some(o) = next_option(&mut rest) {
+        check_option(o)?;
     }
     Ok(())
 }
 
-fn options(value: &[u8]) -> impl Iterator<Item = &[u8]> {
-    value.split(|&b| b == b',').map(trim_ows).filter(|o| !o.is_empty())
+/// One `Connection` element: a token that names no `PROTECTED` field.
+fn check_option(option: &[u8]) -> Result<(), HttpRefusal> {
+    if !is_token(option) {
+        return Err(HttpRefusal::ConnectionOption);
+    }
+    if PROTECTED.iter().any(|p| option.eq_ignore_ascii_case(p)) {
+        return Err(HttpRefusal::ConnectionNamesProtected);
+    }
+    Ok(())
+}
+
+/// Takes the next non-empty list element off `rest`, without the OWS
+/// around it, and the comma after it; `None` once only commas and OWS
+/// remain, leaving `rest` empty. Loops in sequence, never nested, so the
+/// Kani step harnesses stay single-level (M6 plan Re-plan R3).
+fn next_option<'a>(rest: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let Some(start) = rest.iter().position(|&b| !matches!(b, b',' | b' ' | b'\t')) else {
+        *rest = &[];
+        return None;
+    };
+    let element = rest.get(start..).unwrap_or(&[]);
+    let end = element.iter().position(|&b| b == b',').unwrap_or(element.len());
+    let (option, tail) = element.split_at_checked(end).unwrap_or_default();
+    // Past the comma; at the end, the empty tail keeps `rest` a suffix.
+    *rest = tail.get(1..).unwrap_or(tail);
+    Some(trim_ows(option))
 }
 
 /// `host [":" port]` with host an IP-literal (IPv6 only, no IPvFuture) or a
 /// non-empty reg-name (which covers IPv4address); port 0..=65535.
 fn is_authority(value: &[u8]) -> bool {
-    let (host_ok, port) = match value.strip_prefix(b"[") {
-        Some(inner) => {
-            let Some(close) = inner.iter().position(|&b| b == b']') else {
-                return false;
-            };
-            let (addr, after) = inner.split_at_checked(close).unwrap_or_default();
-            (is_ipv6(addr), after.get(1..).unwrap_or(&[]))
-        }
-        None => {
-            let end = value.iter().position(|&b| b == b':').unwrap_or(value.len());
-            let (name, after) = value.split_at_checked(end).unwrap_or_default();
-            (!name.is_empty() && uri_chars(name, b""), after)
-        }
+    let Some((host, port)) = authority_parts(value) else {
+        return false;
+    };
+    let host_ok = match host {
+        AuthorityHost::Ipv6(addr) => is_ipv6(addr),
+        AuthorityHost::Name(name) => !name.is_empty() && uri_chars(name, b""),
     };
     host_ok
         && match port {
@@ -512,6 +532,32 @@ fn is_authority(value: &[u8]) -> bool {
             [b':', digits @ ..] => is_port(digits),
             _ => false,
         }
+}
+
+/// The host of an authority, before its own syntax is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthorityHost<'a> {
+    /// The address inside `[` `]`.
+    Ipv6(&'a [u8]),
+    /// Everything before the first `:`.
+    Name(&'a [u8]),
+}
+
+/// `value` split into its host and what follows it (empty, or the `:`
+/// and port); `None` for a `[` without its `]`.
+fn authority_parts(value: &[u8]) -> Option<(AuthorityHost<'_>, &[u8])> {
+    match value.strip_prefix(b"[") {
+        Some(inner) => {
+            let close = inner.iter().position(|&b| b == b']')?;
+            let (addr, after) = inner.split_at_checked(close).unwrap_or_default();
+            Some((AuthorityHost::Ipv6(addr), after.get(1..).unwrap_or(&[])))
+        }
+        None => {
+            let end = value.iter().position(|&b| b == b':').unwrap_or(value.len());
+            let (name, after) = value.split_at_checked(end).unwrap_or_default();
+            Some((AuthorityHost::Name(name), after))
+        }
+    }
 }
 
 fn is_port(digits: &[u8]) -> bool {
@@ -536,63 +582,90 @@ fn is_ipv6(addr: &[u8]) -> bool {
     }
     // Each pass takes one piece; a ninth is never valid.
     for _ in 0..8 {
-        let end = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
-        let (piece, after) = rest.split_at_checked(end).unwrap_or_default();
-        if after.is_empty() {
-            let worth = if piece.contains(&b'.') {
-                if !is_ipv4(piece) {
-                    return false;
-                }
-                2
-            } else {
-                if !is_h16(piece) {
-                    return false;
-                }
-                1
-            };
-            groups = groups.wrapping_add(worth);
-            return if elided { groups <= 7 } else { groups == 8 };
-        }
-        if !is_h16(piece) {
-            return false;
-        }
-        groups = groups.wrapping_add(1);
-        rest = after.get(1..).unwrap_or(&[]);
-        if let Some(r) = rest.strip_prefix(b":") {
-            if elided {
-                return false;
-            }
-            elided = true;
-            rest = r;
-            if rest.is_empty() {
-                return groups <= 7;
-            }
-        } else if rest.is_empty() {
-            return false;
+        if let Some(valid) = ipv6_piece(&mut rest, &mut groups, &mut elided) {
+            return valid;
         }
     }
     false
+}
+
+/// One pass of `is_ipv6`: takes the next piece and its `:` (or `::`) off
+/// `rest`, counting it in `groups`. `None` means go on to the next piece;
+/// `Some(valid)` is `is_ipv6`'s answer. A step function, so the Kani
+/// harnesses stay single-level (M6 plan Re-plan R3).
+fn ipv6_piece(rest: &mut &[u8], groups: &mut usize, elided: &mut bool) -> Option<bool> {
+    let end = rest.iter().position(|&b| b == b':').unwrap_or(rest.len());
+    let (piece, after) = rest.split_at_checked(end).unwrap_or_default();
+    if after.is_empty() {
+        let worth = if piece.contains(&b'.') {
+            if !is_ipv4(piece) {
+                return Some(false);
+            }
+            2
+        } else {
+            if !is_h16(piece) {
+                return Some(false);
+            }
+            1
+        };
+        *groups = groups.wrapping_add(worth);
+        return Some(if *elided { *groups <= 7 } else { *groups == 8 });
+    }
+    if !is_h16(piece) {
+        return Some(false);
+    }
+    *groups = groups.wrapping_add(1);
+    *rest = after.get(1..).unwrap_or(&[]);
+    if let Some(r) = rest.strip_prefix(b":") {
+        if *elided {
+            return Some(false);
+        }
+        *elided = true;
+        *rest = r;
+        if rest.is_empty() {
+            return Some(*groups <= 7);
+        }
+    } else if rest.is_empty() {
+        return Some(false);
+    }
+    None
 }
 
 fn is_h16(piece: &[u8]) -> bool {
     (1..=4).contains(&piece.len()) && piece.iter().all(u8::is_ascii_hexdigit)
 }
 
+/// Four dec-octets (`0`, or 1 to 3 digits without a leading zero, at most
+/// 255) joined by dots, checked in one pass so the Kani harnesses stay
+/// single-level (M6 plan Re-plan R3).
 fn is_ipv4(s: &[u8]) -> bool {
-    let mut parts = s.split(|&b| b == b'.');
-    (0..4).all(|_| parts.next().is_some_and(is_dec_octet)) && parts.next().is_none()
-}
-
-fn is_dec_octet(p: &[u8]) -> bool {
-    match p {
-        [b'0'] => true,
-        [b'1'..=b'9', ..] => {
-            p.len() <= 3
-                && p.iter().all(u8::is_ascii_digit)
-                && p.iter().fold(0u16, |n, &d| n.wrapping_mul(10).wrapping_add(u16::from(d.wrapping_sub(b'0')))) <= 255
+    let mut dots = 0u8;
+    let mut digits = 0u8;
+    let mut value = 0u16;
+    for &b in s {
+        if b == b'.' {
+            if digits == 0 || dots == 3 {
+                return false;
+            }
+            dots = dots.wrapping_add(1);
+            digits = 0;
+            value = 0;
+        } else if b.is_ascii_digit() {
+            // A digit after a leading zero; a value above 255 also caps the
+            // octet at three digits.
+            if digits > 0 && value == 0 {
+                return false;
+            }
+            value = value.wrapping_mul(10).wrapping_add(u16::from(b.wrapping_sub(b'0')));
+            if value > 255 {
+                return false;
+            }
+            digits = digits.wrapping_add(1);
+        } else {
+            return false;
         }
-        _ => false,
     }
+    dots == 3 && digits > 0
 }
 
 /// unreserved / sub-delims / pct-encoded / `extra` (RFC 3986 section 2).
@@ -659,7 +732,10 @@ fn is_dropped<const N: usize>(head: &Head<'_, N>, name: &[u8]) -> bool {
             .headers()
             .iter()
             .filter(|h| h.name.eq_ignore_ascii_case(b"connection"))
-            .any(|h| options(h.value).any(|o| o.eq_ignore_ascii_case(name)))
+            .any(|h| {
+                let mut rest = h.value;
+                core::iter::from_fn(|| next_option(&mut rest)).any(|o| o.eq_ignore_ascii_case(name))
+            })
 }
 
 struct Writer<'o> {

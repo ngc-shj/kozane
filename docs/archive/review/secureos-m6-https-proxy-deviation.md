@@ -1438,3 +1438,116 @@ Kani, Verus, make test/check, run.py/QEMU, check-selftest.
   throwaway full copy under build/, `make unit` only: both failed with their needle printed; the needles are
   absent from the green run's build/counts/unit.log.
   The probe changes (T-N1–T-N3) need the QEMU runs.
+
+## Re-plan R3: http-wire step proofs
+
+- **Code (behaviour-preserving).** `options()` is gone. `next_option(&mut
+  rest)` takes the next non-empty element: one `position` skips commas and
+  OWS, a second finds the comma, `trim_ows` trims the end; the loops run in
+  sequence, never nested. `None` leaves `rest` empty; at the end of the
+  value `rest` becomes the empty tail, so it stays a suffix of the old one.
+  `check_connection` is `while let Some(o) = next_option(..) { check_option(o)? }`;
+  `is_dropped` scans with `iter::from_fn` over the same step. `check_option`
+  is split out. The interim `parse_with` (the Connection check as a
+  parameter) and `check_connection_any` went with the whole-head
+  harnesses, their only users: `parse` calls `check_connection` again, and
+  R3's "the parameter stays for the unit tests" was wrong (no unit test
+  used it).
+- **Harnesses (proofs.rs).** Removed (HEAD 1e4fe75 had them):
+  `head_is_total_and_slices_stay_inside`,
+  `rewrite_fits_and_keeps_the_request_line`, `connection_value_is_total`.
+  (R3's `connection_options_lie_inside` never existed in HEAD.) Added:
+  `connection_option_is_total`, `next_line_step`, `next_line_step_tail`,
+  `next_line_unterminated`, `next_option_step`, `next_option_step_tail`,
+  `next_option_none`, `ipv6_piece_step`, `ipv6_piece_step_tail`,
+  `is_ipv4_is_total`, `uri_chars_is_total`, `is_port_is_total`,
+  `writer_put_step`, `writer_put_step_tail`,
+  `put_decimal_writes_one_to_three`. `field_line_slices_stay_inside` now
+  asserts that `f.line` is the line (pointer and length). The header states
+  the composition, one bounds row per harness and the composed statement.
+- **Bounds (named consts in proofs.rs).**
+
+  | Harness | Bound | Unwind | Measured (alone; host) |
+  |---|---|---|---|
+  | `next_line_step` | `B_LINE` = 32 to the LF; remainder ≤ `MAX_HEAD`, bytes past `B_LINE` fixed | 33 | 120 s (gx10) |
+  | `next_line_step_tail` | remainder ≤ `B_LINE` + 8, all symbolic | 33 | 20 s (z1mn) |
+  | `next_line_unterminated` | rest ≤ `B_LINE` = 32 | 33 | 21 s (gx10) |
+  | `request_line`, `field_line` | `B_PART` = 48 (was 24: 80 s, 60 s on z1mn) | 50 | tbd |
+  | `content_length` | 24 | 26 | 20 s (z1mn) |
+  | `connection_option_is_total` | 12; now also asserts `host` and `connection` refused | 18 | tbd (was 20 s, mrx33) |
+  | `next_option_step` | `B_OPT` = 16 to the comma; remainder ≤ `MAX_CONNECTION_VALUE` (1024), bytes past `B_OPT` fixed | 17 | 50 s (z1mn) |
+  | `next_option_step_tail` | remainder ≤ `B_OPT` + 8, all symbolic | 17 | 41 s (z1mn) |
+  | `next_option_none` | rest ≤ `B_OPT` = 16 | 17 | 20 s (gx10) |
+  | `ipv6_piece_step` | `B_PIECE` = 16 to the `:` or the end; remainder ≤ `B_IPV6` = 48, bytes past `B_PIECE + 1` fixed | 18 | tbd |
+  | `ipv6_piece_step_tail` | remainder ≤ `B_PIECE` + 8, all symbolic | 18 | tbd |
+  | `is_ipv4_is_total` | 15 | 17 | tbd |
+  | `uri_chars_is_total` | `B_URI` = 32, both `extra` sets | 34 | tbd |
+  | `is_port_is_total` | 8 | 10 | tbd |
+  | `writer_put_step` | out ≤ `MAX_REWRITE`, put ≤ `MAX_HEAD`, first `B_WSYM` = 8 bytes of each symbolic, rest fixed patterns; nondet-index assertions (was `B_OUT` = 16 / `B_PUT` = 8: 10 s, mrx33) | 4 | tbd |
+  | `writer_put_step_tail` | out ≤ 64, put ≤ 56, all symbolic | 4 | tbd |
+  | `put_decimal_writes_one_to_three` | any `u8` | 5 | 10 s (mrx33) |
+
+- **The whole crate through `tools/kani-gate.sh -p http-wire`:** gx10, 591 s, 13 of 13 verified (before the `is_authority` fallback and the full-size `Writer::put`). Every cover was satisfied: 8 harnesses at 1/1, 3 at 2/2, 2 at 3/3. With 19 harnesses: tbd.
+- **The shape search that set these bounds:**
+  - The first `next_line_step` and `next_option_step`, over a fully symbolic `MAX_HEAD` array, timed out at 20 minutes and hit the 30 GiB guard respectively. So the bytes past the delimiter are fixed while the remainder length ranges over its maximum, and a `*_tail` harness lets them vary over a short remainder. The step reads no byte past the delimiter (`position` stops there; `split_at_checked` and `get` only compute pointers), and that joins the two.
+  - `next_option_step` passed with a remainder of 256 and 1024 bytes, and timed out at 4096 and 8192. So `check_connection` now refuses a value longer than `MAX_CONNECTION_VALUE` = 1024 as `ConnectionOption`, before the loop. A unit test pins 1024 accepted and 1025 refused. Every value the loop can see is then within the proven remainder.
+- **`is_authority_is_total` was removed; R3's fallback replaces it (owner, 2026-10-25).**
+  - At 24 bytes it hit the 30 GiB guard on z1mn. At 12 and 16 bytes it timed out at 15 minutes on mrx33. The cause is the same nested-iterator shape: `is_ipv6`'s piece loop over `position`, and `is_ipv4`'s `split`.
+  - `is_ipv6`'s loop body is now the step `ipv6_piece(&mut rest, &mut groups, &mut elided) -> Option<bool>` (`None` = next piece), harnessed by `ipv6_piece_step` and `_tail`. `is_ipv4` is now one pass over the bytes (dots, digits, value) instead of `split` and `is_dec_octet`, so it is single-level inside the piece step too; that replaces the `next_dot` step R3 review suggested, being simpler. `uri_chars` and `is_port` get their own totality harnesses. `is_authority` itself is composed in the proofs.rs header (two branches of single-level pieces), not re-harnessed.
+  - Behaviour pins: `ipv6_literals_follow_rfc_3986` (34-row table, passed before the refactor) and `ipv4_agrees_with_the_reference_on_every_short_string` (the old `split` form kept in tests.rs, compared on every string of up to 7 bytes over `0125.9x` plus edge cases). Red-proof: `ipv6_piece` with `groups <= 8` after a trailing `::` failed the table; `is_ipv4` without the leading-zero check failed both.
+- **`Writer::put` at full size (owner, 2026-10-25).** `writer_put_step` now takes an output of up to `MAX_REWRITE` and a put of up to `MAX_HEAD` (symbolic prefix, fixed compile-time patterns past it), and asserts the frame and copy properties at one nondeterministic index each, so it has no loop; `writer_put_step_tail` keeps an all-symbolic 64/56 variant (`XFP_AND_CLOSE` is 49).
+- **Counts:** KANI-HTTP-WIRE 19, KANI-HARNESSES 102, UNIT-HTTP-WIRE 74, UNIT-TESTS 1247 (new unit tests: the two pins above and `request_head_refuses_a_connection_value_over_max_connection_value`).
+
+- **`next_option_step`'s assumption.** For a remainder longer than `B_OPT`,
+  a comma at some index below `B_OPT` with a byte before it that is neither
+  comma nor OWS: the element `next_option` returns then ends within the
+  bound, which is R3's "comma within `B_OPT`" for a step that skips empty
+  elements.
+- **Tests.** The old splitter stays as `reference_options` (tests.rs); a
+  table test (runs of commas, runs of OWS, trailing comma, HTAB-only element,
+  empty value) and the bolero target
+  `fuzz_next_option_matches_the_reference_splitter` (5 committed seeds,
+  Makefile `bolero_targets`) compare it with `next_option`. Red-proof:
+  `next_option` without the trailing trim failed both.
+- **Bolero.** BOLERO-TARGETS 6 → 7.
+
+### R3 final: 19 http-wire harnesses, and what Kani does not prove
+
+R3's review asked for the `is_ipv6` piece-step fallback, a full-size `Writer::put`, and precise per-element bounds. All three are done. The owner also asked for Kani proofs rather than arguments wherever feasible, so `is_authority`'s top-level split became the step `authority_parts`.
+
+Each harness measured alone:
+
+| Harness | Bound | Measured (alone; host) |
+|---|---|---|
+| `head_end_finds_the_first_blank_line` | 32 | 130 s (z1mn) |
+| `next_line_step` | LF within `B_LINE` = 32; remainder ≤ `MAX_HEAD`, the tail fixed | 120 s (gx10) |
+| `next_line_step_tail` | remainder ≤ 40, all symbolic | 20 s (z1mn) |
+| `next_line_unterminated` | ≤ 32 | 21 s (gx10) |
+| `request_line_slices_stay_inside` | `B_PART` = 48 | 410 s (z1mn) |
+| `field_line_slices_stay_inside` | `B_PART` = 48 | 240 s (z1mn) |
+| `content_length_parse_is_exact_and_saturates` | 24 | 20 s (z1mn) |
+| `connection_option_is_total` | 12; `host` and `connection` refused | 20 s (mrx33) |
+| `next_option_step` | comma within `B_OPT` = 16; remainder ≤ `MAX_CONNECTION_VALUE`, the tail fixed | 50 s (z1mn) |
+| `next_option_step_tail` | remainder ≤ 24, all symbolic | 41 s (z1mn) |
+| `next_option_none` | ≤ 16 | 20 s (gx10) |
+| `ipv6_piece_step` | piece within `B_PIECE` = 16; remainder ≤ `B_IPV6` = 48 | 50 s (gx10) |
+| `ipv6_piece_step_tail` | remainder ≤ 24, all symbolic | 30 s (z1mn) |
+| `is_ipv4_is_total` | 15 | 20 s (mrx33) |
+| `uri_chars_is_total` | `B_URI` = 32 | 851 s (z1mn) |
+| `is_port_is_total` | 8, the acceptance condition exact | 11 s (mrx33) |
+| `authority_parts_split` | `B_PART` = 48 | 350 s (gx10); out of memory on mrx33 (7 GB) |
+| `writer_put_step` | output ≤ 64, put ≤ 56, all symbolic | 20 s (gx10) |
+| `put_decimal_writes_one_to_three` | any `u8` | 10 s (mrx33) |
+
+**`writer_put_step` at full size could not be proven.**
+- With an output of up to `MAX_REWRITE` and a put of up to `MAX_HEAD`, cbmc hit the 30 GiB guard after 1110 s.
+- With the put cut to 56 bytes, the guard still stopped it at outputs of 8 KiB, 4 KiB, 2 KiB and 1 KiB.
+- The cost is the copy of a symbolic length at a symbolic offset, which grows with the array.
+- The harness therefore stays at 64 bytes, all symbolic.
+
+**What Kani does not prove (owner's decision, 2026-10-25).** It is recorded as residual RM6-11 and stated in the proofs.rs header:
+1. **The induction across loop iterations.** Machine-checking it would need Kani's unstable loop contracts. That changes the workspace's Kani configuration and invalidates every crate's proof cache, so it is a candidate for a later task.
+2. **Scans without a delimiter longer than the step bounds.** This covers an unterminated remainder longer than `B_LINE` and a separator-only run longer than `B_OPT`. They rest on `position` returning `None` over bytes holding no match.
+3. **`Writer::put` into outputs larger than 64 bytes.** It is loop-free: a `checked_add`, a slice bounds check, and a copy between slices of equal length.
+
+**Counts:** KANI-HTTP-WIRE 19, KANI-HARNESSES 102, UNIT-HTTP-WIRE 74, UNIT-TESTS 1247.

@@ -1782,3 +1782,77 @@ The floor of 4 existed only for the ordering predicate's observability (R4-N1), 
 - **Selftest.** The test-gate lockstep case keeps its mutation and needle; its red reason is now the new predicate. The unit and pins cases are unchanged.
 - **RM6-7 cost (recorded).** A real-source attacker needs ⌈3/2⌉ = 2 sources to deny new handshakes with idle connects renewed every 10 s. Today that takes 4. Spoofers could already do it (RM6-7).
 - **RM6-8.** 3 concurrent handshakes at `tls` 0.05 under TCG, within ⅔ of the handshake timeout. On hardware the sign costs milliseconds, so the cap's value is a TCG-calibrated bound, recorded as such.
+
+## Re-plan R3 (2026-10-25): http-wire's whole-head proofs by induction over steps (C9, T15; revised after its review)
+
+**Trigger.** C9/T15 promised three Kani harnesses: the whole head (total, every slice inside), the rewrite (fits, starts with the request line, ends with ours), and the Connection value. None of them has ever finished.
+- **Logs.** The http-wire Kani runs that reached them were stopped or timed out, at 45 minutes up to more than 6 hours.
+- **Bound search on three hosts (20-minute limit).** Every whole-head and rewrite variant timed out, at 8, 10 and 12 symbolic field bytes and at an exact 16. The Connection split failed at 4 bytes (unwinding) and timed out at 8.
+- **Cause.** CBMC fully re-unrolls the slice iterators' inner loops (`split`'s search, `trim_ows`'s `position`/`rposition`, `next_line`'s `position`) on every iteration of the enclosing loop. It cannot track the sub-slices' lengths, so the unrolling multiplies with nesting depth. Input size is not the lever.
+
+**Decision (owner, 2026-10-25).** Prove each loop's *step* with Kani, and compose by induction over the steps.
+- The result covers heads of any number of lines, each line within the element bounds tabled below, and heads up to MAX_HEAD in total.
+- The replaced harnesses covered only heads of a few dozen bytes in total, and never finished.
+- It is not a proof for every element length (R3 review F3).
+
+| Property | Step proven by Kani | Composition |
+|---|---|---|
+| `parse_with` is total; every returned slice lies inside `bytes` | `next_line` (new harness), with an exact decomposition (R3 review F2). On `Ok(line)` there is a `k` such that `line` is `old[..k]` (same pointer, same length), `old[k..k + 2]` is `\r\n`, and the new `rest` is `old[k + 2..]`. `Err` is total. `rest` is a symbolic slice of up to MAX_HEAD bytes over a nondeterministic array, with the LF assumed within the first `B_LINE` bytes. `position` stops at the first LF, so the unwinding assertion holds for any tail. A second harness covers the no-LF case (`Unterminated`) for `rest` of at most `B_LINE` bytes (R3 review F1). | Induction over the lines: every line lies inside `bytes`. The per-line work is `field_line` and `request_line` (proven: slices inside the line, total), `parse_content_length` (proven), `is_authority` (new harness: total), the name comparisons and the Connection check (below). The field loop is bounded by `N + 1` iterations in the code itself. `host` and every header's slices are sub-slices of lines, so they lie inside `bytes`. `content_length ≤ MAX_BODY` is checked before the return. |
+| `check_connection` is total; its result is one of {Ok, ConnectionOption, ConnectionNamesProtected} | `options` becomes an explicit step function, `next_option(&mut rest) -> Option<&[u8]>`. It skips empty elements internally.<br>**`Some(o)`:** `o` is inside the old `rest`, is non-empty and holds no comma or leading or trailing OWS; the new `rest` is a strictly shorter suffix.<br>**`None`:** the old `rest` held only commas and OWS, and the new `rest` is empty.<br>The harness takes `rest` as a symbolic slice of up to MAX_HEAD bytes, with a comma or the end assumed within the first `B_OPT` bytes, and with the `None` case for `rest` of at most `B_OPT` bytes. `check_option` is proven: total, three results. | Induction over the options. `check_connection` is `while let Some(o) = next_option(..) { check_option(o)? }`. `is_dropped`'s Connection scan uses the same step. |
+| `rewrite` is total; its output fits in `bytes.len() + REWRITE_GROWTH`; it starts with the request line and ends with `XFP_AND_CLOSE` | `Writer::put` (new harness).<br>**When `Ok`:** exactly when `len + bytes.len() ≤ out.len()`. Then `out[len..len']` equals `bytes`, `len'` is `len + bytes.len()`, and `out` outside `[len, len')` is unchanged (the frame condition, R3 review F2).<br>**When `Err`:** nothing in `out` changes.<br>`put_decimal` writes 1–3 bytes. `is_dropped` is total (built from the steps above). The `field_line` harness also asserts that `f.line` is the line (pointer and length), which the length arithmetic needs (R3 review F2). | `rewrite`'s output is the request line, then CRLF, then each kept header line followed by CRLF, then XFF and the client address (at most 15 bytes), then CRLF, then `XFP_AND_CLOSE`. In `bytes`, the request line and each header line are disjoint ranges, each followed by its CRLF, and the head ends with a blank CRLF: the `next_line` step, by induction. So the output length is at most `bytes.len() − 2 + XFF_LONGEST.len() + XFP_AND_CLOSE.len()`, which is `bytes.len() + REWRITE_GROWTH`, as defined. Puts are sequential, so the first is the request line and the last is `XFP_AND_CLOSE`. |
+
+**All bounds the composition rests on (R3 review F3).** The theorem's element bound is the smallest of these.
+- **Raised where possible.** `request_line` and `field_line` are single-level harnesses (24 bytes today). Each is raised to the largest bound that passes within 10 minutes, measured on the hosts.
+- **Recorded.** The final table goes in the proofs.rs header and in the deviation log. The harnesses involved:
+  - `next_line`: `B_LINE`;
+  - `request_line` and `field_line`: raised from 24;
+  - `parse_content_length`: 24;
+  - `check_option`: 12;
+  - `next_option`: `B_OPT`;
+  - `is_authority`: to be set;
+  - `Writer::put`: input and output lengths.
+- **Fallback for `is_ipv6`.** `is_authority` reaches `is_ipv6`: a piece loop with a `position` per pass, then `is_ipv4`'s `split`. That is the same nested shape that blew up. If `is_authority_is_total` misses the 10-minute limit, `is_ipv6` gets the same treatment: a piece step function with its own step harness, composed over at most 8 pieces.
+
+**What is machine-checked and what is argued.**
+- **Machine-checked:** each step and each per-line function, over its bound. The step harnesses are small and single-level, so their bounds can be generous (to be set by the runs).
+- **Argued in the proofs.rs header:** the induction, the length arithmetic and the sequencing. They rest on the code's loop structure and Rust's semantics (no unsafe, no aliasing in these functions).
+- **The composed statement.** For every head of at most MAX_HEAD bytes whose request line, field lines and Connection elements are each within the element bound above, `parse_with` is total and its slices lie inside the head. The rewrite properties hold for every such head.
+  - The step harnesses cover any remainder length up to MAX_HEAD, because the delimiter is assumed within the element bound and the tail is symbolic (R3 review F1).
+  - Longer elements rest on the same code without a Kani argument. Unit tests and bolero cover them, as before.
+
+**Removed harnesses.** `head_is_total_and_slices_stay_inside`, `rewrite_fits_and_keeps_the_request_line` and `connection_options_lie_inside` (the iterator form) are removed: they have never terminated. KANI-HTTP-WIRE changes accordingly.
+
+**Code changes (http-wire), behaviour-preserving:**
+- `options()` is replaced by `next_option`. `check_connection` and `is_dropped` loop over it.
+- `parse_with` stays as it is: the Connection check stays a parameter for the unit tests' sake; the step proofs no longer need it.
+
+The existing unit tests and bolero targets must pass unchanged.
+
+`is_dropped` decides which Connection-named fields reach the backend, so the old splitter is kept as a `#[cfg(test)]` reference: `split(',').map(trim_ows).filter(non-empty)`. A **bolero differential target** asserts that collecting `next_option` over arbitrary bytes equals the reference. A table unit test covers the edges named in R3 review F4:
+- runs of commas;
+- runs of OWS;
+- a trailing comma;
+- an element that is only a HTAB;
+- an empty value.
+
+**Acceptance.**
+- The new harnesses pass within 10 minutes each on gx10, with the exact assertions stated in the table above (R3 review F2):
+  - `next_line_step` and `next_line_unterminated`;
+  - `next_option_step` and `next_option_none`;
+  - `is_authority_is_total`, or its `is_ipv6` piece-step fallback;
+  - `writer_put_step`;
+  - `put_decimal_writes_one_to_three`.
+- Each harness has covers showing that its Ok and Err outcomes are reachable.
+- The `field_line` harness gains the assertion that `f.line` is the line.
+- The bolero differential target for `next_option` passes.
+- The existing part harnesses still pass: `head_end`, `field_line`, `request_line`, `content_length`, `connection_option`.
+- The full http-wire Kani suite finishes.
+- The proofs.rs header states the composition, as in the table above.
+- `cargo test -p http-wire` and bolero pass. The manifest's KANI counts are exact.
+
+**Superseded during implementation (see the deviation log, "Re-plan R3").**
+- `parse_with` is folded back into `parse`: no unit test used the parameter, and the step proofs do not need it.
+- `is_authority_is_total` did not finish; the `is_ipv6` piece-step fallback is taken (owner, 2026-10-25), with `is_ipv4` made a single pass and `uri_chars` and `is_port` harnessed separately. `is_authority` is composed in the proofs.rs header.
+- `Writer::put` is proven at full size (output up to `MAX_REWRITE`, put up to `MAX_HEAD`) with nondeterministic-index assertions, plus an all-symbolic 64/56 variant.
+- `check_connection` refuses a value over `MAX_CONNECTION_VALUE` (1024) as `ConnectionOption`, so every value the loop sees is within the proven remainder.
+- `B_PART` is raised from 24 to 48 (pending the measured run).

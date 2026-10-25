@@ -490,6 +490,86 @@ fn non_authority_hosts_are_refused() {
     }
 }
 
+/// Pins `is_ipv6` across its piece step (M6 plan Re-plan R3): elision at
+/// either end or inside, once only; an IPv4 tail worth two pieces; exactly
+/// eight pieces without elision, at most seven with it.
+#[test]
+fn ipv6_literals_follow_rfc_3986() {
+    let table: &[(&str, bool)] = &[
+        ("::", true),
+        ("::1", true),
+        ("1::", true),
+        ("1::8", true),
+        ("fe80::1:2", true),
+        ("1:2:3:4:5:6:7:8", true),
+        ("1:2:3:4:5:6:7::", true),
+        ("::2:3:4:5:6:7:8", true),
+        ("ABCD:ef01::", true),
+        ("::ffff:1.2.3.4", true),
+        ("1:2:3:4:5:6:1.2.3.4", true),
+        ("1::1.2.3.4", true),
+        ("", false),
+        (":", false),
+        (":::", false),
+        (":1", false),
+        ("1:", false),
+        ("1:::2", false),
+        ("1::2::3", false),
+        ("::1::", false),
+        ("::1:2:3:4:5:6:7:8", false),
+        ("1:2:3:4:5:6:7", false),
+        ("1:2:3:4:5:6:7:8:9", false),
+        ("1:2:3:4:5:6:7:8::", false),
+        ("1:2:3:4:5:6:7:1.2.3.4", false),
+        ("1:2:3:4:5:6:7::1.2.3.4", false),
+        ("1.2.3.4", false),
+        ("::1.2.3", false),
+        ("::1.2.3.4:5", false),
+        ("::01.2.3.4", false),
+        ("12345::", false),
+        ("g::", false),
+        ("1:2::", true),
+        (":1:2", false),
+    ];
+    for &(addr, valid) in table {
+        assert_eq!(is_ipv6(addr.as_bytes()), valid, "{addr:?}");
+    }
+}
+
+/// `is_ipv4` as it was, over `split` and `is_dec_octet`: the single pass
+/// replaced it (M6 plan Re-plan R3) so that its Kani harness stays
+/// single-level, and must agree with it on every input.
+fn reference_ipv4(s: &[u8]) -> bool {
+    fn dec_octet(p: &[u8]) -> bool {
+        match p {
+            [b'0'] => true,
+            [b'1'..=b'9', ..] => p.len() <= 3 && p.iter().all(u8::is_ascii_digit) && std::str::from_utf8(p).unwrap().parse::<u16>().unwrap() <= 255,
+            _ => false,
+        }
+    }
+    let mut parts = s.split(|&b| b == b'.');
+    (0..4).all(|_| parts.next().is_some_and(dec_octet)) && parts.next().is_none()
+}
+
+#[test]
+fn ipv4_agrees_with_the_reference_on_every_short_string() {
+    // Every string of up to 7 bytes over an alphabet that reaches each
+    // branch: zero, small and large digits, the dot, a non-digit.
+    const ALPHABET: &[u8] = b"0125.9x";
+    let mut strings: Vec<Vec<u8>> = std::vec![Vec::new()];
+    let mut last = strings.clone();
+    for _ in 0..7 {
+        last = last.iter().flat_map(|s| ALPHABET.iter().map(move |&b| [s.as_slice(), &[b]].concat())).collect();
+        strings.extend(last.iter().cloned());
+    }
+    for s in &strings {
+        assert_eq!(is_ipv4(s), reference_ipv4(s), "{:?}", std::str::from_utf8(s));
+    }
+    for s in ["255.255.255.255", "256.0.0.0", "0.0.0.0", "199.200.249.250", "1.2.3.4.5", "1..2.3", "300.1.1.1", "10.0.0.010", "1.2.3.25x"] {
+        assert_eq!(is_ipv4(s.as_bytes()), reference_ipv4(s.as_bytes()), "{s}");
+    }
+}
+
 // --- Connection ---
 
 #[test]
@@ -623,6 +703,42 @@ fn rewrite_of_the_largest_head_fits_max_rewrite() {
     assert_eq!(rewritten(&bytes, [255; 4]).len(), MAX_HEAD + REWRITE_GROWTH);
 }
 
+// --- the Connection list step ---
+
+/// The splitter `next_option` replaced (M6 plan Re-plan R3): `is_dropped`
+/// decides by it which fields reach the backend, so the step must agree
+/// with it on every input.
+fn reference_options(value: &[u8]) -> Vec<&[u8]> {
+    value.split(|&b| b == b',').map(trim_ows).filter(|o| !o.is_empty()).collect()
+}
+
+fn stepped_options(value: &[u8]) -> Vec<&[u8]> {
+    let mut rest = value;
+    let options: Vec<&[u8]> = core::iter::from_fn(|| next_option(&mut rest)).collect();
+    assert!(rest.is_empty());
+    options
+}
+
+#[test]
+fn next_option_agrees_with_the_reference_splitter_on_list_edges() {
+    let table: &[(&[u8], &[&[u8]])] = &[
+        (b"", &[]),
+        (b",,,", &[]),
+        (b"a,,,b", &[b"a", b"b"]),
+        (b",,a,,", &[b"a"]),
+        (b"   ", &[]),
+        (b" \t a \t , \t b \t ", &[b"a", b"b"]),
+        (b"a, b c ,d", &[b"a", b"b c", b"d"]),
+        (b"keep-alive,", &[b"keep-alive"]),
+        (b"a,\t,b", &[b"a", b"b"]),
+        (b"\t", &[]),
+    ];
+    for (value, expected) in table {
+        assert_eq!(reference_options(value), *expected, "reference {value:?}");
+        assert_eq!(stepped_options(value), *expected, "next_option {value:?}");
+    }
+}
+
 // --- seeds and the fuzz target ---
 
 #[test]
@@ -730,4 +846,30 @@ fn fuzz_one(bytes: &[u8]) {
 #[test]
 fn fuzz_parse_never_panics_and_rewrite_reparses() {
     bolero::check!().for_each(fuzz_one);
+}
+
+/// `next_option` collected over any bytes equals the reference splitter.
+fn options_match(bytes: &[u8]) {
+    assert_eq!(stepped_options(bytes), reference_options(bytes));
+}
+
+#[test]
+fn fuzz_next_option_matches_the_reference_splitter() {
+    bolero::check!().for_each(options_match);
+}
+
+#[test]
+fn connection_values_longer_than_max_connection_value_are_refused() {
+    let at = [b'a'; MAX_CONNECTION_VALUE];
+    assert_eq!(check_connection(&at), Ok(()));
+    let over = [b'a'; MAX_CONNECTION_VALUE + 1];
+    assert_eq!(check_connection(&over), Err(HttpRefusal::ConnectionOption));
+}
+
+#[test]
+fn request_head_refuses_a_connection_value_over_max_connection_value() {
+    let at = req(&std::format!("Connection: {}\r\n", "a".repeat(MAX_CONNECTION_VALUE)));
+    assert!(request_head(&at).is_ok());
+    let over = req(&std::format!("Connection: {}\r\n", "a".repeat(MAX_CONNECTION_VALUE + 1)));
+    assert_eq!(refusal(&over), HttpRefusal::ConnectionOption);
 }

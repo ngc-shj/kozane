@@ -257,7 +257,8 @@ bolero_targets := wire/tests::fuzz_parse_never_panics_and_round_trips \
 	rosenpass-wire/tests::fuzz_parsers_never_panic_and_round_trip \
 	tpm2-wire/tests::fuzz_response_parsers_never_panic_and_stay_in_bounds \
 	tls-wire/tests::fuzz_parsers_never_panic_and_stay_in_bounds \
-	http-wire/tests::fuzz_parse_never_panics_and_rewrite_reparses
+	http-wire/tests::fuzz_parse_never_panics_and_rewrite_reparses \
+	http-wire/tests::fuzz_next_option_matches_the_reference_splitter
 
 # Each target must load its committed seed corpus and complete > 0 runs, so
 # a target that silently stops running fails (BOLERO-TARGETS).

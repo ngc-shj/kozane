@@ -696,3 +696,12 @@ Checked clean:
 - **No security regression** beyond RM6-7.
 
 Stale R2 text and the conn.rs assert are noted as superseded in A1. Resolved in A1; no Critical or Major finding remains open.
+
+## Re-plan R3 review (2026-10-25, one verifier)
+
+Four Major findings, all resolved in R3's revision:
+
+- **F1. The step harnesses bounded the whole remainder, not the element.** Fix: `rest` is symbolic up to MAX_HEAD, with the delimiter assumed within the element bound; the no-delimiter case is a separate harness.
+- **F2. The step properties were too weak for the rewrite arithmetic.** Fix: `next_line` gets an exact decomposition; `field_line` asserts that `f.line` is the line; `Writer::put` gets a frame condition and Ok iff it fits. These are now the acceptance criteria.
+- **F3. The decision overclaimed "every length", and the composed bound ignored the per-line bounds.** Fix: the claim is withdrawn; all bounds are tabled, the theorem takes their minimum, the per-line bounds are raised where they can be, and `is_ipv6` has a piece-step fallback.
+- **F4. Only a table pinned the `next_option` replacement, which is security-relevant.** Fix: the old splitter stays as a `cfg(test)` reference, a bolero differential compares against it, the edge cases have a table, and the None semantics are specified.
