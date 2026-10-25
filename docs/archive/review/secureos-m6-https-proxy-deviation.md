@@ -1551,3 +1551,17 @@ Each harness measured alone:
 3. **`Writer::put` into outputs larger than 64 bytes.** It is loop-free: a `checked_add`, a slice bounds check, and a copy between slices of equal length.
 
 **Counts:** KANI-HTTP-WIRE 19, KANI-HARNESSES 102, UNIT-HTTP-WIRE 74, UNIT-TESTS 1247.
+
+## M6 close (2026-10-25)
+
+- **Final `make check`:** green at 4479d66, run solo on gx10. It took 2466 s; the Kani results came from cache: http-wire from its own kani-gate run, and the other crates from z1mn's caches copied back.
+- **Full check-selftest:** deferred by the owner. It runs once, after the post-M6 fixes from memory and the repository restructure, not again now.
+  - The partial run on 4479d66's tree before it was stopped:
+    - **z1mn:** 8 of 8 test-gate cases red as intended. It then stopped with a FileNotFoundError, because the fresh clone had no `build/counts` from a green run.
+    - **mrx33:** 77 non-QEMU cases red as intended, with no failure.
+  - Code review round 3 and the R2/R3 reviews had no open Critical or Major findings. The partition runs on earlier trees of this milestone were green: mrx33 157/157 on A1 and 158 on r2.
+- **Next, before the long runs:**
+  - the M3b rotating-spoof fix;
+  - the load-sensitive VPN integration cases: cookie boot a and the rp gate boot failed when the host carried a solver. That is either a timing assumption in the tests or an availability fragility, and must be diagnosed;
+  - the other fixes recorded in memory;
+  - the repository restructure.
