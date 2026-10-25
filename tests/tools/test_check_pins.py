@@ -651,7 +651,8 @@ CASES = [
     ("P11 == on a Finished in pds/tls", {"P11"},
      lambda t: append(t / "crates/pds/tls/src/main.rs",
                       "\nfn bad(expected: &[u8; 32], finished: &[u8; 32]) -> bool {\n    finished == expected\n}\n")),
-    ("P11 pds/tls's main removed", {"P11"}, lambda t: (t / "crates/pds/tls/src/main.rs").unlink()),
+    # P21 anchors in the same file and fails closed without it.
+    ("P11 pds/tls's main removed", {"P11", "P21"}, lambda t: (t / "crates/pds/tls/src/main.rs").unlink()),
     # P9/P10 (M6 Phase 2 self-check): the shared `secret` crate joins.
     ("P9 derive(Clone) on Secret in crates/secret", {"P9"},
      lambda t: edit(t / "crates/secret/src/lib.rs", "pub struct Secret<const N: usize>([u8; N]);",
@@ -719,6 +720,37 @@ CASES = [
     ("allow exchange_with_randomness in tls-core's tests", set(),
      lambda t: append(t / "crates/tls-core/src/tests.rs",
                       "\nfn again(s: &[u8; 1216]) {\n    let _ = exchange_with_randomness(s, &[0; 64]);\n}\n")),
+    # P20 (external review E2): hello_keys, pub for the ct-harness, stays
+    # with handshake.rs and the harness; tls-core's tests may not name it.
+    ("P20 hello_keys called in pds/tls", {"P20"},
+     lambda t: append(t / "crates/pds/tls/src/main.rs",
+                      "\nfn hk() {\n    let _ = tls_core::handshake::hello_keys::<Hedged<Hw>>;\n}\n")),
+    ("P20 hello_keys imported in tls-core's tests", {"P20"},
+     lambda t: append(t / "crates/tls-core/src/tests.rs", "\nuse crate::handshake::hello_keys as hk;\n")),
+    # P20 (code review round 2, S-N3): no alias, the re-export included.
+    ("P20 exchange_with_randomness re-exported under an alias in tls-core's lib", {"P20"},
+     lambda t: edit(t / "crates/tls-core/src/lib.rs", "exchange_with_randomness, scrub_session_stack}",
+                    "exchange_with_randomness as exchange_fixed, scrub_session_stack}")),
+    ("P20 hello_keys imported under an alias in the ct-harness", {"P20"},
+     lambda t: append(t / "tools/ct-harness/src/residue.rs", "\nuse tls_core::handshake::hello_keys as hk;\n")),
+    ("allow hello_keys in the ct-harness and in comments", set(),
+     lambda t: (append(t / "tools/ct-harness/src/residue.rs", "\nfn again() {\n    let _ = handshake::hello_keys::<Fixed>;\n}\n"),
+                append(t / "crates/pds/tls/src/main.rs", "\n// hello_keys is the harness's hello-depth root.\n"))),
+    # P21 (M6 plan C13): Pass::serve's return keeps the hello turn's pass.
+    ("P21 && in place of || in the pass's return", {"P21"},
+     lambda t: edit(t / "crates/pds/tls/src/main.rs", "PASS_PACKETS) || tls_core::conn::pass_due(",
+                    "PASS_PACKETS) && tls_core::conn::pass_due(")),
+    ("P21 pass_due dropped from the pass's return", {"P21"},
+     lambda t: edit(t / "crates/pds/tls/src/main.rs", " || tls_core::conn::pass_due(consumed, waiting)", "")),
+    ("P21 the Pass impl renamed away", {"P21"},
+     lambda t: edit(t / "crates/pds/tls/src/main.rs", "impl ring::pass::Pass for Pass<'_> {",
+                    "impl ring::pass::Pass for Passes<'_> {")),
+    ("P21 a constant as pass_due's second argument", {"P21"},
+     lambda t: edit(t / "crates/pds/tls/src/main.rs", "tls_core::conn::pass_due(consumed, waiting)",
+                    "tls_core::conn::pass_due(consumed, true)")),
+    ("allow the pass's return split over lines around a comment", set(),
+     lambda t: edit(t / "crates/pds/tls/src/main.rs", "PASS_PACKETS) || tls_core::conn::pass_due(",
+                    "PASS_PACKETS)\n            // the hello turn\n            || tls_core::conn::pass_due(")),
 ]
 
 

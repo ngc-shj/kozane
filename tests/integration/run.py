@@ -2838,9 +2838,14 @@ def py_installed(conf: str, gw_pub: bytes, rp: Rosenpass, deadline: float) -> Py
 
 
 def rust_usize(rel: str, name: str) -> int:
-    m = re.search(rf"pub const {name}: (?:usize|u\d+) = (0x[0-9a-fA-F_]+|[0-9_]+);", open(os.path.join(ROOT, rel)).read())
+    """`pub const NAME: usize = <literal>;`, or `= OTHER;` naming another
+    such constant of the same file."""
+    m = re.search(rf"pub const {name}: (?:usize|u\d+) = (0x[0-9a-fA-F_]+|[0-9_]+|[A-Z][A-Z0-9_]*);",
+                  open(os.path.join(ROOT, rel)).read())
     if not m:
         raise Fail(f"{name} not found in {rel}")
+    if m.group(1)[0].isalpha():
+        return rust_usize(rel, m.group(1))
     return int(m.group(1), 0)
 
 
@@ -3877,6 +3882,9 @@ class BackendConn:
     def __init__(self, sock: socket.socket, peer: tuple, auto: bool):
         self.sock, self.peer, self.auto = sock, peer, auto
         self.data = bytearray()
+        # time.monotonic() of the first chunk received (M6 plan C13's
+        # receipt, recorded data).
+        self.first = None
         self.ended = None
         self.stopped = False
         self.lock = threading.Lock()
@@ -3902,6 +3910,8 @@ class BackendConn:
                     self.ended = "eof"
                     break
                 with self.lock:
+                    if self.first is None:
+                        self.first = time.monotonic()
                     self.data += chunk
                 if self.auto and not answered:
                     response = backend_response(bytes(self.data))
@@ -4020,6 +4030,17 @@ class Backend:
     def count(self) -> int:
         with self.lock:
             return len(self.conns)
+
+    def first_chunk(self, marker: bytes):
+        """The first-chunk time of the connection whose bytes hold `marker`,
+        or None."""
+        with self.lock:
+            conns = list(self.conns)
+        for c in conns:
+            with c.lock:
+                if marker in c.data:
+                    return c.first
+        return None
 
     def conn(self, i: int, what: str, timeout: float = HTTPS_WAIT_S) -> BackendConn:
         """Connection number `i` (from 0), once accepted."""
@@ -4819,7 +4840,7 @@ def https_rst_inherit_case(con: Console, tap: Tap, sniffer: "Sniffer", backend: 
     handshake timeout), and no backend connection opens. One batch: p2 is
     aborted (a RST to it). Two: p2 is a fresh admission, answered, and is
     reset here. The decision itself is red-proved at unit level
-    (`client_left`). Second in its boot, after slowloris, so its PeerReset
+    (`client_left_retarget`). Second in its boot, after slowloris, so its PeerReset
     is the boot's first (total=1, an emitted line)."""
     what = "https rst inherit"
     (ip1, port1), (ip2, port2) = INHERIT_SOURCES
@@ -5265,21 +5286,95 @@ def https_source_cap_case(con: Console, deploy: str, backend: Backend, sniffer: 
           "TlsClosed(PerSource), another source accepted]")
 
 
-def https_concurrent_probe(con: Console, deploy: str, sniffer: Sniffer, passed: list):
-    """The 8-concurrent probe (M6 plan C10, D3, RM6-8): MAX_CONNS handshakes
-    started together from four sources, each then fetching the backend's
-    response. Every connection must get a slot (else the probe measured
-    fewer); each handshake's time, and whether it failed (a server-side
-    handshake timeout under TCG: sign time × the queue), is recorded, not
-    asserted: RM6-8's measured value for D3. A failed handshake with a
-    TlsTimeout(Handshake) audited since the start is named a D3 breach in
-    the record; none completing at all fails the probe, which then measured
-    nothing (T8)."""
+def probe_port_events(frames: list, src: bytes, port: int) -> dict:
+    """What crossed the tap for the client at `src`:`port` (M6 plan C13):
+    its SYN; the server's first ServerHello, the first crossing of the
+    server's segment at its ISN + 1 whose payload starts a handshake record
+    holding ServerHello (`16 03 03 .. .. 02`), so retransmits are ignored;
+    the client's Finished (R2 amendment A1), its first segment with payload
+    after that ServerHello at a sequence number past the end of the client
+    payload that crossed before it (the ClientHello, however many segments
+    it took), so a retransmitted ClientHello does not count; the server's
+    first RST, and whether server payload crossed before it; and every
+    segment, for the diagnosis."""
+    ev = {"syn": None, "hello": None, "finished": None, "rst": None, "payload": False, "segments": []}
+    isn = None
+    # The client's sequence numbers relative to its first payload byte, and
+    # the end of its payload before the first ServerHello.
+    first_seq, hello_end = None, 0
+    for ts, f, outgoing in frames:
+        t = tcp_fields(f)
+        if not t:
+            continue
+        if outgoing and (t[0], t[1], t[3]) == (src, port, HTTPS_PORT):
+            if t[4] & TCP_SYN and ev["syn"] is None:
+                ev["syn"] = ts
+            payload = tcp_payload(f)
+            if payload:
+                if first_seq is None:
+                    first_seq = t[5]
+                rel = (t[5] - first_seq) & 0xFFFFFFFF
+                if ev["hello"] is None:
+                    hello_end = max(hello_end, rel + len(payload))
+                elif ev["finished"] is None and hello_end <= rel < 1 << 31:
+                    ev["finished"] = ts
+        elif not outgoing and (t[0], t[1], t[2], t[3]) == (GW_IP, HTTPS_PORT, src, port):
+            payload = tcp_payload(f)
+            if t[4] & TCP_SYN and isn is None:
+                isn = t[5]
+            if t[4] & TCP_RST and ev["rst"] is None:
+                ev["rst"] = ts
+            if payload and ev["rst"] is None:
+                ev["payload"] = True
+            if (ev["hello"] is None and isn is not None and t[5] == (isn + 1) & 0xFFFFFFFF
+                    and payload[:3] == b"\x16\x03\x03" and payload[5:6] == b"\x02"):
+                ev["hello"] = ts
+        else:
+            continue
+        names = "|".join(n for n, bit in (("S", TCP_SYN), ("A", TCP_ACK), ("R", TCP_RST), ("F", TCP_FIN)) if t[4] & bit)
+        ev["segments"].append((ts, f"{'c>s' if outgoing else 's>c'} {names} seq={t[5]} len={len(tcp_payload(f))}"))
+    return ev
+
+
+def https_concurrent_probe(con: Console, deploy: str, backend: Backend, sniffer: Sniffer, passed: list):
+    """The concurrent probe (M6 plan C10, Re-plan R2's C13, RM6-8):
+    MAX_CONNS handshakes started together from four sources, each then
+    sending a request marked `X-Probe: <client port>` (forwarded unchanged)
+    and reading the backend's response. Judged only from what the tap and
+    the backend observe, the ordering predicate first (R2 amendment A1):
+    with the admitted ports in the order their first ServerHello crossed
+    the tap, at least 2 of them, each port's Finished crossed before the
+    next port's first ServerHello. Under C13 a sign separates every two
+    flights (one hello turn per pass); under the lockstep a pass serving
+    two or more ClientHellos sends their flights in one egress,
+    milliseconds apart, before either client can answer: a round trip
+    against signs of 0.4 s or more, neither depending on host load. Then,
+    per port from the sniffer, refused (a server RST with no server payload
+    before it, less than HANDSHAKE_TIMEOUT_NS after the SYN) or admitted:
+    a refusal before the SYN-ACK fails the client's connect with
+    ConnectionRefusedError, accepted only for a port the sniffer counts as
+    refused (any other connect failure fails the probe); every admitted
+    port got a flight and completed; at least min(HS_CAP, MAX_CONNS)
+    admitted; refused + admitted = MAX_CONNS; a refusal only when
+    MAX_CONNS > HS_CAP, and at least one then (so expected at HS_CAP 3);
+    TlsClosed(HandshakeCap) total=1 since the
+    start if and only if the sniffer counted a refusal (the probe is the
+    boot's first HandshakeCap producer: case 12's flood runs after it); no
+    TlsTimeout(Handshake) since the start. The times (first ServerHello,
+    Finished and completion per port, the gaps between first ServerHellos,
+    the last completion, the sign high-water) are printed as RM6-8 data on
+    the passing and the failing path, before any verdict; no time is
+    asserted. The backend's receipt per port is recorded data only. An
+    admitted port that did not complete gets the diagnosis lines: its
+    phase, its segments and the backend's receipt. Every admitted port's
+    release RST is awaited; a refused port's RST was its refusal."""
     ca = os.path.join(deploy, "devca.pem")
     conns, per = per_source_layout()
+    cap = rust_usize(TLS_CONN, "HS_CAP")
     timeout = rust_const(TLS_CONN, "HANDSHAKE_TIMEOUT_NS") / NS
     linger = rust_const(TLS_CONN, "CLOSE_LINGER_NS") / NS
     want = backend_response(request_head())
+    # (status, port, detail, phase, handshake completed at)
     results = [None] * conns
     go = threading.Event()
     start, mark = len(sniffer.since(0)), con.mark()
@@ -5289,7 +5384,7 @@ def https_concurrent_probe(con: Console, deploy: str, sniffer: Sniffer, passed: 
         try:
             raw = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         except OSError as e:
-            results[k] = ("socket", 0.0, 0, repr(e))
+            results[k] = ("socket", 0, repr(e), "connect", None)
             return
         with raw:
             go.wait()
@@ -5297,26 +5392,40 @@ def https_concurrent_probe(con: Console, deploy: str, sniffer: Sniffer, passed: 
                 raw.settimeout(timeout + HTTPS_WAIT_S)
                 raw.bind((ip_str(src), 0))
                 port = raw.getsockname()[1]
-                raw.connect((ip_str(GW_IP), HTTPS_PORT))
             except OSError as e:
-                results[k] = ("connect", 0.0, 0, f"{type(e).__name__}: {e}")
+                results[k] = ("socket", 0, f"{type(e).__name__}: {e}", "connect", None)
+                return
+            # The bound port is kept on a failed connect: a HandshakeCap
+            # refusal's RST before the SYN-ACK is ConnectionRefusedError,
+            # judged against that port's segments below.
+            try:
+                raw.connect((ip_str(GW_IP), HTTPS_PORT))
+            except ConnectionRefusedError as e:
+                results[k] = ("connect refused", port, f"{type(e).__name__}: {e}", "connect", None)
+                return
+            except OSError as e:
+                results[k] = ("connect", port, f"{type(e).__name__}: {e}", "connect", None)
                 return
             ctx = ssl.create_default_context(cafile=ca)
             ctx.minimum_version = ssl.TLSVersion.TLSv1_3
-            t0 = time.monotonic()
+            phase, done = "handshake", None
             try:
                 with ctx.wrap_socket(raw, server_hostname=ip_str(GW_IP)) as s:
-                    t = time.monotonic() - t0
-                    s.sendall(request_head())
+                    done = time.monotonic()
+                    phase = "request write"
+                    s.sendall(request_head(f"X-Probe: {port}\r\n"))
+                    phase = "response read"
                     ok = read_to_end(s) == want
-                results[k] = ("ok" if ok else "body", t, port, "")
+                results[k] = ("ok" if ok else "body", port, "", "", done)
             except OSError as e:
-                results[k] = ("failed", time.monotonic() - t0, port, f"{type(e).__name__}: {e}")
+                results[k] = ("failed", port, f"{type(e).__name__}: {e}", phase, done)
 
     threads = [threading.Thread(target=one, args=(k,), daemon=True) for k in range(conns)]
     try:
         for t in threads:
             start_without_stop_signals(t)
+        # The times printed are from here.
+        origin = time.monotonic()
         go.set()
     finally:
         go.set()
@@ -5325,30 +5434,83 @@ def https_concurrent_probe(con: Console, deploy: str, sniffer: Sniffer, passed: 
             t.join(max(0.0, deadline - time.monotonic()))
     if any(t.is_alive() for t in threads) or None in results:
         raise Fail("https concurrent probe: a client thread did not finish with a result")
+    sniffer.check_drops()
+    frames = sniffer.since(start)
+    events = [probe_port_events(frames, CLIENT_IPS[k // per], r[1]) for k, r in enumerate(results)]
+    receipts = [backend.first_chunk(f"X-Probe: {r[1]}\r\n".encode()) if r[1] else None for r in results]
+    refused = [ev["rst"] is not None and not ev["payload"] and ev["syn"] is not None
+               and ev["rst"] - ev["syn"] < timeout for ev in events]
+    hellos = sorted(ev["hello"] for ev in events if ev["hello"] is not None)
+    crossed = sorted((k for k in range(conns) if not refused[k] and events[k]["hello"] is not None),
+                     key=lambda k: events[k]["hello"])
+    gaps = [b - a for a, b in zip(hellos, hellos[1:])]
+    completions = [r[4] for k, r in enumerate(results) if r[0] == "ok" and not refused[k]]
     signs = [int(us) for us in con.count(r"audit: src=tls TlsSignHighWater us=(\d+) ", since=mark)]
-    timeouts = con.count(r"audit: src=tls TlsTimeout\(Handshake\) total=\d+ ", since=mark)
-    print("\nhttps concurrent probe (RM6-8): " + "; ".join(
-        f"{ip_str(CLIENT_IPS[k // per])} {r[0]} {r[1]:.3f} s{' ' + r[3] if r[3] else ''}"
-        for k, r in enumerate(results)) + f"; failed {sum(r[0] == 'failed' for r in results)} of {conns}; "
-        f"TlsTimeout(Handshake) audited: {bool(timeouts)}; TlsSignHighWater us since: {signs}", flush=True)
-    failed = sum(r[0] == "failed" for r in results)
-    breach = f"D3 breach: {failed} of {conns} handshakes failed with TlsTimeout(Handshake) audited since the start"
-    if not any(r[0] in ("ok", "body") for r in results):
-        raise Fail(f"https concurrent probe: no handshake of {conns} completed; the probe measured nothing"
-                   + (f" ({breach})" if timeouts else ""))
-    if failed and timeouts:
-        print(f"\nhttps concurrent probe (RM6-8): {breach}", flush=True)
+    rel = lambda t: "-" if t is None else f"{t - origin:.3f}"
+
+    def classified(k: int) -> str:
+        if refused[k]:
+            return "refused"
+        return "admitted" if results[k][0] == "ok" else f"admitted, failed in {results[k][3]}"
+
+    print(f"\nhttps concurrent probe (RM6-8): HS_CAP {cap}; " + "; ".join(
+        f"{ip_str(CLIENT_IPS[k // per])}:{r[1]} {classified(k)} hello {rel(events[k]['hello'])} s finished "
+        f"{rel(events[k]['finished'])} s done {rel(r[4])} s "
+        f"receipt {rel(receipts[k])} s{' ' + r[2] if r[2] else ''}" for k, r in enumerate(results))
+          + f"; first ServerHello gaps {', '.join(f'{g:.3f}' for g in gaps)} s; last completion "
+          f"{rel(max(completions) if completions else None)} s; TlsSignHighWater us since: {signs}", flush=True)
     for k, r in enumerate(results):
-        if r[0] in ("socket", "connect"):
-            raise Fail(f"https concurrent probe: client {k + 1} got no slot ({r[3]}); the probe did not hold "
-                       f"{conns} at once")
+        if refused[k] or r[0] == "ok":
+            continue
+        segs = "; ".join(f"{rel(ts)} {seg}" for ts, seg in events[k]["segments"])
+        print(f"\nhttps concurrent probe diagnosis: client {k + 1} port {r[1]} failed in {r[3]} ({r[2]}); backend "
+              f"receipt {rel(receipts[k])} s; {len(events[k]['segments'])} segments: {segs}", flush=True)
+    # Judged first: it covers whatever was observed.
+    if len(crossed) < 2:
+        raise Fail(f"https concurrent probe: {len(crossed)} admitted port(s) with a first ServerHello on the tap, "
+                   "the ordering predicate needs at least 2")
+    for x, y in zip(crossed, crossed[1:]):
+        if events[x]["finished"] is None or events[x]["finished"] >= events[y]["hello"]:
+            raise Fail(f"https concurrent probe: a server flight left before the previous client's Finished (port "
+                       f"{results[x][1]} Finished {rel(events[x]['finished'])} s, port {results[y][1]} first "
+                       f"ServerHello {rel(events[y]['hello'])} s)")
+    for k, r in enumerate(results):
+        if r[0] == "socket" or r[0] == "connect" or (r[0] == "connect refused" and not refused[k]):
+            raise Fail(f"https concurrent probe: client {k + 1} got no TCP connection ({r[2]})")
+    for k, r in enumerate(results):
+        if not refused[k] and events[k]["hello"] is None:
+            raise Fail(f"https concurrent probe: client {k + 1} admitted but got no server flight")
+    for k, r in enumerate(results):
+        if refused[k]:
+            continue
+        if r[0] == "failed":
+            raise Fail(f"https concurrent probe: client {k + 1} admitted but failed in {r[3]} ({r[2]})")
         if r[0] == "body":
             raise Fail(f"https concurrent probe: client {k + 1} did not receive the backend's response exactly")
+    admitted = sum(1 for k, r in enumerate(results) if not refused[k] and r[0] == "ok")
+    n_refused = sum(refused)
+    if n_refused != conns - admitted:
+        raise Fail(f"https concurrent probe: {admitted} admitted and {n_refused} refused of {conns}")
+    if admitted < min(cap, conns):
+        raise Fail(f"https concurrent probe: {admitted} of {conns} admitted, below min(HS_CAP {cap}, {conns})")
+    if n_refused and conns <= cap:
+        raise Fail(f"https concurrent probe: {n_refused} refused with {conns} connections under HS_CAP {cap}")
+    if not n_refused and conns > cap:
+        raise Fail(f"https concurrent probe: none of {conns} connections refused over HS_CAP {cap}")
+    if con.count(r"audit: src=tls TlsTimeout\(Handshake\) total=\d+ ", since=mark):
+        raise Fail("https concurrent probe: TlsTimeout(Handshake) audited since the start")
+    if n_refused:
+        con.wait_for(r"audit: src=tls TlsClosed\(HandshakeCap\) total=1 lost=\d+", since=mark)
+    elif con.count(r"audit: src=tls TlsClosed\(HandshakeCap\) ", since=mark):
+        raise Fail("https concurrent probe: TlsClosed(HandshakeCap) audited with no refusal on the tap")
     for k, r in enumerate(results):
-        wait_server_rst(sniffer, start, r[2], linger + HTTPS_WAIT_S, f"https concurrent probe: client {k + 1}'s release",
+        if refused[k]:
+            continue
+        wait_server_rst(sniffer, start, r[1], linger + HTTPS_WAIT_S, f"https concurrent probe: client {k + 1}'s release",
                         dst=CLIENT_IPS[k // per])
     passed.append("https concurrent probe")
-    print(f"\nPASS [https concurrent probe: {conns} handshakes from {conns // per} sources at once, times recorded]")
+    print(f"\nPASS [https concurrent probe: {conns} handshakes from {conns // per} sources at once, each server "
+          f"flight after the previous client's Finished, {admitted} admitted and completed, {n_refused} refused, times recorded]")
 
 
 def capture_client_hello(ca: str, sniffer: Sniffer, what: str) -> bytes:
@@ -5390,8 +5552,9 @@ class HelloFlood:
     TCP handshake), by helper threads. A connection counts a flight once
     the server's first byte arrives as a handshake record: `tls` builds the
     whole flight, CertificateVerify's signature included, before sending
-    any of it. Each connection is then reset (SO_LINGER 0) so its slot
-    frees at once. close() shuts any open socket down so the threads end
+    any of it. A connection the handshake cap refuses (the server's RST
+    after the TCP handshake; M6 plan C13) counts as ended. Each connection
+    is then reset (SO_LINGER 0) so its slot frees at once. close() shuts any open socket down so the threads end
     promptly."""
 
     def __init__(self, hello: bytes, sources: list, per_source: int, wait: float):
@@ -5562,7 +5725,8 @@ def test_https_flood(pkg: "Package", deploy: str, passed: list):
     the raw backend on the inside tap, which also answers pings from peer
     1's tunnel address. Case 10 first (fresh slots), the probe, then
     Rosenpass for peer 1, case 12, and the SYN flood last (its spoofed SYNs
-    hold listeners until their timeout)."""
+    hold listeners until their timeout). The probe precedes case 12, so it
+    is the boot's first TlsClosed(HandshakeCap) producer (C13)."""
     tap = Tap()
     inside = backend = sniffer = rp = None
     try:
@@ -5580,7 +5744,7 @@ def test_https_flood(pkg: "Package", deploy: str, passed: list):
         con.wait_for(r"tls: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
         https_recycling_case(con, deploy, backend, sniffer, passed)
         https_source_cap_case(con, deploy, backend, sniffer, passed)
-        https_concurrent_probe(con, deploy, sniffer, passed)
+        https_concurrent_probe(con, deploy, backend, sniffer, passed)
         cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
         gw_pub = b64(cfg["gateway"]["public_key"])
         con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)

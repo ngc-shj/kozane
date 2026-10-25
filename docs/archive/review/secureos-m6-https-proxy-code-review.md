@@ -52,11 +52,11 @@ verified-local (QEMU): TCP, TLS X25519MLKEM768 + ECDSA (OpenSSL s_client, curl),
 All round 1 findings addressed; details in the deviation log's "Phase 3 round 1 fixes". Gates run: pins, lint, lint-pds, unit, laws, image, ct, ct-shape, bolero, mir. Not run: Kani, Verus, make test/check, check-selftest; `test`-gate selftest cases need a QEMU red-proof.
 
 ### F1 [Major] Reset listener inherits the admitted slot — Fixed
-- Action: client gone also when the remote endpoint differs from the admitted `l.peer` (address and port) or is None outside Closed/Listen; `l.peer` retargeted before the abort; comment corrected. Integration case `https rst inherit` (residue boot); selftest `https-rst-inherit` (needs QEMU red-proof).
-- Modified: crates/pds/tls/src/main.rs:903, crates/pds/tls/src/main.rs:1173; tests/integration/run.py:4809; tools/check-selftest:1281
+- Action: client gone also when the remote endpoint differs from the admitted `l.peer` (address and port) or is None outside Closed/Listen; `l.peer` retargeted before the abort; comment corrected. Integration case `https rst inherit` (residue boot; judged under either batching); selftest `rst-inherit` (unit gate, red-proved). Round 2 (T-N5): check and retarget are one tls-core function, `client_left_retarget`.
+- Modified: crates/pds/tls/src/main.rs:903, crates/pds/tls/src/main.rs:1173; tests/integration/run.py:4809; tools/check-selftest (`rst-inherit`)
 
 ### F2 [Minor] Slot::error no-op once Draining — Fixed
-- Action: `error()` aborts a Draining/Lingering slot (TlsClosed(Error)); unit test.
+- Action: `error()` aborts a Draining/Lingering slot; unit test. Round 2 (F-N1): no second TlsClosed outcome.
 - Modified: crates/tls-core/src/conn/proxy.rs:234; crates/tls-core/src/tests.rs:1317
 
 ### F3 [Minor] Too many extensions refused as DuplicateExtension — Fixed
@@ -100,7 +100,7 @@ All round 1 findings addressed; details in the deviation log's "Phase 3 round 1 
 - Modified: tools/check-selftest:1044, tools/check-selftest:1053
 
 ### T3 [Major] Wipe points unproven — Fixed (needs QEMU red-proof)
-- Action: selftest `residue-secret-drop` (Secret's drop zeroize removed) and `residue-wipe-state` (read/write secret wipes removed), residue boot, failure-only needles.
+- Action: selftest `residue-secret-drop` (Secret's drop zeroize removed; ct gate, the `exchange` residue case) and `residue-wipe-state` (read/write secret wipes removed; https residue boot, needs the QEMU red-proof), failure-only needles.
 - Modified: tools/check-selftest:1287, tools/check-selftest:1294
 
 ### T4 [Major] Undiagnosed slowloris connect timeout — Fixed
@@ -143,3 +143,78 @@ All round 1 findings addressed; details in the deviation log's "Phase 3 round 1 
 ### Env: VE10/VE11 — Recorded
 - Action: M7 QEMU-only (owner, 2026-10-24): VE10/VE11 become residuals RM6-9/RM6-10; VE9 stays blocked-deferred.
 - Modified: docs/archive/review/secureos-m6-https-proxy-deviation.md (Phase 3 round 1 fixes)
+
+# Review round: 2
+
+Reviewed: the C13 + A1 working tree on 906ffc8 (Re-plan R2 and its amendment A1).
+
+## Testing Findings (round 2)
+T-N1 [Major] The concurrent probe records a HandshakeCap refusal (RST before SYN-ACK, ConnectionRefusedError) as ("connect", port 0) and fails "got no TCP connection"; 3 of 3 gx10 runs — tests/integration/run.py https_concurrent_probe (~5391, 5446, 5470).
+T-N2 [Major] Nothing requires a refusal when conns > HS_CAP, and no test or selftest pins that `Table::admit` (not admit_with_cap) applies HS_CAP.
+T-N3 [Minor] "Fewer than 2 admitted ports crossed" shares the lockstep needle; the needle names no pair.
+T-N4 [Minor] P21 accepts any pass_due arguments, a constant included.
+T-N5 [Minor] F1's check and retarget live apart (tls-core compares, the PD retargets); no test that the comparison uses the old peer; deviation log and Resolution Status still describe superseded forms (test-gate https-rst-inherit, a case failing on two passes, residue-secret-drop on the residue boot).
+
+## Functionality Findings (round 2)
+F-N1 [Minor] `Slot::error` on Draining/Lingering pushes a second TlsClosed (the close cause was already audited) — crates/tls-core/src/conn/proxy.rs ~246.
+F-N2 [Minor] hello_turn ties break by listener index; the plan says slot index; undocumented.
+
+## Security Findings (round 2)
+S-N1 [Minor] An early-admitted connection sending 1-byte ClientHello fragments holds the turn, bounded by MAX_HANDSHAKE and the TCP data meter (~1 s per connection, ~2 s per source); not recorded under RM6-7/RM6-8.
+S-N2 [Minor] The inside RST-loss residual (backend abort refused at inner's TxReserve, never resent) is unrecorded and has no unit pair.
+S-N3 [Minor] P20 blanks the whole `pub use hybrid::{..}` re-export, so an aliased re-export escapes; no alias check.
+
+## Resolution Status (round 2)
+All round 2 findings addressed; details in the deviation log's "Phase 3 round 2 fixes". Gates run: pins, lint, lint-pds, unit, laws, ct. Not run: Kani, Verus, make test/check, run.py/QEMU, check-selftest. The probe changes (T-N1–T-N3) await the QEMU runs.
+
+### T-N1 [Major] Connect refusals recorded as no connection — Fixed (needs QEMU run)
+- Action: the bound port is kept on a failed connect; ConnectionRefusedError accepted only where the tap classifies the port as refused (server RST, no server payload, RST − SYN below the handshake timeout); the release loop uses real ports and skips refused ones.
+- Modified: tests/integration/run.py (https_concurrent_probe)
+
+### T-N2 [Major] No refusal required; admit's cap unpinned — Fixed
+- Action: the probe fails with no refusal when conns > HS_CAP and checks refused = conns − admitted; unit test `admit_refuses_at_hs_cap_slots_in_handshake`; unit-gate selftest `c13-admit-hs-cap` (red-proved).
+- Modified: tests/integration/run.py; crates/tls-core/src/tests.rs; tools/check-selftest
+
+### T-N3 [Minor] Shared needle — Fixed
+- Action: own message for fewer than 2 crossed; the lockstep needle (unchanged prefix) only for a failing pair, with its ports and times.
+- Modified: tests/integration/run.py
+
+### T-N4 [Minor] P21 accepts any arguments — Fixed
+- Action: pass_due's arguments must be the last two identifiers destructured from the one `self.tls.pass()`; deny fixture with a constant.
+- Modified: tools/check-pins (check_pass_due); tests/tools/test_check_pins.py
+
+### T-N5 [Minor] F1 split across crates; stale records — Fixed
+- Action: `tls_core::conn::client_left_retarget(closed_or_listen, current, &mut peer)` compares with the old peer, then retargets; unit test of the order; `rst-inherit` anchored on it (red-proved); round 1 records corrected in place.
+- Modified: crates/tls-core/src/conn/proxy.rs; crates/tls-core/src/conn.rs; crates/pds/tls/src/main.rs; crates/tls-core/src/tests.rs; tools/check-selftest; tests/integration/run.py (docstring); deviation log; this file (F1, F2, T3)
+
+### F-N1 [Minor] Second TlsClosed on error() — Fixed
+- Action: the abort stays, no outcome pushed; the test expects none in both phases.
+- Modified: crates/tls-core/src/conn/proxy.rs; crates/tls-core/src/tests.rs
+
+### F-N2 [Minor] Tie-break undocumented — Fixed (documented)
+- Action: `conn::hello_turn` doc and a deviation-log note (plan left as locked).
+- Modified: crates/tls-core/src/conn.rs; deviation log
+
+### S-N1 [Minor] Fragmented ClientHello holds the turn — Recorded
+- Action: recorded under RM6-7/RM6-8 with its bound.
+- Modified: deviation log
+
+### S-N2 [Minor] Inside RST loss — Fixed (recorded, pinned)
+- Action: residual recorded beside R2-S4's; inner-core pair for a bare RST|ACK at the edge and edge + 1.
+- Modified: crates/inner-core/src/tests.rs; deviation log
+
+### S-N3 [Minor] P20 alias escape — Fixed
+- Action: only the exact re-exported token is exempt; `exchange_with_randomness as` / `hello_keys as` flagged everywhere; deny fixtures for the re-export alias and a harness alias.
+- Modified: tools/check-pins (check_exchange_callers); tests/tools/test_check_pins.py
+
+# Review round: 3 (verification of round 2's fixes, one verifier, all perspectives)
+
+Scope: `wip/m6-a1..wip/m6-r2`, excluding docs.
+
+Every round 2 finding is resolved: T-N1 to T-N5, F-N1, F-N2, S-N1 to S-N3.
+- **Manifest counts:** consistent.
+- **Real-tree P20/P21:** no false positives.
+- **`refused == conns − admitted` (T-N2):** this probe check cannot fire, because earlier checks already fail every non-refused port that is not ok. It is harmless and left in place.
+- **The S-N3 re-export fixture:** it is also caught by the alias rule, so it gives defence in depth. Minor, accepted.
+
+No Critical or Major findings. The code review has converged.

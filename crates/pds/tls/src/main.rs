@@ -35,7 +35,7 @@ use smoltcp::time::{Duration, Instant};
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint, Ipv4Address};
 use tls_core::conn::{
     Action, BACKEND_CHUNK, BackendEnd, Closed, Endpoint, MAX_CLIENT_OUT, Next, Outcome, Slot, Stage, Table, Timeout,
-    backend_end, client_left,
+    backend_end, client_left_retarget, hello_turn,
 };
 use tls_core::halt;
 use tls_core::handshake::{Ctx, Signer};
@@ -808,6 +808,10 @@ struct Conn<'a, 'r> {
     ctx: &'a mut Ctx<'r, Hedged<Hw>, KeySigner<'r>>,
     audit: &'a mut Audit,
     now: u64,
+    /// This connection holds the pass's hello turn (M6 plan C13).
+    turn: bool,
+    /// Client records taken this serve.
+    taken: usize,
 }
 
 impl Conn<'_, '_> {
@@ -900,10 +904,11 @@ impl Conn<'_, '_> {
         // the peer retargeted so that the abort's RST to it is the one
         // awaited.
         let ep = self.client.remote_endpoint().map(peer_of);
-        let gone = client_left(matches!(self.client.state(), tcp::State::Closed | tcp::State::Listen), ep, self.l.peer);
-        if let Some(ep) = ep {
-            self.l.peer = ep;
-        }
+        let gone = client_left_retarget(
+            matches!(self.client.state(), tcp::State::Closed | tcp::State::Listen),
+            ep,
+            &mut self.l.peer,
+        );
         match self.slot.stage() {
             Some(_) if gone => {
                 let next = self.slot.client_gone(self.now);
@@ -941,7 +946,14 @@ impl Conn<'_, '_> {
             if self.slot.stage().is_none() || !self.slot.reads_client() || !self.may_write() {
                 break;
             }
+            // A ClientHello's records wait for the connection's hello turn
+            // (M6 plan C13): a pass computes at most one server flight, so
+            // the flights already computed are not held behind the rest.
+            if self.slot.awaits_hello() && !self.turn {
+                break;
+            }
             let Some(rec) = take_record(self.client, self.record) else { break };
+            self.taken = self.taken.saturating_add(1);
             let next = self.slot.client_record(rec, self.out, self.ctx, self.now);
             // Secrets the session moved (Rust moves are copies that nothing
             // wipes) and libcrux's frames, below this one.
@@ -1018,12 +1030,15 @@ impl Conn<'_, '_> {
 }
 
 impl Tls {
-    /// One bounded pass: at most PASS_PACKETS segments in on each link,
-    /// every connection served, everything due sent on both, then the
-    /// aborted sockets whose RST went out (or whose passes ran out)
+    /// One bounded pass (M6 plan C13): at most PASS_PACKETS segments in on
+    /// each link; every connection served with its ClientHello held back;
+    /// everything due sent on both links, and the peers notified; then the
+    /// hello turn, one waiting ClientHello served and its flight sent; then
+    /// the aborted sockets whose RST went out (or whose passes ran out)
     /// released before the next poll of their interface. Returns the
-    /// segments taken on each link.
-    fn pass(&mut self) -> (usize, usize) {
+    /// segments taken on each link, whether the turn took a record, and
+    /// whether a ClientHello still waits for a turn.
+    fn pass(&mut self) -> (usize, usize, bool, bool) {
         let t = now();
         let now_ns = cpu::now_ns();
         self.outside.rsts.clear();
@@ -1035,14 +1050,19 @@ impl Tls {
         self.inside_iface.poll_maintenance(t);
         let taken_in = ingress(&mut self.inside_iface, t, &mut in_dev, &mut self.backend_sockets);
         for i in 0..MAX_CONNS {
-            self.serve(i, now_ns);
+            self.serve(i, now_ns, false);
         }
-        self.iface.poll_egress(t, &mut Dev { link: &mut self.outside, audit: &mut self.audit }, &mut self.sockets);
-        self.inside_iface.poll_egress(
-            t,
-            &mut Dev { link: &mut self.inside, audit: &mut self.audit },
-            &mut self.backend_sockets,
-        );
+        // Finished replies, responses and backend SYNs leave before the
+        // turn's sign (R2-F3).
+        let t = self.egress(t);
+        self.notify_sent();
+        let mut consumed = false;
+        if let Some(i) = self.hello_turn() {
+            consumed = self.serve(i, now_ns, true) > 0;
+            self.egress(t);
+        }
+        // Once, after the last egress: the RSTs both egresses dispatched
+        // are in the logs, cleared only at the pass's start (R2-N3).
         for i in 0..MAX_CONNS {
             self.after_egress(i);
         }
@@ -1050,16 +1070,59 @@ impl Tls {
             self.audit.record(Event::KeyUnavailable { code });
             self.audit.halt(reason);
         }
-        (taken_out, taken_in)
+        (taken_out, taken_in, consumed, self.hello_turn().is_some())
     }
 
-    fn serve(&mut self, i: usize, now_ns: u64) {
+    /// Everything due sent on both links, at a fresh time no earlier than
+    /// `after`: a flight sent after a sign is not stamped before it, so
+    /// smoltcp's retransmit timer does not start already expired (R2-F4).
+    /// Returns that time.
+    fn egress(&mut self, after: Instant) -> Instant {
+        let t = now().max(after);
+        self.iface.poll_egress(t, &mut Dev { link: &mut self.outside, audit: &mut self.audit }, &mut self.sockets);
+        self.inside_iface.poll_egress(
+            t,
+            &mut Dev { link: &mut self.inside, audit: &mut self.audit },
+            &mut self.backend_sockets,
+        );
+        t
+    }
+
+    /// `ingress` and `inner` notified of the segments sent to them since
+    /// their last notification.
+    fn notify_sent(&mut self) {
+        if core::mem::take(&mut self.outside.sent) {
+            INGRESS.notify();
+        }
+        if core::mem::take(&mut self.inside.sent) {
+            INNER.notify();
+        }
+    }
+
+    /// The listener whose ClientHello has the hello turn: of the open
+    /// connections awaiting their ClientHello with a complete record
+    /// buffered, the earliest admitted (M6 plan C13).
+    fn hello_turn(&mut self) -> Option<usize> {
+        let mut waiting = [(false, 0u64); MAX_CONNS];
+        for (w, l) in waiting.iter_mut().zip(self.listeners.iter()) {
+            let slot = l.slot.filter(|_| !l.aborting).and_then(|k| self.table.slots.get(k));
+            let Some(slot) = slot else { continue };
+            let Some(since) = slot.handshake_since() else { continue };
+            let client = self.sockets.get_mut::<tcp::Socket>(l.handle);
+            *w = (slot.awaits_hello() && complete_record(client).is_some(), since);
+        }
+        hello_turn(&waiting)
+    }
+
+    /// Listener `i`'s connection for this pass, holding the hello turn or
+    /// not. Returns the client records it took.
+    fn serve(&mut self, i: usize, now_ns: u64, turn: bool) -> usize {
         let Tls {
             sockets, backend_sockets, inside_iface, listeners, table, record, out, rng, audit, sign_us, unavailable, next_port, ..
         } = self;
-        let Some(l) = listeners.get_mut(i) else { return };
+        let Some(l) = listeners.get_mut(i) else { return 0 };
         if l.aborting {
-            return;
+            return 0;
         }
         let client = sockets.get_mut::<tcp::Socket>(l.handle);
         let Some(k) = l.slot else {
@@ -1073,16 +1136,16 @@ impl Tls {
                 }
                 _ => admit(l, client, table, audit, now_ns),
             }
-            return;
+            return 0;
         };
-        let Some(slot) = table.slots.get_mut(k) else { return };
+        let Some(slot) = table.slots.get_mut(k) else { return 0 };
         if client.state() == tcp::State::Established && !l.raised {
             client.set_timeout(Some(IDLE_TIMEOUT));
             l.raised = true;
         }
         let mut signer = KeySigner { sign_us, unavailable };
         let mut ctx = Ctx { cert: config::TLS_CERT, rng, signer: &mut signer };
-        Conn {
+        let mut conn = Conn {
             i,
             l,
             client,
@@ -1095,8 +1158,11 @@ impl Tls {
             ctx: &mut ctx,
             audit,
             now: now_ns,
-        }
-        .serve();
+            turn,
+            taken: 0,
+        };
+        conn.serve();
+        conn.taken
     }
 
     /// After the pass's transmits: an aborted backend socket whose RST was
@@ -1175,8 +1241,8 @@ fn peer_of(ep: IpEndpoint) -> Peer {
     (addr.octets(), ep.port)
 }
 
-/// A connection leaving Listen gets a slot, or is refused (per-source cap)
-/// and aborted like any other.
+/// A connection leaving Listen gets a slot, or is refused (the per-source
+/// cap, every slot taken, or the handshake cap) and aborted like any other.
 fn admit(l: &mut Listener, s: &mut tcp::Socket<'_>, table: &mut Table, audit: &mut Audit, now_ns: u64) {
     let Some(ep) = s.remote_endpoint() else { return };
     l.peer = peer_of(ep);
@@ -1206,18 +1272,16 @@ struct Pass<'a> {
 }
 
 impl ring::pass::Pass for Pass<'_> {
+    /// Another pass is due when an input took its full cap, or when a
+    /// ClientHello waits for the turn after this pass's turn took a record
+    /// (M6 plan C13; check-pins P21).
     fn serve(&mut self) -> bool {
-        let (outside, inside) = self.tls.pass();
-        any_full(&[outside, inside], PASS_PACKETS)
+        let (outside, inside, consumed, waiting) = self.tls.pass();
+        any_full(&[outside, inside], PASS_PACKETS) || tls_core::conn::pass_due(consumed, waiting)
     }
 
     fn end_pass(&mut self) {
-        if core::mem::take(&mut self.tls.outside.sent) {
-            INGRESS.notify();
-        }
-        if core::mem::take(&mut self.tls.inside.sent) {
-            INNER.notify();
-        }
+        self.tls.notify_sent();
         self.tls.audit.flush();
     }
 }

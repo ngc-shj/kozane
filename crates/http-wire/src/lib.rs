@@ -64,9 +64,14 @@ const PROTECTED: [&[u8]; 6] = [
 /// Dropped by `rewrite` besides the fields `Connection` names. `Proxy`
 /// is not hop-by-hop, but CGI-style backends read it as `HTTP_PROXY`
 /// (httpoxy, CVE-2016-5385), so it goes with `Proxy-*`. The client-address
-/// fields CDNs and proxies set (from `Forwarded` on) go too: a backend that
-/// trusts any of them would take the client's word for its address, which
-/// only `X-Forwarded-For` carries (M6 code review S4).
+/// fields CDNs and proxies set (from `Forwarded` on, and Envoy's
+/// `X-Envoy-*`) go too: a backend that trusts any of them would take the
+/// client's word for its address (M6 code review S4).
+///
+/// The trust contract: the backend may trust only the `X-Forwarded-For`
+/// this proxy generates for the client address. These lists are defence in
+/// depth against a backend that reads another field, not the boundary; a
+/// field no list names still reaches the backend.
 const DROPPED: [&[u8]; 15] = [
     b"proxy",
     b"connection",
@@ -84,7 +89,7 @@ const DROPPED: [&[u8]; 15] = [
     b"x-original-forwarded-for",
     b"client-ip",
 ];
-const DROPPED_PREFIXES: [&[u8]; 2] = [b"proxy-", b"x-forwarded-"];
+const DROPPED_PREFIXES: [&[u8]; 3] = [b"proxy-", b"x-forwarded-", b"x-envoy-"];
 
 /// The responses `tls` generates itself (M6 plan C10's audit order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -621,8 +626,8 @@ fn trim_ows(s: &[u8]) -> &[u8] {
 /// Writes the head the backend sees into `out`: the request line verbatim;
 /// the field lines verbatim minus `Connection` and the fields it names,
 /// `Keep-Alive`, `Proxy` and `Proxy-*`, `TE`, `Trailer`, `Upgrade`, `Forwarded`,
-/// `X-Real-IP`, the other client-address fields of `DROPPED` and
-/// `X-Forwarded-*`; then `X-Forwarded-For: <client_ip>`,
+/// `X-Real-IP`, the other client-address fields of `DROPPED`,
+/// `X-Forwarded-*` and `X-Envoy-*`; then `X-Forwarded-For: <client_ip>`,
 /// `X-Forwarded-Proto: https`, `Connection: close` and the blank line.
 /// Returns the length written; `MAX_REWRITE` bytes always suffice.
 pub fn rewrite<const N: usize>(head: &Head<'_, N>, client_ip: [u8; 4], out: &mut [u8]) -> Result<usize, HttpRefusal> {

@@ -503,9 +503,14 @@ walkthroughs are in the Acceptance appendix.
 - `rewrite(head, client_ip, out) -> Result<usize, HttpRefusal>`: request
   line verbatim; hop-by-hop fields dropped (`Connection` and the fields it
   names, `Keep-Alive`, `Proxy-*`, `TE`, `Trailer`, `Upgrade`); `Forwarded`,
-  `X-Real-IP` and every `X-Forwarded-*` dropped, then ours appended
+  `X-Real-IP`, the other client-address fields CDNs and proxies set, every
+  `X-Forwarded-*` and every `X-Envoy-*` dropped, then ours appended
   (`X-Forwarded-For`, `X-Forwarded-Proto: https`) and `Connection: close`;
   output bounded (overflow → 431).
+- Trust contract (external review E1): the backend may trust only the
+  `X-Forwarded-For` this proxy generates for the client address. The drop
+  list is defence in depth against a backend that reads another field; it
+  is not the boundary, and a field no list names reaches the backend.
 - Statuses: 400 (syntax), 413 (`Content-Length` > `MAX_BODY`, decided at
   head time), 417 (`Expect`), 431 (head or rewrite too large), 501
   (method/feature refused); fixed bodies; then close (C10 rules).
@@ -1727,3 +1732,53 @@ happens to it:
   - the stall's attribution, if one is seen;
   - the RST-loss residual;
   - steps 3 and 6 recorded as review-only.
+
+### R2 amendment A1 (2026-10-25, after the HS_CAP measurement; D3 stop resolved by the owner)
+
+**The measurement.** C13 tree, cap inert (`HS_CAP = MAX_CONNS`), gx10 with no solver, 3 runs of `https flood`. All three were *complete* runs: 8 of 8 admitted and completed, and the ordering predicate held.
+
+| Run | Last completion | Largest first-ServerHello gap |
+|---|---|---|
+| 1 | 8.73 s | 1.670 s |
+| 2 | 6.85 s | 0.992 s |
+| 3 | 8.17 s | 1.106 s |
+
+Applying the rule:
+- `L` = 8.73 s, which is above ⅔ · 10 s = 6.67 s.
+- `c` = 1.670 s, so ⌊6.67 / 1.670⌋ = 3.
+- 3 is below the floor of 4, so the locked rule made this a D3 stop.
+
+z1mn's 3 runs, on the same inert-cap tree, are added to `c` when they finish: the rule takes the maximum over all runs.
+
+**Options weighed.**
+- **Re-splitting `pq`'s nominal 0.05 to give `tls` 0.07: not possible.** M3's record (deviation, MCE-COST) shows `pq`'s effective share is about 2 %. Its 0.029 is the nominal need of 8 rekeying peers, not slack. `PQ_HANDSHAKE_COST_NS` (20 s) is the measured maximum at 0.05 plus 25 %. At 0.03 the M3 guarantees break, and the M3b fix scheduled next is about `pq` occupancy.
+- **Taking 0.05 from `data`** cuts the VPN's data-plane budget by a quarter.
+- **Keeping `HS_CAP = 8`** relaxes a locked rule after seeing the data.
+
+**Decision (owner).** `HS_CAP` = 3, the value the rule's formula gives. No budget changes.
+
+The floor of 4 existed only for the ordering predicate's observability (R4-N1), not for the product. So the predicate is redefined so that it holds with 2 or more admitted handshakes:
+- **The new ordering predicate, judged for every consecutive pair** (A1 review: a "some client" form misses a lockstep that runs in two waves).
+  - **Ordering:** the admitted ports are taken in the order their first ServerHello crossed. At least 2 are required.
+  - **A port's Finished:** its first client segment with payload after its first ServerHello, at a sequence number past the end of its ClientHello, so a retransmitted ClientHello does not count.
+  - **Green** when, for every consecutive pair (X, Y), X's Finished crosses before Y's first ServerHello.
+  - **Red**, with the existing needle, when any pair fails, when fewer than 2 admitted ports crossed, or when no first ServerHello crossed at all.
+  - It supersedes the receipt-based predicate in R2's "Probe enforcement".
+- **Why it distinguishes the two cases:**
+  - **Under C13** every consecutive pair has at least one sign between the two flights: one turn per pass, sent at step 4. X's Finished leaves the client milliseconds after X's flight.
+  - **Under the lockstep mutation**, any pass that serves two or more ClientHellos puts their flights into one egress, milliseconds apart, before either client can answer. That breaks the pair. OpenSSL's compat-mode ChangeCipherSpec is sent only after the server's Finished is read, and tls-core accepts it only in AwaitClientFinished, so it cannot come early.
+  - The lockstep could escape only if every hello arrived at least one sign apart from the others. That cannot happen with the probe's simultaneous start, and it would not be a lockstep.
+  - The comparison is milliseconds of RTT against signs of 0.4 s or more, on both sides.
+- **The floor becomes `MAX_PER_SOURCE < HS_CAP ≤ MAX_CONNS`** (compile-time assert, so `HS_CAP ≥ 3`). R2-S6's reason stands. R4-N1's reason is withdrawn, since the new predicate needs only 2.
+  - **Superseded R2 text:** "4 ≤ HS_CAP"; "at least 4 crossings, so at least 3 gaps" (now at least 2 crossings, so at least 1 gap); "a floor of 4 needs `c ≤ 1.67 s`" (a floor of 3 needs `c ≤ 2.22 s`); and the receipt predicate.
+- **Rule changes:**
+  - A computed value below 3, or at or below `MAX_PER_SOURCE`, is the D3 stop. It replaces "below 4".
+  - If z1mn's runs raise `c` above 2.22 s (⌊6.67/c⌋ < 3), this is a D3 stop again and returns to the owner.
+- **The probe with `HS_CAP = 3` and 8 concurrent clients.**
+  - The admitted ports (at least 3) complete.
+  - The rest are refused at admission (refused > 0), with `TlsClosed(HandshakeCap) total=1`.
+  - No `TlsTimeout(Handshake)` occurs.
+  - The final gate runs on this capped tree, 3 times each on gx10 and z1mn (R5-M2).
+- **Selftest.** The test-gate lockstep case keeps its mutation and needle; its red reason is now the new predicate. The unit and pins cases are unchanged.
+- **RM6-7 cost (recorded).** A real-source attacker needs ⌈3/2⌉ = 2 sources to deny new handshakes with idle connects renewed every 10 s. Today that takes 4. Spoofers could already do it (RM6-7).
+- **RM6-8.** 3 concurrent handshakes at `tls` 0.05 under TCG, within ⅔ of the handshake timeout. On hardware the sign costs milliseconds, so the cap's value is a TCG-calibrated bound, recorded as such.

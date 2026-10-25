@@ -1095,6 +1095,21 @@ fn tls_egress_is_refused_at_its_tier_while_data_and_answers_still_pass() {
     assert!(rp_tx_allowed(TxTier::Unsolicited, edge));
 }
 
+/// M6 plan C13 (R2-S4): an abort's bare RST|ACK has no tier of its own; at
+/// the TLS tier's edge it is refused like any other `tls` segment (the
+/// RST-loss residual).
+#[test]
+fn a_bare_rst_ack_is_refused_at_the_tls_tier_edge() {
+    let rst = tcp_packet(CFG.ipv4, PEER_IP, HTTPS, 40000, wire::TCP_RST | wire::TCP_ACK, b"");
+    assert_eq!(tls_egress(&CFG, &rst, NET_BUFFERS / 2 + TLS_TX_SHARE), Err(EgressRefusal::TxReserve));
+}
+
+#[test]
+fn a_bare_rst_ack_is_admitted_one_buffer_above_the_tls_tier_edge() {
+    let rst = tcp_packet(CFG.ipv4, PEER_IP, HTTPS, 40000, wire::TCP_RST | wire::TCP_ACK, b"");
+    assert!(tls_egress(&CFG, &rst, NET_BUFFERS / 2 + TLS_TX_SHARE + 1).is_ok());
+}
+
 #[test]
 fn a_tls_segment_is_never_allowed_where_an_unsolicited_reply_is_refused() {
     for free in 0..=NET_BUFFERS {

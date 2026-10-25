@@ -684,3 +684,15 @@ Everything else checked clean in this round:
 - It touches no other part of R2: the measurement, the probe and the gates are unaffected, because Full and HandshakeCap differ only when no slot is free.
 
 C13 is locked.
+
+## R2 amendment A1 review (2026-10-25, one verifier, all perspectives)
+
+One Major: the "some client's Finished precedes the last first-ServerHello" predicate is fooled by a lockstep that runs in two waves. The mutation serves the hellos complete at each pass start, and a hello arriving a few ms late splits the batch. The fix judges every consecutive pair by first-ServerHello order. A port's Finished is its first client payload past the end of its ClientHello.
+
+Checked clean:
+- **CCS.** OpenSSL's compat CCS follows the server Finished, and tls-core accepts it only in AwaitClientFinished.
+- **The sniffer data.** It supports the predicate; one new field is needed.
+- **HS_CAP=3 against the other cases.** All of them complete their handshakes one at a time.
+- **No security regression** beyond RM6-7.
+
+Stale R2 text and the conn.rs assert are noted as superseded in A1. Resolved in A1; no Critical or Major finding remains open.

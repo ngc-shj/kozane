@@ -61,8 +61,17 @@ pub enum BackendEnd {
 /// same ingress batch takes it before the PD's pass looks, so the state
 /// alone misses that the slot's peer is gone (M6 code review F1). A
 /// socket with no peer outside Closed and Listen counts as left.
-pub fn client_left<P: PartialEq>(closed_or_listen: bool, current: Option<P>, admitted: P) -> bool {
-    closed_or_listen || current != Some(admitted)
+///
+/// `peer` is the admitted peer: it is compared before it is retargeted to
+/// the socket's current peer, so that the abort's RST to that peer is the
+/// one awaited. Compared after, a socket carrying another peer would look
+/// unchanged.
+pub fn client_left_retarget<P: PartialEq + Copy>(closed_or_listen: bool, current: Option<P>, peer: &mut P) -> bool {
+    let gone = closed_or_listen || current != Some(*peer);
+    if let Some(current) = current {
+        *peer = current;
+    }
+    gone
 }
 
 /// The backend's end, decided only once its receive queue is empty: a FIN
@@ -240,13 +249,11 @@ impl Slot {
 
     /// The PD could not carry out what it was asked (a send that did not
     /// fit): abort, also when the unsent bytes were the close_notify or
-    /// alert of a slot already draining or lingering.
+    /// alert of a slot already draining or lingering. Such a slot's close
+    /// cause was audited when it closed, so its abort adds no outcome.
     pub fn error(&mut self, now: u64) -> Next {
         self.driven(|slot, next| match slot.phase {
-            Phase::Draining { .. } | Phase::Lingering { .. } => {
-                next.action = slot.abort();
-                next.outcomes.push(Outcome::TlsClosed(Closed::Error));
-            }
+            Phase::Draining { .. } | Phase::Lingering { .. } => next.action = slot.abort(),
             _ => slot.end(CloseCause::Error, Closed::Error, now, next),
         })
     }

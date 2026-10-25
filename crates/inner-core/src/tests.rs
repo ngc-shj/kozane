@@ -450,3 +450,20 @@ fn tls_segment_one_buffer_above_its_tier_leaves() {
     let edge = INNER_TX_RESERVE + TLS_TX_SHARE_INSIDE;
     assert!(matches!(from_tls(&CFG, &to_backend(TLS_START), edge + 1, &mut [0u8; MAX_FRAME]), FromTls::Emitted(_)));
 }
+
+/// Code review round 2 (S-N2): a backend abort's bare RST|ACK has no tier
+/// of its own; at the inside tier's edge it is refused like any other
+/// `tls` segment and not resent (the inside RST-loss residual).
+#[test]
+fn a_bare_rst_ack_is_refused_at_the_inside_tier_edge() {
+    let rst = tcp(GW_IP, TLS_START, HOST_IP, BACKEND_PORT, wire::TCP_RST | wire::TCP_ACK);
+    let edge = INNER_TX_RESERVE + TLS_TX_SHARE_INSIDE;
+    assert_eq!(from_tls(&CFG, &rst, edge, &mut [0u8; MAX_FRAME]), FromTls::TxReserve);
+}
+
+#[test]
+fn a_bare_rst_ack_leaves_one_buffer_above_the_inside_tier_edge() {
+    let rst = tcp(GW_IP, TLS_START, HOST_IP, BACKEND_PORT, wire::TCP_RST | wire::TCP_ACK);
+    let edge = INNER_TX_RESERVE + TLS_TX_SHARE_INSIDE;
+    assert!(matches!(from_tls(&CFG, &rst, edge + 1, &mut [0u8; MAX_FRAME]), FromTls::Emitted(_)));
+}

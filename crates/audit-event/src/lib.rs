@@ -108,8 +108,17 @@ pub const TLS_REFUSED_NAMES: [&str; 32] = [
     "Closed",
 ];
 /// `tls_core::conn::Closed`'s variants, by code.
-pub const TLS_CLOSED_NAMES: [&str; 8] =
-    ["BackendFin", "SelfResponse", "BackendRst", "ClientClosed", "Error", "SlotsFull", "PerSource", "PeerReset"];
+pub const TLS_CLOSED_NAMES: [&str; 9] = [
+    "BackendFin",
+    "SelfResponse",
+    "BackendRst",
+    "ClientClosed",
+    "Error",
+    "SlotsFull",
+    "PerSource",
+    "PeerReset",
+    "HandshakeCap",
+];
 /// `http_wire::Status` by index: the status codes.
 pub const HTTP_REFUSED_NAMES: [&str; 5] = ["400", "413", "417", "431", "501"];
 /// `tls_core::conn::Timeout`'s variants, by stage.

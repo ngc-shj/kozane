@@ -1,5 +1,6 @@
-//! Connection slots (M6 plan C8, C10): admission with the per-source cap,
-//! the stage timers on an injected clock, close sequencing, and the wipe.
+//! Connection slots (M6 plan C8, C10, C13): admission with the per-source
+//! and handshake caps, the hello turn, the stage timers on an injected
+//! clock, close sequencing, and the wipe.
 //! The PD wires smoltcp and the rings to this; every decision about when a
 //! connection's secrets go and when its sockets may be released is here.
 //!
@@ -25,17 +26,26 @@
 
 use tls_wire::Refusal;
 
-use crate::handshake::{Buffers, Ctx, Event, RX_BUF_LEN, Session, Signer, Step, TX_BUF_LEN};
+use crate::handshake::{Buffers, Ctx, Event, RX_BUF_LEN, Session, Signer, State, Step, TX_BUF_LEN};
 use crate::rng::Rng;
 use crate::wipe;
 
 mod proxy;
 
-pub use proxy::{BACKEND_CHUNK, BAD_GATEWAY, BackendEnd, MAX_CLIENT_OUT, Next, Outcome, Outcomes, backend_end, client_left};
+pub use proxy::{BACKEND_CHUNK, BAD_GATEWAY, BackendEnd, MAX_CLIENT_OUT, Next, Outcome, Outcomes, backend_end, client_left_retarget};
 
 pub const MAX_CONNS: usize = 8;
 /// Connections one source address may hold (S17).
 pub const MAX_PER_SOURCE: usize = 2;
+/// Connections in the Handshake stage at once (M6 plan C13): it bounds the
+/// signing work queued ahead of the last admitted handshake. 3 is the
+/// value C13's measurement gives (R2 amendment A1, RM6-8): a TCG-calibrated
+/// bound, at `tls`'s 0.05, within two thirds of the handshake timeout.
+pub const HS_CAP: usize = 3;
+// Above MAX_PER_SOURCE, so one source cannot hold every handshake place
+// (R2-S6); at most MAX_CONNS, where it is inert. The former floor of 4
+// (R4-N1, the receipt predicate) is withdrawn by A1.
+const _: () = assert!(MAX_PER_SOURCE < HS_CAP && HS_CAP <= MAX_CONNS);
 
 const NS_PER_SEC: u64 = 1_000_000_000;
 pub const HANDSHAKE_TIMEOUT_NS: u64 = 10 * NS_PER_SEC;
@@ -97,6 +107,9 @@ pub enum AdmitRefusal {
     Full,
     /// The source already holds [`MAX_PER_SOURCE`] connections.
     PerSource,
+    /// A slot is free, but the cap's number of connections are in the
+    /// Handshake stage ([`HS_CAP`]).
+    HandshakeCap,
 }
 
 /// What the PD does next for a slot.
@@ -141,11 +154,12 @@ pub enum Closed {
     SlotsFull,
     PerSource,
     PeerReset,
+    HandshakeCap,
 }
 
 impl Closed {
     /// Every variant, in code order.
-    pub const ALL: [Closed; 8] = [
+    pub const ALL: [Closed; 9] = [
         Self::BackendFin,
         Self::SelfResponse,
         Self::BackendRst,
@@ -154,6 +168,7 @@ impl Closed {
         Self::SlotsFull,
         Self::PerSource,
         Self::PeerReset,
+        Self::HandshakeCap,
     ];
 
     pub const fn code(self) -> u16 {
@@ -171,6 +186,7 @@ impl Closed {
             Self::SlotsFull => "SlotsFull",
             Self::PerSource => "PerSource",
             Self::PeerReset => "PeerReset",
+            Self::HandshakeCap => "HandshakeCap",
         }
     }
 }
@@ -192,6 +208,7 @@ impl From<AdmitRefusal> for Closed {
         match r {
             AdmitRefusal::Full => Self::SlotsFull,
             AdmitRefusal::PerSource => Self::PerSource,
+            AdmitRefusal::HandshakeCap => Self::HandshakeCap,
         }
     }
 }
@@ -326,6 +343,22 @@ impl Slot {
 
     pub fn source(&self) -> [u8; 4] {
         self.source
+    }
+
+    /// When the Handshake stage began (the admission), while in it.
+    pub fn handshake_since(&self) -> Option<u64> {
+        match self.phase {
+            Phase::Open { stage: Stage::Handshake, since } => Some(since),
+            _ => None,
+        }
+    }
+
+    /// The connection is open and its session still waits for (the rest
+    /// of) the ClientHello: the PD holds its records back outside its turn
+    /// (M6 plan C13). Free and reset slots' sessions also sit in
+    /// `AwaitClientHello`, hence the stage.
+    pub fn awaits_hello(&self) -> bool {
+        self.handshake_since().is_some() && self.session.state() == State::AwaitClientHello
     }
 
     pub(crate) fn open(&mut self, source: [u8; 4], now: u64) {
@@ -581,15 +614,25 @@ impl Table {
         Self { slots: core::array::from_fn(|_| Slot::new()) }
     }
 
+    /// A slot for a new connection from `source`, under [`HS_CAP`].
+    pub fn admit(&mut self, source: [u8; 4], now: u64) -> Result<usize, AdmitRefusal> {
+        self.admit_with_cap(source, now, HS_CAP)
+    }
+
     /// A slot for a new connection from `source`: at most
     /// [`MAX_PER_SOURCE`] per source (slots still closing count), at most
-    /// [`MAX_CONNS`] in all.
-    pub fn admit(&mut self, source: [u8; 4], now: u64) -> Result<usize, AdmitRefusal> {
+    /// [`MAX_CONNS`] in all, at most `cap` in the Handshake stage. Refused
+    /// in that order: `HandshakeCap` only when a slot is free (M6 plan C13).
+    pub fn admit_with_cap(&mut self, source: [u8; 4], now: u64, cap: usize) -> Result<usize, AdmitRefusal> {
         let held = self.slots.iter().filter(|s| !s.is_free() && s.source == source).count();
         if held >= MAX_PER_SOURCE {
             return Err(AdmitRefusal::PerSource);
         }
+        let in_handshake = self.slots.iter().filter(|s| s.stage() == Some(Stage::Handshake)).count();
         let (i, slot) = self.slots.iter_mut().enumerate().find(|(_, s)| s.is_free()).ok_or(AdmitRefusal::Full)?;
+        if in_handshake >= cap {
+            return Err(AdmitRefusal::HandshakeCap);
+        }
         slot.open(source, now);
         Ok(i)
     }
@@ -605,6 +648,24 @@ impl Table {
         slot.phase = Phase::Aborting { client: RstWait::new(true) };
         Some(i)
     }
+}
+
+/// The hello turn (M6 plan C13): of the connections whose ClientHello has a
+/// complete record waiting (`(eligible, since)` per slot, `since` its
+/// admission), the earliest admitted, so the earliest handshake deadline;
+/// on a tie the lowest index in `waiting`, which the PD fills by listener
+/// index (not slot index). One per pass: a pass computes at most one
+/// server flight, and a later admission never passes an earlier one.
+pub fn hello_turn(waiting: &[(bool, u64)]) -> Option<usize> {
+    waiting.iter().enumerate().filter(|(_, w)| w.0).min_by_key(|(i, w)| (w.1, *i)).map(|(i, _)| i)
+}
+
+/// Another pass is due at once for the hello turn: this pass's turn
+/// consumed a record and a ClientHello still waits for its turn, so it
+/// needs no unrelated wakeup. Each such pass consumes a record of a finite
+/// receive buffer.
+pub fn pass_due(consumed: bool, waiting: bool) -> bool {
+    consumed && waiting
 }
 
 /// The static per-connection state the PD holds (C10, F18), checked

@@ -648,11 +648,14 @@ fn per_source_cap_admits_two_and_another_source_still_gets_a_slot() {
     });
 }
 
+/// Each admitted slot is moved past the handshake, so the handshake cap
+/// (whatever its value) refuses none of them.
 #[test]
 fn table_is_full_at_max_conns() {
     with_table(|t| {
         for i in 0..MAX_CONNS {
-            t.admit([10, 0, 1, u8::try_from(i / 2).unwrap()], 0).unwrap();
+            let k = t.admit([10, 0, 1, u8::try_from(i / 2).unwrap()], 0).unwrap();
+            t.slots[k].advance(0);
         }
         assert_eq!(t.admit([10, 9, 9, 9], 0), Err(AdmitRefusal::Full));
     });
@@ -918,7 +921,8 @@ fn a_refused_connection_whose_rst_never_goes_out_is_released_after_pass_8() {
 fn refuse_finds_no_slot_in_a_full_table() {
     with_table(|t| {
         for i in 0..MAX_CONNS {
-            t.admit([10, 0, 1, u8::try_from(i).unwrap()], 0).unwrap();
+            let k = t.admit([10, 0, 1, u8::try_from(i).unwrap()], 0).unwrap();
+            t.slots[k].advance(0);
         }
         assert_eq!(t.refuse(), None);
     });
@@ -937,6 +941,181 @@ fn closed_and_timeout_codes_are_their_index_and_names_their_variants() {
     assert!(Closed::ALL.len() <= 32 && Timeout::ALL.len() <= 32);
     assert_eq!(Closed::from(CloseCause::SelfResponse), Closed::SelfResponse);
     assert_eq!(Closed::from(AdmitRefusal::PerSource), Closed::PerSource);
+    assert_eq!(Closed::from(AdmitRefusal::HandshakeCap), Closed::HandshakeCap);
+}
+
+// ---------------------------------------------------------------- C13: the hello turn and the handshake cap
+
+#[test]
+fn awaits_hello_from_admission_through_a_split_hello() {
+    let mut s = slot_at(0, 0);
+    assert!(s.awaits_hello());
+    let mut client = Client::new(8);
+    let mut out = vec![0u8; 16 * 1024];
+    let mut ctx = Ctx { cert: CERT, rng: &mut CountingRng::new(1), signer: &mut TestSigner { calls: 0 } };
+    let ch = client.client_hello(Offer::default());
+    let first = s.on_record(&record(ContentType::Handshake, &ch[..700]), &mut out, &mut ctx, S).unwrap();
+    assert_eq!(first.event, Event::None);
+    assert!(s.awaits_hello(), "after the first fragment");
+    let step = s.on_record(&record(ContentType::Handshake, &ch[700..]), &mut out, &mut ctx, S).unwrap();
+    assert_eq!(step.event, Event::Flight);
+    assert!(!s.awaits_hello(), "after the whole hello");
+}
+
+/// Free and reset slots' sessions sit in AwaitClientHello too.
+#[test]
+fn free_and_reset_slots_do_not_await_a_hello() {
+    with_table(|t| {
+        assert!(!t.slots[0].awaits_hello(), "free");
+        let refused = t.refuse().unwrap();
+        assert!(!t.slots[refused].awaits_hello(), "refused at admission");
+        let k = t.admit(A, 0).unwrap();
+        t.slots[k].close(CloseCause::Error, &mut [], 1);
+        assert!(!t.slots[k].awaits_hello(), "aborted");
+        assert_eq!(t.slots[k].handshake_since(), None);
+    });
+}
+
+/// `(eligible, since)` per slot, as the PD builds it, with every complete
+/// record buffered: the turn over the table.
+fn turn_of(t: &Table) -> Option<usize> {
+    let waiting: Vec<(bool, u64)> =
+        t.slots.iter().map(|s| (s.awaits_hello(), s.handshake_since().unwrap_or(u64::MAX))).collect();
+    hello_turn(&waiting)
+}
+
+#[test]
+fn the_turn_goes_to_the_earlier_admission_in_either_index_order() {
+    assert_eq!(hello_turn(&[(true, 2 * S), (true, S)]), Some(1));
+    assert_eq!(hello_turn(&[(true, S), (true, 2 * S)]), Some(0));
+}
+
+#[test]
+fn the_turn_breaks_a_tie_by_the_lowest_index() {
+    assert_eq!(hello_turn(&[(false, 0), (true, S), (true, S), (true, 2 * S)]), Some(1));
+}
+
+/// A slot without a complete record (a slowloris partial) is not eligible,
+/// however early it was admitted.
+#[test]
+fn the_turn_skips_a_slot_without_a_complete_record() {
+    assert_eq!(hello_turn(&[(false, 0), (true, 5 * S)]), Some(1));
+    assert_eq!(hello_turn(&[(false, 0), (false, S)]), None);
+}
+
+/// Re-arrival (R2-F2): slot 0 is re-armed with a newer admission every
+/// pass; slot 7, admitted before, gets the turn first, and slot 0 after it.
+#[test]
+fn an_older_handshake_gets_the_turn_before_a_re_armed_lower_slot() {
+    with_table(|t| {
+        t.slots[7].open(B, 0);
+        for pass in 1..=3 {
+            t.slots[0].open(A, pass * S);
+            assert_eq!(turn_of(t), Some(7), "pass {pass}");
+        }
+        t.slots[7].advance(4 * S);
+        assert_eq!(turn_of(t), Some(0));
+    });
+}
+
+#[test]
+fn a_pass_is_due_when_the_turn_consumed_a_record_and_a_hello_waits() {
+    assert!(pass_due(true, true));
+}
+
+#[test]
+fn no_pass_is_due_when_nothing_waits_or_the_turn_consumed_nothing() {
+    assert!(!pass_due(true, false));
+    assert!(!pass_due(false, true));
+    assert!(!pass_due(false, false));
+}
+
+/// `n` slots admitted from distinct sources, all in the Handshake stage.
+fn in_handshake(t: &mut Table, n: usize) {
+    for i in 0..n {
+        t.admit_with_cap([10, 0, 1, u8::try_from(i).unwrap()], 0, MAX_CONNS).unwrap();
+    }
+}
+
+#[test]
+fn the_handshake_cap_refuses_an_admission_at_cap() {
+    with_table(|t| {
+        in_handshake(t, 4);
+        assert_eq!(t.admit_with_cap(B, S, 4), Err(AdmitRefusal::HandshakeCap));
+    });
+}
+
+/// `Table::admit` applies `HS_CAP` itself (code review round 2, T-N2):
+/// with `HS_CAP` slots in Handshake and a free slot (`HS_CAP < MAX_CONNS`;
+/// at `MAX_CONNS` the refusal would be Full), a new source is refused
+/// `HandshakeCap`.
+#[test]
+fn admit_refuses_at_hs_cap_slots_in_handshake() {
+    with_table(|t| {
+        for i in 0..HS_CAP {
+            t.admit([10, 0, 1, u8::try_from(i).unwrap()], 0).unwrap();
+        }
+        assert_eq!(t.admit(B, S), Err(AdmitRefusal::HandshakeCap));
+    });
+}
+
+#[test]
+fn the_handshake_cap_admits_at_cap_minus_one() {
+    with_table(|t| {
+        in_handshake(t, 3);
+        assert!(t.admit_with_cap(B, S, 4).is_ok());
+    });
+}
+
+#[test]
+fn a_slot_leaving_the_handshake_frees_a_place_under_the_cap() {
+    with_table(|t| {
+        in_handshake(t, 4);
+        t.slots[0].advance(S);
+        assert!(t.admit_with_cap(B, S, 4).is_ok());
+    });
+}
+
+/// With no free slot the refusal is Full, also with `cap` in the Handshake
+/// stage (R6-M1).
+#[test]
+fn a_table_with_no_free_slot_refuses_full_before_the_cap() {
+    with_table(|t| {
+        in_handshake(t, MAX_CONNS);
+        assert_eq!(t.admit_with_cap(B, S, 4), Err(AdmitRefusal::Full));
+    });
+}
+
+#[test]
+fn the_per_source_cap_is_refused_before_the_handshake_cap() {
+    with_table(|t| {
+        t.admit_with_cap(A, 0, MAX_CONNS).unwrap();
+        t.admit_with_cap(A, 0, MAX_CONNS).unwrap();
+        in_handshake(t, 2);
+        assert_eq!(t.admit_with_cap(A, S, 4), Err(AdmitRefusal::PerSource));
+    });
+}
+
+/// At `MAX_CONNS` the cap is inert: every refusal is Full or PerSource.
+#[test]
+fn the_handshake_cap_at_max_conns_never_refuses() {
+    with_table(|t| {
+        for i in 0..MAX_CONNS {
+            assert!(t.admit_with_cap([10, 0, 1, u8::try_from(i).unwrap()], 0, MAX_CONNS).is_ok(), "admission {i}");
+        }
+        assert_eq!(t.admit_with_cap(B, S, MAX_CONNS), Err(AdmitRefusal::Full));
+    });
+}
+
+/// C13 holds hellos back but leaves the timer alone: a slot admitted and
+/// still in the Handshake stage times out 10 s after its admission.
+#[test]
+fn an_admitted_handshake_times_out_10_s_after_admission() {
+    with_table(|t| {
+        let k = t.admit(A, 3 * S).unwrap();
+        assert_eq!(t.slots[k].tick(3 * S + HANDSHAKE_TIMEOUT_NS - 1), (Action::None, None));
+        assert_eq!(t.slots[k].tick(3 * S + HANDSHAKE_TIMEOUT_NS), (Action::Abort, Some(Timeout::Handshake)));
+    });
 }
 
 #[test]
@@ -1312,21 +1491,23 @@ fn lifetime_ends_a_streaming_connection_with_its_backend() {
 }
 
 /// A send that did not fit aborts a slot whose close_notify (or alert) it
-/// carried, rather than leaving it to linger.
+/// carried, rather than leaving it to linger. The close was audited when
+/// it happened, so the abort adds no second TlsClosed.
 #[test]
 fn an_error_aborts_a_draining_or_lingering_slot() {
     let (mut s, _, mut out) = streaming();
     pump(&mut s, &mut Vec::new(), usize::MAX, 4 * S);
     s.backend_fin(&mut out, 5 * S);
     let next = s.error(5 * S);
-    assert_eq!((next.action, outcomes(&next)), (Action::Abort, vec![Outcome::TlsClosed(Closed::Error)]));
+    assert_eq!((next.action, outcomes(&next)), (Action::Abort, vec![]));
     assert!(s.is_zeroized());
 
     let (mut s, _, mut out) = streaming();
     pump(&mut s, &mut Vec::new(), usize::MAX, 4 * S);
     s.backend_fin(&mut out, 5 * S);
     assert_eq!(s.drained(6 * S), Action::None);
-    assert_eq!(s.error(6 * S).action, Action::Abort);
+    let next = s.error(6 * S);
+    assert_eq!((next.action, outcomes(&next)), (Action::Abort, vec![]));
 }
 
 #[test]
@@ -1358,11 +1539,30 @@ fn backend_end_waits_for_the_receive_queue_to_drain() {
 /// and port) keeps it.
 #[test]
 fn client_left_when_the_socket_carries_another_peer() {
-    use crate::conn::client_left;
+    use crate::conn::client_left_retarget;
     let a = ([10, 0, 2, 78], 52000);
-    assert!(!client_left(false, Some(a), a));
-    assert!(client_left(false, Some(([10, 0, 2, 79], 52001)), a));
-    assert!(client_left(false, Some(([10, 0, 2, 78], 52001)), a));
-    assert!(client_left(false, None, a));
-    assert!(client_left(true, Some(a), a));
+    let left = |closed_or_listen, current| {
+        let mut peer = a;
+        client_left_retarget(closed_or_listen, current, &mut peer)
+    };
+    assert!(!left(false, Some(a)));
+    assert!(left(false, Some(([10, 0, 2, 79], 52001))));
+    assert!(left(false, Some(([10, 0, 2, 78], 52001))));
+    assert!(left(false, None));
+    assert!(left(true, Some(a)));
+}
+
+/// Code review round 2 (T-N5): the socket's peer is compared with the
+/// admitted peer before the retarget, and the retarget then follows the
+/// socket, so the abort's RST is awaited from the peer that took it.
+#[test]
+fn client_left_compares_the_old_peer_then_retargets() {
+    use crate::conn::client_left_retarget;
+    let (a, b) = (([10, 0, 2, 78], 52000), ([10, 0, 2, 78], 52001));
+    let mut peer = a;
+    assert!(client_left_retarget(false, Some(b), &mut peer));
+    assert_eq!(peer, b);
+    let mut peer = a;
+    assert!(client_left_retarget(true, None, &mut peer));
+    assert_eq!(peer, a);
 }

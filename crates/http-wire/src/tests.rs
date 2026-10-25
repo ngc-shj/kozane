@@ -577,6 +577,18 @@ fn rewrite_keeps_a_custom_field_that_only_resembles_a_client_address_field() {
     assert_eq!(rewritten(&req(fields), [192, 0, 2, 7]), expected.as_bytes());
 }
 
+/// Envoy's fields (external review E1): X-Envoy-External-Address is
+/// dropped, and the ordinary custom field beside it passes byte for byte.
+#[test]
+fn rewrite_drops_an_x_envoy_field_and_keeps_a_custom_field() {
+    let kept = "X-Custom: value\r\n";
+    let with = req(&std::format!("X-Envoy-External-Address: 127.0.0.1\r\n{kept}"));
+    let expected = std::format!(
+        "GET / HTTP/1.1\r\nHost: example.com\r\n{kept}X-Forwarded-For: 192.0.2.7\r\nX-Forwarded-Proto: https\r\nConnection: close\r\n\r\n"
+    );
+    assert_eq!(rewritten(&with, [192, 0, 2, 7]), expected.as_bytes());
+}
+
 #[test]
 fn rewrite_passes_ordinary_fields_unchanged() {
     let fields = "User-Agent: curl/8.11.1\r\nX-Custom:\tvalue  \r\nCookie: a=b; c=d\r\nX-Forwarded: kept\r\nProxyish: kept\r\n";

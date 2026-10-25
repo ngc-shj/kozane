@@ -159,7 +159,7 @@ CASES_FOR_GATE = {
     "clean-counts": {"stale-counts", "check-propagation"},
     # pins runs the package checker fixtures; package-debug drives the real target.
     "pins": {"pins", "package-debug", "package-waiver", "package-waiver-removed", "mkcert-constraints",
-             "l14-constructor", "l14-codepoint", "finished-ct-eq"},
+             "l14-constructor", "l14-codepoint", "finished-ct-eq", "c13-pass-due-pin"},
     "lint": {"lint"},
     "audit": {"audit"},
     "lint-pds": {"lint-pds", "tls-audit-names"},
@@ -179,7 +179,8 @@ CASES_FOR_GATE = {
              "c9-te-refusal", "c9-duplicate-cl", "c9-connection-names-cl", "c9-xff-strip", "c9-body-413",
              "c4-inner-src", "c4-inner-port-range", "c4-tln-dst-ip", "c4-tln-dst-port", "c4-tln-src-port-range",
              "proxy-truncation-rst", "proxy-early-client-fin", "proxy-413-no-connect", "proxy-connect-timeout-wipe", "proxy-fin-drain", "rst-inherit",
-             "conn-per-source-cap", "c2-tcp-offset", "c2-tls-egress-syn", "s1-inner-tls-tier"},
+             "conn-per-source-cap", "c2-tcp-offset", "c2-tls-egress-syn", "s1-inner-tls-tier",
+             "c13-turn-earliest", "c13-pass-due", "c13-hs-cap", "c13-admit-hs-cap"},
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
     "ct": {"ct-barrier", "ct-c1-barrier", "ct-harness-unit", "ct-harness-lint", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms",
@@ -200,7 +201,7 @@ CASES_FOR_GATE = {
              "integration-expiry", "rp-cookie-gate", "integration-expiry-residue",
              "tls-key-halt", "c8-head-wipe", "tls-scalar-scrub", "https-probe-canary", "tlskey-wipe",
              "proxy-pd-backend-room", "proxy-pd-backend-rst", "https-syn-flood", "https-per-source-cap",
-             "https-recycle-abort", "residue-wipe-state"},
+             "https-recycle-abort", "residue-wipe-state", "https-hello-lockstep"},
     "repro": {"repro-path-leak"},
     "mir": {"mir-target-split", "mir-env-split", "mir-debug-split", "mir-feature-split"},
     "manifest": {"manifest"},
@@ -1032,7 +1033,7 @@ CASES = {
                                                         "PROTECTED.iter().any(", "PROTECTED.iter().skip(1).any("),
                                "---- tests::connection_naming_a_protected_field_is_refused stdout ----"),
     "c9-xff-strip": (["unit"], lambda t: edit(t, "crates/http-wire/src/lib.rs",
-                                              'b"proxy-", b"x-forwarded-"]', 'b"proxy-", b"proxy-"]'),
+                                              'b"proxy-", b"x-forwarded-", ', 'b"proxy-", b"proxy-", '),
                      "---- tests::rewrite_drops_hop_by_hop_and_forwarding_fields_exactly stdout ----"),
     "c9-body-413": (["unit"], lambda t: edit(t, "crates/http-wire/src/lib.rs",
                                              "if head.content_length > MAX_BODY {",
@@ -1280,8 +1281,8 @@ CASES = {
     # slot. Red-proved where the decision lives: whether the two segments
     # share a batch under QEMU is timing, so the boot case cannot be.
     "rst-inherit": (["unit"], lambda t: edit(t, "crates/tls-core/src/conn/proxy.rs",
-                                             "    closed_or_listen || current != Some(admitted)\n",
-                                             "    let _ = (current, admitted);\n    closed_or_listen\n"),
+                                             "    let gone = closed_or_listen || current != Some(*peer);\n",
+                                             "    let gone = closed_or_listen;\n"),
                     "---- tests::client_left_when_the_socket_carries_another_peer stdout ----"),
     # C8's drop-time wipe (code review T3): without Secret's zeroize on
     # drop, a dropped secret stays in memory. The ct gate's `exchange`
@@ -1317,6 +1318,34 @@ CASES = {
         t, "crates/pds/tls/src/main.rs", "    l.rst_due = s.remote_endpoint().is_some();\n    s.abort();\n",
         "    l.rst_due = s.remote_endpoint().is_some();\n    s.close();\n"),
                             "the server's abort: no RST from the server to port"),
+    # M6 plan C13 (Re-plan R2): the hello turn goes to the earliest
+    # admission (rotation or index order lets the oldest expire), another
+    # pass follows while a hello waits, and the handshake cap refuses.
+    "c13-turn-earliest": (["unit"], lambda t: edit(t, "crates/tls-core/src/conn.rs",
+                                                   ".min_by_key(|(i, w)| (w.1, *i))", ".min_by_key(|(i, _)| *i)"),
+                          "---- tests::an_older_handshake_gets_the_turn_before_a_re_armed_lower_slot stdout ----"),
+    "c13-pass-due": (["unit"], lambda t: edit(t, "crates/tls-core/src/conn.rs", "    consumed && waiting\n",
+                                              "    let _ = (consumed, waiting);\n    false\n"),
+                     "---- tests::a_pass_is_due_when_the_turn_consumed_a_record_and_a_hello_waits stdout ----"),
+    "c13-hs-cap": (["unit"], lambda t: edit(t, "crates/tls-core/src/conn.rs", "        if in_handshake >= cap {",
+                                            "        if false {"),
+                   "---- tests::the_handshake_cap_refuses_an_admission_at_cap stdout ----"),
+    # Code review round 2 (T-N2): `admit` itself applies HS_CAP; the
+    # cap tests above pass their cap to admit_with_cap.
+    "c13-admit-hs-cap": (["unit"], lambda t: edit(t, "crates/tls-core/src/conn.rs",
+                                                  "        self.admit_with_cap(source, now, HS_CAP)\n",
+                                                  "        self.admit_with_cap(source, now, MAX_CONNS)\n"),
+                         "---- tests::admit_refuses_at_hs_cap_slots_in_handshake stdout ----"),
+    "c13-pass-due-pin": (["pins"], lambda t: edit(t, "crates/pds/tls/src/main.rs",
+                                                  " || tls_core::conn::pass_due(consumed, waiting)", ""),
+                         "P21 crates/pds/tls/src/main.rs"),
+    # The lockstep (R2's root cause): every waiting ClientHello served in
+    # step 2, so a pass computes all its flights before any leaves; the
+    # probe's first-judged ordering predicate names it.
+    "https-hello-lockstep": (["test", "it_boots=https flood"], lambda t: edit(
+        t, "crates/pds/tls/src/main.rs", "            if self.slot.awaits_hello() && !self.turn {\n",
+        "            if false {\n"),
+                             "https concurrent probe: a server flight left before the previous client's Finished"),
     # The probe canary (T-R3-8): its bound against the measured handshakes.
     "https-probe-canary": (["test", "it_boots=https"], lambda t: edit(t, "tests/integration/run.py",
                                                                      'limit = rust_const(TLS_CONN, "HANDSHAKE_TIMEOUT_NS") / NS / 3\n',

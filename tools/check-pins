@@ -83,7 +83,19 @@ Rules:
      crates/tls-core/src/hybrid.rs (its definition and the RNG-drawing
      shim), tls-core's unit tests (src/tests.rs) and tools/ct-harness/,
      plus tls-core's `pub use hybrid::{..}` re-export (M6 code review S2):
-     production randomness comes only through `HybridSecret::exchange`
+     production randomness comes only through `HybridSecret::exchange`;
+     likewise `hello_keys`, public only for the ct-harness, named only in
+     crates/tls-core/src/handshake.rs and tools/ct-harness/ (external
+     review E2); neither may be imported or re-exported under an alias
+     (`.. as name`) anywhere, the re-export included (code review round 2,
+     S-N3)
+  P21 the hello turn's next pass (M6 plan C13): in
+     crates/pds/tls/src/main.rs, `impl ring::pass::Pass for Pass` exists and
+     its `fn serve` returns `any_full(..) || tls_core::conn::pass_due(..)`,
+     pass_due's two arguments exactly the last two identifiers its one
+     `let (.., consumed, waiting) = self.tls.pass();` destructures, so a
+     ClientHello waiting for its turn gets another pass without an
+     unrelated wakeup
 
 Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
 fail until they are removed from PENDING; --enforce-pending makes them fail
@@ -102,7 +114,11 @@ that gate made to fail.
 P6 is a fail-closed binding check (Cargo.lock against
 policy/waivers.toml).
 P20 is a tripwire over names: a dependency re-exporting the function under
-another name escapes it.
+another name escapes it, and so does an alias spelled other than
+`name as other` (a `type` or `fn` wrapper).
+P21 is a fail-closed check of one expression's shape: it reads the tail
+expression only, so a `return` earlier in the body escapes it (the review
+of the pass order is the adjudicating control).
 P7-P11 and P19 are best-effort tripwires over source text; P19's known
 bypasses: a code point computed (`0x10 + 13`), built from bytes out of
 order, read from configuration, or spelled in a dependency. L14's
@@ -136,7 +152,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P18",
-         "P19", "P20"]
+         "P19", "P20", "P21"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
                "crates/tls-core", "crates/tlskey-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data",
@@ -178,6 +194,11 @@ CODE_POINT_CRATE = "crates/tls-core"
 # re-export of it.
 EXCHANGE_ALLOWED = ("crates/tls-core/src/hybrid.rs", "crates/tls-core/src/tests.rs", "tools/ct-harness/")
 EXCHANGE_REEXPORT = "crates/tls-core/src/lib.rs"
+# P20: where `hello_keys` (pub for the ct-harness only) may be named.
+HELLO_KEYS_ALLOWED = ("crates/tls-core/src/handshake.rs", "tools/ct-harness/")
+# P21: the file, the impl and the function whose return the rule pins.
+PASS_FILE = "crates/pds/tls/src/main.rs"
+PASS_IMPL = r"\bimpl\s+ring\s*::\s*pass\s*::\s*Pass\s+for\s+Pass\b"
 
 
 def run_blocks(dockerfile: str):
@@ -452,16 +473,106 @@ def check_hybrid_constructors(root: pathlib.Path, out: list):
 def check_exchange_callers(root: pathlib.Path, out: list):
     for top in ("crates", "tools"):
         for rel, text in crate_sources(root, top):
-            if not rel.endswith(".rs") or rel.startswith(EXCHANGE_ALLOWED):
+            if not rel.endswith(".rs"):
                 continue
+            exchange, hello = not rel.startswith(EXCHANGE_ALLOWED), not rel.startswith(HELLO_KEYS_ALLOWED)
             code = strip_rust_comments(text)
+            line = lambda pos: code.count("\n", 0, pos) + 1
+            # An alias would carry either name past the name rule, so none
+            # is allowed, in the allowed files and the re-export too.
+            for m in re.finditer(r"\b(exchange_with_randomness|hello_keys)\s+as\b", code):
+                out.append(f"P20 {rel}:{line(m.start())}: {m.group(1)} imported or re-exported under an alias; "
+                           "the rule follows its name only (S-N3)")
+            if not (exchange or hello):
+                continue
             unterminated("P20", rel, code, out)
+            if hello:
+                for m in re.finditer(r"\bhello_keys\b", code):
+                    out.append(f"P20 {rel}:{line(m.start())}: hello_keys named outside handshake.rs and "
+                               "tools/ct-harness; it is public for the ct-harness only (E2)")
+            if not exchange:
+                continue
             if rel == EXCHANGE_REEXPORT:
-                code = re.sub(r"\bpub\s+use\s+hybrid::\{[^}]*\}\s*;", lambda m: re.sub(r"[^\n]", " ", m.group(0)), code)
+                # Only the re-exported name itself is exempt, not the block.
+                code = re.sub(r"\bpub\s+use\s+hybrid::\{[^}]*\}\s*;",
+                              lambda m: re.sub(r"\bexchange_with_randomness\b(?!\s+as\b)", " " * len(HYBRID_ROOT),
+                                               m.group(0)), code)
             for m in re.finditer(r"\bexchange_with_randomness\b", code):
-                n = code.count("\n", 0, m.start()) + 1
-                out.append(f"P20 {rel}:{n}: exchange_with_randomness named outside hybrid.rs, tls-core's tests and "
-                           "tools/ct-harness; randomness comes through HybridSecret::exchange (S2)")
+                out.append(f"P20 {rel}:{line(m.start())}: exchange_with_randomness named outside hybrid.rs, tls-core's "
+                           "tests and tools/ct-harness; randomness comes through HybridSecret::exchange (S2)")
+
+
+def balanced_call(text: str, pos: int, name: str):
+    """The end of the call `name(..)` starting at `pos` (whitespace before
+    it skipped), its parentheses balanced; None if `name(` is not there."""
+    m = re.compile(rf"\s*{name}\s*\(").match(text, pos)
+    if not m:
+        return None
+    depth = 1
+    for i in range(m.end(), len(text)):
+        if text[i] == "(":
+            depth += 1
+        elif text[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return None
+
+
+def check_pass_due(root: pathlib.Path, out: list):
+    path = root / PASS_FILE
+    if not path.is_file():
+        if (root / "crates/pds/tls").is_dir():
+            out.append(f"P21 {PASS_FILE}: missing; the hello turn's next pass has nothing to check")
+        return
+    code = strip_rust_comments(path.read_text())
+    unterminated("P21", PASS_FILE, code, out)
+    m = re.search(PASS_IMPL, code)
+    start = code.find("{", m.end()) if m else -1
+    if start < 0:
+        out.append(f"P21 {PASS_FILE}: no `impl ring::pass::Pass for Pass`; the rule has nothing to anchor on")
+        return
+    depth, end = 0, len(code)
+    for i in range(start, len(code)):
+        depth += {"{": 1, "}": -1}.get(code[i], 0)
+        if depth == 0:
+            end = i + 1
+            break
+    block = code[start:end]
+    span = body_span(block, "serve")
+    if span is None:
+        out.append(f"P21 {PASS_FILE}: no `fn serve` in `impl ring::pass::Pass for Pass`")
+        return
+    body = block[span[0] + 1:span[1] - 1]
+    # The tail expression: after the last statement or item at the body's
+    # own depth.
+    depth, tail = 0, 0
+    for i, c in enumerate(body):
+        if c in "({[":
+            depth += 1
+        elif c in ")}]":
+            depth -= 1
+            if depth == 0 and c == "}":
+                tail = i + 1
+        elif c == ";" and depth == 0:
+            tail = i + 1
+    tail_code = body[tail:]
+    first = balanced_call(tail_code, 0, "any_full")
+    op = re.compile(r"\s*\|\|").match(tail_code, first) if first is not None else None
+    second = balanced_call(tail_code, op.end(), r"tls_core\s*::\s*conn\s*::\s*pass_due") if op else None
+    n = code.count("\n", 0, m.start()) + 1
+    if second is None or tail_code[second:].strip():
+        out.append(f"P21 {PASS_FILE}:{n}: Pass::serve must return any_full(..) || tls_core::conn::pass_due(..), "
+                   "so a waiting ClientHello gets the next pass (C13)")
+        return
+    # pass_due's arguments: the turn's record count and the turn at the
+    # pass's end, as `Tls::pass` returned them, not a constant (T-N4).
+    lets = re.findall(r"\blet\s*\(\s*\w+\s*,\s*\w+\s*,\s*(\w+)\s*,\s*(\w+)\s*\)\s*=\s*self\s*\.\s*tls\s*\.\s*pass\s*\(\s*\)\s*;",
+                      body[:tail])
+    args = re.sub(r"\s", "", tail_code[tail_code.index("(", op.end()) + 1:second - 1])
+    if len(lets) != 1 or args != ",".join(lets[0]):
+        out.append(f"P21 {PASS_FILE}:{n}: pass_due's arguments must be the (consumed, waiting) destructured "
+                   "from the one `self.tls.pass()` in Pass::serve (C13)")
 
 
 # P19: classical groups (RFC 8446 section 4.2.7, RFC 8734, RFC 7919) as
@@ -781,6 +892,7 @@ def main() -> int:
     check_hybrid_constructors(root, out)
     check_classical_groups(root, out)
     check_exchange_callers(root, out)
+    check_pass_due(root, out)
     failing = [l for l in out if l.split()[0] not in pending]
     for line in out:
         print(line if line in failing else f"pending {line}")

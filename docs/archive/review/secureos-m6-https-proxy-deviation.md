@@ -1037,13 +1037,18 @@ red-proved on a throwaway copy; `test`-gate cases are written but unrun.
   is rewritten. Integration case `https rst inherit` (residue boot, after
   slowloris so its PeerReset line is the boot's first, total=1): SYN from
   10.0.2.78:52000 answered, then its RST (seq ISN + 1) and a SYN from
-  10.0.2.79:52001 in one burst; wants a RST to 52001, TlsClosed(PeerReset)
-  and no backend connection. If the two segments were taken in different
-  passes the case fails naming whether p2 got a SYN-ACK. Selftest
-  `https-rst-inherit` (endpoint check removed).
+  10.0.2.79:52001 back to back; wants TlsClosed(PeerReset) for p1's slot
+  and no backend connection, whichever batching QEMU gave: one batch, p2 is
+  aborted (a RST to it); two, p2 is a fresh admission the case resets.
+  Selftest `rst-inherit`, unit gate (the endpoint comparison removed; red:
+  `client_left_when_the_socket_carries_another_peer`), since the batching
+  is timing. *(Updated in round 2: this text first described a test-gate
+  `https-rst-inherit` and a case that failed on two passes; the
+  check-and-retarget is now one tls-core function, `client_left_retarget`.)*
 - **F2.** `Slot::error` on a Draining or Lingering slot (the unsent bytes
-  were its close_notify or alert) aborts it, with TlsClosed(Error), instead
-  of doing nothing until the linger or idle bound.
+  were its close_notify or alert) aborts it instead of doing nothing until
+  the linger or idle bound. *(Round 2, F-N1: no second TlsClosed; the close
+  cause was audited when the slot closed.)*
 - **F3.** A ClientHello with more than `MAX_EXTENSIONS` extensions is
   `Refusal::Decode`, not `DuplicateExtension`.
 - **F4.** Stale `key`/`TlsKeyMismatch`/128 KiB references now name `tlskey`,
@@ -1090,9 +1095,12 @@ red-proved on a throwaway copy; `test`-gate cases are written but unrun.
   options/payload `get` refusals made lenient, so the named test reddens)
   and `c2-tls-egress-syn` (tls_egress's bare-SYN refusal removed).
 - **T3.** Selftest `residue-secret-drop` (`Secret`'s drop-time zeroize
-  removed) and `residue-wipe-state` (the read/write traffic secret wipes in
-  `wipe_state` removed), both on the residue boot, needles only the scan's
-  absence failure prints; the live controls are asserted first.
+  removed; ct gate, the `exchange` residue case's kem-ss and x-ss hits,
+  which see it before the residue boot could) and `residue-wipe-state` (the
+  read/write traffic secret wipes in `wipe_state` removed; the https
+  residue boot), needles only the failure prints; the live controls are
+  asserted first. *(Updated in round 2: both were first described as
+  residue-boot cases.)*
 - **T4.** A failed slowloris connect names the SYNs that crossed the tap,
   the gateway's answers, the sniffer's drops and the TcpLimited/TlsClosed
   audits since boot; no retry or wait.
@@ -1153,3 +1161,280 @@ it then failed in the https boot on the T9 change, recorded under T9.
 These rp and cookie cases are timing-sensitive (M3b). Integration runs
 therefore share a host with no solver. Before a run, the host's process
 list is checked for cbmc, kani-gate and cargo-kani.
+
+## Re-plan R2: C13 implementation
+
+Re-plan R2 (plan, "Re-plan R2") as built at 906ffc8 plus this change.
+Gates run by the implementer: make pins/lint/lint-pds/unit/laws/image/ct/
+ct-shape/bolero/mir. Not run: Kani, Verus, make test/check, check-selftest.
+`HS_CAP` is `MAX_CONNS`, the plan's inert measurement value; the
+measurement, the value and RM6-8's record follow from the orchestrator's
+runs.
+
+- **tls-core::conn.** `HS_CAP` (`= MAX_CONNS`, asserted
+  `4 ≤ HS_CAP ≤ MAX_CONNS` and above `MAX_PER_SOURCE`).
+  `Table::admit_with_cap(source, now, cap)` refuses `PerSource`, then
+  `Full`, then `HandshakeCap` (a free slot withheld); `Table::admit` calls
+  it with `HS_CAP`. `AdmitRefusal::HandshakeCap` maps to
+  `Closed::HandshakeCap`, code 8, appended so the earlier codes keep their
+  values; audit-event's `TLS_CLOSED_NAMES` gains its name, and the PD's
+  `names_match` and audit-event's per-kind loop cover it unchanged.
+  `Slot::handshake_since` (the admission while in Handshake) and
+  `Slot::awaits_hello` (Open{Handshake} with the session in
+  `AwaitClientHello`). `hello_turn(&[(eligible, since)])` picks the
+  smallest `since`, then the lowest index; `pass_due(consumed, waiting)`.
+- **pds/tls.** `Tls::pass` in C13's order: ingress; every connection
+  served with `turn = false`, `Conn::proxy` breaking before `take_record`
+  while the slot `awaits_hello` (the one deferral point; timers, gone
+  detection, FIN handling and records past the hello run as before);
+  `egress` on both links, then `notify_sent` (`mem::take` of each link's
+  `sent`, the helper `end_pass` also uses); the turn, the listener whose
+  slot awaits its hello with `complete_record` true, earliest `since`,
+  served with `turn = true` (it takes every complete record of its hello
+  in that serve), then a second egress; `after_egress` and
+  `halt::after_sign` once, after the last egress. `Pass::serve` returns
+  `any_full(..) || tls_core::conn::pass_due(consumed, waiting)`, where
+  `consumed` is the turn's record count above zero and `waiting` is the
+  turn recomputed at the pass's end. Each egress takes `now().max(previous)`.
+  The experiment copy's per-connection egress is not carried over (R2-F4,
+  T2).
+- **Review-only (plan C13 steps 3 and 6).** Egress before the turn and a
+  fresh, non-decreasing `now()` per egress have no unit or pins control:
+  their effect is timing on the wire, which only the integration probe
+  observes, and neither is the probe's ordering predicate on its own.
+- **check-pins P21.** In crates/pds/tls/src/main.rs, `impl ring::pass::Pass
+  for Pass` must exist and its `fn serve`'s tail expression must be
+  exactly `any_full(..) || tls_core::conn::pass_due(..)` (balanced calls,
+  nothing after). Missing file, missing impl or missing `fn serve` fail
+  closed. Fixtures: `&&` for `||`, the term dropped, the impl renamed away
+  (deny); the return split over lines around a comment (allow). The
+  existing "pds/tls's main removed" fixture now also expects P21.
+  CHECK-PINS-RULES 19 → 20.
+- **Selftest.** Unit gate: `c13-turn-earliest` (the turn by index only;
+  red: the re-arrival test), `c13-pass-due` (forced false; red: the allow
+  test), `c13-hs-cap` (the cap check removed; red: the cap-at-cap test).
+  Pins gate: `c13-pass-due-pin` (`|| pass_due(..)` removed from the real
+  main.rs; needle `P21 crates/pds/tls/src/main.rs`). Test gate:
+  `https-hello-lockstep` (the deferral removed, so step 2 serves every
+  hello; needle the ordering predicate's). `c9-xff-strip`'s anchor follows
+  the prefix list's new third entry.
+- **Integration (`https flood`).** The concurrent probe takes `backend`;
+  each client sends `X-Probe: <port>`; `BackendConn` records its first
+  chunk's `time.monotonic()`. Per port from the sniffer: the SYN, the first
+  ServerHello (server seq = ISN + 1, payload `16 03 03 .. .. 02`), the
+  first server RST and whether server payload preceded it. The times are
+  printed first on both paths; diagnosis lines (phase, segments, backend
+  receipt) only for an admitted port that did not complete. Verdicts in
+  order: the ordering predicate; no TCP connection; an admitted port
+  without a flight; an admitted port not completing; admitted ≥
+  min(`HS_CAP`, conns); refused only when conns > `HS_CAP`; no
+  `TlsTimeout(Handshake)`; `TlsClosed(HandshakeCap) total=1` iff a refusal
+  was counted; every port's release RST. `rust_usize` resolves a constant
+  defined as another constant of the same file (`HS_CAP = MAX_CONNS`).
+  Case 12's hello flood counts a `HandshakeCap` refusal as "ended" (its
+  docstring says so); the probe precedes it, so it is the boot's first
+  `HandshakeCap` producer. INTEGRATION-CASES stays 77.
+- **Unit tests made cap-independent.** `table_is_full_at_max_conns` and
+  `refuse_finds_no_slot_in_a_full_table` move each admitted slot past the
+  handshake, so a measured `HS_CAP < MAX_CONNS` does not turn their
+  admissions into `HandshakeCap` refusals.
+- **RST loss at the outside TX tier (residual, R2-S4).** No RST exemption:
+  a RST that `ingress` drops at the TLS tier is not resent, since `tls`
+  counts it dispatched once it reached `tli`. Equivalent to a RST lost in
+  the network: a client with data outstanding retransmits and is reset by
+  the re-armed listener; only a client idly waiting on a connection being
+  aborted waits for its own timeout. Pinned by the ingress-core pair: a
+  bare RST|ACK refused at `tx_free == TX_RESERVE + TLS_TX_SHARE`, admitted
+  one above. The tiers and the I8 proofs are unchanged.
+- **RM6-7, what the cap costs** (open while `HS_CAP < MAX_CONNS`; inert at
+  `MAX_CONNS`):
+  - a real-source attacker needs only ⌈`HS_CAP`/`MAX_PER_SOURCE`⌉ sources,
+    not ⌈`MAX_CONNS`/2⌉, to deny all new handshakes with idle connects
+    renewed every 10 s;
+  - a refusal burst holds free slots in Aborting for up to
+    `MAX_RST_PASSES` passes.
+- **E1 (external review).** `rewrite` drops `X-Envoy-*`
+  (`DROPPED_PREFIXES` gains `x-envoy-`); unit test: an
+  X-Envoy-External-Address field is dropped and a custom field beside it
+  passes byte for byte. The `DROPPED` doc comment and plan C9 state the
+  trust contract: the backend may trust only the proxy-generated
+  X-Forwarded-For for the client address; the drop lists are defence in
+  depth, not the boundary. The rewrite Kani harness's prefix loop grows
+  from 2 to 3 (unrun here).
+- **E2 (external review).** P20 also restricts `hello_keys` (pub for the
+  ct-harness) to crates/tls-core/src/handshake.rs and tools/ct-harness/;
+  tls-core's tests may not name it. Fixtures: a call in pds/tls and an
+  import in tls-core's tests (deny); the harness and a comment (allow).
+- **Counts.** UNIT-TESTS 1219 → 1237, UNIT-TLS-CORE 98 → 113 (15:
+  awaits_hello 2, the turn 4, pass_due 2, the cap 6, the tick regression
+  1), UNIT-INGRESS-CORE 133 → 135, UNIT-HTTP-WIRE 67 → 68,
+  CHECK-PINS-RULES 19 → 20, CHECK-PINS-FIXTURES 262 → 269 (P21 4, E2 3).
+  UNIT-AUDIT-EVENT stays 49 (its completeness loop iterates the name
+  table). INTEGRATION-CASES stays 77.
+- **Red-proofs.** `c13-turn-earliest`, `c13-pass-due`, `c13-hs-cap`,
+  `c13-pass-due-pin` and `c9-xff-strip` (new anchor) were red-proved on a
+  throwaway copy: their gate failed, the needle was printed, and it is
+  absent from the green run's build/counts logs. `https-hello-lockstep`
+  needs a QEMU red-proof; only its anchor was checked here.
+
+### R2 amendment A1: `HS_CAP` = 3 and the pair predicate
+
+Plan, "R2 amendment A1". It supersedes the inert value, the floor of 4 and
+the receipt predicate above; the rest of this section stands.
+
+- **The measurement** (C13 tree, cap inert, gx10 with no solver, 3 runs of
+  `https flood`). All three *complete*: 8 of 8 admitted and completed, the
+  receipt predicate held.
+
+  | Run | Last completion | Largest first-ServerHello gap |
+  |---|---|---|
+  | 1 | 8.73 s | 1.670 s |
+  | 2 | 6.85 s | 0.992 s |
+  | 3 | 8.17 s | 1.106 s |
+
+  `L` = 8.73 s > ⅔ · 10 s; `c` = 1.670 s, ⌊6.67 / 1.670⌋ = 3. Below the
+  then floor of 4, a D3 stop; the owner took 3 with no budget change.
+  z1mn's 3 inert-cap runs join `c` when they finish; `c` above 2.22 s
+  (⌊6.67/c⌋ < 3) is a D3 stop again.
+- **tls-core::conn.** `HS_CAP = 3`, asserted
+  `MAX_PER_SOURCE < HS_CAP && HS_CAP <= MAX_CONNS`: R2-S6's reason (one
+  source cannot hold every handshake place) stands, R4-N1's (the receipt
+  predicate's observability) is withdrawn. No unit test changes: the cap
+  tests pass an explicit cap to `admit_with_cap`, the table-fill tests
+  advance each slot past Handshake, and the other `admit` callers hold at
+  most two slots in Handshake.
+- **The ordering predicate** (concurrent probe, judged first). Per admitted
+  port from the sniffer: its first ServerHello as before, and its Finished,
+  the first client segment with payload after that ServerHello at a
+  sequence number at or past the end of the client payload that crossed
+  before it (the ClientHello, in however many segments; a retransmitted
+  ClientHello segment lies below it, sequence numbers taken relative to
+  the client's first payload byte). The admitted ports with a first
+  ServerHello, in crossing order: green iff at least 2 crossed and, for
+  every consecutive pair (X, Y), X's Finished crossed before Y's first
+  ServerHello. Red otherwise, with the needle renamed to "https concurrent
+  probe: a server flight left before the previous client's Finished"
+  (check-selftest's `https-hello-lockstep` follows; the PASS line does not
+  contain it). Backend receipt times are printed as recorded data only.
+  Each port's Finished time is printed with its other times. With 8
+  clients over `HS_CAP` 3, refused > 0 is now expected, with
+  `TlsClosed(HandshakeCap) total=1`.
+- **RM6-7, the cost now open.** A real-source attacker needs ⌈3/2⌉ = 2
+  sources to deny new handshakes with idle connects renewed every 10 s
+  (4 at `MAX_CONNS`); spoofers could already (RM6-7).
+- **RM6-8.** 3 concurrent handshakes at `tls` 0.05 under TCG, within ⅔ of
+  the handshake timeout. On hardware the sign costs milliseconds, so
+  `HS_CAP` = 3 is a TCG-calibrated bound, recorded as such.
+- **Counts.** None change (no test or rule added). The final gate is the
+  capped tree, 3 runs each on gx10 and z1mn (R5-M2); `https-hello-lockstep`
+  still needs its QEMU red-proof.
+
+#### A1: z1mn's measurement runs (inert cap, no solver)
+
+| Run | Admitted / flights | Failed port | Largest first-ServerHello gap | Classification |
+|---|---|---|---|---|
+| 1 | 8 / 7 | 1, no flight, `TlsTimeout(Handshake)` | 1.799 s (gaps 1.42–1.80) | capacity |
+| 2 | 8 / 7 | 1, no flight, `TlsTimeout(Handshake)` | 1.659 s (gaps 1.21–1.66) | capacity |
+| 3 | 8 / 7 | 1, no flight, `TlsTimeout(Handshake)` | 1.605 s (gaps 1.42–1.61) | capacity |
+
+In each run the port that timed out was the last in the queue and never got its turn. Its gaps were even, all within twice the median. That is queueing, not a stall.
+
+Over all six runs:
+- c = 1.799 s (z1mn run 1);
+- L = ∞, because capacity runs occurred;
+- `HS_CAP` = ⌊6.67 / 1.799⌋ = 3;
+- c ≤ 2.22 s, so this is no D3 stop and 3 stands.
+
+The runs also show directly that eight concurrent handshakes at `tls` 0.05 under TCG cannot all complete within the handshake timeout.
+
+## Phase 3 round 2 fixes
+
+Code review round 2 (code-review file, "Review round: 2") on the C13 + A1
+working tree. Gates run: make pins/lint/lint-pds/unit/laws/ct. Not run:
+Kani, Verus, make test/check, run.py/QEMU, check-selftest.
+
+- **T-N1, the probe's connect refusals.** A `HandshakeCap` refusal is a
+  RST before the SYN-ACK, so the client's connect fails with
+  ConnectionRefusedError; the probe recorded it with port 0 and failed
+  "got no TCP connection" (3 of 3 runs on gx10). The bound port is now kept
+  on a failed connect (only a failed `socket()`/`bind` has none), the port
+  is classified from its tap segments as before (refused: a server RST, no
+  server payload before it, RST − SYN below the handshake timeout), and
+  ConnectionRefusedError is accepted only for a port so classified; any
+  other connect failure, or a refused connect the tap does not show as a
+  refusal, still fails "got no TCP connection". The release loop awaits
+  real ports and skips refused ones (their RST was the refusal).
+- **T-N2, the refusal is required.** With conns > `HS_CAP` the probe fails
+  when nothing was refused, and checks refused = conns − admitted with
+  admitted counted from completed exchanges. tls-core test
+  `admit_refuses_at_hs_cap_slots_in_handshake`: `Table::admit` itself (not
+  `admit_with_cap`) refuses `HandshakeCap` with `HS_CAP` slots in Handshake
+  and a slot free. Unit-gate selftest `c13-admit-hs-cap` (`admit` passes
+  `MAX_CONNS`; red: that test).
+- **T-N3.** Fewer than 2 admitted ports with a first ServerHello fails with
+  its own message; the lockstep needle is raised only for a failing pair
+  and now carries the pair's ports, X's Finished time and Y's first
+  ServerHello time after it. This splits A1's "red with the existing
+  needle when fewer than 2 crossed": that case is still red, under its own
+  message. `https-hello-lockstep`'s needle is the message's unchanged
+  prefix.
+- **T-N4, P21's arguments.** P21 also requires pass_due's arguments to be
+  exactly the last two identifiers of the one
+  `let (.., consumed, waiting) = self.tls.pass();` before the tail. Deny
+  fixture: `pass_due(consumed, true)`.
+- **T-N5, F1 in one function.** `client_left(closed_or_listen, current,
+  admitted)` plus the PD's retarget become
+  `tls_core::conn::client_left_retarget(closed_or_listen, current, &mut
+  peer) -> bool`: gone is computed against the old peer, then `peer` follows
+  the socket's current peer. Test
+  `client_left_compares_the_old_peer_then_retargets` (a comparison after
+  the retarget would return false for another peer). `rst-inherit`'s anchor
+  follows the function (red-proved again). The round 1 entries above that
+  described a test-gate `https-rst-inherit`, an integration case failing on
+  two passes and `residue-secret-drop` on the residue boot are corrected in
+  place.
+- **F-N1.** `Slot::error` on a Draining/Lingering slot still aborts it but
+  pushes no outcome: its close cause was audited when it closed, so a
+  second TlsClosed(Error) would count one connection twice.
+  `an_error_aborts_a_draining_or_lingering_slot` expects no outcome in both
+  phases.
+- **F-N2, the turn's tie-break.** `hello_turn` breaks ties by the index in
+  its input, which `Tls::hello_turn` fills by listener index; the plan's
+  C13 says slot index. Ties need equal admission times (one pass's
+  `now_ns`), and either order is a fixed, admission-independent rule, so
+  the plan stays as locked and this note records the built form;
+  `conn::hello_turn`'s doc says so.
+- **S-N1, RM6-7/RM6-8: a fragmented ClientHello holds the turn.** The
+  turn goes to the earliest admission with a complete record waiting, and
+  the holder takes every complete record of its hello. An early-admitted
+  connection sending its ClientHello as 1-byte handshake fragments, one
+  record per segment, has a complete record waiting in every pass, so it
+  keeps the turn while no flight is computed, and later hellos wait. Bounded
+  by `MAX_HANDSHAKE` (8 KiB, so at most 8192 fragments) and the global TCP
+  data meter (10 000 segments/s): about 1 s per connection, about 2 s per
+  source (`MAX_PER_SOURCE` = 2), within the connection's handshake timeout.
+  That time comes out of the ⅔-of-timeout margin RM6-8 measured for honest
+  handshakes. Recorded, not changed: under RM6-7 and RM6-8, an attacker
+  slows handshakes for a bounded time.
+- **S-N2, inside RST loss (residual, next to R2-S4's outside one).** A
+  backend abort's bare RST that `inner` refuses at the inside tier
+  (`TxReserve`) is not resent: `tls` counts it sent once it reached `tli`.
+  The backend then holds a half-open connection until its own timeout, as
+  after a RST lost on the LAN; the slot is released as before. Pinned by
+  the inner-core pair: a bare RST|ACK from `tls` refused at
+  `INNER_TX_RESERVE + TLS_TX_SHARE_INSIDE`, emitted one above.
+- **S-N3, P20 aliases.** The lib.rs re-export exempts only the exact
+  `exchange_with_randomness` token (not followed by `as`), no longer the
+  whole `pub use hybrid::{..}`; `exchange_with_randomness as ..` and
+  `hello_keys as ..` are flagged in every .rs file under crates/ and
+  tools/, the allowed files included. Deny fixtures: the re-export aliased
+  in tls-core's lib, `hello_keys as hk` in the ct-harness. Each of the
+  three new fixtures was run against the checker without the change: no
+  P20/P21 line.
+- **Counts.** UNIT-TESTS 1237 → 1241, UNIT-TLS-CORE 113 → 115,
+  UNIT-INNER-CORE 45 → 47, CHECK-PINS-FIXTURES 269 → 272.
+  CHECK-PINS-RULES stays 20, INTEGRATION-CASES stays 77.
+- **Red-proofs.** `c13-admit-hs-cap` and `rst-inherit` (new anchor) on a
+  throwaway full copy under build/, `make unit` only: both failed with their needle printed; the needles are
+  absent from the green run's build/counts/unit.log.
+  The probe changes (T-N1–T-N3) need the QEMU runs.
