@@ -147,9 +147,9 @@ pub fn seal_cookie_reply(
 
 /// The CookieReply nonce for the `counter`-th reply under `secret`: never
 /// repeated under one secret, and unpredictable without it. Local to the
-/// responder (upstream draws a random one), so it carries a secureos label.
+/// responder (upstream draws a random one), so it carries a kozane label.
 pub fn reply_nonce(secret: &Secret<COOKIE_SECRET_LEN>, counter: u64) -> [u8; XNONCE_LEN] {
-    let full = Shake::root().mix(b"secureos cookie reply nonce").mix(secret.expose()).mix(&counter.to_le_bytes()).0;
+    let full = Shake::root().mix(b"kozane cookie reply nonce").mix(secret.expose()).mix(&counter.to_le_bytes()).0;
     let mut n = [0u8; XNONCE_LEN];
     if let Some(head) = full.first_chunk::<XNONCE_LEN>() {
         n = *head;

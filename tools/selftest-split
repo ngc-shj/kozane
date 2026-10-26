@@ -16,7 +16,7 @@ Makefile (prerequisites and `$(MAKE)` recipe calls), first match wins:
   rest    everything else, round-robin over N instances    parallel
 Every instance is one check-selftest run with its own TMPDIR, so its own
 warm tree and lock. qemu and pds hold a host-wide lock while they run:
-both build into $(HOME)/.cache/secureos.
+both build into $(HOME)/.cache/kozane.
 
 On another host: check out the same commit, `pack` on the `make check` host,
 copy the tar over and `run <partition> --inputs <tar>` (build/counts and the
@@ -50,8 +50,8 @@ INPUTS = ("counts", "kani-cache", "verus-cache")
 # Outside the checkout, like check-selftest's own scratch dir (cargo would
 # merge the checkout's .cargo/config.toml into the copy's), and kept, so
 # each instance's warm tree stays warm across runs.
-WORK = pathlib.Path(tempfile.gettempdir()) / "secureos-selftest-split"
-PD_LOCK = pathlib.Path.home() / ".cache/secureos/selftest-split-pd.lock"
+WORK = pathlib.Path(tempfile.gettempdir()) / "kozane-selftest-split"
+PD_LOCK = pathlib.Path.home() / ".cache/kozane/selftest-split-pd.lock"
 
 
 def load_selftest():

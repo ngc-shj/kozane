@@ -1,8 +1,8 @@
 """tools/kani-guarded and tools/kani-harness (post-M6 plan P4(c), T14).
 
-No real Kani or cbmc runs: SECUREOS_KANI_GATE points both tools at a stub
+No real Kani or cbmc runs: KOZANE_KANI_GATE points both tools at a stub
 gate, and the "cbmc" it starts is a script on PATH that execs python3 with
-argv[0] "cbmc-fixture-<pid>" (SECUREOS_KANI_CBMC), allocates a few MiB and
+argv[0] "cbmc-fixture-<pid>" (KOZANE_KANI_CBMC), allocates a few MiB and
 blocks. The RSS decision is
 checked against fixture /proc trees; the live cases prove the guard's own
 message, the timeout's group kill and the --exact pass-through, each with
@@ -66,7 +66,7 @@ esac
 
 CBMC = r"""#!/bin/bash
 echo $$ > "$FAKE_DIR/cbmc.pid"
-exec -a "$SECUREOS_KANI_CBMC" python3 -c '
+exec -a "$KOZANE_KANI_CBMC" python3 -c '
 import os, sys, time
 block = b"\x01" * (int(os.environ["FAKE_MIB"]) << 20)
 time.sleep(float(os.environ["FAKE_HOLD_S"]))
@@ -114,8 +114,8 @@ def stub_env(d: pathlib.Path, mode: str, mib: int = 4, hold: float = 60) -> dict
     for name, text in (("gate", GATE), ("cbmc", CBMC)):
         (d / name).write_text(text)
         (d / name).chmod(0o755)
-    return {**os.environ, "SECUREOS_KANI_GATE": str(d / "gate"), "PATH": f"{d}:{os.environ['PATH']}",
-            "SECUREOS_KANI_CBMC": FAKE_CBMC, "FAKE_DIR": str(d), "FAKE_MODE": mode, "FAKE_MIB": str(mib), "FAKE_HOLD_S": str(hold)}
+    return {**os.environ, "KOZANE_KANI_GATE": str(d / "gate"), "PATH": f"{d}:{os.environ['PATH']}",
+            "KOZANE_KANI_CBMC": FAKE_CBMC, "FAKE_DIR": str(d), "FAKE_MODE": mode, "FAKE_MIB": str(mib), "FAKE_HOLD_S": str(hold)}
 
 
 def run(cmd: list, env: dict) -> subprocess.CompletedProcess:

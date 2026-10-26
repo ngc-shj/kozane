@@ -16,8 +16,8 @@ root=$(cd "$(dirname "$0")/.." && pwd)
 cd "$root"
 # The whole run holds the proof lock (tools/proof-lock): one Kani or
 # Verus run at a time in this container.
-if [ -z "${SECUREOS_PROOF_LOCKED:-}" ]; then
-    exec tools/proof-lock env SECUREOS_PROOF_LOCKED=1 "$0" "$@"
+if [ -z "${KOZANE_PROOF_LOCKED:-}" ]; then
+    exec tools/proof-lock env KOZANE_PROOF_LOCKED=1 "$0" "$@"
 fi
 if [ $# -ne 2 ] || [ "$1" != "-p" ]; then
     echo "usage: verus-gate.sh -p <crate>" >&2

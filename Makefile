@@ -18,7 +18,7 @@ endif
 
 sdk_config_dir := $(MICROKIT_SDK)/board/$(MICROKIT_BOARD)/$(MICROKIT_CONFIG)
 target := aarch64-sel4-microkit
-system := system/secureos.system
+system := system/kozane.system
 policy := policy/laws.toml
 loader := $(BUILD)/loader.img
 counts := $(BUILD)/counts
@@ -47,7 +47,7 @@ pds:
 # local ThinLTO names promoted symbols with a hash of the absolute output
 # path, so the image is reproducible from any tree path only if this does
 # not move (M5 plan C3, tools/repro). Source paths are remapped below.
-pd_target ?= $(HOME)/.cache/secureos/pd-target-$(MICROKIT_CONFIG)
+pd_target ?= $(HOME)/.cache/kozane/pd-target-$(MICROKIT_CONFIG)
 
 .PHONY: print-pd-target
 print-pd-target:
@@ -55,7 +55,7 @@ print-pd-target:
 
 define build_pd
 SEL4_INCLUDE_DIRS=$(abspath $(sdk_config_dir)/include) \
-	RUSTFLAGS="-Zunstable-options --remap-path-prefix=$(CURDIR)=/secureos" \
+	RUSTFLAGS="-Zunstable-options --remap-path-prefix=$(CURDIR)=/kozane" \
 	cargo build --locked \
 		-Z build-std=core,alloc,compiler_builtins \
 		-Z build-std-features=compiler-builtins-mem \
@@ -341,7 +341,7 @@ pins: release-tool | $(counts)
 # prints INTEGRATION-CASES-PARTIAL, which this grep does not take.
 it_boots :=
 test: ct uboot | $(counts)
-	SECUREOS_IT_BOOTS="$(it_boots)" python3 tests/integration/run.py > $(counts)/test.log 2>&1 \
+	KOZANE_IT_BOOTS="$(it_boots)" python3 tests/integration/run.py > $(counts)/test.log 2>&1 \
 		|| { tail -40 $(counts)/test.log; exit 1; }
 	grep '^INTEGRATION-CASES ' $(counts)/test.log > $(counts)/test
 
@@ -357,15 +357,15 @@ uboot_measure := $(BUILD)/u-boot-measure/u-boot.bin
 .PHONY: uboot
 uboot: $(uboot) $(uboot_measure)
 
-$(BUILD)/u-boot-%/u-boot.bin: support/u-boot/secureos.config support/u-boot/boot.cmd tools/uboot-config $(uboot_tarball)
+$(BUILD)/u-boot-%/u-boot.bin: support/u-boot/kozane.config support/u-boot/boot.cmd tools/uboot-config $(uboot_tarball)
 	rm -rf $(BUILD)/u-boot-$*
 	mkdir -p $(BUILD)/u-boot-$*
 	tar -xjf $(uboot_tarball) -C $(BUILD)/u-boot-$* --strip-components=1
-	tools/uboot-config $* $(BUILD)/u-boot-$*/secureos.frag
+	tools/uboot-config $* $(BUILD)/u-boot-$*/kozane.frag
 	env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/u-boot-$* qemu_arm64_defconfig > $(BUILD)/u-boot-$*.log 2>&1
-	cd $(BUILD)/u-boot-$* && scripts/kconfig/merge_config.sh -m .config secureos.frag >> ../u-boot-$*.log 2>&1
+	cd $(BUILD)/u-boot-$* && scripts/kconfig/merge_config.sh -m .config kozane.frag >> ../u-boot-$*.log 2>&1
 	env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/u-boot-$* olddefconfig >> $(BUILD)/u-boot-$*.log 2>&1
-	tools/uboot-config verify $(BUILD)/u-boot-$*/secureos.frag $(BUILD)/u-boot-$*/.config
+	tools/uboot-config verify $(BUILD)/u-boot-$*/kozane.frag $(BUILD)/u-boot-$*/.config
 	SOURCE_DATE_EPOCH=0 env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/u-boot-$* -j$$(nproc) LOCALVERSION= >> $(BUILD)/u-boot-$*.log 2>&1 \
 		|| { tail -30 $(BUILD)/u-boot-$*.log; exit 1; }
 
@@ -420,4 +420,4 @@ check-selftest:
 	tools/check-selftest
 
 clean:
-	rm -rf $(BUILD) $(HOME)/.cache/secureos
+	rm -rf $(BUILD) $(HOME)/.cache/kozane

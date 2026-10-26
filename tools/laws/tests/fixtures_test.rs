@@ -424,7 +424,7 @@ fn a_tpm_mr_off_the_tis_page_is_l5_and_seeds_taint() {
 }
 
 /// Regression test against the real files (not a frozen fixture): keeps
-/// `policy/laws.toml` honest as `system/secureos.system` grows, since C2
+/// `policy/laws.toml` honest as `system/kozane.system` grows, since C2
 /// wires `laws check` into `make image` against exactly these two paths.
 #[test]
 fn live_repo_system_passes_against_live_policy() {
@@ -432,7 +432,7 @@ fn live_repo_system_passes_against_live_policy() {
     let out = Command::new(env!("CARGO_BIN_EXE_laws"))
         .arg("check")
         .arg("--system")
-        .arg(repo_root.join("system/secureos.system"))
+        .arg(repo_root.join("system/kozane.system"))
         .arg("--policy")
         .arg(repo_root.join("policy/laws.toml"))
         .arg("--search-path")
@@ -443,7 +443,7 @@ fn live_repo_system_passes_against_live_policy() {
     let text = stdout(&out);
     assert!(
         out.status.success(),
-        "system/secureos.system does not pass policy/laws.toml\nstdout:\n{text}\nstderr:\n{}",
+        "system/kozane.system does not pass policy/laws.toml\nstdout:\n{text}\nstderr:\n{}",
         stderr(&out)
     );
 }

@@ -791,7 +791,7 @@ def main() -> int:
     ap.add_argument("--search-path", required=True, type=pathlib.Path)
     ap.add_argument("--checks", default=",".join(CHECKS))
     ap.add_argument("--policy", type=pathlib.Path, default=POLICY)
-    ap.add_argument("--system", type=pathlib.Path, default=ROOT / "system/secureos.system")
+    ap.add_argument("--system", type=pathlib.Path, default=ROOT / "system/kozane.system")
     ap.add_argument("--print-baseline", action="store_true")
     ap.add_argument("elfs", nargs="*", type=pathlib.Path)
     a = ap.parse_args()

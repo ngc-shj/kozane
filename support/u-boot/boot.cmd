@@ -1,4 +1,4 @@
-# The secureos boot command (M5 plan C8), compiled into U-Boot as
+# The kozane boot command (M5 plan C8), compiled into U-Boot as
 # CONFIG_BOOTCOMMAND by tools/uboot-config: one command per line, `#` lines
 # dropped, REFUSE expanded. Layout (fixed addresses, little-endian):
 #   0x6ff00000  boot descriptor v2, 80 bytes: magic "SOSBOOT1", version

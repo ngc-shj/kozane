@@ -17,7 +17,7 @@ fn parse_num(s: &str) -> usize {
 }
 
 fn system_text() -> String {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../system/secureos.system");
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../system/kozane.system");
     std::fs::read_to_string(path).expect("read .system")
 }
 

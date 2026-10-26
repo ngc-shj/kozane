@@ -218,7 +218,7 @@ def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BL
             (d / "tls.bin").write_bytes(tls)
             (d / "srk.pub").write_bytes(srk)
             (d / "gen_config.h").write_text(gen)
-            (d / "secureos.system").write_text(
+            (d / "kozane.system").write_text(
                 '<system>\n<program_image path="pd-pqkey.elf" />\n<program_image path="pd-pq.elf" />\n'
                 '<program_image path="pd-key.elf" />\n<program_image path="pd-tls.elf" />\n'
                 '<program_image path="pd-tlskey.elf" />\n</system>\n')
@@ -235,7 +235,7 @@ def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BL
                 return 0
             pkg.build = fake_build
             sys.argv = ["package", "--secrets", str(d / "secrets.bin"), "--pq-secrets", str(d / "pq.bin"),
-                        "--tls-secrets", str(d / "tls.bin"), "--srk-public", str(d / "srk.pub"), "--out", str(d / "pkg"), "--system", str(d / "secureos.system"), "--policy", "x", "--image", "x",
+                        "--tls-secrets", str(d / "tls.bin"), "--srk-public", str(d / "srk.pub"), "--out", str(d / "pkg"), "--system", str(d / "kozane.system"), "--policy", "x", "--image", "x",
                         "--gen-config", str(d / "gen_config.h"), "--search-path", str(search), "--board", "x",
                         "--config", "x", "--microkit", "x", "--harness", str(harness_path)]
             captured = io.StringIO()

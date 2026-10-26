@@ -176,3 +176,89 @@ Deviations:
   generated report. Auditing the generated capability graph would catch a
   Microkit translation fault; it is recorded as a candidate, not done.
 - **raspi4b has no GENET in QEMU.** This supports building M7 on `virt`.
+
+## Slice 5 (P7, the rename to Kozane, with P4 (a))
+
+Gates run:
+- make lint/lint-pds/unit/laws/pins/repro green on gx10;
+- check-selftest `--dry` 220 of 220;
+- check-pins fixtures 281 of 281;
+- QEMU on z1mn: `measured boot` (the new banner), `sealed boot` and
+  `tpm cap failure` green.
+
+The full `make check` and selftest are the combined long run (slice 6).
+
+- **The substitution.** It covered every tracked file outside docs/archive
+  and third_party: `secureos` → `kozane` and `SECUREOS_` → `KOZANE_`.
+  - Citations of archive file names (`secureos-pq-vpn-architecture-*`,
+    `secureos-m<N>-*`, `secureos-post-m6-*`) were held out, as the plan
+    requires.
+  - **Files renamed:** `system/kozane.system` and
+    `support/u-boot/kozane.config`.
+  - **Docker names:** `kozane-dev` (image and container), the volume
+    `kozane-cargo-registry` (copied from the old one, which is kept for
+    now), and `kozane-rp-oracle`. The containers were recreated with
+    docker/Makefile's `run` flags on gx10, z1mn and mrx33. The image
+    content is unchanged, since only its tag is new. `make -C docker run`
+    was not used: it rebuilds first, and P5's Dockerfile change misses
+    the cache on arm64.
+- **Removed: `crates/pds/hello`.** The M0 hello PD was a workspace member
+  that no image contained (the Makefile's `pds` list omits it). It is
+  removed with its Cargo.lock entry, so the public tree has no dead PD.
+  The laws fixtures still name `pd-hello.elf`, as fixture text.
+- **Format changes:**
+  - **Release domain** `kozane-release-v1\0`. There is a new test,
+    `a_signature_over_the_old_domain_is_refused`: with the right keys, a
+    signature over the old domain fails, and the same construction over
+    `DOMAIN` verifies, which proves the domain caused the refusal. No
+    fixture is pre-signed; the tests sign their own.
+  - **Cookie nonce label** `kozane cookie reply nonce`.
+  - **rp-vectors.** `cookie.txt` was regenerated through the pinned oracle
+    image (`--cookie`). Only `shake.data` and `shake.out` changed, the
+    label-dependent lines.
+    - The keyed-hash KAT label in `v02.txt` stays `secureos …`. Only a
+      full regeneration rewrites it, and that also draws new keys, so it is
+      not label-only. It is a test input, not a wire format, and it is
+      listed in the allowlist.
+  - **U-Boot banner and boot script** (`kozane: measured`, `kozane: boot
+    refused`). PCR 8's expected value is computed at run time
+    (`tools/measure.py`), not pinned, so no constant changed.
+  - **`--remap-path-prefix=…=/kozane` and `~/.cache/kozane/pd-target-*`.**
+    The reproducible digests change; `make repro` was rerun.
+- **Test vectors and fixtures:**
+  - **wg-core's keyed-BLAKE2s vectors** were recomputed with Python
+    `hashlib`. The old labels reproduce the old values, which checks the
+    method.
+  - **`ecdsa_sigs.txt` and `keylog.txt`** were regenerated with
+    `tests/tls/*.py`.
+  - **A capture finding.** `openssl s_client` reads a line starting with
+    "k" as its KeyUpdate command. The renamed line "kozane keylog
+    fixture…" therefore became a KeyUpdate, and the capture failed with
+    InvalidTag. The lines now start with "The kozane…", and a comment
+    records the constraint.
+- **S7, stale variables fail closed.**
+  - `crates/config/build.rs` panics when `SECUREOS_CONFIG` is set without
+    `KOZANE_CONFIG`; there is a fixture in `test_config_build.py`.
+  - `run.py` refuses to start when any `SECUREOS_*` variable is set
+    without its `KOZANE_` name. This is checked first in `main`, before
+    any build, and was seen to refuse `SECUREOS_IT_BOOTS=x`.
+- **P23, the old name.** A new check-pins rule. It skips docs/archive,
+  third_party, build, target, .git and .claude. Elsewhere, a line naming
+  `secureos` (or `secure_os`, `secure-os`, in any case) passes only if
+  it is an archive citation, or its file is in `policy/old-name-allowlist`
+  with a reason.
+  - A listed file that still exists but no longer names it is a stale
+    entry. A listed file that is gone is not judged: the P7 fixtures
+    replace `crates/` wholesale.
+  - It has four fixtures: three red, one allow.
+- **P4 (a), the proof lock.** It moved to `/tmp/kozane-proof.lock` and
+  `KOZANE_PROOF_LOCK(ED)`. The switch was made with the containers just
+  recreated, so nothing held the old path. Every proof cache is
+  invalidated once, inside the long run.
+- **Git history, before publishing all of it.** A search of every commit
+  found:
+  - PEM private keys, AWS keys, GitHub tokens: none;
+  - `PrivateKey =` lines: only WireGuard config templates;
+  - key-like file names: only the laws fixtures.
+  The M5 dev release keys are generated at run time, so none was
+  committed.

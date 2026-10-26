@@ -18,7 +18,7 @@ frozen under two (memory `kani-never-concurrent`). `--exact` is passed to
 to build/kg-<crate>-<harness's last segment>.log.
 Last line: "<crate> <harness> rc=<n> <Kani's summary lines>"; exits with
 the gate's code, 1 if the guard stopped a run that still exited 0.
-SECUREOS_KANI_GATE replaces tools/kani-gate.sh and SECUREOS_KANI_CBMC the
+KOZANE_KANI_GATE replaces tools/kani-gate.sh and KOZANE_KANI_CBMC the
 name prefix "cbmc": the fixtures' stub gate, and a stub cbmc name no real
 cbmc on the host can match even if the descendant filter broke.
 """
@@ -93,8 +93,8 @@ def main() -> int:
     args = ap.parse_args()
     log = args.log or ROOT / f"build/kg-{args.crate}-{args.harness.split('::')[-1]}.log"
     log.parent.mkdir(parents=True, exist_ok=True)
-    gate_cmd = os.environ.get("SECUREOS_KANI_GATE", str(ROOT / "tools/kani-gate.sh"))
-    cbmc_name = os.environ.get("SECUREOS_KANI_CBMC", "cbmc")
+    gate_cmd = os.environ.get("KOZANE_KANI_GATE", str(ROOT / "tools/kani-gate.sh"))
+    cbmc_name = os.environ.get("KOZANE_KANI_CBMC", "cbmc")
     cmd = [gate_cmd, "-p", args.crate, "--harness", args.harness] + (["--exact"] if args.exact else [])
     with open(log, "w") as out:
         gate = subprocess.Popen(cmd, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT)

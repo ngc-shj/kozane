@@ -102,7 +102,7 @@ def main():
     assert len(reply) == 64
 
     print("cookie_key", ck.hex())
-    print("mac16", mac(bytes(range(16)), b"secureos wg-core").hex())
+    print("mac16", mac(bytes(range(16)), b"kozane wg-core").hex())
     print("make_cookie", cookie.hex())
     print("make_cookie_other_port", cookie_other_port.hex())
     print("mac2", mac2.hex())

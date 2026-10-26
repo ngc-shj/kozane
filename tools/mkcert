@@ -47,7 +47,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 VALIDITY = datetime.timedelta(days=30)
-CA_NAME = "secureos dev CA"
+CA_NAME = "kozane dev CA"
 # A DNS label (RFC 1123), lowercase; a name has at least one dot-free label.
 LABEL = re.compile(r"^(?!-)[a-z0-9-]{1,63}(?<!-)$")
 OUTPUTS = ("devca.pem", "tls.der")

@@ -14,6 +14,6 @@ if [ $# -eq 0 ]; then
     echo "usage: proof-lock <command> [args...]" >&2
     exit 2
 fi
-exec 9>"${SECUREOS_PROOF_LOCK:-/tmp/secureos-proof.lock}"
+exec 9>"${KOZANE_PROOF_LOCK:-/tmp/kozane-proof.lock}"
 flock 9
 exec "$@"

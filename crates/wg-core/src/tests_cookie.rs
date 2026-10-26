@@ -38,7 +38,7 @@ const COUNTER: u64 = 0x0102_0304_0506_0708;
 const RECEIVER: u32 = 0x0403_0201;
 
 const COOKIE_KEY: &str = "3dd5869c5202e45146936d1644f76ff697061661c181f3fd450eae43932eacec";
-const MAC16: &str = "4ba8c7b945e775a20eab0bc71c97bee4";
+const MAC16: &str = "2493c5a085546bb1c7dcc11d9c5f9289";
 const COOKIE: &str = "53394be9b5ee9105486447b159e06cf2";
 const COOKIE_OTHER_PORT: &str = "89d3ab3eb1aaf5a8c0e8989f169287b7";
 const MAC2: &str = "ab1a194221b9651d952c60cc4c996b40";
@@ -91,7 +91,7 @@ fn cookie_key_matches_python() {
 #[test]
 fn mac16_matches_python_with_a_16_byte_key() {
     let key: [u8; 16] = core::array::from_fn(|i| i as u8);
-    assert_eq!(crypto::mac16(&key, &[b"secureos ", b"wg-core"]).unwrap(), hex(MAC16));
+    assert_eq!(crypto::mac16(&key, &[b"kozane ", b"wg-core"]).unwrap(), hex(MAC16));
 }
 
 // BLAKE2s carries the key length in its parameter block [M18].

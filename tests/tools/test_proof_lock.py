@@ -37,7 +37,7 @@ def wait_for(path: pathlib.Path, proc: subprocess.Popen, what: str):
 def b_starts_while_a_holds(script: pathlib.Path, tmp: pathlib.Path):
     """Returns (lock_free_while_a_runs, b_started) for one script."""
     lock, log, release = tmp / "lock", tmp / "log", tmp / "release"
-    env = dict(os.environ, SECUREOS_PROOF_LOCK=str(lock))
+    env = dict(os.environ, KOZANE_PROOF_LOCK=str(lock))
     a_started = tmp / "a-started"
     a = subprocess.Popen(
         [str(script), "bash", "-c",

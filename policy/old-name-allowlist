@@ -1,0 +1,11 @@
+# Files that keep the pre-rename name `secureos` on purpose (check-pins
+# P23, post-M6 plan P7). One path per line, the reason after `#`. Citations
+# of docs/archive file names need no entry.
+
+crates/config/build.rs          # S7: a stale SECUREOS_CONFIG stops the build instead of building the default
+tests/integration/run.py        # S7: a stale SECUREOS_* variable stops the run instead of running every boot
+tests/tools/test_config_build.py  # S7's fixture sets SECUREOS_CONFIG alone
+tools/release/src/tests.rs      # the old release domain, refused under the right keys
+tools/rp-vectors/src/main.rs    # v02.txt's keyed-hash KAT label: a test input, regenerated only with all of v02 (new keys)
+tools/check-pins                # P23 itself
+tests/tools/test_check_pins.py  # P23's fixtures

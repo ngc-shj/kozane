@@ -33,7 +33,7 @@ for pd in "$@"; do
     artifacts+=("pd-$pd.elf")
 done
 
-scratch=$(mktemp -d "${TMPDIR:-/tmp}/secureos-repro.XXXXXX")
+scratch=$(mktemp -d "${TMPDIR:-/tmp}/kozane-repro.XXXXXX")
 pd_target=$(make -s -C "$root" --no-print-directory print-pd-target MICROKIT_CONFIG="$config")
 # The copy's build leaves units in the shared target directory that cargo
 # would reuse for the primary tree; any build-script output that embeds the

@@ -1,4 +1,4 @@
-# secureos roadmap
+# kozane roadmap
 
 A single-purpose network appliance OS on seL4 (Microkit), in pure no_std Rust:
 first a post-quantum remote-access VPN gateway (WireGuard + Rosenpass), then a
@@ -10,7 +10,7 @@ PQ-hybrid HTTPS reverse proxy on the same base.
 
 ## Goals beyond QEDOS
 
-| Axis | QEDOS | secureos |
+| Axis | QEDOS | kozane |
 |---|---|---|
 | Entry point addressed | HTTPS front | VPN/RDP edge (≥ 60% of JP ransomware entry), then HTTPS |
 | Crypto TCB | OpenSSL (C) inside `tls_pd` | Pure Rust; libcrux verified primitives |

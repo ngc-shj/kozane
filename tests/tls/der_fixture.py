@@ -41,7 +41,7 @@ def main() -> int:
     found = {}
     i = 0
     while want - set(found):
-        msg = b"secureos tls-wire DER fixture %d" % i
+        msg = b"kozane tls-wire DER fixture %d" % i
         i += 1
         der = key.sign(msg, ec.ECDSA(hashes.SHA256()))
         r, s = decode_dss_signature(der)

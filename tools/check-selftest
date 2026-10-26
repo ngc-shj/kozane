@@ -118,7 +118,7 @@ def append(tree: pathlib.Path, rel: str, text: str):
 
 
 def two_key_channel(tree: pathlib.Path, caller: str, caller_id: int, callee: str, callee_id: int):
-    edit(tree, "system/secureos.system", "</system>",
+    edit(tree, "system/kozane.system", "</system>",
          f'    <channel>\n        <end pd="{caller}" id="{caller_id}" pp="true" notify="false" />\n'
          f'        <end pd="{callee}" id="{callee_id}" pp="false" />\n    </channel>\n</system>')
     append(tree, "policy/laws.toml",
@@ -130,16 +130,16 @@ def share_key_with_tls(tree: pathlib.Path):
     """`tls` back on `key`'s endpoint (M6 slice 2's shape) and `tlskey`
     removed with its region, its PPC to `tpm` and their policy entries, so
     the system is otherwise lawful."""
-    edit(tree, "system/secureos.system", '<end pd="tlskey" id="1" pp="false" />', '<end pd="key" id="4" pp="false" />')
-    edit(tree, "system/secureos.system",
+    edit(tree, "system/kozane.system", '<end pd="tlskey" id="1" pp="false" />', '<end pd="key" id="4" pp="false" />')
+    edit(tree, "system/kozane.system",
          '    <channel>\n        <end pd="tlskey" id="3" pp="true" notify="false" />\n'
          '        <end pd="tpm" id="3" pp="false" notify="false" />\n    </channel>\n', "")
-    text = (tree / "system/secureos.system").read_text()
+    text = (tree / "system/kozane.system").read_text()
     pd = re.search(r'\n\n    <!-- M6 plan C12: the TLS signing oracle\..*?</protection_domain>\n', text, re.S)
     mr = re.search(r'    <!-- tlskey\'s TLS signing key .*?prefill_path="tls-secrets-placeholder.bin" />\n', text, re.S)
     if not pd or not mr:
         raise SystemExit("selftest: tlskey's pd or region not found in the system file")
-    (tree / "system/secureos.system").write_text(text.replace(pd.group(0), "\n").replace(mr.group(0), ""))
+    (tree / "system/kozane.system").write_text(text.replace(pd.group(0), "\n").replace(mr.group(0), ""))
     edit(tree, "policy/laws.toml", '[[channels]]\nbetween = ["tls", "tlskey"]\npp = { tls = true, tlskey = false }\n'
          'notify = { tls = false, tlskey = true }\n',
          '[[channels]]\nbetween = ["tls", "key"]\npp = { tls = true, key = false }\nnotify = { tls = false, key = true }\n')
@@ -553,9 +553,9 @@ CASES = {
                  "ct-shape: pd-pqkey.elf: shape: mce460896::bm::bm:"),
     # One PD built with other codegen than the harness: identity fails.
     "ct-identity": (["ct-shape"], lambda t: edit(t, "Makefile",
-                                                 "\tRUSTFLAGS=\"-Zunstable-options --remap-path-prefix=$(CURDIR)=/secureos\" \\\n"
+                                                 "\tRUSTFLAGS=\"-Zunstable-options --remap-path-prefix=$(CURDIR)=/kozane\" \\\n"
                                                  "\tcargo build --locked \\\n",
-                                                 "\tRUSTFLAGS=\"-Zunstable-options --remap-path-prefix=$(CURDIR)=/secureos"
+                                                 "\tRUSTFLAGS=\"-Zunstable-options --remap-path-prefix=$(CURDIR)=/kozane"
                                                  " $(if $(filter pq,$(1)),-Copt-level=3)\" \\\n\tcargo build --locked \\\n"),
                     "ct-shape: pd-pq.elf: identity: mce460896::"),
     # The TLS identity root (M6 plan C7, T-R5-1): the exchange's code in
@@ -592,7 +592,7 @@ CASES = {
     # A warning whose exception is removed must fail the audit gate.
     "audit": (["audit"], lambda t: edit(t, "policy/audit-ignore.toml", 'id = "RUSTSEC-2024-0436"', 'id = "RUSTSEC-0000-0000"'),
               "unmaintained warning RUSTSEC-2024-0436 for paste"),
-    "laws": (["laws"], lambda t: edit(t, "system/secureos.system", "</system>", "    <selftest_unknown />\n</system>"), "L4"),
+    "laws": (["laws"], lambda t: edit(t, "system/kozane.system", "</system>", "    <selftest_unknown />\n</system>"), "L4"),
     "pins": (["pins"], lambda t: edit(t, "Makefile", "\trm -rf $(BUILD) $(HOME)", "\t-rm -rf $(BUILD) $(HOME)"), "P5"),
     "integration": (["test", "it_boots=wireguard"], lambda t: edit(t, "tests/integration/run.py",
                                               "        if bad.consume_response(resp):",
@@ -792,7 +792,7 @@ CASES = {
     # sticky flag ends the 32-bit field loops early: the wrapping range is
     # measured instead of refused.
     "measure-ctrlc": (["test", "it_boots=measured boot"], lambda t: edit(
-        t, "support/u-boot/secureos.config", "CONFIG_AUTOBOOT_KEYED=y\n", ""),
+        t, "support/u-boot/kozane.config", "CONFIG_AUTOBOOT_KEYED=y\n", ""),
         "a wrapping range was not refused"),
     "l8-fallback": (["test", "it_boots=wireguard"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                              "            Some(Entry::Absent) | None => Err(PskRefusal::Missing),",
@@ -997,7 +997,7 @@ CASES = {
     # A timer that can be notified is tainted (L1): flipped in both the
     # system and the policy, so only the law can object (M2.5 plan C4).
     "laws-timer-ingress": (["laws"], lambda t: (
-        edit(t, "system/secureos.system", '<end pd="ingress" id="5" notify="false" />',
+        edit(t, "system/kozane.system", '<end pd="ingress" id="5" notify="false" />',
              '<end pd="ingress" id="5" notify="true" />'),
         edit(t, "policy/laws.toml", "notify = { timer = true, ingress = false }",
              "notify = { timer = true, ingress = true }")),
@@ -1007,7 +1007,7 @@ CASES = {
     "laws-pq-key": (["laws"], lambda t: two_key_channel(t, "pq", 6, "key", 2), "pd 'pq' has pp channels to more than one key pd"),
     "laws-hs-pqkey": (["laws"], lambda t: two_key_channel(t, "hs", 7, "pqkey", 2),
                       "pd 'hs' has pp channels to more than one key pd"),
-    "laws-pq-secrets-writable": (["laws"], lambda t: edit(t, "system/secureos.system",
+    "laws-pq-secrets-writable": (["laws"], lambda t: edit(t, "system/kozane.system",
                                                           '<map mr="pq_secrets" vaddr="0x2_000_000" perms="r" ',
                                                           '<map mr="pq_secrets" vaddr="0x2_000_000" perms="rw" '),
                                  "secrets mr 'pq_secrets' is mapped into pd 'pqkey' with perms other than r"),
@@ -1015,11 +1015,11 @@ CASES = {
     # policy where it needs one, so only the law can object.
     "laws-tls-pqkey": (["laws"], lambda t: two_key_channel(t, "tls", 6, "pqkey", 2),
                        "pd 'tls' has pp channels to more than one key pd"),
-    "laws-tls-budget": (["laws"], lambda t: edit(t, "system/secureos.system",
+    "laws-tls-budget": (["laws"], lambda t: edit(t, "system/kozane.system",
                                                  '<protection_domain name="tls" priority="100" budget="500" ',
                                                  '<protection_domain name="tls" priority="100" budget="1_000" '),
                         "tainted pds' summed budget/period ratio 1.000 exceeds the sum cap 0.95"),
-    "laws-tls-priority": (["laws"], lambda t: edit(t, "system/secureos.system",
+    "laws-tls-priority": (["laws"], lambda t: edit(t, "system/kozane.system",
                                                    '<protection_domain name="tls" priority="100" ',
                                                    '<protection_domain name="tls" priority="140" '),
                           "pd 'tls' (priority 140) must be strictly below pd 'key' (priority 140)"),
@@ -1027,7 +1027,7 @@ CASES = {
     # gone with its region and entries, so only the single-caller rule can
     # object.
     "laws-hs-tls-share-key": (["laws"], lambda t: share_key_with_tls(t), "key pd 'key' has 2 pp callers, at most one"),
-    "laws-tls-hd": (["laws"], lambda t: edit(t, "system/secureos.system",
+    "laws-tls-hd": (["laws"], lambda t: edit(t, "system/kozane.system",
                                              '        <map mr="audit_tls" vaddr="0x7_000_000" ',
                                              '        <map mr="hd_data" vaddr="0x10_400_000" perms="r" setvar_vaddr="hd_data" />\n'
                                              '        <map mr="audit_tls" vaddr="0x7_000_000" '),
@@ -1467,7 +1467,7 @@ def copy_repo(dst: pathlib.Path):
 # (counts, caches, records, images) is removed.
 # Outside the checkout, so cargo does not merge the checkout's
 # .cargo/config.toml into the copy's as a parent directory's.
-WORK = pathlib.Path(tempfile.gettempdir()) / "secureos-selftest"
+WORK = pathlib.Path(tempfile.gettempdir()) / "kozane-selftest"
 KEEP_BUILD = re.compile(r"^target")
 
 

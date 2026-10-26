@@ -604,7 +604,7 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
         return 1
 
     # 4. The image with the envelopes, as U-Boot assembles it at boot.
-    system = out / "secureos.system"
+    system = out / "kozane.system"
     system.write_text(with_prefill(placeholder_system, {mr: str(out / f"{mr}.env") for mr in SECRETS_MRS}))
     microkit(a, system, out / "envelope.img", out / "report.txt")
     errors = check_systems(placeholder_system, system.read_text())

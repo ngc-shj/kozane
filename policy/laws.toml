@@ -136,7 +136,7 @@
 #     violation — see tools/laws/src/sdf.rs.
 #
 # Current system (M6: WireGuard responder with cookies, a Rosenpass V02
-# responder and the HTTPS endpoint; see system/secureos.system):
+# responder and the HTTPS endpoint; see system/kozane.system):
 #   `eth_out` and `eth_in` own one virtio-net device each (L5) and seed
 #   taint. `ingress` (outside) and `inner` (inside) parse attacker-
 #   controlled frames; `ingress` also holds the cookie secret, which only

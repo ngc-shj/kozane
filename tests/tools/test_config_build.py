@@ -64,7 +64,7 @@ CASES = [
 
 
 def build(cfg: pathlib.Path, target: pathlib.Path) -> subprocess.CompletedProcess:
-    env = {**os.environ, "SECUREOS_CONFIG": str(cfg)}
+    env = {**os.environ, "KOZANE_CONFIG": str(cfg)}
     return subprocess.run(["cargo", "build", "--locked", "-q", "-p", "config", "--target-dir", str(target)],
                           cwd=ROOT, env=env, capture_output=True, text=True)
 
@@ -90,7 +90,17 @@ def main() -> int:
             print(f"{'ok  ' if ok else 'FAIL'} {name}: exit={r.returncode}")
             if not ok:
                 print(r.stderr[-1500:])
-    print(f"CONFIG-BUILD-FIXTURES {len(CASES)}")
+        # S7: the pre-rename variable alone stops the build, by name.
+        env = {k: v for k, v in os.environ.items() if k != "KOZANE_CONFIG"}
+        env["SECUREOS_CONFIG"] = str(pathlib.Path(d) / "case0.toml")
+        r = subprocess.run(["cargo", "build", "--locked", "-q", "-p", "config", "--target-dir", str(target)],
+                           cwd=ROOT, env=env, capture_output=True, text=True)
+        ok = r.returncode != 0 and "SECUREOS_CONFIG is set but KOZANE_CONFIG is not" in r.stderr
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} a stale SECUREOS_CONFIG alone fails the build: exit={r.returncode}")
+        if not ok:
+            print(r.stderr[-1500:])
+    print(f"CONFIG-BUILD-FIXTURES {len(CASES) + 1}")
     return 1 if failures else 0
 
 

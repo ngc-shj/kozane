@@ -1,6 +1,6 @@
 //! Generates a development deployment (plan C16, M3 plan C6, M6 plan C11):
 //! fresh gateway and peer keys, a gateway config for the build
-//! (SECUREOS_CONFIG) with the McEliece public key files it names, the three
+//! (KOZANE_CONFIG) with the McEliece public key files it names, the three
 //! secrets regions for `make package` (`secrets.bin` for `key`,
 //! `pqkey-secrets.bin` for `pqkey`, `tls-secrets.bin` for `tlskey`), and per
 //! peer a client bundle: a wg(8)

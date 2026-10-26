@@ -102,7 +102,7 @@ enum PqKey {
     Unavailable { code: u32 },
 }
 
-/// `stack_size` of `pqkey` in system/secureos.system (the integration
+/// `stack_size` of `pqkey` in system/kozane.system (the integration
 /// suite checks that this constant matches it).
 const STACK_SIZE: usize = 0x20_000;
 

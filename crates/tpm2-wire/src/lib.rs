@@ -1,4 +1,4 @@
-//! TPM 2.0 marshalling for the one flow secureos runs (M5 plan C9, C10):
+//! TPM 2.0 marshalling for the one flow kozane runs (M5 plan C9, C10):
 //! the commands of an offline-sealed unseal (CreatePrimary →
 //! StartAuthSession → PolicyPCR → PolicyAuthValue → Import → Load → Unseal
 //! → FlushContext), PCR_Read and the cap's PCR_Extend, their response

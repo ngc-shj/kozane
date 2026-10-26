@@ -1864,7 +1864,7 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
                 except OSError:
                     pass  # QEMU has exited; wait_for reports it
                 try:
-                    m = con.wait_for(r"secureos: (measured|boot refused)\r*\n", since=banner.end(),
+                    m = con.wait_for(r"kozane: (measured|boot refused)\r*\n", since=banner.end(),
                                      timeout=CTRLC_REPEAT_S)
                     break
                 except Fail:
@@ -1888,7 +1888,7 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
                 after = con.text[banner.end() + m.end():]
                 # Two controls, each failing on its own: nothing runs after the
                 # refusal (the spin and the Ctrl-C lock), and U-Boot powers off.
-                if "secureos: measured" in after or re.search(r"(^|\n)=> ", after):
+                if "kozane: measured" in after or re.search(r"(^|\n)=> ", after):
                     raise Fail("measure_boot: U-Boot ran past its refusal")
                 if con.alive:
                     raise Fail("measure_boot: U-Boot did not power off after its refusal")
@@ -2763,7 +2763,7 @@ def py_ping(peer: PyPeer, tries: int, ident: int, src: bytes = PEER1_IP) -> int:
     while True:
         if seq < tries and time.monotonic() >= next_send:
             seq += 1
-            peer.send(peer.init.transport(icmp_echo(src, HOST_IP, 8, ident, seq, b"secureos")))
+            peer.send(peer.init.transport(icmp_echo(src, HOST_IP, 8, ident, seq, b"kozane")))
             next_send = time.monotonic() + PING_INTERVAL_S
             if seq == tries:
                 until = time.monotonic() + PING_WAIT_S
@@ -3629,10 +3629,10 @@ STACK_HEADROOM_MIN = 16 * 1024
 
 def system_stack_size(pd: str) -> int:
     """`stack_size` of `pd`, read as XML (as microkit and laws read it)."""
-    root = ET.parse(os.path.join(ROOT, "system/secureos.system")).getroot()
+    root = ET.parse(os.path.join(ROOT, "system/kozane.system")).getroot()
     sizes = [e.get("stack_size") for e in root.iter("protection_domain") if e.get("name") == pd]
     if len(sizes) != 1 or not sizes[0]:
-        raise Fail(f"no single stack_size for {pd} in system/secureos.system")
+        raise Fail(f"no single stack_size for {pd} in system/kozane.system")
     return int(sizes[0].replace("_", ""), 0)
 
 
@@ -4269,7 +4269,7 @@ def backend_body() -> bytes:
     server records long (several backend chunks, more than the backend
     socket's receive buffer), so its FIN arrives while bytes before it
     still wait for room on the client socket."""
-    return hashlib.shake_256(b"secureos backend body").digest(6 * rust_size(TLS_HANDSHAKE, "MAX_SERVER_RECORD") + 123)
+    return hashlib.shake_256(b"kozane backend body").digest(6 * rust_size(TLS_HANDSHAKE, "MAX_SERVER_RECORD") + 123)
 
 
 def backend_response(data: bytes):
@@ -4825,12 +4825,12 @@ def https_rewrite_case(con: Console, deploy: str, backend: Backend, passed: list
     ca = os.path.join(deploy, "devca.pem")
     tls_ports = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))["gateway"]["tls_ports"]
     host = b"Host: " + ip_str(GW_IP).encode()
-    request = (b"GET /path?q=1 HTTP/1.1\r\n" + host + b"\r\nUser-Agent: secureos-it\r\nX-Custom: kept\r\n"
+    request = (b"GET /path?q=1 HTTP/1.1\r\n" + host + b"\r\nUser-Agent: kozane-it\r\nX-Custom: kept\r\n"
                b"Connection: keep-alive, X-Hop\r\nX-Hop: dropped\r\nKeep-Alive: timeout=5\r\nTE: trailers\r\n"
                b"Trailer: X-T\r\nProxy-Authorization: Basic eA==\r\nProxy: http://198.51.100.1/\r\n"
                b"Forwarded: for=198.51.100.6\r\nX-Forwarded-For: 198.51.100.6\r\nX-Forwarded-Proto: http\r\n"
                b"X-Real-IP: 198.51.100.6\r\n\r\n")
-    want = forwarded_head([b"GET /path?q=1 HTTP/1.1", host, b"User-Agent: secureos-it", b"X-Custom: kept"])
+    want = forwarded_head([b"GET /path?q=1 HTTP/1.1", host, b"User-Agent: kozane-it", b"X-Custom: kept"])
     data, got, conn = backend_exchange(ca, backend, request, "https rewrite")
     if data != want:
         raise Fail(f"https rewrite: the backend received {data!r}, want exactly {want!r}")
@@ -6429,7 +6429,7 @@ def build(tmp: str):
     _, srk_a = provision_tpm(tmp, "a")
     _, srk_c = provision_tpm(tmp, "c")
     _, srk_foreign = provision_tpm(tmp, "foreign")
-    env = {**os.environ, "SECUREOS_CONFIG": os.path.join(tmp, "a/gateway.toml")}
+    env = {**os.environ, "KOZANE_CONFIG": os.path.join(tmp, "a/gateway.toml")}
     make("image", env=env)
     make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
          f"TLS_SECRETS={tmp}/a/tls-secrets.bin", f"SRK_PUBLIC={srk_a}",
@@ -6447,7 +6447,7 @@ def build(tmp: str):
     make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
          f"TLS_SECRETS={tmp}/a/tls-secrets-mismatch.bin",
          f"SRK_PUBLIC={srk_a}", f"OUT={tmp}/a/pkg-tls-mismatch", env=env)
-    env_c = {**os.environ, "SECUREOS_CONFIG": os.path.join(tmp, "c/gateway.toml")}
+    env_c = {**os.environ, "KOZANE_CONFIG": os.path.join(tmp, "c/gateway.toml")}
     make("package", f"SECRETS={tmp}/c/secrets.bin", f"PQ_SECRETS={tmp}/c/pqkey-secrets.bin",
          f"TLS_SECRETS={tmp}/c/tls-secrets.bin", f"SRK_PUBLIC={srk_c}",
          f"OUT={tmp}/c/pkg", env=env_c)
@@ -6543,13 +6543,13 @@ def in_netns(tmp: str) -> int:
              ("https flood", lambda: test_https_flood(good, deploy, passed)),
              ("tls key failure", lambda: test_tls_key_failure(tls_mismatch, deploy, passed))]
     # check-selftest's red-proofs need only the boot their injection breaks:
-    # SECUREOS_IT_BOOTS names those (comma-separated). A filtered run never
+    # KOZANE_IT_BOOTS names those (comma-separated). A filtered run never
     # prints INTEGRATION-CASES, so it can never pass `make check`'s manifest.
-    only = [b for b in os.environ.get("SECUREOS_IT_BOOTS", "").split(",") if b]
+    only = [b for b in os.environ.get("KOZANE_IT_BOOTS", "").split(",") if b]
     if only:
         unknown = sorted(set(only) - {name for name, _ in cases})
         if unknown:
-            print(f"\nFAIL [setup]: SECUREOS_IT_BOOTS names no boot: {unknown}", file=sys.stderr)
+            print(f"\nFAIL [setup]: KOZANE_IT_BOOTS names no boot: {unknown}", file=sys.stderr)
             return 1
         cases = [c for c in cases if c[0] in only]
     for name, fn in cases:
@@ -6638,11 +6638,19 @@ def main() -> int:
         die_with_parent()
         # Compare with the outer harness's own pid: under a subreaper an
         # orphan is not reparented to 1.
-        if str(os.getppid()) != os.environ.get("SECUREOS_IT_PARENT"):
+        if str(os.getppid()) != os.environ.get("KOZANE_IT_PARENT"):
             print("\nFAIL [setup]: outer harness already gone", file=sys.stderr)
             return 1
         return in_netns(sys.argv[2])
-    tmp = tempfile.mkdtemp(prefix="secureos-it-")
+    # The pre-rename variables (post-M6 plan P7, S7): a stale one must not
+    # silently run the defaults (every boot) instead.
+    stale = sorted(k for k in os.environ if k.startswith("SECUREOS_")
+                   and "KOZANE_" + k.removeprefix("SECUREOS_") not in os.environ)
+    if stale:
+        print(f"\nFAIL [setup]: {', '.join(stale)} set without its KOZANE_ name: the variables were renamed",
+              file=sys.stderr)
+        return 1
+    tmp = tempfile.mkdtemp(prefix="kozane-it-")
     status = 1
     try:
         preflight()
@@ -6651,7 +6659,7 @@ def main() -> int:
         # The outer harness has no threads, so preexec_fn is safe here.
         child = subprocess.Popen(["unshare", "-rn", sys.executable, os.path.abspath(__file__), "--netns", tmp],
                                  preexec_fn=die_with_parent,
-                                 env={**os.environ, "SECUREOS_IT_PARENT": str(os.getpid())})
+                                 env={**os.environ, "KOZANE_IT_PARENT": str(os.getpid())})
         try:
             status = child.wait()
         except BaseException:

@@ -10,7 +10,7 @@ upstream's.
 One upstream initiator and one upstream responder run a full V02 handshake
 without a PSK. Only the responder runs under `assert_tv::TestVectorActive` in
 init mode, so the recorded values (ck chain IHR4–RHR7, sidr, both
-encapsulations, the biscuit) are the ones the secureos responder must
+encapsulations, the biscuit) are the ones the kozane responder must
 reproduce. Hash domains, the mac key, peer ids, the ICR1–ICR4 ck values and
 the OSK come from upstream's own functions. The two KEM KATs drive liboqs with
 a SplitMix64 `randombytes` stream that the Rust side re-implements.
@@ -28,15 +28,15 @@ not ship cmake, which liboqs needs. Run the driver in a container from the
 Dockerfile's `rosenpass-oracle` stage, which has cmake and the pinned
 toolchain from the same apt snapshot:
 
-    docker build --target rosenpass-oracle -t secureos-rp-oracle docker
-    docker run --rm -v "$PWD":/work -w /work/tools/rp-vectors secureos-rp-oracle \
+    docker build --target rosenpass-oracle -t kozane-rp-oracle docker
+    docker run --rm -v "$PWD":/work -w /work/tools/rp-vectors kozane-rp-oracle \
         sh -c 'cargo +1.93.1 run --locked --release -- /work'
 
 The cookie vectors (`crates/rosenpass-core/tests/vectors/cookie.txt`, M3b plan
 C1) are a separate mode. It reads the committed `spkm.bin` and InitHello seed,
 so it does not touch `v02.txt` or the keys:
 
-    docker run --rm -v "$PWD":/work -w /work/tools/rp-vectors secureos-rp-oracle \
+    docker run --rm -v "$PWD":/work -w /work/tools/rp-vectors kozane-rp-oracle \
         sh -c 'cargo +1.93.1 run --locked --release -- /work --cookie'
 
 `v02.txt` still lists `domain.cookie*` from before M3b. Those are the V02
@@ -52,7 +52,7 @@ A second quirk: upstream casts the EmptyData envelope over its transmit buffer
 and never writes the cookie field, so on the wire that field carries bytes 48..64
 of whatever the buffer held before (the previous RespHello in a long-running
 responder). The driver hands the responder a zeroed buffer for that message, so
-the captured EmptyData has the all-zero cookie the secureos responder sends.
+the captured EmptyData has the all-zero cookie the kozane responder sends.
 
 The McEliece vectors for `crates/mce460896` (M4 plan C8) are one more mode.
 It does not touch the files above.
@@ -72,5 +72,5 @@ classic-mceliece-rust 2.0.2 (the blob's layout) before the cut-over to
 its classic-mceliece-rust and rand_core dependencies; the file itself is
 frozen and never regenerated.
 
-    docker run --rm -v "$PWD":/work -w /work/tools/rp-vectors secureos-rp-oracle \
+    docker run --rm -v "$PWD":/work -w /work/tools/rp-vectors kozane-rp-oracle \
         sh -c 'cargo +1.93.1 run --locked --release -- /work --mce'

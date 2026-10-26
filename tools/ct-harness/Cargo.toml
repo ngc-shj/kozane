@@ -5,7 +5,7 @@ edition = "2024"
 license = "BSD-2-Clause"
 publish = false
 
-# Not a member of the secureos workspace (M4 plan C9): `make ct` builds it
+# Not a member of the kozane workspace (M4 plan C9): `make ct` builds it
 # for support/targets/aarch64-ct-harness.json with build-std, under its own
 # lock, so that its codegen is the PD's and C10 can compare the two.
 [workspace]

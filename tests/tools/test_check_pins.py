@@ -14,7 +14,10 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools/check-pins"
 FILES = ["docker/Dockerfile", "Makefile", "rust-toolchain.toml", "Cargo.toml", "Cargo.lock", "policy/waivers.toml",
-         "policy/verus-trusted.toml", ".cargo/config.toml"]
+         "policy/verus-trusted.toml", ".cargo/config.toml",
+         # P23: the allowlist and the files it lists that are not *.rs.
+         "policy/old-name-allowlist", "tests/integration/run.py", "tests/tools/test_config_build.py",
+         "tools/check-pins", "tests/tools/test_check_pins.py"]
 # P7's cases run on a tree whose crates/ is replaced by a synthetic one.
 # P7 is enforced, so they need no --enforce-pending.
 ENFORCE: list = []
@@ -764,6 +767,15 @@ CASES = [
     ("allow the barrier call split over lines", set(),
      lambda t: edit(t / "crates/tpm2/src/boot.rs", "=> cap_barrier(tpm, &mut rsp),",
                     "=> cap_barrier(\n            tpm,\n            &mut rsp,\n        ),")),
+    # P23 (post-M6 plan P7): the old name stays only where it is listed.
+    ("P23 the old name in an unlisted source file", {"P23"},
+     lambda t: append(t / "crates/wire/src/lib.rs", "// the secureos wire parser\n")),
+    ("P23 an old variable name in an unlisted file", {"P23"},
+     lambda t: append(t / "crates/wire/src/lib.rs", "// read SECUREOS_DEBUG\n")),
+    ("P23 a listed file that no longer names it", {"P23"},
+     lambda t: append(t / "policy/old-name-allowlist", "crates/wire/src/lib.rs  # stale\n")),
+    ("allow an archive document cited by its file name", set(),
+     lambda t: append(t / "crates/wire/src/lib.rs", "// docs/archive/review/secureos-m5-measured-release-plan.md\n")),
 ]
 
 

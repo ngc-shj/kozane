@@ -1,4 +1,4 @@
-//! Sizes and channel numbers shared by PDs and `system/secureos.system`.
+//! Sizes and channel numbers shared by PDs and `system/kozane.system`.
 //! The .system file must agree with these (checked by this crate's tests).
 
 #![no_std]

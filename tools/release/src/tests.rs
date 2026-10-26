@@ -95,7 +95,28 @@ fn the_domain_prefix_is_part_of_what_is_signed() {
     let mut unprefixed = m.clone();
     unprefixed.splice(0..0, b"x".iter().copied());
     assert!(sig::verify(&pk, &unprefixed, &s).is_err());
-    assert_eq!(sig::DOMAIN, b"secureos-release-v1\0");
+    assert_eq!(sig::DOMAIN, b"kozane-release-v1\0");
+}
+
+/// The pre-rename domain is refused even under the right keys: the
+/// verifier knows only `DOMAIN`, never both (post-M6 plan P7).
+#[test]
+fn a_signature_over_the_old_domain_is_refused() {
+    let mut rng = counter_rng();
+    let (sk, pk) = sig::keygen(&mut rng).unwrap();
+    let m = good_manifest();
+    let old = [b"secureos-release-v1\0".as_slice(), &m].concat();
+    let ed = libcrux_ed25519::sign(&old, &sk.ed25519).unwrap();
+    let ml = libcrux_ml_dsa::ml_dsa_65::sign(&sk.ml_dsa, &old, b"", [9; 32]).unwrap();
+    let file = format!("ed25519={}\nml-dsa-65={}\n", sig::hex(&ed), sig::hex(ml.as_ref()));
+    assert_eq!(sig::verify(&pk, &m, file.as_bytes()), Err(SigError::Ed25519Invalid));
+    // The same construction over the current domain verifies, so the refusal
+    // above is the domain's doing.
+    let new = [sig::DOMAIN, &m].concat();
+    let ed = libcrux_ed25519::sign(&new, &sk.ed25519).unwrap();
+    let ml = libcrux_ml_dsa::ml_dsa_65::sign(&sk.ml_dsa, &new, b"", [9; 32]).unwrap();
+    let file = format!("ed25519={}\nml-dsa-65={}\n", sig::hex(&ed), sig::hex(ml.as_ref()));
+    assert_eq!(sig::verify(&pk, &m, file.as_bytes()), Ok(()));
 }
 
 #[test]

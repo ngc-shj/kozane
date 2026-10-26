@@ -5,7 +5,7 @@ edition = "2021"
 license = "BSD-2-Clause"
 publish = false
 
-# Not a member of the secureos workspace: it builds upstream rosenpass (std,
+# Not a member of the kozane workspace: it builds upstream rosenpass (std,
 # liboqs via cmake) and only regenerates committed golden vectors (M3 plan C1).
 [workspace]
 

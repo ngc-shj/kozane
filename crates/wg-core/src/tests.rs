@@ -137,11 +137,11 @@ fn blake2s_rfc7693_appendix_b_abc() {
     assert_eq!(hash(&[b"a", b"", b"bc"]).unwrap(), hash(&[b"abc"]).unwrap());
 }
 
-// python3 -c "import hashlib; print(hashlib.blake2s(b'secureos wg-core', key=bytes(range(32)), digest_size=16).hexdigest())"
+// python3 -c "import hashlib; print(hashlib.blake2s(b'kozane wg-core', key=bytes(range(32)), digest_size=16).hexdigest())"
 #[test]
 fn keyed_blake2s_128_matches_python_hashlib() {
     let key: [u8; 32] = core::array::from_fn(|i| i as u8);
-    assert_eq!(mac(&key, &[b"secureos ", b"wg-core"]).unwrap(), hex("3e45c41d7444d09a16d59d56caa9fe47"));
+    assert_eq!(mac(&key, &[b"kozane ", b"wg-core"]).unwrap(), hex("76b98da795ad9efbdee12d310fa1ed81"));
 }
 
 // python3 -c "import hashlib,hmac; print(hmac.new(bytes(range(32)), b'hmac test', hashlib.blake2s).hexdigest())"

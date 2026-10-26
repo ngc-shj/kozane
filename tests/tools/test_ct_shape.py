@@ -316,7 +316,7 @@ def cli(**kw):
         try:
             search, harness = elf.tree(d, **kw)
             shape_policy(search, harness, d)
-            system = d / "secureos.system"
+            system = d / "kozane.system"
             third_line = "<program_image path='pd-ingress.elf' />\n" if third == "single" else \
                 '<program_image path="pd-ingress.elf" />\n' if third else ""
             text = system_text if system_text is not None else SYSTEM_TWO + third_line
@@ -498,7 +498,7 @@ CASES = [
          want=f"ct-shape: pd-tls.elf: identity: {ENCAPSULATE} differs from the harness")),
     ("the CLI refuses McEliece code in a third PD the system file lists", None, cli(third=True)),
     ("the CLI reads a single-quoted program_image too", None, cli(third="single")),
-    ("an unreadable system file fails", None, cli(system_text=False, want="secureos.system: No such file")),
+    ("an unreadable system file fails", None, cli(system_text=False, want="kozane.system: No such file")),
     ("a system file without program_image fails", None, cli(system_text="", want="no program_image")),
     ("a system file that does not parse fails", None, cli(system_text="<program_image", want="not well-formed")),
     ("a program_image without a path fails", None,

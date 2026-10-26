@@ -38,7 +38,9 @@ SERVER = ["openssl", "s_server", "-accept", "127.0.0.1:{port}", "-groups", "X255
           "-keylogfile", "{keylog}", "-cert", "{cert}", "-key", "{key}"]
 CLIENT = ["openssl", "s_client", "-connect", "127.0.0.1:{port}", "-groups", "X25519MLKEM768",
           "-ciphersuites", "TLS_CHACHA20_POLY1305_SHA256", "-tls1_3"]
-LINES = [b"secureos keylog fixture: before the update\n", b"k\n", b"secureos keylog fixture: after the update\n"]
+# No line but the KeyUpdate may start with "k": s_client reads such a line
+# as its KeyUpdate command.
+LINES = [b"The kozane keylog fixture: before the update\n", b"k\n", b"The kozane keylog fixture: after the update\n"]
 
 
 def hkdf_expand_label(secret: bytes, label: bytes, context: bytes, length: int) -> bytes:

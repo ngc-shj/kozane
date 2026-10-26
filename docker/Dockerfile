@@ -1,4 +1,4 @@
-# Development image for secureos. The target is aarch64; the host is
+# Development image for kozane. The target is aarch64; the host is
 # aarch64 (the reference) or x86_64, chosen by BuildKit's TARGETARCH (arm64
 # or amd64; post-M6 plan P5). Every downloaded artifact is pinned by sha256
 # per host architecture; the Microkit SDK is also checked against the

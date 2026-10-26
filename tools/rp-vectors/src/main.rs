@@ -5,7 +5,7 @@
 //! the gateway) run a full V02 handshake. Only the responder runs under
 //! `assert_tv::TestVectorActive` in init mode, so the recorded values (ck
 //! chain, sidr, the two encapsulations, the biscuit) are exactly the ones the
-//! secureos responder must reproduce. Everything else (domains, macs, peer
+//! kozane responder must reproduce. Everything else (domains, macs, peer
 //! ids, ICR ck values, the OSK) is computed with upstream's own functions.
 
 use std::collections::BTreeMap;
@@ -161,9 +161,9 @@ fn cookie_vectors(vec_dir: &Path, seed_dir: &Path) -> anyhow::Result<()> {
 
     let mut kh_out = [0u8; 32];
     let kh_key: [u8; 32] = std::array::from_fn(|i| i as u8);
-    ks.keyed_hash(&kh_key, b"secureos rosenpass-core keyed shake256 KAT", &mut kh_out)?;
+    ks.keyed_hash(&kh_key, b"kozane rosenpass-core keyed shake256 KAT", &mut kh_out)?;
     out.put("shake.key", &kh_key)?;
-    out.put("shake.data", b"secureos rosenpass-core keyed shake256 KAT")?;
+    out.put("shake.data", b"kozane rosenpass-core keyed shake256 KAT")?;
     out.put("shake.out", &kh_out)?;
     out.put("cookie.domain.protocol", &hd::protocol(ks.clone(), ek)?.into_value())?;
 
@@ -299,14 +299,14 @@ fn mce_vectors(repo: &Path) -> anyhow::Result<()> {
 
 fn main() -> anyhow::Result<()> {
     let repo: PathBuf =
-        std::env::args().nth(1).context("usage: rp-vectors <secureos repo root> [--cookie|--mce]")?.into();
+        std::env::args().nth(1).context("usage: rp-vectors <kozane repo root> [--cookie|--mce]")?.into();
     match std::env::args().nth(2).as_deref() {
         Some("--mce") => return mce_vectors(&repo),
         _ => {}
     }
     let vec_dir = repo.join("crates/rosenpass-core/tests/vectors");
     let seed_dir = repo.join("crates/rosenpass-wire/src/__fuzz__/tests__parsers_never_panic_and_round_trip/corpus");
-    ensure!(vec_dir.is_dir() && seed_dir.is_dir(), "run from a secureos checkout: {repo:?}");
+    ensure!(vec_dir.is_dir() && seed_dir.is_dir(), "run from a kozane checkout: {repo:?}");
     if std::env::args().nth(2).as_deref() == Some("--cookie") {
         return cookie_vectors(&vec_dir, &seed_dir);
     }

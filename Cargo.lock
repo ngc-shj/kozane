@@ -1149,13 +1149,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pd-hello"
-version = "0.1.0"
-dependencies = [
- "sel4-microkit",
-]
-
-[[package]]
 name = "pd-hs"
 version = "0.1.0"
 dependencies = [

@@ -1,5 +1,5 @@
 //! Compiles the gateway configuration into the image (law L6). The file is
-//! `config/gateway.toml`, or the path in SECUREOS_CONFIG (tests generate one
+//! `config/gateway.toml`, or the path in KOZANE_CONFIG (tests generate one
 //! with fresh keys). Key files it names are relative to its directory. Any
 //! validation error fails the build.
 
@@ -18,11 +18,17 @@ fn main() {
     // CARGO_MANIFEST_DIR is read when the script runs, not baked in when it
     // is compiled: a build-script binary reused from another tree's build
     // (the shared PD target directory, M5 C3) must not carry that tree's path.
-    let path = std::env::var("SECUREOS_CONFIG").unwrap_or_else(|_| {
+    // The pre-rename variable (post-M6 plan P7, S7): a stale SECUREOS_CONFIG
+    // must not silently build the default configuration instead.
+    println!("cargo:rerun-if-env-changed=SECUREOS_CONFIG");
+    if std::env::var_os("SECUREOS_CONFIG").is_some() && std::env::var_os("KOZANE_CONFIG").is_none() {
+        panic!("SECUREOS_CONFIG is set but KOZANE_CONFIG is not: the variable was renamed to KOZANE_CONFIG");
+    }
+    let path = std::env::var("KOZANE_CONFIG").unwrap_or_else(|_| {
         let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|e| panic!("CARGO_MANIFEST_DIR: {e}"));
         format!("{manifest}/../../config/gateway.toml")
     });
-    println!("cargo:rerun-if-env-changed=SECUREOS_CONFIG");
+    println!("cargo:rerun-if-env-changed=KOZANE_CONFIG");
     println!("cargo:rerun-if-changed={path}");
     println!("cargo:rerun-if-changed=src/validate.rs");
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("cannot read {path}: {e}"));

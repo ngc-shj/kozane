@@ -174,7 +174,7 @@ struct Pq {
     stack: cpu::StackProbe,
 }
 
-/// `stack_size` of `pq` in system/secureos.system (the integration suite
+/// `stack_size` of `pq` in system/kozane.system (the integration suite
 /// checks that this constant matches it).
 const STACK_SIZE: usize = 0x20_000;
 

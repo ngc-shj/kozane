@@ -6,7 +6,7 @@ use zeroize::Zeroize;
 
 /// Prefixed to the manifest before signing, so these signatures cannot be
 /// replayed as signatures over anything else either key signs.
-pub const DOMAIN: &[u8] = b"secureos-release-v1\0";
+pub const DOMAIN: &[u8] = b"kozane-release-v1\0";
 
 pub struct SigningKeys {
     pub ed25519: [u8; 32],

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Writes the U-Boot config fragment (M5 plan C8): support/u-boot/secureos.config
+"""Writes the U-Boot config fragment (M5 plan C8): support/u-boot/kozane.config
 plus CONFIG_BOOTCOMMAND built from support/u-boot/boot.cmd.
 
 The shipped variant ends by running the system; the `measure` variant (the
@@ -18,14 +18,14 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 # poweroff that ever returns still never reaches the next command (the boot
 # command is one hush line, run statement by statement).
 HALT = "poweroff; while true; do true; done"
-REFUSE = "echo secureos: boot refused; " + HALT
+REFUSE = "echo kozane: boot refused; " + HALT
 RUN = {
     # If the loader ever returns, PCR 8 still holds the release's value: no
     # prompt, power off.
-    "shipped": "dcache flush; dcache off; icache off; go 0x70000000; echo secureos: loader returned; " + HALT,
+    "shipped": "dcache flush; dcache off; icache off; go 0x70000000; echo kozane: loader returned; " + HALT,
     # pcr_read prints the digest itself (print_byte_string, which never
     # polls Ctrl-C); md.b's print_buffer would abort on a pending 0x03 (R5-S1).
-    "measure": "tpm2 pcr_read 8 0x6fb00040; echo secureos: measured; " + HALT,
+    "measure": "tpm2 pcr_read 8 0x6fb00040; echo kozane: measured; " + HALT,
 }
 
 
@@ -78,7 +78,7 @@ def main() -> int:
         return 1 if errors else 0
     if len(sys.argv) != 3 or sys.argv[1] not in RUN:
         raise SystemExit("usage: tools/uboot-config shipped|measure <out> | verify <frag> <.config>")
-    frag = (ROOT / "support/u-boot/secureos.config").read_text()
+    frag = (ROOT / "support/u-boot/kozane.config").read_text()
     pathlib.Path(sys.argv[2]).write_text(frag + f'CONFIG_BOOTCOMMAND="{bootcommand(sys.argv[1])}"\n')
     return 0
 
