@@ -262,3 +262,43 @@ The full `make check` and selftest are the combined long run (slice 6).
   - key-like file names: only the laws fixtures.
   The M5 dev release keys are generated at run time, so none was
   committed.
+- **The directory move (after 66c2f4b, owner-approved).**
+  - **What moved:** the repository, from `~/ghq/github.com/ngc-shj/secureos`
+    to `.../ngc-shj/kozane` on gx10, z1mn and mrx33. Before the move:
+    - the memory was copied to the new project key;
+    - stale worktrees were removed.
+  - **After the move:**
+    - the other session's `docs/public-release` worktree was repaired;
+    - z1mn's and mrx33's origins were repointed;
+    - the containers were recreated on the new path.
+  - **Checks from the new path:** `make pins` and `make repro` green on
+    gx10.
+
+## Slice 6 (the combined long run)
+
+- **The first `make check` at 66c2f4b.** Every gate passed, including the
+  full Kani re-proof, Verus and the integration suite, except `manifest`:
+  `UNIT-RELEASE-TOOL` was 15 against 14. The rename's old-domain test had
+  been added without raising the count. The count is raised, and the long
+  run restarts at the new commit.
+  - **Kani, split by host.** z1mn proved the tail of `kani_crates` in
+    reverse (http-wire, tls-wire, tpm2-wire, rosenpass-wire, msgs), while
+    gx10's `make check` proved it from the head. z1mn's pass entries were
+    copied into gx10's `build/kani-cache`, new keys only. The cache keys
+    are relative, and both hosts ran one commit and one image, so gx10
+    hits them.
+- **The QEMU partition at 66c2f4b (z1mn): 40 of 41.**
+  `integration-count` failed once, with the needle missing; a rerun alone
+  passed (78 cases). The cause was not captured: check-selftest printed
+  only the last 3000 characters of make's output plus the gate logs, and
+  the unit-test logs filled them.
+  - **The fix.** A failing case now prints every `FAIL [...]` line and
+    then make's own tail, so a flake names its boot.
+- **Setup slips.**
+  - z1mn's main clone held uncommitted files from earlier sessions, so its
+    checkout failed, and one partition start ran on an old tree for
+    seconds before it was stopped. The files were kept in stash
+    `z1mn-leftovers-2026-10-27-before-long-run` (35707be).
+  - A worktree cannot serve the container runs: its `.git` file names
+    the host path, which the container cannot resolve, and the selftest
+    cases read git.

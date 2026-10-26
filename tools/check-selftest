@@ -1653,7 +1653,12 @@ def run_case(name: str) -> bool:
         ok = out.returncode != 0 and found
     print(f"{'ok  ' if ok else 'FAIL'} {name}: exit={out.returncode} needle={needle!r} found={found}")
     if not ok:
-        print(text[-3000:])
+        # The gate logs follow make's own output in `text`, so its tail can be
+        # all unit-test noise (as integration-count's first long-run failure
+        # was). Show every failure line, then make's own tail.
+        for line in re.findall(r"(?m)^FAIL \[[^\n]*", text):
+            print(line[:300])
+        print((out.stdout + out.stderr)[-2000:])
     return ok
 
 
