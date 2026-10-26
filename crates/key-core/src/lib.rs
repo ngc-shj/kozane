@@ -105,6 +105,9 @@ pub enum BootError {
     TpmResponseInvalid,
     /// The unsealed KEK did not open the envelope.
     EnvelopeOpen,
+    /// The unseal succeeded but `tpm` could not confirm the cap of PCR 8
+    /// (post-M6 plan P3): the secrets were not released.
+    TpmCapFailed,
 }
 
 impl From<UnsealError> for BootError {
@@ -117,6 +120,7 @@ impl From<UnsealError> for BootError {
             UnsealError::UnsealRefused => BootError::UnsealRefused,
             UnsealError::ResponseInvalid => BootError::TpmResponseInvalid,
             UnsealError::EnvelopeOpen => BootError::EnvelopeOpen,
+            UnsealError::CapFailed => BootError::TpmCapFailed,
         }
     }
 }
@@ -136,6 +140,7 @@ impl BootError {
             BootError::UnsealRefused => "secrets: the TPM refused to unseal (PCR 8)",
             BootError::TpmResponseInvalid => "secrets: a TPM response failed its checks",
             BootError::EnvelopeOpen => "secrets: the unsealed KEK does not open the envelope",
+            BootError::TpmCapFailed => "secrets: the TPM did not confirm the PCR 8 cap",
         }
     }
 
@@ -159,6 +164,7 @@ impl BootError {
             BootError::UnsealRefused => 14,
             BootError::TpmResponseInvalid => 15,
             BootError::EnvelopeOpen => 16,
+            BootError::TpmCapFailed => 17,
         }
     }
 }

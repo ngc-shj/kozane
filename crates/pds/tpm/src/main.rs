@@ -4,7 +4,8 @@
 //! (`layout::tpm`); the `tpm2_wire` gate decides whether it reaches the
 //! device: the allowlist, per-client handle ownership (L2 between the key
 //! domains), one flow per client and one flow at a time (Busy), and the
-//! cap of PCR 8 once every client sent Done or Failed.
+//! cap of PCR 8 once every client sent Done or Failed, and the cap status
+//! each Done client asks for before it releases its key (post-M6 plan P3).
 //! The TIS FIFO is polled with bounded CNTPCT timeouts, so a device that
 //! stops answering gets the caller an error reply, never a hang. No audit
 //! channel and no console: what happened shows in the clients' replies.
@@ -18,7 +19,7 @@ use layout::tpm::{self as ipc, MSG_BYTES, MSG_WORDS};
 use sel4_microkit::{
     Channel, Handler, Infallible, MessageInfo, protection_domain, var, with_msg_regs, with_msg_regs_mut,
 };
-use tpm2_wire::gate::{CLIENTS, Gate, Refusal};
+use tpm2_wire::gate::{CLIENTS, CapStatus, CapTransport, CapVerdict, Gate, Refusal};
 
 const _: () = assert!(MSG_BYTES == tpm2_wire::IPC_MSG_BYTES);
 
@@ -62,10 +63,6 @@ const SHORT_TIMEOUT_NS: u64 = 5_000_000_000;
 /// well under a second; a real TPM's long commands take seconds.
 const COMMAND_TIMEOUT_NS: u64 = 60_000_000_000;
 
-/// Tries of the cap's PCR_Extend before giving up (each one bounded by the
-/// TIS timeouts above).
-const CAP_ATTEMPTS: usize = 3;
-
 /// Why the device did not answer a command; the code is RSP_DEVICE's arg.
 #[derive(Clone, Copy)]
 enum DeviceError {
@@ -104,9 +101,11 @@ impl Tis {
         ((sts >> 8) & 0xffff) as usize
     }
 
-    /// Polls `read` until `ok` holds, for at most `timeout_ns`.
-    fn wait<T: Copy>(read: impl Fn() -> T, ok: impl Fn(T) -> bool, timeout_ns: u64) -> Option<T> {
-        let deadline = cpu::now_ns().saturating_add(timeout_ns);
+    /// Polls `read` until `ok` holds, for at most `timeout_ns` and not past
+    /// `limit` (the command's overall deadline, if it has one): each wait is
+    /// min(its default, what is left of the deadline).
+    fn wait<T: Copy>(read: impl Fn() -> T, ok: impl Fn(T) -> bool, timeout_ns: u64, limit: u64) -> Option<T> {
+        let deadline = cpu::now_ns().saturating_add(timeout_ns).min(limit);
         loop {
             let v = read();
             if ok(v) {
@@ -119,16 +118,16 @@ impl Tis {
         }
     }
 
-    fn wait_sts(&self, ok: impl Fn(u32) -> bool, timeout_ns: u64) -> Option<u32> {
-        Self::wait(|| self.sts(), ok, timeout_ns)
+    fn wait_sts(&self, ok: impl Fn(u32) -> bool, timeout_ns: u64, limit: u64) -> Option<u32> {
+        Self::wait(|| self.sts(), ok, timeout_ns, limit)
     }
 
     /// One command, locality 0: request the locality, wait commandReady,
     /// write the command in bursts, go, wait dataAvail, read the response
     /// (at most `MSG_BYTES`), then idle the TPM and release the locality,
-    /// whatever happened.
-    fn transact(&self, cmd: &[u8], rsp: &mut [u8; MSG_BYTES]) -> Result<usize, DeviceError> {
-        let r = self.exchange(cmd, rsp);
+    /// whatever happened. No wait runs past `limit` (`u64::MAX`: none).
+    fn transact(&self, cmd: &[u8], rsp: &mut [u8; MSG_BYTES], limit: u64) -> Result<usize, DeviceError> {
+        let r = self.exchange(cmd, rsp, limit);
         self.write8(STS, STS_COMMAND_READY as u8);
         self.write8(ACCESS, ACCESS_ACTIVE_LOCALITY);
         if r.is_err() {
@@ -137,16 +136,17 @@ impl Tis {
         r
     }
 
-    fn exchange(&self, cmd: &[u8], rsp: &mut [u8; MSG_BYTES]) -> Result<usize, DeviceError> {
+    fn exchange(&self, cmd: &[u8], rsp: &mut [u8; MSG_BYTES], limit: u64) -> Result<usize, DeviceError> {
         self.write8(ACCESS, ACCESS_REQUEST_USE);
         let active = ACCESS_VALID | ACCESS_ACTIVE_LOCALITY;
-        Self::wait(|| self.read8(ACCESS), |a| a & active == active, SHORT_TIMEOUT_NS).ok_or(DeviceError::Locality)?;
+        Self::wait(|| self.read8(ACCESS), |a| a & active == active, SHORT_TIMEOUT_NS, limit)
+            .ok_or(DeviceError::Locality)?;
         self.write8(STS, STS_COMMAND_READY as u8);
-        self.wait_sts(|s| s & STS_COMMAND_READY != 0, SHORT_TIMEOUT_NS).ok_or(DeviceError::CommandReady)?;
+        self.wait_sts(|s| s & STS_COMMAND_READY != 0, SHORT_TIMEOUT_NS, limit).ok_or(DeviceError::CommandReady)?;
 
         let mut sent = 0;
         while sent < cmd.len() {
-            let sts = self.wait_sts(|s| Self::burst(s) > 0, SHORT_TIMEOUT_NS).ok_or(DeviceError::Write)?;
+            let sts = self.wait_sts(|s| Self::burst(s) > 0, SHORT_TIMEOUT_NS, limit).ok_or(DeviceError::Write)?;
             let end = sent.saturating_add(Self::burst(sts)).min(cmd.len());
             for b in cmd.get(sent..end).unwrap_or(&[]) {
                 self.write8(DATA_FIFO, *b);
@@ -155,18 +155,18 @@ impl Tis {
         }
         // The TPM must want nothing more: the command's own size field and
         // what was written agree.
-        let sts = self.wait_sts(|s| s & STS_VALID != 0, SHORT_TIMEOUT_NS).ok_or(DeviceError::Expect)?;
+        let sts = self.wait_sts(|s| s & STS_VALID != 0, SHORT_TIMEOUT_NS, limit).ok_or(DeviceError::Expect)?;
         if sts & STS_EXPECT != 0 {
             return Err(DeviceError::Expect);
         }
         self.write8(STS, STS_GO as u8);
 
         let avail = STS_VALID | STS_DATA_AVAIL;
-        self.wait_sts(|s| s & avail == avail, COMMAND_TIMEOUT_NS).ok_or(DeviceError::Execute)?;
+        self.wait_sts(|s| s & avail == avail, COMMAND_TIMEOUT_NS, limit).ok_or(DeviceError::Execute)?;
         let mut len = tpm2_wire::HEADER_LEN;
         let mut got = 0;
         while got < len {
-            let sts = self.wait_sts(|s| s & avail == avail && Self::burst(s) > 0, SHORT_TIMEOUT_NS)
+            let sts = self.wait_sts(|s| s & avail == avail && Self::burst(s) > 0, SHORT_TIMEOUT_NS, limit)
                 .ok_or(DeviceError::Read)?;
             let end = got.saturating_add(Self::burst(sts)).min(len);
             for b in rsp.get_mut(got..end).ok_or(DeviceError::Read)? {
@@ -182,7 +182,7 @@ impl Tis {
                     .ok_or(DeviceError::ResponseSize)?;
             }
         }
-        let sts = self.wait_sts(|s| s & STS_VALID != 0, SHORT_TIMEOUT_NS).ok_or(DeviceError::Read)?;
+        let sts = self.wait_sts(|s| s & STS_VALID != 0, SHORT_TIMEOUT_NS, limit).ok_or(DeviceError::Read)?;
         if sts & STS_DATA_AVAIL != 0 {
             return Err(DeviceError::ExcessData);
         }
@@ -190,8 +190,24 @@ impl Tis {
     }
 }
 
+/// The cap's PCR_Extend on the TIS, each attempt within its budget (the
+/// gate's `CAP_ATTEMPT_DEADLINE_NS`): every wait inside it is bounded by
+/// what is left of that deadline.
+struct CapDevice<'t> {
+    tis: &'t Tis,
+    rsp: &'t mut [u8; MSG_BYTES],
+}
+
+impl CapTransport for CapDevice<'_> {
+    fn attempt(&mut self, cmd: &[u8], budget_ns: u64) -> Option<&[u8]> {
+        let limit = cpu::now_ns().saturating_add(budget_ns);
+        let n = self.tis.transact(cmd, self.rsp, limit).ok()?;
+        self.rsp.get(..n)
+    }
+}
+
 /// RSP_REFUSED's arg. Busy is never a refusal: it is answered RSP_BUSY.
-fn refusal_code(r: Refusal) -> usize {
+const fn refusal_code(r: Refusal) -> usize {
     match r {
         Refusal::UnknownClient => 1,
         Refusal::Finished => 2,
@@ -202,6 +218,18 @@ fn refusal_code(r: Refusal) -> usize {
         Refusal::NotOwned => 7,
         Refusal::Hierarchy => 8,
         Refusal::Busy => 9,
+        Refusal::NotDone => 10,
+    }
+}
+const _: () = assert!(ipc::REFUSED_CAP_FAILED > refusal_code(Refusal::NotDone));
+
+/// The reply to the Done (or Failed) that ran the cap, and to the cap
+/// status once it ran: a cap the device did not confirm is answered as a
+/// refusal of its own, so the key PD does not release its key.
+fn cap_label(verdict: CapVerdict) -> u64 {
+    match verdict {
+        CapVerdict::Confirmed => ipc::label(ipc::RSP_OK, 0),
+        CapVerdict::Failed => ipc::label(ipc::RSP_REFUSED, ipc::REFUSED_CAP_FAILED),
     }
 }
 
@@ -226,13 +254,21 @@ impl Tpm {
             }
             ipc::REQ_DONE | ipc::REQ_FAILED if len == 0 && words.is_empty() => {
                 match self.gate.finish(client, ipc::kind(label) == ipc::REQ_DONE) {
-                    Ok(()) => {
-                        self.cap();
-                        ipc::label(ipc::RSP_OK, 0)
-                    }
+                    Ok(()) => match self.cap() {
+                        Some(verdict) => cap_label(verdict),
+                        None => ipc::label(ipc::RSP_OK, 0),
+                    },
                     Err(r) => ipc::label(ipc::RSP_REFUSED, refusal_code(r)),
                 }
             }
+            // The cap barrier, next to Done: the gate's command allowlist
+            // never sees it.
+            ipc::REQ_CAP_STATUS if len == 0 && words.is_empty() => match self.gate.cap_status(client) {
+                Ok(CapStatus::Pending) => ipc::label(ipc::RSP_BUSY, 0),
+                Ok(CapStatus::Confirmed) => cap_label(CapVerdict::Confirmed),
+                Ok(CapStatus::Failed) => cap_label(CapVerdict::Failed),
+                Err(r) => ipc::label(ipc::RSP_REFUSED, refusal_code(r)),
+            },
             _ => ipc::label(ipc::RSP_BAD_REQUEST, 0),
         }
     }
@@ -246,7 +282,7 @@ impl Tpm {
             Err(Refusal::Busy) => return ipc::label(ipc::RSP_BUSY, 0),
             Err(r) => return ipc::label(ipc::RSP_REFUSED, refusal_code(r)),
         };
-        match self.tis.transact(cmd, &mut self.rsp) {
+        match self.tis.transact(cmd, &mut self.rsp, u64::MAX) {
             Ok(n) => {
                 self.gate.response(fwd, self.rsp.get(..n).unwrap_or(&[]));
                 ipc::label(ipc::RSP_OK, n)
@@ -255,30 +291,19 @@ impl Tpm {
         }
     }
 
-    /// Once every client has finished: the one PCR_Extend the gate issues.
-    /// The gate refuses every Unseal from here whatever the device answers;
-    /// the device's PCR 8 is what closes RM5-5's window, so the extend is
-    /// confirmed by the TPM's own response and retried on a transient
-    /// failure. A retry after a lost response may extend PCR 8 twice, which
-    /// moves it further from the sealed value (fail-closed, F4). If every
-    /// attempt fails on the device there is no channel to report it on: PCR
-    /// 8 stays at its sealed value until reboot, which is RM5-5's accepted
-    /// state before the cap.
-    fn cap(&mut self) {
-        let mut cmd = [0u8; tpm2_wire::PCR_EXTEND_CMD_LEN];
-        if let Some(n) = self.gate.cap(&mut cmd) {
-            let cmd = cmd.get(..n).unwrap_or(&[]);
-            for _ in 0..CAP_ATTEMPTS {
-                let done = match self.tis.transact(cmd, &mut self.rsp) {
-                    Ok(len) => self.rsp.get(..len).is_some_and(|r| tpm2_wire::parse_pcr_extend(r).is_ok()),
-                    Err(_) => false,
-                };
-                if done {
-                    break;
-                }
-            }
-            self.rsp.fill(0);
-        }
+    /// Once every client has finished: the one PCR_Extend the gate issues,
+    /// its verdict the gate's `run_cap` (None while not due). The gate
+    /// refuses every Unseal from here whatever the device answers; the
+    /// device's PCR 8 is what closes RM5-5's window, so the extend is
+    /// confirmed by the TPM's own response. A failed cap is answered to
+    /// this Done and to every Done client's cap status, and every key PD
+    /// then halts without releasing its key (post-M6 plan P3). PCR 8 stays
+    /// at its sealed value until reboot, which is RM5-5's accepted state
+    /// before the cap; a bus attacker is not stopped by this.
+    fn cap(&mut self) -> Option<CapVerdict> {
+        let verdict = self.gate.run_cap(&mut CapDevice { tis: &self.tis, rsp: &mut self.rsp });
+        self.rsp.fill(0);
+        verdict
     }
 }
 

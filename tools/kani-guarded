@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""Runs one Kani harness through tools/kani-gate.sh and stops its cbmc if
+their resident memory passes the guard (post-M6 plan P4(c), T14).
+
+Usage: kani-guarded <crate> <harness> [guard-KiB] [--exact] [--log PATH]
+                    [--poll S] [--grace S]
+
+The guard reads cbmc's own VmRSS, not the container's memory.current, which
+also counts page cache and other jobs' builds. Only cbmc processes started
+under this run's gate count, and only they are stopped: a cbmc of another
+run (another container on the host shares this /proc view) is never
+touched. A cbmc past the guard is sent SIGTERM; if the gate has not exited
+`--grace` seconds later, it and everything under it get SIGKILL.
+
+The default guard is 30 GiB: one cbmc can exceed 28 GB, and the host has
+frozen under two (memory `kani-never-concurrent`). `--exact` is passed to
+`cargo kani`, whose --harness is otherwise a prefix match. The log defaults
+to build/kg-<crate>-<harness's last segment>.log.
+Last line: "<crate> <harness> rc=<n> <Kani's summary lines>"; exits with
+the gate's code, 1 if the guard stopped a run that still exited 0.
+SECUREOS_KANI_GATE replaces tools/kani-gate.sh and SECUREOS_KANI_CBMC the
+name prefix "cbmc": the fixtures' stub gate, and a stub cbmc name no real
+cbmc on the host can match even if the descendant filter broke.
+"""
+
+import argparse
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+GUARD_KIB = 30 * 1024 * 1024
+
+
+def read_procs(proc: pathlib.Path) -> dict:
+    """pid -> (ppid, argv[0], VmRSS KiB) for every readable process under a
+    /proc-shaped directory. A process that exits mid-read is skipped."""
+    procs = {}
+    for p in proc.iterdir():
+        if not p.name.isdigit():
+            continue
+        try:
+            argv0 = (p / "cmdline").read_bytes().split(b"\0")[0].decode(errors="replace")
+            status = dict(line.split(":", 1) for line in (p / "status").read_text().splitlines() if ":" in line)
+        except OSError:
+            continue
+        rss = int(status.get("VmRSS", "0 kB").split()[0])
+        procs[int(p.name)] = (int(status.get("PPid", "0").split()[0]), argv0, rss)
+    return procs
+
+
+def descendants(procs: dict, root: int) -> set:
+    children = {}
+    for pid, (ppid, _, _) in procs.items():
+        children.setdefault(ppid, []).append(pid)
+    seen, todo = set(), [root]
+    while todo:
+        for c in children.get(todo.pop(), []):
+            if c not in seen:
+                seen.add(c)
+                todo.append(c)
+    return seen
+
+
+def cbmc_over_guard(procs: dict, gate: int, guard: int, name: str = "cbmc") -> tuple:
+    """(summed VmRSS of cbmc under `gate`, the cbmc pids to stop or [] when
+    the sum does not pass `guard`). cbmc is any process whose argv[0]'s
+    basename starts with `name`."""
+    pids = sorted(p for p in descendants(procs, gate) if os.path.basename(procs[p][1]).startswith(name))
+    rss = sum(procs[p][2] for p in pids)
+    return rss, (pids if rss > guard else [])
+
+
+def signal_all(pids, sig):
+    for pid in pids:
+        try:
+            os.kill(pid, sig)
+        except ProcessLookupError:
+            pass
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="kani-guarded")
+    ap.add_argument("crate")
+    ap.add_argument("harness")
+    ap.add_argument("guard", type=int, nargs="?", default=GUARD_KIB, help="KiB (default 30 GiB)")
+    ap.add_argument("--exact", action="store_true")
+    ap.add_argument("--log", type=pathlib.Path)
+    ap.add_argument("--poll", type=float, default=5.0)
+    ap.add_argument("--grace", type=float, default=60.0)
+    args = ap.parse_args()
+    log = args.log or ROOT / f"build/kg-{args.crate}-{args.harness.split('::')[-1]}.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    gate_cmd = os.environ.get("SECUREOS_KANI_GATE", str(ROOT / "tools/kani-gate.sh"))
+    cbmc_name = os.environ.get("SECUREOS_KANI_CBMC", "cbmc")
+    cmd = [gate_cmd, "-p", args.crate, "--harness", args.harness] + (["--exact"] if args.exact else [])
+    with open(log, "w") as out:
+        gate = subprocess.Popen(cmd, cwd=ROOT, stdout=out, stderr=subprocess.STDOUT)
+    stopped = False
+    while gate.poll() is None:
+        rss, pids = cbmc_over_guard(read_procs(pathlib.Path("/proc")), gate.pid, args.guard, cbmc_name)
+        if pids:
+            signal_all(pids, signal.SIGTERM)
+            print(f"GUARD {args.crate} {args.harness}: cbmc RSS {rss} KiB ({rss / 1048576:.1f} GiB)"
+                  f" > {args.guard} KiB, stopped", flush=True)
+            stopped = True
+            try:
+                gate.wait(timeout=args.grace)
+            except subprocess.TimeoutExpired:
+                rest = descendants(read_procs(pathlib.Path("/proc")), gate.pid)
+                signal_all([gate.pid, *rest], signal.SIGKILL)
+            break
+        try:
+            gate.wait(timeout=args.poll)
+        except subprocess.TimeoutExpired:
+            pass
+    rc = gate.wait()
+    rc = 128 - rc if rc < 0 else rc
+    summary = [line for line in log.read_text(errors="replace").splitlines()
+               if "Complete" in line or "cover properties" in line]
+    print(f"{args.crate} {args.harness} rc={rc} {' '.join(summary)}")
+    return 1 if stopped and rc == 0 else rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

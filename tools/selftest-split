@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+"""Runs tools/check-selftest split into partitions, on one host or several,
+and merges their logs into one verdict (post-M6 plan P4(b), T12).
+
+Usage:
+  selftest-split plan [--instances N]
+  selftest-split pack <out.tar>
+  selftest-split run <partition> [--instances N] [--instance I] [--inputs <tar>] [--log-dir DIR]
+  selftest-split merge <log> ...
+
+Partitions, from each case's make targets and their closure over the
+Makefile (prerequisites and `$(MAKE)` recipe calls), first match wins:
+  qemu    the case reaches a QEMU boot (`test`)            serial
+  solver  the case runs Kani or Verus                      serial
+  pds     the case builds PDs into the shared pd_target    serial
+  rest    everything else, round-robin over N instances    parallel
+Every instance is one check-selftest run with its own TMPDIR, so its own
+warm tree and lock. qemu and pds hold a host-wide lock while they run:
+both build into $(HOME)/.cache/secureos.
+
+On another host: check out the same commit, `pack` on the `make check` host,
+copy the tar over and `run <partition> --inputs <tar>` (build/counts and the
+proof caches; the cache keys use relative paths, so the copies hold). Then
+`merge` every instance's log on one host at that commit: it requires every
+case run exactly once, every instance exited and printed SELFTEST-LAYERS,
+and one commit throughout. It prints "SELFTEST-LAYERS <n>" like a full run.
+"""
+
+import argparse
+import fcntl
+import hashlib
+import importlib.machinery
+import importlib.util
+import io
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+SELFTEST = ROOT / "tools/check-selftest"
+PARTITIONS = ("qemu", "solver", "pds", "rest")
+# A case whose closure holds one of these targets belongs to that partition.
+MARKERS = {"qemu": {"test", "run"}, "solver": {"kani", "verus"}, "pds": {"pds"}}
+INPUTS = ("counts", "kani-cache", "verus-cache")
+# Outside the checkout, like check-selftest's own scratch dir (cargo would
+# merge the checkout's .cargo/config.toml into the copy's), and kept, so
+# each instance's warm tree stays warm across runs.
+WORK = pathlib.Path(tempfile.gettempdir()) / "secureos-selftest-split"
+PD_LOCK = pathlib.Path.home() / ".cache/secureos/selftest-split-pd.lock"
+
+
+def load_selftest():
+    loader = importlib.machinery.SourceFileLoader("check_selftest", str(SELFTEST))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+def makefile_deps(text: str, rule_prerequisites) -> dict:
+    """check-selftest's prerequisites, plus each recipe's `$(MAKE) <target>`
+    calls (ct-shape's `$(MAKE) pds`, repro's `$(MAKE) image`). Variable
+    assignments and flags in a call are not targets."""
+    deps = rule_prerequisites(text)
+    target = None
+    for line in text.replace("\\\n", " ").splitlines():
+        # make keeps reading a recipe across blank and column-0 comment lines.
+        if not line.startswith("\t"):
+            if line.strip() and not line.startswith("#"):
+                m = re.match(r"^([A-Za-z0-9_.-]+)\s*:(?!=)", line)
+                target = m.group(1) if m else None
+            continue
+        if target is None:
+            continue
+        for call in re.findall(r"\$\(MAKE\)((?:[ \t]+[^\s;|&<>]+)*)", line):
+            deps.setdefault(target, []).extend(
+                w for w in call.split() if "=" not in w and not w.startswith(("-", "$")))
+    return deps
+
+
+def classify(cases: dict, deps: dict, closure) -> dict:
+    """partition -> sorted case names. Targets carrying `=` are variable
+    overrides, not goals."""
+    parts = {p: [] for p in PARTITIONS}
+    for name in sorted(cases):
+        goals = [t for t in cases[name][0] if "=" not in t]
+        reached = set(closure(goals, deps))
+        part = next((p for p in PARTITIONS[:-1] if reached & MARKERS[p]), "rest")
+        parts[part].append(name)
+    return parts
+
+
+def instances(parts: dict, n: int) -> list:
+    """(partition, index, count, cases) for every instance: one per serial
+    partition, n for rest. Deterministic, so every host derives the same."""
+    out = [(p, 1, 1, parts[p]) for p in PARTITIONS[:-1] if parts[p]]
+    out += [("rest", i + 1, n, parts["rest"][i::n]) for i in range(n) if parts["rest"][i::n]]
+    return out
+
+
+def commit_id(root: pathlib.Path) -> str:
+    """HEAD, plus a digest of uncommitted changes (tracked diff and untracked
+    files) when the tree is dirty, so two hosts with different edits on one
+    commit do not merge."""
+    git = lambda *a: subprocess.run(["git", "-C", str(root), *a], capture_output=True, check=True).stdout
+    head = git("rev-parse", "HEAD").decode().strip()
+    diff = git("diff", "HEAD", "--binary")
+    others = git("ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
+    if not diff and others == [b""]:
+        return head
+    h = hashlib.sha256(diff)
+    for rel in filter(None, others):
+        p = root / rel.decode()
+        h.update(rel + b"\0" + (p.read_bytes() if p.is_file() and not p.is_symlink() else b""))
+    return f"{head}+dirty.{h.hexdigest()[:16]}"
+
+
+def selftest_parts(n: int):
+    st = load_selftest()
+    deps = makefile_deps((ROOT / "Makefile").read_text(), st.rule_prerequisites)
+    return st, classify(st.CASES, deps, st.closure), n
+
+
+def cmd_plan(args) -> int:
+    _, parts, n = selftest_parts(args.instances)
+    for part, i, count, names in instances(parts, n):
+        mode = "parallel" if part == "rest" else "serial"
+        print(f"{part} {i}/{count} {mode} {len(names)}: {' '.join(names)}")
+    return 0
+
+
+def cmd_pack(args) -> int:
+    missing = [d for d in INPUTS if not (ROOT / "build" / d).is_dir()]
+    if "counts" in missing:
+        print("selftest-split: build/counts missing; run `make check` first")
+        return 1
+    commit = commit_id(ROOT)
+    with tarfile.open(args.out, "w") as tar:
+        info = tarfile.TarInfo("commit")
+        info.size = len(commit) + 1
+        tar.addfile(info, io.BytesIO(commit.encode() + b"\n"))
+        for d in INPUTS:
+            if d not in missing:
+                tar.add(ROOT / "build" / d, arcname=d)
+    print(f"selftest-split: packed {', '.join(d for d in INPUTS if d not in missing)} at {commit}")
+    return 0
+
+
+def unpack(path: pathlib.Path, commit: str):
+    """build/{counts,kani-cache,verus-cache} replaced by the pack's. Refuses
+    a pack made at another commit, and any member outside those three."""
+    with tarfile.open(path) as tar:
+        members = tar.getmembers()
+        for m in members:
+            parts = pathlib.PurePosixPath(m.name).parts
+            if m.name == "commit" and m.isfile():
+                continue
+            if not parts or parts[0] not in INPUTS or ".." in parts or m.name.startswith("/") \
+                    or not (m.isfile() or m.isdir()):
+                raise SystemExit(f"selftest-split: {path}: refusing member {m.name!r}")
+        packed = tar.extractfile("commit").read().decode().strip()
+        if packed != commit:
+            raise SystemExit(f"selftest-split: {path} was packed at {packed}, this checkout is {commit}")
+        build = ROOT / "build"
+        for d in INPUTS:
+            shutil.rmtree(build / d, ignore_errors=True)
+        build.mkdir(exist_ok=True)
+        for m in members:
+            if m.name != "commit":
+                tar.extract(m, build, filter="data")
+
+
+def launch(part: str, i: int, count: int, names: list, commit: str, log_dir: pathlib.Path) -> tuple:
+    log = log_dir / f"{part}-{i}-of-{count}.log"
+    tmp = WORK / f"{part}-{i}-of-{count}"
+    tmp.mkdir(parents=True, exist_ok=True)
+    f = open(log, "w")
+    f.write(f"SELFTEST-SPLIT-INSTANCE {part} {i}/{count} commit={commit}\n")
+    f.write(f"SELFTEST-SPLIT-ASSIGNED {' '.join(names)}\n")
+    f.flush()
+    proc = subprocess.Popen([sys.executable, str(SELFTEST), *names], stdout=f, stderr=subprocess.STDOUT,
+                            env={**os.environ, "TMPDIR": str(tmp)})
+    return proc, f, log
+
+
+def cmd_run(args) -> int:
+    _, parts, n = selftest_parts(args.instances)
+    commit = commit_id(ROOT)
+    if args.inputs:
+        unpack(args.inputs, commit)
+    chosen = [x for x in instances(parts, n) if x[0] == args.partition and args.instance in (None, x[1])]
+    if not chosen:
+        print(f"selftest-split: no {args.partition} instance {args.instance or ''} at --instances {n}")
+        return 1
+    args.log_dir.mkdir(parents=True, exist_ok=True)
+    lock = None
+    if args.partition in ("qemu", "pds"):
+        PD_LOCK.parent.mkdir(parents=True, exist_ok=True)
+        lock = open(PD_LOCK, "w")
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print(f"selftest-split: waiting for {PD_LOCK}", flush=True)
+            fcntl.flock(lock, fcntl.LOCK_EX)
+    running = [launch(*x, commit, args.log_dir) for x in chosen]
+    rc = 0
+    for proc, f, log in running:
+        code = proc.wait()
+        f.write(f"SELFTEST-SPLIT-EXIT {code}\n")
+        f.close()
+        rc |= code != 0
+        print(f"selftest-split: {log} exit {code}")
+    return rc
+
+
+def merge(logs: dict, cases: set, commit: str) -> tuple:
+    """(problems, failed cases, passed count) over log name -> text. The
+    problems are what makes the logs not one full run; failures are cases
+    that ran and failed."""
+    problems, failed, passed, seen, commits = [], [], 0, {}, set()
+    for name, text in logs.items():
+        head = re.search(r"^SELFTEST-SPLIT-INSTANCE (\S+) (\S+) commit=(\S+)$", text, re.M)
+        if not head:
+            problems.append(f"{name}: not a selftest-split instance log")
+            continue
+        commits.add(head.group(3))
+        if head.group(3) != commit:
+            problems.append(f"{name}: ran commit {head.group(3)}, this checkout is {commit}")
+        exits = re.findall(r"^SELFTEST-SPLIT-EXIT (-?\d+)$", text, re.M)
+        layers = re.findall(r"^SELFTEST-LAYERS (\d+)$", text, re.M)
+        marks = re.findall(r"^SELFTEST-CASE (\S+) (ok|FAIL)$", text, re.M)
+        if len(exits) != 1:
+            problems.append(f"{name}: instance did not exit (crashed or still running)")
+        if len(layers) != 1:
+            problems.append(f"{name}: instance printed no SELFTEST-LAYERS (crashed or refused)")
+        elif int(layers[0]) != sum(r == "ok" for _, r in marks):
+            problems.append(f"{name}: SELFTEST-LAYERS {layers[0]} but {sum(r == 'ok' for _, r in marks)} cases ok")
+        if exits and int(exits[0]) != 0 and all(r == "ok" for _, r in marks):
+            problems.append(f"{name}: exit {exits[0]} with every case ok")
+        for case, result in marks:
+            seen.setdefault(case, []).append(name)
+            if result == "ok":
+                passed += 1
+            else:
+                failed.append(case)
+    if len(commits) > 1:
+        problems.append(f"instances ran different commits: {sorted(commits)}")
+    for case, where in sorted(seen.items()):
+        if len(where) > 1:
+            problems.append(f"{case}: ran {len(where)} times ({', '.join(where)})")
+    for case in sorted(cases - set(seen)):
+        problems.append(f"{case}: never ran")
+    for case in sorted(set(seen) - cases):
+        problems.append(f"{case}: not a case at this commit")
+    return problems, failed, passed
+
+
+def cmd_merge(args) -> int:
+    st = load_selftest()
+    logs = {str(p): p.read_text(errors="replace") for p in args.logs}
+    problems, failed, passed = merge(logs, set(st.CASES), commit_id(ROOT))
+    for p in problems:
+        print(f"selftest-split: {p}")
+    for case in failed:
+        print(f"selftest-split: FAIL {case}")
+    print(f"SELFTEST-LAYERS {passed}")
+    return 1 if problems or failed else 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="selftest-split")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("plan")
+    p.add_argument("--instances", type=int, default=4)
+    p = sub.add_parser("pack")
+    p.add_argument("out", type=pathlib.Path)
+    p = sub.add_parser("run")
+    p.add_argument("partition", choices=PARTITIONS)
+    p.add_argument("--instances", type=int, default=4, help="rest instances in the whole split")
+    p.add_argument("--instance", type=int, help="run only this one (1-based), e.g. on another host")
+    p.add_argument("--inputs", type=pathlib.Path, help="a `pack` tar from the make check host")
+    p.add_argument("--log-dir", type=pathlib.Path, default=ROOT / "build/selftest-split")
+    p = sub.add_parser("merge")
+    p.add_argument("logs", type=pathlib.Path, nargs="+")
+    args = ap.parse_args()
+    if getattr(args, "instances", 1) < 1:
+        ap.error("--instances must be at least 1")
+    return {"plan": cmd_plan, "pack": cmd_pack, "run": cmd_run, "merge": cmd_merge}[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

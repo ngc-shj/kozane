@@ -288,6 +288,17 @@ pub enum Event {
     /// `CostHighWater` bounds it). `tls` raises it: the signing latency it
     /// bears on its own budget (M6 plan C12, RM6-8).
     TlsSignHighWater { us: u32 },
+    /// The Rosenpass cookie gate engaged because uncookied InitHellos whose
+    /// exchange did not complete drained the unfinished meter, recorded
+    /// alongside `RpUnderLoad` so tests and operators can tell that trigger
+    /// from the meters (post-M6 plan P1, A1; never coalesced, raised only on
+    /// that edge).
+    RpUnfinishedLoad,
+    /// The key PD the producer calls unsealed its secrets but `tpm` could
+    /// not confirm the cap of PCR 8, so the key PD released nothing and the
+    /// producer halts (post-M6 plan P3). Raised after `KeyUnavailable`,
+    /// once per boot (an edge; never coalesced).
+    TpmCapFailed,
 }
 
 impl Event {
@@ -355,6 +366,8 @@ impl Event {
             Event::RpCookieSuppressed => 0x0051,
             Event::Ready => 0x0053,
             Event::BackendUnavailable => 0x0059,
+            Event::RpUnfinishedLoad => 0x005a,
+            Event::TpmCapFailed => 0x005b,
             Event::RpCostHighWater { .. } => COST_HIGH_WATER,
             Event::StackHighWater { .. } => STACK_HIGH_WATER,
             Event::Halted { .. } => HALTED,
@@ -375,7 +388,7 @@ impl Event {
 
     /// Every variant except the parameterised `FrameDropped`, `TcpLimited`
     /// and `tls` kinds and the value-carrying ones (`Event::value` is `Some`).
-    pub const FIXED: [Event; 62] = [
+    pub const FIXED: [Event; 64] = [
         Event::ArpReplied,
         Event::UdpEchoed,
         Event::RingCorrupt,
@@ -438,6 +451,8 @@ impl Event {
         Event::RpCookieSuppressed,
         Event::Ready,
         Event::BackendUnavailable,
+        Event::RpUnfinishedLoad,
+        Event::TpmCapFailed,
     ];
 
     /// Display name; exhaustive, so a new variant fails to compile here.
@@ -505,6 +520,8 @@ impl Event {
             Event::RpCookieSuppressed => "RpCookieSuppressed",
             Event::Ready => "Ready",
             Event::BackendUnavailable => "BackendUnavailable",
+            Event::RpUnfinishedLoad => "RpUnfinishedLoad",
+            Event::TpmCapFailed => "TpmCapFailed",
             Event::RpCostHighWater { .. } => "RpCostHighWater",
             Event::StackHighWater { .. } => "StackHighWater",
             Event::Halted { .. } => "Halted",
@@ -533,11 +550,13 @@ impl Event {
             | Event::RpPqSyncDead
             | Event::RpUnderLoad
             | Event::RpLoadCleared
+            | Event::RpUnfinishedLoad
             | Event::RpCookieSecretExpired
             | Event::RpCookieSecretUnavailable
             | Event::RpCostHighWater { .. }
             | Event::StackHighWater { .. }
             | Event::Ready
+            | Event::TpmCapFailed
             | Event::Halted { .. }
             | Event::KeyUnavailable { .. }
             | Event::KeyStackHighWater { .. }
@@ -687,6 +706,8 @@ impl Event {
             Event::RpCookieSuppressed => 59,
             Event::Ready => 60,
             Event::BackendUnavailable => 61,
+            Event::RpUnfinishedLoad => 62,
+            Event::TpmCapFailed => 63,
             Event::RpCostHighWater { .. } => COST_HIGH_WATER_SLOT,
             Event::StackHighWater { .. } => STACK_HIGH_WATER_SLOT,
             Event::Halted { .. } => HALTED_SLOT,
@@ -712,7 +733,7 @@ impl Event {
     }
 }
 
-const FIXED_SLOTS: usize = 62;
+const FIXED_SLOTS: usize = 64;
 const COST_HIGH_WATER_SLOT: usize = FIXED_SLOTS + MAX_DROP_REASON as usize + 1;
 const STACK_HIGH_WATER_SLOT: usize = COST_HIGH_WATER_SLOT + 1;
 const HALTED_SLOT: usize = STACK_HIGH_WATER_SLOT + 1;

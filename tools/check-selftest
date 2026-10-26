@@ -7,6 +7,11 @@ target there, and require (a) a non-zero exit and (b) output naming the
 injected item. Run inside the dev container.
 
 Usage: check-selftest [layer ...]
+       check-selftest --dry [layer ...]
+
+--dry applies each injection to a fresh copy and runs nothing: an anchor
+that no longer applies fails there in seconds (post-M6 plan T16), before a
+real run spends hours to reach it.
 """
 
 import fcntl
@@ -159,7 +164,7 @@ CASES_FOR_GATE = {
     "clean-counts": {"stale-counts", "check-propagation"},
     # pins runs the package checker fixtures; package-debug drives the real target.
     "pins": {"pins", "package-debug", "package-waiver", "package-waiver-removed", "mkcert-constraints",
-             "l14-constructor", "l14-codepoint", "finished-ct-eq", "c13-pass-due-pin"},
+             "l14-constructor", "l14-codepoint", "finished-ct-eq", "c13-pass-due-pin", "cap-barrier-pin"},
     "lint": {"lint"},
     "audit": {"audit"},
     "lint-pds": {"lint-pds", "tls-audit-names"},
@@ -168,7 +173,8 @@ CASES_FOR_GATE = {
              "rotate-before-max-age", "net-buffers-equal", "l8-stale", "l8-expiry-tick", "l8-order",
              "rp-domain-label", "rp-mac-always", "c2-hello-burst", "c2-hello-interval", "c2-boot-spkm",
              "c2-boot-kat", "c4-hello-src", "c4-hello-global", "c4-conf-src", "c4-conf-global", "c4-type-filter",
-             "rp-cookie-domain", "rp-legacy-probe", "rp-conf-share", "rp-awaited", "rp-proven-reserve", "rp-sid-binding", "rp-nat",
+             "rp-cookie-domain", "rp-legacy-probe", "rp-unfinished-trigger", "rp-unfinished-boundary",
+             "rp-unfinished-refill", "rp-unfinished-refund", "rp-conf-share", "rp-awaited", "rp-proven-reserve", "rp-sid-binding", "rp-nat",
              "rp-cookie-offload", "rp-tx-tier", "rp-reply-fifo", "rp-reply-order", "rp-reply-dst", "rp-sync-sticky",
              "mce-fresh-draw", "c2-tcp-checksum", "c2-syn-fin", "c2-tls-egress-src", "c2-tls-tier", "c2-syn-src-bucket", "c2-syn-global-bucket",
              "c5-tls-static-dh", "c5-k-prime", "c5-nonce-cap", "c5-cv-content", "c5-d5-codes", "c5-syn-burst",
@@ -198,10 +204,11 @@ CASES_FOR_GATE = {
              "measure-range2-wrap", "measure-version", "measure-halt", "measure-poweroff", "measure-ctrlc", "key-wipe", "sealed-pcr-unbound", "sealed-srk-name", "sealed-cap", "tpm-proxy-hmac",
              "integration", "integration-count", "integration-residue", "integration-cookie",
              "integration-pq-residue", "l8-fallback", "integration-rp-src-meter", "integration-rotation",
-             "integration-expiry", "rp-cookie-gate", "integration-expiry-residue",
+             "integration-expiry", "rp-cookie-gate", "rp-rotating-spoof", "integration-expiry-residue",
              "tls-key-halt", "c8-head-wipe", "tls-scalar-scrub", "https-probe-canary", "tlskey-wipe",
              "proxy-pd-backend-room", "proxy-pd-backend-rst", "https-syn-flood", "https-per-source-cap",
-             "https-recycle-abort", "residue-wipe-state", "https-hello-lockstep"},
+             "https-recycle-abort", "residue-wipe-state", "https-hello-lockstep", "cap-failure-ignored",
+             "cap-barrier-skipped"},
     "repro": {"repro-path-leak"},
     "mir": {"mir-target-split", "mir-env-split", "mir-debug-split", "mir-feature-split"},
     "manifest": {"manifest"},
@@ -615,14 +622,22 @@ CASES = {
     # holding, the spoofed InitHellos are metered with the victim's, and its
     # exchange starves.
     "rp-cookie-gate": (["test", "it_boots=rp gate boot"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
-                                                "            self.refresh_load(now_ns);\n        }\n        now_ns < self.under_load_until_ns\n",
-                                                "            self.refresh_load(now_ns);\n        }\n        false\n"),
+                                                "            self.refresh_load(now_ns, RpLoadTrigger::Unfinished);\n        }\n        now_ns < self.under_load_until_ns\n",
+                                                "            self.refresh_load(now_ns, RpLoadTrigger::Unfinished);\n        }\n        false\n"),
                        # With the gate never on, a slow host fails the victim's
                        # exchange; a fast one (z1mn) completes it without the
                        # cookie path, and the cookie attribution fails. Both
                        # are this gate's failure, and print only on failure.
                        ("rp spoof: the victim's exchange did not complete under the spoof",
                         "rp spoof: no CookieReply reached the client's port")),
+    # The unfinished trigger end to end (post-M6 plan P1/A1, T2): without
+    # it, a closed-loop spoof from fresh sources, one per global interval,
+    # never engages load, and the bound on spoofed RespHellos runs out. rp
+    # spoof before it still passes: its per-IP refusals engage load.
+    "rp-rotating-spoof": (["test", "it_boots=rp gate boot"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                   "        if self.unfinished_low(now_ns) {\n",
+                                                   "        if false && self.unfinished_low(now_ns) {\n"),
+                          "rp rotating spoof: no unfinished engagement within"),
     # The full guest-RAM scan (M3b plan C7) red on its own: with the expiry
     # tick leaving the entry Live, `fresh` still refuses the stale PSK (the
     # expiry case passes), but the OSK stays in hs's table.
@@ -636,6 +651,28 @@ CASES = {
                                                  "                if !cookied && self.in_probe_window(now_ns) {\n",
                                                  "                if false && !cookied && self.in_probe_window(now_ns) {\n"),
                         "---- tests::a_spoofer_at_the_source_rate_gets_one_init_hello_to_pq_per_clearance stdout ----"),
+    # The unfinished trigger (post-M6 plan P1/A1), each part broken alone:
+    # the trigger removed, its boundary inverted so one interval left
+    # triggers, the refill doubled, and a refund on a completed exchange
+    # whose InitHello carried no mark (round 2 N1).
+    "rp-unfinished-trigger": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                       "        if self.unfinished_low(now_ns) {\n",
+                                                       "        if false && self.unfinished_low(now_ns) {\n"),
+                              "---- tests::spoofs_claiming_proven_endpoints_engage_load_through_the_unfinished_trigger stdout ----"),
+    "rp-unfinished-boundary": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                        "        !self.pq_dead && self.unfinished_credit(now_ns) < RP_UNFINISHED_INTERVAL_NS\n",
+                                                        "        !self.pq_dead && self.unfinished_credit(now_ns) <= RP_UNFINISHED_INTERVAL_NS\n"),
+                               "---- tests::one_unfinished_interval_left_is_no_trigger_and_less_is stdout ----"),
+    "rp-unfinished-refill": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                      "    /// nothing.\n    fn level_ns(&self, now_ns: u64) -> u64 {\n"
+                                                      "        self.budget_ns.saturating_add(now_ns.saturating_sub(self.last_ns)).min(Self::CAPACITY_NS)\n",
+                                                      "    /// nothing.\n    fn level_ns(&self, now_ns: u64) -> u64 {\n"
+                                                      "        self.budget_ns.saturating_add(now_ns.saturating_sub(self.last_ns).saturating_mul(2)).min(Self::CAPACITY_NS)\n"),
+                             "---- tests::the_unfinished_meter_saturates_at_0_and_at_its_capacity stdout ----"),
+    "rp-unfinished-refund": (["unit"], lambda t: edit(t, "crates/ingress-core/src/lib.rs",
+                                                      "        if core::mem::take(&mut a.counted) {\n",
+                                                      "        if core::mem::take(&mut a.counted) || true {\n"),
+                             "---- tests::a_cookied_exchange_completing_refunds_nothing stdout ----"),
     "integration-expiry": (["test", "it_boots=wireguard"], lambda t: edit(t, "crates/hs-core/src/lib.rs",
                                                     "if now_ns.saturating_sub(*installed_at) < REJECT_AFTER_TIME_NS =>",
                                                     "if now_ns.saturating_sub(*installed_at) < REJECT_AFTER_TIME_NS - 20_000_000_000 =>"),
@@ -701,10 +738,26 @@ CASES = {
         "        if r.name != self.envelope.srk_name() {\n            return Err(Cause::SrkName);\n        }\n", ""),
                         re.compile(r"FAIL \[sealed boot\]: Fail: foreign TPM: hs audited KeyUnavailable code=\d+, "
                                    r"want SrkMismatch")),
-    # The cap: tpm never extends PCR 8 after both clients finished.
+    # The cap: tpm never extends PCR 8 after the three clients finished, yet
+    # counts the cap confirmed (so the barrier lets every domain serve).
     "sealed-cap": (["test", "it_boots=sealed boot"], lambda t: edit(
-        t, "crates/pds/tpm/src/main.rs", "                        self.cap();\n", ""),
+        t, "crates/tpm2-wire/src/gate.rs", "            if extend_confirmed(device.attempt(",
+        "            if true || extend_confirmed(device.attempt("),
                    re.compile(r"FAIL \[sealed boot\]: Fail: cap: PCR 8 after the boot is [0-9a-f]{64} \(uncapped\)")),
+    # Post-M6 plan P3: tpm answers a failed cap as confirmed, to the Done
+    # that ran it and to the cap status; every domain serves.
+    "cap-failure-ignored": (["test", "it_boots=tpm cap failure"], lambda t: edit(
+        t, "crates/pds/tpm/src/main.rs",
+        "        CapVerdict::Failed => ipc::label(ipc::RSP_REFUSED, ipc::REFUSED_CAP_FAILED),\n",
+        "        CapVerdict::Failed => ipc::label(ipc::RSP_OK, 0),\n"),
+                            re.compile(r"FAIL \[tpm cap failure\]: Fail: tpm cap failure: (hs|pq|tls) became ready "
+                                       r"with the cap failed")),
+    # The barrier skipped: only the last client to finish (its Done ran
+    # the cap) learns of the failure; the other two serve.
+    "cap-barrier-skipped": (["test", "it_boots=tpm cap failure"], lambda t: edit(
+        t, "crates/tpm2/src/boot.rs", "=> cap_barrier(tpm, &mut rsp),", "=> Ok(()),"),
+                            re.compile(r"FAIL \[tpm cap failure\]: Fail: tpm cap failure: (hs|pq|tls) became ready "
+                                       r"with the cap failed")),
     # I10.1 on the A7 path: without the response HMAC check the flipped
     # outData decrypts to a wrong KEK, refused only by the envelope's AEAD.
     "tpm-proxy-hmac": (["test", "it_boots=tpm proxy"], lambda t: edit(
@@ -1233,9 +1286,8 @@ CASES = {
     # init stops on INIT_FAILED instead, which run.py names against the
     # reason it wants.
     "tls-key-halt": (["test", "it_boots=tls key failure"], lambda t: edit(t, "crates/pds/tls/src/main.rs",
-                                                                         "            audit.record(Event::KeyUnavailable { code });\n"
                                                                          "            audit.halt(halt::KEY_UNAVAILABLE)\n",
-                                                                         "            audit.record(Event::KeyUnavailable { code });\n"),
+                                                                         ""),
                      "tls key failure: tls halted with reason="),
     # C8: the head buffer wiped once rewritten (the proxy's early wipe) and
     # on close and release; without both the marker outlives the rewrite
@@ -1265,9 +1317,8 @@ CASES = {
     # close_notify); reported as its FIN, the client sees a clean end.
     "proxy-pd-backend-rst": (["test", "it_boots=https"], lambda t: edit(
         t, "crates/pds/tls/src/main.rs",
-        "            // Reset, refused or timed out: closed without a FIN.\n"
-        "            self.slot.backend_rst(self.out, self.now)\n",
-        "            self.slot.backend_fin(self.out, self.now)\n"),
+        "            BackendEnd::Rst => self.slot.backend_rst(self.out, self.now),\n",
+        "            BackendEnd::Rst => self.slot.backend_fin(self.out, self.now),\n"),
                              "s_client received close_notify after the backend's RST"),
     # T8: `tlskey` scrubs its stack after each TlsSign; without it the
     # scalar's copies in the dead P-256 frames (HACL's limbs: little-endian)
@@ -1339,6 +1390,10 @@ CASES = {
     "c13-pass-due-pin": (["pins"], lambda t: edit(t, "crates/pds/tls/src/main.rs",
                                                   " || tls_core::conn::pass_due(consumed, waiting)", ""),
                          "P21 crates/pds/tls/src/main.rs"),
+    # Post-M6 plan P3: the barrier call deleted from unseal.
+    "cap-barrier-pin": (["pins"], lambda t: edit(t, "crates/tpm2/src/boot.rs", "=> cap_barrier(tpm, &mut rsp),",
+                                                 "=> Ok(()),"),
+                        "P22 crates/tpm2/src/boot.rs"),
     # The lockstep (R2's root cause): every waiting ClientHello served in
     # step 2, so a pass computes all its flights before any leaves; the
     # probe's first-judged ordering predicate names it.
@@ -1484,7 +1539,8 @@ def rule_prerequisites(text: str) -> dict:
     """target -> plain-word prerequisites (normal and order-only) from the
     Makefile's rule heads. Variable references are skipped."""
     deps = {}
-    for line in text.splitlines():
+    # A backslash-newline continues the line, in a rule head as anywhere.
+    for line in text.replace("\\\n", " ").splitlines():
         m = re.match(r"^([A-Za-z0-9_.-]+)\s*:(?!=)\s*([^=#;]*)", line)
         if not m or line.startswith("\t"):
             continue
@@ -1601,7 +1657,44 @@ def run_case(name: str) -> bool:
     return ok
 
 
+def run_cases(names: list) -> list:
+    """Each case's result, in order. A case whose injection cannot apply
+    (edit()'s anchor miss and the other helpers' SystemExit) fails alone
+    instead of ending the run. "SELFTEST-CASE <name> ok|FAIL" marks each
+    for tools/selftest-split's merge."""
+    results = []
+    for name in names:
+        try:
+            ok = run_case(name)
+        except SystemExit as e:
+            print(f"FAIL {name}: {e}")
+            ok = False
+        print(f"SELFTEST-CASE {name} {'ok' if ok else 'FAIL'}", flush=True)
+        results.append(ok)
+    return results
+
+
+def dry_case(name: str) -> bool:
+    """The injection alone, on a freshly synced copy."""
+    if name == "check-propagation":
+        return True
+    tree = warm_tree()
+    try:
+        CASES[name][1](tree)
+    except SystemExit as e:
+        print(f"FAIL {name}: {e}")
+        return False
+    return True
+
+
+def needs_counts(name: str) -> bool:
+    """The case copies in the last real run's build/counts."""
+    return name == "check-propagation" or "manifest" in CASES[name][0]
+
+
 def main() -> int:
+    dry = sys.argv[1:2] == ["--dry"]
+    args = sys.argv[2:] if dry else sys.argv[1:]
     try:
         gates = check_gates()
     except GateParseError as e:
@@ -1616,7 +1709,15 @@ def main() -> int:
     if gates[:1] != ["clean-counts"]:
         print(f"selftest: `check` must run clean-counts first, runs {gates}")
         return 1
-    names = sys.argv[1:] or list(CASES)
+    names = args or list(CASES)
+    unknown = [n for n in names if n not in CASES]
+    if unknown:
+        print(f"selftest: no such case {unknown}")
+        return 1
+    if not dry and any(map(needs_counts, names)) and not (ROOT / "build/counts").is_dir():
+        print("selftest: build/counts missing; run `make check` first, or unpack the make check host's "
+              "(tools/selftest-split pack / run --inputs)")
+        return 1
     # One selftest at a time: the cases share the warm tree.
     WORK.mkdir(parents=True, exist_ok=True)
     lock = open(WORK / ".lock", "w")
@@ -1625,7 +1726,11 @@ def main() -> int:
     except BlockingIOError:
         print(f"selftest: another selftest holds {WORK}/.lock")
         return 1
-    results = [run_case(n) for n in names]
+    if dry:
+        results = [dry_case(n) for n in names]
+        print(f"SELFTEST-DRY {sum(results)} of {len(results)}")
+        return 0 if all(results) else 1
+    results = run_cases(names)
     print(f"SELFTEST-LAYERS {sum(results)}")
     return 0 if all(results) else 1
 

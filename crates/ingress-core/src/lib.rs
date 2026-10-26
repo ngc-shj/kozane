@@ -820,6 +820,9 @@ struct Awaited {
     conf_budget: u64,
     /// A matched InitConf was forwarded.
     conf_seen: bool,
+    /// Its InitHello spent the unfinished meter, refunded once when its
+    /// exchange completes (post-M6 plan P1, A1).
+    counted: bool,
 }
 
 /// A configured peer's last proven endpoint.
@@ -839,6 +842,82 @@ pub struct RpTickReport {
     pub secret_unavailable: bool,
     /// `RpLoadCleared`.
     pub left_load: bool,
+}
+
+/// Which trigger engaged load (`RpUnderLoad`; post-M6 plan P1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RpLoadTrigger {
+    /// The global InitHello meter below half, a refusal or the legacy probe.
+    Meters,
+    /// The unfinished meter below one interval (`RpUnfinishedLoad`).
+    Unfinished,
+}
+
+/// The unfinished meter (post-M6 plan P1, amendment A1): each uncookied
+/// InitHello spends one RP_UNFINISHED_INTERVAL_NS, and its exchange's
+/// completion refunds it. It counts events, not `pq` time, so it means the
+/// same on every host. The same shape as `Meter`: a budget in ns refilled
+/// 1 ns per ns from `last_ns`, saturating, written only at `sent` and the
+/// refund; `unfinished_credit` reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Unfinished {
+    budget_ns: u64,
+    last_ns: u64,
+    /// Ghost: every spend.
+    #[cfg(kani)]
+    spent_total: u128,
+    /// Ghost: every refund, saturated at the capacity or not.
+    #[cfg(kani)]
+    refunded_total: u128,
+}
+
+impl Default for Unfinished {
+    fn default() -> Self {
+        Self {
+            budget_ns: Self::CAPACITY_NS,
+            last_ns: 0,
+            #[cfg(kani)]
+            spent_total: 0,
+            #[cfg(kani)]
+            refunded_total: 0,
+        }
+    }
+}
+
+impl Unfinished {
+    const CAPACITY_NS: u64 = (RP_UNFINISHED_BURST as u64).saturating_mul(RP_UNFINISHED_INTERVAL_NS);
+
+    /// Budget at `now_ns`, refilled. A clock that goes backwards refills
+    /// nothing.
+    fn level_ns(&self, now_ns: u64) -> u64 {
+        self.budget_ns.saturating_add(now_ns.saturating_sub(self.last_ns)).min(Self::CAPACITY_NS)
+    }
+
+    /// Stores the budget refilled to `now_ns`, before a spend or a refund.
+    fn settle(&mut self, now_ns: u64) {
+        self.budget_ns = self.level_ns(now_ns);
+        self.last_ns = self.last_ns.max(now_ns);
+    }
+
+    /// Spends one interval, saturating at 0: it never refuses.
+    fn spend(&mut self, now_ns: u64) {
+        self.settle(now_ns);
+        self.budget_ns = self.budget_ns.saturating_sub(RP_UNFINISHED_INTERVAL_NS);
+        #[cfg(kani)]
+        {
+            self.spent_total = self.spent_total.saturating_add(1);
+        }
+    }
+
+    /// Gives one interval back, saturating at the capacity.
+    fn refund(&mut self, now_ns: u64) {
+        self.settle(now_ns);
+        self.budget_ns = self.budget_ns.saturating_add(RP_UNFINISHED_INTERVAL_NS).min(Self::CAPACITY_NS);
+        #[cfg(kani)]
+        {
+            self.refunded_total = self.refunded_total.saturating_add(1);
+        }
+    }
 }
 
 fn sid_pair(msg: &[u8]) -> Option<([u8; 4], [u8; 4])> {
@@ -912,6 +991,25 @@ pub const RP_AWAIT_SLOTS: usize = RP_HELLO_GLOBAL_BURST as usize
 /// InitConf link slots, and conf-global tokens, only a matched InitConf may
 /// take.
 pub const RP_CONF_AWAITED_RESERVED: usize = 4;
+/// The cost of one uncookied InitHello whose exchange does not complete
+/// (post-M6 plan P1, amendment A1); below one of these left in the
+/// unfinished meter is a load trigger. A spoof at most one per interval
+/// never engages it (R6 (7), narrowed).
+pub const RP_UNFINISHED_INTERVAL_NS: u64 = 60_000_000_000;
+/// The unfinished meter's capacity, in InitHellos: every peer's boot
+/// exchange at once.
+pub const RP_UNFINISHED_BURST: usize = RP_MAX_PEERS;
+
+// May not be weakened (post-M6 plan A1): an attack at the global InitHello
+// rate spends more than it refills, so it drains the unfinished meter and
+// engages load.
+const _: () = assert!(
+    RP_UNFINISHED_INTERVAL_NS > RP_HELLO_GLOBAL_INTERVAL_NS,
+    "A1: an attack at the global rate would never drain the unfinished meter"
+);
+// May not be weakened (post-M6 plan A1): headroom for boot fan-in beyond
+// the exchanges in flight.
+const _: () = assert!(RP_UNFINISHED_BURST > RP_HELLO_IN_FLIGHT, "A1: no unfinished-meter headroom for boot fan-in");
 
 // A spoofer at the per-source rate always lands in the probe window, so it
 // re-arms load instead of escaping it.
@@ -1008,9 +1106,17 @@ struct Entry {
     /// Where the forward came from: the only destination its reply may have.
     src: Endpoint,
     state: EntryState,
+    /// An uncookied InitHello: it spent the unfinished meter, until
+    /// `complete` moves the mark into its `Reply`.
+    counted: bool,
 }
 
-const NO_ENTRY: Entry = Entry { kind: RpKind::Hello, src: Endpoint { ip: [0; 4], port: 0 }, state: EntryState::AwaitingRecord };
+const NO_ENTRY: Entry = Entry {
+    kind: RpKind::Hello,
+    src: Endpoint { ip: [0; 4], port: 0 },
+    state: EntryState::AwaitingRecord,
+    counted: false,
+};
 
 /// The forwards sent to `pq` whose return `ingress` has not yet seen,
 /// oldest first. It is also the table of what `pq` may answer: each entry
@@ -1047,14 +1153,14 @@ impl InFlight {
         (0..self.len).filter(|i| self.get(*i).is_some_and(|e| e.kind == kind)).count()
     }
 
-    fn push(&mut self, kind: RpKind, src: Endpoint) -> bool {
+    fn push(&mut self, kind: RpKind, src: Endpoint, counted: bool) -> bool {
         if self.len >= RP_IN_FLIGHT {
             return false;
         }
         let Some(e) = self.entries.get_mut(self.head.wrapping_add(self.len) % RP_IN_FLIGHT) else {
             return false;
         };
-        *e = Entry { kind, src, state: EntryState::AwaitingRecord };
+        *e = Entry { kind, src, state: EntryState::AwaitingRecord, counted };
         self.len = self.len.saturating_add(1);
         true
     }
@@ -1100,9 +1206,10 @@ pub struct RpGate<const N: usize> {
     under_load_until_ns: u64,
     /// Load as last announced, so `RpUnderLoad` and `RpLoadCleared` alternate.
     in_load: bool,
-    /// Load entered and not yet taken by the PD.
-    entered_load: bool,
+    /// Load entered, by this trigger, and not yet taken by the PD.
+    entered_load: Option<RpLoadTrigger>,
     life: SecretLife,
+    unfinished: Unfinished,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1175,10 +1282,16 @@ pub fn rp_classify<'a, M: RpMac, K: RpCookieCheck, const N: usize>(
 
 impl<const N: usize> RpGate<N> {
     /// Whether load holds at `now_ns`: the global InitHello meter below half
-    /// is a trigger by itself; refusals refresh it through `refresh_load`.
+    /// and the unfinished meter below one interval are triggers by
+    /// themselves; refusals refresh it through `refresh_load`. Evaluated at
+    /// `now_ns`, so the tick sees it with no new transition (post-M6 plan
+    /// P1, S4).
     fn observe_load(&mut self, now_ns: u64) -> bool {
         if self.hello_global.below_half(now_ns) {
-            self.refresh_load(now_ns);
+            self.refresh_load(now_ns, RpLoadTrigger::Meters);
+        }
+        if self.unfinished_low(now_ns) {
+            self.refresh_load(now_ns, RpLoadTrigger::Unfinished);
         }
         now_ns < self.under_load_until_ns
     }
@@ -1190,12 +1303,24 @@ impl<const N: usize> RpGate<N> {
     }
 
     /// A trigger held: load holds until RP_UNDER_LOAD_AFTER_NS from now.
-    fn refresh_load(&mut self, now_ns: u64) {
+    fn refresh_load(&mut self, now_ns: u64, trigger: RpLoadTrigger) {
         self.under_load_until_ns = self.under_load_until_ns.max(now_ns.saturating_add(RP_UNDER_LOAD_AFTER_NS));
         if !self.in_load {
             self.in_load = true;
-            self.entered_load = true;
+            self.entered_load = Some(trigger);
         }
+    }
+
+    /// The unfinished meter's credit at `now_ns` (post-M6 plan P1, A1), a
+    /// pure read: refilled 1 ns per ns, within 0 and its capacity.
+    pub fn unfinished_credit(&self, now_ns: u64) -> u64 {
+        self.unfinished.level_ns(now_ns)
+    }
+
+    /// The unfinished trigger: less than one interval left and the path is
+    /// up (a dead path is idle).
+    fn unfinished_low(&self, now_ns: u64) -> bool {
+        !self.pq_dead && self.unfinished_credit(now_ns) < RP_UNFINISHED_INTERVAL_NS
     }
 
     /// An InitHello after its mac passed (M3b plan, "Load state", "Lanes").
@@ -1215,7 +1340,7 @@ impl<const N: usize> RpGate<N> {
             // I2: off load the cookie is never computed.
             let o = self.rp_forward_hello(now_ns, src, msg, false);
             if matches!(o, RpOutcome::RateLimited | RpOutcome::RingReserved) {
-                self.refresh_load(now_ns);
+                self.refresh_load(now_ns, RpLoadTrigger::Meters);
             }
             return o;
         }
@@ -1225,7 +1350,7 @@ impl<const N: usize> RpGate<N> {
         if !field_zero && secret == Secret::Usable && cookie.valid(src, msg) {
             let o = self.rp_forward_hello(now_ns, src, msg, true);
             if matches!(o, RpOutcome::RateLimited | RpOutcome::RingReserved) {
-                self.refresh_load(now_ns);
+                self.refresh_load(now_ns, RpLoadTrigger::Meters);
             }
             return o;
         }
@@ -1258,7 +1383,7 @@ impl<const N: usize> RpGate<N> {
             Ok(()) => {
                 // Off load (the only uncookied lane): the legacy probe.
                 if !cookied && self.in_probe_window(now_ns) {
-                    self.refresh_load(now_ns);
+                    self.refresh_load(now_ns, RpLoadTrigger::Meters);
                 }
                 RpOutcome::ForwardHello { src, msg, cookied }
             }
@@ -1364,7 +1489,13 @@ impl<const N: usize> RpGate<N> {
     /// destination for the configured peer `peer`, only if a matched
     /// InitConf of that exchange was forwarded (I6). `dst` is always the
     /// forward's stored source.
-    fn replied(&mut self, kind: RpKind, dst: Endpoint, peer: Option<u8>, msg: &[u8], now_ns: u64) {
+    ///
+    /// Unfinished meter (post-M6 plan P1, A1): a RespHello's awaited entry
+    /// stores `counted`, the mark `complete` moved off its InitHello; the
+    /// EmptyData of a matched `conf_seen` entry refunds one interval if it
+    /// carries the mark, and clears it (so a retransmitted InitConf's
+    /// EmptyData refunds nothing). Nothing else refunds.
+    fn replied(&mut self, kind: RpKind, dst: Endpoint, peer: Option<u8>, msg: &[u8], counted: bool, now_ns: u64) {
         match kind {
             RpKind::Hello => {
                 // RespHello: sidr ‖ sidi.
@@ -1377,7 +1508,7 @@ impl<const N: usize> RpGate<N> {
                 // A full table of live entries records nothing; it never
                 // evicts one (RP_AWAIT_SLOTS bounds the live ones).
                 if let Some(a) = slot.and_then(|i| self.awaited.get_mut(i)) {
-                    *a = Some(Awaited { ep: dst, sidi, sidr, at: now_ns, conf_budget: RP_CONF_SRC_BURST, conf_seen: false });
+                    *a = Some(Awaited { ep: dst, sidi, sidr, at: now_ns, conf_budget: RP_CONF_SRC_BURST, conf_seen: false, counted });
                 }
             }
             RpKind::Conf => {
@@ -1388,6 +1519,7 @@ impl<const N: usize> RpGate<N> {
                 else {
                     return;
                 };
+                self.refund(i, now_ns);
                 let Some(slot) = self.proven.get_mut(usize::from(peer)) else { return };
                 let credit = slot.filter(|p| p.ep == dst).map_or(Meter::full_at(now_ns), |p| p.credit);
                 *slot = Some(Proven { ep: dst, at: now_ns, credit });
@@ -1395,6 +1527,15 @@ impl<const N: usize> RpGate<N> {
                     *a = None;
                 }
             }
+        }
+    }
+
+    /// Refunds awaited entry `i`'s exchange, which completed, if it carries
+    /// the mark, and clears the mark.
+    fn refund(&mut self, i: usize, now_ns: u64) {
+        let Some(Some(a)) = self.awaited.get_mut(i) else { return };
+        if core::mem::take(&mut a.counted) {
+            self.unfinished.refund(now_ns);
         }
     }
 
@@ -1413,9 +1554,10 @@ impl<const N: usize> RpGate<N> {
         report
     }
 
-    /// Whether load was entered since the last call (`RpUnderLoad`).
-    pub fn take_load_entered(&mut self) -> bool {
-        core::mem::take(&mut self.entered_load)
+    /// Whether load was entered since the last call (`RpUnderLoad`), and by
+    /// which trigger (`RpUnfinishedLoad` for the unfinished meter).
+    pub fn take_load_entered(&mut self) -> Option<RpLoadTrigger> {
+        self.entered_load.take()
     }
 
     /// Whether the expiry backstop fired for the first time since a valid
@@ -1437,10 +1579,15 @@ impl<const N: usize> RpGate<N> {
     /// Records a forward the PD just put on the link, as awaiting its
     /// record. Only a send that succeeded is recorded, so a failed send
     /// leaves nothing. A forward with no room to be recorded cannot be
-    /// paired with its record, which stops the `pq` path.
-    pub fn sent(&mut self, kind: RpKind, src: Endpoint) {
-        if !self.in_flight.push(kind, src) {
+    /// paired with its record, which stops the `pq` path. An uncookied
+    /// InitHello spends one interval of the unfinished meter and is marked
+    /// counted (post-M6 plan P1, A1).
+    pub fn sent(&mut self, kind: RpKind, src: Endpoint, cookied: bool, now_ns: u64) {
+        let counted = kind == RpKind::Hello && !cookied;
+        if !self.in_flight.push(kind, src, counted) {
             self.pq_dead = true;
+        } else if counted {
+            self.unfinished.spend(now_ns);
         }
     }
 
@@ -1448,7 +1595,8 @@ impl<const N: usize> RpGate<N> {
     /// waiting for one. A `Reply` must be that forward's reply type and goes
     /// to its stored source, never to anything the record says. An extra
     /// record, a wrong type, a malformed record or an index outside
-    /// `peers` stops the `pq` path.
+    /// `peers` stops the `pq` path. The forward's counted mark moves into
+    /// the `Reply` (and off the entry).
     pub fn complete<'r>(&mut self, record: &'r [u8], peers: usize) -> Result<Completion<'r>, SyncDead> {
         if self.pq_dead {
             return Err(SyncDead);
@@ -1458,6 +1606,7 @@ impl<const N: usize> RpGate<N> {
             match r {
                 msgs::RpReply::NoReply => {
                     e.state = EntryState::CompletedNoReply;
+                    e.counted = false;
                     Some(None)
                 }
                 msgs::RpReply::Reply { index, msg } => {
@@ -1467,13 +1616,13 @@ impl<const N: usize> RpGate<N> {
                         _ => return None,
                     };
                     e.state = EntryState::CompletedReply;
-                    Some(Some((e.src, e.kind, peer)))
+                    Some(Some((e.src, e.kind, peer, core::mem::take(&mut e.counted))))
                 }
             }
         });
         let reply = record.get(2..).unwrap_or(&[]);
         match pairing {
-            Some(Some((dst, kind, peer))) => Ok(Completion::Reply { dst, kind, peer, msg: reply }),
+            Some(Some((dst, kind, peer, counted))) => Ok(Completion::Reply { dst, kind, peer, msg: reply, counted }),
             Some(None) => Ok(Completion::NoReply),
             None => {
                 self.pq_dead = true;
@@ -1510,8 +1659,9 @@ pub struct SyncDead;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Completion<'a> {
     /// Send `msg` to `dst`, the stored source of the forward it answers.
-    /// `peer` is the configured peer of an EmptyData.
-    Reply { dst: Endpoint, kind: RpKind, peer: Option<u8>, msg: &'a [u8] },
+    /// `peer` is the configured peer of an EmptyData. `counted` is the
+    /// forward's unfinished-meter mark, for `replied` to store.
+    Reply { dst: Endpoint, kind: RpKind, peer: Option<u8>, msg: &'a [u8], counted: bool },
     NoReply,
 }
 
@@ -1576,12 +1726,12 @@ pub fn sync_pq<T: PqSync, const N: usize>(gate: &mut RpGate<N>, io: &mut T, peer
             return SyncOutcome::DiedNow;
         };
         match gate.complete(record, peers) {
-            Ok(Completion::Reply { dst, kind, peer, msg }) => {
+            Ok(Completion::Reply { dst, kind, peer, msg, counted }) => {
                 // Only a reply that went out feeds the endpoint state, and
                 // always with the stored source (T19, R4-F1).
                 if io.transmit(dst, msg) {
                     relayed = relayed.saturating_add(1);
-                    gate.replied(kind, dst, peer, msg, now_ns);
+                    gate.replied(kind, dst, peer, msg, counted, now_ns);
                 }
             }
             Ok(Completion::NoReply) => {}

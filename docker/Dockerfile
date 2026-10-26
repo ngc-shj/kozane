@@ -1,10 +1,13 @@
-# Development image for secureos. Host and target are both aarch64.
-# Every downloaded artifact is pinned by sha256; the Microkit SDK is also
-# checked against the release key in keys/ (fingerprint pinned below).
+# Development image for secureos. The target is aarch64; the host is
+# aarch64 (the reference) or x86_64, chosen by BuildKit's TARGETARCH (arm64
+# or amd64; post-M6 plan P5). Every downloaded artifact is pinned by sha256
+# per host architecture; the Microkit SDK is also checked against the
+# release key in keys/ (fingerprint pinned below).
 
 # Shared by the oracle stage and the dev image.
 ARG RUSTUP_VERSION=1.29.1
-ARG RUSTUP_SHA256=15f6e4ce9f583b929c996c91562bad6d4454f3281de858b02cdfdef615fac433
+ARG RUSTUP_SHA256_ARM64=15f6e4ce9f583b929c996c91562bad6d4454f3281de858b02cdfdef615fac433
+ARG RUSTUP_SHA256_AMD64=dda7234360b7f578ca8b0ddcb80145646fa61a67c1720a5abc7051b35c9fcb71
 
 # trixie: Kani 0.68 release binaries need glibc >= 2.39.
 FROM debian:trixie@sha256:913f6706df59a68922d1dd08f78c2476560a8d367897200a6005b00e5f67c2d5 AS base
@@ -58,12 +61,19 @@ RUN apt-get update -q && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 ARG RUSTUP_VERSION
-ARG RUSTUP_SHA256
+ARG RUSTUP_SHA256_ARM64
+ARG RUSTUP_SHA256_AMD64
+ARG TARGETARCH
 # master's rust-toolchain.toml; 0.2.3 pins none and builds with the same one.
 ARG RP_TOOLCHAIN=1.93.1
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
 RUN set -eux; \
-    curl -sSfL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/aarch64-unknown-linux-gnu/rustup-init"; \
+    case "$TARGETARCH" in \
+        arm64) host=aarch64-unknown-linux-gnu RUSTUP_SHA256="$RUSTUP_SHA256_ARM64";; \
+        amd64) host=x86_64-unknown-linux-gnu RUSTUP_SHA256="$RUSTUP_SHA256_AMD64";; \
+        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1;; \
+    esac; \
+    curl -sSfL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${host}/rustup-init"; \
     echo "$RUSTUP_SHA256  /tmp/rustup-init" | sha256sum -c -; \
     chmod +x /tmp/rustup-init; \
     /tmp/rustup-init -y --no-modify-path --default-toolchain none --profile minimal; \
@@ -108,13 +118,23 @@ RUN apt-get update -q && apt-get install -y --no-install-recommends \
     unzip \
     && rm -rf /var/lib/apt/lists/*
 ARG RUSTUP_VERSION
-ARG RUSTUP_SHA256
+ARG RUSTUP_SHA256_ARM64
+ARG RUSTUP_SHA256_AMD64
+ARG TARGETARCH
 ARG VERUS_COMMIT=426d8b01e7ffb910a36c15e1f870ff985bb61eef
 ARG VERUS_SHA256=40be6fb66e457ca71210cb85b3febf3f43fce106df8db3caf3c18df349ab0b93
-ARG Z3_SHA256=87fcd963d3eecb0f12cf1c3ef0ad74e84a3a7bd3caed5d94445645ef94ae6274
+ARG Z3_SHA256_ARM64=87fcd963d3eecb0f12cf1c3ef0ad74e84a3a7bd3caed5d94445645ef94ae6274
+ARG Z3_SHA256_AMD64=7288c49a5bd6dbafd7b0b0d1f65956b91672da24b08f09242919af159be3418e
 ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
 RUN set -eux; \
-    curl -sSfL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/aarch64-unknown-linux-gnu/rustup-init"; \
+    case "$TARGETARCH" in \
+        arm64) host=aarch64-unknown-linux-gnu RUSTUP_SHA256="$RUSTUP_SHA256_ARM64" \
+            z3=z3-4.16.0-arm64-glibc-2.38 Z3_SHA256="$Z3_SHA256_ARM64";; \
+        amd64) host=x86_64-unknown-linux-gnu RUSTUP_SHA256="$RUSTUP_SHA256_AMD64" \
+            z3=z3-4.16.0-x64-glibc-2.39 Z3_SHA256="$Z3_SHA256_AMD64";; \
+        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1;; \
+    esac; \
+    curl -sSfL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${host}/rustup-init"; \
     echo "$RUSTUP_SHA256  /tmp/rustup-init" | sha256sum -c -; \
     chmod +x /tmp/rustup-init; \
     /tmp/rustup-init -y --no-modify-path --default-toolchain none --profile minimal; \
@@ -133,10 +153,10 @@ RUN set -eux; \
     (cd /src/verus && rustup toolchain install); \
     (cd /src/verus/tools/vargo && cargo fetch --locked); \
     (cd /src/verus/source && cargo fetch --locked); \
-    curl -sSfL -o /tmp/z3.zip https://github.com/Z3Prover/z3/releases/download/z3-4.16.0/z3-4.16.0-arm64-glibc-2.38.zip; \
+    curl -sSfL -o /tmp/z3.zip "https://github.com/Z3Prover/z3/releases/download/z3-4.16.0/${z3}.zip"; \
     echo "$Z3_SHA256  /tmp/z3.zip" | sha256sum -c -; \
     unzip -q /tmp/z3.zip -d /tmp/z3; \
-    install -m 0755 /tmp/z3/z3-4.16.0-arm64-glibc-2.38/bin/z3 /src/verus/source/z3; \
+    install -m 0755 "/tmp/z3/${z3}/bin/z3" /src/verus/source/z3; \
     rm -rf /tmp/z3 /tmp/z3.zip
 RUN --network=none set -eux; \
     (cd /src/verus/tools/vargo && cargo build --release --locked --offline); \
@@ -200,10 +220,16 @@ RUN set -eux; \
     curl -sSfL -o /opt/u-boot/u-boot-${UBOOT_VERSION}.tar.bz2 "https://ftp.denx.de/pub/u-boot/u-boot-${UBOOT_VERSION}.tar.bz2"; \
     echo "$UBOOT_SHA256  /opt/u-boot/u-boot-${UBOOT_VERSION}.tar.bz2" | sha256sum -c -
 
-ARG ARM_GNU_URL=https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-aarch64-aarch64-none-elf.tar.xz
-ARG ARM_GNU_SHA256=c4f0daab43f78e0d56ec2bdad76b98a0223ce12ce7fc51a6ce82f9cc6c6dfba0
+ARG ARM_GNU_SHA256_ARM64=c4f0daab43f78e0d56ec2bdad76b98a0223ce12ce7fc51a6ce82f9cc6c6dfba0
+ARG ARM_GNU_SHA256_AMD64=eb54c4727440d03199a6af9a6d021e77f45410cad39effce4e5a1c10a88b7f04
+ARG TARGETARCH
 RUN set -eux; \
-    curl -sSfL -o /tmp/gcc.tar.xz "$ARM_GNU_URL"; \
+    case "$TARGETARCH" in \
+        arm64) host=aarch64 ARM_GNU_SHA256="$ARM_GNU_SHA256_ARM64";; \
+        amd64) host=x86_64 ARM_GNU_SHA256="$ARM_GNU_SHA256_AMD64";; \
+        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1;; \
+    esac; \
+    curl -sSfL -o /tmp/gcc.tar.xz "https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-${host}-aarch64-none-elf.tar.xz"; \
     echo "$ARM_GNU_SHA256  /tmp/gcc.tar.xz" | sha256sum -c -; \
     mkdir -p /opt/gcc-aarch64-none-elf; \
     tar -xJf /tmp/gcc.tar.xz -C /opt/gcc-aarch64-none-elf --strip-components=1; \
@@ -232,14 +258,21 @@ RUN set -eux; \
 ENV PATH=/opt/qemu/bin:$PATH
 
 ARG MICROKIT_VERSION=2.3.1
-ARG MICROKIT_SHA256=979553f288e8e2c099dae8fbec86cbe2cfda2ca006ee36de8234649d6d23bbee
-ARG MICROKIT_ASC_SHA256=8c64fcd77ded111654e9df493232ae86891e7940918f80f72b7eaa5ea456f5b4
+ARG MICROKIT_SHA256_ARM64=979553f288e8e2c099dae8fbec86cbe2cfda2ca006ee36de8234649d6d23bbee
+ARG MICROKIT_ASC_SHA256_ARM64=8c64fcd77ded111654e9df493232ae86891e7940918f80f72b7eaa5ea456f5b4
+ARG MICROKIT_SHA256_AMD64=b1b285b8785db7557eba6d0665dd4fbf2f265ea5c0b39d6f91ae3dcc43d2c424
+ARG MICROKIT_ASC_SHA256_AMD64=b28f03edc09f5a4d55c2688a87f626e169fc36e8445c12664c060410b6211756
 ARG MICROKIT_KEY_FPR=FE91486443B0F4EB9ECC36524D868A34EDF3FDCA
 ENV MICROKIT_SDK=/opt/microkit/sdk
 COPY keys/microkit-release.asc /tmp/microkit-release.asc
 RUN set -eux; \
     cd /tmp; \
-    base="https://github.com/seL4/microkit/releases/download/${MICROKIT_VERSION}/microkit-sdk-${MICROKIT_VERSION}-linux-aarch64.tar.gz"; \
+    case "$TARGETARCH" in \
+        arm64) host=aarch64 MICROKIT_SHA256="$MICROKIT_SHA256_ARM64" MICROKIT_ASC_SHA256="$MICROKIT_ASC_SHA256_ARM64";; \
+        amd64) host=x86-64 MICROKIT_SHA256="$MICROKIT_SHA256_AMD64" MICROKIT_ASC_SHA256="$MICROKIT_ASC_SHA256_AMD64";; \
+        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1;; \
+    esac; \
+    base="https://github.com/seL4/microkit/releases/download/${MICROKIT_VERSION}/microkit-sdk-${MICROKIT_VERSION}-linux-${host}.tar.gz"; \
     curl -sSfL -o sdk.tar.gz "$base"; \
     curl -sSfL -o sdk.tar.gz.asc "$base.asc"; \
     echo "$MICROKIT_SHA256  sdk.tar.gz" | sha256sum -c -; \
@@ -263,9 +296,16 @@ USER dev
 
 # The toolchain itself is selected by rust-toolchain.toml in the repo.
 ARG RUSTUP_VERSION
-ARG RUSTUP_SHA256
+ARG RUSTUP_SHA256_ARM64
+ARG RUSTUP_SHA256_AMD64
+ARG TARGETARCH
 RUN set -eux; \
-    curl -sSfL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/aarch64-unknown-linux-gnu/rustup-init"; \
+    case "$TARGETARCH" in \
+        arm64) host=aarch64-unknown-linux-gnu RUSTUP_SHA256="$RUSTUP_SHA256_ARM64";; \
+        amd64) host=x86_64-unknown-linux-gnu RUSTUP_SHA256="$RUSTUP_SHA256_AMD64";; \
+        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1;; \
+    esac; \
+    curl -sSfL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${host}/rustup-init"; \
     echo "$RUSTUP_SHA256  /tmp/rustup-init" | sha256sum -c -; \
     chmod +x /tmp/rustup-init; \
     /tmp/rustup-init -y --no-modify-path --default-toolchain none --profile minimal; \
@@ -282,15 +322,21 @@ RUN rustup toolchain install "$PD_TOOLCHAIN" --profile minimal --component rust-
 # release bundle verified by sha256, so `cargo kani setup` downloads nothing
 # except its pinned toolchain through rustup.
 ARG KANI_VERSION=0.68.0
-ARG KANI_BUNDLE_SHA256=0042d2688bf1550270def4a79c96aaeea138631818cb4ab5480120f2d51a942c
+ARG KANI_BUNDLE_SHA256_ARM64=0042d2688bf1550270def4a79c96aaeea138631818cb4ab5480120f2d51a942c
+ARG KANI_BUNDLE_SHA256_AMD64=32e2b484d73ede0bbf64a2cf0879c4259422497d8aec4ee67d448de9ae7843d3
 ARG CARGO_BOLERO_VERSION=0.13.5
 ARG CARGO_AUDIT_VERSION=0.22.2
 # Host tools are built with a pinned stable toolchain (no rust-toolchain.toml at build time).
 ARG TOOLS_RUST=1.97.1
 RUN set -eux; \
+    case "$TARGETARCH" in \
+        arm64) host=aarch64-unknown-linux-gnu KANI_BUNDLE_SHA256="$KANI_BUNDLE_SHA256_ARM64";; \
+        amd64) host=x86_64-unknown-linux-gnu KANI_BUNDLE_SHA256="$KANI_BUNDLE_SHA256_AMD64";; \
+        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1;; \
+    esac; \
     rustup toolchain install "$TOOLS_RUST" --profile minimal; \
     cargo +"$TOOLS_RUST" install --locked kani-verifier --version "$KANI_VERSION"; \
-    curl -sSfL -o /tmp/kani.tar.gz "https://github.com/model-checking/kani/releases/download/kani-${KANI_VERSION}/kani-${KANI_VERSION}-aarch64-unknown-linux-gnu.tar.gz"; \
+    curl -sSfL -o /tmp/kani.tar.gz "https://github.com/model-checking/kani/releases/download/kani-${KANI_VERSION}/kani-${KANI_VERSION}-${host}.tar.gz"; \
     echo "$KANI_BUNDLE_SHA256  /tmp/kani.tar.gz" | sha256sum -c -; \
     cargo +"$TOOLS_RUST" kani setup --use-local-bundle /tmp/kani.tar.gz; \
     rm /tmp/kani.tar.gz; \

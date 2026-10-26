@@ -15,6 +15,11 @@
 //! - Done (or Failed) is sent whatever happened, so `tpm` can cap PCR 8
 //!   once every client (`key`, `pqkey`, `tlskey`) has finished. A Done
 //!   `tpm` does not acknowledge leaves the PD without its secrets.
+//! - The cap barrier (post-M6 plan P3): after its Done, the client asks
+//!   `tpm` for the cap status until the cap is confirmed, and keeps its
+//!   secrets only then. A failed cap is `CapFailed`, so every key domain
+//!   fails closed, not only the last to finish; so does a client that
+//!   never finishes, once the barrier times out.
 
 use layout::tpm as ipc;
 
@@ -32,6 +37,15 @@ const FLOW_MAX_NS: u64 = 120_000_000_000;
 /// other client may be served first (M6 plan C12: two flows of the three).
 pub const BUSY_TIMEOUT_NS: u64 = FLOW_MAX_NS * (tpm2_wire::gate::CLIENTS as u64 - 1);
 const _: () = assert!(BUSY_TIMEOUT_NS == 240_000_000_000);
+/// How long a Done client waits for the cap: the other clients' flows (as
+/// `BUSY_TIMEOUT_NS`), then every attempt of the cap within its deadline
+/// (round 3 R3-3), so a slow TCG boot does not halt every domain.
+pub const CAP_BARRIER_TIMEOUT_NS: u64 =
+    BUSY_TIMEOUT_NS + tpm2_wire::gate::CAP_ATTEMPTS as u64 * tpm2_wire::gate::CAP_ATTEMPT_DEADLINE_NS;
+const _: () = assert!(
+    CAP_BARRIER_TIMEOUT_NS
+        >= BUSY_TIMEOUT_NS + tpm2_wire::gate::CAP_ATTEMPTS as u64 * tpm2_wire::gate::CAP_ATTEMPT_DEADLINE_NS
+);
 /// Fresh draws of the client entropy when the ECDH scalar is unusable
 /// (zero or not below the group order: about 2^-32 per draw).
 const ENTROPY_DRAWS: usize = 4;
@@ -71,6 +85,9 @@ pub enum UnsealError {
     ResponseInvalid,
     /// The unsealed KEK did not open the envelope.
     EnvelopeOpen,
+    /// The unseal succeeded but `tpm` could not confirm the cap of PCR 8
+    /// (post-M6 plan P3): the secrets are not released.
+    CapFailed,
 }
 
 impl UnsealError {
@@ -131,8 +148,37 @@ fn exchange(tpm: &mut impl Transport, req: &[u8], rsp: &mut [u8; ipc::MSG_BYTES]
     }
 }
 
+/// The cap barrier: asks `tpm` for the cap status, pausing while it is
+/// pending, until the cap is confirmed (Ok) or failed (`CapFailed`). Any
+/// other answer, or no verdict within `CAP_BARRIER_TIMEOUT_NS`, is
+/// `TpmUnavailable`.
+pub fn cap_barrier(tpm: &mut impl Transport, rsp: &mut [u8; ipc::MSG_BYTES]) -> Result<(), UnsealError> {
+    let since = tpm.now_ns();
+    loop {
+        let (label, _) = tpm.call(ipc::label(ipc::REQ_CAP_STATUS, 0), &[], rsp);
+        if label == ipc::label(ipc::RSP_OK, 0) {
+            return Ok(());
+        }
+        if label == ipc::label(ipc::RSP_REFUSED, ipc::REFUSED_CAP_FAILED) {
+            return Err(UnsealError::CapFailed);
+        }
+        if ipc::kind(label) != ipc::RSP_BUSY {
+            return Err(UnsealError::TpmUnavailable);
+        }
+        let now = tpm.now_ns();
+        if now.saturating_sub(since) >= CAP_BARRIER_TIMEOUT_NS {
+            return Err(UnsealError::TpmUnavailable);
+        }
+        let until = now.saturating_add(BUSY_PAUSE_NS);
+        while tpm.now_ns() < until {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 /// Runs the whole unseal of `envelope` (`kind`'s, read in place) into
-/// `out` (the region's size), then tells `tpm` Done or Failed.
+/// `out` (the region's size), then tells `tpm` Done or Failed and, after a
+/// Done, waits at the cap barrier.
 pub fn unseal(tpm: &mut impl Transport, envelope: &[u8], kind: Kind, out: &mut [u8]) -> Result<(), UnsealError> {
     out.fill(0);
     let mut rsp = [0u8; ipc::MSG_BYTES];
@@ -148,15 +194,18 @@ pub fn unseal(tpm: &mut impl Transport, envelope: &[u8], kind: Kind, out: &mut [
     scrub_session_stack();
     let finish = if result.is_ok() { ipc::REQ_DONE } else { ipc::REQ_FAILED };
     let (label, _) = tpm.call(ipc::label(finish, 0), &[], &mut rsp);
-    rsp.fill(0);
-    match result {
-        Ok(()) if label == ipc::label(ipc::RSP_OK, 0) => Ok(()),
-        Ok(()) => {
-            out.fill(0);
-            Err(UnsealError::TpmUnavailable)
-        }
+    let result = match result {
+        Ok(()) if label == ipc::label(ipc::RSP_OK, 0) => cap_barrier(tpm, &mut rsp),
+        // This Done ran the cap, and it failed.
+        Ok(()) if label == ipc::label(ipc::RSP_REFUSED, ipc::REFUSED_CAP_FAILED) => Err(UnsealError::CapFailed),
+        Ok(()) => Err(UnsealError::TpmUnavailable),
         Err(e) => Err(e),
+    };
+    rsp.fill(0);
+    if result.is_err() {
+        out.fill(0);
     }
+    result
 }
 
 fn run(

@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Runs one Kani harness (tools/kani-guarded) in its own process group and
+stops the whole group after a time limit (post-M6 plan P4(c), T14).
+
+Usage: kani-harness -p <crate> <harness> <limit-s> [--exact] [--guard KiB]
+                    [--grace S] [--log PATH]
+
+The group is the new session kani-guarded starts in: the gate, cargo,
+kani and cbmc all stay in it, so SIGTERM and, `--grace` seconds later,
+SIGKILL to the group reach every one of them. `--exact` runs exactly the
+named harness (cargo kani's --harness alone is a prefix match). Logs as
+kani-guarded's (build/kg-<crate>-<harness's last segment>.log) unless
+`--log`.
+Prints "<harness> TIMEOUT after <n>s" when stopped and
+"<harness> done secs=<n>" at the end; exits with kani-guarded's code, or
+124 on a timeout.
+"""
+
+import argparse
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+import time
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+TIMED_OUT = 124
+
+
+def kill_group(pgid: int, sig):
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="kani-harness")
+    ap.add_argument("-p", dest="crate", required=True)
+    ap.add_argument("harness")
+    ap.add_argument("limit", type=float, help="seconds")
+    ap.add_argument("--exact", action="store_true")
+    ap.add_argument("--guard", type=int, help="KiB, kani-guarded's default if unset")
+    ap.add_argument("--grace", type=float, default=5.0)
+    ap.add_argument("--log", help="kani-guarded's --log")
+    args = ap.parse_args()
+    cmd = [str(ROOT / "tools/kani-guarded"), args.crate, args.harness]
+    cmd += [str(args.guard)] if args.guard is not None else []
+    cmd += ["--exact"] if args.exact else []
+    cmd += ["--log", args.log] if args.log else []
+    start = time.monotonic()
+    proc = subprocess.Popen(cmd, start_new_session=True)
+    timed_out = False
+    try:
+        rc = proc.wait(timeout=args.limit)
+    except subprocess.TimeoutExpired:
+        kill_group(proc.pid, signal.SIGTERM)
+        time.sleep(args.grace)
+        kill_group(proc.pid, signal.SIGKILL)
+        print(f"{args.harness} TIMEOUT after {args.limit:g}s", flush=True)
+        timed_out = True
+        rc = proc.wait()
+    print(f"{args.harness} done secs={time.monotonic() - start:.0f}")
+    return TIMED_OUT if timed_out else (128 - rc if rc < 0 else rc)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

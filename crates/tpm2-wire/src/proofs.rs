@@ -3,7 +3,7 @@
 //! is kept small: concrete command shapes with symbolic handles, codes and
 //! clients.
 
-use super::gate::{ALLOWED, Gate, Refusal};
+use super::gate::{ALLOWED, CAP_ATTEMPTS, CapStatus, CapTransport, Gate, Refusal};
 use super::*;
 
 const MAX_LEN: usize = 64;
@@ -346,4 +346,69 @@ fn a_flushed_handle_number_is_usable_by_the_other_client() {
     let salted = buf.get(..n).unwrap_or(&[]);
     assert!(g.command(third, salted) == Err(Refusal::NotOwned));
     assert!(g.command(b, salted).is_ok());
+}
+
+/// PCR_Extend's success (a password session, no parameters) and a refusal
+/// (TPM_RC_FAILURE).
+const EXTEND_OK: [u8; 19] = [0x80, 0x02, 0, 0, 0, 19, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0];
+const EXTEND_REFUSED: [u8; 10] = [0x80, 0x01, 0, 0, 0, 10, 0, 0, 0x01, 0x01];
+
+/// A device whose attempts answer as its symbolic script says: nothing, a
+/// refusal, or the success; `confirmed` records that it ever answered the
+/// success.
+struct ScriptedDevice {
+    script: [u8; CAP_ATTEMPTS],
+    next: usize,
+    confirmed: bool,
+}
+
+impl CapTransport for ScriptedDevice {
+    fn attempt(&mut self, _cmd: &[u8], _budget_ns: u64) -> Option<&[u8]> {
+        let kind = self.script.get(self.next).copied().unwrap_or(0);
+        self.next = self.next.saturating_add(1);
+        match kind {
+            0 => None,
+            1 => Some(&EXTEND_REFUSED),
+            _ => {
+                self.confirmed = true;
+                Some(&EXTEND_OK)
+            }
+        }
+    }
+}
+
+/// The cap barrier (post-M6 plan P3): `cap_status` changes nothing, answers
+/// a Done client only, and is never Confirmed unless every client finished
+/// and the device confirmed the extend; whichever subset finished and
+/// however, whether the cap ran or not, whatever the device answered.
+#[kani::proof]
+#[kani::unwind(12)]
+fn cap_status_is_pure_and_never_confirmed_before_a_confirmed_extend() {
+    let mut g = Gate::new();
+    let finished: [bool; gate::CLIENTS] = kani::any();
+    for (client, done) in finished.iter().enumerate() {
+        if *done {
+            let ok: bool = kani::any();
+            assert!(g.finish(client, ok).is_ok());
+        }
+    }
+    let mut device = ScriptedDevice { script: kani::any(), next: 0, confirmed: false };
+    let ran: bool = kani::any();
+    if ran {
+        let _ = g.run_cap(&mut device);
+    }
+    let client: usize = kani::any();
+    let before = g.clone();
+    let status = g.cap_status(client);
+    assert!(g == before);
+    if status.is_ok() {
+        assert!(g.state(client) == Some(gate::State::Done));
+    }
+    if status == Ok(CapStatus::Confirmed) {
+        assert!(finished.iter().all(|f| *f));
+        assert!(device.confirmed);
+    }
+    kani::cover!(status == Ok(CapStatus::Confirmed), "a confirmed cap");
+    kani::cover!(status == Ok(CapStatus::Failed), "a failed cap");
+    kani::cover!(status == Ok(CapStatus::Pending), "a pending cap");
 }

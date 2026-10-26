@@ -441,7 +441,7 @@ fn any_entry() -> Entry {
         1 => EntryState::CompletedReply,
         _ => EntryState::CompletedNoReply,
     };
-    Entry { kind: any_kind(), src: Endpoint { ip: kani::any(), port: kani::any() }, state }
+    Entry { kind: any_kind(), src: Endpoint { ip: kani::any(), port: kani::any() }, state, counted: kani::any() }
 }
 
 fn any_sources<const B: u64, const I: u64>() -> SourceMeters<2, B, I> {
@@ -469,6 +469,7 @@ fn any_awaited() -> [Option<Awaited>; RP_AWAIT_SLOTS] {
             at: kani::any(),
             conf_budget: kani::any(),
             conf_seen: kani::any(),
+            counted: kani::any(),
         });
     }
     a
@@ -516,11 +517,27 @@ fn classify_any<'a>(gate: &mut RpGate<2>, mac: &AnyRpMac, cookie: &mut AnyRpCook
 
 /// Any state: meters at any level within capacity, any source table, any
 /// FIFO within its bounds and either `pq` state. Each kind within its slots
-/// is the invariant the harnesses below show is kept.
+/// is the invariant the harnesses below show is kept. The unfinished meter
+/// (post-M6 plan P1, A1): any budget within [0, capacity], and the ghost
+/// totals within the no-double-refund invariant, which the unfinished
+/// harnesses show every operation keeps.
 fn any_rp_gate() -> RpGate<2> {
     let in_flight = InFlight { entries: core::array::from_fn(|_| any_entry()), head: kani::any(), len: kani::any() };
     kani::assume(in_flight.head < RP_IN_FLIGHT && in_flight.len <= RP_IN_FLIGHT);
-    RpGate {
+    let budget_ns: u64 = kani::any();
+    kani::assume(budget_ns <= Unfinished::CAPACITY_NS);
+    let unfinished = Unfinished {
+        budget_ns,
+        last_ns: kani::any(),
+        spent_total: u128::from(kani::any::<u64>()),
+        refunded_total: u128::from(kani::any::<u64>()),
+    };
+    let entered_load = match kani::any::<u8>() % 3 {
+        0 => None,
+        1 => Some(RpLoadTrigger::Meters),
+        _ => Some(RpLoadTrigger::Unfinished),
+    };
+    let gate = RpGate {
         hello_src: any_sources(),
         hello_global: any_meter(),
         conf_src: any_sources(),
@@ -533,7 +550,7 @@ fn any_rp_gate() -> RpGate<2> {
         proven: any_proven(),
         under_load_until_ns: kani::any(),
         in_load: kani::any(),
-        entered_load: kani::any(),
+        entered_load,
         life: SecretLife {
             born_ns: kani::any(),
             last_retry_ns: kani::any(),
@@ -541,7 +558,50 @@ fn any_rp_gate() -> RpGate<2> {
             unavailable_reported: kani::any(),
             expired_edge: kani::any(),
         },
+        unfinished,
+    };
+    kani::assume(unfinished_invariant(&gate));
+    gate
+}
+
+/// No double refund (post-M6 plan A1): the counted marks on entries in
+/// flight, plus those on awaited entries, plus every refund, never exceed
+/// the spends.
+fn unfinished_invariant(g: &RpGate<2>) -> bool {
+    let f = &g.in_flight;
+    let mut inflight_counted = 0u128;
+    let mut i = 0usize;
+    while i < f.len {
+        if f.entries[(f.head + i) % RP_IN_FLIGHT].counted {
+            inflight_counted += 1;
+        }
+        i += 1;
     }
+    let mut awaited_marked = 0u128;
+    let mut j = 0usize;
+    while j < RP_AWAIT_SLOTS {
+        if let Some(a) = g.awaited[j] {
+            if a.counted {
+                awaited_marked += 1;
+            }
+        }
+        j += 1;
+    }
+    inflight_counted + awaited_marked + g.unfinished.refunded_total <= g.unfinished.spent_total
+}
+
+/// The unfinished meter's credit at `now`, from the plan: the budget
+/// refilled 1 ns per ns since its last update, within [0, capacity].
+fn spec_unfinished_credit(g: &RpGate<2>, now: u64) -> u64 {
+    let u = &g.unfinished;
+    let elapsed = if now > u.last_ns { now - u.last_ns } else { 0 };
+    (u.budget_ns as u128 + elapsed as u128).min(RP_UNFINISHED_BURST as u128 * RP_UNFINISHED_INTERVAL_NS as u128) as u64
+}
+
+/// The unfinished trigger, from the plan: less than one interval left on a
+/// live path.
+fn spec_unfinished_empty(g: &RpGate<2>, now: u64) -> bool {
+    !g.pq_dead && spec_unfinished_credit(g, now) < RP_UNFINISHED_INTERVAL_NS
 }
 
 /// Classification is total: a forward is an InitHello or InitConf of its
@@ -685,7 +745,7 @@ fn rp_shares_stay_disjoint_and_bounded() {
     } else {
         let o = classify_any(&mut gate, &AnyRpMac::default(), &mut AnyRpCookie::default(), kani::any(), src, msg);
         if matches!(o, RpOutcome::ForwardHello { .. } | RpOutcome::ForwardConf { .. }) {
-            gate.sent(kind, src);
+            gate.sent(kind, src, kani::any(), kani::any());
         }
         Some(o)
     };
@@ -826,7 +886,9 @@ fn spec_tokens<const B: u64, const I: u64>(m: &Meter<B, I>, now: u64) -> u64 {
 /// I1: under load, an InitHello without a valid cookie (any outcome but a
 /// forward, after the mac passed) spends no meter and records nothing: only
 /// the load deadline and its edge, and the expiry edge, may change.
-/// I2: off load the cookie is never asked.
+/// I2: off load the cookie is never asked. Load before is a trigger (the
+/// meter below half or, post-M6 plan P1/A1, the unfinished meter below one
+/// interval) or the hold.
 #[kani::proof]
 #[kani::unwind(20)]
 fn rp_cookie_lane_spends_nothing_and_is_never_asked_off_load() {
@@ -836,7 +898,8 @@ fn rp_cookie_lane_spends_nothing_and_is_never_asked_off_load() {
     let now: u64 = kani::any();
     let mut cookie = AnyRpCookie::default();
     let o = classify_any(&mut gate, &AnyRpMac::default(), &mut cookie, now, any_endpoint(), &payload);
-    let loaded_before = spec_below_half(&before.hello_global, now) || now < before.under_load_until_ns;
+    let loaded_before =
+        spec_below_half(&before.hello_global, now) || spec_unfinished_empty(&before, now) || now < before.under_load_until_ns;
     if !loaded_before {
         assert!(cookie.valid_calls.get() == 0);
     }
@@ -849,9 +912,9 @@ fn rp_cookie_lane_spends_nothing_and_is_never_asked_off_load() {
         assert!(gate.hello_cookied_ip == before.hello_cookied_ip && gate.hello_global == before.hello_global);
         assert!(gate.conf_src == before.conf_src && gate.conf_global == before.conf_global);
         assert!(gate.in_flight == before.in_flight && gate.awaited == before.awaited && gate.proven == before.proven);
-        // Only the below-half trigger can move the deadline here: an
-        // uncookied InitHello under load is not one (VE13).
-        if !spec_below_half(&before.hello_global, now) {
+        // Only the below-half and the unfinished triggers can move the
+        // deadline here: an uncookied InitHello under load is not one (VE13).
+        if !spec_below_half(&before.hello_global, now) && !spec_unfinished_empty(&before, now) {
             assert!(gate.under_load_until_ns == before.under_load_until_ns);
         }
     }
@@ -927,7 +990,7 @@ fn rp_proven_changes_only_through_the_session_ids() {
     let dst = any_endpoint();
     let peer: Option<u8> = kani::any();
     let kind = any_kind();
-    gate.replied(kind, dst, peer, &msg, kani::any());
+    gate.replied(kind, dst, peer, &msg, kani::any(), kani::any());
     if gate.proven != before.proven {
         assert!(kind == RpKind::Conf);
         let a = before.awaited[0].unwrap();
@@ -952,6 +1015,172 @@ fn rp_tx_tiers_are_ordered() {
         assert!(rp_tx_allowed(TxTier::Answer, free));
     }
     kani::cover!(rp_tx_allowed(TxTier::Answer, free) && !rp_tx_allowed(TxTier::Unsolicited, free));
+}
+
+// ---- The unfinished trigger (post-M6 plan P1, amendment A1) ----
+
+/// Writes one completion record of any shape into `out`: a NoReply, a
+/// RespHello with any session ids, or an EmptyData for any index.
+fn any_record(out: &mut [u8; RP_RECORD_MAX]) -> usize {
+    let mut resp = [0x82u8; RP_RESP_HELLO_LEN];
+    let sids: [u8; 8] = kani::any();
+    resp[RP_SID_AT..RP_SID_AT + 8].copy_from_slice(&sids);
+    let r = match kani::any::<u8>() % 3 {
+        0 => msgs::RpReply::NoReply,
+        1 => msgs::RpReply::Reply { index: kani::any(), msg: &resp },
+        _ => msgs::RpReply::Reply { index: kani::any(), msg: &[0x84; RP_EMPTY_DATA_LEN] },
+    };
+    r.encode(out).unwrap_or(0)
+}
+
+/// The meter in range: the read matches the plan and stays within
+/// [0, capacity]; a spend or a refund keeps the stored budget there (no
+/// overflow is checked on every operation), and a spend never refuses; and
+/// less than one interval on a live path is a trigger from the tick alone,
+/// with nothing else happening (S4).
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_unfinished_meter_stays_in_range_and_empty_triggers() {
+    let mut gate = any_rp_gate();
+    let before = gate.clone();
+    let now: u64 = kani::any();
+    let credit = gate.unfinished_credit(now);
+    assert!(credit <= Unfinished::CAPACITY_NS && credit == spec_unfinished_credit(&before, now));
+    if kani::any() {
+        gate.unfinished.spend(now);
+        assert!(gate.unfinished.budget_ns == credit.saturating_sub(RP_UNFINISHED_INTERVAL_NS));
+    } else {
+        gate.unfinished.refund(now);
+        assert!(gate.unfinished.budget_ns == (credit + RP_UNFINISHED_INTERVAL_NS).min(Unfinished::CAPACITY_NS));
+    }
+    assert!(gate.unfinished.budget_ns <= Unfinished::CAPACITY_NS);
+    assert!(gate.unfinished_credit(kani::any()) <= Unfinished::CAPACITY_NS);
+    let mut ticked = before.clone();
+    let r = ticked.tick_if_due(&mut AnyRpCookie::default(), now);
+    if spec_unfinished_empty(&before, now) {
+        assert!(ticked.under_load_until_ns >= now.saturating_add(RP_UNDER_LOAD_AFTER_NS));
+        if now < u64::MAX - RP_UNDER_LOAD_AFTER_NS {
+            assert!(!r.left_load);
+        }
+        if !before.in_load && !spec_below_half(&before.hello_global, now) {
+            assert!(ticked.entered_load == Some(RpLoadTrigger::Unfinished));
+        }
+    }
+    kani::cover!(spec_unfinished_empty(&before, now) && ticked.entered_load == Some(RpLoadTrigger::Unfinished));
+    kani::cover!(credit == RP_UNFINISHED_INTERVAL_NS && ticked.entered_load == before.entered_load);
+}
+
+/// Split invariance: the credit read at t2 after the budget was settled at
+/// t1 (as a spend or a refund does first) equals a single read at t2.
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_unfinished_read_is_split_invariant() {
+    let gate = any_rp_gate();
+    let t1: u64 = kani::any();
+    let t2: u64 = kani::any();
+    kani::assume(t1 <= t2);
+    let mut split = gate.clone();
+    split.unfinished.settle(t1);
+    assert!(split.unfinished_credit(t2) == gate.unfinished_credit(t2));
+    kani::cover!(t1 > gate.unfinished.last_ns && gate.unfinished_credit(t2) < Unfinished::CAPACITY_NS);
+}
+
+/// Refund only through a matched awaited entry carrying the mark (round 2
+/// N1, A1): of the transitions, the credit read at the same instant rises
+/// only through `replied(Conf)` on a matched `conf_seen` awaited entry that
+/// carries the mark, by no more than one interval, and the mark is gone.
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_unfinished_refunds_only_a_marked_completed_exchange() {
+    let mut gate = any_rp_gate();
+    let before = gate.clone();
+    let now: u64 = kani::any();
+    let dst = any_endpoint();
+    let msg: [u8; 12] = kani::any();
+    let mut out = [0u8; RP_RECORD_MAX];
+    let op = kani::any::<u8>() % 5;
+    match op {
+        0 => gate.sent(any_kind(), dst, kani::any(), now),
+        1 => {
+            let n = any_record(&mut out);
+            let _ = gate.complete(&out[..n], 2);
+        }
+        2 => {
+            let _ = gate.retire(kani::any());
+        }
+        3 => gate.replied(RpKind::Hello, dst, kani::any(), &msg, kani::any(), now),
+        _ => gate.replied(RpKind::Conf, dst, kani::any(), &msg, kani::any(), now),
+    }
+    let (credit_before, credit_after) = (before.unfinished_credit(now), gate.unfinished_credit(now));
+    if credit_after > credit_before {
+        assert!(op == 4);
+        // `any_awaited` fills slot 0 only.
+        let a = before.awaited[0].unwrap();
+        assert!(a.ep == dst && a.conf_seen && a.counted && msg[4..8] == a.sidi);
+        assert!(credit_after - credit_before <= RP_UNFINISHED_INTERVAL_NS);
+        assert!(gate.awaited[0].is_none_or(|a| !a.counted));
+    }
+    kani::cover!(credit_after > credit_before);
+}
+
+/// No double refund (post-M6 plan A1, R4-1): `inflight_counted +
+/// awaited_marked + refunded_total <= spent_total` is inductive.
+/// `any_rp_gate` assumes it, and each operation that moves a mark or the
+/// meter preserves it, so it holds over every sequence of them. This one:
+/// `sent`.
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_unfinished_invariant_survives_sent() {
+    let mut gate = any_rp_gate();
+    gate.sent(any_kind(), any_endpoint(), kani::any(), kani::any());
+    assert!(unfinished_invariant(&gate));
+}
+
+/// The invariant across `complete` and the `replied(Hello)` that stores the
+/// mark it moved (they share that value, so they are one step here).
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_unfinished_invariant_survives_complete_and_reply() {
+    let mut gate = any_rp_gate();
+    let mut out = [0u8; RP_RECORD_MAX];
+    let n = any_record(&mut out);
+    if let Ok(Completion::Reply { dst, kind, peer, msg, counted }) = gate.complete(&out[..n], 2) {
+        // The moved mark, carried, still counts.
+        assert!(unfinished_invariant(&gate));
+        if kani::any() {
+            gate.replied(kind, dst, peer, msg, counted, kani::any());
+        }
+    }
+    assert!(unfinished_invariant(&gate));
+}
+
+/// The invariant across `replied(Conf)`, and a repeated one (a
+/// retransmitted InitConf's EmptyData) refunds nothing more.
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_unfinished_invariant_survives_a_repeated_conf() {
+    let mut gate = any_rp_gate();
+    let dst = any_endpoint();
+    let peer: Option<u8> = kani::any();
+    let empty: [u8; 12] = kani::any();
+    let at: u64 = kani::any();
+    let credit_before = gate.unfinished_credit(at);
+    gate.replied(RpKind::Conf, dst, peer, &empty, false, at);
+    assert!(unfinished_invariant(&gate));
+    let refunded = gate.unfinished_credit(at);
+    gate.replied(RpKind::Conf, dst, peer, &empty, false, at);
+    assert!(unfinished_invariant(&gate));
+    assert!(gate.unfinished_credit(at) == refunded);
+    kani::cover!(refunded > credit_before);
+}
+
+/// The invariant across `retire`.
+#[kani::proof]
+#[kani::unwind(20)]
+fn rp_unfinished_invariant_survives_retire() {
+    let mut gate = any_rp_gate();
+    let _ = gate.retire(kani::any());
+    assert!(unfinished_invariant(&gate));
 }
 
 // ---- TCP to the HTTPS endpoint (M6 plan C2) ----

@@ -13,6 +13,15 @@ build:
 		--build-arg GID=$(shell id -g) \
 		-t $(image) .
 
+# The same image for an x86_64 host (post-M6 plan P5). Built natively there;
+# under emulation on an arm64 host it takes hours.
+.PHONY: build-amd64
+build-amd64:
+	docker build --platform linux/amd64 \
+		--build-arg UID=$(shell id -u) \
+		--build-arg GID=$(shell id -g) \
+		-t $(image):amd64 .
+
 .PHONY: run
 run: build
 	# No NET_ADMIN: integration tests create an unprivileged user + network

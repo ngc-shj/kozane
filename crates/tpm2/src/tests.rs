@@ -664,7 +664,7 @@ fn every_command_of_the_flow_fits_one_ipc_message() {
 use layout::tpm as ipc;
 use tpm2_wire::gate::{Gate, Refusal, State};
 
-use super::boot::{self, BUSY_PAUSE_NS, BUSY_TIMEOUT_NS, Transport, UnsealError};
+use super::boot::{self, BUSY_PAUSE_NS, BUSY_TIMEOUT_NS, CAP_BARRIER_TIMEOUT_NS, Transport, UnsealError};
 
 /// `tpm` as the PD runs it: the gate in front of the fake TPM, with knobs
 /// for the transport's failures.
@@ -685,6 +685,10 @@ struct FakePpc {
     finish_reply: Option<u64>,
     /// The reply words carry 8 bytes fewer than the label's length.
     short_words: bool,
+    /// Busy replies to the cap status before `cap_reply`.
+    cap_busy: usize,
+    /// The reply to the cap status once it is not Busy.
+    cap_reply: u64,
 }
 
 impl FakePpc {
@@ -700,6 +704,8 @@ impl FakePpc {
             unseal_rc: None,
             finish_reply: None,
             short_words: false,
+            cap_busy: 0,
+            cap_reply: ipc::label(ipc::RSP_OK, 0),
         }
     }
 
@@ -745,6 +751,15 @@ impl Transport for FakePpc {
                 let carried = if self.short_words { r.len() - 8 } else { ipc::words(r.len()) * 8 };
                 (ipc::label(ipc::RSP_OK, r.len()), carried)
             }
+            ipc::REQ_CAP_STATUS => {
+                assert!(req.is_empty() && ipc::arg(label) == 0);
+                assert_eq!(self.gate.state(0), Some(State::Done), "the cap status asked before Done");
+                if self.cap_busy > 0 {
+                    self.cap_busy -= 1;
+                    return (ipc::label(ipc::RSP_BUSY, 0), 0);
+                }
+                (self.cap_reply, 0)
+            }
             kind => {
                 assert!(kind == ipc::REQ_DONE || kind == ipc::REQ_FAILED, "unknown request {kind}");
                 assert!(req.is_empty());
@@ -781,7 +796,8 @@ fn boot_unseals_through_the_gate_and_sends_done() {
     assert_eq!(r, Ok(()));
     assert!(out == plain);
     assert_eq!(ppc.commands(), FULL_FLOW.len());
-    assert_eq!(ppc.last(), ipc::REQ_DONE);
+    let n = ppc.calls.len();
+    assert_eq!(ppc.calls[n - 2..], [(ipc::REQ_DONE, 0), (ipc::REQ_CAP_STATUS, 0)], "Done, then the cap barrier");
     assert_eq!(ppc.gate.state(0), Some(State::Done));
     assert_eq!(ppc.tpm.flushed, [OBJECT_HANDLE, SESSION_HANDLE, SRK_HANDLE]);
 }
@@ -889,6 +905,77 @@ fn a_done_tpm_does_not_acknowledge_leaves_no_plaintext() {
     let (r, out) = boot_unseal(&env, &mut ppc);
     assert_eq!(r, Err(UnsealError::TpmUnavailable));
     assert!(out.iter().all(|b| *b == 0));
+}
+
+#[test]
+fn a_done_answered_cap_failed_is_cap_failed_without_the_barrier() {
+    let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.finish_reply = Some(ipc::label(ipc::RSP_REFUSED, ipc::REFUSED_CAP_FAILED));
+    let (r, out) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Err(UnsealError::CapFailed));
+    assert!(out.iter().all(|b| *b == 0));
+    assert_eq!(ppc.last(), ipc::REQ_DONE, "this Done ran the cap: nothing to wait for");
+}
+
+#[test]
+fn the_barrier_waits_out_a_pending_cap_and_keeps_the_plaintext_once_confirmed() {
+    let plain = region(Kind::Key, 500);
+    let env = sealed(Kind::Key, &plain, 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.cap_busy = 3;
+    let before = ppc.clock;
+    let (r, out) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Ok(()));
+    assert!(out == plain);
+    assert_eq!(ppc.calls.iter().filter(|(k, _)| *k == ipc::REQ_CAP_STATUS).count(), 4);
+    assert!(ppc.clock - before >= 3 * BUSY_PAUSE_NS, "asked again without pausing: {} ns", ppc.clock);
+}
+
+#[test]
+fn a_failed_cap_at_the_barrier_is_cap_failed_and_leaves_no_plaintext() {
+    let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.cap_busy = 2;
+    ppc.cap_reply = ipc::label(ipc::RSP_REFUSED, ipc::REFUSED_CAP_FAILED);
+    let (r, out) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Err(UnsealError::CapFailed));
+    assert!(out.iter().all(|b| *b == 0));
+    assert_eq!(ppc.last(), ipc::REQ_CAP_STATUS);
+}
+
+#[test]
+fn a_cap_pending_past_the_barrier_timeout_leaves_no_plaintext() {
+    let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.cap_busy = usize::MAX;
+    let (r, out) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Err(UnsealError::TpmUnavailable));
+    assert!(out.iter().all(|b| *b == 0));
+    assert!(ppc.clock >= CAP_BARRIER_TIMEOUT_NS);
+}
+
+#[test]
+fn any_other_cap_status_answer_leaves_no_plaintext() {
+    let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
+    for reply in [ipc::label(ipc::RSP_REFUSED, 10), ipc::label(ipc::RSP_BAD_REQUEST, 0), ipc::label(ipc::RSP_OK, 1)] {
+        let mut ppc = FakePpc::new(&env);
+        ppc.cap_reply = reply;
+        let (r, out) = boot_unseal(&env, &mut ppc);
+        assert_eq!(r, Err(UnsealError::TpmUnavailable), "{reply:#x}");
+        assert!(out.iter().all(|b| *b == 0), "{reply:#x}");
+    }
+}
+
+#[test]
+fn a_failed_unseal_never_asks_the_cap_status() {
+    let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.unseal_rc = Some(0x99D);
+    ppc.cap_reply = ipc::label(ipc::RSP_REFUSED, ipc::REFUSED_CAP_FAILED);
+    let (r, _) = boot_unseal(&env, &mut ppc);
+    assert_eq!(r, Err(UnsealError::UnsealRefused), "the unseal's own failure, not the cap's");
+    assert!(ppc.calls.iter().all(|(k, _)| *k != ipc::REQ_CAP_STATUS));
 }
 
 #[test]

@@ -168,6 +168,12 @@ pub mod tpm {
     pub const REQ_DONE: u64 = 2;
     /// The same after a failed one.
     pub const REQ_FAILED: u64 = 3;
+    /// The cap barrier (post-M6 plan P3): a Done client asks whether PCR 8
+    /// is capped before it releases its key. A label of this protocol, not
+    /// a TPM command: the gate refuses a Done client every command. Answered
+    /// RSP_BUSY while the cap is pending, RSP_OK once confirmed, and
+    /// RSP_REFUSED with `REFUSED_CAP_FAILED` once failed.
+    pub const REQ_CAP_STATUS: u64 = 4;
 
     /// Replies. `arg`: the response's byte length (for Done and Failed, 0).
     pub const RSP_OK: u64 = 1;
@@ -180,6 +186,10 @@ pub mod tpm {
     pub const RSP_BUSY: u64 = 4;
     /// Not a request of this protocol, or a caller `tpm` does not serve.
     pub const RSP_BAD_REQUEST: u64 = 5;
+
+    /// RSP_REFUSED's arg when the cap failed: to the cap status, and to the
+    /// Done (or Failed) whose cap failed. Above every gate refusal's code.
+    pub const REFUSED_CAP_FAILED: usize = 11;
 
     pub const fn label(kind: u64, arg: usize) -> u64 {
         kind << KIND_SHIFT | (arg as u64 & ARG_MASK)

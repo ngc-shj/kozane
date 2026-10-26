@@ -96,6 +96,11 @@ Rules:
      `let (.., consumed, waiting) = self.tls.pass();` destructures, so a
      ClientHello waiting for its turn gets another pass without an
      unrelated wakeup
+  P22 the cap barrier (post-M6 plan P3): crates/tpm2/src/boot.rs's `fn
+     unseal` calls `cap_barrier(` after its Done, `fn cap_barrier` asks
+     `REQ_CAP_STATUS`, and each key PD (key, pqkey, tlskey) unseals through
+     `tpm2::boot::unseal(`, so none releases its key before the cap of PCR
+     8 is confirmed
 
 Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
 fail until they are removed from PENDING; --enforce-pending makes them fail
@@ -116,6 +121,9 @@ policy/waivers.toml).
 P20 is a tripwire over names: a dependency re-exporting the function under
 another name escapes it, and so does an alias spelled other than
 `name as other` (a `type` or `fn` wrapper).
+P22 is a tripwire over names: it sees that the calls are spelled, not that
+the barrier's verdict is obeyed (the tpm2 unit tests and the integration
+cap-failure boot adjudicate that).
 P21 is a fail-closed check of one expression's shape: it reads the tail
 expression only, so a `return` earlier in the body escapes it (the review
 of the pass order is the adjudicating control).
@@ -152,7 +160,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P18",
-         "P19", "P20", "P21"]
+         "P19", "P20", "P21", "P22"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
                "crates/tls-core", "crates/tlskey-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data",
@@ -199,6 +207,10 @@ HELLO_KEYS_ALLOWED = ("crates/tls-core/src/handshake.rs", "tools/ct-harness/")
 # P21: the file, the impl and the function whose return the rule pins.
 PASS_FILE = "crates/pds/tls/src/main.rs"
 PASS_IMPL = r"\bimpl\s+ring\s*::\s*pass\s*::\s*Pass\s+for\s+Pass\b"
+# P22: the file holding the barrier, and the key PDs that must unseal
+# through it.
+BARRIER_FILE = "crates/tpm2/src/boot.rs"
+KEY_PDS = ("key", "pqkey", "tlskey")
 
 
 def run_blocks(dockerfile: str):
@@ -575,6 +587,38 @@ def check_pass_due(root: pathlib.Path, out: list):
                    "from the one `self.tls.pass()` in Pass::serve (C13)")
 
 
+def check_cap_barrier(root: pathlib.Path, out: list):
+    # As P11: a tree without tpm2 (the P7 fixtures') has nothing to check;
+    # one that has the crate without the file has lost what this rule pins.
+    if not (root / "crates/tpm2").is_dir():
+        return
+    path = root / BARRIER_FILE
+    if not path.is_file():
+        out.append(f"P22 {BARRIER_FILE}: missing; the cap barrier has nothing to check")
+        return
+    code = strip_rust_comments(path.read_text())
+    unterminated("P22", BARRIER_FILE, code, out)
+    for name, call, what in (("unseal", r"\bcap_barrier\s*\(", "call cap_barrier after its Done"),
+                             ("cap_barrier", r"\bREQ_CAP_STATUS\b", "ask tpm for REQ_CAP_STATUS")):
+        span = body_span(code, name)
+        if span is None or not re.search(call, code[span[0]:span[1]]):
+            m = re.search(rf"\bfn\s+{name}\b", code)
+            n = code.count("\n", 0, m.start()) + 1 if m else 1
+            out.append(f"P22 {BARRIER_FILE}:{n}: fn {name} must {what}, so no key PD releases its key "
+                       "before the PCR 8 cap is confirmed (post-M6 P3)")
+    for pd in KEY_PDS:
+        rel = f"crates/pds/{pd}/src/main.rs"
+        if not (root / rel).is_file():
+            if (root / f"crates/pds/{pd}").is_dir():
+                out.append(f"P22 {rel}: missing; the key PD's unseal has nothing to check")
+            continue
+        main = strip_rust_comments((root / rel).read_text())
+        unterminated("P22", rel, main, out)
+        if not re.search(r"\btpm2\s*::\s*boot\s*::\s*unseal\s*\(", main):
+            out.append(f"P22 {rel}: the key PD must unseal through tpm2::boot::unseal, which waits at the cap "
+                       "barrier (post-M6 P3)")
+
+
 # P19: classical groups (RFC 8446 section 4.2.7, RFC 8734, RFC 7919) as
 # spelled in Rust source.
 CLASSICAL_SPELLINGS = [
@@ -893,6 +937,7 @@ def main() -> int:
     check_classical_groups(root, out)
     check_exchange_callers(root, out)
     check_pass_due(root, out)
+    check_cap_barrier(root, out)
     failing = [l for l in out if l.split()[0] not in pending]
     for line in out:
         print(line if line in failing else f"pending {line}")

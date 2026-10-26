@@ -173,6 +173,7 @@ fn each_unseal_failure_has_its_own_boot_error() {
         UnsealError::UnsealRefused,
         UnsealError::ResponseInvalid,
         UnsealError::EnvelopeOpen,
+        UnsealError::CapFailed,
     ];
     assert_eq!(all.len(), core::mem::variant_count::<UnsealError>());
     assert_eq!(BootError::from(UnsealError::Rndr), BootError::RndrUnavailable);
@@ -183,7 +184,7 @@ fn each_unseal_failure_has_its_own_boot_error() {
     }
 }
 
-/// Every BootError: the nine plain kinds, then each BlobError by an
+/// Every BootError: the ten plain kinds, then each BlobError by an
 /// exhaustive successor match (a new variant fails to compile until it is
 /// placed in the walk).
 fn all_boot_errors() -> std::vec::Vec<BootError> {
@@ -207,14 +208,15 @@ fn all_boot_errors() -> std::vec::Vec<BootError> {
         BootError::UnsealRefused,
         BootError::TpmResponseInvalid,
         BootError::EnvelopeOpen,
+        BootError::TpmCapFailed,
     ];
     let mut e = Some(BlobError::BadMagic);
     while let Some(v) = e {
         all.push(BootError::Blob(v));
         e = next(v);
     }
-    assert_eq!(all.len() - 9, core::mem::variant_count::<BlobError>());
-    assert_eq!(core::mem::variant_count::<BootError>(), 10);
+    assert_eq!(all.len() - 10, core::mem::variant_count::<BlobError>());
+    assert_eq!(core::mem::variant_count::<BootError>(), 11);
     all
 }
 

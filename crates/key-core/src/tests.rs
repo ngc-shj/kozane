@@ -88,11 +88,11 @@ fn boot_error_messages_are_distinct() {
     }
 }
 
-/// Every BootError: the ten plain kinds, then each BlobError reached by
+/// Every BootError: the eleven plain kinds, then each BlobError reached by
 /// `next`. The walk must visit every BlobError and BootError must have
-/// exactly the eleven kinds listed, or this fails.
-fn all_boot_errors(next: impl Fn(BlobError) -> Option<BlobError>) -> [BootError; 16] {
-    let mut all = [BootError::GatewayKeyMismatch; 16];
+/// exactly the twelve kinds listed, or this fails.
+fn all_boot_errors(next: impl Fn(BlobError) -> Option<BlobError>) -> [BootError; 17] {
+    let mut all = [BootError::GatewayKeyMismatch; 17];
     all[1] = BootError::PeerMismatch;
     all[2] = BootError::RndrUnavailable;
     all[3] = BootError::SeedDerivation;
@@ -102,7 +102,8 @@ fn all_boot_errors(next: impl Fn(BlobError) -> Option<BlobError>) -> [BootError;
     all[7] = BootError::UnsealRefused;
     all[8] = BootError::TpmResponseInvalid;
     all[9] = BootError::EnvelopeOpen;
-    let mut n = 10;
+    all[10] = BootError::TpmCapFailed;
+    let mut n = 11;
     let mut e = Some(BlobError::BadMagic);
     while let Some(v) = e {
         all[n] = BootError::Blob(v);
@@ -110,8 +111,8 @@ fn all_boot_errors(next: impl Fn(BlobError) -> Option<BlobError>) -> [BootError;
         e = next(v);
     }
     assert_eq!(n, all.len(), "every BlobError listed");
-    assert_eq!(n - 10, core::mem::variant_count::<BlobError>());
-    assert_eq!(core::mem::variant_count::<BootError>(), 11);
+    assert_eq!(n - 11, core::mem::variant_count::<BlobError>());
+    assert_eq!(core::mem::variant_count::<BootError>(), 12);
     all
 }
 
@@ -153,6 +154,7 @@ fn each_unseal_failure_has_its_own_boot_error() {
         UnsealError::UnsealRefused,
         UnsealError::ResponseInvalid,
         UnsealError::EnvelopeOpen,
+        UnsealError::CapFailed,
     ];
     assert_eq!(all.len(), core::mem::variant_count::<UnsealError>());
     assert_eq!(BootError::from(UnsealError::Rndr), BootError::RndrUnavailable);

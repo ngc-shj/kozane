@@ -20,7 +20,7 @@ use audit_event::Event;
 use cookie::CookieAdapter;
 use ingress_core::{
     Buckets, Config, EgressRefusal, Endpoint, Gate, Mac1, Outcome, PassIo, PqSync, RP_COOKIE_REPLY_LEN, RP_RECORD_MAX,
-    RpGate, RpKind, RpMac, RpOutcome, SyncOutcome, TcpGate, TcpLimit, TxTier, emit_udp, respond, rp_classify,
+    RpGate, RpKind, RpLoadTrigger, RpMac, RpOutcome, SyncOutcome, TcpGate, TcpLimit, TxTier, emit_udp, respond, rp_classify,
     rp_tx_allowed, run_passes, tls_egress,
 };
 use layout::ingress as ch;
@@ -323,8 +323,12 @@ fn record_edges(gate: &mut Gate, audit: &mut Audit) {
 
 /// The Rosenpass gate's edges (never coalesced), as `record_edges`.
 fn record_rp_edges<const N: usize>(rp: &mut RpGate<N>, audit: &mut Audit) {
-    if rp.take_load_entered() {
+    if let Some(trigger) = rp.take_load_entered() {
         audit.record(Event::RpUnderLoad);
+        // Which trigger engaged, after the edge itself (post-M6 plan P1).
+        if trigger == RpLoadTrigger::Unfinished {
+            audit.record(Event::RpUnfinishedLoad);
+        }
     }
     if rp.take_expired() {
         audit.record(Event::RpCookieSecretExpired);
@@ -462,11 +466,11 @@ impl Ingress {
                         if cookied {
                             self.audit.record(Event::RpCookieAccepted);
                         }
-                        rp_forward = Some((RpKind::Hello, src));
+                        rp_forward = Some((RpKind::Hello, src, cookied));
                         msgs::RpDatagram { peer: ep(src), msg }.encode(&mut self.msg)
                     }
                     RpOutcome::ForwardConf { src, msg } => {
-                        rp_forward = Some((RpKind::Conf, src));
+                        rp_forward = Some((RpKind::Conf, src, false));
                         msgs::RpDatagram { peer: ep(src), msg }.encode(&mut self.msg)
                     }
                     RpOutcome::BadMac => {
@@ -565,8 +569,8 @@ impl Ingress {
             Target::Pq => {
                 let sent = pdkit::send(&mut self.to_pq, &mut self.scratch, msg, &mut self.audit);
                 // Only a forward on the link awaits a record (I9a).
-                if let (true, Some((kind, src))) = (sent, rp_forward) {
-                    self.rp.sent(kind, src);
+                if let (true, Some((kind, src, cookied))) = (sent, rp_forward) {
+                    self.rp.sent(kind, src, cookied, cpu::now_ns());
                 }
                 wake.pq |= sent;
             }

@@ -149,9 +149,12 @@ fn init() -> Hs {
         Err(_) => {
             // The boot seed is hs's first call to `key`, so this is the first
             // time an Unavailable `key` can show: audited once, as hs then
-            // halts.
+            // halts. A failed PCR 8 cap is named as well (post-M6 plan P3).
             if let Some(code) = key_core::unavailable_code(key.last_error) {
                 audit.record(Event::KeyUnavailable { code });
+                if code == key_core::BootError::TpmCapFailed.code() {
+                    audit.record(Event::TpmCapFailed);
+                }
             }
             audit.halt(halt::NO_BOOT_SEED)
         }

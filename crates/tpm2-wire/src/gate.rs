@@ -24,7 +24,14 @@
 //!   nothing, and the PD answers it RSP_BUSY, which `tpm2::boot` retries.
 //! - The cap: once every client is Done or Failed, `cap` yields the one
 //!   PCR_Extend of PCR 8 the core itself issues; from then on everything is
-//!   refused (the clients already are).
+//!   refused (the clients already are). `run_cap` runs it on the device,
+//!   retried at most `CAP_ATTEMPTS` times, and keeps the verdict (confirmed
+//!   by the TPM's own response, or failed) apart from `capped`, which is set
+//!   whatever the device answers.
+//! - The cap barrier (post-M6 plan P3): a Done client asks `cap_status`
+//!   before it releases its key: Pending until the cap has run, then its
+//!   verdict. Every other client is refused, so a domain whose flow failed
+//!   holds no key to release anyway.
 //!
 //! The device's responses are A7's: a handle that is not of the expected
 //! kind, or that is already recorded, fails the client instead of being
@@ -32,8 +39,8 @@
 
 use crate::{
     CC_CREATE_PRIMARY, CC_FLUSH_CONTEXT, CC_IMPORT, CC_LOAD, CC_PCR_READ, CC_POLICY_AUTH_VALUE, CC_POLICY_PCR,
-    CC_START_AUTH_SESSION, CC_UNSEAL, DIGEST_LEN, IPC_MSG_BYTES, RH_NULL, RH_OWNER, RS_PW, Reader,
-    ST_NO_SESSIONS, ST_SESSIONS,
+    CC_START_AUTH_SESSION, CC_UNSEAL, DIGEST_LEN, IPC_MSG_BYTES, PCR_EXTEND_CMD_LEN, RH_NULL, RH_OWNER, RS_PW, Reader,
+    ST_NO_SESSIONS, ST_SESSIONS, parse_pcr_extend,
 };
 
 pub const CLIENTS: usize = 3;
@@ -45,6 +52,47 @@ const MAX_SESSIONS: usize = 3;
 /// What the cap extends PCR 8 with: a fixed value that no measurement
 /// (a sha256 output) is expected to equal.
 pub const CAP_DIGEST: [u8; DIGEST_LEN] = [0xFF; DIGEST_LEN];
+
+/// Tries of the cap's PCR_Extend before its verdict is Failed.
+pub const CAP_ATTEMPTS: usize = 3;
+/// One cap attempt's overall deadline: every TIS wait inside it (locality,
+/// commandReady, each burst, Expect, execution, valid) is bounded by what is
+/// left of it (post-M6 plan P3, round 3 R3-3). `tpm2::boot` sizes the cap
+/// barrier's timeout from it and `CAP_ATTEMPTS`.
+pub const CAP_ATTEMPT_DEADLINE_NS: u64 = 30_000_000_000;
+
+/// The device the cap's PCR_Extend goes to (the `tpm` PD's TIS).
+pub trait CapTransport {
+    /// Sends `cmd` and returns the device's response, or None if the
+    /// device did not answer within `budget_ns`, the attempt's overall
+    /// deadline.
+    fn attempt(&mut self, cmd: &[u8], budget_ns: u64) -> Option<&[u8]>;
+}
+
+/// The cap's outcome once it has run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapVerdict {
+    /// The TPM's own response confirmed the extend.
+    Confirmed,
+    /// No attempt was confirmed: PCR 8 may still hold its sealed value.
+    Failed,
+}
+
+/// What `cap_status` answers a Done client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapStatus {
+    /// The cap has not run: some client has not finished.
+    Pending,
+    Confirmed,
+    Failed,
+}
+
+/// Whether one attempt's outcome confirms the extend: a response came, it
+/// is PCR_Extend's well-formed success. A transport failure, a non-zero
+/// response code and a short or malformed response are failures alike.
+pub fn extend_confirmed(outcome: Option<&[u8]>) -> bool {
+    outcome.is_some_and(|r| parse_pcr_extend(r).is_ok())
+}
 
 /// The allowlist (C9), in flow order.
 pub const ALLOWED: [u32; 9] = [
@@ -88,6 +136,8 @@ pub enum Refusal {
     /// Another client's flow is under way and this one has not started:
     /// ask again later. Nothing was recorded.
     Busy,
+    /// The cap status, asked by a client that has not sent Done.
+    NotDone,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,6 +185,8 @@ pub struct Gate {
     once: [u8; CLIENTS],
     slots: [Option<Entry>; SLOTS],
     capped: bool,
+    /// The cap's verdict, set by `run_cap` alone.
+    verdict: Option<CapVerdict>,
 }
 
 impl Default for Gate {
@@ -154,7 +206,7 @@ fn kind_matches(kind: Kind, handle: u32) -> bool {
 
 impl Gate {
     pub const fn new() -> Self {
-        Self { states: [State::Fresh; CLIENTS], once: [0; CLIENTS], slots: [None; SLOTS], capped: false }
+        Self { states: [State::Fresh; CLIENTS], once: [0; CLIENTS], slots: [None; SLOTS], capped: false, verdict: None }
     }
 
     pub fn state(&self, client: usize) -> Option<State> {
@@ -352,5 +404,42 @@ impl Gate {
         let len = crate::pcr_extend(out, &CAP_DIGEST)?;
         self.capped = true;
         Some(len)
+    }
+
+    /// The cap on `device`: once every client is Done or Failed, the one
+    /// PCR_Extend, tried at most `CAP_ATTEMPTS` times, each attempt within
+    /// `CAP_ATTEMPT_DEADLINE_NS`, until an attempt is confirmed. A retry
+    /// after a lost response may extend PCR 8 twice, which moves it further
+    /// from the sealed value (fail-closed, F4). None while the cap is not
+    /// due (some client has not finished, or it already ran): no verdict,
+    /// and the device is not called.
+    pub fn run_cap(&mut self, device: &mut impl CapTransport) -> Option<CapVerdict> {
+        let mut cmd = [0u8; PCR_EXTEND_CMD_LEN];
+        let n = self.cap(&mut cmd)?;
+        let cmd = cmd.get(..n).unwrap_or(&[]);
+        let mut verdict = CapVerdict::Failed;
+        for _ in 0..CAP_ATTEMPTS {
+            if extend_confirmed(device.attempt(cmd, CAP_ATTEMPT_DEADLINE_NS)) {
+                verdict = CapVerdict::Confirmed;
+                break;
+            }
+        }
+        self.verdict = Some(verdict);
+        Some(verdict)
+    }
+
+    /// The cap barrier's answer to `client`, which must be Done: Pending
+    /// until `run_cap` has given its verdict, then the verdict. Changes
+    /// nothing. A gate capped by `cap` alone (no device) stays Pending, so
+    /// its clients' barriers time out (fail-closed).
+    pub fn cap_status(&self, client: usize) -> Result<CapStatus, Refusal> {
+        if self.state(client).ok_or(Refusal::UnknownClient)? != State::Done {
+            return Err(Refusal::NotDone);
+        }
+        Ok(match self.verdict {
+            None => CapStatus::Pending,
+            Some(CapVerdict::Confirmed) => CapStatus::Confirmed,
+            Some(CapVerdict::Failed) => CapStatus::Failed,
+        })
     }
 }

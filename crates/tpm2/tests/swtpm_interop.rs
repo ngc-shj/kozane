@@ -702,11 +702,33 @@ fn two_seals_of_one_blob_differ_and_both_unseal() {
 
 /// The `tpm` PD as crates/pds/tpm runs it (the gate with its
 /// one-flow-at-a-time Busy rule answered RSP_BUSY, the cap after every
-/// client finished), over swtpm, shared by three client threads.
+/// client finished, the cap status of the barrier), over swtpm, shared by
+/// three client threads.
 struct PdModel {
     tpm: Tpm,
     gate: Gate,
     busy: usize,
+}
+
+/// The cap's device: swtpm, which always answers.
+struct CapDevice<'t> {
+    tpm: &'t mut Tpm,
+    rsp: Vec<u8>,
+}
+
+impl tpm2_wire::gate::CapTransport for CapDevice<'_> {
+    fn attempt(&mut self, cmd: &[u8], _budget_ns: u64) -> Option<&[u8]> {
+        self.rsp = self.tpm.transact(cmd);
+        Some(&self.rsp)
+    }
+}
+
+/// The PD's reply to the Done that ran the cap and to the cap status.
+fn cap_label(verdict: CapVerdict) -> u64 {
+    match verdict {
+        CapVerdict::Confirmed => ipc::label(ipc::RSP_OK, 0),
+        CapVerdict::Failed => ipc::label(ipc::RSP_REFUSED, ipc::REFUSED_CAP_FAILED),
+    }
 }
 
 struct PdCall<'m> {
@@ -733,16 +755,21 @@ impl tpm2::boot::Transport for PdCall<'_> {
                 rsp[..r.len()].copy_from_slice(&r);
                 (ipc::label(ipc::RSP_OK, r.len()), ipc::words(r.len()) * 8)
             }
+            ipc::REQ_CAP_STATUS => match pd.gate.cap_status(self.client) {
+                Ok(CapStatus::Pending) => (ipc::label(ipc::RSP_BUSY, 0), 0),
+                Ok(CapStatus::Confirmed) => (cap_label(CapVerdict::Confirmed), 0),
+                Ok(CapStatus::Failed) => (cap_label(CapVerdict::Failed), 0),
+                Err(_) => (ipc::label(ipc::RSP_REFUSED, 2), 0),
+            },
             kind => {
                 if pd.gate.finish(self.client, kind == ipc::REQ_DONE).is_err() {
                     return (ipc::label(ipc::RSP_REFUSED, 2), 0);
                 }
-                let mut cmd = [0u8; IPC_MSG_BYTES];
-                if let Some(n) = pd.gate.cap(&mut cmd) {
-                    let r = pd.tpm.transact(&cmd[..n]);
-                    tpm2_wire::parse_pcr_extend(&r).unwrap();
+                let PdModel { tpm, gate, .. } = &mut *pd;
+                match gate.run_cap(&mut CapDevice { tpm, rsp: Vec::new() }) {
+                    Some(verdict) => (cap_label(verdict), 0),
+                    None => (ipc::label(ipc::RSP_OK, 0), 0),
                 }
-                (ipc::label(ipc::RSP_OK, 0), 0)
             }
         }
     }
@@ -759,7 +786,7 @@ impl tpm2::boot::Transport for PdCall<'_> {
 }
 
 use layout::tpm as ipc;
-use tpm2_wire::gate::Refusal;
+use tpm2_wire::gate::{CapStatus, CapVerdict, Refusal};
 
 #[test]
 fn every_key_pd_unseals_concurrently_through_the_pd_model_and_pcr8_is_capped() {

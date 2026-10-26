@@ -178,6 +178,16 @@ alongside other implementation work.
    - In rp gate boot: the fan-in budget.
    - Each one is converted to an ordering or count verdict, or recorded as a liveness timeout with its margin.
 
+**Diagnosis (slice 1, 2026-10-26).** The cause is in the test, not the product.
+- **The runs:** z1mn, 2 busy cores, the instrumented run.py, 3 of 3 failing.
+- **What the sniffer shows:** after load engaged (`i0`), the victim ran the cookie path to EmptyData in 0.75 s.
+- **What reached the spoofed endpoint:** no spoofed InitHello arrived in that window; the spoofer sends once a second. The only frame to the spoofed endpoint was a RespHello for a spoof forwarded before engagement, which the existing `pending` allowance accounts for.
+- **Why it fails:** the verdict's window ends when the victim completes. Whenever the victim is faster than the spoof period, the window holds no spoof, so the case fails while the gate behaves correctly.
+- **The fix:**
+  - the window no longer ends at the victim's completion;
+  - the case keeps spoofing and judges within load's hold (`RP_UNDER_LOAD_AFTER_NS` after the last trigger): a CookieReply to the spoofed endpoint must be sniffed before the console shows `RpLoadCleared` (cumulative totals, VE13);
+  - it fails only if load clears without one, which would be a product fault, or if the liveness timeout expires.
+
 **Acceptance.**
 - Both boots pass 3 of 3 under 2 busy cores, and once beside a capped Kani run.
 - Every verdict in them is an ordering or count, or a recorded liveness timeout.
@@ -342,7 +352,7 @@ additions.
 
 ## Residual risks added or changed
 
-- **R6 (7), the rotating spoof:** narrowed by P1. A spoof below θ, from any claimed source, holds up to θ of `pq` ungated, and a peer's extra delay is bounded by about one exchange.
+- **R6 (7), the rotating spoof:** narrowed by P1/A1. About one unfinished uncookied InitHello per `RP_UNFINISHED_INTERVAL_NS` (60 s), plus a one-off burst of `RP_UNFINISHED_BURST` − 1 from a full meter, from any claimed source, reaches `pq` ungated. A peer's extra delay stays about one exchange.
 - **RM5-5:** unchanged. P3 adds detection and a forced stop of every key domain on a cap failure; it does not close the bus window.
 - **RM6-11:** unchanged. Kani loop contracts remain a later candidate.
 
@@ -350,3 +360,54 @@ additions.
 
 - M7's redefinition under QEMU (memory `m7-virtual-not-board`), planned after this batch.
 - Kani loop contracts (RM6-11).
+
+### P1 amendment A1 (2026-10-26, after slice 2's first QEMU run; owner decision)
+
+**Evidence.** The time-based occupancy trigger does not fire against the attack on our hosts.
+- **The measurement.** The rotating-spoof case on mrx33 failed its precondition as vacuous: modelled occupancy 0.17 over 3 cycles, against the required 0.55. On idle TCG hosts `pq` serves an InitHello in about 0.7–2 s (`RpCostHighWater` ≈ 0.73 s on z1mn), not the 8.5 s that M3 measured on a host loaded by Kani.
+- **Why the trigger cannot fire.** The global meter limits uncookied forwards to one per 10 s, so the attack holds `pq` at 7–20 %. That is far below θ = ½, and lower still on hardware.
+- **The root cause.** Anything that measures `pq` time inherits the host's speed. The test then cannot be made non-vacuous, and the threshold means something different on every host.
+
+**Supersedes.** A1 replaces P1's time-based paragraphs: the meter's busy and idle accounting, "Constants" (the `RP_PQ_BUSY_CREDIT_NS` credit and its order assertion against `PQ_HANDSHAKE_COST_NS`), θ, and "Residual (restated, S3)". Where they conflict, A1 governs.
+
+**Decision (owner, 2026-10-26).** P1's trigger counts **uncookied InitHellos whose exchange did not complete**. It counts events, not time. Everything else in P1 is unchanged: the refund-on-completion idea, the exclusion of cookied work, I1/I2, the legacy probe, `pq_dead` as idle, and the separate audit event.
+
+**The meter.** A refill meter in ns units, the same shape as `ingress-core`'s existing `Meter`: lazy refill at 1 ns per ns from its last update, saturating.
+- **Constants:**
+  - `RP_UNFINISHED_INTERVAL_NS` = 60 s, the cost of one unfinished InitHello;
+  - `RP_UNFINISHED_BURST` = `RP_MAX_PEERS` (8), the capacity in InitHellos. The capacity is `RP_UNFINISHED_BURST` × `RP_UNFINISHED_INTERVAL_NS`.
+- **Spend.** `sent(kind, src, cookied, now_ns)` spends one interval for an uncookied InitHello, saturating at 0; it never refuses. The entry is marked counted.
+- **Carry.** `complete()` moves the counted mark into `Completion::Reply`. `replied(Hello)` stores it in the `awaited` entry.
+- **Refund.** `replied(Conf)` through a matched `awaited` entry refunds one interval if the entry carries the mark, saturating at the capacity, and clears the mark. A repeated Conf refunds nothing. Nothing else refunds.
+- **Trigger.** `observe_load` treats a credit below one interval as a trigger, by a pure read at `now`, so it also runs from `tick_if_due`. It is audited as `RpUnfinishedLoad`, which replaces the `RpOccupancyLoad` name.
+- **What that gives:**
+  - an attack at one spoof per 10 s spends 60 s and refills 10 s per cycle, so it engages after about 9 spoofed InitHellos (about 90 s), on any host;
+  - a spoof at most one per 60 s never engages. That is the restated residual: about one unfinished uncookied InitHello per `RP_UNFINISHED_INTERVAL_NS`, plus a one-off burst of `RP_UNFINISHED_BURST` − 1 from a full meter, from any claimed source, reaches `pq` ungated;
+  - legitimate exchanges complete and are refunded. Boot fan-in fits the capacity of 8. A legitimate InitHello whose exchange does not complete, such as a retransmission's twin, costs one interval each.
+
+**Compile-time pins (A1 review).** These are const asserts in ingress-core, marked may-not-be-weakened. They replace the pqkey-core assertion on `RP_PQ_BUSY_CREDIT_NS`:
+- `RP_UNFINISHED_INTERVAL_NS > RP_HELLO_GLOBAL_INTERVAL_NS`, so an attack at the global rate drains the meter and engages it;
+- `RP_UNFINISHED_BURST > RP_HELLO_IN_FLIGHT`, the headroom for boot fan-in.
+
+**Changed acceptance.**
+- **Kani.** The occupancy harnesses are replaced by:
+  - the meter in range, with "empty triggers";
+  - the split-invariant read;
+  - refund only through a matched `awaited` entry carrying the mark;
+  - the inductive no-double-refund invariant `inflight_counted + awaited_marked + refunded_total ≤ spent_total` (ghost counters), with one harness per operation: `sent`, `complete` plus `replied(Hello)`, a repeated `replied(Conf)`, and `retire`;
+  - the existing `rp_*` harnesses, with `spec_unfinished_empty` taking `spec_occupancy_empty`'s place.
+- **Unit tests.** P1's list, restated in counts:
+  - the boundary: one interval left means no trigger, less means a trigger;
+  - saturation;
+  - one per 60 s never triggers;
+  - spoofs claiming proven endpoints, rotated within the per-IP meter, engage through `RpUnfinishedLoad`;
+  - a completed exchange is refunded, one without its InitConf is not, and a repeated Conf refunds nothing;
+  - 8 peers rekeying and completing never engage load;
+  - `pq_dead` means no trigger.
+- **Selftest (unit gate).** The mutations are: remove the trigger, invert the boundary, double the refill, refund without the mark.
+- **Integration (`rp rotating spoof`).**
+  - The closed-loop spoofer stays, so `RingReserved` cannot fire and the period stays at or above `RP_HELLO_GLOBAL_INTERVAL_NS` plus a margin.
+  - The vacuity precondition on time occupancy is removed. There is no θ: the trigger does not depend on service time. The case instead requires the measured period to be below `RP_UNFINISHED_INTERVAL_NS`.
+  - **The verdict.** The first CookieReply to a spoofed source comes within ⌈1.5 × N⌉ + 2 spoofed RespHellos, where N is computed from the constants and the measured period: spoofs until the credit falls below one interval.
+  - Attribution (`RpUnfinishedLoad`, no refusals before it) and the post-engagement bound stay as they are.
+- **Credit carry-over.** The case still drains to idle first. It waits for the credit to refill to its capacity, at most `RP_UNFINISHED_BURST` × `RP_UNFINISHED_INTERVAL_NS` after the last forward.

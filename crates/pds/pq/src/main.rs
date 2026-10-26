@@ -237,6 +237,10 @@ fn init() -> Pq {
     if status != OK {
         if let Some(code) = pqkey_core::unavailable_code(status) {
             audit.record(Event::KeyUnavailable { code });
+            // A failed PCR 8 cap is named as well (post-M6 plan P3).
+            if code == pqkey_core::BootError::TpmCapFailed.code() {
+                audit.record(Event::TpmCapFailed);
+            }
         }
         audit.halt(halt::NO_BOOT_SEED);
     }

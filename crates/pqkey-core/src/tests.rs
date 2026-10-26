@@ -181,6 +181,7 @@ fn boot_error_messages_are_distinct() {
         BootError::UnsealRefused,
         BootError::TpmResponseInvalid,
         BootError::EnvelopeOpen,
+        BootError::TpmCapFailed,
         BootError::Blob(BlobError::BadMagic),
         BootError::Blob(BlobError::BadVersion),
         BootError::Blob(BlobError::BadPeerCount),
@@ -189,8 +190,8 @@ fn boot_error_messages_are_distinct() {
         BootError::Blob(BlobError::TooSmall),
     ];
     // A variant missing from the list fails here.
-    assert_eq!(core::mem::variant_count::<BootError>(), 10);
-    assert_eq!(all.len() - 9, core::mem::variant_count::<BlobError>());
+    assert_eq!(core::mem::variant_count::<BootError>(), 11);
+    assert_eq!(all.len() - 10, core::mem::variant_count::<BlobError>());
     for (i, a) in all.iter().enumerate() {
         for b in &all[i + 1..] {
             assert_ne!(a.message(), b.message());
@@ -212,6 +213,7 @@ fn unseal_failures_carry_key_cores_codes() {
         UnsealError::UnsealRefused,
         UnsealError::ResponseInvalid,
         UnsealError::EnvelopeOpen,
+        UnsealError::CapFailed,
     ];
     assert_eq!(all.len(), core::mem::variant_count::<UnsealError>());
     for e in all {
@@ -231,6 +233,7 @@ fn key_core_code(e: tpm2::boot::UnsealError) -> u32 {
         UnsealError::UnsealRefused => 14,
         UnsealError::ResponseInvalid => 15,
         UnsealError::EnvelopeOpen => 16,
+        UnsealError::CapFailed => 17,
     }
 }
 

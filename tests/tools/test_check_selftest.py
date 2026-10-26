@@ -176,6 +176,74 @@ def main() -> int:
     ok = left == ["target/crashes/keep"]
     failures += not ok
     print(f"{'ok  ' if ok else 'FAIL'} clear_crashes: crash inputs removed: left {left}")
+
+    # An injection whose anchor misses (edit()'s SystemExit) fails its own
+    # case, and the next case still runs.
+    ran += 1
+    with tempfile.TemporaryDirectory() as d:
+        (pathlib.Path(d) / "x.rs").write_text("fn x() {}\n")
+        saved = (g["warm_tree"], g["run_make"])
+        g["warm_tree"] = lambda: pathlib.Path(d)
+        g["run_make"] = lambda tree, *targets: subprocess.CompletedProcess(["make"], 2, "selftest-needle\n", "")
+        g["CASES"]["selftest-anchor"] = (["unit"], lambda t: g["edit"](t, "x.rs", "absent", "x"), "selftest-needle")
+        g["CASES"]["selftest-after"] = (["unit"], lambda t: None, "selftest-needle")
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                got = g["run_cases"](["selftest-anchor", "selftest-after"])
+        except SystemExit as e:
+            got = f"aborted: {e}"
+        finally:
+            g["warm_tree"], g["run_make"] = saved
+            del g["CASES"]["selftest-anchor"], g["CASES"]["selftest-after"]
+    text = out.getvalue()
+    ok = got == [False, True] and "FAIL selftest-anchor: selftest: injection anchor in x.rs matched 0 times" in text \
+        and "SELFTEST-CASE selftest-anchor FAIL" in text and "SELFTEST-CASE selftest-after ok" in text
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} run_cases: a missed anchor fails only its case: got {got}")
+
+    # A case that copies build/counts stops the run, by name, before any
+    # case runs, when there is none.
+    ran += 1
+    with tempfile.TemporaryDirectory() as d:
+        real_gates = g["check_gates"]()
+        saved = (g["ROOT"], g["WORK"], g["check_gates"], g["run_case"], sys.argv)
+        started = []
+        g["ROOT"], g["WORK"] = pathlib.Path(d), pathlib.Path(d) / "work"
+        g["check_gates"] = lambda: real_gates
+        g["run_case"] = lambda name: started.append(name) or True
+        sys.argv = ["check-selftest", "unit", "manifest"]
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                code = g["main"]()
+        finally:
+            g["ROOT"], g["WORK"], g["check_gates"], g["run_case"], sys.argv = saved
+    ok = code == 1 and not started and "selftest: build/counts missing; run `make check` first" in out.getvalue()
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} main: build/counts missing stops the run: code {code}, started {started}")
+    # --dry (T16): each injection on a fresh copy, nothing run; a missed
+    # anchor fails its case by name, an applying one passes.
+    ran += 1
+    with tempfile.TemporaryDirectory() as d:
+        (pathlib.Path(d) / "x.rs").write_text("fn x() {}\n")
+        saved = (g["warm_tree"], g["run_make"])
+        made = []
+        g["warm_tree"] = lambda: pathlib.Path(d)
+        g["run_make"] = lambda tree, *targets: made.append(targets)
+        g["CASES"]["selftest-anchor"] = (["unit"], lambda t: g["edit"](t, "x.rs", "absent", "x"), "n")
+        g["CASES"]["selftest-applies"] = (["unit"], lambda t: g["edit"](t, "x.rs", "fn x", "fn y"), "n")
+        out = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(out):
+                got = [g["dry_case"]("selftest-anchor"), g["dry_case"]("selftest-applies")]
+        finally:
+            g["warm_tree"], g["run_make"] = saved
+            del g["CASES"]["selftest-anchor"], g["CASES"]["selftest-applies"]
+    ok = got == [False, True] and not made \
+        and "FAIL selftest-anchor: selftest: injection anchor in x.rs matched 0 times" in out.getvalue()
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} dry_case: a missed anchor fails, nothing is made: got {got}, made {made}")
     print(f"CHECK-SELFTEST-FIXTURES {ran}")
     return 1 if failures else 0
 

@@ -131,6 +131,9 @@ pub enum BootError {
     TpmResponseInvalid,
     /// The unsealed KEK did not open the envelope.
     EnvelopeOpen,
+    /// The unseal succeeded but `tpm` could not confirm the cap of PCR 8
+    /// (post-M6 plan P3): the secrets were not released.
+    TpmCapFailed,
 }
 
 impl From<UnsealError> for BootError {
@@ -143,6 +146,7 @@ impl From<UnsealError> for BootError {
             UnsealError::UnsealRefused => BootError::UnsealRefused,
             UnsealError::ResponseInvalid => BootError::TpmResponseInvalid,
             UnsealError::EnvelopeOpen => BootError::EnvelopeOpen,
+            UnsealError::CapFailed => BootError::TpmCapFailed,
         }
     }
 }
@@ -166,12 +170,13 @@ impl BootError {
             BootError::UnsealRefused => "tls secrets: the TPM refused to unseal (PCR 8)",
             BootError::TpmResponseInvalid => "tls secrets: a TPM response failed its checks",
             BootError::EnvelopeOpen => "tls secrets: the unsealed KEK does not open the envelope",
+            BootError::TpmCapFailed => "tls secrets: the TPM did not confirm the PCR 8 cap",
         }
     }
 
     /// Stable code, one per failure, carried by the Unavailable reply label
     /// and by `tls`'s `KeyUnavailable` audit record. In `CODE_BASE | 1 ..=
-    /// CODE_BASE | 16`; a failure `key` has too keeps `key`'s number above
+    /// CODE_BASE | 17`; a failure `key` has too keeps `key`'s number above
     /// the base (`CODE_BASE | 10` stays unused: `key`'s seed derivation can
     /// fail, `tlskey`'s cannot).
     pub const fn code(self) -> u32 {
@@ -192,6 +197,7 @@ impl BootError {
                 BootError::UnsealRefused => 14,
                 BootError::TpmResponseInvalid => 15,
                 BootError::EnvelopeOpen => 16,
+                BootError::TpmCapFailed => 17,
             }
     }
 }

@@ -5,7 +5,10 @@ extern crate std;
 use std::vec;
 use std::vec::Vec;
 
-use super::gate::{ALLOWED, CAP_DIGEST, CLIENTS, Gate, Refusal, State};
+use super::gate::{
+    ALLOWED, CAP_ATTEMPT_DEADLINE_NS, CAP_ATTEMPTS, CAP_DIGEST, CLIENTS, CapStatus, CapTransport, CapVerdict, Gate, Refusal,
+    State,
+};
 use super::*;
 
 fn hex(s: &str) -> Vec<u8> {
@@ -440,6 +443,117 @@ fn malformed_commands_are_refused() {
     let mut bound = cmd(|b| start_auth_session(b, 0x8000_0000, &[1; 32], &[2; POINT_LEN]));
     bound[17] = 0x00; // bind = the owner's primary, not TPM_RH_NULL
     assert_eq!(g.command(OWNER, &bound), Err(Refusal::Hierarchy));
+}
+
+/// PCR_Extend's success: a password session, no parameters.
+const EXTEND_OK: &str = "8002 00000013 00000000 00000000 0000 01 0000";
+/// TPM_RC_FAILURE.
+const EXTEND_REFUSED: &str = "8001 0000000a 00000101";
+
+/// A device answering each attempt as scripted (None: no response within
+/// the attempt's deadline); past the script, nothing.
+struct Device {
+    script: Vec<Option<Vec<u8>>>,
+    /// The command and budget of every attempt.
+    calls: Vec<(Vec<u8>, u64)>,
+    rsp: Vec<u8>,
+}
+
+impl Device {
+    fn new(script: Vec<Option<Vec<u8>>>) -> Self {
+        Device { script, calls: Vec::new(), rsp: Vec::new() }
+    }
+}
+
+impl CapTransport for Device {
+    fn attempt(&mut self, cmd: &[u8], budget_ns: u64) -> Option<&[u8]> {
+        let next = self.script.get(self.calls.len()).cloned().flatten();
+        self.calls.push((cmd.to_vec(), budget_ns));
+        self.rsp = next?;
+        Some(&self.rsp)
+    }
+}
+
+fn all_finished() -> Gate {
+    let mut g = Gate::new();
+    for c in 0..CLIENTS {
+        g.finish(c, true).unwrap();
+    }
+    g
+}
+
+#[test]
+fn the_cap_is_confirmed_by_the_attempt_that_succeeds_after_two_failures() {
+    let mut g = all_finished();
+    let mut d = Device::new(vec![None, Some(hex(EXTEND_REFUSED)), Some(hex(EXTEND_OK))]);
+    assert_eq!(g.run_cap(&mut d), Some(CapVerdict::Confirmed));
+    let want = cmd(|b| pcr_extend(b, &CAP_DIGEST));
+    assert_eq!(d.calls, vec![(want, CAP_ATTEMPT_DEADLINE_NS); 3], "three attempts, each with the attempt deadline");
+    assert_eq!(g.cap_status(OWNER), Ok(CapStatus::Confirmed));
+}
+
+#[test]
+fn the_cap_fails_after_cap_attempts_failures_and_tries_no_more() {
+    let mut g = all_finished();
+    // A success past the last attempt is never asked for.
+    let mut script = vec![None; CAP_ATTEMPTS];
+    script.push(Some(hex(EXTEND_OK)));
+    let mut d = Device::new(script);
+    assert_eq!(g.run_cap(&mut d), Some(CapVerdict::Failed));
+    assert_eq!(d.calls.len(), CAP_ATTEMPTS);
+    assert!(g.is_capped(), "capped whatever the device answered");
+    assert_eq!(g.cap_status(OWNER), Ok(CapStatus::Failed));
+}
+
+#[test]
+fn a_transport_error_a_nonzero_rc_and_a_short_response_each_fail_an_attempt() {
+    let ok = hex(EXTEND_OK);
+    let failures = [None, Some(hex(EXTEND_REFUSED)), Some(ok[..ok.len() - 1].to_vec())];
+    for (i, f) in failures.iter().enumerate() {
+        let mut g = all_finished();
+        assert_eq!(g.run_cap(&mut Device::new(vec![f.clone(); CAP_ATTEMPTS])), Some(CapVerdict::Failed), "failure {i}");
+        let mut g = all_finished();
+        let mut d = Device::new(vec![f.clone(), Some(ok.clone())]);
+        assert_eq!(g.run_cap(&mut d), Some(CapVerdict::Confirmed), "failure {i}, then success");
+        assert_eq!(d.calls.len(), 2, "failure {i}");
+    }
+}
+
+#[test]
+fn a_cap_not_due_gives_no_verdict_and_calls_no_device() {
+    let mut g = Gate::new();
+    g.finish(OWNER, true).unwrap();
+    let mut d = Device::new(vec![Some(hex(EXTEND_OK))]);
+    assert_eq!(g.run_cap(&mut d), None);
+    assert!(d.calls.is_empty() && !g.is_capped());
+    assert_eq!(g.cap_status(OWNER), Ok(CapStatus::Pending));
+    // Once run, the cap is not due again.
+    let mut g = all_finished();
+    assert_eq!(g.run_cap(&mut Device::new(vec![None; CAP_ATTEMPTS])), Some(CapVerdict::Failed));
+    let mut d = Device::new(vec![Some(hex(EXTEND_OK))]);
+    assert_eq!(g.run_cap(&mut d), None);
+    assert!(d.calls.is_empty());
+    assert_eq!(g.cap_status(OWNER), Ok(CapStatus::Failed), "the first verdict stays");
+}
+
+#[test]
+fn cap_status_answers_done_clients_only_and_changes_nothing() {
+    let mut g = Gate::new();
+    forward(&mut g, 1, &cmd(create_primary), &handle_rsp(0x8000_0000));
+    g.finish(2, false).unwrap();
+    g.finish(OWNER, true).unwrap();
+    let before = g.clone();
+    assert_eq!(g.cap_status(OWNER), Ok(CapStatus::Pending));
+    assert_eq!(g.cap_status(1), Err(Refusal::NotDone), "Unsealing");
+    assert_eq!(g.cap_status(2), Err(Refusal::NotDone), "Failed");
+    assert_eq!(g.cap_status(CLIENTS), Err(Refusal::UnknownClient));
+    assert!(g == before, "cap_status changed the gate");
+    assert_eq!(Gate::new().cap_status(OWNER), Err(Refusal::NotDone), "Fresh");
+    // A gate capped without a device has no verdict: Pending stays.
+    let mut g = all_finished();
+    let mut out = [0u8; PCR_EXTEND_CMD_LEN];
+    assert!(g.cap(&mut out).is_some());
+    assert_eq!(g.cap_status(OWNER), Ok(CapStatus::Pending));
 }
 
 // The bolero target: every response parser on arbitrary bytes. None may

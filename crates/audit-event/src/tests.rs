@@ -181,7 +181,9 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::RpCookieAccepted
         | Event::RpCookieSuppressed
         | Event::Ready
-        | Event::BackendUnavailable => true,
+        | Event::BackendUnavailable
+        | Event::RpUnfinishedLoad
+        | Event::TpmCapFailed => true,
         Event::FrameDropped { .. }
         | Event::TcpLimited { .. }
         | Event::TlsRefused { .. }
@@ -197,7 +199,7 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::TlsSignHighWater { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
-    assert_eq!(Event::FIXED.len(), 62);
+    assert_eq!(Event::FIXED.len(), 64);
 }
 
 #[test]
@@ -245,6 +247,8 @@ fn only_state_edge_kinds_are_never_coalesced() {
             Event::RpCookieSecretExpired,
             Event::RpCookieSecretUnavailable,
             Event::Ready,
+            Event::RpUnfinishedLoad,
+            Event::TpmCapFailed,
         ]
     );
     assert!(Event::FrameDropped { reason: 0 }.is_coalesced());
@@ -283,7 +287,9 @@ fn decode_classifies_fixed_dropped_and_unknown_codes() {
     assert_eq!(decode(0x0057), Decoded::KeyWaitHighWater);
     assert_eq!(decode(0x0058), Decoded::TlsSignHighWater);
     assert_eq!(decode(0x0059), Decoded::Fixed(Event::BackendUnavailable));
-    assert_eq!(decode(0x005a), Decoded::Unknown);
+    assert_eq!(decode(0x005a), Decoded::Fixed(Event::RpUnfinishedLoad));
+    assert_eq!(decode(0x005b), Decoded::Fixed(Event::TpmCapFailed));
+    assert_eq!(decode(0x005c), Decoded::Unknown);
 }
 
 #[test]
@@ -687,6 +693,19 @@ fn backend_unavailable_is_coalesced_on_its_own_counter() {
     assert_eq!(Event::BackendUnavailable.name(), "BackendUnavailable");
 }
 
+#[test]
+fn rp_unfinished_load_is_an_edge_on_its_own_counter() {
+    // Post-M6 plan P1, A1: raised with `RpUnderLoad` when the unfinished meter
+    // engaged load, so every occurrence is emitted and counted apart.
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::RpUnderLoad, 1, &mut out);
+    run(&mut c, Event::RpUnfinishedLoad, 2, &mut out);
+    let got: Vec<_> = out.iter().map(|r| (r.code, r.a)).collect();
+    assert_eq!(got, [(0x004b, 1), (0x005a, 1), (0x005a, 2)]);
+    assert_eq!(Event::RpUnfinishedLoad.name(), "RpUnfinishedLoad");
+}
+
 /// An out-of-range `tls` value is counted on its own, not with the last
 /// real code (`TlsRefused` 31 is `Closed`), whichever kind it came from.
 #[test]
@@ -699,4 +718,17 @@ fn out_of_range_tls_values_are_counted_apart_from_every_real_code() {
     run(&mut c, Event::TlsRefused { reason: 31 }, 64, &mut out);
     let got: Vec<_> = out.iter().map(|r| (r.code, r.a)).collect();
     assert_eq!(got, [(TLS_REFUSED_BASE + 31, 1), (TLS_KIND_UNKNOWN, 1), (TLS_KIND_UNKNOWN, 65), (TLS_REFUSED_BASE + 31, 65)]);
+}
+
+#[test]
+fn tpm_cap_failed_is_emitted_on_every_occurrence_on_its_own_counter() {
+    // Post-M6 plan P3: an edge (once per boot, then the producer halts),
+    // never coalesced away, counted apart from the fixed kind before it.
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::RpUnfinishedLoad, 1, &mut out);
+    run(&mut c, Event::TpmCapFailed, 2, &mut out);
+    let got: Vec<_> = out.iter().map(|r| (r.code, r.a)).collect();
+    assert_eq!(got, [(0x005a, 1), (0x005b, 1), (0x005b, 2)]);
+    assert_eq!(Event::TpmCapFailed.name(), "TpmCapFailed");
 }

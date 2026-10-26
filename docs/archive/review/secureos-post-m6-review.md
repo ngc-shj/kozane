@@ -157,3 +157,25 @@ No Critical or Major finding is open after five rounds.
 - **Rounds 3 to 5** converged on P1's refund accounting and its Kani statement, each change scoped to the previous one.
 
 The plan is locked for implementation.
+
+## P1 amendment A1 review (2026-10-26, one verifier)
+
+A1 (counting unfinished uncookied InitHellos) holds against the code on every axis:
+- **The spend never saturates.** Uncookied forwards happen only off load.
+- **Legitimate exchanges net zero.**
+- **Spoofs cannot earn a refund.** A refund needs an EmptyData with a peer index through a matched awaited entry that has `conf_seen`.
+- **The long-run ungated rate is bounded:** at most 7 plus t/60 s.
+- **At the global rate it engages at k = 9.**
+- **Forcing load is no new harm.** The existing RateLimited path already does it.
+- **Boot fan-in fits.**
+- **Probes alone never trip the meter.**
+- **A lost refund on awaited reuse is conservative.**
+- **The Kani invariant is inductive and tight.**
+- **The integration N is 9–10 for P ≤ 16.5 s.**
+
+One Major: P1's old residual, constants and assertion text contradicted A1. Resolved:
+- A1 now names what it supersedes;
+- the R6 (7) register bullet is rewritten (about one unfinished InitHello per 60 s, plus a one-off burst of 7);
+- the pqkey-core assertion is replaced by ingress-core const asserts: `RP_UNFINISHED_INTERVAL_NS > RP_HELLO_GLOBAL_INTERVAL_NS` and `RP_UNFINISHED_BURST > RP_HELLO_IN_FLIGHT`, may-not-be-weakened.
+
+No Critical or Major finding is open.

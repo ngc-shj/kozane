@@ -135,6 +135,9 @@ fn tpm_labels_carry_kind_and_length() {
     let l = tpm::label(tpm::RSP_OK, tpm::MSG_BYTES);
     assert_eq!((tpm::kind(l), tpm::arg(l)), (tpm::RSP_OK, tpm::MSG_BYTES));
     assert_ne!(tpm::label(tpm::REQ_DONE, 0), tpm::label(tpm::REQ_FAILED, 0));
+    for req in [tpm::REQ_COMMAND, tpm::REQ_DONE, tpm::REQ_FAILED] {
+        assert_ne!(tpm::REQ_CAP_STATUS, req);
+    }
 }
 
 #[test]

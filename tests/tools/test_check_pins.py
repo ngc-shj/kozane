@@ -226,7 +226,7 @@ CASES = [
      lambda t: append(t / "crates/pqkey-core/src/lib.rs",
                       "\n#[derive(Clone)]\npub struct Seed(zeroize::Zeroizing<[u8; 32]>);\n")),
     ("P9 derive(Debug) on a Secret wrapper in pds/pqkey", {"P9"},
-     lambda t: write(t / "crates/pds/pqkey/src/main.rs", SECRET + "#[derive(Debug)]\nstruct Shk(Secret<32>);\n")),
+     lambda t: append(t / "crates/pds/pqkey/src/main.rs", SECRET + "#[derive(Debug)]\nstruct Shk(Secret<32>);\n")),
     # P9, M3b: pds/ingress joins, and a named secret type counts (A1).
     ("P9 derive(Clone) on a CookieSecret holder in pds/ingress", {"P9"},
      lambda t: append(t / "crates/pds/ingress/src/cookie.rs", "\n#[derive(Clone)]\npub struct Held {\n    secret: CookieSecret,\n}\n")),
@@ -751,6 +751,19 @@ CASES = [
     ("allow the pass's return split over lines around a comment", set(),
      lambda t: edit(t / "crates/pds/tls/src/main.rs", "PASS_PACKETS) || tls_core::conn::pass_due(",
                     "PASS_PACKETS)\n            // the hello turn\n            || tls_core::conn::pass_due(")),
+    # P22 (post-M6 plan P3): every key PD waits at the cap barrier.
+    ("P22 the barrier call removed from unseal", {"P22"},
+     lambda t: edit(t / "crates/tpm2/src/boot.rs", "=> cap_barrier(tpm, &mut rsp),", "=> Ok(()),")),
+    ("P22 the barrier call left only in a comment", {"P22"},
+     lambda t: edit(t / "crates/tpm2/src/boot.rs", "=> cap_barrier(tpm, &mut rsp),",
+                    "=> Ok(()), // cap_barrier(tpm, &mut rsp)")),
+    ("P22 the barrier no longer asks the cap status", {"P22"},
+     lambda t: edit(t / "crates/tpm2/src/boot.rs", "ipc::label(ipc::REQ_CAP_STATUS, 0)", "ipc::label(ipc::REQ_DONE, 0)")),
+    ("P22 a key PD unseals around tpm2::boot::unseal", {"P22"},
+     lambda t: edit(t / "crates/pds/pqkey/src/main.rs", "tpm2::boot::unseal(", "tpm2::boot::unseal_unbarred(")),
+    ("allow the barrier call split over lines", set(),
+     lambda t: edit(t / "crates/tpm2/src/boot.rs", "=> cap_barrier(tpm, &mut rsp),",
+                    "=> cap_barrier(\n            tpm,\n            &mut rsp,\n        ),")),
 ]
 
 

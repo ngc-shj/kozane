@@ -449,6 +449,10 @@ fn boot_seed(audit: &mut Audit) -> Secret<SEED_LEN> {
     if !ok {
         if let Some(code) = tlskey_core::unavailable_code(label) {
             audit.record(Event::KeyUnavailable { code });
+            // A failed PCR 8 cap is named as well (post-M6 plan P3).
+            if code == tlskey_core::BootError::TpmCapFailed.code() {
+                audit.record(Event::TpmCapFailed);
+            }
             audit.halt(halt::KEY_UNAVAILABLE)
         }
         audit.halt(halt::INIT_FAILED)
