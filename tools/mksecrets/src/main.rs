@@ -789,11 +789,36 @@ fn run_check_envelope(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// M7 plan C5: the SRK public a provisioning run read is the storage
+/// template `tpm2::envelope` seals to (fixedTPM, fixedParent, restricted,
+/// decrypt; `tpm2_wire::srk_point`, the PDs' own check), and its Name,
+/// computed here from exactly these bytes, is what MakeCredential binds.
+fn srk_name_hex(tpm2b: &[u8]) -> Result<String, String> {
+    let public = srk_public(tpm2b)?;
+    if tpm2_wire::srk_point(public).is_none() {
+        return Err("--srk-public: not the SRK storage template (attributes, curve or point size differ)".into());
+    }
+    Ok(tpm2::crypto::name(public).iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn run_check_srk(args: &[String]) -> Result<(), String> {
+    let [flag, path] = args else {
+        return Err("usage: mksecrets check-srk --srk-public FILE".into());
+    };
+    if flag != "--srk-public" {
+        return Err("usage: mksecrets check-srk --srk-public FILE".into());
+    }
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    println!("name={}", srk_name_hex(&bytes)?);
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((mode, rest)) if mode == "seal" => run_seal(rest),
         Some((mode, rest)) if mode == "check-envelope" => run_check_envelope(rest),
+        Some((mode, rest)) if mode == "check-srk" => run_check_srk(rest),
         _ => run(&args),
     };
     match result {

@@ -654,3 +654,21 @@ fn mkcert_issues_a_leaf_holding_the_written_public_key() {
     let spki = [&validate::P256_SPKI_PREFIX[..], &public[..]].concat();
     assert!(leaf.windows(spki.len()).any(|w| w == spki.as_slice()));
 }
+
+/// M7 plan C5: check-srk accepts the storage template and prints the Name
+/// the envelope would bind; a public with fixedTPM clear is refused.
+#[test]
+fn check_srk_names_the_template_and_refuses_fixed_tpm_clear() {
+    let srk = srk_tpm2b();
+    let name = srk_name_hex(&srk).unwrap();
+    assert_eq!(name.len(), 2 * 34);
+    assert!(name.starts_with("000b"), "{name}");
+    let want: String = tpm2::crypto::name(&srk[2..]).iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(name, want);
+    // objectAttributes is the u32 after type (2) and nameAlg (2): fixedTPM
+    // is bit 1.
+    let mut loose = srk.clone();
+    loose[2 + 4 + 3] &= !0x02;
+    assert!(srk_name_hex(&loose).unwrap_err().contains("not the SRK storage template"));
+    assert!(srk_name_hex(&srk[..40]).is_err());
+}

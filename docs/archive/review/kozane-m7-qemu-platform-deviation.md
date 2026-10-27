@@ -148,3 +148,33 @@ results and Re-plan R1 are in the plan itself.
   reboot case) re-ran BL1. The second boot re-measured, and its
   handshakes worked as before. That covers the swtpm-reset half of P4 for
   a host-initiated reset.
+
+## Slice 3 (C5)
+
+- **What:** no dev EK CA is committed under `support/keys`. The CA is
+  made per run by swtpm-localca in the run's directory (the integration
+  harness and `test_provision.py`), and `tools/provision` takes its root
+  with `--ek-root` and its intermediates with `--ek-intermediates`. A
+  deployment passes its TPM vendor's root.
+  **Why:** a committed CA key is a key anyone with the repo holds. RM7-10
+  is narrowed: the residual is now only that QEMU's TPMs come from a CA
+  the harness itself made, not one their vendor runs.
+- **What:** the EK is the RSA one at the TCG credential profile's index
+  0x01c00002, the one swtpm_setup certifies by default.
+- **What:** the SRK's template check and its Name come from one
+  adjudicator, `mksecrets check-srk` (`tpm2_wire::srk_point`, the PDs'
+  own check, and `tpm2::crypto::name`, the envelope's). That avoids a
+  second Python copy (R1, R48).
+- **What:** tpm2-tools leave the objects they create loaded, and swtpm
+  has few transient slots. `tools/provision` therefore flushes transient
+  objects after each create and on every exit, so the TPM is left as it
+  was found.
+- **What:** three of the five denies substitute one tool's output file
+  through a PATH shim: an EK certificate for another TPM, another TPM's
+  SRK, and fixedTPM clear. The comparison, the template check and the
+  activation they exercise are the real ones. "Another CA" and "no EK
+  certificate" are real swtpm setups.
+- **What:** every integration TPM is now manufactured by
+  `swtpm_setup --create-ek-cert` and provisioned by `tools/provision`.
+  The copy check (a copy of the state gives the same SRK) runs through
+  `tools/provision` too.

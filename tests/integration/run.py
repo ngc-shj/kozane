@@ -6545,20 +6545,33 @@ def make(*args, env=None):
         raise Fail(f"make {' '.join(args)} failed:\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
 
 
-# The SRK every envelope is sealed to: the TCG storage template, as
-# tpm2::envelope pins it (the interop tests check the two agree).
-SRK_TEMPLATE = ["-C", "o", "-G", "ecc256:aes128cfb", "-g", "sha256", "-a",
-                "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda|restricted|decrypt"]
+def ek_ca(root: str) -> str:
+    """The run's EK CA (M7 plan C5): a swtpm-localca configuration whose root
+    and intermediate are made under `root` on first use (removed with the
+    run's directory), and the swtpm_setup configuration that uses it."""
+    ca = os.path.join(root, "ek-ca")
+    setup = os.path.join(root, "swtpm-setup.conf")
+    if not os.path.exists(setup):
+        os.mkdir(ca, 0o700)
+        with open(os.path.join(root, "swtpm-localca.conf"), "w") as f:
+            f.write(f"statedir = {ca}\nsigningkey = {ca}/signkey.pem\nissuercert = {ca}/issuercert.pem\n"
+                    f"certserial = {ca}/certserial\n")
+        with open(setup, "w") as f:
+            f.write("create_certs_tool= /usr/bin/swtpm_localca\n"
+                    f"create_certs_tool_config = {root}/swtpm-localca.conf\n"
+                    "create_certs_tool_options = /etc/swtpm-localca.options\nactive_pcr_banks = sha256\n")
+    return ca
 
 
-def read_srk(state: str, out: str):
-    """Starts swtpm on `state` with a data socket for tpm2-tools, writes the
-    SRK's TPM2B_PUBLIC to `out`, and kills it again (nothing volatile is
-    saved, so a boot's TPM2_Startup finds a fresh TPM)."""
+def read_srk(state: str, out: str, ca: str):
+    """Starts swtpm on `state` with a data socket, provisions it with
+    tools/provision against the run's EK CA `ca` (M7 plan C5: the SRK
+    public is written only once activated against the certified EK), and
+    kills it again (nothing volatile is saved, so a boot's TPM2_Startup
+    finds a fresh TPM)."""
     # tpm2-tss's swtpm TCTI finds the control socket at the data path + ".ctrl".
     data = os.path.join(state, "tpm.sock")
     ctrl = data + ".ctrl"
-    ctx = out + ".ctx"
     proc = subprocess.Popen(DIE_WITH_PARENT + ["swtpm", "socket", "--tpm2", "--tpmstate", f"dir={state}",
                                                "--ctrl", f"type=unixio,path={ctrl}", "--server",
                                                f"type=unixio,path={data}", "--flags", "not-need-init,startup-clear"],
@@ -6569,15 +6582,17 @@ def read_srk(state: str, out: str):
             if proc.poll() is not None or time.monotonic() > deadline:
                 raise Fail("swtpm did not open its data socket for provisioning")
             time.sleep(0.05)
-        env = {**os.environ, "TPM2TOOLS_TCTI": f"swtpm:path={data}"}
-        subprocess.run(["tpm2_createprimary", "-Q", *SRK_TEMPLATE, "-c", ctx], check=True, env=env,
-                       capture_output=True)
-        subprocess.run(["tpm2_readpublic", "-Q", "-c", ctx, "-o", out], check=True, env=env, capture_output=True)
+        r = subprocess.run([sys.executable, os.path.join(ROOT, "tools/provision"), "--tcti", f"swtpm:path={data}",
+                            "--ek-root", os.path.join(ca, "swtpm-localca-rootca-cert.pem"),
+                            "--ek-intermediates", os.path.join(ca, "issuercert.pem"), "--out", out],
+                           capture_output=True, text=True, cwd=ROOT)
+        if r.returncode != 0:
+            raise Fail(f"provisioning {state}: {r.stdout}{r.stderr}")
     finally:
         proc.kill()
         proc.wait()
         # swtpm's lock file goes too: only the TPM's own state is copied.
-        for path in (ctrl, data, ctx, os.path.join(state, ".lock")):
+        for path in (ctrl, data, os.path.join(state, ".lock")):
             with contextlib.suppress(FileNotFoundError):
                 os.unlink(path)
     if sorted(os.listdir(state)) != [SWTPM_PERMALL]:
@@ -6590,13 +6605,19 @@ def provision_tpm(root: str, name: str) -> tuple:
     copy of the state; a copy's SRK must be the same one."""
     state = os.path.join(root, f"tpm-{name}")
     os.mkdir(state, 0o700)
+    ca = ek_ca(root)
+    # The TPM's manufacture: an EK and its certificate from the run's CA.
+    r = subprocess.run(["swtpm_setup", "--tpm2", "--tpmstate", state, "--create-ek-cert", "--overwrite", "--config",
+                        os.path.join(root, "swtpm-setup.conf")], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Fail(f"swtpm_setup {name}: {r.stdout}{r.stderr}")
     srk = os.path.join(root, f"tpm-{name}.srk.pub")
-    read_srk(state, srk)
+    read_srk(state, srk, ca)
     copy = tempfile.mkdtemp(prefix=f"tpm-{name}-copy-", dir=root)
     again = copy + ".srk.pub"
     try:
         shutil.copy2(os.path.join(state, SWTPM_PERMALL), copy)
-        read_srk(copy, again)
+        read_srk(copy, again, ca)
         if open(again, "rb").read() != open(srk, "rb").read():
             raise Fail(f"TPM {name}: a copy of the provisioned state has another SRK")
     finally:

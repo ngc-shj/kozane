@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Provisions one TPM for packaging (M7 plan C5): writes the SRK public that
+`tools/package` seals to, only once that SRK is proven to live in a TPM
+whose EK certificate chains to the pinned CA.
+
+Usage: provision --tcti TCTI --ek-root CERT --ek-intermediates CERTS --out FILE
+
+The flow, failing at the first step that fails:
+  1. read the RSA EK certificate from its NV index (TCG EK credential
+     profile, 0x01c00002), verify its chain to --ek-root through
+     --ek-intermediates, and check its public key is the TPM's EK public
+     (the EK created from the default template);
+  2. create the SRK from the storage template and read its TPM2B_PUBLIC
+     once; `mksecrets check-srk` checks it is the template tpm2::envelope
+     seals to and computes its Name from exactly those bytes;
+  3. TPM2_MakeCredential on the host, to the certificate's public key,
+     naming that Name; TPM2_ActivateCredential in the TPM; the secret
+     must come back;
+  4. only then write those same bytes to --out (a new file, renamed into
+     place).
+
+Everything else lives in a fresh 0700 scratch directory removed on every
+path. Control class: fail-closed gate at provisioning; adjudicated by the
+X.509 chain check (openssl) and the TPM's ActivateCredential. A missing
+tool, input or certificate is a refusal naming it.
+"""
+
+import argparse
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import tempfile
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+EK_CERT_NV_RSA = "0x01c00002"
+
+
+class Refused(Exception):
+    pass
+
+
+def run(what: str, args: list, env=None, input=None) -> bytes:
+    try:
+        r = subprocess.run(args, env=env, input=input, capture_output=True, cwd=ROOT)
+    except OSError as e:
+        raise Refused(f"{what}: cannot run {args[0]}: {e}")
+    if r.returncode != 0:
+        raise Refused(f"{what}: {args[0]} failed: {(r.stderr or r.stdout).decode(errors='replace').strip()}")
+    return r.stdout
+
+
+def spki_der(pem: bytes, what: str) -> bytes:
+    """A public key as DER SubjectPublicKeyInfo, so two encodings compare."""
+    return run(what, ["openssl", "pkey", "-pubin", "-outform", "DER"], input=pem)
+
+
+def provision(a, scratch: pathlib.Path) -> bytes:
+    env = {**os.environ, "TPM2TOOLS_TCTI": a.tcti}
+    for path, what in ((a.ek_root, "--ek-root"), (a.ek_intermediates, "--ek-intermediates")):
+        if not pathlib.Path(path).is_file():
+            raise Refused(f"provision: {what} {path} is missing")
+
+    # 1. The EK certificate and the EK it certifies.
+    cert = scratch / "ek.der"
+    run("EK certificate", ["tpm2_nvread", EK_CERT_NV_RSA, "-C", "o", "-o", str(cert)], env)
+    run("EK certificate chain", ["openssl", "verify", "-CAfile", a.ek_root, "-untrusted", a.ek_intermediates,
+                                 "-purpose", "any", str(cert)])
+    cert_key = run("EK certificate", ["openssl", "x509", "-inform", "DER", "-in", str(cert), "-pubkey", "-noout"])
+    ek_pem = scratch / "ek.pem"
+    run("EK", ["tpm2_createek", "-c", str(scratch / "ek.ctx"), "-G", "rsa", "-u", str(ek_pem), "-f", "pem"], env)
+    # tpm2-tools leave what they created loaded; the TPM has few transient
+    # slots, and each later tool loads its saved context again.
+    run("EK", ["tpm2_flushcontext", "-t"], env)
+    if spki_der(ek_pem.read_bytes(), "EK") != spki_der(cert_key, "EK certificate"):
+        raise Refused("provision: the EK certificate's key is not this TPM's EK")
+
+    # 2. The SRK, read once; its Name from exactly these bytes.
+    srk_ctx, srk_pub = scratch / "srk.ctx", scratch / "srk.pub"
+    run("SRK", ["tpm2_createprimary", "-Q", "-C", "o", "-G", "ecc256:aes128cfb", "-g", "sha256", "-a",
+                "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda|restricted|decrypt",
+                "-c", str(srk_ctx)], env)
+    run("SRK", ["tpm2_readpublic", "-Q", "-c", str(srk_ctx), "-o", str(srk_pub)], env)
+    run("SRK", ["tpm2_flushcontext", "-t"], env)
+    srk = srk_pub.read_bytes()
+    out = run("SRK template", ["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "check-srk",
+                               "--srk-public", str(srk_pub)]).decode()
+    name = out.strip().removeprefix("name=")
+    if out.strip() == name or len(name) != 68:
+        raise Refused(f"provision: mksecrets check-srk printed no Name: {out!r}")
+
+    # 3. The credential: made on the host to the certificate's key, opened
+    # by the TPM only if the SRK with that Name lives beside that EK.
+    secret = os.urandom(32)
+    (scratch / "secret").write_bytes(secret)
+    (scratch / "cert-key.pem").write_bytes(cert_key)
+    blob = scratch / "credential"
+    run("MakeCredential", ["tpm2_makecredential", "-T", "none", "-u", str(scratch / "cert-key.pem"), "-G", "rsa",
+                           "-s", str(scratch / "secret"), "-n", name, "-o", str(blob)])
+    session = scratch / "session.ctx"
+    run("ActivateCredential", ["tpm2_startauthsession", "--policy-session", "-S", str(session)], env)
+    try:
+        run("ActivateCredential", ["tpm2_policysecret", "-S", str(session), "-c", "e"], env)
+        opened = scratch / "opened"
+        run("ActivateCredential", ["tpm2_activatecredential", "-c", str(srk_ctx), "-C", str(scratch / "ek.ctx"),
+                                   "-i", str(blob), "-o", str(opened), "-P", f"session:{session}"], env)
+    finally:
+        # The session, and the EK and SRK ActivateCredential loaded: the TPM
+        # is left as it was found.
+        subprocess.run(["tpm2_flushcontext", str(session)], env=env, capture_output=True)
+        subprocess.run(["tpm2_flushcontext", "-t"], env=env, capture_output=True)
+    if opened.read_bytes() != secret:
+        raise Refused("provision: ActivateCredential returned another secret")
+    return srk
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    for opt in ("tcti", "ek-root", "ek-intermediates", "out"):
+        ap.add_argument(f"--{opt}", required=True)
+    a = ap.parse_args()
+    out = pathlib.Path(a.out)
+    if out.exists():
+        print(f"provision: {out} already exists")
+        return 1
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="kozane-provision-"))
+    try:
+        srk = provision(a, scratch)
+        staged = out.with_name(f".{out.name}.provision")
+        fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(srk)
+        os.rename(staged, out)
+    except Refused as e:
+        print(e)
+        return 1
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+        if scratch.exists():
+            print(f"provision: scratch directory {scratch} survived")
+            return 1
+    print(f"provision: wrote {out} (SRK activated against the certified EK)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
