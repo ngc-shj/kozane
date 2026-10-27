@@ -83,7 +83,8 @@ make -C docker run      # start the container (repo mounted at /work)
 make -C docker exec     # shell inside it
 
 make image              # build the PD ELFs and the loader image
-make run                # boot it in QEMU (WireGuard on udp/127.0.0.1:51820)
+make package ...        # seal secrets to a provisioned TPM (tools/provision)
+make run PKG=<out> TPM_STATE=<swtpm state>   # boot the package as shipped
 make test               # integration tests: VPN, HTTPS proxy, measured boot
 make check              # every gate: proofs, laws, constant-time, fuzz, repro, tests
 ```

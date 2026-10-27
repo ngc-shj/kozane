@@ -373,3 +373,89 @@ results and Re-plan R1 are in the plan itself.
   - U-Boot's REFUSE and TF-A's refusals declare `guest-shutdown`.
 - **What:** boot-stop cases (no rng, tls key failure, mismatched blob)
   now also assert that no supervisor record was printed.
+
+## Slice 6 (C11, self-test injections, `make run`)
+
+### C11: the release boot
+
+- **What:** `build()` releases and verifies A's package the way a deployer
+  would:
+  - `release keygen` into the run's directory;
+  - `tools/release.py make --allow-dirty`, since the suite runs on
+    uncommitted trees;
+  - `verify` once per envelope, with `--envelope`/`--kind`, which checks
+    each policy against the signed PCRs.
+
+  The case boots the release's own `flash.bin`, `published.img` and
+  `boot.desc`, plus the package's envelopes.
+  - `qemu_machine` accepts a firmware file only if its bytes equal the
+    shipped image's.
+  - The case reads the manifest through the release tool's own `verify`,
+    so the signature is checked before any field is used.
+  - P24 allows `"-bios"` only in `qemu_machine`. So the case checks that
+    the firmware path appears once in QEMU's argv, and that the loader
+    files are exactly the release's.
+- **What:** the deny cases:
+  - **A firmware digest flipped in the manifest:** already
+    test_release's "an edited manifest is refused". The signature fails
+    before any digest is compared.
+  - **The wrong SRK:** the existing foreign-TPM boot now also asserts
+    `Halted` for exactly hs, pq and tls, and no supervisor record. Kill's
+    QMP verdict rejects any SHUTDOWN.
+  - **The fault-inject image:** asserted to differ from the manifest's
+    `loader_img_sha256`.
+- **What:** every QEMU now starts in one `spawn_qemu`, U-Boot's measure
+  variant included.
+  - Before, `boot_uboot` spawned its own QEMU without QMP, so a self-test
+    run showed a refusal declaration that nothing could check.
+  - The measure variant declares `guest-shutdown` and waits for it in
+    both branches.
+  - `kill_qemu` drains QMP to EOF before judging a QEMU that has already
+    exited, so a SHUTDOWN in flight is not missed.
+
+### Self-test injections
+
+- **What:** the new cases:
+  - `laws-supervisor-smc`;
+  - `supervisor-allowlist` (pins);
+  - `stage-run-init` and `stage-callee-boot-stop` (ct-shape);
+  - `supervisor-resume`: the record is kept and the reset becomes a
+    reply. The positive evidence is a second record, which
+    `reset_after_one_record` names.
+  - `c11-refuse-reason`: U-Boot's HALT resets instead of powering off,
+    so the guest really sends guest-reset.
+  - `c11-no-shutdown`: QEMU is SIGKILLed after the raw-frames case
+    passed.
+  - `c11-fault-inject-serving`: the raw-frames case on the fault-inject
+    image, with frame A.
+  - `c7-rndr-fault`: a raw RNDR after hs's HandshakeOk; the record names
+    hs.
+  - `repro-firmware-timestamp`: `BUILD_MESSAGE_TIMESTAMP` dropped, so the
+    copy's `bl1.bin` differs.
+
+  Each was run once and went red on its needle.
+- **What:** `measure-poweroff` now takes either needle. Without
+  `poweroff`, the measure variant's own power-off also goes, and
+  whichever boot comes first fails: by the old refusal check, or by C11's
+  wait for SHUTDOWN.
+- **What:** four M6 cases were re-anchored after M7's changes:
+  - `laws-tls-budget` and `laws-tls-priority` now match tls's `id`;
+  - `laws-hs-tls-share-key` also removes tlskey's rng channel and gives
+    tls key's free id 2;
+  - `tls-key-halt` now matches `boot_seed`'s `return Err`.
+- **What:** the release refusing the `fault-inject` feature is covered by
+  test_release's two fixtures (make and verify), not by a self-test that
+  builds a release. No `make check` gate runs `tools/release.py`.
+- **What:** once, `c11-fault-inject-serving` failed in the self-test's
+  scratch `make ct` before reaching its boot. The rerun passed and the
+  log was not kept. The long run's `ct` is the watch on it.
+
+### `make run`
+
+- **What:** it boots a package (`PKG`, `TPM_STATE`) through
+  `run.py --run`. That path uses the same `qemu_machine` firmware, the
+  package's media and a per-run swtpm copy, so no unmeasured path is
+  left (I2.1). With no package it prints its usage and exits 2.
+  - It is interactive, with no QMP and no oracle.
+  - Its full boot is the same argv the release-boot case runs, but it has
+    not been run interactively here.

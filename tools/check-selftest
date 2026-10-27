@@ -128,14 +128,14 @@ def two_key_channel(tree: pathlib.Path, caller: str, caller_id: int, callee: str
 
 def share_key_with_tls(tree: pathlib.Path):
     """`tls` back on `key`'s endpoint (M6 slice 2's shape) and `tlskey`
-    removed with its region, its PPC to `tpm` and their policy entries, so
+    removed with its region, its PPCs to `tpm` and `rng` and their policy entries, so
     the system is otherwise lawful."""
-    edit(tree, "system/kozane.system", '<end pd="tlskey" id="1" pp="false" />', '<end pd="key" id="4" pp="false" />')
+    edit(tree, "system/kozane.system", '<end pd="tlskey" id="1" pp="false" />', '<end pd="key" id="2" pp="false" />')
     edit(tree, "system/kozane.system",
          '    <channel>\n        <end pd="tlskey" id="3" pp="true" notify="false" />\n'
          '        <end pd="tpm" id="3" pp="false" notify="false" />\n    </channel>\n', "")
     text = (tree / "system/kozane.system").read_text()
-    pd = re.search(r'\n\n    <!-- M6 plan C12: the TLS signing oracle\..*?</protection_domain>\n', text, re.S)
+    pd = re.search(r'\n\n *<!-- M6 plan C12: the TLS signing oracle\..*?</protection_domain>\n', text, re.S)
     mr = re.search(r'    <!-- tlskey\'s TLS signing key .*?prefill_path="tls-secrets-placeholder.bin" />\n', text, re.S)
     if not pd or not mr:
         raise SystemExit("selftest: tlskey's pd or region not found in the system file")
@@ -145,6 +145,12 @@ def share_key_with_tls(tree: pathlib.Path):
          '[[channels]]\nbetween = ["tls", "key"]\npp = { tls = true, key = false }\nnotify = { tls = false, key = true }\n')
     edit(tree, "policy/laws.toml", '\n[[channels]]\nbetween = ["tlskey", "tpm"]\npp = { tlskey = true, tpm = false }\n'
          'notify = { tlskey = false, tpm = false }\n', "")
+    # M7 plan C6: and its seed oracle channel.
+    edit(tree, "system/kozane.system",
+         '    <channel>\n        <end pd="tlskey" id="4" pp="true" notify="false" />\n'
+         '        <end pd="rng" id="7" pp="false" />\n    </channel>\n', "")
+    edit(tree, "policy/laws.toml", '\n[[channels]]\nbetween = ["tlskey", "rng"]\npp = { tlskey = true, rng = false }\n'
+         'notify = { tlskey = false }\n', "")
     edit(tree, "policy/laws.toml", '\n[pds.tlskey]\nrole = "key"\n', "")
     edit(tree, "policy/laws.toml", '\n[mrs.tls_secrets]\nkind = "secrets"\nowner = "tlskey"\n', "")
 
@@ -164,7 +170,8 @@ CASES_FOR_GATE = {
     "clean-counts": {"stale-counts", "check-propagation"},
     # pins runs the package checker fixtures; package-debug drives the real target.
     "pins": {"pins", "package-debug", "package-waiver", "package-waiver-removed", "mkcert-constraints",
-             "l14-constructor", "l14-codepoint", "finished-ct-eq", "c13-pass-due-pin", "cap-barrier-pin"},
+             "l14-constructor", "l14-codepoint", "finished-ct-eq", "c13-pass-due-pin", "cap-barrier-pin",
+             "supervisor-allowlist"},
     "lint": {"lint"},
     "audit": {"audit"},
     "lint-pds": {"lint-pds", "tls-audit-names"},
@@ -192,14 +199,15 @@ CASES_FOR_GATE = {
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms",
            "mce-residue-encaps-scrub", "mce-residue-encaps-depth", "mce-residue-bm", "tpm2-open-residue",
            "tls-exchange-residue", "tls-exchange-scrub-depth", "tls-hello-scrub", "tls-hello-scrub-depth", "residue-secret-drop"},
-    "ct-shape": {"ct-shape", "ct-identity", "verus-erasure", "tls-identity"},
+    "ct-shape": {"ct-shape", "ct-identity", "verus-erasure", "tls-identity", "stage-run-init", "stage-callee-boot-stop"},
     "verus": {"verus-cache", "verus-trusted", "verus-trusted-item", "verus-no-cheating", "verus-required", "verus-required-site",
               "verus-required-member", "verus-wg-wire-window",
               "verus-wg-wire-roundtrip", "verus-rp-wire-roundtrip",
               "verus-msgs-exact", "verus-ring-mask", "verus-wire-ipv4"},
     "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire", "bolero-tls-wire", "bolero-http-wire"},
     "laws": {"laws", "laws-timer-ingress", "laws-pq-key", "laws-hs-pqkey", "laws-pq-secrets-writable",
-             "laws-tls-pqkey", "laws-tls-budget", "laws-tls-priority", "laws-tls-hd", "laws-hs-tls-share-key"},
+             "laws-tls-pqkey", "laws-tls-budget", "laws-tls-priority", "laws-tls-hd", "laws-hs-tls-share-key",
+             "laws-supervisor-smc"},
     "test": {"measure-twin", "measure-wrap", "measure-pair-01", "measure-pair-02", "measure-pair-12",
              "measure-range2-wrap", "measure-version", "measure-halt", "measure-poweroff", "measure-ctrlc", "key-wipe", "sealed-pcr-unbound", "sealed-srk-name", "sealed-cap", "tpm-proxy-hmac",
              "integration", "integration-count", "integration-residue", "integration-cookie",
@@ -208,8 +216,9 @@ CASES_FOR_GATE = {
              "tls-key-halt", "c8-head-wipe", "tls-scalar-scrub", "https-probe-canary", "tlskey-wipe",
              "proxy-pd-backend-room", "proxy-pd-backend-rst", "https-syn-flood", "https-per-source-cap",
              "https-recycle-abort", "residue-wipe-state", "https-hello-lockstep", "cap-failure-ignored",
-             "cap-barrier-skipped"},
-    "repro": {"repro-path-leak"},
+             "cap-barrier-skipped", "supervisor-resume", "c11-refuse-reason", "c11-no-shutdown",
+             "c11-fault-inject-serving", "c7-rndr-fault"},
+    "repro": {"repro-path-leak", "repro-firmware-timestamp"},
     "mir": {"mir-target-split", "mir-env-split", "mir-debug-split", "mir-feature-split"},
     "manifest": {"manifest"},
 }
@@ -256,6 +265,12 @@ CASES = {
     "repro-path-leak": (["repro"], lambda t: append(t, "crates/pds/timer/src/main.rs",
                                                     '\n#[used]\nstatic SELFTEST_PATH: &str = env!("CARGO_MANIFEST_DIR");\n'),
                         "repro: pd-timer.elf differs between"),
+    # M7 plan C2: without its fixed build message TF-A embeds the build
+    # time, so the copy's firmware differs (the regression P24 names, seen
+    # by the gate that adjudicates it).
+    "repro-firmware-timestamp": (["repro"], lambda t: edit(t, "support/tf-a/build-flags",
+                                                           'BUILD_MESSAGE_TIMESTAMP="kozane"\n', ""),
+                                 "repro: firmware-shipped/bl1.bin differs between"),
     # M5 plan C4: each split gives the shipped wire a body the proof build
     # does not compile, and only the MIR comparison can see it.
     "mir-target-split": (["mir"], lambda t: append(t, "crates/wire/src/lib.rs", MIR_SPLIT.format(
@@ -594,6 +609,66 @@ CASES = {
               "unmaintained warning RUSTSEC-2024-0436 for paste"),
     "laws": (["laws"], lambda t: edit(t, "system/kozane.system", "</system>", "    <selftest_unknown />\n</system>"),
               "L4: unsupported element <selftest_unknown>"),
+    # M7 plan C8, C10: who may reset the machine is the supervisor alone.
+    "laws-supervisor-smc": (["laws"], lambda t: edit(t, "system/kozane.system",
+                                                     '<protection_domain name="audit" id="14" ',
+                                                     '<protection_domain name="audit" id="14" smc="true" '),
+                            "L4: smc is denied outside the supervisor (pd 'audit')"),
+    # M7 plan C8: what the supervisor may name (tools/supervisor-allowlist).
+    "supervisor-allowlist": (["pins"], lambda t: append(t, "crates/pds/supervisor/src/main.rs",
+                                                        "\n#[allow(dead_code)]\nfn selftest(t: T) {\n    t.tcb_resume();\n}\n"),
+                             "S3 main.rs:"),
+    # M7 plan C9's link check: an init that skips run_init, and a callee
+    # PD that links the boot stop.
+    "stage-run-init": (["ct-shape"], lambda t: edit(t, "crates/pds/key/src/main.rs",
+                                                    "    boot_stage::run_init(|_| start())\n", "    start()\n"),
+                       "ct-shape: pd-key.elf: stage: no boot_stage::run_init"),
+    "stage-callee-boot-stop": (["ct-shape"], lambda t: (
+        edit(t, "crates/pds/key/Cargo.toml", 'boot-stage = { path = "../../boot-stage" }',
+             'boot-stage = { path = "../../boot-stage", features = ["boot-stop"] }'),
+        append(t, "crates/pds/key/src/main.rs",
+               "\n#[used]\nstatic SELFTEST_STOP: fn(&boot_stage::Init) -> boot_stage::Dormant = "
+               "boot_stage::Init::boot_stop;\n")),
+                               "ct-shape: pd-key.elf: stage: <boot_stage::Init>::boot_stop"),
+    # M7 plan C8's resume mutation: the record is written, the reset is
+    # replaced by a reply. The resumed child faults again: a second record.
+    "supervisor-resume": (["test", "it_boots=supervisor"], lambda t: edit(t, "crates/pds/supervisor/src/main.rs",
+                                                                          "        match decide(child.index(), msg_info.label()) {\n"
+                                                                          "            Action::Reset => reset::system_reset(),\n"
+                                                                          "        }\n",
+                                                                          "        let _ = (decide, Action::Reset, reset::system_reset);\n"
+                                                                          "        Ok(Some(msg_info))\n"),
+                          "a second supervisor record: the faulting child resumed"),
+    # M7 plan C11: a REFUSE case declaring another SHUTDOWN reason, a QEMU
+    # gone without one, and the fault-inject image under a serving case.
+    "c11-refuse-reason": (["test", "it_boots=measured boot"], lambda t: edit(
+        t, "tools/uboot-config", 'HALT = "poweroff; while true; do true; done"\n',
+        'HALT = "reset; while true; do true; done"\n'),
+                          "QMP: SHUTDOWN guest-reset, want guest-shutdown"),
+    "c11-no-shutdown": (["test", "it_boots=raw frames"], lambda t: edit(t, "tests/integration/run.py",
+                                                                        '        flood(w, con, "Ipv4BadChecksum", k=640)\n        arp_roundtrip(w)\n',
+                                                                        '        flood(w, con, "Ipv4BadChecksum", k=640)\n        arp_roundtrip(w)\n'
+                                                                        '        os.kill(child.pid, signal.SIGKILL)\n'
+                                                                        '        with child.qmp.cond:\n'
+                                                                        '            child.qmp.cond.wait_for(lambda: child.qmp.eof, LINE_TIMEOUT_S)\n'),
+                        "QMP: QEMU exited without a SHUTDOWN event"),
+    "c11-fault-inject-serving": (["test", "it_boots=raw frames"], lambda t: (
+        edit(t, "tests/integration/run.py", 'single("raw frames", lambda: test_raw(good))',
+             'single("raw frames", lambda: test_raw(fi_net))'),
+        edit(t, "tests/integration/run.py",
+             '        con.wait_for(r"audit: src=ingress ArpReplied total=1 lost=0")\n        for reason in DROP_REASONS:\n',
+             '        con.wait_for(r"audit: src=ingress ArpReplied total=1 lost=0")\n'
+             '        w.send(ipv4_udp(PEER_IP, GW_IP, 40000, WG_PORT, FAULT_FRAME_A))\n        for reason in DROP_REASONS:\n')),
+                                 "supervisor: fault pd=ingress"),
+    # M7 plan C7: a raw RNDR on hs's handshake path faults on cortex-a72,
+    # and the supervisor's record names hs.
+    "c7-rndr-fault": (["test", "it_boots=wireguard"], lambda t: edit(t, "crates/pds/hs/src/main.rs",
+                                                                     "                            self.audit.record(Event::HandshakeOk);\n",
+                                                                     "                            self.audit.record(Event::HandshakeOk);\n"
+                                                                     "                            let _r: u64;\n"
+                                                                     "                            // SAFETY: selftest only.\n"
+                                                                     "                            unsafe { core::arch::asm!(\"mrs {}, s3_3_c2_c4_0\", out(reg) _r) };\n"),
+                      "supervisor: fault pd=hs"),
     "pins": (["pins"], lambda t: edit(t, "Makefile", "\trm -rf $(BUILD) $(HOME)", "\t-rm -rf $(BUILD) $(HOME)"),
               "recipe error-ignore prefix"),
     "integration": (["test", "it_boots=wireguard"], lambda t: edit(t, "tests/integration/run.py",
@@ -777,7 +852,9 @@ CASES = {
     "measure-poweroff": (["test", "it_boots=measured boot"], lambda t: edit(
         t, "tools/uboot-config", 'HALT = "poweroff; while true; do true; done"\n',
         'HALT = "while true; do true; done"\n'),
-        "measure_boot: U-Boot did not power off after its refusal"),
+        # The measure variant's own power-off goes too: whichever boot comes
+        # first goes red (M7 plan C11 waits for its SHUTDOWN).
+        ("measure_boot: U-Boot did not power off after its refusal", "QMP: no SHUTDOWN guest-shutdown")),
     # M5 plan C6 (review T3): without the wipe after a failed boot, the
     # Unavailable key keeps the opened blob in guest RAM.
     "key-wipe": (["test", "it_boots=mismatched blob halts key"], lambda t: edit(
@@ -1018,12 +1095,12 @@ CASES = {
     "laws-tls-pqkey": (["laws"], lambda t: two_key_channel(t, "tls", 6, "pqkey", 2),
                        "pd 'tls' has pp channels to more than one key pd"),
     "laws-tls-budget": (["laws"], lambda t: edit(t, "system/kozane.system",
-                                                 '<protection_domain name="tls" priority="100" budget="500" ',
-                                                 '<protection_domain name="tls" priority="100" budget="1_000" '),
+                                                 '<protection_domain name="tls" id="13" priority="100" budget="500" ',
+                                                 '<protection_domain name="tls" id="13" priority="100" budget="1_000" '),
                         "tainted pds' summed budget/period ratio 1.000 exceeds the sum cap 0.95"),
     "laws-tls-priority": (["laws"], lambda t: edit(t, "system/kozane.system",
-                                                   '<protection_domain name="tls" priority="100" ',
-                                                   '<protection_domain name="tls" priority="140" '),
+                                                   '<protection_domain name="tls" id="13" priority="100" ',
+                                                   '<protection_domain name="tls" id="13" priority="140" '),
                           "pd 'tls' (priority 140) must be strictly below pd 'key' (priority 140)"),
     # M6 plan C12: no key pd is shared. `tls` calls `key` again, `tlskey`
     # gone with its region and entries, so only the single-caller rule can
@@ -1288,7 +1365,7 @@ CASES = {
     # init stops on INIT_FAILED instead, which run.py names against the
     # reason it wants.
     "tls-key-halt": (["test", "it_boots=tls key failure"], lambda t: edit(t, "crates/pds/tls/src/main.rs",
-                                                                         "            audit.halt(halt::KEY_UNAVAILABLE)\n",
+                                                                         "            return Err(halt::KEY_UNAVAILABLE);\n",
                                                                          ""),
                      "tls key failure: tls halted with reason="),
     # C8: the head buffer wiped once rewritten (the proxy's early wipe) and

@@ -134,24 +134,15 @@ package-fault-inject-%: ct-harness $(firmware)
 	$(if $(fault_inject_$*),,$(error no fault-inject variant '$*'))
 	$(MAKE) package BUILD=$(BUILD)/fault-inject-$* $(fault_inject_$*) ct_dir=$(ct_dir) firmware=$(firmware)
 
-# Boots an image interactively with both NICs as the integration test does
-# (outside on user-net with 51820 forwarded to RUN_PORT, inside on a dgram
-# socket). The default image holds the zero placeholder, so `key` is
-# Unavailable and `hs` halts. A package is no loader image any more: it boots
-# through U-Boot with the TPM it was sealed to (tests/integration/run.py).
-LOADER ?= $(loader)
+# Boots a package interactively, the shipped way (M7 plan I2.1): the
+# shipped firmware measures it into a per-run copy of the swtpm state it
+# was sealed to (tools/provision, then `make package`), through the one QEMU
+# argv builder the suite uses (tests/integration/run.py). Both NICs as the
+# integration test wires them: outside on user-net with 51820 forwarded to
+# RUN_PORT, inside on a dgram socket.
 RUN_PORT ?= 51820
-# Build the default image; another LOADER= is booted as is.
-run: $(if $(filter $(loader),$(LOADER)),image)
-	qemu-system-aarch64 \
-		-machine virt,virtualization=on -cpu cortex-a72 -m size=2G \
-		-object rng-random,id=rng0,filename=/dev/urandom -device virtio-rng-device,rng=rng0,bus=virtio-mmio-bus.0 \
-		-serial mon:stdio -nographic \
-		-device loader,file=$(LOADER),addr=0x70000000,cpu-num=0 \
-		-device virtio-net-device,netdev=n0,mac=52:54:00:12:34:56,bus=virtio-mmio-bus.31 \
-		-netdev user,id=n0,hostfwd=udp:127.0.0.1:$(RUN_PORT)-:51820 \
-		-device virtio-net-device,netdev=n1,mac=52:54:00:12:34:57,bus=virtio-mmio-bus.23 \
-		-netdev dgram,id=n1,local.type=inet,local.host=127.0.0.1,local.port=45001,remote.type=inet,remote.host=127.0.0.1,remote.port=45002
+run: $(firmware)
+	python3 tests/integration/run.py --run "$(PKG)" "$(TPM_STATE)" $(RUN_PORT)
 
 # The crate-level clippy denies (indexing, unwrap, arithmetic) only bite here.
 lint: | $(counts)
