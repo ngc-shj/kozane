@@ -1,0 +1,86 @@
+#
+# Copyright (c) 2020-2026, Arm Limited and Contributors. All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+#
+# References:
+# [LCS]         Linux Coding Style
+#                 (https://www.kernel.org/doc/html/v4.10/process/coding-style.html)
+# [PEP8]        Style Guide for Python Code
+#		          (https://www.python.org/dev/peps/pep-0008)
+root = true
+################################
+# Default settings for all files
+[*]
+# Windows .bat files may have trouble with utf8 and will fail with lf line ends.
+# Currently no plans to add .bat files, but this can be an issue in the future.
+charset = utf-8
+end_of_line = lf
+trim_trailing_whitespace = true
+indent_size = 4
+indent_style = tab
+################################
+#C and C++, follow LCS
+[*.{c,h,cpp,hpp}]
+# [LCS] Chapter 1: Indentation
+#       "Tabs are 8 characters"
+tab_width = 8
+# [LCS] Chapter 1: Indentation
+#       "and thus indentations are also 8 characters"
+indent_size = 8
+# [LCS] Chapter 1: Indentation
+#       "Outside of comments,...spaces are never used for indentation"
+indent_style = tab
+# [LCS] Chapter 2: Breaking long lines and strings
+#       "Statements may be up to 100 columns when appropriate."
+#   This is a "soft" requirement for Arm-TF, and should not be the sole
+#   reason for changes.
+max_line_length = 100
+# [LCS] Chapter 1: Indentation
+#       "Get a decent editor and don't leave whitespace at the end of lines."
+# [LCS] Chapter 3.1: Spaces
+#       "Do not leave trailing whitespace at the ends of lines."
+trim_trailing_whitespace = true
+################################
+#CMake specific settings
+[{CMakeLists.txt,*.cmake}]
+charset = utf-8
+end_of_line = lf
+indent_size = 4
+indent_style = tab
+insert_final_newline = false
+max_line_length = 128
+trim_trailing_whitespace = true
+################################
+#Documentation
+[*.{rst,md}]
+charset = utf-8
+end_of_line = lf
+indent_size = 4
+indent_style = space
+insert_final_newline = false
+max_line_length = 128
+tab_width = 4
+trim_trailing_whitespace = true
+################################
+# Python code
+[*.py]
+# [PEP8] Indentation
+#	"Use 4 spaces per indentation level."
+indent_size = 4
+indent_style = space
+# [PEP8] Maximum Line Length
+#	"Limit all lines to a maximum of 79 characters."
+max_line_length = 79
+################################
+# Makefiles
+[{Makefile,*.mk}]
+indent_style = tab
+indent_size = 4
+################################
+# json,yaml and xml files
+[{*.json,*.yaml,*.xml}]
+indent_style = space
+indent_size = 4
+tab_width = 4
+trim_trailing_whitespace = true

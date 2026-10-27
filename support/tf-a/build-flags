@@ -1,0 +1,11 @@
+# TF-A build flags for flash.bin (M7 plan C2, C3), one make variable per
+# line; `#` lines are dropped. The two fixed strings keep BL1, BL2 and BL31
+# free of the build time and of `git describe` of the enclosing tree.
+PLAT=qemu
+CROSS_COMPILE=aarch64-none-elf-
+MEASURED_BOOT=1
+MBOOT_TPM_HASH_ALG=sha256
+DISCRETE_TPM=1
+TPM_INTERFACE=FIFO_MMIO
+BUILD_STRING=kozane
+BUILD_MESSAGE_TIMESTAMP="kozane"

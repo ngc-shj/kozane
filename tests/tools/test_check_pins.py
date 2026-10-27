@@ -17,7 +17,9 @@ FILES = ["docker/Dockerfile", "Makefile", "rust-toolchain.toml", "Cargo.toml", "
          "policy/verus-trusted.toml", ".cargo/config.toml",
          # P23: the allowlist and the files it lists that are not *.rs.
          "policy/old-name-allowlist", "tests/integration/run.py", "tests/tools/test_config_build.py",
-         "tools/check-pins", "tests/tools/test_check_pins.py"]
+         "tools/check-pins", "tests/tools/test_check_pins.py",
+         # P24: the firmware's flags and the boot path.
+         "support/tf-a/build-flags", "support/u-boot/boot.cmd", "support/u-boot/kozane.config"]
 # P7's cases run on a tree whose crates/ is replaced by a synthetic one.
 # P7 is enforced, so they need no --enforce-pending.
 ENFORCE: list = []
@@ -776,6 +778,26 @@ CASES = [
      lambda t: append(t / "policy/old-name-allowlist", "crates/wire/src/lib.rs  # stale\n")),
     ("allow an archive document cited by its file name", set(),
      lambda t: append(t / "crates/wire/src/lib.rs", "// docs/archive/review/secureos-m5-measured-release-plan.md\n")),
+    # P24 (M7 plan C2, C3): the firmware's fixed strings and the boot path.
+    ("P24 the firmware flags without BUILD_STRING", {"P24"},
+     lambda t: edit(t / "support/tf-a/build-flags", "BUILD_STRING=kozane\n", "")),
+    ("P24 the firmware flags with a build-time timestamp", {"P24"},
+     lambda t: edit(t / "support/tf-a/build-flags", 'BUILD_MESSAGE_TIMESTAMP="kozane"', "BUILD_MESSAGE_TIMESTAMP=__TIME__")),
+    ("P24 no firmware flags file", {"P24"},
+     lambda t: (t / "support/tf-a/build-flags").unlink()),
+    ("P24 U-Boot starting the TPM", {"P24"},
+     lambda t: edit(t / "support/u-boot/boot.cmd", "tpm2 init || REFUSE\n",
+                    "tpm2 init || REFUSE\ntpm2 startup TPM2_SU_CLEAR || REFUSE\n")),
+    ("allow a comment naming tpm2 startup", set(),
+     lambda t: append(t / "support/u-boot/boot.cmd", "# no tpm2 startup here: BL1 starts the TPM\n")),
+    ("P24 U-Boot with measured boot on", {"P24"},
+     lambda t: append(t / "support/u-boot/kozane.config", "CONFIG_MEASURED_BOOT=y\n")),
+    ("P24 U-Boot with the EFI TCG2 protocol on", {"P24"},
+     lambda t: append(t / "support/u-boot/kozane.config", "CONFIG_EFI_TCG2_PROTOCOL=y\n")),
+    ("allow U-Boot measured boot left off", set(),
+     lambda t: append(t / "support/u-boot/kozane.config", "# CONFIG_MEASURED_BOOT is not set\n")),
+    ("P24 a second QEMU command line naming its firmware", {"P24"},
+     lambda t: append(t / "tests/integration/run.py", 'BYPASS = ["-bios", "u-boot.bin"]\n')),
 ]
 
 

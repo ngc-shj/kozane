@@ -292,6 +292,31 @@ RUN set -eux; \
     useradd --uid "$UID" --gid "$GID" --create-home dev; \
     # wireguard-go's UAPI socket directory, for the unprivileged test netns.
     install -d -o "$UID" -g "$GID" -m 0700 /var/run/wireguard
+
+# M7 C1: TF-A and the Mbed TLS release its measured boot hashes with, built
+# by `make firmware` with the repo's patch (support/tf-a). TF-A's libTPM and
+# libEventLog submodules are vendored under third_party/ instead: their
+# upstream serves no stable release archive.
+ARG TFA_VERSION=2.15.0
+ARG TFA_SHA256=ec4d6779225c5243a05dd190cd25c06ae79bec293afea780f0eb63541341a505
+ARG MBEDTLS_VERSION=3.6.6
+ARG MBEDTLS_SHA256=8fb65fae8dcae5840f793c0a334860a411f884cc537ea290ce1c52bb64ca007a
+# TF-A's build tools, from the same snapshot as the list above (a layer of
+# its own, so adding them did not rebuild every layer after that list):
+# fiptool links OpenSSL, libTPM and libEventLog build with cmake, the fdts
+# need dtc.
+RUN apt-get update -q && apt-get install -y --no-install-recommends \
+    cmake \
+    device-tree-compiler \
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN set -eux; \
+    mkdir -p /opt/tf-a; \
+    curl -sSfL -o /opt/tf-a/tf-a-${TFA_VERSION}.tar.gz "https://github.com/ARM-software/arm-trusted-firmware/archive/refs/tags/v${TFA_VERSION}.tar.gz"; \
+    echo "$TFA_SHA256  /opt/tf-a/tf-a-${TFA_VERSION}.tar.gz" | sha256sum -c -; \
+    curl -sSfL -o /opt/tf-a/mbedtls-${MBEDTLS_VERSION}.tar.bz2 "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VERSION}/mbedtls-${MBEDTLS_VERSION}.tar.bz2"; \
+    echo "$MBEDTLS_SHA256  /opt/tf-a/mbedtls-${MBEDTLS_VERSION}.tar.bz2" | sha256sum -c -
+
 USER dev
 
 # The toolchain itself is selected by rust-toolchain.toml in the repo.

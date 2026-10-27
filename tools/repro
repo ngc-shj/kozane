@@ -4,8 +4,9 @@
 #
 # Copies the work tree (without build/, target dirs, .git and crashes/) to a
 # directory at another absolute path, builds the published image there from
-# a cold PD target directory, and compares loader.img, report.txt and every
-# PD ELF with the primary build, which the caller has just made.
+# a cold PD target directory, and compares loader.img, report.txt, every
+# PD ELF, and both firmware images with their U-Boot (M7 plan C2) with the
+# primary build, which the caller has just made.
 #
 # The PD target directory is fixed by the Makefile (pd_target), outside any
 # tree: LLVM's local ThinLTO names promoted symbols with a hash of the
@@ -32,6 +33,11 @@ artifacts=(loader.img report.txt)
 for pd in "$@"; do
     artifacts+=("pd-$pd.elf")
 done
+# The firmware: its bytes decide PCR 0 (M7 plan C2, C4).
+for variant in shipped measure; do
+    artifacts+=("firmware-$variant/flash.bin" "firmware-$variant/bl1.bin" "firmware-$variant/fip.bin"
+                "u-boot-$variant/u-boot.bin")
+done
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/kozane-repro.XXXXXX")
 pd_target=$(make -s -C "$root" --no-print-directory print-pd-target MICROKIT_CONFIG="$config")
@@ -49,6 +55,7 @@ for a in "${artifacts[@]}"; do
         echo "repro: primary build/$a is missing" >&2
         exit 1
     fi
+    mkdir -p "$scratch/primary/$(dirname "$a")"
     cp "build/$a" "$scratch/primary/$a"
 done
 
@@ -57,7 +64,7 @@ mkdir -p "$copy"
 tar -C "$root" --exclude=./build --exclude=./.git --exclude=./crashes --exclude='*/target' -cf - . \
     | tar -C "$copy" -xf -
 rm -rf "$pd_target"
-if ! make -C "$copy" image MICROKIT_CONFIG="$config" > "$scratch/build.log" 2>&1; then
+if ! make -C "$copy" image firmware MICROKIT_CONFIG="$config" > "$scratch/build.log" 2>&1; then
     tail -30 "$scratch/build.log"
     echo "repro: the copy at $copy did not build" >&2
     exit 1

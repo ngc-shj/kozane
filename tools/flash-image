@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""Writes flash.bin (M7 plan C2): TF-A's BL1 at offset 0, padded with zeros
+to the qemu platform's FIP offset, then the FIP. QEMU maps it as the secure
+flash with `-bios`.
+
+Usage: tools/flash-image <bl1.bin> <fip.bin> <out>
+"""
+
+import pathlib
+import sys
+
+# plat/qemu/qemu/include/platform_def.h: PLAT_QEMU_FIP_BASE.
+FIP_OFFSET = 0x40000
+# QEMU_FLASH0_SIZE.
+FLASH_SIZE = 0x4000000
+
+
+def image(bl1: bytes, fip: bytes) -> bytes:
+    if not bl1 or len(bl1) > FIP_OFFSET:
+        raise ValueError(f"flash-image: BL1 is {len(bl1):#x} bytes, outside (0, {FIP_OFFSET:#x}]")
+    if not fip or FIP_OFFSET + len(fip) > FLASH_SIZE:
+        raise ValueError(f"flash-image: the FIP ({len(fip):#x} bytes) does not fit the flash")
+    return bl1 + bytes(FIP_OFFSET - len(bl1)) + fip
+
+
+def main(argv: list) -> int:
+    if len(argv) != 4:
+        print(__doc__, file=sys.stderr)
+        return 2
+    try:
+        out = image(pathlib.Path(argv[1]).read_bytes(), pathlib.Path(argv[2]).read_bytes())
+    except (OSError, ValueError) as e:
+        print(e, file=sys.stderr)
+        return 1
+    pathlib.Path(argv[3]).write_bytes(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

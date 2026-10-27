@@ -106,6 +106,14 @@ Rules:
      case) either cites an archive document by its file name or sits in a
      file policy/old-name-allowlist lists with a reason; a listed file that
      still exists but no longer names it is a stale entry
+  P24 the measured firmware (M7 plan C2, C3): support/tf-a/build-flags
+     exists and fixes BUILD_STRING=kozane and BUILD_MESSAGE_TIMESTAMP=
+     "kozane" (TF-A otherwise embeds the build time and `git describe`);
+     support/u-boot/boot.cmd starts no TPM (`tpm2 startup`: BL1 does), and
+     support/u-boot/kozane.config turns on neither CONFIG_MEASURED_BOOT nor
+     CONFIG_EFI_TCG2_PROTOCOL (no event-log replay); tests/integration/run.py
+     spells "-bios" once, in qemu_machine, the one builder of the QEMU
+     command line, which refuses any firmware but `make firmware`'s
 
 Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
 fail until they are removed from PENDING; --enforce-pending makes them fail
@@ -165,7 +173,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P18",
-         "P19", "P20", "P21", "P22", "P23"]
+         "P19", "P20", "P21", "P22", "P23", "P24"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
                "crates/tls-core", "crates/tlskey-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data",
@@ -951,6 +959,37 @@ def check_old_name(root: pathlib.Path, out: list):
         out.append(f"P23 {OLD_NAME_ALLOWLIST}: {rel} no longer names the old name; drop the stale entry")
 
 
+# P24: the firmware build's fixed strings and the boot path's shape.
+TFA_FLAGS = "support/tf-a/build-flags"
+TFA_FIXED = ("BUILD_STRING=kozane", 'BUILD_MESSAGE_TIMESTAMP="kozane"')
+
+
+def check_firmware(root: pathlib.Path, out: list):
+    flags = root / TFA_FLAGS
+    if not flags.is_file():
+        out.append(f"P24 {TFA_FLAGS}: missing; the firmware build has no fixed flags")
+    else:
+        lines = {l.strip() for l in flags.read_text().splitlines() if not l.startswith("#")}
+        for fixed in TFA_FIXED:
+            if fixed not in lines:
+                out.append(f"P24 {TFA_FLAGS}: no `{fixed}` line; TF-A embeds the build time or `git describe`")
+    boot = root / "support/u-boot/boot.cmd"
+    for n, line in enumerate(boot.read_text().splitlines(), 1):
+        if not line.lstrip().startswith("#") and re.search(r"\btpm2\s+startup\b", line):
+            out.append(f"P24 support/u-boot/boot.cmd:{n}: U-Boot starts the TPM; BL1 does (M7 plan C3)")
+    config = root / "support/u-boot/kozane.config"
+    for n, line in enumerate(config.read_text().splitlines(), 1):
+        if re.fullmatch(r"CONFIG_(MEASURED_BOOT|EFI_TCG2_PROTOCOL)=y\s*", line):
+            out.append(f"P24 support/u-boot/kozane.config:{n}: {line.split('=')[0]} replays the event log (M7 plan D1)")
+    run = (root / "tests/integration/run.py").read_text()
+    bios = [m.start() for m in re.finditer(r'"-bios"', run)]
+    start = run.find("\ndef qemu_machine(")
+    end = min((i for i in (run.find("\ndef ", start + 1), run.find("\nclass ", start + 1)) if i > 0), default=len(run))
+    if len(bios) != 1 or start < 0 or not start <= bios[0] < end:
+        out.append(f'P24 tests/integration/run.py: "-bios" appears {len(bios)} time(s); only qemu_machine may name '
+                   "the firmware")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
@@ -983,6 +1022,7 @@ def main() -> int:
     check_pass_due(root, out)
     check_cap_barrier(root, out)
     check_old_name(root, out)
+    check_firmware(root, out)
     failing = [l for l in out if l.split()[0] not in pending]
     for line in out:
         print(line if line in failing else f"pending {line}")

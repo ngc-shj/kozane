@@ -340,7 +340,7 @@ pins: release-tool | $(counts)
 # it_boots (check-selftest only) runs a subset of the boots; such a run
 # prints INTEGRATION-CASES-PARTIAL, which this grep does not take.
 it_boots :=
-test: ct uboot | $(counts)
+test: ct firmware | $(counts)
 	KOZANE_IT_BOOTS="$(it_boots)" python3 tests/integration/run.py > $(counts)/test.log 2>&1 \
 		|| { tail -40 $(counts)/test.log; exit 1; }
 	grep '^INTEGRATION-CASES ' $(counts)/test.log > $(counts)/test
@@ -368,6 +368,38 @@ $(BUILD)/u-boot-%/u-boot.bin: support/u-boot/kozane.config support/u-boot/boot.c
 	tools/uboot-config verify $(BUILD)/u-boot-$*/kozane.frag $(BUILD)/u-boot-$*/.config
 	SOURCE_DATE_EPOCH=0 env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/u-boot-$* -j$$(nproc) LOCALVERSION= >> $(BUILD)/u-boot-$*.log 2>&1 \
 		|| { tail -30 $(BUILD)/u-boot-$*.log; exit 1; }
+
+# M7 plan C2, C3: flash.bin, TF-A's BL1 at 0 and its FIP (BL2, BL31, and
+# the variant's U-Boot as BL33) at the platform's FIP offset. TF-A, Mbed
+# TLS and the vendored libTPM and libEventLog are unpacked fresh and
+# patched (support/tf-a): BL1 and BL2 extend PCR 0 through the MMIO TIS
+# before each image runs.
+tfa_tarball ?= /opt/tf-a/tf-a-2.15.0.tar.gz
+mbedtls_tarball ?= /opt/tf-a/mbedtls-3.6.6.tar.bz2
+tfa_flags := $(shell grep -v '^\#' support/tf-a/build-flags)
+tfa_patches := support/tf-a/tf-a-qemu-discrete-tpm.patch support/tf-a/libtpm-fifo-mmio.patch
+firmware := $(BUILD)/firmware-shipped/flash.bin
+firmware_measure := $(BUILD)/firmware-measure/flash.bin
+.PHONY: firmware
+firmware: $(firmware) $(firmware_measure)
+
+$(BUILD)/firmware-%/flash.bin: $(BUILD)/u-boot-%/u-boot.bin support/tf-a/build-flags $(tfa_patches) \
+		$(shell find third_party/libtpm third_party/libeventlog -type f) $(tfa_tarball) $(mbedtls_tarball)
+	rm -rf $(BUILD)/firmware-$*
+	mkdir -p $(BUILD)/firmware-$*/src/contrib/mbed-tls
+	tar -xzf $(tfa_tarball) -C $(BUILD)/firmware-$*/src --strip-components=1
+	tar -xjf $(mbedtls_tarball) -C $(BUILD)/firmware-$*/src/contrib/mbed-tls --strip-components=1
+	rm -rf $(BUILD)/firmware-$*/src/contrib/libtpm $(BUILD)/firmware-$*/src/contrib/libeventlog
+	cp -r third_party/libtpm $(BUILD)/firmware-$*/src/contrib/libtpm
+	cp -r third_party/libeventlog $(BUILD)/firmware-$*/src/contrib/libeventlog
+	patch -s -p1 -d $(BUILD)/firmware-$*/src < support/tf-a/tf-a-qemu-discrete-tpm.patch
+	patch -s -p1 -d $(BUILD)/firmware-$*/src/contrib/libtpm < support/tf-a/libtpm-fifo-mmio.patch
+	env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/firmware-$*/src -j$$(nproc) $(foreach f,$(tfa_flags),'$(f)') \
+		BUILD_BASE=$(abspath $(BUILD))/firmware-$*/build BL33=$(abspath $<) all fip > $(BUILD)/firmware-$*.log 2>&1 \
+		|| { tail -30 $(BUILD)/firmware-$*.log; exit 1; }
+	cp $(BUILD)/firmware-$*/build/qemu/release/bl1.bin $(BUILD)/firmware-$*/bl1.bin
+	cp $(BUILD)/firmware-$*/build/qemu/release/fip.bin $(BUILD)/firmware-$*/fip.bin
+	python3 tools/flash-image $(BUILD)/firmware-$*/bl1.bin $(BUILD)/firmware-$*/fip.bin $@
 
 # M5 plan C13: hybrid-signed releases with dev keys (residual RM5-1).
 #   make release-keys KEYS=<new dir outside the repo and cache volumes>
@@ -397,7 +429,7 @@ mir: | $(counts)
 # M5 plan C3: the published (release) image rebuilt from a copy of the tree
 # at another path, from a cold PD target directory, equals this one.
 repro: | $(counts)
-	$(MAKE) image MICROKIT_CONFIG=release
+	$(MAKE) image firmware MICROKIT_CONFIG=release
 	tools/repro release $(pds) > $(counts)/repro.log 2>&1 || { cat $(counts)/repro.log; exit 1; }
 	grep '^REPRO-ARTIFACTS ' $(counts)/repro.log > $(counts)/repro
 

@@ -9,6 +9,8 @@ This file lists what it contains, derives from, or ships that is not its own.
 |---|---|---|
 | `third_party/verus/` | Parts of [Verus](https://github.com/verus-lang/verus) at commit `426d8b01e7ffb910a36c15e1f870ff985bb61eef` (`vstd` and the macro crates it needs) | MIT, [third_party/verus/LICENSE](third_party/verus/LICENSE) |
 | `crates/mce460896/` | A Rust port of Classic McEliece 460896: the decoding core and round-3 key generation from [libmceliece](https://lib.mceliece.org/) 20260622, the round-3 KEM framing as in PQClean `mceliece460896_vec` | libmceliece is in the public domain (`LicenseRef-PD-hp OR CC0-1.0 OR 0BSD OR MIT-0 OR MIT`), PQClean's Classic McEliece code likewise; the port is BSD-2-Clause |
+| `third_party/libtpm/` | [libTPM](https://review.trustedfirmware.org/plugins/gitiles/shared/libTPM) at commit `2adab98e049f6065757b3e811dd42725b1913f49`, the TPM library TF-A 2.15.0 pins as `contrib/libtpm` | BSD-3-Clause, [third_party/libtpm/LICENSE](third_party/libtpm/LICENSE) |
+| `third_party/libeventlog/` | [libEventLog](https://review.trustedfirmware.org/plugins/gitiles/shared/libEventLog) at commit `ab03a7c027056f4f1420c1d5618fc6138d1064b1`, as TF-A 2.15.0 pins it in `contrib/libeventlog` | BSD-3-Clause, [third_party/libeventlog/LICENSE](third_party/libeventlog/LICENSE) |
 | `crates/mce460896/tests/vectors/` | Outputs of liboqs 0.8 and classic-mceliece-rust 2.0.2 (see each file's header) | Test data |
 
 ## Rust dependencies
@@ -32,6 +34,8 @@ SHA-256. A binary image contains them:
 | seL4 kernel (from the Microkit SDK) | Microkit 2.3.1 | GPL-2.0-only |
 | Microkit loader and monitor | 2.3.1 | BSD-2-Clause |
 | U-Boot (measured-boot images) | 2025.01 | GPL-2.0-or-later |
+| TF-A (BL1, BL2, BL31 of `flash.bin`) | 2.15.0 | BSD-3-Clause |
+| Mbed TLS (hashing in TF-A's measured boot) | 3.6.6 | Apache-2.0 OR GPL-2.0-or-later |
 
 Anyone who distributes a binary image must meet the GPL's source obligations
 for the seL4 kernel and U-Boot, for example by naming the exact upstream

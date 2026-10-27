@@ -1,0 +1,319 @@
+--- a/drivers/tpm/tpm2.mk
++++ b/drivers/tpm/tpm2.mk
+@@ -35,6 +35,8 @@
+ 
+ ifeq (${TPM_INTERFACE}, FIFO_SPI)
+     $(eval $(call add_define,TPM_INTERFACE_FIFO_SPI))
++else ifeq (${TPM_INTERFACE}, FIFO_MMIO)
++    $(eval $(call add_define,TPM_INTERFACE_FIFO_MMIO))
+ else
+     $(error "The selected TPM_INTERFACE is invalid.")
+ endif #TPM_INTERFACE
+--- a/plat/qemu/qemu/include/platform_def.h
++++ b/plat/qemu/qemu/include/platform_def.h
+@@ -228,6 +228,16 @@
+ #define DEVICE1_BASE			0x09000000
+ #define DEVICE1_SIZE			0x00c00000
+ 
++#if DISCRETE_TPM
++/*
++ * QEMU virt's tpm-tis-device, the first device on the platform bus:
++ * locality 0's page of the TIS FIFO registers.
++ */
++#define QEMU_TPM_TIS_BASE		0x0c000000
++#define DEVICE2_BASE			QEMU_TPM_TIS_BASE
++#define DEVICE2_SIZE			0x00001000
++#endif
++
+ /*
+  * GIC related constants
+  */
+--- a/plat/qemu/qemu/platform.mk
++++ b/plat/qemu/qemu/platform.mk
+@@ -108,6 +108,16 @@
+     BL1_SOURCES	+=	plat/qemu/qemu/qemu_bl1_measured_boot.c	\
+ 			common/measured_boot_helpers.c
+ 
++ifeq (${DISCRETE_TPM},1)
++    LIBTPM2_PATH	?=	contrib/libtpm
++    TPM2_MK := drivers/tpm/tpm2.mk
++    $(info Including ${TPM2_MK})
++    include ${TPM2_MK}
++
++    BL1_SOURCES	+=	plat/qemu/qemu/qemu_dtpm.c
++    BL2_SOURCES	+=	plat/qemu/qemu/qemu_dtpm.c
++endif
++
+ endif
+ 
+ ifeq (${MEASURED_BOOT},1)
+--- a/plat/qemu/qemu/qemu_bl1_measured_boot.c
++++ b/plat/qemu/qemu/qemu_bl1_measured_boot.c
+@@ -1,21 +1,54 @@
+ /*
+  * Copyright (c) 2022, Arm Limited. All rights reserved.
+- * Copyright (c) 2022, Linaro.
+  *
+  * SPDX-License-Identifier: BSD-3-Clause
+  */
+ 
+ #include <stdint.h>
++
+ #include <common/desc_image_load.h>
+ 
++#if DISCRETE_TPM
++#include <common/debug.h>
++#include <drivers/auth/crypto_mod.h>
++
++#include "qemu_dtpm.h"
++
+ /*
+- * Add dummy functions for measured boot for BL1.
+- * In most of the SoC's, ROM/BL1 code is pre-built. So we are assumimg that
+- * it doesn't have the capability to do measurements and extend eventlog.
+- * hence these are dummy functions.
++ * Kozane M7 C3: BL1 is the CRTM stand-in (VE14). It starts the TPM and
++ * extends PCR 0 with every image it loads before that image runs; the
++ * closed list is BL2 alone, and any other image stops the boot.
+  */
+ void bl1_plat_mboot_init(void)
+ {
++	qemu_dtpm_open("BL1", 1);
++}
++
++void bl1_plat_mboot_finish(void)
++{
++	qemu_dtpm_close("BL1");
++}
++
++int plat_mboot_measure_image(unsigned int image_id, image_info_t *image_data)
++{
++	uint8_t digest[CRYPTO_MD_MAX_SIZE];
++
++	if (image_id != BL2_IMAGE_ID) {
++		ERROR("BL1: image %u is not on the measured list\n", image_id);
++		qemu_dtpm_fail("BL1", "measure");
++	}
++	if (crypto_mod_calc_hash(CRYPTO_MD_SHA256,
++				 (void *)image_data->image_base,
++				 image_data->image_size, digest) != 0) {
++		qemu_dtpm_fail("BL1", "measure");
++	}
++	qemu_dtpm_extend_pcr0("BL1", digest, 32U);
++	NOTICE("BL1: extended PCR 0 with BL2\n");
++	return 0;
++}
++#else
++void bl1_plat_mboot_init(void)
++{
+ }
+ 
+ void bl1_plat_mboot_finish(void)
+@@ -26,6 +59,7 @@
+ {
+ 	return 0;
+ }
++#endif
+ 
+ int plat_mboot_measure_key(const void *pk_oid, const void *pk_ptr,
+ 			   size_t pk_len)
+--- a/plat/qemu/qemu/qemu_measured_boot.c
++++ b/plat/qemu/qemu/qemu_measured_boot.c
+@@ -21,6 +21,9 @@
+ #include <tools_share/tbbr_oid.h>
+ 
+ #include "../common/qemu_private.h"
++#if DISCRETE_TPM
++#include "qemu_dtpm.h"
++#endif
+ 
+ /* Event Log data */
+ static uint8_t event_log[PLAT_EVENT_LOG_MAX_SIZE];
+@@ -65,6 +68,9 @@
+ 	 * to measure the BL2 code which is a common case for
+ 	 * already existing platforms
+ 	 */
++#if DISCRETE_TPM
++	qemu_dtpm_open("BL2", 0);
++#endif
+ 	rc = event_log_init_and_reg(event_log, event_log + sizeof(event_log),
+ 				    0U, crypto_mod_tcg_hash);
+ 	if (rc < 0) {
+@@ -100,6 +106,11 @@
+ 
+ 	event_log_dump((uint8_t *)event_log_base, event_log_cur_size);
+ 
++#if DISCRETE_TPM
++	/* U-Boot (BL33) takes locality 0 next. */
++	qemu_dtpm_close("BL2");
++#endif
++
+ #if TRANSFER_LIST
+ 	if (!plat_handoff_mboot((void *)event_log_base, event_log_cur_size,
+ 				(void *)(uintptr_t)FW_HANDOFF_BASE))
+@@ -157,9 +168,40 @@
+ 						     image_id);
+ 	if (metadata_ptr == NULL) {
+ 		ERROR("Unable to find metadata for image %u.\n", image_id);
++#if DISCRETE_TPM
++		qemu_dtpm_fail("BL2", "measure");
++#endif
+ 		return -1;
+ 	}
+ 
++#if DISCRETE_TPM
++	/*
++	 * Kozane M7 C3: extend PCR 0 itself, before the image is used, and
++	 * record the same digest in the Event Log.
++	 */
++	{
++		uint8_t digest_buf[MAX_TPML_BUFFER_SIZE];
++		const tpmt_ha *digest;
++
++		if (event_log_measure(image_data->image_base,
++				      image_data->image_size, digest_buf,
++				      sizeof(digest_buf)) != 0) {
++			qemu_dtpm_fail("BL2", "measure");
++		}
++		if (event_log_write_pcr_event2(metadata_ptr->pcr, EV_POST_CODE,
++				(const tpml_digest_values *)digest_buf,
++				(const uint8_t *)metadata_ptr->name,
++				strlen(metadata_ptr->name) + 1U) != 0) {
++			qemu_dtpm_fail("BL2", "record");
++		}
++		digest = ((const tpml_digest_values *)digest_buf)->digests;
++		qemu_dtpm_extend_pcr0("BL2", digest->digest, TCG_DIGEST_SIZE);
++		NOTICE("BL2: extended PCR 0 with image %u (%s)\n", image_id,
++		       metadata_ptr->name);
++		return 0;
++	}
++#endif
++
+ 	/* Calculate image hash and record data in Event Log */
+ 	err = event_log_measure_and_record(metadata_ptr->pcr,
+ 					   image_data->image_base,
+--- a/plat/qemu/qemu/qemu_dtpm.c
++++ b/plat/qemu/qemu/qemu_dtpm.c
+@@ -0,0 +1,89 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * Kozane M7 C3: QEMU virt's tpm-tis-device driven from BL1 and BL2.
++ */
++
++#include <stddef.h>
++#include <stdint.h>
++
++#include <arch_helpers.h>
++#include <common/debug.h>
++#include <lib/mmio.h>
++#include <platform_def.h>
++
++#include <tpm2.h>
++#include <tpm2_chip.h>
++#include <transport/mmio.h>
++
++#include "qemu_dtpm.h"
++
++#define TPM_ALG_ID_SHA256	0x000BU
++#define TPM_PCR_0		0U
++
++/* PL061: data register at the pin's address mask, direction at 0x400. */
++#define PL061_GPIODIR		0x400U
++#define PL061_DATA(pin)		(1U << ((pin) + 2U))
++
++extern struct tpm_chip_data tpm_chip_data;
++
++/* The FIFO core's timeouts, on the generic counter (no delay timer here). */
++static uint64_t dtpm_timeout_init_us(uint32_t usec)
++{
++	uint64_t freq = read_cntfrq_el0();
++
++	return read_cntpct_el0() + (freq / 1000000U) * usec;
++}
++
++static bool dtpm_timeout_elapsed(uint64_t cnt)
++{
++	return read_cntpct_el0() >= cnt;
++}
++
++void __dead2 qemu_dtpm_fail(const char *stage, const char *step)
++{
++	ERROR("KOZANE-MBOOT: %s %s failed\n", stage, step);
++	console_flush();
++	mmio_write_32(SECURE_GPIO_BASE + PL061_GPIODIR,
++		      mmio_read_32(SECURE_GPIO_BASE + PL061_GPIODIR) |
++			      (1U << SECURE_GPIO_POWEROFF));
++	mmio_write_32(SECURE_GPIO_BASE + PL061_DATA(SECURE_GPIO_POWEROFF),
++		      0xffU);
++	for (;;) {
++		wfi();
++	}
++}
++
++void qemu_dtpm_open(const char *stage, int startup)
++{
++	const struct tpm_timeout_ops timeout_ops = {
++		.timeout_init_us = dtpm_timeout_init_us,
++		.timeout_elapsed = dtpm_timeout_elapsed,
++	};
++
++	tpm2_fifo_mmio_set_base(QEMU_TPM_TIS_BASE);
++	if (tpm_interface_init(NULL, &timeout_ops, &tpm_chip_data, 0) != 0) {
++		qemu_dtpm_fail(stage, "init");
++	}
++	/* Anything but TPM_RC_SUCCESS, TPM_RC_INITIALIZE included, stops. */
++	if ((startup != 0) && (tpm_startup(&tpm_chip_data, TPM_SU_CLEAR) != 0)) {
++		qemu_dtpm_fail(stage, "startup");
++	}
++}
++
++void qemu_dtpm_extend_pcr0(const char *stage, const uint8_t *digest,
++			   size_t digest_len)
++{
++	if ((digest_len != 32U) ||
++	    (tpm_pcr_extend(&tpm_chip_data, TPM_PCR_0, TPM_ALG_ID_SHA256,
++			    digest, (uint32_t)digest_len) != 0)) {
++		qemu_dtpm_fail(stage, "extend");
++	}
++}
++
++void qemu_dtpm_close(const char *stage)
++{
++	if (tpm_interface_close(&tpm_chip_data, 0) != 0) {
++		qemu_dtpm_fail(stage, "close");
++	}
++}
+--- a/plat/qemu/qemu/qemu_dtpm.h
++++ b/plat/qemu/qemu/qemu_dtpm.h
+@@ -0,0 +1,30 @@
++/*
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * Kozane M7 C3: QEMU virt's tpm-tis-device driven from BL1 and BL2, so that
++ * every FIP entry is extended into PCR 0 before it is used.
++ */
++
++#ifndef QEMU_DTPM_H
++#define QEMU_DTPM_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++/* Opens locality 0 (and, in BL1, sends TPM2_Startup(CLEAR)). */
++void qemu_dtpm_open(const char *stage, int startup);
++
++/* Extends PCR 0 with one sha256 digest; stops the boot on any error. */
++void qemu_dtpm_extend_pcr0(const char *stage, const uint8_t *digest,
++			   size_t digest_len);
++
++/* Releases locality 0 for the next stage. */
++void qemu_dtpm_close(const char *stage);
++
++/*
++ * The I3.2 stop: one fixed line naming the stage and the failed step, then
++ * power off through the secure GPIO (QMP SHUTDOWN guest-shutdown).
++ */
++void __dead2 qemu_dtpm_fail(const char *stage, const char *step);
++
++#endif /* QEMU_DTPM_H */

@@ -405,6 +405,20 @@ def free_udp_port() -> int:
             return port
 
 
+# The machine every boot runs (M7 plan C2 I2.1): EL3 for TF-A, EL2 for seL4.
+QEMU_CPU = "neoverse-n2"
+
+
+def qemu_machine(firmware: str) -> list:
+    """The QEMU arguments every boot starts with. The only firmware a boot
+    may run is one of the two images `make firmware` builds, so no boot
+    skips TF-A's measurements (I2.1)."""
+    if firmware not in (FIRMWARE, FIRMWARE_MEASURE):
+        raise Fail(f"qemu_machine: {firmware} is not a firmware image `make firmware` builds")
+    return ["-machine", "virt,secure=on,virtualization=on", "-cpu", QEMU_CPU, "-m", "size=2G",
+            "-serial", "mon:stdio", "-nographic", "-bios", firmware]
+
+
 def boot(pkg: "Package", outside: str, inside: str, monitor: str = "", media=None, flip=None,
          fail_extend: bool = False) -> tuple:
     """Every boot is the shipped one (M5 plan C14): U-Boot measures and
@@ -419,8 +433,7 @@ def boot(pkg: "Package", outside: str, inside: str, monitor: str = "", media=Non
     try:
         if flip is not None or fail_extend:
             proxy = TpmProxy(tpm, bool(flip), fail_extend)
-        cmd = ["-machine", "virt,virtualization=on", "-cpu", "neoverse-n2", "-m", "size=2G",
-               "-serial", "mon:stdio", "-nographic", "-bios", UBOOT]
+        cmd = qemu_machine(FIRMWARE)
         for path, addr in media or pkg.media():
             cmd += ["-device", f"loader,file={path},addr={addr:#x},force-raw=on"]
         cmd += (proxy or tpm).qemu_args()
@@ -1557,10 +1570,11 @@ def test_mismatched_blob(pkg: "Package"):
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import measure  # noqa: E402  (the host model of support/u-boot/boot.cmd)
 
-UBOOT_MEASURE = os.path.join(ROOT, "build/u-boot-measure/u-boot.bin")
-# What every other boot runs (M5 plan C14): the same boot command, ending in
-# the jump to the loader.
-UBOOT = os.path.join(ROOT, "build/u-boot-shipped/u-boot.bin")
+# TF-A with the measure variant's U-Boot as BL33 (M7 plan C2).
+FIRMWARE_MEASURE = os.path.join(ROOT, "build/firmware-measure/flash.bin")
+# What every other boot runs (M5 plan C14, M7 plan C2): TF-A measuring the
+# shipped U-Boot, whose boot command ends in the jump to the loader.
+FIRMWARE = os.path.join(ROOT, "build/firmware-shipped/flash.bin")
 SWTPM_SOCKET_WAIT_S = 10.0
 # How often measure_boot repeats its Ctrl-C until the boot command decides.
 CTRLC_REPEAT_S = 0.25
@@ -1817,11 +1831,10 @@ class TpmProxy:
             raise Fail("tpm proxy relay thread survived its boot")
 
 
-def boot_uboot(uboot: str, files: list, tpm: Swtpm) -> tuple:
-    """QEMU with U-Boot as firmware; `files` are (path, address) pairs, the
-    boot media U-Boot reads (measure.LOAD_*)."""
-    cmd = ["-machine", "virt,virtualization=on", "-cpu", "neoverse-n2", "-m", "size=2G",
-           "-serial", "mon:stdio", "-nographic", "-bios", uboot]
+def boot_uboot(firmware: str, files: list, tpm: Swtpm) -> tuple:
+    """QEMU with a firmware image (TF-A and a U-Boot); `files` are (path,
+    address) pairs, the boot media U-Boot reads (measure.LOAD_*)."""
+    cmd = qemu_machine(firmware)
     for path, addr in files:
         cmd += ["-device", f"loader,file={path},addr={addr:#x},force-raw=on"]
     cmd += tpm.qemu_args()
@@ -1847,7 +1860,7 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
         paths.append(path)
     tpm = Swtpm(scratch)
     try:
-        child, con = boot_uboot(UBOOT_MEASURE, list(zip(paths, (measure.LOAD_IMAGE, measure.LOAD_DESC)
+        child, con = boot_uboot(FIRMWARE_MEASURE, list(zip(paths, (measure.LOAD_IMAGE, measure.LOAD_DESC)
                                                               + measure.LOAD_ENVELOPES)), tpm)
         try:
             # Ctrl-C on the UART throughout the boot command: with the lock
@@ -6309,8 +6322,9 @@ def preflight():
     missing = [t for t in ("unshare", "setpriv", "wireguard-go", "wg", "ip", "ping", "qemu-system-aarch64", "swtpm",
                            "tpm2_createprimary", "tpm2_readpublic", "openssl", "curl")
                if not shutil.which(t)]
-    if not os.path.isfile(UBOOT):
-        raise Fail(f"{UBOOT} is missing; `make uboot` builds it")
+    for firmware in (FIRMWARE, FIRMWARE_MEASURE):
+        if not os.path.isfile(firmware):
+            raise Fail(f"{firmware} is missing; `make firmware` builds it")
     if missing:
         raise Fail(f"missing tools: {missing}")
     if not os.path.exists("/dev/net/tun"):
