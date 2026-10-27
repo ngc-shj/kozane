@@ -6,3 +6,4 @@
 /crates/*/src/__fuzz__/*/crashes/
 __pycache__/
 /tools/*/target/
+/.claude/
