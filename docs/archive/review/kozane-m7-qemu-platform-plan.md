@@ -100,6 +100,53 @@ and is re-planned. No contract has a silent fallback.
 | P5 | What do `panic!`, `pdkit::halt` and an abort do today in a rust-sel4 Microkit PD: fault or spin? Which fault label and syndrome reach a parent for `brk #imm` and for `udf`? | Observed and recorded. | C9 |
 | P6 | Do the TCG budgets hold on `cortex-a72`? This covers RM6-8's HS_CAP, the load-sensitive VPN boots, `BOOT_TIMEOUT_S` and `LINE_TIMEOUT_S` with TF-A's boot time, and the two-boot case [TE17]. | Each is re-measured, with the numbers recorded. | C7 (values only) |
 
+### Probe results (slice 0, 2026-10-27)
+
+- **P1a passed.** TF-A v2.15.0 (`PLAT=qemu`, BL33 = `u-boot-shipped`),
+  `-machine virt,secure=on,virtualization=on -cpu neoverse-n2`, boot media
+  via `-device loader`. The `wireguard` and `https` boots (28 cases,
+  sealed through PCR 8) passed unchanged.
+- **P1b passed.** On `-cpu cortex-a72`, seL4 boots and `audit`, `inner`,
+  `data`, `eth_out` and `eth_in` reach ready. The RNDR users stop silently
+  (release kernel), as D3 predicts.
+- **P3 passed at run time.** A child fault reaches a parent of lower
+  priority (10 under 200). The labels observed are VM fault 6, `brk` 4
+  (DebugException in the debug config) and `udf` 3.
+- **P4, first half, passed.** PSCI SYSTEM_RESET through
+  `microkit_arm_smc_call` reaches TF-A BL31 ("QEMU System Reset: with
+  GPIO"), and QEMU exits under `-no-reboot`. The swtpm-reset half runs in
+  slice 2.
+- **P5, refutes C8/C9 as planned.**
+  - The fault message carries no `brk`/`udf` immediate. For `brk` it
+    carries the IP and a reason code; for `udf` the ESR ISS is 0.
+  - rust-sel4's panic ends in `core::intrinsics::abort` (`brk`), so a panic
+    is a fault, not a spin.
+- **Toolchain findings for C1/C2:**
+  - fiptool needs OpenSSL headers, and the TF-A build may need `dtc`.
+    Pin `libssl-dev` and `device-tree-compiler` in the image (the probe
+    installed them by hand).
+  - TF-A embeds `git describe` of the enclosing repository and the build
+    time in BL1, BL2 and BL31. C2 fixes `BUILD_STRING` as well as
+    `BUILD_MESSAGE_TIMESTAMP`.
+  - GitHub archive tarballs are not guaranteed byte-stable, so C1 pins
+    the source by commit digest.
+- **P2 and P6** move into slices 2 and 4: they need the C3 patch and the
+  RNDR removal.
+
+### Re-plan R1 (P5): a boot stop does not fault
+
+The supervisor cannot tell a boot stop from a fault by the fault message.
+So a boot stop no longer faults:
+
+- the PD records `Halted{reason}` and returns an init-only `Dormant`
+  handler;
+- every fault resets;
+- the supervisor reads only (child, label).
+
+This removes the immediate decoding, the per-child eligibility in the
+supervisor, and one of its input words. D4, C8 and C9 are amended in
+place, and the leaf-only rule moves wholly to the C9 link check.
+
 ## Decisions (recorded, not asked)
 
 - **D1: TF-A extends the TPM directly. Event-log replay by U-Boot is
@@ -129,8 +176,10 @@ and is re-planned. No contract has a silent fallback.
 - **D4: two outcomes for a stopped PD** [FN1, SE9].
   - **Boot stop.** A PD refuses during `init` for a deterministic,
     configuration-shaped cause: no key, no boot seed, no rng, no clock, a
-    config hash mismatch. The supervisor records it and does nothing more:
-    the PD stays stopped and the rest serves. This is today's audited
+    config hash mismatch. The PD records its own audit `Halted{reason}`
+    and goes **dormant**: `init` returns a handler that ignores every
+    event. Nothing faults, so the supervisor never sees it, and the rest
+    serves (Re-plan R1). This is today's audited
     refusal (M5 scenario 3, M6's "tls halted before listening, the VPN
     handshakes"). Resetting would only loop, because the next boot
     reproduces the cause.
@@ -145,11 +194,12 @@ and is re-planned. No contract has a silent fallback.
       as `key` does today. That way their callers reach their own boot stop
       instead of blocking forever.
     - `audit` and `timer` never boot-stop either.
-    - A boot stop from a non-leaf child is handled as a fault.
+    - A dormant callee would block its callers forever, so the C9 link
+      check keeps the boot-stop symbol out of every non-leaf ELF.
   - **The class is the PD's own choice.** A boot stop can only be raised
     through the `pdkit` init context (C9). A compromised PD can still
-    choose a stop over a reset. That gives it nothing a deliberate spin
-    does not (RM7-3), because a stopped PD is never resumed.
+    ignore its events instead of faulting. That gives it nothing a
+    deliberate spin does not (RM7-3).
   - **Transient seed failures** get a bounded retry before they become a
     boot stop (`RNG_INIT_TRIES`, C7) [R2 SE-N5].
   - **The cost** is A11 amplification (RM7-6): a run-time fault an
@@ -469,7 +519,8 @@ it) [TE11, FN8].
   - **Integration, after slice 5** [TE6, R2 TE-N7]: a boot without the rng
     device.
     - The audit shows `Unavailable`.
-    - The supervisor gives boot-stop records with the rng reason class for
+    - The audit shows `Halted` lines with the `RNG_UNAVAILABLE` reason,
+      and no supervisor record and no QMP `SHUTDOWN` appear, for
       exactly `hs`, `pq`, `ingress` and `tls`. A missing or an extra record
       fails the case.
     - `key`, `pqkey` and `tlskey` stay up, answering `Unavailable`.
@@ -582,20 +633,14 @@ it) [TE11, FN8].
     (R42): `grep -c '<protection_domain' system/kozane.system` gives 14
     today. With C6's `rng` there are 16 PDs and 15 children [FN11].
   - C10 checks that the children equal every other PD.
-  - `fault()` reads the child id, the fault label and, for a user
-    exception, the syndrome word (P5). Nothing else.
+  - `fault()` reads the child id and the fault label. Nothing else
+    (Re-plan R1).
 - **Action:**
-  - **Boot stop** (C9's dedicated exception, from a leaf child only):
-    write the record (`child`, `boot-stop`, reason class), notify `audit`,
-    and leave the child stopped. No reset.
-    - The reason class is decoded from the `brk` immediate through a
-      closed enum.
-    - An unknown immediate, or a boot stop from a non-leaf child, takes
-      the fault path [R2 SE-N3].
-  - **Records** go into a ring of at least one slot per child. Overflow is
-    counted, and the count is printed with the next record. So the boot
-    stops of scenario 3, all at once, are not lost [R2 SE-N5].
-  - **Any other fault:**
+  - Boot stops never reach the supervisor, because they do not fault
+    (D4, Re-plan R1).
+  - **Records:** one record slot. A fault that arrives while a reset is
+    pending is counted, and the count is printed in the same record.
+  - **Every fault:**
     1. Write the record (`child`, `label`).
     2. Notify `audit`.
     3. Let `audit` drain. If P3's run-time check confirms fault delivery
@@ -620,9 +665,9 @@ it) [TE11, FN8].
   - That module builds exactly one SMCCC function ID, SYSTEM_RESET.
     SYSTEM_OFF is not used.
   - The fault-to-action function is pure and Kani-exhaustive over (label,
-    syndrome, child).
+    child).
 - **Invariants:**
-  - **I8.1:** every non-boot-stop fault ends in SYSTEM_RESET within a
+  - **I8.1:** every fault ends in SYSTEM_RESET within a
     bound derived from the L13 budgets in the chosen ordering, as recorded
     by P3. In the timer ordering, I8.1 depends on a live `timer`. A fault
     in `timer` skips the wait [SE10].
@@ -680,19 +725,35 @@ it) [TE11, FN8].
     positive evidence: a second record for `ingress` (the resumed child
     re-faults), or `ingress` answering after frame A. A wall-clock bound is
     a hang guard only.
-  - **Kani:** a boot stop from each non-leaf child, and an unknown
-    immediate, both map to the fault path.
-  - **Boot stop:** a placeholder-secrets boot gives the `tls` boot-stop
-    record. The VPN still handshakes (the existing M6 case, re-asserted
-    with the record).
+  - **Kani:** every (label, child) pair maps to reset, with the
+    `audit`/`timer` wait skip.
+  - **Boot stop:** a placeholder-secrets boot gives `tls`'s `Halted` line
+    and no supervisor record. The VPN still handshakes (the existing M6
+    case, re-asserted).
 
-### C9 — Every PD stop reaches the supervisor, in the right class (Major tier)
+### C9 — Every PD stop is either a fault or an init-only dormant boot stop (Major tier)
 
 - **Member set:** every PD binary in `$(pds)`, and every halt call site:
   `grep -rn '\.halt(' crates/pds` gives 25 sites today.
 - **Interface:**
-  - A boot stop is available only on an `Init` context [R2 FN-N3,
-    SE-N3, TE-N5].
+  - A boot stop, `Init::boot_stop(reason) -> Dormant`, is available only
+    on an `Init` context [R2 FN-N3, SE-N3, TE-N5; Re-plan R1].
+    - It flushes the audit `Halted{reason}` record and returns `Dormant`,
+      a unit type with a private constructor, so only `boot_stop` makes
+      one [R1 SE-D2].
+    - **Shape** [R1 FN-RP1]:
+      `run_init<H: Handler>(f: impl FnOnce(&Init) -> Result<H, Dormant>) -> Stage<H>`.
+      `Stage<H>` is a pdkit enum that implements `Handler`: it either
+      delegates to `H` or ignores every event.
+      - The init helpers that call `halt` as `!` today return
+        `Result<_, Dormant>` and propagate it with `?`.
+      - Because a boot stop returns rather than aborts, every local drops.
+        Every holder of seed-derived material (`Secret`, `Handshaker`,
+        `HedgedEntropy` and the like) zeroizes on drop.
+    - **Leaf-only, by build** [R1 SE-D1]: `boot_stop` sits behind cargo
+      feature `boot-stop`. A `check-pins` rule allows that feature only in
+      the leaf PD crates' `Cargo.toml`. `boot_stop` and `run_init` are also
+      `#[inline(never)]` with stable names, for the ELF check.
     - `Init` lives in a host-buildable crate in `host_crates`. It has a
       private constructor, and no `Clone`, `Copy` or `Default`.
     - The entry wrapper lives in that same crate [R3 FN-R3-1]:
@@ -707,37 +768,48 @@ it) [TE11, FN8].
       calls `run_init` at run time resets the system rather than
       boot-stopping.
     - `Init` is borrowed, not `'static`, so `f` cannot keep it.
-    - The boot-stop `brk` immediate is emitted only in that crate. A
-      `check-pins` rule enforces this, with a fixture. The asm is gated on
-      `target_os = "none"`, and the doctests and the host tests are
+    - The crate has no asm. The doctests and the host tests are
       target-independent (x86_64 hosts included) [R3 TE-R3-3].
-    - Key-role, `rng`, `tpm`, `audit` and `timer` ELFs must not contain the
-      boot-stop symbol (C9 link check).
+    - Key-role, `rng`, `tpm`, `audit` and `timer` crates may not enable
+      `boot-stop`, and their ELFs must not contain the `boot_stop` symbol
+      (C9 link check, release profile). A missing ELF or symbol table is a
+      refusal.
+    - Each leaf PD's `halt` module gains the reason codes the new causes
+      need, `RNG_UNAVAILABLE` among them [R1 FN-RP3].
   - Every existing init-time halt site moves to it. Run-time halts, the
     three in `tls` among them, stay on `pdkit::halt`.
-  - A boot stop executes a dedicated `brk` immediate. Any other stop path
-    (`halt`, panic, abort) executes the generic one, and the shared abort
-    hook routes panics there if P5 shows rust-sel4 spinning.
+  - Any other stop path (`halt`, panic, abort) ends in rust-sel4's abort
+    trap, `core::intrinsics::abort`, an aarch64 `brk`. P5 observed that
+    this reaches the parent as a fault (label 4 in the debug config), so
+    no extra hook is needed. The weak `abort_trap` is not overridden, and
+    a `check-pins` rule keeps it that way.
 - **Invariants:**
-  - **I9.1:** every stop routed through `pdkit` or the panic/abort hook
-    reaches the supervisor as a fault of the right class.
-  - **I9.2:** a boot stop is unreachable after `init` returns, because
-    rustc enforces the lifetime.
+  - **I9.1:** every stop other than a boot stop reaches the supervisor as
+    a fault.
+  - **I9.2:** a boot stop is unreachable after `init` returns. rustc
+    enforces this through the lifetime and the private constructors, and
+    the one-shot flag enforces it too.
 - **Control class:** code property, linked in every PD. A spin or a
   blocked wait that never stops is not covered (RM7-3) [SE10].
 - **Link check:** the M4 C10 ELF check gains a rule: every `$(pds)` ELF
-  contains the hook symbol. Red-proof: one PD built without it. Allow: the
-  real tree [TE12].
+  contains `run_init` (it entered through pdkit), and only leaf ELFs may
+  contain `boot_stop`. Red-proofs: one PD built without `run_init`, and
+  `key` linking `boot_stop`. Allow: the real tree [TE12].
 - **Acceptance:**
   - Inject B gives `Halted`, then the reset record, then `guest-reset`.
-  - The C6 no-device boot gives boot-stop records.
+  - The C6 no-device boot gives the `Halted` lines and no supervisor
+    record, and QEMU keeps running.
   - Doctests in the `Init` crate, counted under its UNIT key:
     - `compile_fail,E0597` or `E0521` for keeping `Init` past `init`;
     - `compile_fail,E0451` or `E0603` for constructing it;
-    - a host unit test that a second `run_init` takes the fault path, and
-      that the first takes the boot-stop path. A first call made after the
-      flag has closed on handler entry also takes the fault path;
-    - an allow doctest in which `init` uses it.
+    - a host unit test that the first `run_init` lends an `Init` whose
+      `boot_stop` yields `Dormant`, and that a second call panics (the
+      fault path). A first call made after the flag has closed on handler
+      entry also panics;
+    - an allow doctest in which `init` uses it;
+    - a compile-fail doctest in which a handler path returns `Dormant`;
+    - a unit test that after `boot_stop`, the boot-seed buffer `hs`
+      held reads zero [R1 SE-D2].
 
     Red-proof: make it `'static` or public, and the compile-fail doctest
     goes red.
@@ -835,9 +907,9 @@ it) [TE11, FN8].
 - **Acceptance:**
   - The case is green.
   - Deny: `verify` refuses a manifest with one firmware digest flipped.
-  - Deny: a boot of a package sealed to the wrong SRK gives boot-stop
-    records for exactly `hs`, `pq` and `tls`, and no handshake
-    [R2 FN-N6, TE-N7].
+  - Deny: a boot of a package sealed to the wrong SRK gives `Halted` lines
+    for exactly `hs`, `pq` and `tls`, no supervisor record, no QMP
+    `SHUTDOWN`, and no handshake [R2 FN-N6, TE-N7; R1 FN-RP3].
   - Deny: a `fault-inject` image differs from the manifest's
     `loader_img_sha256`.
   - Each deny has a failure-only needle.
@@ -916,7 +988,7 @@ the end.
 - **RM7-4.** A fault in the supervisor goes to the monitor, which only
   prints it.
   - Worst case: the fault policy is lost until reboot. Its inputs are
-    three kernel-supplied words.
+    two kernel-supplied words, the child id and the label.
 - **RM7-5.** The supervisor holds every child's TCB cap and an
   unrestricted SMC cap. It is in every PD's TCB, constrained by the C8
   allowlist tripwire and Kani.
@@ -961,12 +1033,12 @@ the end.
 2. **A10 swaps U-Boot** for one that skips PCR 8.
    - The device boots, and PCR 0 differs, so the envelopes stay sealed.
    - `key`, `pqkey` and `tlskey` answer `Unavailable`, and `hs`, `pq` and
-     `tls` give boot-stop records.
+     `tls` give `Halted` lines and go dormant.
    - The system stays up, refusing, with no reset loop. Peers see no
      handshake.
 3. **The host has no virtio-rng.**
    - `rng` answers `Unavailable`. `hs`, `pq`, `ingress` and `tls` give
-     boot-stop records, and the key PDs stay up, refusing.
+     `Halted` lines and go dormant, and the key PDs stay up, refusing.
    - No handshake and no TLS (L9). The audit names the cause.
 4. **A crafted frame faults a tainted PD at run time** (a bug).
    - The audit records the PD, and the system resets and serves again

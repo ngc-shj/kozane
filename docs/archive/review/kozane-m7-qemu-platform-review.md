@@ -711,3 +711,48 @@ re-checked by the expert who raised it, and only for that finding.
 | Functionality | R38 (N1, R3-2) and R40 (N2) resolved; R41 resolved; R42 re-derived from the system file (leaf list matches); R49 R3-1 resolved, R4-1 fixed in the plan. All other rules unchanged from round 2. |
 | Security | R29 (P2) and R49 (P1) fixed in the plan. All other rules unchanged from round 2. |
 | Testing | RT7 (R3-1), RT4 (R3-2) and RT2 (R3-3) resolved; RT1 (the proxy injection point) fixed. All other rules unchanged from round 2. |
+
+---
+
+# Re-plan R1 review (slice 0 probe P5)
+
+Date: 2026-10-27
+
+Probe P5 showed that a seL4 fault message carries no `brk`/`udf`
+immediate: `brk` delivers the IP and a reason code, and for `udf` the ISS
+is 0. A release-config `brk` still faults to the parent. Because the
+supervisor cannot decode the stop class, a boot stop no longer faults.
+Instead the PD records `Halted` and returns an init-only `Dormant`
+handler, and every fault resets. Functionality and security re-checked
+only this change.
+
+- **FN-RP1, Major, R40. Fixed (C9 shape).**
+  - Problem: `init` returns one concrete handler type, and 22 sites rely
+    on `halt`'s `!`.
+  - Resolution: `run_init<H>(… -> Result<H, Dormant>) -> Stage<H>`.
+    `Stage` is a pdkit enum, and the init helpers propagate `Dormant` with
+    `?`. A compile-fail doctest covers a handler path returning `Dormant`.
+- **FN-RP2, Minor, prose. Fixed (C6).**
+  - Problem: the `Halted` lines were attributed to the supervisor.
+  - Resolution: the audit shows them, with no supervisor record.
+- **FN-RP3, Minor, R42. Fixed (C6, C11, C9).**
+  - Problem: the oracles needed "no supervisor record, no QMP SHUTDOWN",
+    and the new halt reason codes were missing.
+  - Resolution: both are added, and the reason code is `RNG_UNAVAILABLE`.
+- **SE-D1, Minor, R47. Fixed (C9).**
+  - Problem: a symbol-presence check can miss an inlined `boot_stop`.
+  - Resolution: a `boot-stop` cargo feature that only leaf crates may
+    enable (`check-pins`), `#[inline(never)]` with stable names, a check on
+    the release-profile ELF, and a missing ELF or symbol table is a
+    refusal.
+- **SE-D2, Minor, L12/R39. Fixed (C9).**
+  - Problem: the boot-stop path must drop what it holds.
+  - Resolution: `Dormant` is a unit type, boot-stop sites return so drops
+    run, holders of seed-derived material zeroize on drop, and a unit test
+    shows `hs`'s seed reads zero after `boot_stop`.
+- **Security answers:** dormant leaves keep no authority that matters, and
+  dormant is better for secrets than today's abort, which never ran the
+  destructors. Removing the syndrome input is a net gain.
+
+No Critical or Major finding remains open, and C8 and C9 are `locked`
+again.
