@@ -75,7 +75,8 @@ def make(a) -> None:
         raise Refused(str(e))
     if (pkg / "pcrs").read_text().split() != pcrs:
         raise Refused("the package's pcrs differ from tools/measure.py's")
-    placeholder = measure.check_placeholder(image.read_bytes(), desc.read_bytes())
+    placeholder = measure.check_placeholder(image.read_bytes(), desc.read_bytes()) \
+        + measure.check_not_fault_inject(image.read_bytes())
     if placeholder:
         raise Refused("; ".join(placeholder))
     dirty = bool(git("status", "--porcelain", "--untracked-files=no"))
@@ -123,7 +124,8 @@ def verify(a) -> None:
     image, desc, firmware = rel / "published.img", rel / "boot.desc", rel / "flash.bin"
     if fields.get("commit", "").endswith("-dirty") and not a.allow_dirty:
         raise Refused(f"the release was built from a dirty tree ({fields['commit']})")
-    placeholder = measure.check_placeholder(image.read_bytes(), desc.read_bytes())
+    placeholder = measure.check_placeholder(image.read_bytes(), desc.read_bytes()) \
+        + measure.check_not_fault_inject(image.read_bytes())
     if placeholder:
         raise Refused("; ".join(placeholder))
     try:

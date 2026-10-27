@@ -22,6 +22,7 @@ pub fn check(system: &System, policy: &Policy) -> Vec<Finding> {
     check_console(system, policy, &mut findings);
     check_tpm(system, policy, &tainted, &mut findings);
     check_rng(system, policy, &tainted, &mut findings);
+    check_supervisor(system, policy, &tainted, &mut findings);
     check_dma_setvar_present(system, policy, &mut findings);
     check_irq_duplicates(system, &mut findings);
     check_data_confinement(system, policy, &mut findings);
@@ -213,16 +214,19 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
 
     // Shared-mr edges: unconditional, both directions, for every pair of
     // distinct pds that map the same mr.
-    let mut mappers: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let mut mappers: BTreeMap<&str, Vec<(&str, bool)>> = BTreeMap::new();
     for pd in &system.pds {
         for m in mrs_mapped_by(pd) {
-            mappers.entry(m.mr.as_str()).or_default().push(pd.name.as_str());
+            mappers.entry(m.mr.as_str()).or_default().push((pd.name.as_str(), m.perms.w));
         }
     }
     for pds in mappers.values() {
-        for a in pds {
-            for b in pds {
-                if a != b {
+        for (a, a_writes) in pds {
+            for (b, _) in pds {
+                // The supervisor's record page (M7 plan C8): a reader that
+                // cannot write it carries nothing into the supervisor.
+                let into_supervisor = policy.role(b) == Some(Role::Supervisor) && !a_writes;
+                if a != b && !into_supervisor {
                     add_edge(a, b);
                 }
             }
@@ -241,6 +245,7 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
             Some(Role::Key) => channel_is_exempt(system, policy, a, b, findings),
             Some(Role::Timer) => timer_channel_is_exempt(system, policy, a, b, findings),
             Some(Role::Rng) => rng_channel_is_exempt(system, policy, a, b, findings),
+            Some(Role::Supervisor) => supervisor_channel_is_exempt(a, b, findings),
             _ => false,
         };
         let b_exempt = match b_role {
@@ -248,6 +253,7 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
             Some(Role::Key) => channel_is_exempt(system, policy, b, a, findings),
             Some(Role::Timer) => timer_channel_is_exempt(system, policy, b, a, findings),
             Some(Role::Rng) => rng_channel_is_exempt(system, policy, b, a, findings),
+            Some(Role::Supervisor) => supervisor_channel_is_exempt(b, a, findings),
             _ => false,
         };
 
@@ -397,6 +403,28 @@ fn rng_channel_is_exempt(
                 "channel between rng pd '{}' and '{}' does not meet the rng exemption \
                  (peer pp=true, rng pp=false, peer notify=false, rng maps only its device and dma mrs)",
                 rng_end.pd, peer.pd
+            ),
+        ));
+    }
+    ok
+}
+
+/// Whether the channel between `sup` (the `supervisor`) and `peer` carries
+/// nothing into it (M7 plan C8 I8.4): no pp on either end and the peer
+/// cannot notify, so the supervisor only signals out. A failure is L1.
+fn supervisor_channel_is_exempt(
+    sup: &crate::sdf::ChannelEnd,
+    peer: &crate::sdf::ChannelEnd,
+    findings: &mut Vec<Finding>,
+) -> bool {
+    let ok = !sup.pp && !peer.pp && !peer.notify;
+    if !ok {
+        findings.push(Finding::new(
+            LawId::L1,
+            format!(
+                "channel between supervisor pd '{}' and '{}' does not meet the supervisor exemption \
+                 (pp=false on both ends, peer notify=false)",
+                sup.pd, peer.pd
             ),
         ));
     }
@@ -733,6 +761,87 @@ fn check_rng(system: &System, policy: &Policy, tainted: &BTreeSet<String>, findi
                 findings.push(Finding::new(
                     LawId::L1,
                     format!("rng pd '{}' has a channel to '{}', which is not a key or untrusted_input pd", end.pd, peer.pd),
+                ));
+            }
+        }
+    }
+}
+
+/// The `supervisor` role (M7 plan C8, C10). L4 as amended: `smc` and child
+/// pds only on the supervisor, at most one supervisor, and every other pd
+/// its direct child; the policy's pds are exactly the system's. L1 as
+/// amended: the supervisor is untainted, maps only mrs every other mapper
+/// reads without writing (its record page), and has channels only to
+/// `audit`.
+fn check_supervisor(system: &System, policy: &Policy, tainted: &BTreeSet<String>, findings: &mut Vec<Finding>) {
+    let sups: Vec<&str> = system
+        .pds
+        .iter()
+        .filter(|pd| policy.role(&pd.name) == Some(Role::Supervisor))
+        .map(|pd| pd.name.as_str())
+        .collect();
+    if sups.len() > 1 {
+        findings.push(Finding::new(LawId::L4, format!("{} supervisor pds ({}); at most one", sups.len(), sups.join(", "))));
+    }
+    for pd in &system.pds {
+        let role = policy.role(&pd.name);
+        if pd.smc && role != Some(Role::Supervisor) {
+            findings.push(Finding::new(LawId::L4, format!("smc is denied outside the supervisor (pd '{}')", pd.name)));
+        }
+        match (&pd.parent, role) {
+            (Some(parent), _) if policy.role(parent) != Some(Role::Supervisor) => findings.push(Finding::new(
+                LawId::L4,
+                format!("pd '{}' is a child of '{parent}', which is not the supervisor", pd.name),
+            )),
+            (Some(_), Some(Role::Supervisor)) => findings.push(Finding::new(
+                LawId::L4,
+                format!("supervisor pd '{}' is itself a child pd", pd.name),
+            )),
+            (None, r) if r != Some(Role::Supervisor) && !sups.is_empty() => findings.push(Finding::new(
+                LawId::L4,
+                format!("pd '{}' is not a child of the supervisor", pd.name),
+            )),
+            _ => {}
+        }
+    }
+    // With the pds nested under a supervisor, a parse that skipped a child
+    // would make every law vacuous for it (R2 FN6): the policy's pds must
+    // all be found.
+    let names: BTreeSet<&str> = system.pds.iter().map(|pd| pd.name.as_str()).collect();
+    for name in policy.pd_names().filter(|_| !sups.is_empty()) {
+        if !names.contains(name) {
+            findings.push(Finding::new(
+                LawId::L4,
+                format!("pd '{name}' is described by policy but missing from the system"),
+            ));
+        }
+    }
+    for pd in system.pds.iter().filter(|pd| policy.role(&pd.name) == Some(Role::Supervisor)) {
+        if tainted.contains(&pd.name) {
+            findings.push(Finding::new(LawId::L1, format!("supervisor pd '{}' is tainted", pd.name)));
+        }
+        for m in mrs_mapped_by(pd) {
+            let others_write = system
+                .pds
+                .iter()
+                .filter(|o| o.name != pd.name)
+                .flat_map(mrs_mapped_by)
+                .any(|o| o.mr == m.mr && o.perms.w);
+            if others_write || matches!(policy.mrs.get(m.mr.as_str()), Some(MrPolicy::Device { .. } | MrPolicy::Secrets { .. })) {
+                findings.push(Finding::new(
+                    LawId::L1,
+                    format!("supervisor pd '{}' maps mr '{}', which is not a record page others only read", pd.name, m.mr),
+                ));
+            }
+        }
+    }
+    for channel in &system.channels {
+        let [a, b] = &channel.ends;
+        for (end, peer) in [(a, b), (b, a)] {
+            if policy.role(&end.pd) == Some(Role::Supervisor) && policy.role(&peer.pd) != Some(Role::Service) {
+                findings.push(Finding::new(
+                    LawId::L1,
+                    format!("supervisor pd '{}' has a channel to '{}', which is not the audit (service) pd", end.pd, peer.pd),
                 ));
             }
         }

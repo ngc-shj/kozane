@@ -22,6 +22,15 @@ const CTRL_PERIODIC: u32 = 1 << 6;
 const CTRL_INT_ENABLE: u32 = 1 << 5;
 const CTRL_32BIT: u32 = 1 << 1;
 
+/// Marks an image built with `fault-inject` (M7 plan C8): tools/release.py
+/// refuses one that holds it.
+#[cfg(feature = "fault-inject")]
+#[used]
+static FAULT_INJECT_VARIANT: [u8; 27] = *b"KOZANE-FAULT-INJECT-VARIANT";
+
+#[cfg(feature = "fault-inject")]
+const FAULT_TICK: u32 = 30;
+
 const DEVICE: Channel = Channel::new(ch::CH_DEVICE);
 const PEERS: [Channel; 5] = [
     Channel::new(ch::CH_DATA),
@@ -57,6 +66,8 @@ impl Sp804 {
 
 struct Timer {
     device: Sp804,
+    #[cfg(feature = "fault-inject")]
+    ticks: u32,
 }
 
 impl Handler for Timer {
@@ -69,6 +80,15 @@ impl Handler for Timer {
                 for peer in PEERS {
                     peer.notify();
                 }
+                // M7 plan C8's selftest variant: the timer faults on its
+                // FAULT_TICK-th tick, once the system is up.
+                #[cfg(feature = "fault-inject")]
+                {
+                    self.ticks = self.ticks.saturating_add(1);
+                    if self.ticks == FAULT_TICK {
+                        panic!("fault-inject: timer");
+                    }
+                }
             }
             let _ = DEVICE.irq_ack();
         }
@@ -78,9 +98,17 @@ impl Handler for Timer {
 
 #[protection_domain]
 fn init() -> Timer {
+    boot_stage::run_init(|_| start())
+}
+
+fn start() -> Timer {
     let vaddr = *var!(timer_mmio_vaddr: usize = 0);
     let base = NonNull::new(vaddr as *mut u32).unwrap_or_else(|| panic!("timer: no mmio mapping"));
     let device = Sp804 { base };
     device.start_periodic(TIMER_FREQ_HZ);
-    Timer { device }
+    Timer {
+        device,
+        #[cfg(feature = "fault-inject")]
+        ticks: 0,
+    }
 }

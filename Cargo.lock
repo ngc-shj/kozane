@@ -183,6 +183,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "boot-stage"
+version = "0.1.0"
+
+[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -766,6 +770,7 @@ dependencies = [
  "audit-event",
  "ring",
  "roxmltree",
+ "supervisor-core",
 ]
 
 [[package]]
@@ -1117,9 +1122,11 @@ name = "pd-audit"
 version = "0.1.0"
 dependencies = [
  "audit-event",
+ "boot-stage",
  "layout",
  "ring",
  "sel4-microkit",
+ "supervisor-core",
  "wire",
 ]
 
@@ -1128,6 +1135,7 @@ name = "pd-data"
 version = "0.1.0"
 dependencies = [
  "audit-event",
+ "boot-stage",
  "config",
  "cpu",
  "data-core",
@@ -1142,6 +1150,7 @@ dependencies = [
 name = "pd-eth-in"
 version = "0.1.0"
 dependencies = [
+ "boot-stage",
  "layout",
  "netdrv",
  "sel4-microkit",
@@ -1151,6 +1160,7 @@ dependencies = [
 name = "pd-eth-out"
 version = "0.1.0"
 dependencies = [
+ "boot-stage",
  "layout",
  "netdrv",
  "sel4-microkit",
@@ -1161,6 +1171,7 @@ name = "pd-hs"
 version = "0.1.0"
 dependencies = [
  "audit-event",
+ "boot-stage",
  "config",
  "cpu",
  "hs-core",
@@ -1177,6 +1188,7 @@ name = "pd-ingress"
 version = "0.1.0"
 dependencies = [
  "audit-event",
+ "boot-stage",
  "config",
  "cpu",
  "ingress-core",
@@ -1197,6 +1209,7 @@ name = "pd-inner"
 version = "0.1.0"
 dependencies = [
  "audit-event",
+ "boot-stage",
  "config",
  "inner-core",
  "layout",
@@ -1209,6 +1222,7 @@ dependencies = [
 name = "pd-key"
 version = "0.1.0"
 dependencies = [
+ "boot-stage",
  "config",
  "cpu",
  "key-core",
@@ -1226,6 +1240,7 @@ name = "pd-pq"
 version = "0.1.0"
 dependencies = [
  "audit-event",
+ "boot-stage",
  "config",
  "cpu",
  "layout",
@@ -1244,6 +1259,7 @@ dependencies = [
 name = "pd-pqkey"
 version = "0.1.0"
 dependencies = [
+ "boot-stage",
  "config",
  "cpu",
  "layout",
@@ -1259,6 +1275,7 @@ dependencies = [
 name = "pd-rng"
 version = "0.1.0"
 dependencies = [
+ "boot-stage",
  "cpu",
  "layout",
  "rng-core",
@@ -1268,9 +1285,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pd-supervisor"
+version = "0.1.0"
+dependencies = [
+ "boot-stage",
+ "layout",
+ "sel4",
+ "sel4-microkit",
+ "supervisor-core",
+]
+
+[[package]]
 name = "pd-timer"
 version = "0.1.0"
 dependencies = [
+ "boot-stage",
  "layout",
  "sel4-microkit",
 ]
@@ -1280,6 +1309,7 @@ name = "pd-tls"
 version = "0.1.0"
 dependencies = [
  "audit-event",
+ "boot-stage",
  "config",
  "cpu",
  "http-wire",
@@ -1300,6 +1330,7 @@ dependencies = [
 name = "pd-tlskey"
 version = "0.1.0"
 dependencies = [
+ "boot-stage",
  "config",
  "cpu",
  "layout",
@@ -1315,6 +1346,7 @@ dependencies = [
 name = "pd-tpm"
 version = "0.1.0"
 dependencies = [
+ "boot-stage",
  "cpu",
  "layout",
  "sel4-microkit",
@@ -1326,6 +1358,7 @@ name = "pdkit"
 version = "0.1.0"
 dependencies = [
  "audit-event",
+ "boot-stage",
  "layout",
  "ring",
  "sel4-microkit",
@@ -2097,6 +2130,18 @@ name = "static_assertions"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
+
+[[package]]
+name = "supervisor-allowlist"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "syn 2.0.119",
+]
+
+[[package]]
+name = "supervisor-core"
+version = "0.1.0"
 
 [[package]]
 name = "syn"

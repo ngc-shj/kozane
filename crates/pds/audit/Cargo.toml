@@ -5,8 +5,15 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+boot-stage = { path = "../../boot-stage" }
 audit-event = { path = "../../audit-event" }
 layout = { path = "../../layout" }
 ring = { path = "../../ring" }
 sel4-microkit.workspace = true
+supervisor-core = { path = "../../supervisor-core" }
 wire = { path = "../../wire" }
+
+[features]
+# M7 plan C8: a selftest variant only; `make` refuses it outside the debug
+# kernel config, tools/package refuses an ELF that carries it.
+fault-inject = []

@@ -1,8 +1,8 @@
-"""tools/ct-shape (M4 plan C10, C1 erasure, M5 plan C6 printing): the
-normaliser catches a one-instruction difference and nothing but address and
-hash noise passes; the closure stops where C10 says; forbidden, shape,
-erasure and printing each refuse their one-change fixture; the TLS roots
-(M6 plan C7) are held to identity alone.
+"""tools/ct-shape (M4 plan C10, C1 erasure, M5 plan C6 printing, M7 plan C9
+stage): the normaliser catches a one-instruction difference and nothing but
+address and hash noise passes; the closure stops where C10 says; forbidden,
+shape, erasure, printing and stage each refuse their one-change fixture;
+the TLS roots (M6 plan C7) are held to identity alone.
 
 The ELFs are assembled from tests/tools/ct_shape_elf.py with the
 aarch64-none-elf toolchain (the dev image's), so objdump and c++filt run as
@@ -289,6 +289,13 @@ def printing(label="pd-pqkey.elf", **kw):
     return run
 
 
+def stage(label="pd-key.elf", **kw):
+    @with_tree(**kw)
+    def run(search, _harness, _d):
+        return cts.check_stage(search / label)
+    return run
+
+
 @with_tree()
 def printing_control_fails(search, _harness, _d):
     """An ELF whose entry symbol is another crate's fails the control."""
@@ -304,7 +311,7 @@ def erasure_control_fails(search, _harness, _d):
 
 
 def cli(**kw):
-    """tools/ct-shape end to end, all five checks, against a policy made from
+    """tools/ct-shape end to end, all six checks, against a policy made from
     the unmutated tree: (exit status, the ct-shape: lines, the count)."""
     mutated = kw.pop("mutated", False)
     third = kw.pop("third", False)
@@ -323,7 +330,8 @@ def cli(**kw):
             if text is not False:
                 system.write_text(f"<system>\n{text}</system>\n")
             if third:
-                elf.build(search, "pd-ingress.elf", elf.program("a1", "pd_ingress"), 0x200000)
+                elf.build(search, "pd-ingress.elf", elf.program("a1", "pd_ingress", run_init_crate="pd_ingress"),
+                          0x200000)
             if mutated:
                 (d / "m").mkdir()
                 search, _ = elf.tree(d / "m", pd_bm=bm_with("csel x0, x9, x1, eq", "csel x0, x9, x2, eq"))
@@ -491,6 +499,19 @@ CASES = [
     ("the CLI refuses a PD referencing DebugPutChar", None,
      cli(debug_put_char="pd-pq.elf",
          want="ct-shape: pd-pq.elf: printing: sel4_sys::syscalls::calls::seL4_DebugPutChar is the DebugPutChar")),
+    ("stage passes a callee PD entering through run_init, without boot_stop", None, stage()),
+    ("stage passes a leaf PD with boot_stop", None, stage("pd-pq.elf", boot_stop="pd-pq.elf")),
+    ("stage names boot_stop in a callee PD",
+     ["pd-key.elf: stage: <boot_stage::Init>::boot_stop in a PD other PDs call; a dormant callee blocks its callers"],
+     stage(boot_stop="pd-key.elf")),
+    ("stage names a PD whose init skips run_init",
+     ["pd-key.elf: stage: no boot_stage::run_init::<_, pd_key::init::{closure#0}>; "
+      "init does not enter through the one-shot wrapper"], stage(run_init_crates={"pd-key.elf": None})),
+    ("stage does not count another crate's run_init",
+     ["pd-key.elf: stage: no boot_stage::run_init::<_, pd_key::init::{closure#0}>; "
+      "init does not enter through the one-shot wrapper"], stage(run_init_crates={"pd-key.elf": "pd_tls"})),
+    ("the CLI refuses a callee PD with boot_stop", None,
+     cli(boot_stop="pd-pqkey.elf", want="ct-shape: pd-pqkey.elf: stage: <boot_stage::Init>::boot_stop")),
     ("the CLI passes the unmutated tree", None, cli()),
     ("the CLI refuses a mutated ELF", None, cli(mutated=True)),
     ("the CLI refuses a differing TLS closure", None,

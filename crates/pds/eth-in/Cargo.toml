@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+boot-stage = { path = "../../boot-stage" }
 layout = { path = "../../layout" }
 netdrv = { path = "../../netdrv" }
 sel4-microkit = { workspace = true, features = ["alloc"] }

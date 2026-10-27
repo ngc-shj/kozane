@@ -234,6 +234,27 @@ def case_v1_descriptor(d):
     return rc == 1 and "descriptor is 64 bytes, expected 80" in out and not (d / "rel").exists(), out
 
 
+def fault_inject_image(d) -> bytes:
+    """The package's image with the fault-inject marker in its code bytes."""
+    img = bytearray((d / "pkg/published.img").read_bytes())
+    img[0x100:0x100 + len(measure.FAULT_INJECT_MARKER)] = measure.FAULT_INJECT_MARKER
+    return bytes(img)
+
+
+def case_make_fault_inject(d):
+    """M7 plan C8: a package built from fault-inject PDs is no release."""
+    (d / "pkg/published.img").write_bytes(fault_inject_image(d))
+    write_pcrs(d / "pkg")
+    rc, out = make(d)
+    return rc == 1 and "fault-inject feature" in out and not (d / "rel").exists(), out
+
+
+def case_verify_fault_inject(d):
+    made = signed_release(d, "0" * 40, fault_inject_image(d))
+    rc, out = verify_default(d)
+    return made and rc == 1 and "fault-inject feature" in out, out
+
+
 def case_kind_tls(d):
     """`--kind tls` is a choice: only the --envelope pairing refuses it."""
     rc, out = verify(d, "keys", "rel", "--kind", "tls")
@@ -258,6 +279,8 @@ CASES = [
     ("a release from a dirty tree is refused unless accepted", case_dirty_refused),
     ("a clean release verifies by default, no flag", case_clean_default_verify),
     ("verify refuses a signed range over non-zero image bytes", case_verify_placeholder),
+    ("make refuses an image holding a fault-inject PD", case_make_fault_inject),
+    ("verify refuses a signed image holding a fault-inject PD", case_verify_fault_inject),
     ("a descriptor range over non-zero image bytes is refused", case_range_over_code),
     ("a descriptor range 2 over non-zero image bytes is refused", case_range2_over_code),
     ("a version-1 descriptor is refused", case_v1_descriptor),

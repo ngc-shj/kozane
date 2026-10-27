@@ -23,9 +23,9 @@ policy := policy/laws.toml
 loader := $(BUILD)/loader.img
 counts := $(BUILD)/counts
 
-pds := eth-out eth-in ingress audit timer tpm rng key hs inner data pq pqkey tls tlskey
-host_crates := wire ring rng-core audit-event drbg ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct limits tlskey-core secret
-kani_crates := wire ring drbg rng-core ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire
+pds := supervisor eth-out eth-in ingress audit timer tpm rng key hs inner data pq pqkey tls tlskey
+host_crates := wire ring boot-stage rng-core supervisor-core audit-event drbg ingress-core inner-core layout laws supervisor-allowlist config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct limits tlskey-core secret
+kani_crates := wire ring boot-stage drbg rng-core supervisor-core ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire
 
 .PHONY: clean-counts
 .PHONY: all image package run test check check-selftest repro mir audit lint lint-pds unit kani verus ct ct-harness ct-shape bolero fuzz-long laws pins manifest kernel-config clean
@@ -122,6 +122,18 @@ package: image ct-harness $(firmware)
 		--search-path $(BUILD) --board $(MICROKIT_BOARD) --config $(MICROKIT_CONFIG) \
 		--microkit $(MICROKIT_SDK)/bin/microkit --harness $(ct_harness)
 
+# M7 plan C8: the fault-inject selftest variants, packaged as `package`
+# does (same arguments) from PDs built with the feature into a BUILD of
+# their own; the kernel, the C9 harness and the firmware are the main
+# build's. `net`: ingress faults on frame A and halts on frame B, audit
+# faults on ingress's first WgBadMessage; `timer`: the timer faults on a
+# tick. tools/release.py refuses an image either built.
+fault_inject_net := features_ingress=fault-inject features_audit=fault-inject
+fault_inject_timer := features_timer=fault-inject
+package-fault-inject-%: ct-harness $(firmware)
+	$(if $(fault_inject_$*),,$(error no fault-inject variant '$*'))
+	$(MAKE) package BUILD=$(BUILD)/fault-inject-$* $(fault_inject_$*) ct_dir=$(ct_dir) firmware=$(firmware)
+
 # Boots an image interactively with both NICs as the integration test does
 # (outside on user-net with 51820 forwarded to RUN_PORT, inside on a dgram
 # socket). The default image holds the zero placeholder, so `key` is
@@ -210,14 +222,15 @@ verus: | $(counts)
 # rustc sees their sources by absolute path; remapped to the relative path
 # a PD's workspace build records, so that a panic Location an identity root
 # references names the same file in both (M6 plan C7).
-ct_harness := $(BUILD)/ct/target/aarch64-ct-harness/release/ct-harness
+ct_dir ?= $(BUILD)/ct
+ct_harness := $(ct_dir)/target/aarch64-ct-harness/release/ct-harness
 ct-harness:
 	RUSTFLAGS="-Zunstable-options -Clinker-flavor=gnu-lld-cc -Clink-self-contained=+linker --remap-path-prefix=$(CURDIR)/=" \
 	cargo build --locked --release \
 		--manifest-path tools/ct-harness/Cargo.toml \
 		-Zjson-target-spec -Z build-std=std,panic_abort \
 		--target support/targets/aarch64-ct-harness.json \
-		--target-dir $(BUILD)/ct/target
+		--target-dir $(ct_dir)/target
 
 # CT mode under memcheck, then residue mode natively (tools/ct-gate);
 # writes build/ct/pass-<key> (tools/ct_record.py) only when both pass.
@@ -305,6 +318,9 @@ laws: | $(counts)
 
 pins: release-tool | $(counts)
 	tools/check-pins > $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	# M7 plan C8: what the supervisor's source may name (RM7-5).
+	cargo run --locked -q -p supervisor-allowlist -- crates/pds/supervisor/src >> $(counts)/pins.log \
+		|| { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_check_pins.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_check_selftest.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_package.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
@@ -380,7 +396,7 @@ tfa_tarball ?= /opt/tf-a/tf-a-2.15.0.tar.gz
 mbedtls_tarball ?= /opt/tf-a/mbedtls-3.6.6.tar.bz2
 tfa_flags := $(shell grep -v '^\#' support/tf-a/build-flags)
 tfa_patches := support/tf-a/tf-a-qemu-discrete-tpm.patch support/tf-a/libtpm-fifo-mmio.patch
-firmware := $(BUILD)/firmware-shipped/flash.bin
+firmware ?= $(BUILD)/firmware-shipped/flash.bin
 firmware_measure := $(BUILD)/firmware-measure/flash.bin
 .PHONY: firmware
 firmware: $(firmware) $(firmware_measure)

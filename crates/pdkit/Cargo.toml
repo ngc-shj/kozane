@@ -6,6 +6,11 @@ license.workspace = true
 
 [dependencies]
 audit-event = { path = "../audit-event" }
+boot-stage = { path = "../boot-stage" }
 layout = { path = "../layout" }
 ring = { path = "../ring" }
 sel4-microkit = { workspace = true }
+
+[features]
+# Audit::boot_stop (M7 plan C9): the leaf PDs' crates only (check-pins P26).
+boot-stop = ["boot-stage/boot-stop"]

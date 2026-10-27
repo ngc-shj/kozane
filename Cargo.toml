@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/audit-event", "crates/config", "crates/cpu", "crates/ct", "crates/data-core", "crates/drbg", "crates/hs-core", "crates/http-wire", "crates/ingress-core", "crates/key-core", "crates/inner-core", "crates/layout", "crates/limits", "crates/mce460896", "crates/msgs", "crates/netdrv", "crates/pdkit", "crates/pds/audit", "crates/pds/data", "crates/pds/eth-in", "crates/pds/eth-out", "crates/pds/hs", "crates/pds/ingress", "crates/pds/inner", "crates/pds/key", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/rng", "crates/pds/timer", "crates/pds/tls", "crates/pds/tlskey", "crates/pds/tpm", "crates/pqkey-core", "crates/ring", "crates/rng-client", "crates/rng-core", "crates/rosenpass-core", "crates/rosenpass-wire", "crates/secret", "crates/secret-blob", "crates/tls-core", "crates/tls-wire", "crates/tlskey-core", "crates/tpm2", "crates/tpm2-wire", "crates/wg-core", "crates/wg-wire", "crates/wire", "tools/laws", "tools/mksecrets"]
+members = ["crates/audit-event", "crates/boot-stage", "crates/config", "crates/cpu", "crates/ct", "crates/data-core", "crates/drbg", "crates/hs-core", "crates/http-wire", "crates/ingress-core", "crates/key-core", "crates/inner-core", "crates/layout", "crates/limits", "crates/mce460896", "crates/msgs", "crates/netdrv", "crates/pdkit", "crates/pds/audit", "crates/pds/data", "crates/pds/eth-in", "crates/pds/eth-out", "crates/pds/hs", "crates/pds/ingress", "crates/pds/inner", "crates/pds/key", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/rng", "crates/pds/supervisor", "crates/pds/timer", "crates/pds/tls", "crates/pds/tlskey", "crates/pds/tpm", "crates/pqkey-core", "crates/ring", "crates/rng-client", "crates/rng-core", "crates/rosenpass-core", "crates/rosenpass-wire", "crates/secret", "crates/supervisor-core", "crates/secret-blob", "crates/tls-core", "crates/tls-wire", "crates/tlskey-core", "crates/tpm2", "crates/tpm2-wire", "crates/wg-core", "crates/wg-wire", "crates/wire", "tools/laws", "tools/mksecrets", "tools/supervisor-allowlist"]
 
 [workspace.package]
 edition = "2024"
@@ -9,6 +9,7 @@ license = "BSD-2-Clause"
 [workspace.dependencies]
 # Pinned rev: seL4 16.0.0 + Microkit 2.3.0 compatible, toolchain nightly-2026-08-21.
 sel4-microkit = { git = "https://github.com/seL4/rust-sel4", rev = "86a0dbf4f53e6766734331c5df61851489ed38a1", default-features = false }
+sel4 = { git = "https://github.com/seL4/rust-sel4", rev = "86a0dbf4f53e6766734331c5df61851489ed38a1" }
 sel4-virtio-hal-impl = { git = "https://github.com/seL4/rust-sel4", rev = "86a0dbf4f53e6766734331c5df61851489ed38a1" }
 virtio-drivers = { version = "=0.13.0", default-features = false, features = ["alloc"] }
 

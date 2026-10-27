@@ -111,6 +111,17 @@ def check_placeholder(image: bytes, desc: bytes) -> list:
             for i, (off, length) in enumerate(ranges) if any(image[off:off + length])]
 
 
+# What every PD built with `fault-inject` holds (M7 plan C8).
+FAULT_INJECT_MARKER = b"KOZANE-FAULT-INJECT-VARIANT"
+
+
+def check_not_fault_inject(image: bytes) -> list:
+    """The image holds no PD built with the fault-inject selftest feature
+    (public files alone, so the release verifier runs it too)."""
+    return (["measure: the image holds a PD built with the fault-inject feature (a selftest variant)"]
+            if FAULT_INJECT_MARKER in image else [])
+
+
 def extend(pcr: bytes, digest: bytes) -> bytes:
     return hashlib.sha256(pcr + digest).digest()
 

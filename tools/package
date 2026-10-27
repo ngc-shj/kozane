@@ -49,8 +49,8 @@ CONFIG_PRINTING (no debug printing syscall at all), CONFIG_KERNEL_MCS 1 and
 a single node (L11). Independently, a non-debug kernel is refused while
 policy/waivers.toml lists an open waiver (M3 plan, Packaging), and a
 missing or unparsable waiver file refuses any package. For every kernel,
-tools/ct-shape's identity, forbidden, shape and printing checks (M4 plan
-C10 (a), (b), M5 plan C6) must pass on the PD ELFs under --search-path
+tools/ct-shape's identity, forbidden, shape, printing and stage checks (M4 plan
+C10 (a), (b), M5 plan C6, M7 plan C9) must pass on the PD ELFs under --search-path
 against the C9 harness, and a missing harness refuses; a non-debug kernel
 also needs the C9 pass record `make ct` wrote for that harness
 (tools/ct_record.py, C11).
@@ -188,7 +188,7 @@ def run_ct_shape(harness: pathlib.Path, search_path: str, system: str) -> list:
     try:
         r = subprocess.run([str(CT_SHAPE), "--harness", str(harness), "--search-path", search_path,
                             "--policy", str(CT_POLICY), "--system", system,
-                            "--checks", "identity,forbidden,shape,printing"],
+                            "--checks", "identity,forbidden,shape,printing,stage"],
                            capture_output=True, text=True)
     except OSError as e:
         return [f"package: cannot run tools/ct-shape: {e}"]

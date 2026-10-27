@@ -869,3 +869,75 @@ fn rng_below_one_of_its_callers_is_l13() {
     );
 }
 
+
+// M7 plan C8, C10: the `supervisor` role, the parent of every other pd.
+#[test]
+fn a_supervisor_parenting_every_pd_is_allowed() {
+    assert_allow("supervisor_allow");
+}
+
+#[test]
+fn smc_on_a_child_is_l4() {
+    assert_deny_exactly("supervisor_smc_on_audit_deny", &["L4: smc is denied outside the supervisor (pd 'audit')"]);
+}
+
+#[test]
+fn a_pd_outside_the_supervisor_is_l4() {
+    assert_deny_exactly("supervisor_child_outside_deny", &["L4: pd 'hs' is not a child of the supervisor"]);
+}
+
+#[test]
+fn a_policy_pd_missing_from_a_supervised_system_is_l4() {
+    assert_deny_exactly(
+        "supervisor_policy_pd_missing_deny",
+        &["L4: pd 'timer' is described by policy but missing from the system"],
+    );
+}
+
+#[test]
+fn two_supervisors_are_l4() {
+    assert_deny("supervisor_two_deny", &["L4"]);
+}
+
+#[test]
+fn a_supervisor_channel_to_a_tainted_pd_is_l1() {
+    assert_deny_exactly(
+        "supervisor_channel_to_hs_deny",
+        &["L1: supervisor pd 'supervisor' has a channel to 'hs', which is not the audit (service) pd"],
+    );
+}
+
+#[test]
+fn a_supervisor_ppc_is_l1() {
+    assert_deny_exactly(
+        "supervisor_ppc_deny",
+        &["L1: channel between supervisor pd 'supervisor' and 'audit' does not meet the supervisor exemption \
+           (pp=false on both ends, peer notify=false)"],
+    );
+}
+
+#[test]
+fn a_record_page_audit_can_write_is_l1() {
+    assert_deny_exactly(
+        "supervisor_record_rw_in_audit_deny",
+        &["L1: supervisor pd 'supervisor' maps mr 'record', which is not a record page others only read"],
+    );
+}
+
+#[test]
+fn a_supervisor_owning_a_device_is_refused() {
+    assert_parse_error_naming("supervisor_device_deny", "device mr 'nic' owner 'supervisor' must have role");
+}
+
+#[test]
+fn a_child_without_an_id_is_refused() {
+    assert_parse_error_naming("supervisor_child_without_id_deny", "missing required attribute 'id'");
+}
+
+#[test]
+fn existing_laws_hold_under_nesting() {
+    assert_deny_exactly(
+        "supervisor_nested_secret_deny",
+        &["L2: secrets mr 'secrets' (owner 'key') is mapped into pd 'hs'"],
+    );
+}

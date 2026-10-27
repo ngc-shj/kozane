@@ -5,5 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+boot-stage = { path = "../../boot-stage" }
 layout = { path = "../../layout" }
 sel4-microkit = { workspace = true }
+
+[features]
+# M7 plan C8: a selftest variant only (see pd-audit's).
+fault-inject = []

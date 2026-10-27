@@ -1,0 +1,42 @@
+[pds.supervisor]
+role = "supervisor"
+
+[pds.audit]
+role = "service"
+
+[pds.hs]
+role = "untrusted_input"
+
+[pds.key]
+role = "key"
+
+[mrs.record]
+kind = "plain"
+shares = { supervisor = "rw", audit = "r" }
+
+[mrs.secrets]
+kind = "secrets"
+owner = "key"
+
+[[channels]]
+between = ["supervisor", "audit"]
+notify = { audit = false }
+
+[[channels]]
+between = ["supervisor", "hs"]
+notify = { hs = false }
+
+[[channels]]
+between = ["hs", "key"]
+pp = { hs = true, key = false }
+notify = { hs = false }
+
+[priority]
+below = [["untrusted_input", "key"]]
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

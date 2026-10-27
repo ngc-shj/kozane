@@ -81,7 +81,7 @@ fn every_region_is_a_link_an_audit_ring_or_a_named_singleton() {
         .flat_map(|l| ["used", "free", "data"].map(|s| std::format!("{l}_{s}")))
         .chain(AUDITS.iter().map(|a| String::from(*a)))
         .chain(
-            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "tpm_mmio", "rng_mmio", "rng_dma", "secrets", "pq_secrets", "tls_secrets"]
+            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "tpm_mmio", "rng_mmio", "rng_dma", "supervisor_record", "secrets", "pq_secrets", "tls_secrets"]
                 .map(String::from),
         )
         .collect();
@@ -218,6 +218,7 @@ fn channel_ids_match_layout() {
         (("key", key::CH_RNG), ("rng", rng::CH_KEY)),
         (("pqkey", pqkey::CH_RNG), ("rng", rng::CH_PQKEY)),
         (("tlskey", tlskey::CH_RNG), ("rng", rng::CH_TLSKEY)),
+        (("supervisor", supervisor::CH_AUDIT), ("audit", audit::CH_SUPERVISOR)),
     ];
     for (a, b) in expected {
         assert!(has_channel(a, b), "{a:?} <-> {b:?}");
@@ -347,3 +348,26 @@ fn tlskey_is_a_passive_key_pd_on_the_planned_schedule() {
         assert!(map_of(pd, "tls_secrets").is_none(), "{pd} maps tls_secrets");
     }
 }
+
+/// M7 plan C8: every pd but the supervisor is its child, with the id that
+/// names it in `supervisor_core::CHILDREN` (what audit prints).
+#[test]
+fn child_ids_name_the_supervisor_children() {
+    let text = system_text();
+    let doc = roxmltree::Document::parse(&text).expect("parse .system");
+    let sup = doc
+        .descendants()
+        .find(|n| n.has_tag_name("protection_domain") && n.attribute("name") == Some("supervisor"))
+        .expect("a supervisor pd");
+    let mut seen = 0;
+    for pd in sup.children().filter(|n| n.has_tag_name("protection_domain")) {
+        let name = pd.attribute("name").expect("name");
+        let id = parse_num(pd.attribute("id").expect("id"));
+        assert_eq!(supervisor_core::CHILDREN.get(id).copied(), Some(name), "child id {id}");
+        seen += 1;
+    }
+    assert_eq!(seen, supervisor_core::CHILDREN.len());
+    let all = doc.descendants().filter(|n| n.has_tag_name("protection_domain")).count();
+    assert_eq!(all, seen + 1, "a pd outside the supervisor");
+}
+

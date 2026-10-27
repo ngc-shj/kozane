@@ -41,6 +41,11 @@ pub enum Role {
     /// and its DMA mr, callee only, with `key`'s exemption shape towards
     /// every caller (L1 as amended).
     Rng,
+    /// The fault handler (M7 plan C8): the parent of every other pd, the
+    /// only pd with `smc`, untainted; it maps only a record page `audit`
+    /// reads, and its one channel notifies `audit` and is never signalled
+    /// back (L1, L4 as amended).
+    Supervisor,
 }
 
 impl Role {
@@ -54,8 +59,10 @@ impl Role {
             "timer" => Ok(Role::Timer),
             "tpm" => Ok(Role::Tpm),
             "rng" => Ok(Role::Rng),
+            "supervisor" => Ok(Role::Supervisor),
             other => Err(err(format!(
-                "unknown role '{other}' (expected driver, untrusted_input, key, data, service, timer, tpm or rng)"
+                "unknown role '{other}' (expected driver, untrusted_input, key, data, service, timer, tpm, rng or \
+                 supervisor)"
             ))),
         }
     }
@@ -472,6 +479,11 @@ impl Policy {
 
     pub fn role(&self, pd: &str) -> Option<Role> {
         self.pds.get(pd).map(|p| p.role)
+    }
+
+    /// Every pd the policy describes, by name.
+    pub fn pd_names(&self) -> impl Iterator<Item = &str> {
+        self.pds.keys().map(String::as_str)
     }
 
     /// The driver irqs declared for `pd`, or `None` if `pd` is undeclared.

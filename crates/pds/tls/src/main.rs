@@ -435,7 +435,7 @@ fn key_call(label: u64, req: &[u64], reply: &mut [u64]) -> (u64, usize) {
 /// `tlskey`'s boot seed, the hedged RNG's key (M6 plan C7). An Unavailable
 /// `tlskey` (its unseal, blob or scalar failed) is audited with its code,
 /// and `tls` halts before any listener exists (M6 plan C12).
-fn boot_seed(audit: &mut Audit) -> Secret<SEED_LEN> {
+fn boot_seed(audit: &mut Audit) -> Result<Secret<SEED_LEN>, u32> {
     let mut reply = [0u64; tlskey_core::BOOT_SEED_REPLY_WORDS];
     let (label, n) = key_call(LABEL_BOOT_SEED, &[], &mut reply);
     let mut seed = Secret::<SEED_LEN>::zero();
@@ -453,11 +453,11 @@ fn boot_seed(audit: &mut Audit) -> Secret<SEED_LEN> {
             if code == tlskey_core::BootError::TpmCapFailed.code() {
                 audit.record(Event::TpmCapFailed);
             }
-            audit.halt(halt::KEY_UNAVAILABLE)
+            return Err(halt::KEY_UNAVAILABLE);
         }
-        audit.halt(halt::INIT_FAILED)
+        return Err(halt::INIT_FAILED);
     }
-    seed
+    Ok(seed)
 }
 
 /// `tlskey`'s `TlsSign` (M6 plan C5, C12) as the handshake's signer. Each
@@ -632,8 +632,17 @@ fn interface(dev: &mut Dev<'_>, ours: [u8; 4], seed: u64) -> Option<Interface> {
     (added && iface.routes_mut().add_default_ipv4_route(ours).is_ok()).then_some(iface)
 }
 
+// The closure names this init in run_init's symbol (ct-shape's stage check).
+#[allow(clippy::redundant_closure)]
 #[protection_domain]
-fn init() -> Tls {
+fn init() -> pdkit::Stage<Tls> {
+    boot_stage::run_init(|init| start(init))
+}
+
+/// Init proper. Every refusal here is a boot stop (M7 plan C9): recorded,
+/// then dormant, so the supervisor does not reset for what the next boot
+/// would repeat (no TLS key leaves the VPN serving, as before).
+fn start(init: &boot_stage::Init) -> pdkit::Stage<Tls> {
     // SAFETY: first thing in init, with this PD's stack_size (layout checks
     // it against the system file).
     let stack = unsafe { cpu::StackProbe::paint(layout::TLS_STACK_SIZE) };
@@ -666,24 +675,31 @@ fn init() -> Tls {
         )
     };
     if cpu::checked_frequency(cpu::cntfrq()).is_none() {
-        audit.halt(halt::NO_CLOCK);
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::NO_CLOCK));
     }
+    let Ok(entropy) = rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG)) else {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::RNG_UNAVAILABLE));
+    };
     // The boot seed is `tls`'s first call to `tlskey`: an Unavailable
-    // `tlskey` shows here, audited once, and tls halts before listening.
-    let hw = Hw(rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG))
-        .unwrap_or_else(|_| audit.halt(halt::RNG_UNAVAILABLE)));
-    let mut rng = Hedged::new(boot_seed(&mut audit), hw);
+    // `tlskey` shows here, audited once, and tls stops before listening.
+    let boot = match boot_seed(&mut audit) {
+        Ok(seed) => seed,
+        Err(reason) => return pdkit::Stage::Dormant(audit.boot_stop(init, reason)),
+    };
+    let mut rng = Hedged::new(boot, Hw(entropy));
     // One ISN seed per interface (smoltcp's PCG32, RM6-7).
     let (mut seed, mut inside_seed) = ([0u8; 8], [0u8; 8]);
     if rng.fill(&mut seed).is_err() || rng.fill(&mut inside_seed).is_err() {
-        audit.halt(halt::RNG);
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::RNG));
     }
     let mut outside = Link::new(rx, tx, client_rst);
     let mut inside = Link::new(from_inner, to_inner, backend_rst);
     let iface = interface(&mut Dev { link: &mut outside, audit: &mut audit }, config::OUTSIDE_IP, u64::from_le_bytes(seed));
     let inside_iface =
         interface(&mut Dev { link: &mut inside, audit: &mut audit }, config::INSIDE_IP, u64::from_le_bytes(inside_seed));
-    let (Some(iface), Some(inside_iface)) = (iface, inside_iface) else { audit.halt(halt::INIT_FAILED) };
+    let (Some(iface), Some(inside_iface)) = (iface, inside_iface) else {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::INIT_FAILED));
+    };
     let st = STORAGE.0.get();
     // SAFETY: init runs once and is the only place these parts of the
     // storage are handed out; from here the socket sets own the socket
@@ -714,7 +730,7 @@ fn init() -> Tls {
         // SAFETY: no socket over listener i's buffers exists yet.
         match unsafe { listener_socket(i) } {
             Some(s) => l.handle = sockets.add(s),
-            None => audit.halt(halt::INIT_FAILED),
+            None => return pdkit::Stage::Dormant(audit.boot_stop(init, halt::INIT_FAILED)),
         }
     }
     // The boot seed's copies in the frames below.
@@ -740,7 +756,7 @@ fn init() -> Tls {
         stack,
     };
     tls.audit.flush();
-    tls
+    pdkit::Stage::Run(tls)
 }
 
 /// The length of the next record on `s`, if it is complete. A header that

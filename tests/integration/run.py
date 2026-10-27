@@ -431,16 +431,25 @@ def qemu_machine(firmware: str, rng: bool = True) -> list:
 
 def boot(pkg: "Package", outside: str, inside: str, monitor: str = "", media=None, flip=None,
          fail_extend: bool = False, inject_pcr3: bool = False, fail_nth: tuple = None,
-         firmware: str = None, rng: bool = True) -> tuple:
+         firmware: str = None, rng: bool = True, shutdown: str = None, resets: tuple = None) -> tuple:
     """Every boot is the shipped one (M5 plan C14): U-Boot measures and
     assembles the package's boot media (`media`, the package's own unless
     given: (path, address) pairs at measure.LOAD_*), and its TPM is a fresh
     copy of the deployment's provisioned swtpm state (the same SRK, fresh
     PCRs), stopped and removed by kill(). `flip` puts the A7 proxy between
     QEMU and swtpm, flipping a byte of each Unseal response if true;
-    `fail_extend` puts it there failing the cap's PCR_Extend (post-M6 P3)."""
+    `fail_extend` puts it there failing the cap's PCR_Extend (post-M6 P3).
+
+    M7 plan C11: QEMU starts paused under `-no-reboot`, with a QMP socket in
+    a fresh 0700 directory; the harness negotiates QMP, then continues it.
+    `shutdown` is the one SHUTDOWN reason the case expects (None: none
+    before kill(); a case that learns it later sets child.shutdown), and
+    kill() fails a boot that saw another, or that QEMU left without one.
+    `resets` drops `-no-reboot` (the opt-outs: S11's monitor reset and the
+    supervisor's reboot case): the boot must then see exactly those RESET
+    reasons, in order, and no SHUTDOWN."""
     tpm = Swtpm(os.path.dirname(pkg.dir), state=pkg.state)
-    proxy = None
+    proxy = qmp_dir = None
     try:
         if flip is not None or fail_extend or inject_pcr3 or fail_nth:
             proxy = TpmProxy(tpm, bool(flip), fail_extend, inject_pcr3, fail_nth)
@@ -456,14 +465,27 @@ def boot(pkg: "Package", outside: str, inside: str, monitor: str = "", media=Non
         ]
         if monitor:
             cmd += ["-monitor", f"unix:{monitor},server,nowait"]
+        qmp_dir = tempfile.mkdtemp(prefix="kozane-qmp-")
+        qmp_path = os.path.join(qmp_dir, "qmp.sock")
+        cmd += ["-S", "-qmp", f"unix:{qmp_path},server=on,wait=off"] + ([] if resets is not None else ["-no-reboot"])
         # pexpect makes the child a session leader, so kill() takes the group.
         child = pexpect.spawn(DIE_WITH_PARENT[0], DIE_WITH_PARENT[1:] + ["qemu-system-aarch64"] + cmd,
                               encoding="utf-8", timeout=BOOT_TIMEOUT_S)
     except BaseException:
         close_tpm(proxy, tpm)
+        if qmp_dir is not None:
+            shutil.rmtree(qmp_dir, ignore_errors=True)
         raise
-    child.tpm, child.proxy = tpm, proxy
-    return child, Console(child)
+    child.tpm, child.proxy, child.qmp, child.qmp_dir = tpm, proxy, None, qmp_dir
+    child.shutdown, child.resets = shutdown, resets
+    try:
+        con = Console(child)
+        child.qmp = Qmp(qmp_path)
+        child.qmp.cont()
+    except BaseException:
+        kill(child)
+        raise
+    return child, con
 
 
 def close_tpm(proxy, tpm):
@@ -477,6 +499,11 @@ def close_tpm(proxy, tpm):
 
 
 def kill_qemu(child: pexpect.spawn):
+    """SIGKILLs QEMU's group, judging the QMP events first (once): after
+    the kill, QEMU's exit is the harness's, not the guest's."""
+    qmp = getattr(child, "qmp", None)
+    if qmp is not None and not hasattr(child, "verdict"):
+        child.verdict = qmp.verdict(child.shutdown, child.resets)
     try:
         os.killpg(child.pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -486,11 +513,23 @@ def kill_qemu(child: pexpect.spawn):
 
 def kill(child: pexpect.spawn):
     """Ends QEMU, then the boot's TPM. Idempotent: the teardown paths call
-    it again after a stop signal."""
+    it again after a stop signal. On a case's own success path (no exception
+    in flight) a QMP verdict other than the declared one fails it (C11)."""
+    qmp = getattr(child, "qmp", None)
     kill_qemu(child)
+    verdict, child.verdict = getattr(child, "verdict", None), None
     tpm, proxy = getattr(child, "tpm", None), getattr(child, "proxy", None)
-    child.tpm = child.proxy = None
-    close_tpm(proxy, tpm)
+    child.tpm = child.proxy = child.qmp = None
+    try:
+        close_tpm(proxy, tpm)
+    finally:
+        if qmp is not None:
+            qmp.close()
+        qmp_dir, child.qmp_dir = getattr(child, "qmp_dir", None), None
+        if qmp_dir is not None:
+            shutil.rmtree(qmp_dir, ignore_errors=True)
+    if verdict is not None and sys.exception() is None:
+        raise Fail(verdict)
 
 
 class Monitor:
@@ -551,6 +590,115 @@ class Monitor:
         if len(data) != size:
             raise Fail(f"pmemsave returned {len(data)} of {size} bytes")
         return data
+
+
+class Qmp:
+    """QEMU's QMP over a unix socket (M7 plan C11). The boot starts paused
+    (`-S`): the harness reads the greeting, negotiates capabilities, then
+    sends `cont`, so no event can precede the reader. A thread keeps every
+    event; EOF (QEMU gone) is recorded too."""
+
+    def __init__(self, path: str):
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sock.connect(path)
+                break
+            except OSError:
+                self.sock.close()
+                if time.monotonic() > deadline:
+                    raise Fail("QEMU QMP socket did not appear")
+                time.sleep(0.05)
+        self.sock.settimeout(LINE_TIMEOUT_S)
+        self.file = self.sock.makefile("rb")
+        self.events = []
+        self.eof = False
+        self.cond = threading.Condition()
+        if "QMP" not in self._message():
+            raise Fail("QMP: no greeting")
+        self._execute("qmp_capabilities")
+
+    def _message(self) -> dict:
+        line = self.file.readline()
+        if not line:
+            raise Fail("QMP closed during negotiation")
+        return json.loads(line)
+
+    def _execute(self, command: str):
+        self.sock.sendall(json.dumps({"execute": command}).encode() + b"\n")
+        while True:
+            msg = self._message()
+            if "event" in msg:
+                self.events.append(msg)
+            elif "error" in msg:
+                raise Fail(f"QMP {command}: {msg['error']}")
+            elif "return" in msg:
+                return
+
+    def cont(self):
+        self._execute("cont")
+        self.sock.settimeout(None)
+        start_without_stop_signals(threading.Thread(target=self._read, daemon=True))
+
+    def _read(self):
+        try:
+            for line in self.file:
+                msg = json.loads(line)
+                if "event" in msg:
+                    with self.cond:
+                        self.events.append(msg)
+                        self.cond.notify_all()
+        except (OSError, ValueError):
+            pass
+        with self.cond:
+            self.eof = True
+            self.cond.notify_all()
+
+    def reasons(self, event: str) -> list:
+        with self.cond:
+            return [e.get("data", {}).get("reason") for e in self.events if e.get("event") == event]
+
+    def wait_shutdown(self, reason: str, timeout: float = BOOT_TIMEOUT_S):
+        """The first SHUTDOWN, which must give `reason`; QEMU leaving
+        without one fails."""
+        deadline = time.monotonic() + timeout
+        with self.cond:
+            while True:
+                got = [e.get("data", {}).get("reason") for e in self.events if e.get("event") == "SHUTDOWN"]
+                if got:
+                    if got[0] != reason:
+                        raise Fail(f"QMP: SHUTDOWN {got[0]}, want {reason}")
+                    return
+                if self.eof:
+                    raise Fail(f"QMP: QEMU exited without a SHUTDOWN event (want {reason})")
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise Fail(f"QMP: no SHUTDOWN {reason} within {timeout}s")
+                self.cond.wait(left)
+
+    def verdict(self, shutdown, resets):
+        """None when the events so far are what the case declared, else
+        why not."""
+        with self.cond:
+            eof = self.eof
+        downs, rs = self.reasons("SHUTDOWN"), self.reasons("RESET")
+        if resets is not None:
+            if downs or rs != list(resets):
+                return f"QMP: want RESET {list(resets)} and no SHUTDOWN, saw RESET {rs}, SHUTDOWN {downs}"
+            return None
+        if downs != ([shutdown] if shutdown else []):
+            return f"QMP: SHUTDOWN {downs}, the case declared {[shutdown] if shutdown else 'none'}"
+        if eof and not downs:
+            return "QMP: QEMU exited without a SHUTDOWN event"
+        return None
+
+    def close(self):
+        with contextlib.suppress(OSError):
+            self.sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
+            self.file.close()
+            self.sock.close()
 
 
 # Guest RAM scanned for residue. Which frames back which region at run time
@@ -1078,8 +1226,10 @@ def test_wireguard(pkg: "Package", deploy: str, passed: list):
     rp_fwd = free_udp_port()
     host = InsideHost(inside)
     monitor = os.path.join(deploy, "monitor.sock")
+    # S11 resets the machine from the monitor: the one host reset C11 opts out.
     child, con = boot(pkg, f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT},"
-                              f"hostfwd=udp:127.0.0.1:{rp_fwd}-:{RP_PORT}", inside.netdev("n1"), monitor)
+                              f"hostfwd=udp:127.0.0.1:{rp_fwd}-:{RP_PORT}", inside.netdev("n1"), monitor,
+                      resets=("host-qmp-system-reset",))
     wg = None
     rps = []
     threads = []
@@ -1567,6 +1717,7 @@ def test_mismatched_blob(pkg: "Package"):
         con.wait_for(r"audit: src=pq KeyStackHighWater bytes=", timeout=BOOT_TIMEOUT_S)
         scan_absent(Monitor(monitor), gateway_private, pq_plain, os.path.join(deploy, "pmem-b.bin"),
                     "key's opened blob (an Unavailable key must hold no secret)", "pqkey's plaintext")
+        no_supervisor_record(con, "mismatched blob")
     finally:
         try:
             with signals_held():
@@ -1957,6 +2108,8 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
                     if not con.alive or time.monotonic() > deadline:
                         raise
             if m.group(1) == "boot refused":
+                # QEMU's SHUTDOWN must say the guest powered off (C11).
+                child.shutdown = "guest-shutdown"
                 # A refusal must end the boot: nothing runs after it, not
                 # even when someone on the UART presses Ctrl-C (S-BOOT-1,
                 # S-BOOT-5). U-Boot powers off; until it does (or for the
@@ -2172,9 +2325,10 @@ def media_with(pkg: Package, scratch: str, image: bytes = None, desc: bytes = No
 
 
 def sealed_boot(pkg: Package, media=None, flip=None, inject_pcr3: bool = False, fail_nth: tuple = None,
-                firmware: str = None, rng: bool = True) -> tuple:
+                firmware: str = None, rng: bool = True, shutdown: str = None, resets: tuple = None) -> tuple:
     return boot(pkg, dgram("n0", free_udp_port(), free_udp_port()), dgram("n1", free_udp_port(), free_udp_port()),
-                media=media, flip=flip, inject_pcr3=inject_pcr3, fail_nth=fail_nth, firmware=firmware, rng=rng)
+                media=media, flip=flip, inject_pcr3=inject_pcr3, fail_nth=fail_nth, firmware=firmware, rng=rng,
+                shutdown=shutdown, resets=resets)
 
 
 def stop(child):
@@ -2343,7 +2497,7 @@ def test_firmware(good: Package, passed: list):
                 stop(child)
             passed.append(f"firmware: a changed {entry} is refused")
         for nth, token in FIRMWARE_REFUSALS:
-            child, con = sealed_boot(good, fail_nth=nth)
+            child, con = sealed_boot(good, fail_nth=nth, shutdown="guest-shutdown")
             try:
                 con.wait_for(rf"KOZANE-MBOOT: {token} failed", timeout=BOOT_TIMEOUT_S)
                 deadline = time.monotonic() + LINE_TIMEOUT_S
@@ -2386,6 +2540,7 @@ def test_no_rng(good: Package, passed: list):
         for pd in RNG_HALTS:
             if re.search(rf"(?m)^{pd}: ready", con.text):
                 raise Fail(f"no rng: {pd} became ready without a seed")
+        no_supervisor_record(con, "no rng")
     finally:
         stop(child)
     passed.append("no rng: exactly hs, pq, ingress and tls halt (RNG_UNAVAILABLE), no handshake")
@@ -2483,6 +2638,109 @@ def test_tpm_cap_failure(pkg: Package, deploy: str, passed: list):
             kill(child)
             tap.close()
             raise
+
+
+# ---------------------------------------------------------------- supervisor (M7 plan C8, C11)
+
+# The fault-inject variants build() packages (Makefile
+# package-fault-inject-%), and the frames ingress's variant acts on.
+FAULT_INJECT_VARIANTS = ("net", "timer")
+FAULT_FRAME_A = b"KOZANE-FAULT-INJECT-A"
+FAULT_FRAME_B = b"KOZANE-FAULT-INJECT-B"
+SUPERVISOR_RECORD = r"supervisor: fault pd=(\w+) label=(\d+) lost=(\d+)\r*\n"
+
+
+def no_supervisor_record(con: Console, what: str):
+    """A boot stop never faults (M7 plan D4): no reset record on this boot."""
+    m = re.search(SUPERVISOR_RECORD, con.text)
+    if m:
+        raise Fail(f"{what}: a boot stop reached the supervisor ({m.group(0).strip()})")
+
+
+def fault_boot(pkg: Package, resets: tuple = None):
+    """A variant boot on a dgram wire, ready: (child, con, wire). Under
+    -no-reboot a reset is QEMU's SHUTDOWN guest-reset."""
+    w = Wire()
+    child, con = boot(pkg, w.netdev("n0"), dgram("n1", free_udp_port(), free_udp_port()),
+                      shutdown=None if resets is not None else "guest-reset", resets=resets)
+    try:
+        wait_arp_ready(w, con)
+        con.wait_for(r"hs: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+    except BaseException:
+        stop(child)
+        raise
+    return child, con, w
+
+
+def test_supervisor(fi_net: Package, fi_timer: Package, passed: list):
+    """M7 plan C8: every fault is recorded by the supervisor, printed by
+    audit (which preempts it), and resets the machine through PSCI. Under
+    -no-reboot that is QMP's SHUTDOWN guest-reset (C11); without it, one
+    guest-reset RESET and a second boot that unseals and serves again."""
+    record_a = None
+    for frame, halted in ((FAULT_FRAME_A, False), (FAULT_FRAME_B, True)):
+        name = "A" if frame == FAULT_FRAME_A else "B"
+        child, con, w = fault_boot(fi_net)
+        try:
+            mark = con.mark()
+            w.send(ipv4_udp(PEER_IP, GW_IP, 40000, WG_PORT, frame))
+            if halted:
+                h = con.wait_for(r"audit: src=ingress Halted reason=(\d+) ", since=mark)
+                if int(h.group(1)) != halt_reason("ingress", "FAULT_INJECT"):
+                    raise Fail(f"inject B: ingress halted with reason={h.group(1)}")
+            r = con.wait_for(SUPERVISOR_RECORD, since=mark)
+            if r.group(1) != "ingress" or r.group(3) != "0":
+                raise Fail(f"inject {name}: the record is {r.group(0).strip()}, want pd=ingress lost=0")
+            child.qmp.wait_shutdown("guest-reset")
+            if con.count(r"WgBadMessage", since=mark):
+                raise Fail(f"inject {name}: ingress audited the frame instead of stopping")
+            record_a = record_a or r.group(0).strip()
+        finally:
+            stop(child)
+        passed.append(f"supervisor: inject {name} records ingress and resets")
+
+    # The one opt-out of -no-reboot: the reset boots the machine again.
+    child, con, w = fault_boot(fi_net, resets=("guest-reset",))
+    try:
+        mark = con.mark()
+        w.send(ipv4_udp(PEER_IP, GW_IP, 40000, WG_PORT, FAULT_FRAME_A))
+        r = con.wait_for(SUPERVISOR_RECORD, since=mark)
+        if r.group(1) != "ingress":
+            raise Fail(f"reboot: the record is {r.group(0).strip()}")
+        again = con.wait_for(r"U-Boot \d{4}\.\d{2} ", since=r.end() + mark, timeout=BOOT_TIMEOUT_S)
+        second = again.end() + r.end() + mark
+        for pd in ("hs", "pq", "tls"):
+            con.wait_for(rf"{pd}: ready", since=second, timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        wait_arp_ready(w, con)
+        if con.count(r"KeyUnavailable", since=second):
+            raise Fail("reboot: a key PD was Unavailable on the second boot")
+    finally:
+        stop(child)
+    passed.append("supervisor: without -no-reboot the reset boots again and re-unseals")
+
+    # audit faults itself once it has printed ingress's WgBadMessage.
+    child, con, w = fault_boot(fi_net)
+    try:
+        mark = con.mark()
+        w.send(ipv4_udp(PEER_IP, GW_IP, 40000, WG_PORT, b"hello"))
+        con.wait_for(r"audit: src=ingress WgBadMessage total=1 ", since=mark)
+        child.qmp.wait_shutdown("guest-reset")
+    finally:
+        stop(child)
+    passed.append("supervisor: an audit fault resets")
+
+    # The timer faults on its FAULT_TICK-th tick, the system up.
+    child, con = sealed_boot(fi_timer, shutdown="guest-reset")
+    try:
+        con.wait_for(r"hs: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        r = con.wait_for(SUPERVISOR_RECORD, timeout=BOOT_TIMEOUT_S)
+        if r.group(1) != "timer":
+            raise Fail(f"timer fault: the record is {r.group(0).strip()}, want pd=timer")
+        child.qmp.wait_shutdown("guest-reset")
+    finally:
+        stop(child)
+    passed.append("supervisor: a timer fault is recorded and resets")
+    print(f"\nPASS [supervisor: inject A and B, reboot, audit and timer faults reset ({record_a})]")
 
 
 # ---------------------------------------------------------------- cookie boots (M2.5 plan C6)
@@ -6456,6 +6714,7 @@ def test_tls_key_failure(pkg: "Package", deploy: str, passed: list):
         h = con.wait_for(r"audit: src=tls Halted reason=(\d+) lost=\d+\r*\n", since=m.end())
         if int(h.group(1)) != reason:
             raise Fail(f"tls key failure: tls halted with reason={h.group(1)}, want KEY_UNAVAILABLE ({reason})")
+        no_supervisor_record(con, "tls key failure")
         r = curl(os.path.join(deploy, "devca.pem"), https_url())
         if r.returncode == 0:
             raise Fail("tls key failure: HTTPS completed with tlskey Unavailable")
@@ -6695,7 +6954,13 @@ def build(tmp: str):
     make("package", f"SECRETS={tmp}/c/secrets.bin", f"PQ_SECRETS={tmp}/c/pqkey-secrets.bin",
          f"TLS_SECRETS={tmp}/c/tls-secrets.bin", f"SRK_PUBLIC={srk_c}",
          f"OUT={tmp}/c/pkg", env=env_c)
-    for pkg in ("a/pkg", "b/pkg", "a/pkg-foreign", "a/pkg-tls-mismatch", "c/pkg"):
+    # M7 plan C8: the fault-inject selftest variants of A's package.
+    for variant in FAULT_INJECT_VARIANTS:
+        make(f"package-fault-inject-{variant}", f"SECRETS={tmp}/a/secrets.bin",
+             f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin", f"TLS_SECRETS={tmp}/a/tls-secrets.bin",
+             f"SRK_PUBLIC={srk_a}", f"OUT={tmp}/a/pkg-fi-{variant}", env=env)
+    for pkg in ("a/pkg", "b/pkg", "a/pkg-foreign", "a/pkg-tls-mismatch", "c/pkg",
+                *(f"a/pkg-fi-{v}" for v in FAULT_INJECT_VARIANTS)):
         if sorted(os.listdir(os.path.join(tmp, pkg))) != sorted(PACKAGE_OUTPUTS):
             raise Fail(f"{pkg} holds {sorted(os.listdir(os.path.join(tmp, pkg)))}, want {sorted(PACKAGE_OUTPUTS)}")
         check_oracle_not_in_image(os.path.join(tmp, pkg, "published.img"))
@@ -6712,7 +6977,9 @@ def packages(tmp: str) -> dict:
             "mismatched": Package(os.path.join(tmp, "b/pkg"), os.path.join(tmp, "tpm-a")),
             "binding": Package(os.path.join(tmp, "c/pkg"), os.path.join(tmp, "tpm-c")),
             "foreign": Package(os.path.join(tmp, "a/pkg-foreign"), os.path.join(tmp, "tpm-foreign")),
-            "tls_mismatch": Package(os.path.join(tmp, "a/pkg-tls-mismatch"), os.path.join(tmp, "tpm-a"))}
+            "tls_mismatch": Package(os.path.join(tmp, "a/pkg-tls-mismatch"), os.path.join(tmp, "tpm-a")),
+            **{f"fi_{v}": Package(os.path.join(tmp, f"a/pkg-fi-{v}"), os.path.join(tmp, "tpm-a"))
+               for v in FAULT_INJECT_VARIANTS}}
 
 
 def check_harness_matches_config(deploy: str):
@@ -6752,6 +7019,7 @@ def in_netns(tmp: str) -> int:
     pkgs = packages(tmp)
     good, mismatched, binding, foreign = pkgs["good"], pkgs["mismatched"], pkgs["binding"], pkgs["foreign"]
     tls_mismatch = pkgs["tls_mismatch"]
+    fi_net, fi_timer = pkgs["fi_net"], pkgs["fi_timer"]
     deploy = os.path.join(tmp, "a")
     subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
     try:
@@ -6788,7 +7056,8 @@ def in_netns(tmp: str) -> int:
                                          passed)),
              ("https residue", lambda: test_https_residue(good, deploy, passed)),
              ("https flood", lambda: test_https_flood(good, deploy, passed)),
-             ("tls key failure", lambda: test_tls_key_failure(tls_mismatch, deploy, passed))]
+             ("tls key failure", lambda: test_tls_key_failure(tls_mismatch, deploy, passed)),
+             ("supervisor", lambda: test_supervisor(fi_net, fi_timer, passed))]
     # check-selftest's red-proofs need only the boot their injection breaks:
     # KOZANE_IT_BOOTS names those (comma-separated). A filtered run never
     # prints INTEGRATION-CASES, so it can never pass `make check`'s manifest.

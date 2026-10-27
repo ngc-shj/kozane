@@ -11,7 +11,8 @@ cpu = { path = "../../cpu" }
 ingress-core = { path = "../../ingress-core" }
 layout = { path = "../../layout" }
 msgs = { path = "../../msgs" }
-pdkit = { path = "../../pdkit" }
+boot-stage = { path = "../../boot-stage" }
+pdkit = { path = "../../pdkit", features = ["boot-stop"] }
 rng-client = { path = "../../rng-client" }
 ring = { path = "../../ring" }
 rosenpass-core = { path = "../../rosenpass-core" }
@@ -19,3 +20,7 @@ rosenpass-wire = { path = "../../rosenpass-wire" }
 sel4-microkit.workspace = true
 wg-core = { path = "../../wg-core" }
 wire = { path = "../../wire" }
+
+[features]
+# M7 plan C8: a selftest variant only (see pd-audit's).
+fault-inject = []

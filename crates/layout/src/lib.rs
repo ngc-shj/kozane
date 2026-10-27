@@ -34,7 +34,7 @@ pub const ETH_IN_IRQ: usize = 71;
 
 /// `data`'s stack_size: its handler state, returned by value from init,
 /// lives there (crates/pds/data asserts it fits).
-pub const DATA_STACK_SIZE: usize = 0x20_000;
+pub const DATA_STACK_SIZE: usize = 0x40_000;
 /// `tls`'s stack_size, which its stack probe paints.
 pub const TLS_STACK_SIZE: usize = 0x30_000;
 
@@ -66,6 +66,7 @@ pub mod ingress {
 }
 
 pub mod audit {
+    pub const CH_SUPERVISOR: usize = 9;
     pub const CH_INGRESS: usize = 1;
     pub const CH_ETH_OUT: usize = 2;
     pub const CH_ETH_IN: usize = 3;
@@ -153,6 +154,13 @@ pub mod pqkey {
     pub const CH_PQ: usize = 1;
     pub const CH_TPM: usize = 3;
     pub const CH_RNG: usize = 4;
+}
+
+/// M7: the supervisor (plan C8), parent of every other PD; its one channel
+/// notifies `audit` of a fault record. Child ids are
+/// `supervisor_core::CHILDREN`'s indices.
+pub mod supervisor {
+    pub const CH_AUDIT: usize = 1;
 }
 
 /// M7: the entropy driver (plan C6), callee of the PDs that draw

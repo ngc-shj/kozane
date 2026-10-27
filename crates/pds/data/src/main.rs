@@ -30,9 +30,11 @@ impl AllowedIps for Config {
     }
 }
 
-// The handler state lives on the stack (returned by value from `init`);
-// half the stack stays free for per-call buffers and the crypto.
-const _: () = assert!(core::mem::size_of::<DataPd>() <= layout::DATA_STACK_SIZE / 2, "data state needs a bigger stack");
+// The handler state lives on the stack, returned by value from `start`
+// through `boot_stage::run_init` and Microkit's entry (M7 plan C9): about
+// three copies are live at once during init (measured: `start`'s frame
+// 114 KiB, `run_main`'s 61 KiB), so a quarter of the stack bounds it.
+const _: () = assert!(core::mem::size_of::<DataPd>() <= layout::DATA_STACK_SIZE / 4, "data state needs a bigger stack");
 
 struct DataPd {
     from_hs: Rx,
@@ -55,8 +57,14 @@ mod halt {
     pub const NO_CLOCK: u32 = 1;
 }
 
+// The closure names this init in run_init's symbol (ct-shape's stage check).
+#[allow(clippy::redundant_closure)]
 #[protection_domain]
-fn init() -> DataPd {
+fn init() -> pdkit::Stage<DataPd> {
+    boot_stage::run_init(|init| start(init))
+}
+
+fn start(init: &boot_stage::Init) -> pdkit::Stage<DataPd> {
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout`; receive data regions are read-only here.
     let (from_hs, from_ingress, to_ingress, from_inner, to_inner, mut audit) = unsafe {
@@ -90,10 +98,10 @@ fn init() -> DataPd {
         )
     };
     if cpu::checked_frequency(cpu::cntfrq()).is_none() {
-        audit.halt(halt::NO_CLOCK);
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::NO_CLOCK));
     }
     audit.ready();
-    DataPd {
+    pdkit::Stage::Run(DataPd {
         from_hs,
         from_ingress,
         to_ingress,
@@ -105,7 +113,7 @@ fn init() -> DataPd {
         out: [0; layout::NET_BUF_SIZE],
         msg: [0; layout::NET_BUF_SIZE],
         scratch: [0; layout::NET_BUF_SIZE],
-    }
+    })
 }
 
 fn send_to_ingress(tx: &mut Tx, scratch: &mut Buf, audit: &mut Audit, m: ToIngress<'_>) -> bool {

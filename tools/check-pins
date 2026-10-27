@@ -120,6 +120,15 @@ Rules:
      the RNDR core the platform left (the CPU is cortex-a72, which faults
      on RNDR). A best-effort tripwire over source text: the CPU faulting is
      the enforcement
+  P26 the boot stop (M7 plan C9): `boot-stop` appears in no Cargo.toml but
+     boot-stage's and pdkit's (which define it) and the leaf PDs' (crates/
+     pds/{hs,pq,ingress,tls,data,inner,eth-in,eth-out}, the PDs no PD
+     calls): a callee that went dormant would block its callers for good;
+     every crates/pds/*/src/main.rs has one `#[protection_domain]` whose
+     `init` body is `boot_stage::run_init(...)`, so every PD's init
+     consumes the one-shot; and nothing under crates/ names `abort_trap`
+     (rust-sel4's weak abort trap stays, so every other stop faults). The
+     ELF half is tools/ct-shape's stage check
 
 Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
 fail until they are removed from PENDING; --enforce-pending makes them fail
@@ -180,7 +189,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P18",
-         "P19", "P20", "P21", "P22", "P23", "P24", "P25"]
+         "P19", "P20", "P21", "P22", "P23", "P24", "P25", "P26"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
                "crates/tls-core", "crates/tlskey-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data",
@@ -1023,6 +1032,37 @@ def check_no_rndr(root: pathlib.Path, out: list):
                     out.append(f"P25 {rel}:{n}: neoverse-n2 (an RNDR core); the platform CPU is cortex-a72 (M7 plan D3)")
 
 
+# P26: the boot stop's feature and the one-shot init entry.
+LEAF_PDS = ("hs", "pq", "ingress", "tls", "data", "inner", "eth-in", "eth-out")
+BOOT_STOP_DEFINERS = ("crates/boot-stage/Cargo.toml", "crates/pdkit/Cargo.toml")
+PD_INIT = re.compile(r"#\[protection_domain[^\]]*\]\s*fn init\(\)[^{]*\{\s*(?://[^\n]*\s*)*([^\n]*)")
+
+
+def check_boot_stage(root: pathlib.Path, out: list):
+    allowed = set(BOOT_STOP_DEFINERS) | {f"crates/pds/{pd}/Cargo.toml" for pd in LEAF_PDS}
+    for p in sorted(root.glob("**/Cargo.toml")):
+        rel = str(p.relative_to(root))
+        if any(part in ("target", "build", "third_party") for part in p.relative_to(root).parts) or rel in allowed:
+            continue
+        for n, line in enumerate(p.read_text().splitlines(), 1):
+            if "boot-stop" in line.split("#", 1)[0]:
+                out.append(f"P26 {rel}:{n}: boot-stop outside a leaf PD; a dormant callee blocks its callers "
+                           "(M7 plan D4)")
+    for main in sorted((root / "crates/pds").glob("*/src/main.rs")):
+        rel = main.relative_to(root)
+        text = main.read_text()
+        inits = PD_INIT.findall(text)
+        if len(inits) != 1 or text.count("#[protection_domain") != 1:
+            out.append(f"P26 {rel}: {text.count('#[protection_domain')} #[protection_domain] init(s); "
+                       "want exactly one")
+        elif not inits[0].strip().startswith("boot_stage::run_init("):
+            out.append(f"P26 {rel}: init does not enter through boot_stage::run_init (M7 plan C9)")
+    for rel, text in crate_sources(root, "crates"):
+        for n, line in enumerate(text.splitlines(), 1):
+            if "abort_trap" in line:
+                out.append(f"P26 {rel}:{n}: abort_trap; rust-sel4's weak trap stays, so every stop faults (C9)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
@@ -1057,6 +1097,7 @@ def main() -> int:
     check_old_name(root, out)
     check_firmware(root, out)
     check_no_rndr(root, out)
+    check_boot_stage(root, out)
     failing = [l for l in out if l.split()[0] not in pending]
     for line in out:
         print(line if line in failing else f"pending {line}")

@@ -309,6 +309,10 @@ impl Tpm {
 
 #[protection_domain]
 fn init() -> Tpm {
+    boot_stage::run_init(|_| start())
+}
+
+fn start() -> Tpm {
     let vaddr = *var!(tpm_mmio_vaddr: usize = 0);
     let base = NonNull::new(vaddr as *mut u8).unwrap_or_else(|| panic!("tpm: no mmio mapping"));
     Tpm { tis: Tis { base }, gate: Gate::new(), cmd: [0; MSG_BYTES], rsp: [0; MSG_BYTES] }

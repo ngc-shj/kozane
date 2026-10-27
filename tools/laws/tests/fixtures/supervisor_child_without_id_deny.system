@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <memory_region name="record" size="0x1000" />
+    <memory_region name="secrets" size="0x1000" />
+    <protection_domain name="supervisor" priority="1" budget="100" period="10_000" smc="true">
+        <program_image path="supervisor.elf" />
+        <map mr="record" vaddr="0x2000000" perms="rw" />
+        <protection_domain name="audit" id="1" priority="5" budget="1_000" period="10_000">
+            <program_image path="audit.elf" />
+            <map mr="record" vaddr="0x2000000" perms="r" />
+        </protection_domain>
+        <protection_domain name="hs" priority="2" budget="1_000" period="10_000">
+            <program_image path="hs.elf" />
+        </protection_domain>
+        <protection_domain name="key" id="3" priority="3" passive="true">
+            <program_image path="key.elf" />
+            <map mr="secrets" vaddr="0x2000000" perms="r" />
+        </protection_domain>
+    </protection_domain>
+    <channel>
+        <end pd="supervisor" id="1" />
+        <end pd="audit" id="1" notify="false" />
+    </channel>
+    <channel>
+        <end pd="hs" id="2" pp="true" notify="false" />
+        <end pd="key" id="1" pp="false" />
+    </channel>
+</system>

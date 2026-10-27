@@ -130,6 +130,10 @@ static ENTROPY: rng_client::Global = rng_client::Global::new();
 
 #[protection_domain]
 fn init() -> Key {
+    boot_stage::run_init(|_| start())
+}
+
+fn start() -> Key {
     ENTROPY.set(rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG)).ok());
     match boot() {
         Ok(oracle) => Key::Ready { oracle, bucket: Bucket::new(KEY_BURST, KEY_INTERVAL_NS) },

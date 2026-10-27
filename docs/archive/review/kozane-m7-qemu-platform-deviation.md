@@ -258,3 +258,118 @@ results and Re-plan R1 are in the plan itself.
 - **What:** on cortex-a72 with the rng PD, the wireguard boot passes all
   14 cases, the MCE handshake cost case among them. The full run's timing
   is recorded below once it completes.
+
+## Slice 5 (C8, C9, C10's supervisor parts, C11's harness)
+
+### C8: the supervisor
+
+- **What:** priority 40, below `audit` (50), as P3 allows: `audit`
+  preempts it on the notify and prints the record before the reset. The
+  timer-ordering wait is not built.
+- **What:** the record page write is the crate's one `unsafe`, so it sits
+  in the reset module beside the SMC (`reset::write_record`). The plan
+  allows `unsafe` only there, and a second module for one volatile write
+  would need its own allowlist entry.
+- **What:** the allowlist check is a workspace tool,
+  `tools/supervisor-allowlist`, built on `syn` (already locked), run by
+  `make pins`. Its rules are S1-S8. The deny fixtures are its unit tests,
+  one per plan item; the allow case is the real crate. A listed item's
+  associated items (`seL4_ARM_SMCContext::default`) are listed with it.
+  Any 32-bit literal with bit 31 set counts as an SMCCC ID, so a second
+  ID cannot hide as a plain constant.
+- **What:** under the release kernel (hypervisor support on, no
+  HARDWARE_DEBUG_API), a panic's abort trap reaches the supervisor as
+  label 8, not the debug configuration's 4 (P5). A stack overflow reaches
+  it as label 6 (VMFault). The supervisor resets on any label, so this
+  changes nothing it does.
+- **What:** `fault-inject` triggers:
+  - `ingress`: frame A and frame B, each a UDP payload on the WireGuard
+    port that is no WireGuard message (A panics, B halts with
+    `FAULT_INJECT`, 8).
+  - `audit`: faults right after it prints ingress's first
+    `WgBadMessage`, a run-time trigger instead of the planned boot-time
+    flag. `audit` has an inbound path (ingress's records); a flag would
+    need a new MR in the variant's system file and laws.
+  - `timer`: has no inbound path at all, so it faults on its 30th tick
+    (`FAULT_TICK`), in its own variant image.
+- **What:** the variants are packaged by `make package-fault-inject-{net,timer}`.
+  The PDs are built with the feature into `$(BUILD)/fault-inject-<v>`;
+  the kernel, the C9 harness (`ct_dir`) and the firmware are the main
+  build's. Each feature PD carries a `#[used]` marker,
+  `KOZANE-FAULT-INJECT-VARIANT`. `tools/release.py` refuses an image that
+  holds it, in both `make` and `verify` (`measure.check_not_fault_inject`).
+  The selftest injection that builds a release with the feature is
+  slice 6.
+
+### C9: boot stops
+
+- **What:** `run_init` closes the one shot on entry, not on return. So a
+  `run_init` nested inside init panics too. Kani proves three facts:
+  - the first call runs init once;
+  - a second call panics, after a first call or after `close`;
+  - a nested call panics.
+- **What:** every PD enters through `boot_stage::run_init`. The leaf PDs
+  that refuse at boot (hs, pq, ingress, tls, data) return
+  `pdkit::Stage`; the others call `run_init(|_| start())`.
+  - `tls`'s `boot_seed` returns the halt reason, and the caller turns it
+    into the boot stop.
+  - `inner`, `eth_in` and `eth_out` may enable `boot-stop` but have no
+    init refusal to move.
+- **What:** each leaf `start` returns `pdkit::Stage<H>` directly, not the
+  planned `Result<H, Dormant>`. A refusal is `return
+  Stage::Dormant(audit.boot_stop(init, reason))`.
+  - The first integration run reset at boot, with `supervisor: fault
+    pd=ingress label=6` (VMFault), then `pd=data`: their stacks
+    overflowed. The handler, returned by value through `run_init` and
+    Microkit's entry, has one more live copy during init. `DataPd` is
+    about 57 KiB, and the Result-to-Stage match added another.
+  - Even without that match, `data`'s init path measures 174 KiB of
+    frames (`start` 114 KiB, `run_main` 61 KiB), so `data` goes from 128
+    to 256 KiB (`DATA_STACK_SIZE`; the size assert is now a quarter).
+  - `ingress` measures 45 KiB of frames on its init path, against 64 KiB;
+    it goes to 128 KiB.
+  - Every other PD's init path is at most 7 KiB (tls: 65 KiB of 192 KiB).
+- **What:** the C9 link check is a `stage` check in `tools/ct-shape`,
+  which already reads every PD ELF's symbols in `make ct-shape` and
+  `tools/package`. It requires
+  `boot_stage::run_init::<_, <crate>::init::{closure#0}>`, which binds the
+  wrapper to the PD's own init, and `<boot_stage::Init>::boot_stop` only in
+  `LEAF_ELFS`. It has six fixtures (CT-SHAPE-FIXTURES 65 → 71).
+- **What:** the source half is check-pins P26:
+  - `boot-stop` appears in no Cargo.toml but the definers (boot-stage,
+    pdkit) and the leaf PDs;
+  - every PD's single `#[protection_domain]` init body starts with
+    `boot_stage::run_init(`;
+  - nothing under crates/ names `abort_trap`.
+
+### C10: laws (supervisor)
+
+- **What:** eleven fixtures:
+  - the allow case;
+  - smc on a child;
+  - a PD outside the supervisor;
+  - a policy PD missing;
+  - two supervisors;
+  - a supervisor channel to a tainted PD;
+  - a supervisor PPC;
+  - a record page `audit` can write;
+  - a supervisor owning a device (a policy refusal);
+  - a child without an id (a parse refusal);
+  - L2 under nesting.
+
+### C11: the harness (part)
+
+- **What:** every boot starts with `-S` and `-no-reboot`, and has a QMP
+  socket in a fresh 0700 directory. The harness negotiates QMP, then sends
+  `cont`, so no event can precede its reader.
+  - A case declares the SHUTDOWN reason it expects: `boot(shutdown=...)`,
+    or `child.shutdown` once known, as in measure_boot's refusal branch.
+  - `kill()` fails a case, on its success path only, that saw another
+    reason or a QEMU exit without a SHUTDOWN.
+  - The opt-outs pass `resets=(reason, ...)`: no `-no-reboot`, and
+    exactly those RESET reasons. They are S11's monitor `system_reset`
+    (`host-qmp-system-reset`) and the supervisor's reboot case
+    (`guest-reset`).
+  - U-Boot's REFUSE and TF-A's refusals declare `guest-shutdown`.
+- **What:** boot-stop cases (no rng, tls key failure, mismatched blob)
+  now also assert that no supervisor record was printed.

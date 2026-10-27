@@ -11,7 +11,8 @@ cpu = { path = "../../cpu" }
 hs-core = { path = "../../hs-core" }
 key-core = { path = "../../key-core" }
 layout = { path = "../../layout" }
-pdkit = { path = "../../pdkit" }
+boot-stage = { path = "../../boot-stage" }
+pdkit = { path = "../../pdkit", features = ["boot-stop"] }
 rng-client = { path = "../../rng-client" }
 sel4-microkit = { workspace = true }
 wg-core = { path = "../../wg-core" }

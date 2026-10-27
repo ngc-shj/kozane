@@ -1,0 +1,22 @@
+[package]
+name = "boot-stage"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+[features]
+# Only the leaf PDs, the ones no PD calls, may enable it: a callee
+# that went dormant would block its callers for good (D4; check-pins P26).
+boot-stop = []
+
+[[test]]
+name = "after_close"
+path = "tests/after_close.rs"
+
+[[test]]
+name = "boot_stop"
+path = "tests/boot_stop.rs"
+required-features = ["boot-stop"]

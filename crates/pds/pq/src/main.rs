@@ -198,8 +198,17 @@ mod halt {
     pub const RNG_UNAVAILABLE: u32 = 7;
 }
 
+// The closure names this init in run_init's symbol (ct-shape's stage check).
+#[allow(clippy::redundant_closure)]
 #[protection_domain]
-fn init() -> Pq {
+fn init() -> pdkit::Stage<Pq> {
+    boot_stage::run_init(|init| start(init))
+}
+
+/// Init proper. Every refusal here is a boot stop (M7 plan C9): recorded,
+/// then dormant, so the supervisor does not reset for what the next boot
+/// would repeat.
+fn start(init: &boot_stage::Init) -> pdkit::Stage<Pq> {
     // SAFETY: first thing in init, with STACK_SIZE this PD's stack_size.
     let stack = unsafe { cpu::StackProbe::paint(STACK_SIZE) };
     // SAFETY: each link's regions are mapped into this PD and its one peer
@@ -224,15 +233,19 @@ fn init() -> Pq {
             Audit::new(memory_region_symbol!(audit_pq: *mut u8), Channel::new(ch::CH_AUDIT)),
         )
     };
-    let freq = cpu::checked_frequency(cpu::cntfrq()).unwrap_or_else(|| audit.halt(halt::NO_CLOCK));
-    let hw = Cpu(rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG))
-        .unwrap_or_else(|_| audit.halt(halt::RNG_UNAVAILABLE)));
+    let Some(freq) = cpu::checked_frequency(cpu::cntfrq()) else {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::NO_CLOCK));
+    };
+    let Ok(entropy) = rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG)) else {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::RNG_UNAVAILABLE));
+    };
+    let hw = Cpu(entropy);
     // The embedded keys must be the configured ones (M3 plan S8).
     if secret_blob::blake2s(&[SPKM]) != config::GATEWAY_RP_HASH {
-        audit.halt(halt::GATEWAY_RP_HASH);
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::GATEWAY_RP_HASH));
     }
     if SPKTS.iter().zip(config::PEERS).any(|(spkt, peer)| secret_blob::blake2s(&[*spkt]) != peer.rp_hash) {
-        audit.halt(halt::PEER_RP_HASH);
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::PEER_RP_HASH));
     }
     // Once per boot, the first call to `pqkey`: an Unavailable `pqkey` shows
     // here first and is audited once, as pq then halts. No PSK ever reaches
@@ -247,7 +260,7 @@ fn init() -> Pq {
                 audit.record(Event::TpmCapFailed);
             }
         }
-        audit.halt(halt::NO_BOOT_SEED);
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::NO_BOOT_SEED));
     }
     // pqkey's stack mark after its boot KAT (C8), audited here for it. A
     // refusal leaves it unreported, which the integration check fails on.
@@ -259,15 +272,15 @@ fn init() -> Pq {
     let mut rng = Hedged::new(seed, hw);
     let mut responder = match Responder::new(SPKM, SPKTS, &mut rng) {
         Ok(r) => r,
-        Err(Error::Rng) => audit.halt(halt::RNG),
-        Err(_) => audit.halt(halt::INIT_FAILED),
+        Err(Error::Rng) => return pdkit::Stage::Dormant(audit.boot_stop(init, halt::RNG)),
+        Err(_) => return pdkit::Stage::Dormant(audit.boot_stop(init, halt::INIT_FAILED)),
     };
     // The first biscuit key; a failure is retried on every timer tick.
     if let Err(e) = responder.tick(cpu::now_ns(), &mut rng) {
         audit.record(reject_event(e));
     }
     audit.ready();
-    Pq {
+    pdkit::Stage::Run(Pq {
         from_ingress,
         to_ingress,
         to_hs,
@@ -281,7 +294,7 @@ fn init() -> Pq {
         scratch: [0; layout::NET_BUF_SIZE],
         stuck: false,
         stack,
-    }
+    })
 }
 
 #[derive(Default)]

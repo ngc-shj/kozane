@@ -225,8 +225,8 @@ CASES = [
      lambda t: append(t / "crates/pqkey-core/src/lib.rs",
                       SECRET + "#[derive(PartialEq, Debug)]\n#[repr(C)]\npub struct Reply {\n    shk: Secret<32>,\n}\n")),
     ("P9 cfg_attr derive(Copy) in pds/pq", {"P9"},
-     lambda t: write(t / "crates/pds/pq/src/main.rs",
-                     SECRET + "#[cfg_attr(test, derive(Copy))]\nenum Slot {\n    Live(Secret<32>),\n    Empty,\n}\n")),
+     lambda t: append(t / "crates/pds/pq/src/main.rs",
+                      SECRET + "#[cfg_attr(test, derive(Copy))]\nenum Slot {\n    Live(Secret<32>),\n    Empty,\n}\n")),
     ("P9 derive(Clone) on a Zeroizing wrapper in pqkey-core", {"P9"},
      lambda t: append(t / "crates/pqkey-core/src/lib.rs",
                       "\n#[derive(Clone)]\npub struct Seed(zeroize::Zeroizing<[u8; 32]>);\n")),
@@ -811,6 +811,21 @@ CASES = [
      lambda t: append(t / "tests/integration/run.py", 'CPU = "neoverse-n2"\n')),
     ("allow the RNDR core named in docs", set(),
      lambda t: write(t / "docs/note.md", "M6 ran on neoverse-n2.\n")),
+    # P26 (M7 plan C9): boot-stop in leaves only, init through run_init.
+    ("P26 a PPC callee enabling boot-stop", {"P26"},
+     lambda t: edit(t / "crates/pds/key/Cargo.toml", 'boot-stage = { path = "../../boot-stage" }',
+                    'boot-stage = { path = "../../boot-stage", features = ["boot-stop"] }')),
+    ("P26 a non-PD crate enabling pdkit's boot-stop", {"P26"},
+     lambda t: append(t / "crates/netdrv/Cargo.toml", '\n[features]\nstop = ["pdkit/boot-stop"]\n')),
+    ("allow a leaf PD enabling boot-stop", set(),
+     lambda t: edit(t / "crates/pds/inner/Cargo.toml", 'boot-stage = { path = "../../boot-stage" }',
+                    'boot-stage = { path = "../../boot-stage", features = ["boot-stop"] }')),
+    ("P26 a PD whose init skips run_init", {"P26"},
+     lambda t: edit(t / "crates/pds/key/src/main.rs", "    boot_stage::run_init(|_| start())\n", "    start()\n")),
+    ("P26 a PD with a second protection_domain entry", {"P26"},
+     lambda t: append(t / "crates/pds/timer/src/main.rs", "#[protection_domain]\nfn other() {}\n")),
+    ("P26 the abort trap overridden", {"P26"},
+     lambda t: append(t / "crates/pdkit/src/lib.rs", "#[unsafe(no_mangle)]\nfn sel4_runtime_abort_trap() {}\n")),
 ]
 
 

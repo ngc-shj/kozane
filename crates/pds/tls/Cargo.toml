@@ -14,7 +14,8 @@ http-wire = { path = "../../http-wire" }
 # pd-hs uses key-core.
 tlskey-core = { path = "../../tlskey-core" }
 layout = { path = "../../layout" }
-pdkit = { path = "../../pdkit" }
+boot-stage = { path = "../../boot-stage" }
+pdkit = { path = "../../pdkit", features = ["boot-stop"] }
 rng-client = { path = "../../rng-client" }
 ring = { path = "../../ring" }
 sel4-microkit.workspace = true

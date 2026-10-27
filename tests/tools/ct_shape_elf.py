@@ -47,7 +47,14 @@ def syms(h: str) -> dict:
         "mul": f"_RNvNt{mce}3vec3mul",
         "shim": f"_RINv{mce}6encapsNtCs{h}4_6caller3RngE",
         "debug_put_char": f"_RNvNtNtCs{h}5_8sel4_sys8syscalls5calls17seL4_DebugPutChar",
+        "boot_stop": f"_RNvMCs{h}9_10boot_stageNtB2_4Init9boot_stop",
     }
+
+
+def run_init(crate: str, h: str) -> str:
+    """`boot_stage::run_init::<crate::PqK, crate::init::{closure#0}>`."""
+    c = f"Cs{h}2_{len(crate)}{crate}"
+    return f"_RINvCs{h}9_10boot_stage8run_initNt{c}3PqKNCNv{c}4init0E"
 
 
 def entry(crate: str, h: str) -> str:
@@ -78,7 +85,8 @@ BM = [
 def program(h: str, crate: str, filler: int = 0, bm=None, extra=(), vstd: bool = False, mul: bool = False,
             only_root=None, entry_body=("ret",), debug_put_char: bool = False, mce: bool = True,
             open_root: bool = True, tls: bool = False, encapsulate=None, exchange_extra=(), anon_numbers=(1, 2),
-            anon_file: str = "src/hybrid.rs", anon_line: int = 12, cmp_call: str = "memcmp") -> str:
+            anon_file: str = "src/hybrid.rs", anon_line: int = 12, cmp_call: str = "memcmp",
+            run_init_crate=None, boot_stop: bool = False) -> str:
     """`only_root`: keep one of the two roots ("decaps" or "attempt"), as
     each PD links only its own; `mce` False drops McEliece altogether (as
     `key` links none) and `open_root` False the envelope open (as `pq`
@@ -87,7 +95,8 @@ def program(h: str, crate: str, filler: int = 0, bm=None, extra=(), vstd: bool =
     `exchange_extra` appended to the exchange root's; `anon_numbers` are
     the anonymous file name's and Location's numbers (rustc's per codegen
     unit counter), `anon_file` and `anon_line` their content, `cmp_call`
-    the comparison libcall."""
+    the comparison libcall. `run_init_crate` adds the one-shot init wrapper
+    over that crate's init (None: none), `boot_stop` the boot-stop symbol."""
     s = syms(h)
     funcs = [
         ("decaps", ["stp x29, x30, [sp, #-16]!", "bl {bm}", "ldp x29, x30, [sp], #16", "b {scrub}"]),
@@ -123,6 +132,10 @@ def program(h: str, crate: str, filler: int = 0, bm=None, extra=(), vstd: bool =
         named.append((s["vstd"], ["ret"]))
     if debug_put_char:
         named.append((s["debug_put_char"], ["ret"]))
+    if run_init_crate:
+        named.append((run_init(run_init_crate, h), ["ret"]))
+    if boot_stop:
+        named.append((s["boot_stop"], ["ret"]))
     for sym, body in named:
         out += [f".globl {sym}", f".type {sym}, %function", f"{sym}:"]
         out += [line.format(**names) for line in body]
@@ -151,7 +164,7 @@ def build(d: pathlib.Path, name: str, source: str, base: int) -> pathlib.Path:
 def tree(d: pathlib.Path, pd_bm=None, pd_extra=(), harness_bm=None, harness_extra=(), vstd: bool = False,
          harness_mul: bool = False, pd_mul: bool = False, pd_entry=("ret",), debug_put_char=None,
          harness_encapsulate=None, tls_exchange_extra=(), harness_anon_file="src/hybrid.rs", harness_anon_line=12,
-         harness_cmp="bcmp"):
+         harness_cmp="bcmp", boot_stop=None, run_init_crates=None):
     """A search path with pd-pq.elf and pd-pqkey.elf, each with its own
     McEliece root only, pqkey, pd-key.elf and pd-tlskey.elf with the envelope
     open (key and tlskey without McEliece), pd-tls.elf with the TLS roots
@@ -159,20 +172,29 @@ def tree(d: pathlib.Path, pd_bm=None, pd_extra=(), harness_bm=None, harness_extr
     (with every root) built at other addresses with other crate hashes,
     other anonymous-constant numbers and bcmp for memcmp.
     `debug_put_char` names the PD ELF that also gets the DebugPutChar
-    wrapper. Returns (search path, harness)."""
+    wrapper, `boot_stop` the one that also gets the boot-stop symbol;
+    `run_init_crates` maps a PD ELF to the crate its init wrapper names
+    (default: its own; None: no wrapper). Returns (search path, harness)."""
+    own = {"pd-pq.elf": "pd_pq", "pd-pqkey.elf": "pd_pqkey", "pd-key.elf": "pd_key", "pd-tlskey.elf": "pd_tlskey",
+           "pd-tls.elf": "pd_tls"}
+    wrap = {**own, **(run_init_crates or {})}
     search = d / "search"
     search.mkdir()
     for label, crate, root in (("pd-pq.elf", "pd_pq", "attempt"), ("pd-pqkey.elf", "pd_pqkey", "decaps")):
         build(search, label, program("a1", crate, bm=pd_bm, extra=pd_extra, vstd=vstd, mul=pd_mul, only_root=root,
                                      entry_body=pd_entry, debug_put_char=label == debug_put_char,
-                                     open_root=root == "decaps"), 0x200000)
+                                     open_root=root == "decaps", run_init_crate=wrap[label],
+                                     boot_stop=label == boot_stop), 0x200000)
     # The McEliece knobs (bm, extra, mul, entry) are pqkey's and pq's.
     build(search, "pd-key.elf", program("a1", "pd_key", vstd=vstd, debug_put_char=debug_put_char == "pd-key.elf",
-                                        mce=False), 0x200000)
+                                        mce=False, run_init_crate=wrap["pd-key.elf"],
+                                        boot_stop=boot_stop == "pd-key.elf"), 0x200000)
     build(search, "pd-tlskey.elf", program("a1", "pd_tlskey", vstd=vstd,
-                                           debug_put_char=debug_put_char == "pd-tlskey.elf", mce=False), 0x200000)
+                                           debug_put_char=debug_put_char == "pd-tlskey.elf", mce=False,
+                                           run_init_crate=wrap["pd-tlskey.elf"]), 0x200000)
     build(search, "pd-tls.elf", program("a1", "pd_tls", mce=False, open_root=False, tls=True,
-                                        exchange_extra=tls_exchange_extra), 0x200000)
+                                        exchange_extra=tls_exchange_extra, run_init_crate=wrap["pd-tls.elf"]),
+          0x200000)
     harness = build(d, "ct-harness", program("b7", "ct_harness", filler=37, bm=harness_bm, extra=harness_extra,
                                                      mul=harness_mul, tls=True, encapsulate=harness_encapsulate,
                                                      anon_numbers=(7, 9), anon_file=harness_anon_file,

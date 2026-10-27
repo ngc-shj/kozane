@@ -137,6 +137,10 @@ static ENTROPY: rng_client::Global = rng_client::Global::new();
 
 #[protection_domain]
 fn init() -> TlsKey {
+    boot_stage::run_init(|_| start())
+}
+
+fn start() -> TlsKey {
     ENTROPY.set(rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG)).ok());
     let booted = boot();
     // The scalar check's P-256 frames held the scalar, accepted or refused

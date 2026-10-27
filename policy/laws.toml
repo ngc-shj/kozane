@@ -204,6 +204,9 @@ role = "tpm"
 [pds.rng]
 role = "rng"
 
+[pds.supervisor]
+role = "supervisor"
+
 [pds.tls]
 role = "untrusted_input"
 
@@ -249,6 +252,10 @@ owner = "tpm"
 phys_addr = 0xc000000
 size = 0x1000
 tpm = true
+
+[mrs.supervisor_record]
+kind = "plain"
+shares = { supervisor = "rw", audit = "r" }
 
 [mrs.rng_mmio]
 kind = "device"
@@ -701,6 +708,11 @@ notify = { tlskey = false, tpm = false }
 between = ["tls", "audit"]
 pp = { tls = false, audit = false }
 notify = { tls = true, audit = true }
+
+# M7 plan C8: the supervisor's one channel, out to audit.
+[[channels]]
+between = ["supervisor", "audit"]
+notify = { audit = false }
 
 # M7 plan C6: the PDs that draw randomness, and their seed oracle.
 [[channels]]

@@ -30,6 +30,12 @@ const UARTDR: usize = 0x000;
 const UARTFR: usize = 0x018;
 const FR_TXFF: u32 = 1 << 5;
 
+/// Marks an image built with `fault-inject` (M7 plan C8): tools/release.py
+/// refuses one that holds it.
+#[cfg(feature = "fault-inject")]
+#[used]
+static FAULT_INJECT_VARIANT: [u8; 27] = *b"KOZANE-FAULT-INJECT-VARIANT";
+
 /// The PL011's transmit side.
 struct Uart {
     base: NonNull<u32>,
@@ -78,6 +84,10 @@ struct Audit {
     sources: [Source; 8],
     unknown: UnknownCodes,
     uart: Uart,
+    /// The supervisor's record page (M7 plan C8), read-only here, and the
+    /// last record printed.
+    record: NonNull<[u64; supervisor_core::RECORD_WORDS]>,
+    last_seq: u64,
 }
 
 fn source(name: &'static str, channel: usize, region: NonNull<u8>) -> Source {
@@ -88,6 +98,10 @@ fn source(name: &'static str, channel: usize, region: NonNull<u8>) -> Source {
 
 #[protection_domain]
 fn init() -> Audit {
+    boot_stage::run_init(|_| start())
+}
+
+fn start() -> Audit {
     let vaddr = *var!(uart_mmio_vaddr: usize = 0);
     // Without a console nothing could be reported; stop (fail-closed).
     let base = NonNull::new(vaddr as *mut u32).unwrap_or_else(|| panic!("audit: no uart mapping"));
@@ -103,7 +117,8 @@ fn init() -> Audit {
         source("tls", ch::CH_TLS, memory_region_symbol!(audit_tls: *mut u8)),
     ];
     println!(uart, "audit: ready");
-    Audit { sources, unknown: UnknownCodes::new(), uart }
+    let record = memory_region_symbol!(supervisor_record: *mut [u64; supervisor_core::RECORD_WORDS]);
+    Audit { sources, unknown: UnknownCodes::new(), uart, record, last_seq: 0 }
 }
 
 fn drop_reason(r: u16) -> Option<DropReason> {
@@ -138,6 +153,12 @@ impl Audit {
             }
             Decoded::Fixed(ev) => {
                 println!(uart, "audit: src={} {} total={} lost={}", src, ev.name(), r.a, r.b);
+                // M7 plan C8's selftest variant: audit itself faults, once
+                // the line that triggers it is out.
+                #[cfg(feature = "fault-inject")]
+                if src == "ingress" && ev == audit_event::Event::WgBadMessage {
+                    panic!("fault-inject: audit");
+                }
                 true
             }
             Decoded::FrameDropped(reason) => match drop_reason(reason) {
@@ -192,6 +213,23 @@ impl Handler for Audit {
     type Error = Infallible;
 
     fn notified(&mut self, channels: ChannelSet) -> Result<(), Self::Error> {
+        if channels.contains(Channel::new(ch::CH_SUPERVISOR)) {
+            // SAFETY: the record page is mapped r into this PD and rw into
+            // the supervisor alone (laws), page-aligned, for the life of
+            // the system. Read once: the supervisor resets right after.
+            let r = supervisor_core::Record::decode(unsafe { self.record.as_ptr().read_volatile() });
+            if r.seq != 0 && r.seq != self.last_seq {
+                self.last_seq = r.seq;
+                match r.child_name() {
+                    Some(pd) => {
+                        println!(self.uart, "supervisor: fault pd={} label={} lost={}", pd, r.label, r.lost);
+                    }
+                    None => {
+                        println!(self.uart, "supervisor: fault child={} label={} lost={}", r.child, r.label, r.lost);
+                    }
+                }
+            }
+        }
         for i in 0..self.sources.len() {
             let Some(src) = self.sources.get(i) else { continue };
             if !channels.contains(src.channel) {

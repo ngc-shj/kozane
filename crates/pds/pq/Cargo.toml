@@ -10,7 +10,8 @@ config = { path = "../../config" }
 cpu = { path = "../../cpu" }
 layout = { path = "../../layout" }
 msgs = { path = "../../msgs" }
-pdkit = { path = "../../pdkit" }
+boot-stage = { path = "../../boot-stage" }
+pdkit = { path = "../../pdkit", features = ["boot-stop"] }
 rng-client = { path = "../../rng-client" }
 pqkey-core = { path = "../../pqkey-core" }
 ring = { path = "../../ring" }

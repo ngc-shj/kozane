@@ -135,6 +135,10 @@ static ENTROPY: rng_client::Global = rng_client::Global::new();
 
 #[protection_domain]
 fn init() -> PqKey {
+    boot_stage::run_init(|_| start())
+}
+
+fn start() -> PqKey {
     // SAFETY: first thing in init, with STACK_SIZE this PD's stack_size.
     let mut stack = unsafe { cpu::StackProbe::paint(STACK_SIZE) };
     ENTROPY.set(rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG)).ok());

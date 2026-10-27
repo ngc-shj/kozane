@@ -11,6 +11,7 @@ cpu = { path = "../../cpu" }
 data-core = { path = "../../data-core" }
 layout = { path = "../../layout" }
 msgs = { path = "../../msgs" }
-pdkit = { path = "../../pdkit" }
+boot-stage = { path = "../../boot-stage" }
+pdkit = { path = "../../pdkit", features = ["boot-stop"] }
 ring = { path = "../../ring" }
 sel4-microkit.workspace = true

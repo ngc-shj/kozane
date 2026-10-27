@@ -133,6 +133,10 @@ fn start() -> Option<Virtio> {
 
 #[protection_domain(heap_size = 64 * 1024)]
 fn init() -> Rng {
+    boot_stage::run_init(|_| boot())
+}
+
+fn boot() -> Rng {
     Rng { device: start(), server: Server::new() }
 }
 

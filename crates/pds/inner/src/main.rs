@@ -46,6 +46,10 @@ struct Inner {
 
 #[protection_domain]
 fn init() -> Inner {
+    boot_stage::run_init(|_| start())
+}
+
+fn start() -> Inner {
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout`; receive data regions are read-only here.
     let (from_driver, to_driver, to_data, from_data, from_tls, to_tls, mut audit) = unsafe {

@@ -11,7 +11,7 @@ use layout::{AUDIT_RING_SLOTS, NET_BUF_SIZE, NET_BUFFERS, NET_REGION_SIZE, NET_R
 use ring::Producer;
 use ring::link::{LinkError, Receiver, Sender, Taken};
 use ring::shmem::{Region, ShmRing};
-use sel4_microkit::Channel;
+use sel4_microkit::{Channel, ChannelSet, Handler, MessageInfo};
 
 pub type DescRing = ShmRing<ring::Desc, NET_RING_SLOTS>;
 pub type Rx = Receiver<DescRing, DescRing, NET_RING_SLOTS, NET_BUFFERS, NET_BUF_SIZE>;
@@ -118,11 +118,51 @@ impl Audit {
 
     /// Stops the PD for good (fail-closed): `Halted { reason }` is pushed and
     /// `audit` notified first, so the record is queued before the fault.
-    /// `reason` comes from the calling PD's own closed table.
+    /// `reason` comes from the calling PD's own closed table. A fault: the
+    /// supervisor resets the system (M7 plan D4).
     pub fn halt(&mut self, reason: u32) -> ! {
         self.record(Event::Halted { reason });
         self.flush();
         panic!("halted");
+    }
+
+    /// The boot stop (M7 plan C9, Re-plan R1): `Halted { reason }` is pushed
+    /// and `audit` notified, then the PD goes dormant instead of faulting,
+    /// so the supervisor does not reset for a refusal the next boot would
+    /// repeat. Init only (`init` is the one `run_init` lends).
+    #[cfg(feature = "boot-stop")]
+    pub fn boot_stop(&mut self, init: &boot_stage::Init, reason: u32) -> boot_stage::Dormant {
+        self.record(Event::Halted { reason });
+        self.flush();
+        init.boot_stop()
+    }
+}
+
+/// A PD's handler after init (M7 plan C9): its own, or dormant after a boot
+/// stop, ignoring every event. Leaf PDs have no callers, so nothing waits
+/// on a dormant one.
+pub enum Stage<H> {
+    Run(H),
+    Dormant(boot_stage::Dormant),
+}
+
+impl<H: Handler> Handler for Stage<H> {
+    type Error = H::Error;
+
+    fn notified(&mut self, channels: ChannelSet) -> Result<(), Self::Error> {
+        boot_stage::close();
+        match self {
+            Stage::Run(h) => h.notified(channels),
+            Stage::Dormant(_) => Ok(()),
+        }
+    }
+
+    fn protected(&mut self, channel: Channel, msg_info: MessageInfo) -> Result<MessageInfo, Self::Error> {
+        boot_stage::close();
+        match self {
+            Stage::Run(h) => h.protected(channel, msg_info),
+            Stage::Dormant(_) => Ok(MessageInfo::new(0, 0)),
+        }
     }
 }
 

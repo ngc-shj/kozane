@@ -154,6 +154,12 @@ struct Ingress {
     cookie: [u8; COOKIE_REPLY_LEN],
 }
 
+/// Marks an image built with `fault-inject` (M7 plan C8): tools/release.py
+/// refuses one that holds it.
+#[cfg(feature = "fault-inject")]
+#[used]
+static FAULT_INJECT_VARIANT: [u8; 27] = *b"KOZANE-FAULT-INJECT-VARIANT";
+
 /// `Halted` reasons (the record's `a`), stable per M5 plan C6.
 mod halt {
     /// CNTFRQ is 0: without a clock the cookie secret would never age out.
@@ -170,6 +176,29 @@ mod halt {
     pub const RP_COOKIE_SECRET: u32 = 6;
     /// `rng` gave no seed in `RNG_INIT_TRIES` tries (M7 plan C7).
     pub const RNG_UNAVAILABLE: u32 = 7;
+    /// Frame B of the fault-inject selftest variant (M7 plan C8).
+    #[cfg(feature = "fault-inject")]
+    pub const FAULT_INJECT: u32 = 8;
+}
+
+/// M7 plan C8's selftest variant: a UDP datagram on the WireGuard port
+/// that is no WireGuard message and carries frame A makes ingress fault
+/// (a panic), frame B makes it halt at run time; both reset the machine.
+#[cfg(feature = "fault-inject")]
+mod fault_inject {
+    use pdkit::Audit;
+
+    const FRAME_A: &[u8] = b"KOZANE-FAULT-INJECT-A";
+    const FRAME_B: &[u8] = b"KOZANE-FAULT-INJECT-B";
+
+    pub fn frame(frame: &[u8], audit: &mut Audit) {
+        if frame.windows(FRAME_A.len()).any(|w| w == FRAME_A) {
+            panic!("fault-inject: frame A");
+        }
+        if frame.windows(FRAME_B.len()).any(|w| w == FRAME_B) {
+            audit.halt(super::halt::FAULT_INJECT);
+        }
+    }
 }
 
 /// The cookie secrets' randomness (M7 plan C7): the DRBG `rng` seeds,
@@ -180,8 +209,17 @@ fn fill_random(out: &mut [u8]) -> bool {
     ENTROPY.fill(out)
 }
 
+// The closure names this init in run_init's symbol (ct-shape's stage check).
+#[allow(clippy::redundant_closure)]
 #[protection_domain]
-fn init() -> Ingress {
+fn init() -> pdkit::Stage<Ingress> {
+    boot_stage::run_init(|init| start(init))
+}
+
+/// Init proper. Every refusal here is a boot stop (M7 plan C9): recorded,
+/// then dormant, so the supervisor does not reset for what the next boot
+/// would repeat.
+fn start(init: &boot_stage::Init) -> pdkit::Stage<Ingress> {
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout`; receive data regions are read-only here.
     let (from_driver, to_driver, to_hs, from_hs, to_data, from_data, to_pq, from_pq, to_tls, from_tls, mut audit) = unsafe {
@@ -241,29 +279,35 @@ fn init() -> Ingress {
     };
     if cpu::checked_frequency(cpu::cntfrq()).is_none() {
         // Without a clock the cookie secret would never age out (L12).
-        audit.halt(halt::NO_CLOCK);
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::NO_CLOCK));
     }
-    let entropy = rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG))
-        .unwrap_or_else(|_| audit.halt(halt::RNG_UNAVAILABLE));
+    let Ok(entropy) = rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG)) else {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::RNG_UNAVAILABLE));
+    };
     ENTROPY.set(Some(entropy));
-    let key = crypto::hash(&[LABEL_MAC1, &config::GATEWAY_PUBLIC]).unwrap_or_else(|_| audit.halt(halt::MAC1_KEY));
-    let mut cookies = CookieAdapter::new(&config::GATEWAY_PUBLIC, fill_random)
-        .unwrap_or_else(|_| audit.halt(halt::COOKIE_KEY));
+    let Ok(key) = crypto::hash(&[LABEL_MAC1, &config::GATEWAY_PUBLIC]) else {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::MAC1_KEY));
+    };
+    let Ok(mut cookies) = CookieAdapter::new(&config::GATEWAY_PUBLIC, fill_random) else {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::COOKIE_KEY));
+    };
     // Only the 32-byte mac and cookie keys are kept; `spkm` itself is read
     // here once.
     let spkm = config::gateway_rp_public!();
-    let rp_mac = RpMacKey::new(spkm).unwrap_or_else(|_| audit.halt(halt::RP_MAC_KEY));
+    let Ok(rp_mac) = RpMacKey::new(spkm) else {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::RP_MAC_KEY));
+    };
     let mut rp_cookie = RpCookieAdapter::new(spkm, fill_random);
     let mut gate = Gate::default();
     if !gate.tick_if_due(&mut cookies, cpu::now_ns(), 0).rotated {
-        audit.halt(halt::COOKIE_SECRET);
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::COOKIE_SECRET));
     }
     let mut rp = RpGate::default();
     if !rp.tick_if_due(&mut rp_cookie, cpu::now_ns()).rotated {
-        audit.halt(halt::RP_COOKIE_SECRET);
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::RP_COOKIE_SECRET));
     }
     audit.ready();
-    Ingress {
+    pdkit::Stage::Run(Ingress {
         from_driver,
         to_driver,
         to_hs,
@@ -290,7 +334,7 @@ fn init() -> Ingress {
         msg: [0; layout::NET_BUF_SIZE],
         scratch: [0; layout::NET_BUF_SIZE],
         cookie: [0; COOKIE_REPLY_LEN],
-    }
+    })
 }
 
 /// Which peers to notify after a pass.
@@ -553,6 +597,8 @@ impl Ingress {
                 None
             }
             Outcome::BadMessage => {
+                #[cfg(feature = "fault-inject")]
+                fault_inject::frame(frame, &mut self.audit);
                 self.audit.record(Event::WgBadMessage);
                 None
             }

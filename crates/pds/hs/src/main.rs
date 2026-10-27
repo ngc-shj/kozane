@@ -115,8 +115,17 @@ mod halt {
     pub const RNG_UNAVAILABLE: u32 = 4;
 }
 
+// The closure names this init in run_init's symbol (ct-shape's stage check).
+#[allow(clippy::redundant_closure)]
 #[protection_domain]
-fn init() -> Hs {
+fn init() -> pdkit::Stage<Hs> {
+    boot_stage::run_init(|init| start(init))
+}
+
+/// Init proper. Every refusal here is a boot stop (M7 plan C9): recorded,
+/// then dormant, so the supervisor does not reset for what the next boot
+/// would repeat.
+fn start(init: &boot_stage::Init) -> pdkit::Stage<Hs> {
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout` (checked by tools/laws and layout tests).
     let (from_pq, from_ingress, to_ingress, to_data, mut audit) = unsafe {
@@ -145,10 +154,12 @@ fn init() -> Hs {
         )
     };
     if cpu::checked_frequency(cpu::cntfrq()).is_none() {
-        audit.halt(halt::NO_CLOCK);
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::NO_CLOCK));
     }
-    let hw = Hw(rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG))
-        .unwrap_or_else(|_| audit.halt(halt::RNG_UNAVAILABLE)));
+    let Ok(entropy) = rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG)) else {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::RNG_UNAVAILABLE));
+    };
+    let hw = Hw(entropy);
     let mut key = KeyClient::new(Ppc { wait_us: None });
     let seed = match key.boot_seed() {
         Ok(seed) => seed,
@@ -162,11 +173,12 @@ fn init() -> Hs {
                     audit.record(Event::TpmCapFailed);
                 }
             }
-            audit.halt(halt::NO_BOOT_SEED)
+            return pdkit::Stage::Dormant(audit.boot_stop(init, halt::NO_BOOT_SEED));
         }
     };
-    let handshaker =
-        Handshaker::new(&config::GATEWAY_PUBLIC, &seed).unwrap_or_else(|_| audit.halt(halt::INIT_FAILED));
+    let Ok(handshaker) = Handshaker::new(&config::GATEWAY_PUBLIC, &seed) else {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::INIT_FAILED));
+    };
     let mut peers = [[0u8; 32]; MAX_PEERS];
     for (dst, p) in peers.iter_mut().zip(config::PEERS) {
         *dst = p.public;
@@ -193,7 +205,7 @@ fn init() -> Hs {
     };
     // The boot seed's call: the no-contention baseline.
     hs.report_key_wait();
-    hs
+    pdkit::Stage::Run(hs)
 }
 
 impl Hs {

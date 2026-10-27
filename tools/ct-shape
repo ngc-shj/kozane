@@ -55,9 +55,16 @@ memmove, memcmp and bcmp.
              headers; a release kernel has no such syscall at all (C7). A
              tripwire, not the boundary: inline `asm!` issuing the syscall
              or a wrapper under another name is not seen.
+  stage      (M7 plan C9) every ELF given as an argument holds
+             `boot_stage::run_init::<_, <crate>::init::{closure}>`, so its
+             `init` entered through the one-shot wrapper, and only a leaf
+             PD's (LEAF_ELFS, the PDs no PD calls) holds
+             `boot_stage::Init::boot_stop`: a callee that could go dormant
+             would block its callers for good. Same positive control.
 
---checks defaults to all five; tools/package runs
-identity,forbidden,shape,printing.
+--checks defaults to all six; tools/package runs
+identity,forbidden,shape,printing,stage.
+
 --print-baseline prints the current shape as TOML on stdout, carrying the
 justification of every entry whose shape is unchanged and leaving the others
 empty (which `shape` refuses). Nothing writes the policy: a human reviews
@@ -117,7 +124,10 @@ MEM_STOPS = ("memcpy", "memset", "memmove")
 # memcpy). A call to either stays forbidden in the C10 closures.
 CMP_LIBCALLS = ("memcmp", "bcmp")
 CMP_STOP = "memcmp|bcmp"
-CHECKS = ("identity", "forbidden", "shape", "erasure", "printing")
+CHECKS = ("identity", "forbidden", "shape", "erasure", "printing", "stage")
+# The PDs no PD calls (M7 plan D4): the only ones that may boot-stop.
+LEAF_ELFS = {f"pd-{pd}.elf" for pd in ("hs", "pq", "ingress", "tls", "data", "inner", "eth-in", "eth-out")}
+BOOT_STOP = re.compile(r"^<boot_stage::Init>::boot_stop$|^boot_stage::Init::boot_stop$")
 # The DebugPutChar syscall wrapper, by its demangled name's last segment.
 DEBUG_PUT_CHAR = re.compile(r"(?:^|::)seL4_DebugPutChar$")
 
@@ -785,6 +795,23 @@ def check_printing(path: pathlib.Path) -> list:
             for n in sorted(set(names.values())) if DEBUG_PUT_CHAR.search(n)]
 
 
+def check_stage(path: pathlib.Path) -> list:
+    names, errors = demangled_with_control(path, "stage")
+    if names is None:
+        return errors
+    crate = re.sub(r"\.elf$", "", path.name).replace("-", "_")
+    entry = re.compile(rf"^boot_stage::run_init::<.*, {re.escape(crate)}::init::\{{closure#0\}}>$")
+    # An instantiating-crate tag (` @<crate>`) is not part of the path.
+    found = {re.sub(r" @\w+$", "", n) for n in names.values()}
+    if not any(entry.search(n) for n in found):
+        errors.append(f"{path.name}: stage: no boot_stage::run_init::<_, {crate}::init::{{closure#0}}>; "
+                      "init does not enter through the one-shot wrapper")
+    if path.name not in LEAF_ELFS:
+        errors += [f"{path.name}: stage: {n} in a PD other PDs call; a dormant callee blocks its callers"
+                   for n in sorted(found) if BOOT_STOP.search(n)]
+    return errors
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--harness", required=True, type=pathlib.Path)
@@ -855,6 +882,12 @@ def main() -> int:
                 raise Fail("printing: no PD ELFs")
             for path in paths:
                 errors += check_printing(path)
+        if "stage" in checks:
+            paths = a.elfs or [a.search_path / name for name in system_images(a.system)]
+            if not paths:
+                raise Fail("stage: no PD ELFs")
+            for path in paths:
+                errors += check_stage(path)
     except Fail as e:
         errors.append(str(e))
     except subprocess.CalledProcessError as e:

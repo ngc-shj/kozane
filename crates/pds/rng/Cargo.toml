@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+boot-stage = { path = "../../boot-stage" }
 cpu = { path = "../../cpu" }
 layout = { path = "../../layout" }
 rng-core = { path = "../../rng-core" }

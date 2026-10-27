@@ -4,8 +4,10 @@
 //! grammar allows but this checker's supported subset does not: unknown
 //! elements, unknown attributes on any element (`<system>`,
 //! `<memory_region>`, `<channel>`/`<end>` included, same as `<map>`/
-//! `<protection_domain>`), `cspace`, child `protection_domain`,
-//! `virtual_machine`, `smc`, `ioport`, `domains` — all L4, default deny.
+//! `<protection_domain>`), `cspace`, `virtual_machine`, `ioport`,
+//! `domains` — all L4, default deny. Child `protection_domain`s are parsed
+//! recursively and `smc` is recorded; the checker allows both only for the
+//! `supervisor` (M7 plan C10).
 //!
 //! A document that is not even valid XML, or that violates the SDF grammar
 //! itself (a required attribute missing, a malformed number, an invalid
@@ -102,6 +104,11 @@ pub struct Pd {
     /// Hardware interrupt numbers from this pd's `<irq irq="...">` elements
     /// (manual §7.1); empty if it declares none.
     pub irqs: Vec<u64>,
+    /// `smc="true"` (M7 plan C8): judged by role in the checker.
+    pub smc: bool,
+    /// The enclosing pd of a child `<protection_domain>` (M7 plan C10),
+    /// None at the top level.
+    pub parent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,10 +191,7 @@ pub fn parse(xml: &str) -> Result<(System, Vec<Finding>), SdfError> {
     for child in root.children().filter(Node::is_element) {
         check_no_duplicate_attrs(child)?;
         match child.tag_name().name() {
-            "protection_domain" => {
-                let pd = parse_pd(child, &mut findings)?;
-                system.pds.push(pd);
-            }
+            "protection_domain" => system.pds.extend(parse_pd(child, None, &mut findings)?),
             "memory_region" => system.mrs.push(parse_mr(child, &mut findings)?),
             "channel" => system.channels.push(parse_channel(child, &mut findings)?),
             other => findings.push(Finding::new(
@@ -231,10 +235,12 @@ fn required_attr<'a>(node: Node<'a, 'a>, name: &str) -> Result<&'a str, SdfError
         .ok_or_else(|| err(format!("<{}> is missing required attribute '{name}'", node.tag_name().name())))
 }
 
-fn parse_pd(node: Node, findings: &mut Vec<Finding>) -> Result<Pd, SdfError> {
-    const ALLOWED: &[&str] =
-        &["name", "priority", "budget", "period", "passive", "stack_size", "cpu", "smc", "fpu"];
-    check_unknown_attrs(node, ALLOWED, findings);
+/// A pd and, recursively, its child pds (M7 plan C10: every law is judged
+/// on every pd at any depth), the pd itself first.
+fn parse_pd(node: Node, parent: Option<&str>, findings: &mut Vec<Finding>) -> Result<Vec<Pd>, SdfError> {
+    const TOP: &[&str] = &["name", "priority", "budget", "period", "passive", "stack_size", "cpu", "smc", "fpu"];
+    const CHILD: &[&str] = &["name", "priority", "budget", "period", "passive", "stack_size", "cpu", "smc", "fpu", "id"];
+    check_unknown_attrs(node, if parent.is_some() { CHILD } else { TOP }, findings);
 
     let name = required_attr(node, "name")?.to_string();
 
@@ -276,10 +282,15 @@ fn parse_pd(node: Node, findings: &mut Vec<Finding>) -> Result<Pd, SdfError> {
         None => None,
     };
 
-    if let Some(v) = node.attribute("smc")
-        && parse_bool(v).map_err(|e| err(e.to_string()))?
-    {
-        findings.push(Finding::new(LawId::L4, format!("smc is denied outright (pd '{name}')")));
+    let smc = match node.attribute("smc") {
+        Some(v) => parse_bool(v).map_err(|e| err(e.to_string()))?,
+        None => false,
+    };
+    if parent.is_some() {
+        let id = parse_u64(required_attr(node, "id")?).map_err(|e| err(e.to_string()))?;
+        if id >= 63 {
+            return Err(err(format!("child id {id} out of range (0-62) on pd '{name}'")));
+        }
     }
     // "fpu" is accepted and otherwise unchecked; it carries no law of its own.
 
@@ -288,6 +299,7 @@ fn parse_pd(node: Node, findings: &mut Vec<Finding>) -> Result<Pd, SdfError> {
     let mut maps = Vec::new();
     let mut setvars = Vec::new();
     let mut irqs = Vec::new();
+    let mut children = Vec::new();
 
     for child in node.children().filter(Node::is_element) {
         check_no_duplicate_attrs(child)?;
@@ -332,6 +344,7 @@ fn parse_pd(node: Node, findings: &mut Vec<Finding>) -> Result<Pd, SdfError> {
                 }
                 irqs.push(irq);
             }
+            "protection_domain" => children.push(child),
             other => findings.push(Finding::new(
                 LawId::L4,
                 format!("unsupported element <{other}> on pd '{name}'"),
@@ -342,8 +355,8 @@ fn parse_pd(node: Node, findings: &mut Vec<Finding>) -> Result<Pd, SdfError> {
     let program_image = program_image
         .ok_or_else(|| err(format!("pd '{name}' is missing required <program_image>")))?;
 
-    Ok(Pd {
-        name,
+    let mut pds = vec![Pd {
+        name: name.clone(),
         priority,
         budget_us,
         budget_explicit,
@@ -356,7 +369,14 @@ fn parse_pd(node: Node, findings: &mut Vec<Finding>) -> Result<Pd, SdfError> {
         maps,
         setvars,
         irqs,
-    })
+        smc,
+        parent: parent.map(str::to_string),
+    }];
+    for child in children {
+        check_no_duplicate_attrs(child)?;
+        pds.extend(parse_pd(child, Some(&name), findings)?);
+    }
+    Ok(pds)
 }
 
 fn parse_mr(node: Node, findings: &mut Vec<Finding>) -> Result<MemoryRegion, SdfError> {
