@@ -89,7 +89,7 @@ pub enum BootError {
     GatewayKeyMismatch,
     PeerMismatch,
     /// RNDR failed while drawing the boot seed's samples.
-    RndrUnavailable,
+    RngUnavailable,
     /// Hashing the boot seed failed.
     SeedDerivation,
     /// The secrets region is not a sealed envelope of `key`'s kind (M5
@@ -113,7 +113,7 @@ pub enum BootError {
 impl From<UnsealError> for BootError {
     fn from(e: UnsealError) -> Self {
         match e {
-            UnsealError::Rndr => BootError::RndrUnavailable,
+            UnsealError::Rng => BootError::RngUnavailable,
             UnsealError::EnvelopeInvalid => BootError::EnvelopeInvalid,
             UnsealError::TpmUnavailable => BootError::TpmUnavailable,
             UnsealError::SrkMismatch => BootError::SrkMismatch,
@@ -132,7 +132,7 @@ impl BootError {
             BootError::Blob(e) => e.message(),
             BootError::GatewayKeyMismatch => "secrets: gateway key does not match the configuration",
             BootError::PeerMismatch => "secrets: peer keys do not match the configuration",
-            BootError::RndrUnavailable => "RNDR unavailable",
+            BootError::RngUnavailable => "rng unavailable",
             BootError::SeedDerivation => "boot seed derivation failed",
             BootError::EnvelopeInvalid => "secrets: not a sealed envelope for key",
             BootError::TpmUnavailable => "secrets: tpm unavailable",
@@ -156,7 +156,7 @@ impl BootError {
             BootError::Blob(BlobError::TooSmall) => 6,
             BootError::GatewayKeyMismatch => 7,
             BootError::PeerMismatch => 8,
-            BootError::RndrUnavailable => 9,
+            BootError::RngUnavailable => 9,
             BootError::SeedDerivation => 10,
             BootError::EnvelopeInvalid => 11,
             BootError::TpmUnavailable => 12,
@@ -302,7 +302,7 @@ impl<'a> Oracle<'a> {
         // Both wipe themselves on drop (tpm2::Secret), on every return.
         let mut samples = tpm2::Secret::<{ SEED_SAMPLES * 8 }>::zero();
         if !entropy.fill_random(samples.as_mut_bytes()) {
-            return Err(BootError::RndrUnavailable);
+            return Err(BootError::RngUnavailable);
         }
         let mut seed = tpm2::Secret::<32>::zero();
         *seed.as_mut_bytes() = crypto::hash(&[blob.boot_seed(), samples.as_bytes(), &entropy.cntpct().to_le_bytes()])

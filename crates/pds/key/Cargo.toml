@@ -9,6 +9,7 @@ config = { path = "../../config" }
 cpu = { path = "../../cpu" }
 key-core = { path = "../../key-core" }
 layout = { path = "../../layout" }
+rng-client = { path = "../../rng-client" }
 secret-blob = { path = "../../secret-blob" }
 sel4-microkit = { workspace = true }
 tpm2 = { path = "../../tpm2" }

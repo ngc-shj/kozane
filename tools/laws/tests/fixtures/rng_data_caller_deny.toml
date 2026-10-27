@@ -1,0 +1,68 @@
+[pds.eth]
+role = "driver"
+
+[pds.hs]
+role = "untrusted_input"
+
+[pds.key]
+role = "key"
+
+[pds.rng]
+role = "rng"
+
+[pds.data]
+role = "data"
+
+[mrs.nic]
+kind = "device"
+owner = "eth"
+phys_addr = 0xa003000
+size = 0x1000
+
+[mrs.rngdev]
+kind = "device"
+owner = "rng"
+phys_addr = 0xa000000
+size = 0x1000
+rng = true
+
+[mrs.rngdma]
+kind = "dma"
+owner = "rng"
+
+[mrs.secrets]
+kind = "secrets"
+owner = "key"
+
+[[channels]]
+between = ["eth", "hs"]
+
+[[channels]]
+between = ["hs", "key"]
+pp = { hs = true, key = false }
+notify = { hs = false }
+
+[[channels]]
+between = ["key", "rng"]
+pp = { key = true, rng = false }
+notify = { key = false }
+
+[[channels]]
+between = ["hs", "rng"]
+pp = { hs = true, rng = false }
+notify = { hs = false }
+
+[[channels]]
+between = ["data", "rng"]
+pp = { data = true, rng = false }
+notify = { data = false }
+
+[priority]
+below = [["untrusted_input", "key"], ["untrusted_input", "rng"], ["key", "rng"]]
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

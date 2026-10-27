@@ -61,7 +61,7 @@ impl Transport for Ppc {
     }
 
     fn random(&mut self, out: &mut [u8]) -> bool {
-        cpu::fill_random(out)
+        ENTROPY.fill(out)
     }
 }
 
@@ -84,7 +84,7 @@ struct Hw;
 
 impl BootEntropy for Hw {
     fn fill_random(&mut self, out: &mut [u8]) -> bool {
-        cpu::fill_random(out)
+        ENTROPY.fill(out)
     }
 
     fn cntpct(&mut self) -> u64 {
@@ -123,8 +123,14 @@ fn boot() -> Result<Oracle<'static>, BootError> {
     })
 }
 
+/// The unseal's salt and the boot seed's randomness (M7 plan C7): the DRBG
+/// `rng` seeds, where RNDR was. Empty when `rng` gave no seed: the unseal
+/// then fails on its salt (and `tpm` still gets this PD's Failed).
+static ENTROPY: rng_client::Global = rng_client::Global::new();
+
 #[protection_domain]
 fn init() -> Key {
+    ENTROPY.set(rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG)).ok());
     match boot() {
         Ok(oracle) => Key::Ready { oracle, bucket: Bucket::new(KEY_BURST, KEY_INTERVAL_NS) },
         Err(e) => Key::Unavailable { code: e.code() },

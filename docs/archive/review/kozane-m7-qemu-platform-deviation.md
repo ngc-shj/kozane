@@ -178,3 +178,83 @@ results and Re-plan R1 are in the plan itself.
   `swtpm_setup --create-ek-cert` and provisioned by `tools/provision`.
   The copy check (a copy of the state gives the same SRK) runs through
   `tools/provision` too.
+
+## Slice 4 (C6, C7, C10's rng parts)
+
+### C7: where the DRBG sits
+
+- **What:** each PD's `rng_client::Entropy`, a `drbg::Drbg` the `rng` PD
+  seeds, replaces RNDR at the point where RNDR was read: `HedgeHw` and
+  `Hardware` samples, `Transport::random` (the unseal's salt),
+  `BootEntropy`, and the cookie adapters' `fill`. The PD's existing hedged
+  construction stays as the outer layer, unchanged:
+  - BLAKE2s(boot seed ‖ ctr ‖ CNTPCT ‖ sample) in hs-core;
+  - HMAC(boot seed, ‖ sample) in tls-core and rosenpass-core;
+  - BLAKE2s(blob seed ‖ sample ‖ CNTPCT) in the key PDs' boot seeds.
+
+  The DRBG is instantiated with a zero hedge. The PD's own hedge is the
+  outer construction's key.
+  **Why:** the property C7 locks (an output needs the rng seed and the
+  PD's hedge seed; fast key erasure; a reseed that combines) holds with
+  the hedge one layer up, and the change stays one line per PD. It also
+  covers the planned two-phase instantiation of the key PDs:
+  - their salt draws need only the rng seed;
+  - their boot seed hashes the blob seed with the DRBG's output.
+
+  So no phase-2 re-instantiation is needed. `ingress` has no outer hedge,
+  as planned (RM7-2).
+- **What:** the DRBG crate's PRF is a trait, `HmacSha256` for every PD.
+  The Kani harnesses use a model PRF that proves the state machine: the
+  bound, the wrap, key replacement and reseed reset. The unit tests check
+  the real construction against HMAC known answers.
+- **What:** a key PD whose `rng` gives no seed calls `tpm2::boot::unseal`
+  anyway. Its salt draw fails, so the unseal fails as `UnsealError::Rng`
+  (formerly `Rndr`), `tpm` receives Failed and caps without waiting, and
+  the PD answers Unavailable with `RngUnavailable` (code 9, formerly
+  `RndrUnavailable`). R3 FN-R3-2 is met without a special path.
+- **What:** renames:
+  - `HedgeHw::rndr` becomes `HedgeHw::random` (tls-core, rosenpass-core);
+  - `halt::RNDR` becomes `halt::RNG` (pq, tls);
+  - `UnsealError::Rndr` becomes `UnsealError::Rng`;
+  - `BootError::RndrUnavailable` becomes `BootError::RngUnavailable`.
+
+  The codes are unchanged. P25 forbids `fn rndr`, so the names had to go.
+- **What:** each leaf PD's halt module gains `RNG_UNAVAILABLE` (hs 4,
+  pq 7, ingress 7, tls 5). It is audited as `Halted`, with no separate
+  event: the rng reason word (quota, device, short, zero, stuck) is not
+  audited. Turning these halts into dormant boot stops is slice 5 (C9).
+
+### C6: the rng PD
+
+- **What:** passive, as `tpm` and `key` are, so each request runs on its
+  caller's scheduling context; priority 147, above every caller.
+  It has no IRQ: one request at a time is polled against a CNTPCT deadline
+  (`RNG_POLL_NS`, 100 ms).
+- **What:** a missing device, a failed init or unset symbols leave the PD
+  up with no device, answering every request `UNAVAILABLE`.
+- **What:** the seed travels in four message registers, which fit the
+  registers a reply carries without touching the IPC buffer.
+- **What:** `rng_dma` is one 2 MiB page, as the NICs' DMA regions are, so
+  the virtqueue's physical addresses are contiguous.
+- **What:** rng-core keeps its own copy of the CNTPCT token bucket, as
+  key-core, pqkey-core and tlskey-core each do. A shared crate would give
+  rng-core an edge to a key crate.
+
+### C10: laws
+
+- **What:** the `rng` role is in:
+  - a device mr with `rng = true`, pinned at 0x0a000000/0x1000;
+  - DMA ownership and `setvar` are allowed;
+  - the L1 exemption has key's shape;
+  - its peers must be `key` or `untrusted_input`;
+  - a key PD may hold one pp channel to tpm and one to rng.
+
+  Eleven fixtures pin these.
+- **What:** the rest of C10 (the supervisor, the recursive parser, PD
+  counting) is slice 5.
+
+### P6 (partial)
+
+- **What:** on cortex-a72 with the rng PD, the wireguard boot passes all
+  14 cases, the MCE handshake cost case among them. The full run's timing
+  is recorded below once it completes.

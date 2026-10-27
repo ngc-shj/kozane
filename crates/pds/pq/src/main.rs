@@ -96,12 +96,13 @@ impl Decaps for PqKey {
     }
 }
 
-/// `Hedged`'s hardware: RNDR and CNTPCT.
-struct Cpu;
+/// `Hedged`'s hardware: the DRBG `rng` seeds (M7 plan C7) where RNDR was,
+/// and CNTPCT.
+struct Cpu(rng_client::Entropy);
 
 impl HedgeHw for Cpu {
-    fn rndr(&mut self) -> Option<u64> {
-        cpu::rndr()
+    fn random(&mut self) -> Option<u64> {
+        self.0.u64()
     }
 
     fn counter(&mut self) -> u64 {
@@ -189,10 +190,12 @@ mod halt {
     /// `pqkey` refused the boot seed (after `KeyUnavailable`, if it is
     /// Unavailable).
     pub const NO_BOOT_SEED: u32 = 4;
-    /// RNDR failed while building the responder.
-    pub const RNDR: u32 = 5;
+    /// A draw failed while building the responder.
+    pub const RNG: u32 = 5;
     /// The responder could not be built for any other reason.
     pub const INIT_FAILED: u32 = 6;
+    /// `rng` gave no seed in `RNG_INIT_TRIES` tries (M7 plan C7).
+    pub const RNG_UNAVAILABLE: u32 = 7;
 }
 
 #[protection_domain]
@@ -222,6 +225,8 @@ fn init() -> Pq {
         )
     };
     let freq = cpu::checked_frequency(cpu::cntfrq()).unwrap_or_else(|| audit.halt(halt::NO_CLOCK));
+    let hw = Cpu(rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG))
+        .unwrap_or_else(|_| audit.halt(halt::RNG_UNAVAILABLE)));
     // The embedded keys must be the configured ones (M3 plan S8).
     if secret_blob::blake2s(&[SPKM]) != config::GATEWAY_RP_HASH {
         audit.halt(halt::GATEWAY_RP_HASH);
@@ -251,10 +256,10 @@ fn init() -> Pq {
         let bytes = u32::try_from(u64::from_le_bytes(mark)).unwrap_or(u32::MAX);
         audit.record(Event::KeyStackHighWater { bytes });
     }
-    let mut rng = Hedged::new(seed, Cpu);
+    let mut rng = Hedged::new(seed, hw);
     let mut responder = match Responder::new(SPKM, SPKTS, &mut rng) {
         Ok(r) => r,
-        Err(Error::Rng) => audit.halt(halt::RNDR),
+        Err(Error::Rng) => audit.halt(halt::RNG),
         Err(_) => audit.halt(halt::INIT_FAILED),
     };
     // The first biscuit key; a failure is retried on every timer tick.

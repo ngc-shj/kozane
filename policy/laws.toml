@@ -201,6 +201,9 @@ role = "key"
 [pds.tpm]
 role = "tpm"
 
+[pds.rng]
+role = "rng"
+
 [pds.tls]
 role = "untrusted_input"
 
@@ -246,6 +249,17 @@ owner = "tpm"
 phys_addr = 0xc000000
 size = 0x1000
 tpm = true
+
+[mrs.rng_mmio]
+kind = "device"
+owner = "rng"
+phys_addr = 0xa000000
+size = 0x1000
+rng = true
+
+[mrs.rng_dma]
+kind = "dma"
+owner = "rng"
 
 [mrs.secrets]
 kind = "secrets"
@@ -688,11 +702,49 @@ between = ["tls", "audit"]
 pp = { tls = false, audit = false }
 notify = { tls = true, audit = true }
 
+# M7 plan C6: the PDs that draw randomness, and their seed oracle.
+[[channels]]
+between = ["hs", "rng"]
+pp = { hs = true, rng = false }
+notify = { hs = false }
+
+[[channels]]
+between = ["pq", "rng"]
+pp = { pq = true, rng = false }
+notify = { pq = false }
+
+[[channels]]
+between = ["ingress", "rng"]
+pp = { ingress = true, rng = false }
+notify = { ingress = false }
+
+[[channels]]
+between = ["tls", "rng"]
+pp = { tls = true, rng = false }
+notify = { tls = false }
+
+[[channels]]
+between = ["key", "rng"]
+pp = { key = true, rng = false }
+notify = { key = false }
+
+[[channels]]
+between = ["pqkey", "rng"]
+pp = { pqkey = true, rng = false }
+notify = { pqkey = false }
+
+[[channels]]
+between = ["tlskey", "rng"]
+pp = { tlskey = true, rng = false }
+notify = { tlskey = false }
+
 [priority]
 # L13: untrusted-input and tunnel PDs run strictly below `key` and `timer`;
 # `tpm`, the key pds' callee, above `key` (M5 plan C9).
 below = [
     ["key", "tpm"],
+    ["key", "rng"],
+    ["untrusted_input", "rng"],
     ["untrusted_input", "key"],
     ["untrusted_input", "timer"],
     ["data", "key"],

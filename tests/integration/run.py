@@ -405,8 +405,12 @@ def free_udp_port() -> int:
             return port
 
 
-# The machine every boot runs (M7 plan C2 I2.1): EL3 for TF-A, EL2 for seL4.
-QEMU_CPU = "neoverse-n2"
+# The machine every boot runs (M7 plan C2 I2.1): EL3 for TF-A, EL2 for seL4;
+# a core without FEAT_RNG (D3), so a stray RNDR faults.
+QEMU_CPU = "cortex-a72"
+# The rng PD's device (M7 plan C6): virtio-rng on slot 0, fed by the host.
+RNG_DEVICE = ["-object", "rng-random,id=rng0,filename=/dev/urandom",
+              "-device", "virtio-rng-device,rng=rng0,bus=virtio-mmio-bus.0"]
 
 
 # Deny-case firmware (M7 plan C3): `firmware_variant` derives each from
@@ -414,7 +418,7 @@ QEMU_CPU = "neoverse-n2"
 FIRMWARE_VARIANTS = set()
 
 
-def qemu_machine(firmware: str) -> list:
+def qemu_machine(firmware: str, rng: bool = True) -> list:
     """The QEMU arguments every boot starts with. The only firmware a boot
     may run is one of the two images `make firmware` builds, or a deny-case
     variant firmware_variant derived from the shipped one, so no boot skips
@@ -422,12 +426,12 @@ def qemu_machine(firmware: str) -> list:
     if firmware not in (FIRMWARE, FIRMWARE_MEASURE) and firmware not in FIRMWARE_VARIANTS:
         raise Fail(f"qemu_machine: {firmware} is not a firmware image `make firmware` builds")
     return ["-machine", "virt,secure=on,virtualization=on", "-cpu", QEMU_CPU, "-m", "size=2G",
-            "-serial", "mon:stdio", "-nographic", "-bios", firmware]
+            "-serial", "mon:stdio", "-nographic", "-bios", firmware] + (RNG_DEVICE if rng else [])
 
 
 def boot(pkg: "Package", outside: str, inside: str, monitor: str = "", media=None, flip=None,
          fail_extend: bool = False, inject_pcr3: bool = False, fail_nth: tuple = None,
-         firmware: str = None) -> tuple:
+         firmware: str = None, rng: bool = True) -> tuple:
     """Every boot is the shipped one (M5 plan C14): U-Boot measures and
     assembles the package's boot media (`media`, the package's own unless
     given: (path, address) pairs at measure.LOAD_*), and its TPM is a fresh
@@ -440,7 +444,7 @@ def boot(pkg: "Package", outside: str, inside: str, monitor: str = "", media=Non
     try:
         if flip is not None or fail_extend or inject_pcr3 or fail_nth:
             proxy = TpmProxy(tpm, bool(flip), fail_extend, inject_pcr3, fail_nth)
-        cmd = qemu_machine(firmware or FIRMWARE)
+        cmd = qemu_machine(firmware or FIRMWARE, rng)
         for path, addr in media or pkg.media():
             cmd += ["-device", f"loader,file={path},addr={addr:#x},force-raw=on"]
         cmd += (proxy or tpm).qemu_args()
@@ -2168,9 +2172,9 @@ def media_with(pkg: Package, scratch: str, image: bytes = None, desc: bytes = No
 
 
 def sealed_boot(pkg: Package, media=None, flip=None, inject_pcr3: bool = False, fail_nth: tuple = None,
-                firmware: str = None) -> tuple:
+                firmware: str = None, rng: bool = True) -> tuple:
     return boot(pkg, dgram("n0", free_udp_port(), free_udp_port()), dgram("n1", free_udp_port(), free_udp_port()),
-                media=media, flip=flip, inject_pcr3=inject_pcr3, fail_nth=fail_nth, firmware=firmware)
+                media=media, flip=flip, inject_pcr3=inject_pcr3, fail_nth=fail_nth, firmware=firmware, rng=rng)
 
 
 def stop(child):
@@ -2358,6 +2362,33 @@ def test_firmware(good: Package, passed: list):
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
         FIRMWARE_VARIANTS.clear()
+
+
+# M7 plan C6, C7: the PDs that halt when `rng` gives no seed, and the
+# `Halted` reason each uses (its halt module's RNG_UNAVAILABLE).
+RNG_HALTS = {"hs": 4, "pq": 7, "ingress": 7, "tls": 5}
+
+
+def test_no_rng(good: Package, passed: list):
+    """M7 plan C6: a boot without the virtio-rng device. Every PD that
+    draws randomness and is no callee halts with its RNG_UNAVAILABLE
+    reason, exactly that set; the rest (drivers, data, inner, audit, and
+    the key PDs, which stay up refusing) does not; no handshake follows
+    (L9). Allow: every other boot has the device and serves."""
+    child, con = sealed_boot(good, rng=False)
+    try:
+        for pd, reason in RNG_HALTS.items():
+            con.wait_for(rf"audit: src={pd} Halted reason={reason} ", timeout=BOOT_TIMEOUT_S)
+        con.wait_for(r"data: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        halted = set(re.findall(r"audit: src=(\w+) Halted reason=", con.text))
+        if halted != set(RNG_HALTS):
+            raise Fail(f"no rng: {sorted(halted)} halted, want exactly {sorted(RNG_HALTS)}")
+        for pd in RNG_HALTS:
+            if re.search(rf"(?m)^{pd}: ready", con.text):
+                raise Fail(f"no rng: {pd} became ready without a seed")
+    finally:
+        stop(child)
+    passed.append("no rng: exactly hs, pq, ingress and tls halt (RNG_UNAVAILABLE), no handshake")
 
 
 def test_tpm_proxy(good: Package, passed: list):
@@ -6751,6 +6782,7 @@ def in_netns(tmp: str) -> int:
              ("sealed boot", lambda: test_sealed(good, foreign, passed)),
              ("tpm proxy", lambda: test_tpm_proxy(good, passed)),
              ("firmware", lambda: test_firmware(good, passed)),
+             ("no rng", lambda: test_no_rng(good, passed)),
              ("tpm cap failure", lambda: test_tpm_cap_failure(good, deploy, passed)),
              ("https", lambda: test_https(good, deploy, os.path.join(os.path.dirname(deploy), "b", "devca.pem"),
                                          passed)),

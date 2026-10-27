@@ -419,6 +419,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "drbg"
+version = "0.1.0"
+dependencies = [
+ "libcrux-hmac",
+ "secret",
+]
+
+[[package]]
 name = "either"
 version = "1.19.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1159,6 +1167,7 @@ dependencies = [
  "key-core",
  "layout",
  "pdkit",
+ "rng-client",
  "sel4-microkit",
  "wg-core",
 ]
@@ -1175,6 +1184,7 @@ dependencies = [
  "msgs",
  "pdkit",
  "ring",
+ "rng-client",
  "rosenpass-core",
  "rosenpass-wire",
  "sel4-microkit",
@@ -1203,6 +1213,7 @@ dependencies = [
  "cpu",
  "key-core",
  "layout",
+ "rng-client",
  "secret-blob",
  "sel4-microkit",
  "tpm2",
@@ -1222,6 +1233,7 @@ dependencies = [
  "pdkit",
  "pqkey-core",
  "ring",
+ "rng-client",
  "rosenpass-core",
  "rosenpass-wire",
  "secret-blob",
@@ -1236,10 +1248,23 @@ dependencies = [
  "cpu",
  "layout",
  "pqkey-core",
+ "rng-client",
  "secret-blob",
  "sel4-microkit",
  "tpm2",
  "zeroize",
+]
+
+[[package]]
+name = "pd-rng"
+version = "0.1.0"
+dependencies = [
+ "cpu",
+ "layout",
+ "rng-core",
+ "sel4-microkit",
+ "sel4-virtio-hal-impl",
+ "virtio-drivers",
 ]
 
 [[package]]
@@ -1261,6 +1286,7 @@ dependencies = [
  "layout",
  "pdkit",
  "ring",
+ "rng-client",
  "sel4-microkit",
  "smoltcp",
  "tls-core",
@@ -1277,6 +1303,7 @@ dependencies = [
  "config",
  "cpu",
  "layout",
+ "rng-client",
  "secret-blob",
  "sel4-microkit",
  "tlskey-core",
@@ -1583,6 +1610,24 @@ name = "ring"
 version = "0.1.0"
 dependencies = [
  "vstd",
+]
+
+[[package]]
+name = "rng-client"
+version = "0.1.0"
+dependencies = [
+ "cpu",
+ "drbg",
+ "layout",
+ "sel4-microkit",
+]
+
+[[package]]
+name = "rng-core"
+version = "0.1.0"
+dependencies = [
+ "libcrux-sha2",
+ "secret",
 ]
 
 [[package]]

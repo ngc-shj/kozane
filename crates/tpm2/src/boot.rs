@@ -68,7 +68,7 @@ pub trait Transport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsealError {
     /// The random source failed (or kept giving unusable scalars).
-    Rndr,
+    Rng,
     /// The secrets region is not an envelope of this PD's kind (a
     /// plaintext `SOSSECR1` blob included).
     EnvelopeInvalid,
@@ -94,7 +94,7 @@ impl UnsealError {
     fn of(f: Failure) -> Self {
         match f.cause {
             Cause::Envelope(_) => UnsealError::EnvelopeInvalid,
-            Cause::Entropy => UnsealError::Rndr,
+            Cause::Entropy => UnsealError::Rng,
             Cause::Buffer | Cause::Order => UnsealError::TpmUnavailable,
             Cause::Response(tpm2_wire::RspError::Tpm(_)) if f.step == Step::Unseal => UnsealError::UnsealRefused,
             Cause::Response(tpm2_wire::RspError::Tpm(_)) => UnsealError::TpmUnavailable,
@@ -113,7 +113,7 @@ fn start<'e>(tpm: &mut impl Transport, envelope: &'e [u8], kind: Kind) -> Result
     let mut entropy = Secret::<CLIENT_ENTROPY_LEN>::zero();
     for _ in 0..ENTROPY_DRAWS {
         if !tpm.random(entropy.as_mut_bytes()) {
-            return Err(UnsealError::Rndr);
+            return Err(UnsealError::Rng);
         }
         match Client::new(envelope, kind, &entropy) {
             Ok(client) => return Ok(client),
@@ -121,7 +121,7 @@ fn start<'e>(tpm: &mut impl Transport, envelope: &'e [u8], kind: Kind) -> Result
             Err(f) => return Err(UnsealError::of(f)),
         }
     }
-    Err(UnsealError::Rndr)
+    Err(UnsealError::Rng)
 }
 
 /// One command through `tpm`, asking again while it is Busy. The response

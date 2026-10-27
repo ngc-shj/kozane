@@ -67,14 +67,16 @@ impl KeyCall for Ppc {
     }
 }
 
-struct Hw;
+/// `HedgedEntropy`'s hardware: CNTPCT, and the DRBG `rng` seeds (M7 plan
+/// C7) where RNDR was.
+struct Hw(rng_client::Entropy);
 
 impl hs_core::Hardware for Hw {
     fn counter(&mut self) -> u64 {
         cpu::cntpct()
     }
     fn random(&mut self) -> Option<u64> {
-        cpu::rndr()
+        self.0.u64()
     }
 }
 
@@ -109,6 +111,8 @@ mod halt {
     pub const NO_BOOT_SEED: u32 = 2;
     /// The handshaker could not be built from the boot seed.
     pub const INIT_FAILED: u32 = 3;
+    /// `rng` gave no seed in `RNG_INIT_TRIES` tries (M7 plan C7).
+    pub const RNG_UNAVAILABLE: u32 = 4;
 }
 
 #[protection_domain]
@@ -143,6 +147,8 @@ fn init() -> Hs {
     if cpu::checked_frequency(cpu::cntfrq()).is_none() {
         audit.halt(halt::NO_CLOCK);
     }
+    let hw = Hw(rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG))
+        .unwrap_or_else(|_| audit.halt(halt::RNG_UNAVAILABLE)));
     let mut key = KeyClient::new(Ppc { wait_us: None });
     let seed = match key.boot_seed() {
         Ok(seed) => seed,
@@ -174,7 +180,7 @@ fn init() -> Hs {
         audit,
         key,
         key_wait: CostHighWater::key_wait(),
-        entropy: HedgedEntropy::new(seed, Hw),
+        entropy: HedgedEntropy::new(seed, hw),
         handshaker,
         psks: PskTable::new(),
         peers,

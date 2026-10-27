@@ -798,6 +798,19 @@ CASES = [
      lambda t: append(t / "support/u-boot/kozane.config", "# CONFIG_MEASURED_BOOT is not set\n")),
     ("P24 a second QEMU command line naming its firmware", {"P24"},
      lambda t: append(t / "tests/integration/run.py", 'BYPASS = ["-bios", "u-boot.bin"]\n')),
+    # P25 (M7 plan C7, D3): no RNDR.
+    ("P25 the RNDR encoding in a crate", {"P25"},
+     lambda t: append(t / "crates/cpu/src/lib.rs", '// asm!("mrs {}, s3_3_c2_c4_0")\n')),
+    ("P25 the removed RNDR API called", {"P25"},
+     lambda t: append(t / "crates/wire/src/lib.rs", "fn f() { let _ = cpu::rndr(); }\n")),
+    ("P25 a function named rndr", {"P25"},
+     lambda t: append(t / "crates/wire/src/lib.rs", "fn rndr() {}\n")),
+    ("allow a function whose name starts with rndr_", set(),
+     lambda t: append(t / "crates/wire/src/lib.rs", "fn rndr_free() {}\n")),
+    ("P25 the RNDR core named outside docs", {"P25"},
+     lambda t: append(t / "tests/integration/run.py", 'CPU = "neoverse-n2"\n')),
+    ("allow the RNDR core named in docs", set(),
+     lambda t: write(t / "docs/note.md", "M6 ran on neoverse-n2.\n")),
 ]
 
 

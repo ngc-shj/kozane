@@ -157,16 +157,16 @@ fn a_scalar_of_another_point_is_a_mismatch_and_the_plaintext_is_wiped() {
 }
 
 #[test]
-fn rndr_failing_after_the_checks_is_its_own_code_and_the_plaintext_is_wiped() {
+fn rng_failing_after_the_checks_is_its_own_code_and_the_plaintext_is_wiped() {
     let mut r = region();
-    assert_eq!(refused_boot(&mut r, &tls_public(), &mut FakeHw { ok: false, byte: 0, tick: 0 }), BootError::RndrUnavailable);
+    assert_eq!(refused_boot(&mut r, &tls_public(), &mut FakeHw { ok: false, byte: 0, tick: 0 }), BootError::RngUnavailable);
 }
 
 #[test]
 fn each_unseal_failure_has_its_own_boot_error() {
     use tpm2::boot::UnsealError;
     let all = [
-        UnsealError::Rndr,
+        UnsealError::Rng,
         UnsealError::EnvelopeInvalid,
         UnsealError::TpmUnavailable,
         UnsealError::SrkMismatch,
@@ -176,7 +176,7 @@ fn each_unseal_failure_has_its_own_boot_error() {
         UnsealError::CapFailed,
     ];
     assert_eq!(all.len(), core::mem::variant_count::<UnsealError>());
-    assert_eq!(BootError::from(UnsealError::Rndr), BootError::RndrUnavailable);
+    assert_eq!(BootError::from(UnsealError::Rng), BootError::RngUnavailable);
     for (i, a) in all.iter().enumerate() {
         for b in &all[i + 1..] {
             assert_ne!(BootError::from(*a), BootError::from(*b), "{a:?} and {b:?}");
@@ -201,7 +201,7 @@ fn all_boot_errors() -> std::vec::Vec<BootError> {
     let mut all = std::vec![
         BootError::ScalarInvalid,
         BootError::Mismatch,
-        BootError::RndrUnavailable,
+        BootError::RngUnavailable,
         BootError::EnvelopeInvalid,
         BootError::TpmUnavailable,
         BootError::SrkMismatch,
@@ -296,7 +296,7 @@ fn another_scalar_with_the_same_blob_seed_gives_the_same_boot_seed() {
 }
 
 #[test]
-fn rndr_and_cntpct_are_inputs_of_the_boot_seed() {
+fn rng_and_cntpct_are_inputs_of_the_boot_seed() {
     let mut r = region();
     let a = seed_of(&Oracle::boot(&mut r, &tls_public(), &mut FakeHw { ok: true, byte: 0x43, tick: 7 }).unwrap());
     let mut r = region();

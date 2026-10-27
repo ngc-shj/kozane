@@ -350,7 +350,7 @@ impl FakeHedgeHw {
 }
 
 impl crate::HedgeHw for FakeHedgeHw {
-    fn rndr(&mut self) -> Option<u64> {
+    fn random(&mut self) -> Option<u64> {
         match &mut self.good_reads {
             Some(0) => None,
             Some(n) => {

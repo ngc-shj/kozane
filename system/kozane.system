@@ -20,6 +20,11 @@
     <!-- TPM TIS, locality 0 only (M5 plan C9): QEMU virt's tpm-tis-device,
          the first device on the platform bus. The tpm PD's alone. -->
     <memory_region name="tpm_mmio" size="0x1000" phys_addr="0xc000000" />
+    <!-- virtio-rng (M7 plan C6): virtio-mmio slot 0, alone on its page;
+         the rng PD's alone, with its DMA region (one 2 MiB page, so the
+         virtqueue's physical addresses are contiguous). -->
+    <memory_region name="rng_mmio" size="0x1000" phys_addr="0xa000000" />
+    <memory_region name="rng_dma" size="0x200_000" page_size="0x200_000" />
     <!-- Static secrets (law L2): zero placeholder here; `make package` swaps
          only this prefill_path for a real blob. -->
     <memory_region name="secrets" size="0x1000" prefill_path="secrets-placeholder.bin" />
@@ -155,6 +160,17 @@
     <protection_domain name="tpm" priority="145" budget="1_000" period="10_000" passive="true" stack_size="0x10_000">
         <program_image path="pd-tpm.elf" />
         <map mr="tpm_mmio" vaddr="0x2_000_000" perms="rw" cached="false" setvar_vaddr="tpm_mmio_vaddr" />
+    </protection_domain>
+
+    <!-- M7 plan C6: the entropy driver. Passive: each seed request runs on
+         its caller's scheduling context; above every caller, as
+         Microkit's PPC rule wants. Polls the device against a CNTPCT
+         deadline; no irq. -->
+    <protection_domain name="rng" priority="147" budget="1_000" period="10_000" passive="true" stack_size="0x10_000">
+        <program_image path="pd-rng.elf" />
+        <map mr="rng_mmio" vaddr="0x2_000_000" perms="rw" cached="false" setvar_vaddr="rng_mmio_vaddr" />
+        <map mr="rng_dma" vaddr="0x4_000_000" perms="rw" setvar_vaddr="rng_dma_vaddr" />
+        <setvar symbol="rng_dma_paddr" region_paddr="rng_dma" />
     </protection_domain>
 
     <protection_domain name="key" priority="140" budget="2_000" period="10_000" passive="true" stack_size="0x20_000">
@@ -442,5 +458,36 @@
     <channel>
         <end pd="tls" id="5" />
         <end pd="audit" id="8" />
+    </channel>
+
+    <!-- M7 plan C6: every PD that draws randomness calls rng (pp on its
+         end, never notified by rng: the rng exemption of L1). -->
+    <channel>
+        <end pd="hs" id="7" pp="true" notify="false" />
+        <end pd="rng" id="1" pp="false" />
+    </channel>
+    <channel>
+        <end pd="pq" id="6" pp="true" notify="false" />
+        <end pd="rng" id="2" pp="false" />
+    </channel>
+    <channel>
+        <end pd="ingress" id="8" pp="true" notify="false" />
+        <end pd="rng" id="3" pp="false" />
+    </channel>
+    <channel>
+        <end pd="tls" id="6" pp="true" notify="false" />
+        <end pd="rng" id="4" pp="false" />
+    </channel>
+    <channel>
+        <end pd="key" id="4" pp="true" notify="false" />
+        <end pd="rng" id="5" pp="false" />
+    </channel>
+    <channel>
+        <end pd="pqkey" id="4" pp="true" notify="false" />
+        <end pd="rng" id="6" pp="false" />
+    </channel>
+    <channel>
+        <end pd="tlskey" id="4" pp="true" notify="false" />
+        <end pd="rng" id="7" pp="false" />
     </channel>
 </system>

@@ -37,6 +37,10 @@ pub enum Role {
     /// The TPM driver (M5 plan C9): untainted, owns the TIS page, callee
     /// of `key` pds only.
     Tpm,
+    /// The entropy driver (M7 plan C6): untainted, owns the virtio-rng page
+    /// and its DMA mr, callee only, with `key`'s exemption shape towards
+    /// every caller (L1 as amended).
+    Rng,
 }
 
 impl Role {
@@ -49,8 +53,9 @@ impl Role {
             "service" => Ok(Role::Service),
             "timer" => Ok(Role::Timer),
             "tpm" => Ok(Role::Tpm),
+            "rng" => Ok(Role::Rng),
             other => Err(err(format!(
-                "unknown role '{other}' (expected driver, untrusted_input, key, data, service, timer or tpm)"
+                "unknown role '{other}' (expected driver, untrusted_input, key, data, service, timer, tpm or rng)"
             ))),
         }
     }
@@ -100,6 +105,11 @@ pub const PL011_PAGE: (u64, u64) = (0x900_0000, 0x1000);
 /// pinned at.
 pub const TIS_PAGE: (u64, u64) = (0xc00_0000, 0x1000);
 
+/// The virtio-rng page (M7 plan C6): QEMU virt's virtio-mmio slots 0-7,
+/// where `-device virtio-rng-device,bus=virtio-mmio-bus.0` sits and no
+/// other device does. The only page an rng mr may be pinned at.
+pub const RNG_PAGE: (u64, u64) = (0xa00_0000, 0x1000);
+
 #[derive(Debug, Clone)]
 pub enum MrPolicy {
     /// MMIO owned by exactly one driver, page-granular (L5). `phys_addr`
@@ -107,9 +117,11 @@ pub enum MrPolicy {
     /// (finding 3) and are what the board-RAM overlap check (finding 2)
     /// uses. `console` marks the one console page, owned by a `service`
     /// pd (L5 as amended by the M5 plan, C6); `tpm` the TIS page, owned by
-    /// a `tpm` pd (C9).
-    Device { owner: String, phys_addr: u64, size: u64, console: bool, tpm: bool },
-    /// DMA buffer owned by exactly one driver, never shared (L5).
+    /// a `tpm` pd (C9); `rng` the virtio-rng page, owned by an `rng` pd
+    /// (M7 plan C6).
+    Device { owner: String, phys_addr: u64, size: u64, console: bool, tpm: bool, rng: bool },
+    /// DMA buffer owned by exactly one driver (or the `rng` pd), never
+    /// shared (L5).
     Dma { owner: String },
     /// An MR holding static secrets, mapped only into its `key`-role owner
     /// (L2). Each key pd owns at most one.
@@ -131,6 +143,12 @@ impl MrPolicy {
     /// taint (L1, S14), keyed to the pin.
     pub fn is_tis(&self) -> bool {
         matches!(self, MrPolicy::Device { tpm: true, phys_addr, size, .. } if (*phys_addr, *size) == TIS_PAGE)
+    }
+
+    /// An rng mr pinned at the virtio-rng page: the entropy device is no
+    /// NIC and seeds no taint (L1 as amended by M7 plan C6), keyed to the pin.
+    pub fn is_rng_page(&self) -> bool {
+        matches!(self, MrPolicy::Device { rng: true, phys_addr, size, .. } if (*phys_addr, *size) == RNG_PAGE)
     }
 }
 
@@ -210,6 +228,8 @@ enum RawMr {
         console: bool,
         #[serde(default)]
         tpm: bool,
+        #[serde(default)]
+        rng: bool,
     },
     Dma { owner: String },
     // `Option` so a missing owner gets an L2-specific policy error rather
@@ -300,16 +320,21 @@ impl Policy {
         let mut secrets_owners: BTreeMap<String, String> = BTreeMap::new();
         for (name, mr) in raw.mrs {
             let policy_mr = match mr {
-                RawMr::Device { owner, phys_addr, size, console, tpm } => {
+                RawMr::Device { owner, phys_addr, size, console, tpm, rng } => {
                     require_pd(&pds, &owner)?;
                     let role = pds.get(&owner).map(|p| p.role);
                     // A service or tpm pd's devices are judged by the laws
                     // (only a console, C6, or the TIS page, C9), so a wrong
                     // one is a reported violation rather than an unloadable
                     // policy.
-                    if !role.is_some_and(|r| r.owns_hardware() || r == Role::Service || r == Role::Tpm) {
+                    if !role.is_some_and(|r| r.owns_hardware() || matches!(r, Role::Service | Role::Tpm | Role::Rng)) {
                         return Err(err(format!(
-                            "device mr '{name}' owner '{owner}' must have role 'driver', 'timer', 'service' or 'tpm'"
+                            "device mr '{name}' owner '{owner}' must have role 'driver', 'timer', 'service', 'tpm' or 'rng'"
+                        )));
+                    }
+                    if rng && role != Some(Role::Rng) {
+                        return Err(err(format!(
+                            "device mr '{name}' is marked rng but its owner '{owner}' is not an rng pd"
                         )));
                     }
                     if console && role != Some(Role::Service) {
@@ -328,10 +353,13 @@ impl Policy {
                     if phys_addr.checked_add(size).is_none() {
                         return Err(err(format!("device mr '{name}' phys_addr + size overflows a 64-bit address")));
                     }
-                    MrPolicy::Device { owner, phys_addr, size, console, tpm }
+                    MrPolicy::Device { owner, phys_addr, size, console, tpm, rng }
                 }
                 RawMr::Dma { owner } => {
-                    require_role(&pds, &owner, Role::Driver)?;
+                    require_pd(&pds, &owner)?;
+                    if !matches!(pds.get(&owner).map(|p| p.role), Some(Role::Driver | Role::Rng)) {
+                        return Err(err(format!("dma mr '{name}' owner '{owner}' must have role 'driver' or 'rng'")));
+                    }
                     MrPolicy::Dma { owner }
                 }
                 RawMr::Secrets { owner } => {

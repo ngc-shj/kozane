@@ -1269,7 +1269,7 @@ CASES = {
                            "---- tests::rst_never_dispatched_releases_after_pass_8 stdout ----"),
     # L9: RNDR failing means no handshake.
     "tls-rndr": (["unit"], lambda t: edit(t, "crates/tls-core/src/rng.rs",
-                                          "let rndr = self.hw.rndr().ok_or(RngError)?;", "let rndr = self.hw.rndr().unwrap_or(0);"),
+                                          "let rndr = self.hw.random().ok_or(RngError)?;", "let rndr = self.hw.random().unwrap_or(0);"),
                  "---- tests::tls_rndr_failure_means_no_handshake stdout ----"),
     # The PD's slots are reset in place (too large to rebuild on its stack):
     # a released slot whose session is not reset refuses the next client.

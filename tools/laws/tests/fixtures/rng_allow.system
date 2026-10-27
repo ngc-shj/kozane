@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <memory_region name="nic" size="0x1000" phys_addr="0xa003000" />
+    <memory_region name="rngdev" size="0x1000" phys_addr="0xa000000" />
+    <memory_region name="rngdma" size="0x1000" />
+    <memory_region name="secrets" size="0x1000" />
+    <protection_domain name="eth" priority="1" budget="1_000" period="10_000">
+        <program_image path="eth.elf" />
+        <map mr="nic" vaddr="0x2000000" perms="rw" cached="false" />
+    </protection_domain>
+    <protection_domain name="hs" priority="2" budget="1_000" period="10_000">
+        <program_image path="hs.elf" />
+    </protection_domain>
+    <protection_domain name="key" priority="3" passive="true">
+        <program_image path="key.elf" />
+        <map mr="secrets" vaddr="0x2000000" perms="r" />
+    </protection_domain>
+    <protection_domain name="rng" priority="5" passive="true">
+        <program_image path="rng.elf" />
+        <map mr="rngdev" vaddr="0x2000000" perms="rw" cached="false" />
+        <map mr="rngdma" vaddr="0x2100000" perms="rw" />
+        <setvar symbol="rng_dma_paddr" region_paddr="rngdma" />
+    </protection_domain>
+    <channel>
+        <end pd="eth" id="1" />
+        <end pd="hs" id="1" />
+    </channel>
+    <channel>
+        <end pd="hs" id="2" pp="true" notify="false" />
+        <end pd="key" id="1" pp="false" />
+    </channel>
+    <channel>
+        <end pd="key" id="2" pp="true" notify="false" />
+        <end pd="rng" id="1" pp="false" />
+    </channel>
+    <channel>
+        <end pd="hs" id="3" pp="true" notify="false" />
+        <end pd="rng" id="2" pp="false" />
+    </channel>
+</system>

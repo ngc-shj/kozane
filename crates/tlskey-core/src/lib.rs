@@ -117,7 +117,7 @@ pub enum BootError {
     /// certificate's.
     Mismatch,
     /// RNDR failed while drawing the boot seed's samples.
-    RndrUnavailable,
+    RngUnavailable,
     /// The region is not a sealed envelope of `tlskey`'s kind (M5 plan C11:
     /// a plaintext blob is refused here).
     EnvelopeInvalid,
@@ -139,7 +139,7 @@ pub enum BootError {
 impl From<UnsealError> for BootError {
     fn from(e: UnsealError) -> Self {
         match e {
-            UnsealError::Rndr => BootError::RndrUnavailable,
+            UnsealError::Rng => BootError::RngUnavailable,
             UnsealError::EnvelopeInvalid => BootError::EnvelopeInvalid,
             UnsealError::TpmUnavailable => BootError::TpmUnavailable,
             UnsealError::SrkMismatch => BootError::SrkMismatch,
@@ -163,7 +163,7 @@ impl BootError {
             BootError::Blob(BlobError::TooSmall) => "tls secrets: region too small",
             BootError::ScalarInvalid => "tls secrets: the TLS key is not a valid P-256 scalar",
             BootError::Mismatch => "tls secrets: the TLS key does not match the certificate",
-            BootError::RndrUnavailable => "RNDR unavailable",
+            BootError::RngUnavailable => "rng unavailable",
             BootError::EnvelopeInvalid => "tls secrets: not a sealed envelope for tlskey",
             BootError::TpmUnavailable => "tls secrets: tpm unavailable",
             BootError::SrkMismatch => "tls secrets: sealed to another TPM",
@@ -190,7 +190,7 @@ impl BootError {
                 BootError::Blob(BlobError::TooSmall) => 6,
                 BootError::ScalarInvalid => 7,
                 BootError::Mismatch => 8,
-                BootError::RndrUnavailable => 9,
+                BootError::RngUnavailable => 9,
                 BootError::EnvelopeInvalid => 11,
                 BootError::TpmUnavailable => 12,
                 BootError::SrkMismatch => 13,
@@ -293,7 +293,7 @@ pub fn per_boot_seed(blob: &Blob<'_>, hw: &mut impl Hw, out: &mut Secret<32>) ->
     // Wipes itself on drop (tpm2::Secret), on every return.
     let mut samples = Secret::<{ SEED_SAMPLES * 8 }>::zero();
     if !hw.fill_random(samples.as_mut_bytes()) {
-        return Err(BootError::RndrUnavailable);
+        return Err(BootError::RngUnavailable);
     }
     *out.as_mut_bytes() = secret_blob::blake2s(&[blob.boot_seed(), samples.as_bytes(), &hw.cntpct().to_le_bytes()]);
     Ok(())

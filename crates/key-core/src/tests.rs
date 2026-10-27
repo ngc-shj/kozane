@@ -94,7 +94,7 @@ fn boot_error_messages_are_distinct() {
 fn all_boot_errors(next: impl Fn(BlobError) -> Option<BlobError>) -> [BootError; 17] {
     let mut all = [BootError::GatewayKeyMismatch; 17];
     all[1] = BootError::PeerMismatch;
-    all[2] = BootError::RndrUnavailable;
+    all[2] = BootError::RngUnavailable;
     all[3] = BootError::SeedDerivation;
     all[4] = BootError::EnvelopeInvalid;
     all[5] = BootError::TpmUnavailable;
@@ -147,7 +147,7 @@ fn boot_error_codes_are_distinct_nonzero_and_fit_the_unavailable_label() {
 fn each_unseal_failure_has_its_own_boot_error() {
     use tpm2::boot::UnsealError;
     let all = [
-        UnsealError::Rndr,
+        UnsealError::Rng,
         UnsealError::EnvelopeInvalid,
         UnsealError::TpmUnavailable,
         UnsealError::SrkMismatch,
@@ -157,7 +157,7 @@ fn each_unseal_failure_has_its_own_boot_error() {
         UnsealError::CapFailed,
     ];
     assert_eq!(all.len(), core::mem::variant_count::<UnsealError>());
-    assert_eq!(BootError::from(UnsealError::Rndr), BootError::RndrUnavailable);
+    assert_eq!(BootError::from(UnsealError::Rng), BootError::RngUnavailable);
     assert_eq!(BootError::from(UnsealError::SrkMismatch).code(), 13);
     assert_eq!(BootError::from(UnsealError::UnsealRefused).code(), 14);
     for (i, a) in all.iter().enumerate() {
@@ -335,6 +335,6 @@ fn boot_with_rndr_failing_after_validation_is_refused() {
     let peers = peer_publics();
     assert!(matches!(
         Oracle::boot(&r, &gw_public(), peers.iter(), &mut FakeEntropy(false)),
-        Err(BootError::RndrUnavailable)
+        Err(BootError::RngUnavailable)
     ));
 }

@@ -23,9 +23,9 @@ policy := policy/laws.toml
 loader := $(BUILD)/loader.img
 counts := $(BUILD)/counts
 
-pds := eth-out eth-in ingress audit timer tpm key hs inner data pq pqkey tls tlskey
-host_crates := wire ring audit-event ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct limits tlskey-core secret
-kani_crates := wire ring ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire
+pds := eth-out eth-in ingress audit timer tpm rng key hs inner data pq pqkey tls tlskey
+host_crates := wire ring rng-core audit-event drbg ingress-core inner-core layout laws config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct limits tlskey-core secret
+kani_crates := wire ring drbg rng-core ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire
 
 .PHONY: clean-counts
 .PHONY: all image package run test check check-selftest repro mir audit lint lint-pds unit kani verus ct ct-harness ct-shape bolero fuzz-long laws pins manifest kernel-config clean
@@ -132,7 +132,8 @@ RUN_PORT ?= 51820
 # Build the default image; another LOADER= is booted as is.
 run: $(if $(filter $(loader),$(LOADER)),image)
 	qemu-system-aarch64 \
-		-machine virt,virtualization=on -cpu neoverse-n2 -m size=2G \
+		-machine virt,virtualization=on -cpu cortex-a72 -m size=2G \
+		-object rng-random,id=rng0,filename=/dev/urandom -device virtio-rng-device,rng=rng0,bus=virtio-mmio-bus.0 \
 		-serial mon:stdio -nographic \
 		-device loader,file=$(LOADER),addr=0x70000000,cpu-num=0 \
 		-device virtio-net-device,netdev=n0,mac=52:54:00:12:34:56,bus=virtio-mmio-bus.31 \

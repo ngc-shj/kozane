@@ -507,11 +507,13 @@ impl KeySigner<'_> {
     }
 }
 
-struct Hw;
+/// `Hedged`'s hardware: the DRBG `rng` seeds (M7 plan C7) where RNDR was,
+/// and CNTPCT.
+struct Hw(rng_client::Entropy);
 
 impl HedgeHw for Hw {
-    fn rndr(&mut self) -> Option<u64> {
-        cpu::rndr()
+    fn random(&mut self) -> Option<u64> {
+        self.0.u64()
     }
     fn counter(&mut self) -> u64 {
         cpu::cntpct()
@@ -668,11 +670,13 @@ fn init() -> Tls {
     }
     // The boot seed is `tls`'s first call to `tlskey`: an Unavailable
     // `tlskey` shows here, audited once, and tls halts before listening.
-    let mut rng = Hedged::new(boot_seed(&mut audit), Hw);
+    let hw = Hw(rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG))
+        .unwrap_or_else(|_| audit.halt(halt::RNG_UNAVAILABLE)));
+    let mut rng = Hedged::new(boot_seed(&mut audit), hw);
     // One ISN seed per interface (smoltcp's PCG32, RM6-7).
     let (mut seed, mut inside_seed) = ([0u8; 8], [0u8; 8]);
     if rng.fill(&mut seed).is_err() || rng.fill(&mut inside_seed).is_err() {
-        audit.halt(halt::RNDR);
+        audit.halt(halt::RNG);
     }
     let mut outside = Link::new(rx, tx, client_rst);
     let mut inside = Link::new(from_inner, to_inner, backend_rst);

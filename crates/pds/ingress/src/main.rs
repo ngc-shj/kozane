@@ -164,10 +164,20 @@ mod halt {
     pub const COOKIE_KEY: u32 = 3;
     /// The Rosenpass mac key could not be derived.
     pub const RP_MAC_KEY: u32 = 4;
-    /// RNDR failed: no WireGuard cookie secret.
+    /// A draw failed: no WireGuard cookie secret.
     pub const COOKIE_SECRET: u32 = 5;
-    /// RNDR failed: no Rosenpass cookie secret.
+    /// A draw failed: no Rosenpass cookie secret.
     pub const RP_COOKIE_SECRET: u32 = 6;
+    /// `rng` gave no seed in `RNG_INIT_TRIES` tries (M7 plan C7).
+    pub const RNG_UNAVAILABLE: u32 = 7;
+}
+
+/// The cookie secrets' randomness (M7 plan C7): the DRBG `rng` seeds,
+/// where RNDR was; a `Global` because the cookie adapters take a plain `fn`.
+static ENTROPY: rng_client::Global = rng_client::Global::new();
+
+fn fill_random(out: &mut [u8]) -> bool {
+    ENTROPY.fill(out)
 }
 
 #[protection_domain]
@@ -233,14 +243,17 @@ fn init() -> Ingress {
         // Without a clock the cookie secret would never age out (L12).
         audit.halt(halt::NO_CLOCK);
     }
+    let entropy = rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG))
+        .unwrap_or_else(|_| audit.halt(halt::RNG_UNAVAILABLE));
+    ENTROPY.set(Some(entropy));
     let key = crypto::hash(&[LABEL_MAC1, &config::GATEWAY_PUBLIC]).unwrap_or_else(|_| audit.halt(halt::MAC1_KEY));
-    let mut cookies = CookieAdapter::new(&config::GATEWAY_PUBLIC, cpu::fill_random)
+    let mut cookies = CookieAdapter::new(&config::GATEWAY_PUBLIC, fill_random)
         .unwrap_or_else(|_| audit.halt(halt::COOKIE_KEY));
     // Only the 32-byte mac and cookie keys are kept; `spkm` itself is read
     // here once.
     let spkm = config::gateway_rp_public!();
     let rp_mac = RpMacKey::new(spkm).unwrap_or_else(|_| audit.halt(halt::RP_MAC_KEY));
-    let mut rp_cookie = RpCookieAdapter::new(spkm, cpu::fill_random);
+    let mut rp_cookie = RpCookieAdapter::new(spkm, fill_random);
     let mut gate = Gate::default();
     if !gate.tick_if_due(&mut cookies, cpu::now_ns(), 0).rotated {
         audit.halt(halt::COOKIE_SECRET);

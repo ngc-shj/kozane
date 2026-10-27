@@ -235,7 +235,7 @@ struct FakeHw {
 }
 
 impl HedgeHw for FakeHw {
-    fn rndr(&mut self) -> Option<u64> {
+    fn random(&mut self) -> Option<u64> {
         self.rndr
     }
     fn counter(&mut self) -> u64 {
@@ -1140,7 +1140,7 @@ fn append_head_moves_application_data_into_the_head_buffer_up_to_its_room() {
 fn a_sign_answered_unavailable_halts_tls_with_its_code_and_key_unavailable() {
     assert_eq!(crate::halt::after_sign(Some(0x48)), Some((0x48, crate::halt::KEY_UNAVAILABLE)));
     assert_eq!(crate::halt::after_sign(None), None);
-    let reasons = [crate::halt::NO_CLOCK, crate::halt::RNDR, crate::halt::INIT_FAILED, crate::halt::KEY_UNAVAILABLE];
+    let reasons = [crate::halt::NO_CLOCK, crate::halt::RNG, crate::halt::INIT_FAILED, crate::halt::KEY_UNAVAILABLE];
     assert_eq!(reasons, [1, 2, 3, 4]);
 }
 

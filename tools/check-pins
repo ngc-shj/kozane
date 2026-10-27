@@ -114,6 +114,12 @@ Rules:
      CONFIG_EFI_TCG2_PROTOCOL (no event-log replay); tests/integration/run.py
      spells "-bios" once, in qemu_machine, the one builder of the QEMU
      command line, which refuses any firmware but `make firmware`'s
+  P25 no RNDR (M7 plan C7, D3): in crates/ (*.rs, Cargo.toml) no RNDR
+     encoding (`s3_3_c2_c4_0`) and none of the removed API (`cpu::rndr`,
+     `cpu::fill_random`, `fn rndr`); and outside docs/ no `neoverse-n2`,
+     the RNDR core the platform left (the CPU is cortex-a72, which faults
+     on RNDR). A best-effort tripwire over source text: the CPU faulting is
+     the enforcement
 
 Pending rules (PENDING) run and print "pending <rule> ..." lines but do not
 fail until they are removed from PENDING; --enforce-pending makes them fail
@@ -163,6 +169,7 @@ the only guard for pqkey-core's wrappers. L8's adjudicating control is
 
 import argparse
 import collections
+import os
 import pathlib
 import re
 import sys
@@ -173,7 +180,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P18",
-         "P19", "P20", "P21", "P22", "P23", "P24"]
+         "P19", "P20", "P21", "P22", "P23", "P24", "P25"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
                "crates/tls-core", "crates/tlskey-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data",
@@ -990,6 +997,32 @@ def check_firmware(root: pathlib.Path, out: list):
                    "the firmware")
 
 
+# P25: RNDR gone from the source and the platform.
+RNDR_FORBIDDEN = re.compile(r"s3_3_c2_c4_0|\bcpu::rndr\b|\bcpu::fill_random\b|\bfn rndr\b")
+OLD_CPU_SKIP = ("docs", "build", "target", ".git", ".claude", "third_party")
+
+
+def check_no_rndr(root: pathlib.Path, out: list):
+    for rel, text in crate_sources(root, "crates"):
+        for n, line in enumerate(text.splitlines(), 1):
+            if RNDR_FORBIDDEN.search(line):
+                out.append(f"P25 {rel}:{n}: RNDR or its removed API; PDs draw from the rng-seeded DRBG (M7 plan C7)")
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if d not in OLD_CPU_SKIP and not d.startswith("target"))
+        for name in sorted(filenames):
+            p = pathlib.Path(dirpath) / name
+            rel = p.relative_to(root)
+            if rel in (pathlib.Path("tools/check-pins"), pathlib.Path("tests/tools/test_check_pins.py")):
+                continue
+            try:
+                text = p.read_text()
+            except (UnicodeDecodeError, OSError):
+                continue
+            for n, line in enumerate(text.splitlines(), 1):
+                if "neoverse-n2" in line:
+                    out.append(f"P25 {rel}:{n}: neoverse-n2 (an RNDR core); the platform CPU is cortex-a72 (M7 plan D3)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
@@ -1023,6 +1056,7 @@ def main() -> int:
     check_cap_barrier(root, out)
     check_old_name(root, out)
     check_firmware(root, out)
+    check_no_rndr(root, out)
     failing = [l for l in out if l.split()[0] not in pending]
     for line in out:
         print(line if line in failing else f"pending {line}")

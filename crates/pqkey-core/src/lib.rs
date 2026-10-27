@@ -138,7 +138,7 @@ pub enum BootError {
     Blob(BlobError),
     SpkmMismatch,
     KatMismatch,
-    RndrUnavailable,
+    RngUnavailable,
     /// The secrets region is not a sealed envelope of `pqkey`'s kind (M5
     /// plan C11: a plaintext blob is refused here).
     EnvelopeInvalid,
@@ -160,7 +160,7 @@ pub enum BootError {
 impl From<UnsealError> for BootError {
     fn from(e: UnsealError) -> Self {
         match e {
-            UnsealError::Rndr => BootError::RndrUnavailable,
+            UnsealError::Rng => BootError::RngUnavailable,
             UnsealError::EnvelopeInvalid => BootError::EnvelopeInvalid,
             UnsealError::TpmUnavailable => BootError::TpmUnavailable,
             UnsealError::SrkMismatch => BootError::SrkMismatch,
@@ -179,7 +179,7 @@ impl BootError {
             BootError::Blob(e) => e.message(),
             BootError::SpkmMismatch => "pq secrets: public key hash does not match the configuration",
             BootError::KatMismatch => "pq secrets: boot KAT decapsulation mismatch",
-            BootError::RndrUnavailable => "RNDR unavailable",
+            BootError::RngUnavailable => "rng unavailable",
             BootError::EnvelopeInvalid => "pq secrets: not a sealed envelope for pqkey",
             BootError::TpmUnavailable => "pq secrets: tpm unavailable",
             BootError::SrkMismatch => "pq secrets: sealed to another TPM",
@@ -202,7 +202,7 @@ impl BootError {
             BootError::Blob(BlobError::TooSmall) => 6,
             BootError::SpkmMismatch => 7,
             BootError::KatMismatch => 8,
-            BootError::RndrUnavailable => 9,
+            BootError::RngUnavailable => 9,
             // The unseal codes are `key-core`'s, so one failure reads the
             // same from `hs` and from `pq` (10 is unused here).
             BootError::EnvelopeInvalid => 11,
@@ -264,7 +264,7 @@ pub fn validate<'a>(region: &'a [u8], spkm_hash: &[u8; 32]) -> Result<Blob<'a>, 
 pub fn boot_seed(blob_seed: &[u8; 32], entropy: &mut impl BootEntropy) -> Result<Zeroizing<[u8; 32]>, BootError> {
     let mut samples = Zeroizing::new([0u8; SEED_SAMPLES * 8]);
     if !entropy.fill_random(&mut samples[..]) {
-        return Err(BootError::RndrUnavailable);
+        return Err(BootError::RngUnavailable);
     }
     let cntpct = entropy.cntpct().to_le_bytes();
     Ok(Zeroizing::new(blake2s(&[BOOT_SEED_LABEL, blob_seed, &samples[..], &cntpct])))

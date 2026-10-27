@@ -12,5 +12,6 @@ hs-core = { path = "../../hs-core" }
 key-core = { path = "../../key-core" }
 layout = { path = "../../layout" }
 pdkit = { path = "../../pdkit" }
+rng-client = { path = "../../rng-client" }
 sel4-microkit = { workspace = true }
 wg-core = { path = "../../wg-core" }

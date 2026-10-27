@@ -71,6 +71,7 @@ fn audit_rings_fit_their_regions() {
 fn dma_regions_match() {
     assert_eq!(mr_sizes()["eth_out_dma"], ETH_OUT_DMA_SIZE);
     assert_eq!(mr_sizes()["eth_in_dma"], ETH_IN_DMA_SIZE);
+    assert_eq!(mr_sizes()["rng_dma"], RNG_DMA_SIZE);
 }
 
 #[test]
@@ -80,7 +81,7 @@ fn every_region_is_a_link_an_audit_ring_or_a_named_singleton() {
         .flat_map(|l| ["used", "free", "data"].map(|s| std::format!("{l}_{s}")))
         .chain(AUDITS.iter().map(|a| String::from(*a)))
         .chain(
-            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "tpm_mmio", "secrets", "pq_secrets", "tls_secrets"]
+            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "tpm_mmio", "rng_mmio", "rng_dma", "secrets", "pq_secrets", "tls_secrets"]
                 .map(String::from),
         )
         .collect();
@@ -210,6 +211,13 @@ fn channel_ids_match_layout() {
         (("tls", tls::CH_TLSKEY), ("tlskey", tlskey::CH_TLS)),
         (("tlskey", tlskey::CH_TPM), ("tpm", tpm::CH_TLSKEY)),
         (("tls", tls::CH_AUDIT), ("audit", audit::CH_TLS)),
+        (("hs", hs::CH_RNG), ("rng", rng::CH_HS)),
+        (("pq", pq::CH_RNG), ("rng", rng::CH_PQ)),
+        (("ingress", ingress::CH_RNG), ("rng", rng::CH_INGRESS)),
+        (("tls", tls::CH_RNG), ("rng", rng::CH_TLS)),
+        (("key", key::CH_RNG), ("rng", rng::CH_KEY)),
+        (("pqkey", pqkey::CH_RNG), ("rng", rng::CH_PQKEY)),
+        (("tlskey", tlskey::CH_RNG), ("rng", rng::CH_TLSKEY)),
     ];
     for (a, b) in expected {
         assert!(has_channel(a, b), "{a:?} <-> {b:?}");

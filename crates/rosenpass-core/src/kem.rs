@@ -22,7 +22,7 @@ pub trait Rng {
 /// What `Hedged` reads from the hardware: RNDR (None when it fails) and a
 /// free-running counter.
 pub trait HedgeHw {
-    fn rndr(&mut self) -> Option<u64>;
+    fn random(&mut self) -> Option<u64>;
     fn counter(&mut self) -> u64;
 }
 
@@ -46,7 +46,7 @@ impl<H: HedgeHw> Hedged<H> {
 impl<H: HedgeHw> Rng for Hedged<H> {
     fn fill(&mut self, out: &mut [u8]) -> Result<(), RngError> {
         for chunk in out.chunks_mut(KEY_LEN) {
-            let rndr = self.hw.rndr().ok_or(RngError)?;
+            let rndr = self.hw.random().ok_or(RngError)?;
             self.draws = self.draws.checked_add(1).ok_or(RngError)?;
             let mut block = Secret::<KEY_LEN>::zero();
             crate::crypto::blake2b(

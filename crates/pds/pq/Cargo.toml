@@ -11,6 +11,7 @@ cpu = { path = "../../cpu" }
 layout = { path = "../../layout" }
 msgs = { path = "../../msgs" }
 pdkit = { path = "../../pdkit" }
+rng-client = { path = "../../rng-client" }
 pqkey-core = { path = "../../pqkey-core" }
 ring = { path = "../../ring" }
 rosenpass-core = { path = "../../rosenpass-core" }

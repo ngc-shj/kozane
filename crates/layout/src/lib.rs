@@ -19,6 +19,13 @@ pub const ETH_OUT_MMIO_OFFSET: usize = 0xe00;
 /// GIC interrupt of QEMU virt virtio-mmio slot 31 (SPI 47).
 pub const ETH_OUT_IRQ: usize = 79;
 
+/// Bytes of the `rng_dma` region (the virtqueue and its bounce buffers;
+/// M7 plan C6).
+pub const RNG_DMA_SIZE: usize = 0x200_000;
+/// virtio-rng sits on virtio-mmio slot 0 (`bus=virtio-mmio-bus.0`), at the
+/// start of its page, which no other device shares.
+pub const RNG_MMIO_OFFSET: usize = 0;
+
 /// Inside NIC: virtio-mmio slot 23 (0xa002e00, own page), placed with QEMU
 /// `bus=virtio-mmio-bus.23`; GIC interrupt 48 + 23.
 pub const ETH_IN_DMA_SIZE: usize = 0x200_000;
@@ -55,6 +62,7 @@ pub mod ingress {
     pub const CH_TIMER: usize = 5;
     pub const CH_PQ: usize = 6;
     pub const CH_TLS: usize = 7;
+    pub const CH_RNG: usize = 8;
 }
 
 pub mod audit {
@@ -83,6 +91,7 @@ pub mod timer {
 pub mod key {
     pub const CH_HS: usize = 1;
     pub const CH_TPM: usize = 3;
+    pub const CH_RNG: usize = 4;
 }
 
 pub mod hs {
@@ -92,6 +101,7 @@ pub mod hs {
     pub const CH_TIMER: usize = 4;
     pub const CH_AUDIT: usize = 5;
     pub const CH_PQ: usize = 6;
+    pub const CH_RNG: usize = 7;
 }
 
 pub mod data {
@@ -116,6 +126,7 @@ pub mod pq {
     pub const CH_HS: usize = 3;
     pub const CH_TIMER: usize = 4;
     pub const CH_AUDIT: usize = 5;
+    pub const CH_RNG: usize = 6;
 }
 
 /// M6: the HTTPS endpoint (plan C1, C3): TCP and TLS on packets `ingress`
@@ -127,18 +138,37 @@ pub mod tls {
     pub const CH_TIMER: usize = 3;
     pub const CH_TLSKEY: usize = 4;
     pub const CH_AUDIT: usize = 5;
+    pub const CH_RNG: usize = 6;
 }
 
 /// M6: the TLS signing oracle (plan C12), a passive key-role PD.
 pub mod tlskey {
     pub const CH_TLS: usize = 1;
     pub const CH_TPM: usize = 3;
+    pub const CH_RNG: usize = 4;
 }
 
 /// M3: the McEliece decapsulation oracle (plan C2), a passive key-role PD.
 pub mod pqkey {
     pub const CH_PQ: usize = 1;
     pub const CH_TPM: usize = 3;
+    pub const CH_RNG: usize = 4;
+}
+
+/// M7: the entropy driver (plan C6), callee of the PDs that draw
+/// randomness; one id per caller, `rng_core::Caller`'s order. One PPC label:
+/// `SEED` (no words in) answers `SEED` with the 32-byte seed in four words,
+/// or `UNAVAILABLE` with the reason code in one.
+pub mod rng {
+    pub const CH_HS: usize = 1;
+    pub const CH_PQ: usize = 2;
+    pub const CH_INGRESS: usize = 3;
+    pub const CH_TLS: usize = 4;
+    pub const CH_KEY: usize = 5;
+    pub const CH_PQKEY: usize = 6;
+    pub const CH_TLSKEY: usize = 7;
+    pub const SEED: u64 = 0;
+    pub const UNAVAILABLE: u64 = 1;
 }
 
 /// M5: the TPM driver (plan C9), callee of the key PDs only, and its

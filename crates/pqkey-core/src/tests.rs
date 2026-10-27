@@ -163,10 +163,10 @@ fn malformed_region_reports_the_blob_error() {
 }
 
 #[test]
-fn rndr_failure_halts_the_boot() {
+fn rng_failure_halts_the_boot() {
     let r = region_a();
     let mut e = FakeEntropy { random: None, cntpct: 1 };
-    assert_eq!(Oracle::boot(&r[..], PK_HASH_A, &mut e).err(), Some(BootError::RndrUnavailable));
+    assert_eq!(Oracle::boot(&r[..], PK_HASH_A, &mut e).err(), Some(BootError::RngUnavailable));
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn boot_error_messages_are_distinct() {
     let all = [
         BootError::SpkmMismatch,
         BootError::KatMismatch,
-        BootError::RndrUnavailable,
+        BootError::RngUnavailable,
         BootError::EnvelopeInvalid,
         BootError::TpmUnavailable,
         BootError::SrkMismatch,
@@ -206,7 +206,7 @@ fn boot_error_messages_are_distinct() {
 fn unseal_failures_carry_key_cores_codes() {
     use tpm2::boot::UnsealError;
     let all = [
-        UnsealError::Rndr,
+        UnsealError::Rng,
         UnsealError::EnvelopeInvalid,
         UnsealError::TpmUnavailable,
         UnsealError::SrkMismatch,
@@ -226,7 +226,7 @@ fn unseal_failures_carry_key_cores_codes() {
 fn key_core_code(e: tpm2::boot::UnsealError) -> u32 {
     use tpm2::boot::UnsealError;
     match e {
-        UnsealError::Rndr => 9,
+        UnsealError::Rng => 9,
         UnsealError::EnvelopeInvalid => 11,
         UnsealError::TpmUnavailable => 12,
         UnsealError::SrkMismatch => 13,

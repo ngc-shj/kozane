@@ -381,7 +381,7 @@ fn a_tpm_mapping_a_non_device_mr_is_l1() {
 fn a_second_pp_channel_from_a_key_pd_is_l1() {
     assert_deny_exactly(
         "tpm_key_second_pp_deny",
-        &["L1: key pd 'key' has 2 channels with pp=true on its own end, at most one (to a tpm pd)"],
+        &["L1: key pd 'key' has 2 channels with pp=true on its own end towards a tpm pd; at most one to a tpm pd and one to an rng pd"],
     );
 }
 
@@ -791,3 +791,81 @@ fn virtual_machine_alone_is_l4() {
 fn smc_alone_is_l4() {
     assert_deny("smc_deny", &["L4"]);
 }
+
+// M7 plan C6, C10: the `rng` role.
+#[test]
+fn rng_called_by_key_and_a_tainted_pd_is_allowed() {
+    assert_allow("rng_allow");
+}
+
+#[test]
+fn rng_sharing_an_mr_with_a_caller_is_l1() {
+    assert_deny("rng_shared_mr_deny", &["L1", "L13"]);
+}
+
+#[test]
+fn rng_with_a_notifying_peer_is_l1() {
+    assert_deny("rng_peer_notify_deny", &["L1", "L13"]);
+}
+
+#[test]
+fn a_key_calling_rng_without_pp_is_l1() {
+    assert_deny_exactly(
+        "rng_key_no_pp_deny",
+        &[
+            "L1: channel between key pd 'key' and 'rng' does not meet the key exemption (peer pp=true, key pp=false, \
+             peer notify=false, key maps only the secrets mr)",
+            "L1: channel between rng pd 'rng' and 'key' does not meet the rng exemption (peer pp=true, rng pp=false, \
+             peer notify=false, rng maps only its device and dma mrs)",
+        ],
+    );
+}
+
+#[test]
+fn a_tainted_pd_calling_rng_without_pp_is_l1() {
+    assert_deny("rng_hs_no_pp_deny", &["L1", "L13"]);
+}
+
+#[test]
+fn a_key_with_two_pp_channels_to_rng_pds_is_l1() {
+    assert_deny_exactly(
+        "rng_two_from_key_deny",
+        &["L1: key pd 'key' has 2 channels with pp=true on its own end towards an rng pd; at most one to a tpm pd \
+           and one to an rng pd"],
+    );
+}
+
+#[test]
+fn a_data_pd_calling_rng_is_l1() {
+    assert_deny_exactly(
+        "rng_data_caller_deny",
+        &["L1: rng pd 'rng' has a channel to 'data', which is not a key or untrusted_input pd"],
+    );
+}
+
+#[test]
+fn an_rng_mr_off_the_virtio_rng_page_is_l5() {
+    assert_deny("rng_page_elsewhere_deny", &["L1", "L5", "L13"]);
+}
+
+#[test]
+fn an_rng_pd_owning_a_second_device_is_l5() {
+    assert_deny("rng_second_device_deny", &["L1", "L5", "L13"]);
+}
+
+#[test]
+fn the_rng_page_mapped_by_another_pd_is_l5() {
+    assert_deny("rng_page_mapped_by_hs_deny", &["L1", "L5", "L13"]);
+}
+
+#[test]
+fn rng_below_one_of_its_callers_is_l13() {
+    assert_deny_exactly(
+        "rng_below_caller_deny",
+        &[
+            "L13: pd 'hs' (priority 2) must be strictly below pd 'rng' (priority 1)",
+            "L13: pd 'key' (priority 3) must be strictly below pd 'rng' (priority 1)",
+        ],
+    );
+}
+

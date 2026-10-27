@@ -63,7 +63,7 @@ impl Transport for Ppc {
     }
 
     fn random(&mut self, out: &mut [u8]) -> bool {
-        cpu::fill_random(out)
+        ENTROPY.fill(out)
     }
 }
 
@@ -86,7 +86,7 @@ struct CpuHw;
 
 impl Hw for CpuHw {
     fn fill_random(&mut self, out: &mut [u8]) -> bool {
-        cpu::fill_random(out)
+        ENTROPY.fill(out)
     }
 
     fn cntpct(&mut self) -> u64 {
@@ -130,8 +130,14 @@ fn scrub_stack() {
     area.zeroize();
 }
 
+/// The unseal's salt and the boot seed's randomness (M7 plan C7): the DRBG
+/// `rng` seeds, where RNDR was. Empty when `rng` gave no seed: the unseal
+/// then fails on its salt (and `tpm` still gets this PD's Failed).
+static ENTROPY: rng_client::Global = rng_client::Global::new();
+
 #[protection_domain]
 fn init() -> TlsKey {
+    ENTROPY.set(rng_client::Entropy::instantiate(Channel::new(ch::CH_RNG)).ok());
     let booted = boot();
     // The scalar check's P-256 frames held the scalar, accepted or refused
     // (M6 plan C5, F-N-b).

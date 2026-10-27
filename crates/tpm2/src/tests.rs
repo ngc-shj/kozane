@@ -917,7 +917,7 @@ fn a_failed_random_source_is_rndr() {
     let mut ppc = FakePpc::new(&env);
     ppc.random_ok = false;
     let (r, _) = boot_unseal(&env, &mut ppc);
-    assert_eq!(r, Err(UnsealError::Rndr));
+    assert_eq!(r, Err(UnsealError::Rng));
     assert_eq!(ppc.calls, [(ipc::REQ_FAILED, 0)]);
 }
 
