@@ -302,3 +302,35 @@ The full `make check` and selftest are the combined long run (slice 6).
   - A worktree cannot serve the container runs: its `.git` file names
     the host path, which the container cannot resolve, and the selftest
     cases read git.
+- **The long run at 728083c: green.**
+  - **`make check`** passed on gx10 in 58 min, with the Kani and Verus
+    caches warm from the first run.
+  - **The selftest, split by host:**
+    - qemu, 41, on z1mn;
+    - solver, 16, on z1mn;
+    - pds, 7, and rest 1–3, 39 each, on gx10;
+    - rest 4, 39, on mrx33.
+  - **The merge:** `SELFTEST-LAYERS 220`. Every case ran exactly once,
+    every instance exited and printed its count, and all of them ran at
+    728083c.
+  - **A start-up slip:** mrx33's first start failed at `git rev-parse` in
+    the container (Docker Desktop's file sharing, just after the
+    checkout). A restart ran clean.
+- **The needle check (T16).** It searched for every failure-expecting
+  needle in the green `make check` logs.
+  - **Eleven hits, nine of them in `pins.log`:** the fixture suites print
+    the messages they expect. Seven of those cases clear `build/counts`
+    and run gates that do not print that log, so their needles cannot
+    match by accident there.
+  - **`check-propagation`'s empty needle:** its verdict is the
+    propagation run, not a needle.
+  - **Two cases were weak:**
+    - `pins`' needle `P5` appears in every green pins run, in the fixture
+      lines;
+    - `laws`' needle `L4` matches inside `seL4`.
+    Both now use the checker's own message, `recipe error-ignore prefix`
+    and `L4: unsupported element <selftest_unknown>`, which are absent
+    from the green logs. Both cases are red with the new needles.
+  - **Four regex needles** timed out in the check; they are `(?=.*A)
+    (?=.*B)` lookaheads over 1 MB. `RESIDUE-HIT` occurs nowhere in the
+    green logs.
