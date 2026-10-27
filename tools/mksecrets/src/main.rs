@@ -26,13 +26,14 @@
 //! scalar (the TLS key failure case, M6 plan C12 case 8).
 //!
 //! `mksecrets seal` seals one of those blobs offline into its envelope (M5
-//! plan C11) for one TPM and one expected PCR 8:
+//! plan C11) for one TPM and one expected set of PCRs 0-8 (M7 plan C4):
 //!
-//!   mksecrets seal --kind key|pq|tls --blob FILE --srk-public FILE --pcr8 HEX --out FILE
+//!   mksecrets seal --kind key|pq|tls --blob FILE --srk-public FILE --pcrs HEX,...,HEX --out FILE
 //!
 //! The SRK public is the TPM2B_PUBLIC `tpm2_readpublic -o` writes for the
-//! SRK (the storage template `tpm2::envelope` pins); PCR 8 is the hex value
-//! `tools/package` writes to `pcr8`. Every envelope gets a fresh KEK,
+//! SRK (the storage template `tpm2::envelope` pins); the PCRs are the nine
+//! comma-separated hex values, PCR 0 first, `tools/package` writes to
+//! `pcrs`. Every envelope gets a fresh KEK,
 //! obfuscation seed and ECDH scalar from /dev/urandom (S13). The envelope
 //! is public; OUT must not exist yet.
 //!
@@ -657,14 +658,26 @@ fn srk_public(tpm2b: &[u8]) -> Result<&[u8], String> {
     Ok(public)
 }
 
-fn pcr8(hex: &str) -> Result<[u8; 32], String> {
-    let hex = hex.trim();
+fn pcr(hex: &str) -> Result<[u8; 32], String> {
     let mut out = [0u8; 32];
     if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
-        return Err("--pcr8: expected 64 hex digits".into());
+        return Err("--pcrs: each PCR is 64 hex digits".into());
     }
     for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| "--pcr8: not hex")?;
+        *b = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16).map_err(|_| "--pcrs: not hex")?;
+    }
+    Ok(out)
+}
+
+/// `--pcrs`: exactly the values of PCRs 0-8, in index order.
+fn pcrs(list: &str) -> Result<tpm2::crypto::PolicyPcrs, String> {
+    let values: Vec<&str> = list.trim().split(',').collect();
+    if values.len() != tpm2_wire::POLICY_PCR_COUNT {
+        return Err(format!("--pcrs: {} values, expected PCRs 0-8 ({})", values.len(), tpm2_wire::POLICY_PCR_COUNT));
+    }
+    let mut out = [[0u8; 32]; tpm2_wire::POLICY_PCR_COUNT];
+    for (o, v) in out.iter_mut().zip(values) {
+        *o = pcr(v)?;
     }
     Ok(out)
 }
@@ -700,7 +713,7 @@ fn read_blob(path: &Path, kind: Kind, region: &mut [u8]) -> Result<(), String> {
 }
 
 /// Seals the blob at `blob` into its envelope.
-fn seal_file(kind: Kind, blob: &Path, srk_public: &[u8], pcr8: &[u8; 32]) -> Result<Vec<u8>, String> {
+fn seal_file(kind: Kind, blob: &Path, srk_public: &[u8], pcrs: &tpm2::crypto::PolicyPcrs) -> Result<Vec<u8>, String> {
     let mut region = Secret::<{ pq::REGION_SIZE }>::zero();
     let region = region.as_mut_bytes().get_mut(..kind.region_size()).ok_or("region size")?;
     read_blob(blob, kind, region)?;
@@ -709,7 +722,7 @@ fn seal_file(kind: Kind, blob: &Path, srk_public: &[u8], pcr8: &[u8; 32]) -> Res
         .and_then(|mut f| f.read_exact(entropy.as_mut_bytes()))
         .map_err(|e| format!("/dev/urandom: {e}"))?;
     let mut out = vec![0u8; kind.region_size()];
-    tpm2::envelope::seal(&mut out, kind, region, srk_public, pcr8, &entropy).map_err(|e| format!("seal: {e:?}"))?;
+    tpm2::envelope::seal(&mut out, kind, region, srk_public, pcrs, &entropy).map_err(|e| format!("seal: {e:?}"))?;
     Ok(out)
 }
 
@@ -724,13 +737,13 @@ fn run_seal(args: &[String]) -> Result<(), String> {
             }
             "--blob" => blob = Some(PathBuf::from(value()?)),
             "--srk-public" => srk = Some(PathBuf::from(value()?)),
-            "--pcr8" => pcr = Some(pcr8(&value()?)?),
+            "--pcrs" => pcr = Some(pcrs(&value()?)?),
             "--out" => out = Some(PathBuf::from(value()?)),
             other => return Err(format!("unknown argument {other}")),
         }
     }
     let (Some(kind), Some(blob), Some(srk), Some(pcr), Some(out)) = (kind, blob, srk, pcr, out) else {
-        return Err("usage: mksecrets seal --kind key|pq|tls --blob FILE --srk-public FILE --pcr8 HEX --out FILE".into());
+        return Err("usage: mksecrets seal --kind key|pq|tls --blob FILE --srk-public FILE --pcrs HEX,...,HEX --out FILE".into());
     };
     let srk_file = std::fs::read(&srk).map_err(|e| format!("{}: {e}", srk.display()))?;
     let envelope = seal_file(kind, &blob, srk_public(&srk_file)?, &pcr)?;
@@ -739,15 +752,15 @@ fn run_seal(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// M5 plan C12: the envelope's sealed object enforces this PCR 8. The
+/// M5 plan C12: the envelope's sealed object enforces these PCRs 0-8. The
 /// policy is the object public's authPolicy, the one the TPM enforces (S15);
 /// `Envelope::parse` already refuses a header copy that disagrees with it,
 /// attributes other than the sealed object's (userWithAuth clear) and a PCR
-/// selection other than {8}/sha256.
-fn envelope_sealed_to(bytes: &[u8], kind: Kind, pcr8: &[u8; 32]) -> Result<(), String> {
+/// selection other than {0..8}/sha256.
+fn envelope_sealed_to(bytes: &[u8], kind: Kind, pcrs: &tpm2::crypto::PolicyPcrs) -> Result<(), String> {
     let envelope = tpm2::envelope::Envelope::parse(bytes, kind).map_err(|e| format!("envelope: {e:?}"))?;
-    if envelope.object_policy() != &tpm2::crypto::policy_digest(pcr8) {
-        return Err("the envelope's sealed object enforces another PCR 8".into());
+    if envelope.object_policy() != &tpm2::crypto::policy_digest(pcrs) {
+        return Err("the envelope's sealed object enforces other PCRs 0-8".into());
     }
     Ok(())
 }
@@ -762,17 +775,17 @@ fn run_check_envelope(args: &[String]) -> Result<(), String> {
                 kind = Some(parse_kind(&value()?)?)
             }
             "--envelope" => envelope = Some(PathBuf::from(value()?)),
-            "--pcr8" => pcr = Some(pcr8(&value()?)?),
+            "--pcrs" => pcr = Some(pcrs(&value()?)?),
             other => return Err(format!("unknown argument {other}")),
         }
     }
     let (Some(kind), Some(envelope), Some(pcr)) = (kind, envelope, pcr) else {
-        return Err("usage: mksecrets check-envelope --kind key|pq|tls --envelope FILE --pcr8 HEX".into());
+        return Err("usage: mksecrets check-envelope --kind key|pq|tls --envelope FILE --pcrs HEX,...,HEX".into());
     };
     let bytes = std::fs::read(&envelope).map_err(|e| format!("{}: {e}", envelope.display()))?;
     envelope_sealed_to(&bytes, kind, &pcr)?;
-    let pcr_hex: String = pcr.iter().map(|b| format!("{b:02x}")).collect();
-    println!("mksecrets: {} is sealed to PCR 8 {pcr_hex}", envelope.display());
+    let pcr_hex: String = pcr[8].iter().map(|b| format!("{b:02x}")).collect();
+    println!("mksecrets: {} is sealed to PCRs 0-8 (PCR 8 {pcr_hex})", envelope.display());
     Ok(())
 }
 

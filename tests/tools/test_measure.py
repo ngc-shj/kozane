@@ -1,5 +1,6 @@
 """tools/measure.py: the PCR 8 chain against known values, and the I8.2
-range checks on both sides of each boundary (M5 plan C8).
+range checks on both sides of each boundary (M5 plan C8); the PCR 0 chain
+over the FIP's closed list and its refusals (M7 plan C3, C4).
 
 Usage: python3 tests/tools/test_measure.py
 Prints "MEASURE-FIXTURES <n>" and exits non-zero on any mismatch.
@@ -13,6 +14,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 import measure  # noqa: E402
+import fip_fixture  # noqa: E402
 
 IMG = 0x10000
 GOOD = [(0x2000, 0x1000), (0x4000, 0x4000), (0x9000, 0x1000)]
@@ -54,6 +56,13 @@ def pcr_moves(i: int, rng: tuple) -> bool:
     The measure variant prints what expected_pcr8 computes (C8)."""
     return measure.expected_pcr8(measure.pack(IMG, with_range(i, rng)), IMAGE) \
         != measure.expected_pcr8(measure.pack(IMG, GOOD), IMAGE)
+
+
+def pcr0_chain() -> bool:
+    pcr = bytes(32)
+    for _, data in fip_fixture.payloads():
+        pcr = hashlib.sha256(pcr + hashlib.sha256(data).digest()).digest()
+    return measure.expected_pcr0(fip_fixture.flash()) == pcr
 
 
 # (name, check returning True on the expected outcome)
@@ -117,7 +126,31 @@ CASES = [
      + bytes(IMG - 0xa000)),
     ("moving range 2's offset changes PCR 8", lambda: pcr_moves(2, (0xa000, 0x1000))),
     ("changing range 2's length changes PCR 8", lambda: pcr_moves(2, (0x9000, 0x800))),
+    # M7 plan C3, C4: PCR 0 is BL2, then BL31, then BL33, each the entry's bytes.
+    ("PCR 0 is BL2 then BL31 then BL33", pcr0_chain),
+    ("PCRs 0-8: PCR 0, seven zeros, PCR 8", lambda: measure.expected_pcrs(
+        fip_fixture.flash(), measure.pack(IMG, GOOD), IMAGE)
+     == [measure.expected_pcr0(fip_fixture.flash())] + [bytes(32)] * 7
+     + [measure.expected_pcr8(measure.pack(IMG, GOOD), IMAGE)]),
+    ("entries out of the ToC's order are measured in TF-A's order", lambda: measure.expected_pcr0(
+        fip_fixture.flash(fip_fixture.payloads()[::-1])) == measure.expected_pcr0(fip_fixture.flash())),
+    ("a changed BL31 byte changes PCR 0", lambda: measure.expected_pcr0(fip_fixture.flash(
+        [(u, d + b"!" if n == 1 else d) for n, (u, d) in enumerate(fip_fixture.payloads())]))
+     != measure.expected_pcr0(fip_fixture.flash())),
+    ("a FIP entry outside the measured list is refused", lambda: "is not on the measured list" in raises(
+        lambda: measure.expected_pcr0(fip_fixture.flash(fip_fixture.payloads() + [(b"\x01" * 16, b"x")])))),
+    ("a FIP entry twice is refused", lambda: "appears twice" in raises(
+        lambda: measure.expected_pcr0(fip_fixture.flash(fip_fixture.payloads() + fip_fixture.payloads()[:1])))),
+    ("a FIP without BL31 is refused", lambda: "has no BL31" in raises(
+        lambda: measure.expected_pcr0(fip_fixture.flash([fip_fixture.payloads()[0], fip_fixture.payloads()[2]])))),
+    ("a FIP entry leaving the FIP is refused", lambda: "leaves the FIP" in raises(
+        lambda: measure.expected_pcr0(fip_fixture.flash()[:-1]))),
+    ("a flash with no FIP at the FIP offset is refused", lambda: "no FIP" in raises(
+        lambda: measure.expected_pcr0(fip_fixture.flash()[:measure.FIP_OFFSET] + bytes(64)))),
+    ("a ToC without its terminator is refused", lambda: "runs off its end" in raises(
+        lambda: measure.expected_pcr0(bytes(measure.FIP_OFFSET) + measure.FIP_HEADER.pack(measure.FIP_TOC_NAME, 0, 0)))),
 ]
+
 
 
 def main() -> int:

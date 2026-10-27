@@ -3,11 +3,12 @@
 C11): the published image (`make image`'s, with the zero placeholders), the
 boot descriptor naming where U-Boot copies each envelope, the three sealed
 envelopes (`key`'s blob for the `secrets` mr, `pqkey`'s for `pq_secrets`,
-`tlskey`'s for `tls_secrets`; M6 plan Re-plan R1), and the PCR 8 they are
-sealed to. No image with a secret in it is written.
+`tlskey`'s for `tls_secrets`; M6 plan Re-plan R1), the firmware that boots
+them, and the PCRs 0-8 they are sealed to (M7 plan C4). No image with a
+secret in it is written.
 
 Usage: package --secrets FILE --pq-secrets FILE --tls-secrets FILE
-               --srk-public FILE --out DIR
+               --srk-public FILE --firmware FLASH --out DIR
                --system FILE --policy FILE --image LOADER
                --gen-config gen_config.h --search-path DIR --board BOARD
                --config CONFIG --microkit BIN --harness CT_HARNESS
@@ -17,10 +18,11 @@ writes (mksecrets seal checks it is the storage template). The flow:
 
   1. microkit builds the system with size-correct, random stand-ins as the
      three prefills: where they land are the envelope ranges;
-  2. the descriptor names those ranges, and PCR 8 is computed from it and
-     the published image (tools/measure.py, what U-Boot will extend);
-  3. `mksecrets seal` seals each blob to that SRK and PCR 8, each under a
-     fresh KEK;
+  2. the descriptor names those ranges, and PCRs 0-8 are computed from
+     the firmware (PCR 0: what TF-A will extend), the descriptor and the
+     published image (PCR 8: what U-Boot will extend; tools/measure.py);
+  3. `mksecrets seal` seals each blob to that SRK and those PCRs, each
+     under a fresh KEK;
   4. microkit builds the system again with the envelopes as prefills, and
      the assembly U-Boot performs (tools/measure.py) must give back that
      image byte for byte.
@@ -37,8 +39,9 @@ the repository (and so `build/`) and the toolchain caches. OUT must not
 exist yet: everything is built in a
 fresh 0700 staging directory beside it under umask 077, renamed into place
 only after every check passed, and removed on every failure path. OUT holds
-published.img, boot.desc, secrets.env, pq_secrets.env, tls_secrets.env and
-pcr8.
+published.img, boot.desc, secrets.env, pq_secrets.env, tls_secrets.env,
+flash.bin (the --firmware the PCRs were computed from) and pcrs (PCRs 0-8,
+one hex value a line).
 Only `release` kernels are packaged (M5 plan C7, closing SC20 and
 architecture R4 on shipped images), judged from the kernel's own
 gen_config.h rather than a make variable: no CONFIG_DEBUG_BUILD, no
@@ -120,7 +123,7 @@ SEAL_KINDS = {"secrets": ("key", 1), "pq_secrets": ("pq", 2), "tls_secrets": ("t
 ENVELOPE_MAGIC = b"SOSSEAL1"
 # tpm2_wire::SRK_PUBLIC_LEN: the SRK's TPMT_PUBLIC (a P-256 point).
 SRK_PUBLIC_LEN = 90
-OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "tls_secrets.env", "pcr8")
+OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "tls_secrets.env", "flash.bin", "pcrs")
 
 
 def is_debug(gen_config: str) -> bool:
@@ -408,7 +411,8 @@ def main() -> int:
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(s, exit_on_signal)
     ap = argparse.ArgumentParser()
-    for opt in ("secrets", "pq-secrets", "tls-secrets", "srk-public", "out", "system", "policy", "image", "gen-config",
+    for opt in ("secrets", "pq-secrets", "tls-secrets", "srk-public", "firmware", "out", "system", "policy", "image",
+                "gen-config",
                 "search-path", "board", "config", "microkit", "harness"):
         ap.add_argument(f"--{opt}", required=True)
     a = ap.parse_args()
@@ -536,10 +540,11 @@ def microkit(a, system: pathlib.Path, image: pathlib.Path, report: pathlib.Path)
                     "--config", a.config, "-r", str(report), "-o", str(image)], check=True)
 
 
-def seal(blob: pathlib.Path, mr: str, srk: pathlib.Path, pcr8: bytes, out: pathlib.Path):
+def seal(blob: pathlib.Path, mr: str, srk: pathlib.Path, pcrs: list, out: pathlib.Path):
     """`mksecrets seal`: one envelope, under a fresh KEK."""
     subprocess.run(["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "seal", "--kind", SEAL_KINDS[mr][0],
-                    "--blob", str(blob), "--srk-public", str(srk), "--pcr8", pcr8.hex(), "--out", str(out)],
+                    "--blob", str(blob), "--srk-public", str(srk), "--pcrs", ",".join(p.hex() for p in pcrs),
+                    "--out", str(out)],
                    check=True)
 
 
@@ -551,6 +556,7 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
     microkit run ever sees a blob."""
     placeholder_system = pathlib.Path(a.system).read_text()
     published = pathlib.Path(a.image).read_bytes()
+    firmware = pathlib.Path(a.firmware).read_bytes()
     srk_copy = out / "srk.pub"
     srk_copy.write_bytes(srk)
 
@@ -569,7 +575,7 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
         print("\n".join(errors))
         return 1
 
-    # 2. The descriptor and the PCR 8 U-Boot will produce.
+    # 2. The descriptor and the PCRs 0-8 TF-A and U-Boot will produce.
     ranges = [(standin_img.find(standins[mr]), len(standins[mr])) for mr in SECRETS_MRS]
     try:
         # The ranges are where microkit placed each stand-in; check_images
@@ -582,7 +588,7 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
         if placeholder:
             print("\n".join(f"package: {e}" for e in placeholder))
             return 1
-        pcr8 = measure.expected_pcr8(desc, published)
+        pcrs = measure.expected_pcrs(firmware, desc, published)
     except measure.DescriptorError as e:
         print(f"package: {e}")
         return 1
@@ -593,7 +599,7 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
         for mr, copy in copies.items():
             copy.write_bytes(blobs[mr])
         for mr, copy in copies.items():
-            seal(copy, mr, srk_copy, pcr8, out / f"{mr}.env")
+            seal(copy, mr, srk_copy, pcrs, out / f"{mr}.env")
     finally:
         for copy in copies.values():
             copy.unlink(missing_ok=True)
@@ -615,7 +621,8 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
         return 1
     (out / "published.img").write_bytes(published)
     (out / "boot.desc").write_bytes(desc)
-    (out / "pcr8").write_text(pcr8.hex() + "\n")
+    (out / "flash.bin").write_bytes(firmware)
+    (out / "pcrs").write_text("".join(p.hex() + "\n" for p in pcrs))
     for p in out.iterdir():
         if p.name not in OUTPUTS:
             p.unlink()

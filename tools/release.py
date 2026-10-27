@@ -4,17 +4,18 @@
   release.py make --keys DIR --pkg DIR --out DIR [--version V] [--allow-dirty]
   release.py verify --pub DIR --release DIR [--envelope FILE --kind key|pq|tls] [--allow-dirty]
 
-`make` writes OUT/{manifest, manifest.sig, published.img, boot.desc}. The
-manifest's image and descriptor digests and its PCR 8 come from the files it
-ships, PCR 8 through tools/measure.py (the one host model of the boot
-command), and must agree with the package's own pcr8. A tree with
+`make` writes OUT/{manifest, manifest.sig, published.img, boot.desc,
+flash.bin}. The manifest's image, descriptor and firmware digests and its
+PCRs 0-8 come from the files it ships, the PCRs through tools/measure.py (the
+one host model of TF-A's and the boot command's measurements, M7 plan C4),
+and must agree with the package's own pcrs. A tree with
 uncommitted changes to tracked files is refused: the commit a release names
 must be the tree it was built from.
 
 `verify` checks both signatures (tools/release), then recomputes every digest
-and PCR 8 from the shipped files and compares them with the signed fields;
-with --envelope it also checks that the envelope (of --kind: `key`'s,
-`pqkey`'s or `tlskey`'s) has a sealed object that enforces the signed PCR 8
+and PCRs 0-8 from the shipped files and compares them with the signed
+fields; with --envelope it also checks that the envelope (of --kind: `key`'s,
+`pqkey`'s or `tlskey`'s) has a sealed object that enforces the signed PCRs
 (`mksecrets check-envelope`, the PDs' own parser).
 
 Control class: fail-closed verification gate; a missing file, a failing tool
@@ -67,10 +68,13 @@ def make(a) -> None:
     pkg, out = pathlib.Path(a.pkg), pathlib.Path(a.out)
     if out.exists():
         raise Refused(f"{out} already exists")
-    image, desc = pkg / "published.img", pkg / "boot.desc"
-    pcr8 = measure.expected_pcr8(desc.read_bytes(), image.read_bytes()).hex()
-    if (pkg / "pcr8").read_text().strip() != pcr8:
-        raise Refused("the package's pcr8 differs from tools/measure.py's")
+    image, desc, firmware = pkg / "published.img", pkg / "boot.desc", pkg / "flash.bin"
+    try:
+        pcrs = [p.hex() for p in measure.expected_pcrs(firmware.read_bytes(), desc.read_bytes(), image.read_bytes())]
+    except measure.DescriptorError as e:
+        raise Refused(str(e))
+    if (pkg / "pcrs").read_text().split() != pcrs:
+        raise Refused("the package's pcrs differ from tools/measure.py's")
     placeholder = measure.check_placeholder(image.read_bytes(), desc.read_bytes())
     if placeholder:
         raise Refused("; ".join(placeholder))
@@ -87,7 +91,8 @@ def make(a) -> None:
         "dev_image": "dockerfile-sha256:" + sha256(ROOT / "docker/Dockerfile"),
         "loader_img_sha256": sha256(image),
         "boot_desc_sha256": sha256(desc),
-        "pcr8": pcr8,
+        "firmware_sha256": sha256(firmware),
+        "pcrs": ",".join(pcrs),
         "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),
         **versions(),
     }
@@ -102,6 +107,7 @@ def make(a) -> None:
         tool("sign", "--keys", a.keys, "--manifest", str(staging / "manifest"), "--out", str(staging / "manifest.sig"))
         shutil.copyfile(image, staging / "published.img")
         shutil.copyfile(desc, staging / "boot.desc")
+        shutil.copyfile(firmware, staging / "flash.bin")
         staging.chmod(0o755)
         os.rename(staging, out)
     except BaseException:
@@ -114,27 +120,32 @@ def verify(a) -> None:
     rel = pathlib.Path(a.release)
     printed = tool("verify", "--pub", a.pub, "--manifest", str(rel / "manifest"), "--sig", str(rel / "manifest.sig"))
     fields = dict(line.split("=", 1) for line in printed.splitlines() if "=" in line)
-    image, desc = rel / "published.img", rel / "boot.desc"
+    image, desc, firmware = rel / "published.img", rel / "boot.desc", rel / "flash.bin"
     if fields.get("commit", "").endswith("-dirty") and not a.allow_dirty:
         raise Refused(f"the release was built from a dirty tree ({fields['commit']})")
     placeholder = measure.check_placeholder(image.read_bytes(), desc.read_bytes())
     if placeholder:
         raise Refused("; ".join(placeholder))
+    try:
+        pcrs = measure.expected_pcrs(firmware.read_bytes(), desc.read_bytes(), image.read_bytes())
+    except measure.DescriptorError as e:
+        raise Refused(str(e))
     want = {
         "loader_img_sha256": sha256(image),
         "boot_desc_sha256": sha256(desc),
-        "pcr8": measure.expected_pcr8(desc.read_bytes(), image.read_bytes()).hex(),
+        "firmware_sha256": sha256(firmware),
+        "pcrs": ",".join(p.hex() for p in pcrs),
     }
     for key, value in want.items():
         if fields.get(key) != value:
             raise Refused(f"{key}: the shipped files give {value}, the signed manifest says {fields.get(key)}")
     if a.envelope:
         r = subprocess.run(["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "check-envelope",
-                            "--kind", a.kind, "--envelope", a.envelope, "--pcr8", fields["pcr8"]],
+                            "--kind", a.kind, "--envelope", a.envelope, "--pcrs", fields["pcrs"]],
                            cwd=ROOT, capture_output=True, text=True)
         if r.returncode != 0:
             raise Refused(r.stderr.strip() or "mksecrets check-envelope failed")
-    print("release: verified" + (" (envelope sealed to its PCR 8)" if a.envelope else ""))
+    print("release: verified" + (" (envelope sealed to its PCRs 0-8)" if a.envelope else ""))
 
 
 def main() -> int:

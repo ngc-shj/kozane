@@ -409,18 +409,25 @@ def free_udp_port() -> int:
 QEMU_CPU = "neoverse-n2"
 
 
+# Deny-case firmware (M7 plan C3): `firmware_variant` derives each from
+# FIRMWARE, one byte changed in one FIP entry, and registers it here.
+FIRMWARE_VARIANTS = set()
+
+
 def qemu_machine(firmware: str) -> list:
     """The QEMU arguments every boot starts with. The only firmware a boot
-    may run is one of the two images `make firmware` builds, so no boot
-    skips TF-A's measurements (I2.1)."""
-    if firmware not in (FIRMWARE, FIRMWARE_MEASURE):
+    may run is one of the two images `make firmware` builds, or a deny-case
+    variant firmware_variant derived from the shipped one, so no boot skips
+    TF-A's measurements (I2.1)."""
+    if firmware not in (FIRMWARE, FIRMWARE_MEASURE) and firmware not in FIRMWARE_VARIANTS:
         raise Fail(f"qemu_machine: {firmware} is not a firmware image `make firmware` builds")
     return ["-machine", "virt,secure=on,virtualization=on", "-cpu", QEMU_CPU, "-m", "size=2G",
             "-serial", "mon:stdio", "-nographic", "-bios", firmware]
 
 
 def boot(pkg: "Package", outside: str, inside: str, monitor: str = "", media=None, flip=None,
-         fail_extend: bool = False) -> tuple:
+         fail_extend: bool = False, inject_pcr3: bool = False, fail_nth: tuple = None,
+         firmware: str = None) -> tuple:
     """Every boot is the shipped one (M5 plan C14): U-Boot measures and
     assembles the package's boot media (`media`, the package's own unless
     given: (path, address) pairs at measure.LOAD_*), and its TPM is a fresh
@@ -431,9 +438,9 @@ def boot(pkg: "Package", outside: str, inside: str, monitor: str = "", media=Non
     tpm = Swtpm(os.path.dirname(pkg.dir), state=pkg.state)
     proxy = None
     try:
-        if flip is not None or fail_extend:
-            proxy = TpmProxy(tpm, bool(flip), fail_extend)
-        cmd = qemu_machine(FIRMWARE)
+        if flip is not None or fail_extend or inject_pcr3 or fail_nth:
+            proxy = TpmProxy(tpm, bool(flip), fail_extend, inject_pcr3, fail_nth)
+        cmd = qemu_machine(firmware or FIRMWARE)
         for path, addr in media or pkg.media():
             cmd += ["-device", f"loader,file={path},addr={addr:#x},force-raw=on"]
         cmd += (proxy or tpm).qemu_args()
@@ -1655,17 +1662,19 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
 
 # swtpm's control channel (tpm_ioctl.h): commands are big-endian u32 codes.
 SWTPM_CMD_SET_DATAFD = 16
-# TPM2_PCR_Read of PCR 8, sha256 bank (tpm2_wire::pcr_read).
-PCR_READ_8 = bytes.fromhex("8001" "00000014" "0000017e" "00000001" "000b" "03" "000100")
+# TPML_PCR_SELECTIONs of the sha256 bank: PCRs 0-7 (one PCR_Read returns at
+# most eight digests) and PCR 8 (tpm2_wire::CAP_PCR_SELECTION).
+PCR0_7_SELECTION = bytes.fromhex("00000001" "000b" "03" "ff0000")
 PCR8_SELECTION = bytes.fromhex("00000001" "000b" "03" "000100")
 
 
-def read_pcr8(tpm: Swtpm) -> bytes:
-    """PCR 8 of a swtpm whose QEMU has been killed (T11): a second control
-    connection hands swtpm a fresh data socket (CMD_SET_DATAFD; no CMD_INIT,
-    which would restart the TPM), then TPM2_PCR_Read. Probed host-side in
-    slice 7: swtpm keeps the TPM running once the killed QEMU's data socket
-    closes."""
+def read_pcrs(tpm: Swtpm) -> list:
+    """PCRs 0-8 of a swtpm whose QEMU has been killed (T11; M7 plan C3, C4):
+    a second control connection hands swtpm a fresh data socket
+    (CMD_SET_DATAFD; no CMD_INIT, which would restart the TPM), then two
+    TPM2_PCR_Reads. Probed host-side in M5 slice 7: swtpm keeps the TPM
+    running once the killed QEMU's data socket closes. A response that is
+    not the selection as asked with its digests is a named failure."""
     ctrl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     mine, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -1677,20 +1686,42 @@ def read_pcr8(tpm: Swtpm) -> bytes:
             raise Fail("swtpm refused a data socket after QEMU exited")
         theirs.close()
         mine.settimeout(LINE_TIMEOUT_S)
-        mine.sendall(PCR_READ_8)
-        head = recv_exact(mine, 10)
-        rsp = head + recv_exact(mine, struct.unpack(">I", head[2:6])[0] - 10)
+        pcrs = []
+        for selection, count in ((PCR0_7_SELECTION, 8), (PCR8_SELECTION, 1)):
+            mine.sendall(struct.pack(">HII", 0x8001, 10 + len(selection), 0x17E) + selection)
+            head = recv_exact(mine, 10)
+            rsp = head + recv_exact(mine, struct.unpack(">I", head[2:6])[0] - 10)
+            # header, pcrUpdateCounter, the selection as asked, then the
+            # TPML_DIGEST: count, and (size 32, digest) per PCR.
+            digests = rsp[24 + 4:]
+            if (rsp[6:10] != bytes(4) or rsp[14:24] != selection or rsp[24:28] != struct.pack(">I", count)
+                    or len(digests) != 34 * count
+                    or any(digests[34 * i:34 * i + 2] != b"\x00\x20" for i in range(count))):
+                raise Fail(f"unexpected PCR_Read response {rsp.hex()}")
+            pcrs += [digests[34 * i + 2:34 * i + 34] for i in range(count)]
     finally:
         for s in (ctrl, mine, theirs):
             s.close()
-    # header, pcrUpdateCounter, the selection as asked, one 32-byte digest.
-    if len(rsp) != 62 or rsp[6:10] != bytes(4) or rsp[14:24] != PCR8_SELECTION or rsp[24:30] != bytes.fromhex("000000010020"):
-        raise Fail(f"unexpected PCR_Read response {rsp.hex()}")
-    return rsp[30:]
+    return pcrs
+
+
+def read_pcr8(tpm: Swtpm) -> bytes:
+    return read_pcrs(tpm)[8]
 
 
 CC_UNSEAL = 0x15E
 CC_PCR_EXTEND = 0x182
+CC_POLICY_PCR = 0x17F
+# The proxy's own command (M7 plan C4, TE4): TPM2_PCR_Extend of PCR 3, sha256,
+# under the empty password session, so PCRs 0-8 move before the policy reads
+# them.
+PCR3_EXTEND = (struct.pack(">HII", 0x8002, 10 + 4 + 4 + 9 + 4 + 2 + 32, CC_PCR_EXTEND) + struct.pack(">I", 3)
+               + struct.pack(">IIHBH", 9, 0x40000009, 0, 0, 0) + struct.pack(">IH", 1, 0x000B) + b"\x33" * 32)
+# TPM_RC_POLICY_FAIL on the policy session (session 1), the refusal Unseal
+# gives when PolicyPCR folded in values other than the object's; and
+# TPM_RC_PCR_CHANGED, which a PCR moved between PolicyPCR and Unseal gives.
+RC_POLICY_FAIL_S1 = 0x99D
+RC_PCR_CHANGED = 0x9A8
 # TPM_RC_FAILURE, the header-only response the proxy gives a failed extend.
 EXTEND_FAILED_RSP = bytes.fromhex("8001" "0000000a" "00000101")
 
@@ -1707,8 +1738,16 @@ class TpmProxy:
     swtpm (U-Boot's measurements, other digests, pass). Feasibility (F6-A):
     the unmodified relay must pass a sealed boot first."""
 
-    def __init__(self, tpm: Swtpm, flip: bool, fail_extend: bool = False):
-        self.tpm, self.flip, self.fail_extend = tpm, flip, fail_extend
+    def __init__(self, tpm: Swtpm, flip: bool, fail_extend: bool = False, inject_pcr3: bool = False,
+                 fail_nth: tuple = None):
+        self.tpm, self.flip, self.fail_extend, self.inject_pcr3 = tpm, flip, fail_extend, inject_pcr3
+        # (command code, n): the n-th command with that code is answered
+        # TPM_RC_FAILURE and never reaches swtpm (M7 plan C3 I3.2), and
+        # `failed` records it once it happened.
+        self.fail_nth, self.failed = fail_nth, None
+        # (command code, response code) of every command relayed, in order;
+        # the injected extend's under "PCR3_EXTEND".
+        self.codes = []
         self.cap = cap_digest()
         self.path = os.path.join(tpm.dir, "proxy.sock")
         self.unseals = self.flipped = self.extends_failed = 0
@@ -1804,6 +1843,28 @@ class TpmProxy:
                 self.extends_failed += 1
                 r[0].sendall(EXTEND_FAILED_RSP)
                 continue
+            if self.fail_nth and cc == self.fail_nth[0] and self.failed is None:
+                seen = sum(1 for c, _ in self.codes if c == cc)
+                if seen + 1 == self.fail_nth[1]:
+                    if r[4]:
+                        raise Fail("proxy: a command to fail while another awaits its response")
+                    # Every earlier command of this code succeeded: the
+                    # failure lands on the stage the case names.
+                    self.failed = (cc, self.fail_nth[1], all(rc == 0 for c, rc in self.codes if c == cc))
+                    self.codes.append((cc, "failed"))
+                    r[0].sendall(EXTEND_FAILED_RSP)
+                    continue
+            if self.inject_pcr3 and cc == CC_POLICY_PCR and not any(c == "PCR3_EXTEND" for c, _ in self.codes):
+                if r[4]:
+                    raise Fail("proxy: a PolicyPCR while another command awaits its response")
+                # swtpm takes one command at a time: the PolicyPCR waits
+                # until the extend's response, which is swallowed below
+                # (QEMU never sees it).
+                r[4].append("PCR3_EXTEND")
+                self.codes.append(("PCR3_EXTEND", None))
+                self.held = (cc, cmd)
+                r[1].sendall(PCR3_EXTEND)
+                continue
             r[4].append(cc)
             r[1].sendall(cmd)
 
@@ -1813,6 +1874,14 @@ class TpmProxy:
         frames, r[3] = self._frames(r[3] + data)
         for rsp in frames:
             cc = r[4].pop(0) if r[4] else None
+            rc = struct.unpack(">I", rsp[6:10])[0]
+            if cc == "PCR3_EXTEND":
+                self.codes[self.codes.index(("PCR3_EXTEND", None))] = ("PCR3_EXTEND", rc)
+                held_cc, held = self.held
+                r[4].append(held_cc)
+                r[1].sendall(held)
+                continue
+            self.codes.append((cc, rc))
             if cc == CC_UNSEAL and rsp[6:10] == bytes(4) and len(rsp) > 16:
                 self.unseals += 1
                 if self.flip:
@@ -1934,8 +2003,10 @@ def test_measured_boot(pkg: str, passed: list):
     image, desc = read("published.img"), read("boot.desc")
     envs = [read("secrets.env"), read("pq_secrets.env"), read("tls_secrets.env")]
     want = measure.expected_pcr8(desc, image)
-    if read("pcr8").decode().strip() != want.hex():
-        raise Fail("package's pcr8 differs from tools/measure.py's")
+    # M7 plan C4: the package's PCRs 0-8 are the twin's for its flash.bin.
+    pcrs = [bytes.fromhex(l) for l in read("pcrs").decode().split()]
+    if pcrs != measure.expected_pcrs(read("flash.bin"), desc, image):
+        raise Fail("package's pcrs differ from tools/measure.py's")
     scratch = tempfile.mkdtemp(prefix="measure-", dir=pkg)
     try:
         got, refused = measure_boot(pkg, scratch, image, desc, envs)
@@ -2096,9 +2167,10 @@ def media_with(pkg: Package, scratch: str, image: bytes = None, desc: bytes = No
     return media
 
 
-def sealed_boot(pkg: Package, media=None, flip=None) -> tuple:
+def sealed_boot(pkg: Package, media=None, flip=None, inject_pcr3: bool = False, fail_nth: tuple = None,
+                firmware: str = None) -> tuple:
     return boot(pkg, dgram("n0", free_udp_port(), free_udp_port()), dgram("n1", free_udp_port(), free_udp_port()),
-                media=media, flip=flip)
+                media=media, flip=flip, inject_pcr3=inject_pcr3, fail_nth=fail_nth, firmware=firmware)
 
 
 def stop(child):
@@ -2149,6 +2221,27 @@ def test_sealed(good: Package, foreign: Package, passed: list):
             stop(child)
         passed.append("sealed boot: a tampered descriptor is refused")
 
+        # M7 plan C4 (TE4): a PCR in 1-7 extended before the policy session's
+        # PolicyPCR. The TPM folds in the moved value and Unseal refuses with
+        # the policy failure, not because a PCR moved after PolicyPCR.
+        child, con = sealed_boot(good, inject_pcr3=True)
+        try:
+            key_outcomes(con, refused, "PCR 3 extended")
+            codes = list(child.proxy.codes)
+        finally:
+            stop(child)
+        injected = [rc for cc, rc in codes if cc == "PCR3_EXTEND"]
+        if injected != [0]:
+            raise Fail(f"PCR 3 extended: the proxy's extend gave {injected}, want one success")
+        unseals = [rc for cc, rc in codes if cc == CC_UNSEAL]
+        if not unseals or any(rc != RC_POLICY_FAIL_S1 for rc in unseals):
+            raise Fail(f"PCR 3 extended: Unseal answered {[hex(rc) for rc in unseals]}, want TPM_RC_POLICY_FAIL "
+                       f"({RC_POLICY_FAIL_S1:#x}), never TPM_RC_PCR_CHANGED ({RC_PCR_CHANGED:#x})")
+        for cc in (0x176, CC_POLICY_PCR, 0x16B, 0x156, 0x157):
+            if any(c == cc and rc != 0 for c, rc in codes):
+                raise Fail(f"PCR 3 extended: command {cc:#x} failed before Unseal: {codes}")
+        passed.append("sealed boot: a PCR 3 extended before PolicyPCR refuses the unseal (policy failure)")
+
         # Envelopes sealed to another TPM's SRK, booted on this one (I10.2).
         child, con = sealed_boot(Package(foreign.dir, good.state))
         try:
@@ -2171,15 +2264,100 @@ def test_sealed(good: Package, foreign: Package, passed: list):
             con.wait_for(r"tls: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
             # QEMU killed (no CMD_SHUTDOWN reaches swtpm), its TPM kept.
             kill_qemu(child)
-            got = read_pcr8(child.tpm)
+            pcrs = read_pcrs(child.tpm)
+            got = pcrs[8]
         finally:
             stop(child)
+        # M7 plan C3: TF-A extended PCR 0 with BL2, BL31 and BL33 before each
+        # ran, as the twin computes from the shipped flash.bin; 1-7 untouched.
+        with open(FIRMWARE, "rb") as f:
+            firmware_want = measure.expected_pcrs(f.read(), desc, image)[:8]
+        for i, (g, w) in enumerate(zip(pcrs[:8], firmware_want)):
+            if g != w:
+                raise Fail(f"PCR {i} after the shipped boot is {g.hex()}, the twin of {FIRMWARE} gives {w.hex()}")
+        passed.append("sealed boot: PCRs 0-7 as the firmware twin computes")
         if got != want:
             capped = "uncapped" if got == measure.expected_pcr8(desc, image) else "unexpected"
             raise Fail(f"cap: PCR 8 after the boot is {got.hex()} ({capped}), want {want.hex()}")
         passed.append("sealed boot: PCR 8 capped after the three key PDs")
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
+
+
+def firmware_variant(scratch: str, entry: str, needle: bytes, offset: int = 0) -> str:
+    """FIRMWARE with one byte changed in FIP entry `entry` (the byte at
+    `offset` in `needle`, a string found once inside that entry, flipped to
+    the other case), every extend intact (M7 plan C3). Registered for
+    qemu_machine."""
+    with open(FIRMWARE, "rb") as f:
+        flash = bytearray(f.read())
+    payload = dict(measure.fip_images(bytes(flash)))[entry]
+    start = bytes(flash).find(payload, measure.FIP_OFFSET)
+    at = payload.find(needle)
+    if start < 0 or payload.count(needle) != 1 or bytes(flash).count(payload) != 1:
+        raise Fail(f"firmware variant: {needle!r} is not one place in {entry}")
+    flash[start + at + offset] ^= 0x20
+    if measure.expected_pcr0(bytes(flash)) == measure.expected_pcr0(open(FIRMWARE, "rb").read()):
+        raise Fail(f"firmware variant: changing {entry} left PCR 0 as it was")
+    path = os.path.join(scratch, f"flash-{entry}.bin")
+    with open(path, "wb") as f:
+        f.write(flash)
+    FIRMWARE_VARIANTS.add(path)
+    return path
+
+
+# The I3.2 cases (M7 plan C3): which TPM command the proxy fails, and the
+# stage token TF-A's refusal line must carry.
+CC_STARTUP = 0x144
+FIRMWARE_REFUSALS = (
+    ((CC_STARTUP, 1), "BL1 startup"),
+    ((CC_PCR_EXTEND, 1), "BL1 extend"),
+    ((CC_PCR_EXTEND, 2), "BL2 extend"),
+)
+
+
+def test_firmware(good: Package, passed: list):
+    """M7 plan C3. Deny: the shipped firmware with one byte changed in BL2,
+    BL31 or BL33 (every extend intact) boots and extends, and the envelopes
+    stay sealed: BL1's extend of BL2 and BL2's extends of the rest put the
+    change into PCR 0 before it runs. I3.2: TPM2_Startup, BL1's extend or
+    BL2's first extend failing stops the boot with TF-A's refusal line and
+    a power-off. The allow side is every other sealed boot."""
+    refused = {"key-core": "UnsealRefused", "pqkey-core": "UnsealRefused", "tlskey-core": "UnsealRefused"}
+    scratch = tempfile.mkdtemp(prefix="firmware-", dir=os.path.dirname(good.dir))
+    try:
+        # The version string TF-A's stages print, and a U-Boot string.
+        for entry, needle, offset in (("BL2", b"release):kozane", 9), ("BL31", b"release):kozane", 9),
+                                      ("BL33", b"U-Boot 2025.01", 0)):
+            child, con = sealed_boot(good, firmware=firmware_variant(scratch, entry, needle, offset))
+            try:
+                if entry in ("BL2", "BL31"):
+                    # Positive evidence the changed stage ran: its banner.
+                    con.wait_for(rf"{entry}: v2\.15\.0\(release\):Kozane", timeout=BOOT_TIMEOUT_S)
+                key_outcomes(con, refused, f"changed {entry}")
+            finally:
+                stop(child)
+            passed.append(f"firmware: a changed {entry} is refused")
+        for nth, token in FIRMWARE_REFUSALS:
+            child, con = sealed_boot(good, fail_nth=nth)
+            try:
+                con.wait_for(rf"KOZANE-MBOOT: {token} failed", timeout=BOOT_TIMEOUT_S)
+                deadline = time.monotonic() + LINE_TIMEOUT_S
+                while con.alive and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                if con.alive:
+                    raise Fail(f"{token}: QEMU still runs after TF-A's refusal")
+                if "U-Boot 20" in con.text:
+                    raise Fail(f"{token}: U-Boot ran after TF-A's refusal")
+                failed = child.proxy.failed
+            finally:
+                stop(child)
+            if failed is None or failed[:2] != nth or not failed[2]:
+                raise Fail(f"{token}: the proxy failed {failed}, want {nth} after every earlier one succeeded")
+            passed.append(f"firmware: {token} failing stops the boot")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+        FIRMWARE_VARIANTS.clear()
 
 
 def test_tpm_proxy(good: Package, passed: list):
@@ -6472,7 +6650,8 @@ def build(tmp: str):
 
 
 # What tools/package writes: no image with a secret in it (M5 plan C8 F2).
-PACKAGE_OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "tls_secrets.env", "pcr8")
+PACKAGE_OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "tls_secrets.env", "flash.bin",
+                   "pcrs")
 
 
 def packages(tmp: str) -> dict:
@@ -6550,6 +6729,7 @@ def in_netns(tmp: str) -> int:
              ("measured boot", lambda: test_measured_boot(good.dir, passed)),
              ("sealed boot", lambda: test_sealed(good, foreign, passed)),
              ("tpm proxy", lambda: test_tpm_proxy(good, passed)),
+             ("firmware", lambda: test_firmware(good, passed)),
              ("tpm cap failure", lambda: test_tpm_cap_failure(good, deploy, passed)),
              ("https", lambda: test_https(good, deploy, os.path.join(os.path.dirname(deploy), "b", "devca.pem"),
                                          passed)),

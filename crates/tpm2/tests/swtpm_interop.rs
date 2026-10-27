@@ -157,6 +157,14 @@ fn expected_pcr8() -> [u8; 32] {
     BOOT_DIGESTS.iter().fold([0u8; 32], |pcr, d| extend(&pcr, d))
 }
 
+/// PCRs 0-8 as the seal policy names them: no firmware runs here, so PCR
+/// 0-7 hold their reset value.
+fn expected_pcrs() -> crypto::PolicyPcrs {
+    let mut pcrs = [[0u8; 32]; tpm2_wire::POLICY_PCR_COUNT];
+    pcrs[8] = expected_pcr8();
+    pcrs
+}
+
 fn measured_boot(tpm: &mut Tpm) {
     for d in &BOOT_DIGESTS {
         tpm.pcr_extend(d);
@@ -174,10 +182,10 @@ fn blob(kind: Kind, label: &str) -> Vec<u8> {
     b
 }
 
-fn seal(kind: Kind, region: &[u8], srk_public: &[u8], pcr8: &[u8; 32], label: &str) -> Vec<u8> {
+fn seal(kind: Kind, region: &[u8], srk_public: &[u8], pcrs: &crypto::PolicyPcrs, label: &str) -> Vec<u8> {
     let mut out = vec![0u8; kind.region_size()];
     let e = entropy::<SEAL_ENTROPY_LEN>(label);
-    envelope::seal(&mut out, kind, region, srk_public, pcr8, &e).unwrap();
+    envelope::seal(&mut out, kind, region, srk_public, pcrs, &e).unwrap();
     out
 }
 
@@ -317,16 +325,20 @@ fn srk_public_and_name_match_tpm2_createprimary() {
 
 #[test]
 fn policy_digest_matches_a_tpm2_tools_trial_session() {
-    let swtpm = Swtpm::start("oracle-policy", false);
-    let pcr = expected_pcr8();
-    let pcrfile = swtpm.dir.join("pcr8.bin");
-    std::fs::write(&pcrfile, pcr).unwrap();
+    // The independent adjudicator of the policy digest (M7 plan C4, TE4):
+    // tpm2-tools over sha256:0-8, reading the values from swtpm itself
+    // after the boot extends (its -f file takes at most eight PCRs).
+    let mut swtpm = Swtpm::start("oracle-policy", false);
+    let mut tpm = swtpm.connect();
+    measured_boot(&mut tpm);
+    drop(tpm);
+    let pcr = expected_pcrs();
     let session = swtpm.dir.join("trial.ctx");
     let policy = swtpm.dir.join("policy.bin");
     let s = session.to_str().unwrap();
     let p = policy.to_str().unwrap();
     tool(&swtpm, &["tpm2_startauthsession", "-Q", "-S", s]);
-    tool(&swtpm, &["tpm2_policypcr", "-Q", "-S", s, "-l", "sha256:8", "-f", pcrfile.to_str().unwrap(), "-L", p]);
+    tool(&swtpm, &["tpm2_policypcr", "-Q", "-S", s, "-l", "sha256:0,1,2,3,4,5,6,7,8", "-L", p]);
     assert_eq!(read(&policy), crypto::policy_pcr_digest(&pcr), "PolicyPCR digest");
     tool(&swtpm, &["tpm2_policyauthvalue", "-Q", "-S", s, "-L", p]);
     assert_eq!(read(&policy), crypto::policy_digest(&pcr), "PolicyPCR ∧ PolicyAuthValue digest");
@@ -341,10 +353,10 @@ fn sealed_envelope_unseals_to_the_original_blob_through_the_gate_and_the_cap_fol
     measured_boot(&mut tpm);
     let key_blob = blob(Kind::Key, "key");
     let pq_blob = blob(Kind::Pq, "pq");
-    let key_env = seal(Kind::Key, &key_blob, &srk_public, &expected_pcr8(), "seal-key");
-    let pq_env = seal(Kind::Pq, &pq_blob, &srk_public, &expected_pcr8(), "seal-pq");
+    let key_env = seal(Kind::Key, &key_blob, &srk_public, &expected_pcrs(), "seal-key");
+    let pq_env = seal(Kind::Pq, &pq_blob, &srk_public, &expected_pcrs(), "seal-pq");
     let tls_blob = blob(Kind::Tls, "tls");
-    let tls_env = seal(Kind::Tls, &tls_blob, &srk_public, &expected_pcr8(), "seal-tls");
+    let tls_env = seal(Kind::Tls, &tls_blob, &srk_public, &expected_pcrs(), "seal-tls");
 
     let mut gate = Gate::new();
     let (r, out) = drive(&mut tpm, client(&key_env, Kind::Key, "c-key"), Kind::Key, Some((&mut gate, 0)), pass);
@@ -387,7 +399,7 @@ fn wrong_pcr8_fails_unseal_with_a_policy_error_and_no_plaintext() {
     tpm.pcr_extend(&BOOT_DIGESTS[0]);
     tpm.pcr_extend(&[0x33; 32]);
     let key_blob = blob(Kind::Key, "key");
-    let env = seal(Kind::Key, &key_blob, &srk_public, &expected_pcr8(), "seal");
+    let env = seal(Kind::Key, &key_blob, &srk_public, &expected_pcrs(), "seal");
     let (r, out) = drive(&mut tpm, client(&env, Kind::Key, "c"), Kind::Key, None, pass);
     let f = r.unwrap_err();
     assert_eq!(f.step, Step::Unseal);
@@ -403,7 +415,7 @@ fn envelope_sealed_to_a_foreign_tpm_fails_the_srk_name_check() {
     let mut swtpm = Swtpm::start("foreign", true);
     let mut tpm = swtpm.connect();
     measured_boot(&mut tpm);
-    let env = seal(Kind::Key, &blob(Kind::Key, "key"), &foreign_public, &expected_pcr8(), "seal");
+    let env = seal(Kind::Key, &blob(Kind::Key, "key"), &foreign_public, &expected_pcrs(), "seal");
     let mut sent = Vec::new();
     let (r, out) = drive(&mut tpm, client(&env, Kind::Key, "c"), Kind::Key, None, |step, dir, _, _| {
         if dir == Dir::Command {
@@ -423,7 +435,7 @@ fn every_flipped_byte_of_the_unseal_response_is_refused_and_outdata_never_used()
     let mut tpm = swtpm.connect();
     let (srk_public, _) = tpm.srk();
     measured_boot(&mut tpm);
-    let env = seal(Kind::Key, &blob(Kind::Key, "key"), &srk_public, &expected_pcr8(), "seal");
+    let env = seal(Kind::Key, &blob(Kind::Key, "key"), &srk_public, &expected_pcrs(), "seal");
     // An unmodified relay first: the response length to iterate over.
     let mut len = 0;
     let (r, _) = drive(&mut tpm, client(&env, Kind::Key, "c-0"), Kind::Key, None, |step, dir, rsp, _| {
@@ -466,7 +478,7 @@ fn stripping_encrypt_from_unseal_gets_a_bad_auth_and_no_outdata() {
     let mut tpm = swtpm.connect();
     let (srk_public, _) = tpm.srk();
     measured_boot(&mut tpm);
-    let env = seal(Kind::Key, &blob(Kind::Key, "key"), &srk_public, &expected_pcr8(), "seal");
+    let env = seal(Kind::Key, &blob(Kind::Key, "key"), &srk_public, &expected_pcrs(), "seal");
     let mut seen = Vec::new();
     let (r, out) = drive(&mut tpm, client(&env, Kind::Key, "c"), Kind::Key, None, |step, dir, bytes, _| {
         if step == Step::Unseal {
@@ -504,7 +516,7 @@ fn without_policy_auth_value_a_stripped_encrypt_still_fails_the_salted_session_h
     measured_boot(&mut tpm);
     let region = blob(Kind::Key, "key");
     let mut env = vec![0u8; Kind::Key.region_size()];
-    let policy = crypto::policy_pcr_digest(&expected_pcr8());
+    let policy = crypto::policy_pcr_digest(&expected_pcrs());
     envelope::seal_with_policy(&mut env, Kind::Key, &region, &srk_public, &policy, &entropy("seal-weak")).unwrap();
     let mut seen = Vec::new();
     let (r, out) = drive(&mut tpm, client(&env, Kind::Key, "c"), Kind::Key, None, |step, dir, bytes, _| {
@@ -544,7 +556,7 @@ fn rm5_5_a_relay_that_unsalts_the_session_reads_the_kek_and_the_client_refuses()
     let (srk_public, _) = tpm.srk();
     measured_boot(&mut tpm);
     let label = "seal";
-    let env = seal(Kind::Key, &blob(Kind::Key, "key"), &srk_public, &expected_pcr8(), label);
+    let env = seal(Kind::Key, &blob(Kind::Key, "key"), &srk_public, &expected_pcrs(), label);
     let name = envelope::Envelope::parse(&env, Kind::Key).unwrap().object_name();
     let mut nonce_tpm = Vec::new();
     let mut leaked = None;
@@ -607,7 +619,7 @@ fn rm5_5_a_relay_running_its_own_session_on_the_loaded_object_unseals_the_kek() 
     let (srk_public, _) = tpm.srk();
     measured_boot(&mut tpm);
     let label = "seal";
-    let env = seal(Kind::Key, &blob(Kind::Key, "key"), &srk_public, &expected_pcr8(), label);
+    let env = seal(Kind::Key, &blob(Kind::Key, "key"), &srk_public, &expected_pcrs(), label);
     let parsed = envelope::Envelope::parse(&env, Kind::Key).unwrap();
     let mut stolen = None;
     let (r, out) = drive(&mut tpm, client(&env, Kind::Key, "c"), Kind::Key, None, |step, dir, bytes, tpm| {
@@ -655,8 +667,8 @@ fn the_other_clients_valid_unseal_response_is_refused() {
     let mut tpm = swtpm.connect();
     let (srk_public, _) = tpm.srk();
     measured_boot(&mut tpm);
-    let env_b = seal(Kind::Key, &blob(Kind::Key, "b"), &srk_public, &expected_pcr8(), "seal-b");
-    let env_a = seal(Kind::Key, &blob(Kind::Key, "a"), &srk_public, &expected_pcr8(), "seal-a");
+    let env_b = seal(Kind::Key, &blob(Kind::Key, "b"), &srk_public, &expected_pcrs(), "seal-b");
+    let env_a = seal(Kind::Key, &blob(Kind::Key, "a"), &srk_public, &expected_pcrs(), "seal-a");
     let mut b_unseal = Vec::new();
     let (r, _) = drive(&mut tpm, client(&env_b, Kind::Key, "c-b"), Kind::Key, None, |step, dir, rsp, _| {
         if step == Step::Unseal && dir == Dir::Response {
@@ -684,8 +696,8 @@ fn two_seals_of_one_blob_differ_and_both_unseal() {
     let (srk_public, _) = tpm.srk();
     measured_boot(&mut tpm);
     let region = blob(Kind::Key, "key");
-    let first = seal(Kind::Key, &region, &srk_public, &expected_pcr8(), "seal-1");
-    let second = seal(Kind::Key, &region, &srk_public, &expected_pcr8(), "seal-2");
+    let first = seal(Kind::Key, &region, &srk_public, &expected_pcrs(), "seal-1");
+    let second = seal(Kind::Key, &region, &srk_public, &expected_pcrs(), "seal-2");
     // The encrypted body alone: under one KEK the stream cipher would give
     // the same bytes whatever the AAD (only the tag would differ).
     let body = |e: &[u8]| {
@@ -796,10 +808,10 @@ fn every_key_pd_unseals_concurrently_through_the_pd_model_and_pcr8_is_capped() {
     measured_boot(&mut tpm);
     let key_blob = blob(Kind::Key, "key");
     let pq_blob = blob(Kind::Pq, "pq");
-    let key_env = seal(Kind::Key, &key_blob, &srk_public, &expected_pcr8(), "boot-seal-key");
-    let pq_env = seal(Kind::Pq, &pq_blob, &srk_public, &expected_pcr8(), "boot-seal-pq");
+    let key_env = seal(Kind::Key, &key_blob, &srk_public, &expected_pcrs(), "boot-seal-key");
+    let pq_env = seal(Kind::Pq, &pq_blob, &srk_public, &expected_pcrs(), "boot-seal-pq");
     let tls_blob = blob(Kind::Tls, "tls");
-    let tls_env = seal(Kind::Tls, &tls_blob, &srk_public, &expected_pcr8(), "boot-seal-tls");
+    let tls_env = seal(Kind::Tls, &tls_blob, &srk_public, &expected_pcrs(), "boot-seal-tls");
     let pd = std::sync::Mutex::new(PdModel { tpm, gate: Gate::new(), busy: 0 });
     let start = Instant::now();
     // Two flows at once would need four transient objects (swtpm has

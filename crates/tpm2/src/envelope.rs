@@ -10,7 +10,7 @@
 //! | 16     | payload_len u32: plaintext bytes                             |
 //! | 20     | pinned SRK Name (34)                                         |
 //! | 54     | pinned SRK public, TPM2B_PUBLIC (2 + 90)                     |
-//! | 146    | PCR selection, TPML_PCR_SELECTION {sha256: {8}} (10)         |
+//! | 146    | PCR selection, TPML_PCR_SELECTION {sha256: {0..8}} (10)      |
 //! | 156    | policy digest (32)                                           |
 //! | 188    | object public, TPM2B_PUBLIC (2 + 78)                         |
 //! | 268    | duplicate, TPM2B_PRIVATE (2 + 108)                           |
@@ -35,7 +35,7 @@
 
 use secret_blob::pq;
 use tpm2_wire::{
-    COORD_LEN, DIGEST_LEN, DUPLICATE_LEN, NAME_LEN, PCR_SELECTION, POINT_LEN, SEALED_PUBLIC_LEN, SENSITIVE_LEN,
+    COORD_LEN, DIGEST_LEN, DUPLICATE_LEN, NAME_LEN, POINT_LEN, POLICY_PCR_SELECTION, SEALED_PUBLIC_LEN, SENSITIVE_LEN,
     SRK_PUBLIC_LEN, Writer,
 };
 use wg_core::crypto::{Key32, TAG_LEN, aead_open, aead_seal};
@@ -51,7 +51,7 @@ const PAYLOAD_LEN_AT: usize = 16;
 const SRK_NAME_AT: usize = 20;
 const SRK_PUBLIC_AT: usize = SRK_NAME_AT + NAME_LEN;
 const PCR_SELECTION_AT: usize = SRK_PUBLIC_AT + 2 + SRK_PUBLIC_LEN;
-const POLICY_AT: usize = PCR_SELECTION_AT + PCR_SELECTION.len();
+const POLICY_AT: usize = PCR_SELECTION_AT + POLICY_PCR_SELECTION.len();
 const OBJECT_PUBLIC_AT: usize = POLICY_AT + DIGEST_LEN;
 const DUPLICATE_AT: usize = OBJECT_PUBLIC_AT + 2 + SEALED_PUBLIC_LEN;
 const SEED_AT: usize = DUPLICATE_AT + 2 + DUPLICATE_LEN;
@@ -189,7 +189,7 @@ impl<'a> Envelope<'a> {
         if field::<NAME_LEN>(bytes, SRK_NAME_AT) != Some(&crypto::name(srk_public)) {
             return Err(EnvError::SrkName);
         }
-        if field::<10>(bytes, PCR_SELECTION_AT) != Some(&PCR_SELECTION) {
+        if field::<10>(bytes, PCR_SELECTION_AT) != Some(&POLICY_PCR_SELECTION) {
             return Err(EnvError::PcrSelection);
         }
         let object_public = tpm2b(bytes, OBJECT_PUBLIC_AT, SEALED_PUBLIC_LEN).ok_or(EnvError::ObjectPublic)?;
@@ -326,16 +326,16 @@ pub const SEAL_ENTROPY_LEN: usize = 3 * 32;
 
 /// Seals `region` (a plaintext blob of `kind`'s region size) into `out`
 /// (the same size) for the TPM whose SRK public is `srk_public`
-/// (TPMT_PUBLIC) and the PCR 8 value `pcr8`.
+/// (TPMT_PUBLIC) and the values of PCRs 0-8, `pcrs`.
 pub fn seal(
     out: &mut [u8],
     kind: Kind,
     region: &[u8],
     srk_public: &[u8],
-    pcr8: &[u8; DIGEST_LEN],
+    pcrs: &crypto::PolicyPcrs,
     entropy: &Secret<SEAL_ENTROPY_LEN>,
 ) -> Result<(), EnvError> {
-    seal_with_policy(out, kind, region, srk_public, &crypto::policy_digest(pcr8), entropy)
+    seal_with_policy(out, kind, region, srk_public, &crypto::policy_digest(pcrs), entropy)
 }
 
 /// `seal` under any authPolicy. Only `seal`'s policy is one `key` and
@@ -410,7 +410,7 @@ pub fn seal_with_policy(
         w.bytes(&u32::try_from(payload_len).ok()?.to_le_bytes())?;
         w.bytes(&srk_name)?;
         w.tpm2b(srk_public)?;
-        w.bytes(&PCR_SELECTION)?;
+        w.bytes(&POLICY_PCR_SELECTION)?;
         w.bytes(auth_policy)?;
         w.tpm2b(&public)?;
         w.u16(u16::try_from(DUPLICATE_LEN).ok()?)?;

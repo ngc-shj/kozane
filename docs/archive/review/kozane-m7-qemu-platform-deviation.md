@@ -87,3 +87,64 @@ results and Re-plan R1 are in the plan itself.
 - **What:** U-Boot treats an already-started TPM as success, so the old
   `tpm2 startup` line would have passed. It is removed anyway, per C3,
   and P24 forbids it.
+
+## Slice 2 (C3, C4)
+
+### C4: the policy and its twin
+
+- **What:** the plan wrote `--pcrs`/`pcrs` as interfaces without giving
+  their encoding. They are encoded as follows:
+  - `mksecrets seal` and `check-envelope` take
+    `--pcrs HEX,...,HEX`: nine values, PCR 0 first. Any other count is
+    refused.
+  - The package writes `pcrs` (one hex value per line) and `flash.bin`.
+  - The release manifest replaces `pcr8` with `firmware_sha256` and `pcrs`
+    (10 keys).
+  - The release ships `flash.bin`.
+- **What:** tpm2-tools' `tpm2_policypcr -f` refuses nine PCRs. Its
+  TPML_DIGEST holds at most eight, the same limit that makes the host
+  read PCRs 0-7 and 8 separately.
+  So the independent oracle (TE4) reads the values from swtpm itself
+  after the boot extends instead of from a file. The result is a stronger
+  oracle: the TPM computes the policy digest from its own PCRs.
+- **What:** `mksecrets` takes `tpm2-wire` as a normal dependency, not only
+  a dev-dependency. It is already in the lock through `tpm2`, so the lock
+  is unchanged.
+- **What:** ct-harness's `residue.rs` also calls `envelope::seal`. The
+  plan's consumer list missed it, and the build found it.
+  `make ct` refreshed the C9 pass record for the changed harness.
+- **What:** the M5 envelope deny (an envelope sealed to PCR 8 alone) is the
+  envelope parser's refusal: the selection field differs. It is covered by
+  the tpm2 unit test on the selection bytes. It is not a separate
+  integration boot.
+
+### C3: integration
+
+- **What:** each stage's deny changes one printed byte of that FIP entry,
+  so the case also proves the changed stage ran:
+  - BL2's and BL31's `release):kozane` becomes `Kozane`;
+  - BL33's `U-Boot 2025.01` becomes `u-Boot`.
+  Each variant is derived from FIRMWARE by the harness and registered,
+  and `qemu_machine` refuses any other firmware. The planned forging BL2
+  is this case: a BL2 changed in one byte that extends exactly what the
+  honest one does.
+- **What:** there is no config deny, because P2 found that no config is
+  consumed (the closed list is {BL2, BL31, BL33}). The twin refuses a FIP
+  with any other entry, as the fixtures in test_measure and test_release
+  show.
+- **What:** each I3.2 case checks that TF-A printed its stage line, that
+  QEMU exited, and that U-Boot never ran. The QMP `guest-shutdown` reason
+  is added with C11's harness change.
+  **Anti-Deferral:** until then, "exited" cannot tell a power-off from a
+  crash. The case's TF-A line names the stop, so the exposure is a
+  mislabelled exit, not a missed one.
+- **What:** the plan's mutations (consistent drops from the patch and the
+  twin) are self-test injections. They belong to slice 6 (bookkeeping),
+  with the C2 repro injection.
+- **What:** the TPM proxy's PCR 3 injection holds the PolicyPCR until the
+  injected extend's response arrives. swtpm takes one command at a time,
+  and two back-to-back commands lost the second (observed: a hang).
+- **Observed:** with TF-A and swtpm, QEMU's `system_reset` (the wireguard
+  reboot case) re-ran BL1. The second boot re-measured, and its
+  handshakes worked as before. That covers the swtpm-reset half of P4 for
+  a host-initiated reset.

@@ -14,7 +14,8 @@ use aes::cipher::{BlockEncrypt, KeyInit};
 use libcrux_p256::P256;
 use libcrux_p256::ecdh_api::EcdhArrayref;
 use libcrux_sha2::{Digest, Sha256};
-use tpm2_wire::{ALG_SHA256, CC_POLICY_AUTH_VALUE, CC_POLICY_PCR, COORD_LEN, DIGEST_LEN, NAME_LEN, PCR_SELECTION};
+use tpm2_wire::{ALG_SHA256, CC_POLICY_AUTH_VALUE, CC_POLICY_PCR, COORD_LEN, DIGEST_LEN, NAME_LEN, POLICY_PCR_COUNT,
+    POLICY_PCR_SELECTION};
 use zeroize::Zeroize;
 
 use crate::Secret;
@@ -133,12 +134,18 @@ pub fn name(public: &[u8]) -> [u8; NAME_LEN] {
     out
 }
 
-/// The policy digest of PolicyPCR(PCR 8 = `pcr8`, sha256) alone.
-pub fn policy_pcr_digest(pcr8: &[u8; DIGEST_LEN]) -> [u8; DIGEST_LEN] {
-    sha256(&[&[0u8; DIGEST_LEN], &CC_POLICY_PCR.to_be_bytes(), &PCR_SELECTION, &sha256(&[pcr8])])
+/// The values of PCRs 0-8, in index order: what the seal policy names.
+pub type PolicyPcrs = [[u8; DIGEST_LEN]; POLICY_PCR_COUNT];
+
+/// The policy digest of PolicyPCR(PCRs 0-8 = `pcrs`, sha256) alone: the
+/// pcrDigest is the hash of the selected values concatenated in index order.
+pub fn policy_pcr_digest(pcrs: &PolicyPcrs) -> [u8; DIGEST_LEN] {
+    let values: [&[u8]; POLICY_PCR_COUNT] = pcrs.each_ref().map(|p| p.as_slice());
+    sha256(&[&[0u8; DIGEST_LEN], &CC_POLICY_PCR.to_be_bytes(), &POLICY_PCR_SELECTION, &sha256(&values)])
 }
 
-/// The seal policy (C11): PolicyPCR(8, sha256) ∧ PolicyAuthValue.
-pub fn policy_digest(pcr8: &[u8; DIGEST_LEN]) -> [u8; DIGEST_LEN] {
-    sha256(&[&policy_pcr_digest(pcr8), &CC_POLICY_AUTH_VALUE.to_be_bytes()])
+/// The seal policy (M5 plan C11, M7 plan C4): PolicyPCR(0-8, sha256) ∧
+/// PolicyAuthValue.
+pub fn policy_digest(pcrs: &PolicyPcrs) -> [u8; DIGEST_LEN] {
+    sha256(&[&policy_pcr_digest(pcrs), &CC_POLICY_AUTH_VALUE.to_be_bytes()])
 }

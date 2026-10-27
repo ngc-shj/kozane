@@ -12,8 +12,6 @@ mce460896 = { path = "../../crates/mce460896" }
 serde = { version = "=1.0.229", features = ["derive"] }
 toml = "=0.9.8"
 tpm2 = { path = "../../crates/tpm2" }
-
-[dev-dependencies]
 tpm2-wire = { path = "../../crates/tpm2-wire" }
 
 [lints.clippy]

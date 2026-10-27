@@ -383,7 +383,7 @@ fn sealed_envelope(kind: Kind, len: usize) -> (Vec<u8>, Box<Secret<32>>, Vec<u8>
     plain[..len].copy_from_slice(&stream(b"blob", len));
     plain[len - 1] |= 1;
     let mut env = vec![0u8; kind.region_size()];
-    envelope::seal(&mut env, kind, &plain, &srk, &[0x88; 32], &entropy).expect("seal");
+    envelope::seal(&mut env, kind, &plain, &srk, &[[0x88; 32]; tpm2_wire::POLICY_PCR_COUNT], &entropy).expect("seal");
     let mut kek = Box::new(Secret::<32>::zero());
     kek.as_mut_bytes().copy_from_slice(&entropy.as_bytes()[..32]);
     (env, kek, plain)

@@ -114,9 +114,9 @@ endif
 # printing) on the PD ELFs it packages against this harness, and wants a C9
 # pass record for it on a non-debug kernel (M4 plan C11), so `make ct` must
 # have passed.
-package: image ct-harness
+package: image ct-harness $(firmware)
 	tools/package --secrets $(SECRETS) --pq-secrets $(PQ_SECRETS) --tls-secrets $(TLS_SECRETS) \
-		--srk-public $(SRK_PUBLIC) --out $(OUT) \
+		--srk-public $(SRK_PUBLIC) --firmware $(firmware) --out $(OUT) \
 		--system $(system) --policy $(policy) \
 		--image $(loader) --gen-config $(sdk_config_dir)/include/kernel/gen_config.h \
 		--search-path $(BUILD) --board $(MICROKIT_BOARD) --config $(MICROKIT_CONFIG) \

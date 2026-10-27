@@ -15,6 +15,7 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 import measure  # noqa: E402
+import fip_fixture  # noqa: E402
 
 RELEASE = [sys.executable, str(ROOT / "tools/release.py")]
 BIN = str(ROOT / "build/release/target/release/release")
@@ -43,7 +44,14 @@ def setup(d: pathlib.Path) -> None:
     desc = measure.pack(len(image), RANGES)
     (pkg / "published.img").write_bytes(image)
     (pkg / "boot.desc").write_bytes(desc)
-    (pkg / "pcr8").write_text(measure.expected_pcr8(desc, image).hex() + "\n")
+    (pkg / "flash.bin").write_bytes(fip_fixture.flash())
+    write_pcrs(pkg)
+
+
+def write_pcrs(pkg: pathlib.Path):
+    pcrs = measure.expected_pcrs((pkg / "flash.bin").read_bytes(), (pkg / "boot.desc").read_bytes(),
+                                 (pkg / "published.img").read_bytes())
+    (pkg / "pcrs").write_text("".join(p.hex() + "\n" for p in pcrs))
 
 
 def make(d, out="rel"):
@@ -82,6 +90,16 @@ def case_desc(d):
     return rc == 1 and ("boot_desc_sha256" in out or "measure:" in out), out
 
 
+def case_firmware(d):
+    """M7 plan C4, C11: a firmware byte changed after signing (BL2's, so PCR 0
+    moves too) is refused."""
+    make(d)
+    flash = d / "rel/flash.bin"
+    flip(flash, measure.FIP_OFFSET + measure.FIP_HEADER.size + measure.FIP_ENTRY.size * 4 + 1)
+    rc, out = verify(d)
+    return rc == 1 and ("firmware_sha256" in out or "pcrs" in out), out
+
+
 def case_manifest(d):
     make(d)
     m = d / "rel/manifest"
@@ -96,10 +114,28 @@ def case_other_key(d):
     return rc == 1 and "does not verify" in out, out
 
 
-def case_pkg_pcr8(d):
-    (d / "pkg/pcr8").write_text("00" * 32 + "\n")
+def case_pkg_pcrs(d):
+    """M7 plan C4: a package whose PCR 0 (TF-A's) disagrees with its flash.bin."""
+    lines = (d / "pkg/pcrs").read_text().split()
+    (d / "pkg/pcrs").write_text("".join(l + "\n" for l in ["00" * 32] + lines[1:]))
     rc, out = make(d)
-    return rc == 1 and "pcr8 differs" in out and not (d / "rel").exists(), out
+    return rc == 1 and "pcrs differ" in out and not (d / "rel").exists(), out
+
+
+def case_pkg_firmware_swapped(d):
+    """M7 plan C4: another firmware beside the pcrs computed from the first."""
+    other = [(u, data + b"!") for u, data in fip_fixture.payloads()]
+    (d / "pkg/flash.bin").write_bytes(fip_fixture.flash(other))
+    rc, out = make(d)
+    return rc == 1 and "pcrs differ" in out and not (d / "rel").exists(), out
+
+
+def case_pkg_firmware_extra_entry(d):
+    """M7 plan C3: a FIP with an entry outside the measured list is refused."""
+    extra = fip_fixture.payloads() + [(bytes.fromhex("9766fd3d89bee849ae5d78a140608213"), b"scp")]
+    (d / "pkg/flash.bin").write_bytes(fip_fixture.flash(extra))
+    rc, out = make(d)
+    return rc == 1 and "not on the measured list" in out and not (d / "rel").exists(), out
 
 
 def case_existing_out(d):
@@ -136,13 +172,16 @@ def signed_release(d, commit: str, image: bytes = None) -> bool:
     fields = {"version": "m5-dev", "commit": commit, "dev_image": "x",
               "loader_img_sha256": hashlib.sha256(img).hexdigest(),
               "boot_desc_sha256": hashlib.sha256(desc).hexdigest(),
-              "pcr8": measure.expected_pcr8(desc, img).hex(), "cargo_lock_sha256": "x", "verus": "x", "kani": "x"}
+              "firmware_sha256": hashlib.sha256(fip_fixture.flash()).hexdigest(),
+              "pcrs": ",".join(p.hex() for p in measure.expected_pcrs(fip_fixture.flash(), desc, img)),
+              "cargo_lock_sha256": "x", "verus": "x", "kani": "x"}
     rc, manifest = run(BIN, "render", *(f"{k}={v}" for k, v in fields.items()))
     (rel / "manifest").write_text(manifest)
     rc2, _ = run(BIN, "sign", "--keys", str(d / "keys"), "--manifest", str(rel / "manifest"),
                  "--out", str(rel / "manifest.sig"))
     (rel / "published.img").write_bytes(img)
     (rel / "boot.desc").write_bytes(desc)
+    (rel / "flash.bin").write_bytes(fip_fixture.flash())
     return rc == 0 and rc2 == 0
 
 
@@ -176,7 +215,7 @@ def case_range_over_code(d, at=0x1000):
     img[at] = 1
     (d / "pkg/published.img").write_bytes(bytes(img))
     desc = (d / "pkg/boot.desc").read_bytes()
-    (d / "pkg/pcr8").write_text(measure.expected_pcr8(desc, bytes(img)).hex() + "\n")
+    write_pcrs(d / "pkg")
     rc, out = make(d)
     return rc == 1 and "zero placeholder" in out, out
 
@@ -207,9 +246,12 @@ CASES = [
     ("a release made and verified with its own key", case_allow),
     ("a published image changed after signing is refused", case_image),
     ("a boot descriptor changed after signing is refused", case_desc),
+    ("a firmware image changed after signing is refused", case_firmware),
     ("an edited manifest is refused", case_manifest),
     ("another key's public half refuses the release", case_other_key),
-    ("a package whose pcr8 disagrees with measure.py is refused", case_pkg_pcr8),
+    ("a package whose pcrs disagree with measure.py is refused", case_pkg_pcrs),
+    ("a package whose flash.bin is not the one its pcrs came from is refused", case_pkg_firmware_swapped),
+    ("a package whose FIP has an unmeasured entry is refused", case_pkg_firmware_extra_entry),
     ("an existing OUT is refused", case_existing_out),
     ("release keys inside the repo are refused", case_keys_in_repo),
     ("a failed signing leaves no OUT and no staging, and the retry succeeds", case_sign_fails_leaves_nothing),

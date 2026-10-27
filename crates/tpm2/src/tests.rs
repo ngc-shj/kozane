@@ -147,10 +147,33 @@ fn hmac_and_sha256_match_rfc_4231_and_fips_180_vectors() {
 
 #[test]
 fn policy_digest_extends_the_pcr_policy_with_policy_auth_value() {
-    let pcr = [7u8; 32];
+    let pcr = [[7u8; 32]; tpm2_wire::POLICY_PCR_COUNT];
     let pcr_only = crypto::policy_pcr_digest(&pcr);
     assert_eq!(crypto::policy_digest(&pcr), crypto::sha256(&[&pcr_only, &0x16Bu32.to_be_bytes()]));
-    assert_ne!(crypto::policy_digest(&pcr), crypto::policy_digest(&[8u8; 32]));
+    assert_ne!(crypto::policy_digest(&pcr), crypto::policy_digest(&[[8u8; 32]; tpm2_wire::POLICY_PCR_COUNT]));
+}
+
+#[test]
+fn the_pcr_policy_binds_every_pcr_0_to_8_in_index_order() {
+    let mut pcrs = [[0u8; 32]; tpm2_wire::POLICY_PCR_COUNT];
+    for (i, p) in pcrs.iter_mut().enumerate() {
+        p[0] = i as u8;
+    }
+    let base = crypto::policy_pcr_digest(&pcrs);
+    let values: Vec<u8> = pcrs.concat();
+    let pcr_digest = crypto::sha256(&[&values]);
+    assert_eq!(
+        base,
+        crypto::sha256(&[&[0u8; 32], &0x17Fu32.to_be_bytes(), &tpm2_wire::POLICY_PCR_SELECTION, &pcr_digest])
+    );
+    for i in 0..tpm2_wire::POLICY_PCR_COUNT {
+        let mut changed = pcrs;
+        changed[i][31] ^= 1;
+        assert_ne!(crypto::policy_pcr_digest(&changed), base, "PCR {i} is not bound");
+    }
+    let mut swapped = pcrs;
+    swapped.swap(0, 8);
+    assert_ne!(crypto::policy_pcr_digest(&swapped), base, "the order is not bound");
 }
 
 // A test SRK whose private scalar the fake TPM below holds.
@@ -165,7 +188,8 @@ fn srk_public() -> Vec<u8> {
     p
 }
 
-const PCR8: [u8; 32] = [0x42; 32];
+// PCRs 0-8 an envelope is sealed to in these tests.
+const PCRS: crypto::PolicyPcrs = [[0x42; 32]; tpm2_wire::POLICY_PCR_COUNT];
 
 fn seal_entropy(tag: u8) -> Secret<SEAL_ENTROPY_LEN> {
     let mut s = Secret::<SEAL_ENTROPY_LEN>::zero();
@@ -189,7 +213,7 @@ fn region(kind: Kind, len: usize) -> Vec<u8> {
 
 fn sealed(kind: Kind, plain: &[u8], tag: u8) -> Vec<u8> {
     let mut out = vec![0u8; kind.region_size()];
-    envelope::seal(&mut out, kind, plain, &srk_public(), &PCR8, &seal_entropy(tag)).unwrap();
+    envelope::seal(&mut out, kind, plain, &srk_public(), &PCRS, &seal_entropy(tag)).unwrap();
     out
 }
 
@@ -207,7 +231,7 @@ fn sealed_envelope_parses_and_opens_to_the_region_every_kind() {
         let e = Envelope::parse(&env, kind).unwrap();
         assert_eq!(e.payload_len(), len);
         assert_eq!(e.srk_public(), &srk_public()[..]);
-        assert_eq!(e.object_policy(), &crypto::policy_digest(&PCR8));
+        assert_eq!(e.object_policy(), &crypto::policy_digest(&PCRS));
         let (r, out) = open(&env, kind, &kek(1));
         assert_eq!(r, Ok(()));
         assert!(out == plain, "{kind:?} did not open to its region");
@@ -256,8 +280,8 @@ fn the_envelope_header_offsets_are_the_documented_ones() {
     assert_eq!(&env[..8], b"SOSSEAL1");
     assert_eq!(&env[20..54], &crypto::name(&srk_public())[..]);
     assert_eq!(&env[54..56], &[0, 90]);
-    assert_eq!(&env[146..156], &tpm2_wire::PCR_SELECTION);
-    assert_eq!(&env[156..188], &crypto::policy_digest(&PCR8));
+    assert_eq!(&env[146..156], &tpm2_wire::POLICY_PCR_SELECTION);
+    assert_eq!(&env[156..188], &crypto::policy_digest(&PCRS));
     assert_eq!(&env[188..190], &[0, 78]);
     assert_eq!(&env[268..270], &[0, 108]);
     assert_eq!(&env[378..380], &[0, 68]);
@@ -334,11 +358,11 @@ fn seal_refuses_a_payload_past_the_capacity_and_a_short_region() {
     let mut out = vec![0u8; Kind::Key.region_size()];
     let e = seal_entropy(1);
     let long = region(Kind::Key, Kind::Key.capacity() + 1);
-    assert_eq!(envelope::seal(&mut out, Kind::Key, &long, &srk_public(), &PCR8, &e), Err(EnvError::Seal));
+    assert_eq!(envelope::seal(&mut out, Kind::Key, &long, &srk_public(), &PCRS, &e), Err(EnvError::Seal));
     assert!(out.iter().all(|b| *b == 0));
     let fits = region(Kind::Key, Kind::Key.capacity());
-    assert_eq!(envelope::seal(&mut out, Kind::Key, &fits, &srk_public(), &PCR8, &e), Ok(()));
-    assert_eq!(envelope::seal(&mut out, Kind::Key, &fits[..100], &srk_public(), &PCR8, &e), Err(EnvError::Seal));
+    assert_eq!(envelope::seal(&mut out, Kind::Key, &fits, &srk_public(), &PCRS, &e), Ok(()));
+    assert_eq!(envelope::seal(&mut out, Kind::Key, &fits[..100], &srk_public(), &PCRS, &e), Err(EnvError::Seal));
 }
 
 #[test]
@@ -351,8 +375,8 @@ fn a_key_blob_with_key_max_peers_seals_and_one_more_does_not() {
     };
     let mut out = vec![0u8; Kind::Key.region_size()];
     let e = seal_entropy(1);
-    assert_eq!(envelope::seal(&mut out, Kind::Key, &blob(KEY_MAX_PEERS)[..], &srk_public(), &PCR8, &e), Ok(()));
-    let r = envelope::seal(&mut out, Kind::Key, &blob(KEY_MAX_PEERS + 1)[..], &srk_public(), &PCR8, &e);
+    assert_eq!(envelope::seal(&mut out, Kind::Key, &blob(KEY_MAX_PEERS)[..], &srk_public(), &PCRS, &e), Ok(()));
+    let r = envelope::seal(&mut out, Kind::Key, &blob(KEY_MAX_PEERS + 1)[..], &srk_public(), &PCRS, &e);
     assert_eq!(r, Err(EnvError::Seal));
 }
 
@@ -361,7 +385,7 @@ fn seal_refuses_an_srk_public_that_is_not_the_template() {
     let mut out = vec![0u8; Kind::Key.region_size()];
     let mut public = srk_public();
     public[7] ^= 0x40; // userWithAuth
-    let r = envelope::seal(&mut out, Kind::Key, &region(Kind::Key, 10), &public, &PCR8, &seal_entropy(1));
+    let r = envelope::seal(&mut out, Kind::Key, &region(Kind::Key, 10), &public, &PCRS, &seal_entropy(1));
     assert_eq!(r, Err(EnvError::SrkPublic));
 }
 

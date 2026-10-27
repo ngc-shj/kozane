@@ -56,10 +56,25 @@ pub const SESSION_CONTINUE: u8 = 0x01;
 pub const SESSION_DECRYPT: u8 = 0x20;
 pub const SESSION_ENCRYPT: u8 = 0x40;
 
-/// The one PCR the seal policy names (M5 plan C8) and the cap extends.
+/// The PCR the cap extends (M5 plan C8): U-Boot's measurements.
 pub const PCR_INDEX: u32 = 8;
-/// TPML_PCR_SELECTION {sha256: {8}}.
-pub const PCR_SELECTION: [u8; 10] = [0, 0, 0, 1, 0x00, 0x0B, 3, 0x00, 0x01, 0x00];
+/// The PCRs the seal policy names (M7 plan C4): 0-7, TF-A's, and 8.
+pub const POLICY_PCR_COUNT: usize = 9;
+/// TPML_PCR_SELECTION {sha256: {0..8}}: PolicyPCR and the envelope.
+pub const POLICY_PCR_SELECTION: [u8; 10] = [0, 0, 0, 1, 0x00, 0x0B, 3, 0xFF, 0x01, 0x00];
+/// TPML_PCR_SELECTION {sha256: {8}}: the cap's PCR_Read.
+pub const CAP_PCR_SELECTION: [u8; 10] = [0, 0, 0, 1, 0x00, 0x0B, 3, 0x00, 0x01, 0x00];
+
+// I4.2: the cap reads a subset of what the policy names, on the same bank
+// and header, and the policy's bitmap names PCRs 0-8, POLICY_PCR_COUNT of
+// them.
+const _: () = {
+    let [p0, p1, p2, p3, p4, p5, p6, p7, p8, p9] = POLICY_PCR_SELECTION;
+    let [c0, c1, c2, c3, c4, c5, c6, c7, c8, c9] = CAP_PCR_SELECTION;
+    assert!(p0 == c0 && p1 == c1 && p2 == c2 && p3 == c3 && p4 == c4 && p5 == c5 && p6 == c6);
+    assert!(c7 & !p7 == 0 && c8 & !p8 == 0 && c9 & !p9 == 0);
+    assert!(p7 == 0xFF && p8 == 0x01 && p9 == 0x00 && POLICY_PCR_COUNT == 9);
+};
 
 pub const HEADER_LEN: usize = 10;
 pub const DIGEST_LEN: usize = 32;
@@ -118,7 +133,7 @@ pub const MAX_PRIVATE: usize = 256;
 
 pub const CREATE_PRIMARY_CMD_LEN: usize = HEADER_LEN + 4 + PW_AUTH_LEN + 6 + 2 + SRK_TEMPLATE_LEN + 2 + 4;
 pub const START_AUTH_SESSION_CMD_LEN: usize = HEADER_LEN + 8 + 2 + NONCE_LEN + 2 + POINT_LEN + 1 + 6 + 2;
-pub const POLICY_PCR_CMD_LEN: usize = HEADER_LEN + 4 + 2 + PCR_SELECTION.len();
+pub const POLICY_PCR_CMD_LEN: usize = HEADER_LEN + 4 + 2 + POLICY_PCR_SELECTION.len();
 pub const POLICY_AUTH_VALUE_CMD_LEN: usize = HEADER_LEN + 4;
 pub const IMPORT_CMD_LEN: usize =
     HEADER_LEN + 4 + PW_AUTH_LEN + 2 + 2 + SEALED_PUBLIC_LEN + 2 + DUPLICATE_LEN + 2 + POINT_LEN + 2;
@@ -128,7 +143,7 @@ pub const MAX_LOAD_CMD_LEN: usize = HEADER_LEN + 4 + PW_AUTH_LEN + 2 + MAX_PRIVA
 const POLICY_SESSION_LEN: usize = 4 + 2 + NONCE_LEN + 1 + 2 + DIGEST_LEN;
 pub const UNSEAL_CMD_LEN: usize = HEADER_LEN + 4 + 4 + POLICY_SESSION_LEN;
 pub const FLUSH_CONTEXT_CMD_LEN: usize = HEADER_LEN + 4;
-pub const PCR_READ_CMD_LEN: usize = HEADER_LEN + PCR_SELECTION.len();
+pub const PCR_READ_CMD_LEN: usize = HEADER_LEN + CAP_PCR_SELECTION.len();
 pub const PCR_EXTEND_CMD_LEN: usize = HEADER_LEN + 4 + PW_AUTH_LEN + 4 + 2 + DIGEST_LEN;
 
 const fn max(a: usize, b: usize) -> usize {
@@ -337,14 +352,14 @@ pub fn start_auth_session(
     w.finish()
 }
 
-/// TPM2_PolicyPCR over PCR 8 (sha256); an empty pcrDigest makes the TPM use
-/// the current value.
+/// TPM2_PolicyPCR over PCRs 0-8 (sha256); an empty pcrDigest makes the TPM
+/// use the current values.
 pub fn policy_pcr(out: &mut [u8], session: u32) -> Option<usize> {
     let mut w = Writer::new(out);
     header(&mut w, ST_NO_SESSIONS, CC_POLICY_PCR)?;
     w.u32(session)?;
     w.tpm2b(&[])?;
-    w.bytes(&PCR_SELECTION)?;
+    w.bytes(&POLICY_PCR_SELECTION)?;
     w.finish()
 }
 
@@ -419,7 +434,7 @@ pub fn flush_context(out: &mut [u8], handle: u32) -> Option<usize> {
 pub fn pcr_read(out: &mut [u8]) -> Option<usize> {
     let mut w = Writer::new(out);
     header(&mut w, ST_NO_SESSIONS, CC_PCR_READ)?;
-    w.bytes(&PCR_SELECTION)?;
+    w.bytes(&CAP_PCR_SELECTION)?;
     w.finish()
 }
 
@@ -592,7 +607,7 @@ pub fn parse_unseal(bytes: &[u8]) -> Result<UnsealRsp<'_>, RspError> {
 pub fn parse_pcr_read(bytes: &[u8]) -> Result<&[u8; DIGEST_LEN], RspError> {
     let mut r = response_header(bytes, ST_NO_SESSIONS)?;
     r.u32()?; // pcrUpdateCounter
-    if r.array::<10>()? != &PCR_SELECTION {
+    if r.array::<10>()? != &CAP_PCR_SELECTION {
         return Err(RspError::Malformed);
     }
     if r.u32()? != 1 {

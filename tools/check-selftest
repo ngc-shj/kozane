@@ -727,8 +727,8 @@ CASES = {
     # unseals.
     "sealed-pcr-unbound": (["test", "it_boots=sealed boot"], lambda t: (
         edit(t, "crates/tpm2/src/crypto.rs",
-             "    sha256(&[&policy_pcr_digest(pcr8), &CC_POLICY_AUTH_VALUE.to_be_bytes()])",
-             "    let _ = pcr8;\n    sha256(&[&[0u8; DIGEST_LEN], &CC_POLICY_AUTH_VALUE.to_be_bytes()])"),
+             "    sha256(&[&policy_pcr_digest(pcrs), &CC_POLICY_AUTH_VALUE.to_be_bytes()])",
+             "    let _ = pcrs;\n    sha256(&[&[0u8; DIGEST_LEN], &CC_POLICY_AUTH_VALUE.to_be_bytes()])"),
         edit(t, "crates/tpm2/src/client.rs",
              "            Step::StartAuthSession => self.on_start_auth_session(rsp).map(|()| Step::PolicyPcr),",
              "            Step::StartAuthSession => self.on_start_auth_session(rsp).map(|()| Step::PolicyAuthValue),")),

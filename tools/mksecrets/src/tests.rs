@@ -418,7 +418,17 @@ fn srk_tpm2b() -> Vec<u8> {
     out
 }
 
-const PCR8_HEX: &str = "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b\n";
+/// PCRs 0-8 as `tools/package` writes them: PCR 0 TF-A's, 1-7 untouched,
+/// 8 U-Boot's (with the trailing newline the file has).
+const PCRS_HEX: &str = "3d4b8c2a9e1f0067a5c3b2d1e0f9a8b7c6d5e4f30112233445566778899aabbc,\
+0000000000000000000000000000000000000000000000000000000000000000,\
+0000000000000000000000000000000000000000000000000000000000000000,\
+0000000000000000000000000000000000000000000000000000000000000000,\
+0000000000000000000000000000000000000000000000000000000000000000,\
+0000000000000000000000000000000000000000000000000000000000000000,\
+0000000000000000000000000000000000000000000000000000000000000000,\
+0000000000000000000000000000000000000000000000000000000000000000,\
+f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b\n";
 
 /// The blobs of the shared deployment (`key`'s, `pqkey`'s, `tlskey`'s),
 /// written where `seal` reads them, and the SRK file.
@@ -442,7 +452,7 @@ fn seal_writes_envelopes_that_parse_for_their_kind() {
         let out = s.0.join(name);
         let args: Vec<String> = [
             "--kind", kind, "--blob", blob.to_str().unwrap(), "--srk-public", srk.to_str().unwrap(),
-            "--pcr8", PCR8_HEX, "--out", out.to_str().unwrap(),
+            "--pcrs", PCRS_HEX, "--out", out.to_str().unwrap(),
         ]
         .iter()
         .map(|a| a.to_string())
@@ -451,7 +461,7 @@ fn seal_writes_envelopes_that_parse_for_their_kind() {
         let bytes = std::fs::read(&out).unwrap();
         let kind = parse_kind(kind).unwrap();
         let env = tpm2::envelope::Envelope::parse(&bytes, kind).unwrap_or_else(|e| panic!("{e:?}"));
-        assert_eq!(env.object_policy(), &tpm2::crypto::policy_digest(&pcr8(PCR8_HEX).unwrap()));
+        assert_eq!(env.object_policy(), &tpm2::crypto::policy_digest(&pcrs(PCRS_HEX).unwrap()));
         assert_eq!(env.srk_public(), &srk_tpm2b()[2..]);
         // The output is never replaced.
         assert!(run_seal(&args).is_err());
@@ -465,7 +475,7 @@ fn two_seals_of_one_blob_give_different_ciphertexts() {
     let s = Scratch::new("seal-twice");
     let (key, _, _, _) = blob_files(&s);
     let srk = srk_tpm2b();
-    let pcr = pcr8(PCR8_HEX).unwrap();
+    let pcr = pcrs(PCRS_HEX).unwrap();
     // The encrypted body without its tag: the tag covers the header, which
     // differs between seals whatever the KEK.
     let body = |e: &[u8]| {
@@ -478,11 +488,11 @@ fn two_seals_of_one_blob_give_different_ciphertexts() {
 }
 
 #[test]
-fn seal_refuses_a_blob_of_the_other_kind_a_bad_pcr8_and_a_bad_srk_file() {
+fn seal_refuses_a_blob_of_the_other_kind_bad_pcrs_and_a_bad_srk_file() {
     let s = Scratch::new("seal-refuse");
     let (key, pqb, tls, _) = blob_files(&s);
     let srk = srk_tpm2b();
-    let pcr = pcr8(PCR8_HEX).unwrap();
+    let pcr = pcrs(PCRS_HEX).unwrap();
     let e = seal_file(Kind::Key, &pqb, srk_public(&srk).unwrap(), &pcr).unwrap_err();
     assert!(e.contains("a Key blob is 4096"), "{e}");
     // The key and TLS blobs are both 4096 bytes: the magic keeps them apart.
@@ -496,8 +506,13 @@ fn seal_refuses_a_blob_of_the_other_kind_a_bad_pcr8_and_a_bad_srk_file() {
     std::fs::write(&bad, &corrupt).unwrap();
     let e = seal_file(Kind::Key, &bad, srk_public(&srk).unwrap(), &pcr).unwrap_err();
     assert!(e.contains("checksum mismatch"), "{e}");
-    assert!(pcr8("f5a5").is_err());
-    assert!(pcr8(&"zz".repeat(32)).is_err());
+    assert!(pcrs("f5a5").is_err());
+    let zeros = |n: usize| vec!["00".repeat(32); n].join(",");
+    assert!(pcrs(&zeros(9).replacen("00", "zz", 1)).is_err());
+    // Exactly PCRs 0-8: one value short or one too many is refused, nine pass.
+    assert!(pcrs(&zeros(8)).is_err());
+    assert!(pcrs(&zeros(10)).is_err());
+    assert!(pcrs(&zeros(9)).is_ok());
     assert!(srk_public(&srk[..50]).is_err());
     let mut other = srk.clone();
     other[9] ^= 0x40; // userWithAuth off: not the template
@@ -506,19 +521,25 @@ fn seal_refuses_a_blob_of_the_other_kind_a_bad_pcr8_and_a_bad_srk_file() {
 }
 
 /// C12: the release verifier's envelope check. Allow: sealed to the
-/// manifest's PCR 8. Deny: another PCR 8, the other kind, a header policy
-/// that differs from the object public's.
+/// manifest's PCRs 0-8. Deny: another PCR 0 or 8, the other kind, a header
+/// policy that differs from the object public's.
 #[test]
-fn check_envelope_accepts_its_own_pcr8_only() {
+fn check_envelope_accepts_its_own_pcrs_only() {
     let s = Scratch::new("check-envelope");
     let (key, _, tls, _) = blob_files(&s);
     let srk = srk_tpm2b();
-    let pcr = pcr8(PCR8_HEX).unwrap();
+    let pcr = pcrs(PCRS_HEX).unwrap();
     let env = seal_file(Kind::Key, &key, srk_public(&srk).unwrap(), &pcr).unwrap();
     assert_eq!(envelope_sealed_to(&env, Kind::Key, &pcr), Ok(()));
-    let mut other = pcr;
-    other[0] ^= 1;
-    assert_eq!(envelope_sealed_to(&env, Kind::Key, &other), Err("the envelope's sealed object enforces another PCR 8".into()));
+    for i in [0, 8] {
+        let mut other = pcr;
+        other[i][0] ^= 1;
+        assert_eq!(
+            envelope_sealed_to(&env, Kind::Key, &other),
+            Err("the envelope's sealed object enforces other PCRs 0-8".into()),
+            "PCR {i}"
+        );
+    }
     assert!(envelope_sealed_to(&env, Kind::Pq, &pcr).is_err());
     // `Key` and `Tls` envelopes have one size: the kind refuses each as the other.
     assert_eq!(envelope_sealed_to(&env, Kind::Tls, &pcr), Err("envelope: BadKind".into()));

@@ -21,7 +21,8 @@ fn good_manifest() -> Vec<u8> {
         ("dev_image", "sha256:aa"),
         ("loader_img_sha256", "bb"),
         ("boot_desc_sha256", "cc"),
-        ("pcr8", "dd"),
+        ("firmware_sha256", "ab"),
+        ("pcrs", "d0,d1,d2,d3,d4,d5,d6,d7,d8"),
         ("cargo_lock_sha256", "ee"),
         ("verus", "0.2026.10.04.426d8b0"),
         ("kani", "0.68.0"),
@@ -134,8 +135,8 @@ fn an_unknown_key_is_refused() {
 
 #[test]
 fn a_missing_key_is_refused() {
-    let m: Vec<u8> = good_manifest().split_inclusive(|&b| b == b'\n').filter(|l| !l.starts_with(b"pcr8=")).flatten().copied().collect();
-    assert_eq!(manifest::parse(&m), Err(ManifestError::Missing("pcr8".into())));
+    let m: Vec<u8> = good_manifest().split_inclusive(|&b| b == b'\n').filter(|l| !l.starts_with(b"pcrs=")).flatten().copied().collect();
+    assert_eq!(manifest::parse(&m), Err(ManifestError::Missing("pcrs".into())));
 }
 
 #[test]

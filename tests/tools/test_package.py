@@ -77,6 +77,10 @@ PQ_END = PQ_AT + len(PQ_BLOB)
 TLS_AT = PQ_END + len(PAD)
 TLS_END = TLS_AT + len(TLS_BLOB)
 PLACEHOLDER_IMG = b"\x7fELF" + PAD + bytes(4096) + PAD + bytes(16384) + PAD + bytes(4096) + PAD
+# The firmware the PCRs are computed from (M7 plan C4): a minimal FIP.
+sys.path.insert(0, str(ROOT / "tests/tools"))
+import fip_fixture  # noqa: E402
+FLASH = fip_fixture.flash()
 PACKAGE_IMG = b"\x7fELF" + PAD + BLOB + PAD + PQ_BLOB + PAD + TLS_BLOB + PAD
 SPANS = f"{KEY_AT:#x}..{KEY_AT + len(BLOB):#x}, {PQ_AT:#x}..{PQ_END:#x}, {TLS_AT:#x}..{TLS_END:#x}"
 GEN_DEBUG = "/* x */\n#define CONFIG_DEBUG_BUILD  1\n#define CONFIG_PRINTING  1\n" \
@@ -235,7 +239,7 @@ def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BL
                 return 0
             pkg.build = fake_build
             sys.argv = ["package", "--secrets", str(d / "secrets.bin"), "--pq-secrets", str(d / "pq.bin"),
-                        "--tls-secrets", str(d / "tls.bin"), "--srk-public", str(d / "srk.pub"), "--out", str(d / "pkg"), "--system", str(d / "kozane.system"), "--policy", "x", "--image", "x",
+                        "--tls-secrets", str(d / "tls.bin"), "--srk-public", str(d / "srk.pub"), "--firmware", "x", "--out", str(d / "pkg"), "--system", str(d / "kozane.system"), "--policy", "x", "--image", "x",
                         "--gen-config", str(d / "gen_config.h"), "--search-path", str(search), "--board", "x",
                         "--config", "x", "--microkit", "x", "--harness", str(harness_path)]
             captured = io.StringIO()
@@ -368,7 +372,7 @@ def run_main(build_result):
 
             pkg.build = fake_build
             sys.argv = ["package", "--secrets", str(blob), "--pq-secrets", str(d / "pq.bin"),
-                        "--tls-secrets", str(d / "tls.bin"), "--srk-public", str(d / "srk.pub"), "--out", str(out), "--system", "x", "--policy", "x",
+                        "--tls-secrets", str(d / "tls.bin"), "--srk-public", str(d / "srk.pub"), "--firmware", "x", "--out", str(out), "--system", "x", "--policy", "x",
                         "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
                         "--config", "x", "--microkit", "x", "--harness", "x"]
             real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
@@ -523,7 +527,7 @@ def staging_in_forbidden_root():
         pkg.forbidden_roots = roots
         pkg.build = lambda *a: built.append(1) or 0
         sys.argv = ["package", "--secrets", str(blob), "--pq-secrets", str(d / "pq.bin"),
-                    "--tls-secrets", str(d / "tls.bin"), "--srk-public", str(d / "srk.pub"), "--out", str(d / "pkg"), "--system", "x", "--policy", "x",
+                    "--tls-secrets", str(d / "tls.bin"), "--srk-public", str(d / "srk.pub"), "--firmware", "x", "--out", str(d / "pkg"), "--system", "x", "--policy", "x",
                     "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
                     "--config", "x", "--microkit", "x", "--harness", "x"]
         out = io.StringIO()
@@ -644,6 +648,7 @@ def _build_case(variant):
     try:
         (d / "system.xml").write_text(SYSTEM)
         (d / "placeholder.img").write_bytes(PLACEHOLDER_IMG)
+        (d / "flash.bin").write_bytes(FLASH)
         staging = d / "staging"
         staging.mkdir()
 
@@ -655,7 +660,7 @@ def _build_case(variant):
                 mr = {"key": "secrets", "pq": "pq_secrets", "tls": "tls_secrets"}[arg(cmd, "--kind")]
                 blob = pathlib.Path(arg(cmd, "--blob"))
                 sealed[mr] = (str(blob), blob.read_bytes(), pathlib.Path(arg(cmd, "--srk-public")).read_bytes(),
-                              arg(cmd, "--pcr8"))
+                              arg(cmd, "--pcrs"))
                 swapped = {"secrets": "tls_secrets", "tls_secrets": "secrets"}.get(mr, mr)
                 out = BLOBS[mr] if variant == "envelope" else envelope(swapped if variant == "swap" else mr)
                 pathlib.Path(arg(cmd, "--out")).write_bytes(out)
@@ -679,8 +684,9 @@ def _build_case(variant):
         pkg.subprocess.run = fake_run
 
         class A:
-            system, image, policy, search_path, board, config, microkit = (
-                str(d / "system.xml"), str(d / "placeholder.img"), "p", "s", "b", "c", "microkit")
+            system, image, firmware, policy, search_path, board, config, microkit = (
+                str(d / "system.xml"), str(d / "placeholder.img"), str(d / "flash.bin"), "p", "s", "b", "c",
+                "microkit")
 
         captured = io.StringIO()
         with contextlib.redirect_stdout(captured):
@@ -695,19 +701,22 @@ def _build_case(variant):
         desc = (staging / "boot.desc").read_bytes() if (staging / "boot.desc").exists() else b""
         if desc and pkg.measure.parse(desc)[1] != [(KEY_AT, len(BLOB)), (PQ_AT, len(PQ_BLOB)), (TLS_AT, len(TLS_BLOB))]:
             errors.append(f"descriptor ranges {pkg.measure.parse(desc)[1]}")
+        want_pcrs = pkg.measure.expected_pcrs(FLASH, desc, PLACEHOLDER_IMG) if desc else []
         for mr in pkg.SECRETS_MRS:
-            path, data, srk, pcr8 = sealed.get(mr, ("", b"", b"", ""))
+            path, data, srk, pcrs = sealed.get(mr, ("", b"", b"", ""))
             if not path.startswith(str(staging)) or data != BLOBS[mr]:
                 errors.append(f"'{mr}' not sealed from its private copy: {path}")
-            if srk != SRK or (desc and pcr8 != pkg.measure.expected_pcr8(desc, PLACEHOLDER_IMG).hex()):
-                errors.append(f"'{mr}' sealed to another SRK or PCR 8 ({pcr8})")
+            if srk != SRK or (desc and pcrs != ",".join(p.hex() for p in want_pcrs)):
+                errors.append(f"'{mr}' sealed to another SRK or PCRs 0-8 ({pcrs})")
             if (staging / f"{mr}.env").exists() and (staging / f"{mr}.env").read_bytes() != envelope(mr):
                 errors.append(f"'{mr}' envelope is not the one sealed")
         if sorted(p.name for p in staging.iterdir()) != sorted(pkg.OUTPUTS):
             errors.append(f"OUT holds {sorted(p.name for p in staging.iterdir())}")
-        if (staging / "pcr8").exists() and desc and \
-                (staging / "pcr8").read_text() != pkg.measure.expected_pcr8(desc, PLACEHOLDER_IMG).hex() + "\n":
-            errors.append("pcr8 is not the descriptor's and the published image's")
+        if (staging / "pcrs").exists() and desc and \
+                (staging / "pcrs").read_text() != "".join(p.hex() + "\n" for p in want_pcrs):
+            errors.append("pcrs are not the firmware's, the descriptor's and the published image's")
+        if (staging / "flash.bin").exists() and (staging / "flash.bin").read_bytes() != FLASH:
+            errors.append("flash.bin is not the firmware the PCRs came from")
         if (staging / "published.img").exists() and (staging / "published.img").read_bytes() != PLACEHOLDER_IMG:
             errors.append("published.img is not the published image")
         return errors

@@ -4,14 +4,17 @@
 //! the fields read from them cannot disagree.
 
 /// Every key a manifest carries, in its required (sorted) order.
-pub const KEYS: [&str; 9] = [
+/// `firmware_sha256` is flash.bin's, and `pcrs` the PCRs 0-8 the envelopes
+/// are sealed to, comma-separated (M7 plan C4).
+pub const KEYS: [&str; 10] = [
     "boot_desc_sha256",
     "cargo_lock_sha256",
     "commit",
     "dev_image",
+    "firmware_sha256",
     "kani",
     "loader_img_sha256",
-    "pcr8",
+    "pcrs",
     "verus",
     "version",
 ];
