@@ -2849,12 +2849,15 @@ def test_release_boot(pkg: Package, release: str, deploy: str, fi_net: Package, 
     if file_sha256(fi_net.path("published.img")) == fields["loader_img_sha256"]:
         raise Fail("release boot: the fault-inject image is the released one")
     cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
+    # HTTPS is served only end to end: the inside tap with the raw backend.
     tap = Tap()
+    inside = backend = None
     try:
-        child, con = boot(pkg, tap.netdev("n0"), dgram("n1", free_udp_port(), free_udp_port()), media=media,
-                          firmware=firmware)
+        inside = InsideTap()
+        backend = Backend()
+        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"), media=media, firmware=firmware)
     except BaseException:
-        tap.close()
+        close_all(backend, inside, tap)
         raise
     rp = py = None
     try:
@@ -2871,7 +2874,9 @@ def test_release_boot(pkg: Package, release: str, deploy: str, fi_net: Package, 
         py = py_installed(open(os.path.join(deploy, "peer-0.conf")).read(), b64(cfg["gateway"]["public_key"]), rp,
                           time.monotonic() + RP_EXCHANGE_S)
         con.wait_for(r"audit: src=hs HandshakeOk total=1 ")
-        curl_get(os.path.join(deploy, "devca.pem"))
+        body, _ = curl_get(os.path.join(deploy, "devca.pem"))
+        if body != backend_body():
+            raise Fail(f"release boot: HTTPS returned {len(body)} bytes, not the backend's body")
         no_supervisor_record(con, "release boot")
         kill_qemu(child)
         got = read_pcrs(child.tpm)
@@ -2887,11 +2892,11 @@ def test_release_boot(pkg: Package, release: str, deploy: str, fi_net: Package, 
             with signals_held():
                 close_all(py, rp)
                 kill(child)
-                tap.close()
+                close_all(backend, inside, tap)
         except SystemExit:
             close_all(py, rp)
             kill(child)
-            tap.close()
+            close_all(backend, inside, tap)
             raise
 
 
