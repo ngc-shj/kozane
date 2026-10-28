@@ -316,9 +316,10 @@ CASES = {
                                                     "bolero::check!().for_each(fuzz_one);",
                                                     "bolero::check!().for_each(|b: &[u8]| if b.len() >= 20 { std::eprintln!(\"selftest-bolero-http-injected\"); panic!() });"),
                          "selftest-bolero-http-injected"),
-    # Editing a path dependency (wire) must re-prove ingress-core rather than
-    # serve the cached pass copied in from the real tree.
-    "kani-cache": (["kani", "kani_crates=ingress-core"],
+    # Editing a path dependency (wire) must re-prove a dependent rather than
+    # serve the cached pass copied in from the real tree. inner-core, not
+    # ingress-core: the latter's full re-proof outgrew CASE_TIMEOUT_S in M7.
+    "kani-cache": (["kani", "kani_crates=inner-core"],
                    lambda t: append(t, "crates/wire/src/lib.rs", "\n// selftest: cache key input\n"),
                    "Checking harness"),
     # The Verus gate (M4 plan C1). The cache: an edit to the verified crate
