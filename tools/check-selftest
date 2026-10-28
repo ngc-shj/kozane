@@ -844,8 +844,12 @@ CASES = {
                                   r"want TpmResponseInvalid")),
     # S-BOOT-1: a refusal that neither powers off nor spins falls through
     # to the next command; the measured-boot cases must see the boot go on.
+    # The refusal's own halt goes, so U-Boot runs on past the refusal; the
+    # measure variant's power-off stays, so C11's SHUTDOWN wait (M7) cannot
+    # go red first.
     "measure-halt": (["test", "it_boots=measured boot"], lambda t: edit(
-        t, "tools/uboot-config", 'HALT = "poweroff; while true; do true; done"\n', 'HALT = "true"\n'),
+        t, "tools/uboot-config", 'REFUSE = "echo kozane: boot refused; " + HALT\n',
+        'REFUSE = "echo kozane: boot refused; true"\n'),
         "measure_boot: U-Boot ran past its refusal"),
     # S-BOOT-1: the power-off is its own control; without it the spin holds
     # (nothing runs on) but U-Boot never stops.
