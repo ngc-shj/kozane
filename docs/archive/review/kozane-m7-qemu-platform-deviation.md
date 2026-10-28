@@ -459,3 +459,22 @@ results and Re-plan R1 are in the plan itself.
   - It is interactive, with no QMP and no oracle.
   - Its full boot is the same argv the release-boot case runs, but it has
     not been run interactively here.
+
+### The first `make check` (599273a): mir refused boot-stage
+
+- **What:** every gate up to `mir` passed, including the full Kani
+  re-proof. That re-proof took about 13 h, because the lock change
+  invalidated every cache key; http-wire was proved in parallel on z1mn.
+  `mir` then refused boot-stage:
+  - it ships in two feature sets, `boot-stop` in the leaf PDs and none
+    elsewhere;
+  - the proof build had one, so the leaf variant's `Init::boot_stop` had
+    no proof counterpart.
+- **What:** fixed by proving both sets rather than dropping the feature:
+  - the Makefile's `kani_variants_<crate>` runs Kani again per extra
+    feature set (`boot-stop`: KANI-HARNESSES 119 → 122);
+  - `tools/mir-gate --variants` proof-builds each set and requires every
+    shipped MIR to equal one of them (MIR-GATE-FIXTURES 9 → 12).
+
+  MIR-CRATES is 14: the M7 crates PDs link are new members (boot-stage,
+  drbg, rng-core, supervisor-core).

@@ -48,6 +48,14 @@ COMPARE = [
      "wire: expected one proof MIR, captured 2"),
     ("a hyphenated crate is found by its library name", {"wg_wire.a.mir": BODY}, {"wg_wire.b.mir": BODY},
      ["wg-wire"], 1, None),
+    # M7 plan C9: a member shipped with and without a feature.
+    ("each shipped variant matches its own proof variant", {"wire.a.mir": BODY, "wire.c.mir": BODY + "\n"},
+     {"wire.b.mir": BODY, "wire.d.mir": BODY + "\n"}, ["wire"], 1, None, {"wire": [["--features", "x"]]}),
+    ("a shipped variant matching no proof variant is refused", {"wire.a.mir": BODY, "wire.c.mir": BODY + "\n\n"},
+     {"wire.b.mir": BODY, "wire.d.mir": BODY + "\n"}, ["wire"], 0,
+     "wire: shipped MIR differs from the proof build (wire.c.mir)", {"wire": [["--features", "x"]]}),
+    ("a declared variant whose proof build is missing is refused", {"wire.a.mir": BODY}, {"wire.b.mir": BODY},
+     ["wire"], 0, "wire: expected 2 proof MIR, captured 1", {"wire": [["--features", "x"]]}),
 ]
 
 # (name, pd dependency graph, verus, kani, pds, expected members)
@@ -61,7 +69,7 @@ MEMBERS = [
 
 def main() -> int:
     failures = cases = 0
-    for name, shipped, proof, crates, want, needle in COMPARE:
+    for name, shipped, proof, crates, want, needle, *variants in COMPARE:
         cases += 1
         with tempfile.TemporaryDirectory() as d:
             base = pathlib.Path(d)
@@ -69,7 +77,7 @@ def main() -> int:
             files(base / "proof", proof)
             (base / "shipped").mkdir(exist_ok=True)
             (base / "proof").mkdir(exist_ok=True)
-            errors, matched = mg.compare(base / "shipped", base / "proof", crates)
+            errors, matched = mg.compare(base / "shipped", base / "proof", crates, *variants)
         ok = matched == want and (not errors if needle is None else any(needle in e for e in errors))
         failures += not ok
         print(f"{'ok  ' if ok else 'FAIL'} {name}: matched={matched} errors={errors}")

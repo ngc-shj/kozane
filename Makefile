@@ -25,6 +25,12 @@ counts := $(BUILD)/counts
 
 pds := supervisor eth-out eth-in ingress audit timer tpm rng key hs inner data pq pqkey tls tlskey
 host_crates := wire ring boot-stage rng-core supervisor-core audit-event drbg ingress-core inner-core layout laws supervisor-allowlist config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct limits tlskey-core secret
+empty :=
+space := $(empty) $(empty)
+# A crate shipped in more than one feature set is proved in each
+# (`kani_variants_<crate>`, cargo arguments, `;`-separated) and tools/mir-gate
+# compares each shipped variant with the proof build of its own features.
+kani_variants_boot-stage := --features boot-stop
 kani_crates := wire ring boot-stage drbg rng-core supervisor-core ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire
 
 .PHONY: clean-counts
@@ -187,7 +193,10 @@ kani: | $(counts)
 	rm -f $(counts)/kani.log
 	$(foreach c,$(kani_crates),echo "KANI-CRATE $(c)" >> $(counts)/kani.log; \
 		tools/kani-gate.sh -p $(c) $(kani_args_$(c)) >> $(counts)/kani.log \
-		|| { cat $(counts)/kani.log; exit 1; };)
+		|| { cat $(counts)/kani.log; exit 1; }; \
+		$(foreach v,$(subst ;, ,$(subst $(space),+,$(kani_variants_$(c)))),echo "KANI-CRATE $(c)" >> $(counts)/kani.log; \
+			tools/kani-gate.sh -p $(c) $(subst +, ,$(v)) >> $(counts)/kani.log \
+			|| { cat $(counts)/kani.log; exit 1; };))
 	# Per-crate counts too (M2 plan T12), keyed KANI-<CRATE>.
 	awk '/^KANI-CRATE / { c = toupper($$2) } /^KANI-HARNESSES/ { n += $$2; per[c] += $$2 } \
 		END { print "KANI-HARNESSES", n; for (k in per) print "KANI-" k, per[k] }' \
@@ -431,7 +440,8 @@ release-verify: release-tool
 # M5 plan C4: the MIR each PD ships from a verified crate equals the MIR the
 # proof configuration compiles (tools/mir-gate).
 mir: | $(counts)
-	tools/mir-gate --verus "$(verus_crates)" --kani "$(kani_crates)" --pds "$(pds)" > $(counts)/mir.log 2>&1 \
+	tools/mir-gate --verus "$(verus_crates)" --kani "$(kani_crates)" --pds "$(pds)" \
+		--variants "$(foreach c,$(kani_crates),$(if $(kani_variants_$(c)),$(c)=$(kani_variants_$(c));))" > $(counts)/mir.log 2>&1 \
 		|| { cat $(counts)/mir.log; exit 1; }
 	grep '^MIR-CRATES ' $(counts)/mir.log > $(counts)/mir
 

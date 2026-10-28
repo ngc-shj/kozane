@@ -27,7 +27,13 @@ cargo metadata's resolve graph). Control class: fail-closed verification
 gate; a member with no shipped or no proof MIR, or with two proof variants,
 is a refusal.
 
-Usage: tools/mir-gate --verus "<crates>" --kani "<crates>" --pds "<pds>"
+A member shipped in more than one feature set (M7 plan C9: boot-stage with
+and without `boot-stop`) names each extra set in --variants, as
+`<crate>=<cargo args>;`. Its proof build runs once per set (Kani proves each,
+the Makefile's kani_variants_<crate>), and every shipped MIR must equal one
+of its proof MIRs.
+
+Usage: tools/mir-gate --verus "<crates>" --kani "<crates>" --pds "<pds>" [--variants "<c>=<args>;..."]
 Prints "MIR-CRATES <n>" when every member matches.
 """
 
@@ -64,8 +70,9 @@ def members(verus: list, kani: list, pds: list, meta: dict) -> list:
     return sorted(set(verus) | (set(kani) & linked))
 
 
-def compare(shipped: pathlib.Path, proof: pathlib.Path, crates: list) -> tuple:
-    """(errors, matched count) over the captured MIR files."""
+def compare(shipped: pathlib.Path, proof: pathlib.Path, crates: list, variants: dict = None) -> tuple:
+    """(errors, matched count) over the captured MIR files; `variants` maps
+    a member to its extra proof feature sets."""
     errors, matched = [], 0
     for crate in crates:
         lib = lib_name(crate)
@@ -74,15 +81,18 @@ def compare(shipped: pathlib.Path, proof: pathlib.Path, crates: list) -> tuple:
         if not ship:
             errors.append(f"mir-gate: {crate}: no shipped MIR was captured")
             continue
-        if len(want) != 1:
-            errors.append(f"mir-gate: {crate}: expected one proof MIR, captured {len(want)}")
+        expected = 1 + len((variants or {}).get(crate, []))
+        if len(want) != expected:
+            errors.append(f"mir-gate: {crate}: expected {'one' if expected == 1 else expected} proof MIR, "
+                          f"captured {len(want)}")
             continue
-        reference = want[0].read_text().splitlines()
+        references = [w.read_text().splitlines() for w in want]
         ok = True
         for s in ship:
             got = s.read_text().splitlines()
-            if got != reference:
+            if got not in references:
                 ok = False
+                reference = min(references, key=lambda r: len(list(difflib.unified_diff(r, got, n=0))))
                 diff = list(difflib.unified_diff(reference, got, "proof", "shipped", n=0, lineterm=""))[:12]
                 errors.append(f"mir-gate: {crate}: shipped MIR differs from the proof build ({s.name})\n  "
                               + "\n  ".join(diff))
@@ -103,7 +113,12 @@ def main() -> int:
     ap.add_argument("--verus", required=True)
     ap.add_argument("--kani", required=True)
     ap.add_argument("--pds", required=True)
+    ap.add_argument("--variants", default="")
     args = ap.parse_args()
+    variants = {}
+    for item in filter(None, (v.strip() for v in args.variants.split(";"))):
+        crate, _, cargo_args = item.partition("=")
+        variants.setdefault(crate.strip(), []).append(cargo_args.split())
     meta = json.loads(subprocess.run(["cargo", "metadata", "--locked", "--format-version", "1"], cwd=ROOT,
                                      check=True, capture_output=True, text=True).stdout)
     crates = members(args.verus.split(), args.kani.split(), args.pds.split(), meta)
@@ -121,10 +136,12 @@ def main() -> int:
         # fresh, and the wrapper would not see it.
         run(["cargo", "clean", "--release", "--target-dir", str(out / "proof-target"), "-p", c], env,
             out / f"proof-clean-{c}.log")
-        run(["cargo", "build", "--locked", "--release", "--target-dir", str(out / "proof-target"), "-p", c],
-            dict(env, MIR_OUT=str(out / "proof"), MIR_CRATES=lib_name(c), CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS="true"),
-            out / f"proof-{c}.log")
-    errors, matched = compare(out / "shipped", out / "proof", crates)
+        for i, extra in enumerate([[]] + variants.get(c, [])):
+            run(["cargo", "build", "--locked", "--release", "--target-dir", str(out / "proof-target"), "-p", c, *extra],
+                dict(env, MIR_OUT=str(out / "proof"), MIR_CRATES=lib_name(c),
+                     CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS="true"),
+                out / f"proof-{c}{'-' + str(i) if i else ''}.log")
+    errors, matched = compare(out / "shipped", out / "proof", crates, variants)
     for e in errors:
         print(e)
     print(f"MIR-CRATES {matched}")
