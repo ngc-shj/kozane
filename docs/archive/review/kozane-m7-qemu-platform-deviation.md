@@ -478,3 +478,37 @@ results and Re-plan R1 are in the plan itself.
 
   MIR-CRATES is 14: the M7 crates PDs link are new members (boot-stage,
   drbg, rng-core, supervisor-core).
+
+## The long run
+
+- **`make check` at e0e8a67:** every gate passed. `manifest` then
+  refused counts that M7 had raised without updating the manifest
+  (REPRO-ARTIFACTS, UNIT-FIXTURES-TEST, UNIT-MKSECRETS, UNIT-TPM2, and
+  the new per-crate keys). All of them went up, so the manifest was raised
+  to match (25a15a1); `make manifest` is green.
+- **The first self-test at 25a15a1:** stopped. On z1mn the release boot's
+  HTTPS timed out: its inside NIC was a dgram socket, so no backend
+  existed. It had passed on gx10 only because the failure came back fast.
+  Fixed in a3f2b06, which serves HTTPS from the inside tap and the raw
+  backend and requires the backend's body byte for byte. Checked on z1mn
+  (release boot and https), then `make test` on gx10: 94 cases.
+- **The self-test at a3f2b06, split by host:**
+  - qemu (46) on z1mn;
+  - solver (16), pds (10) and rest 1–3 (53, 53, 52) on gx10.
+
+  `selftest-split merge`: SELFTEST-LAYERS 228, with two FAILs. Both were
+  cases whose needle M7 had made unreachable, not gates that missed a
+  mutant. Each was re-aimed and run alone afterwards, and each went red
+  on its own needle.
+  - **measure-halt:** emptying HALT also removed the measure variant's
+    power-off, so C11's SHUTDOWN wait failed first and the refusal check
+    was never reached. The mutant now empties only REFUSE's halt
+    (85f2563). Run alone on z1mn: red on "U-Boot ran past its refusal".
+  - **kani-cache:** the `wire` edit forced ingress-core's full re-proof,
+    over four hours, past CASE_TIMEOUT_S. Kani prints the needle only
+    when the crate finishes. The case now uses inner-core, which also
+    depends on `wire` (6d1676d). Run alone on z1mn: green, with the
+    re-proof shown.
+- **Not re-run:** the full self-test at 6d1676d. The two commits after
+  a3f2b06 change only those two cases' injections, so every other case's
+  inputs are unchanged.
