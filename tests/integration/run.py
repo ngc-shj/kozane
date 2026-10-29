@@ -518,7 +518,9 @@ def run_interactive(pkg_dir: str = "", state: str = "", port: str = "51820") -> 
     if not pkg_dir or not state:
         print("run: PKG=<a `make package` OUT> TPM_STATE=<the swtpm state it was sealed to>", file=sys.stderr)
         return 2
-    pkg = Package(pkg_dir, state)
+    # No node bundles yet (M8 slice 2): both slots zero, as the image holds.
+    slots = tempfile.mkdtemp(prefix="kozane-slots-")
+    pkg = Package(pkg_dir, state, write_slots(slots, bytes(measure.BUNDLE_MAX), bytes(measure.BUNDLE_MAX)))
     tpm = Swtpm(tempfile.gettempdir(), state=state)
     try:
         cmd = qemu_machine(FIRMWARE)
@@ -533,6 +535,7 @@ def run_interactive(pkg_dir: str = "", state: str = "", port: str = "51820") -> 
         return subprocess.run(["qemu-system-aarch64", *cmd]).returncode
     finally:
         tpm.close()
+        shutil.rmtree(slots, ignore_errors=True)
 
 
 def close_tpm(proxy, tpm):
@@ -1838,11 +1841,12 @@ class Swtpm:
 
 
 class Package:
-    """One deployment's boot media, as tools/package wrote them, and the
+    """One deployment's boot media, as tools/package wrote them, the node's
+    two bundle slots (M8 plan C4: per node, never in a package) and the
     provisioned swtpm state its envelopes are sealed to."""
 
-    def __init__(self, pkg_dir: str, state: str):
-        self.dir, self.state = pkg_dir, state
+    def __init__(self, pkg_dir: str, state: str, slots: tuple):
+        self.dir, self.state, self.slots = pkg_dir, state, slots
 
     def path(self, name: str) -> str:
         return os.path.join(self.dir, name)
@@ -1853,7 +1857,25 @@ class Package:
 
     def media(self) -> list:
         names = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "tls_secrets.env")
-        return list(zip(map(self.path, names), (measure.LOAD_IMAGE, measure.LOAD_DESC) + measure.LOAD_ENVELOPES))
+        return list(zip(list(map(self.path, names)) + list(self.slots),
+                        (measure.LOAD_IMAGE, measure.LOAD_DESC) + measure.LOADS,
+                        strict=True))
+
+    def slot_bytes(self) -> tuple:
+        out = []
+        for path in self.slots:
+            with open(path, "rb") as f:
+                out.append(f.read())
+        return tuple(out)
+
+
+def write_slots(parent: str, slot_a: bytes, slot_b: bytes) -> tuple:
+    """Slot A and slot B as files in `parent`, for Package and measure_boot."""
+    paths = (os.path.join(parent, "slot-a.bin"), os.path.join(parent, "slot-b.bin"))
+    for path, data in zip(paths, (slot_a, slot_b)):
+        with open(path, "wb") as f:
+            f.write(data)
+    return paths
 
 
 def recv_exact(sock: socket.socket, n: int) -> bytes:
@@ -1869,13 +1891,14 @@ def recv_exact(sock: socket.socket, n: int) -> bytes:
 # swtpm's control channel (tpm_ioctl.h): commands are big-endian u32 codes.
 SWTPM_CMD_SET_DATAFD = 16
 # TPML_PCR_SELECTIONs of the sha256 bank: PCRs 0-7 (one PCR_Read returns at
-# most eight digests) and PCR 8 (tpm2_wire::CAP_PCR_SELECTION).
+# most eight digests), and PCR 8 (tpm2_wire::CAP_PCR_SELECTION) with PCR 9
+# (the bundle slots, M8 plan C4).
 PCR0_7_SELECTION = bytes.fromhex("00000001" "000b" "03" "ff0000")
-PCR8_SELECTION = bytes.fromhex("00000001" "000b" "03" "000100")
+PCR8_9_SELECTION = bytes.fromhex("00000001" "000b" "03" "000300")
 
 
 def read_pcrs(tpm: Swtpm) -> list:
-    """PCRs 0-8 of a swtpm whose QEMU has been killed (T11; M7 plan C3, C4):
+    """PCRs 0-9 of a swtpm whose QEMU has been killed (T11; M7 plan C3, C4):
     a second control connection hands swtpm a fresh data socket
     (CMD_SET_DATAFD; no CMD_INIT, which would restart the TPM), then two
     TPM2_PCR_Reads. Probed host-side in M5 slice 7: swtpm keeps the TPM
@@ -1893,7 +1916,7 @@ def read_pcrs(tpm: Swtpm) -> list:
         theirs.close()
         mine.settimeout(LINE_TIMEOUT_S)
         pcrs = []
-        for selection, count in ((PCR0_7_SELECTION, 8), (PCR8_SELECTION, 1)):
+        for selection, count in ((PCR0_7_SELECTION, 8), (PCR8_9_SELECTION, 2)):
             mine.sendall(struct.pack(">HII", 0x8001, 10 + len(selection), 0x17E) + selection)
             head = recv_exact(mine, 10)
             rsp = head + recv_exact(mine, struct.unpack(">I", head[2:6])[0] - 10)
@@ -2124,8 +2147,9 @@ PCR_DUMP = re.compile(r"PCR #8 sha256 32 byte content \(\d+ known updates\):\r*\
 
 
 def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: list) -> tuple:
-    """Boots the measure variant on these boot media: (PCR 8 or None, whether
-    U-Boot refused)."""
+    """Boots the measure variant on these boot media (`envelopes`: the three
+    envelopes, then slot A and slot B): (PCR 8 or None, whether U-Boot
+    refused)."""
     paths = []
     for name, data in (("published.img", image), ("boot.desc", desc),
                        *((f"env{i}", env) for i, env in enumerate(envelopes))):
@@ -2136,7 +2160,7 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
     tpm = Swtpm(scratch)
     try:
         child, con = boot_uboot(FIRMWARE_MEASURE, list(zip(paths, (measure.LOAD_IMAGE, measure.LOAD_DESC)
-                                                              + measure.LOAD_ENVELOPES)), tpm)
+                                                              + measure.LOADS, strict=True)), tpm)
         try:
             # Ctrl-C on the UART throughout the boot command: with the lock
             # (AUTOBOOT_KEYED) it is never read, so it cannot skip a check of
@@ -2199,18 +2223,18 @@ def measure_boot(pkg: str, scratch: str, image: bytes, desc: bytes, envelopes: l
         tpm.close()
 
 
-def test_measured_boot(pkg: str, passed: list):
+def test_measured_boot(pkg: str, slots: tuple, passed: list):
     """C8: the PCR 8 U-Boot produces is the one tools/measure.py computes
     from the public release files; it moves with any byte of the image or
     the descriptor; and the descriptor checks U-Boot runs on-device refuse a
-    wrapping range, each overlapping pair of the three ranges, range 2 past
-    image_len and a version-1 descriptor, but allow a range ending exactly
-    at image_len."""
+    wrapping range, each overlapping pair of the five ranges (M8 plan C4),
+    range 2 past image_len and a version-2 descriptor, but allow a range
+    ending exactly at image_len."""
     def read(name):
         with open(os.path.join(pkg, name), "rb") as f:
             return f.read()
     image, desc = read("published.img"), read("boot.desc")
-    envs = [read("secrets.env"), read("pq_secrets.env"), read("tls_secrets.env")]
+    envs = [read("secrets.env"), read("pq_secrets.env"), read("tls_secrets.env"), *slots]
     want = measure.expected_pcr8(desc, image)
     # M7 plan C4: the package's PCRs 0-8 are the twin's for its flash.bin.
     pcrs = [bytes.fromhex(l) for l in read("pcrs").decode().split()]
@@ -2236,9 +2260,10 @@ def test_measured_boot(pkg: str, passed: list):
         # A range moved onto the loader's entry code: still in bounds and
         # disjoint, so U-Boot accepts and measures it, and PCR 8 is no longer
         # the release's.
-        (o0, l0), (o1, l1), (o2, l2) = ranges
-        if min(o1, o2) < l0:
-            raise Fail(f"another envelope range ({min(o1, o2):#x}) overlaps [0, {l0:#x}); pick another target")
+        l0 = ranges[0][1]
+        if min(o for o, _ in ranges[1:]) < l0:
+            raise Fail(f"another range ({min(o for o, _ in ranges[1:]):#x}) overlaps [0, {l0:#x}); "
+                       "pick another target")
         tampered = desc[:24] + struct.pack("<Q", 0) + desc[32:]
         got, refused = measure_boot(pkg, scratch, image, tampered, envs)
         if refused or got == want:
@@ -2246,29 +2271,35 @@ def test_measured_boot(pkg: str, passed: list):
         passed.append("measured boot: descriptor measured")
 
         def with_ranges(moved: list) -> bytes:
-            return desc[:24] + struct.pack("<6Q", *(v for r in moved for v in r)) + desc[72:]
+            return desc[:24] + struct.pack(f"<{2 * measure.COUNT}Q", *(v for r in moved for v in r)) \
+                + desc[measure.DESC_LEN - 8:]
 
-        # Range 2 moved to run 0x10 past image_len, clear of ranges 0 and 1.
+        def overlapping(i: int, j: int) -> bytes:
+            """The shorter range of pair (i, j) moved to start where the
+            other does: inside it, so clear of every other range."""
+            m, t = (i, j) if ranges[i][1] < ranges[j][1] else (j, i)
+            return with_ranges(ranges[:m] + [(ranges[t][0], ranges[m][1])] + ranges[m + 1:])
+
+        # Range 2 moved to run 0x10 past image_len, clear of the others.
         past = (image_len - 0x10, 0x20)
-        if max(o0 + l0, o1 + l1) > past[0]:
-            raise Fail("ranges 0 and 1 reach the image's last 0x10 bytes; pick another range-2 target")
+        if max(o + n for k, (o, n) in enumerate(ranges) if k != 2) > past[0]:
+            raise Fail("another range reaches the image's last 0x10 bytes; pick another range-2 target")
         # On-device refusals, one measure-variant boot each. Every descriptor
         # but the first is refused by one boot.cmd line alone (one selftest
-        # drops each): a pair's overlap moves one range onto the other of its
-        # pair, which stays disjoint from the third.
+        # drops each): a pair's overlap moves one range into the other of its
+        # pair, which stays disjoint from the rest.
         refusals = (
             # S12: offset + len wraps 64 bits into the image.
             ("wrapping range refused", "a wrapping range was not refused",
              desc[:24] + struct.pack("<QQ", 2**64 - 0x10, 0x20) + desc[40:]),
-            ("0-1 overlap refused", "the 0-1 overlap was not refused", with_ranges([ranges[0], ranges[0], ranges[2]])),
-            ("0-2 overlap refused", "the 0-2 overlap was not refused", with_ranges([ranges[0], ranges[1], ranges[0]])),
-            ("1-2 overlap refused", "the 1-2 overlap was not refused", with_ranges([ranges[0], ranges[1], ranges[1]])),
+            *((f"{i}-{j} overlap refused", f"the {i}-{j} overlap was not refused", overlapping(i, j))
+              for i, j in measure.PAIRS),
             # Within 32 bits, so only the no-wrap form len <= image_len - offset
             # catches it (offset + len is never computed).
-            ("range 2 wrap refused", "the range-2 wrap was not refused", with_ranges([ranges[0], ranges[1], past])),
-            # M5's version at v2's length: only the version compare catches it.
-            ("version-1 descriptor refused", "the version-1 descriptor was not refused",
-             desc[:8] + struct.pack("<I", 1) + desc[12:]),
+            ("range 2 wrap refused", "the range-2 wrap was not refused", with_ranges(ranges[:2] + [past] + ranges[3:])),
+            # M6's version at v3's length: only the version compare catches it.
+            ("version-2 descriptor refused", "the version-2 descriptor was not refused",
+             desc[:8] + struct.pack("<I", 2) + desc[12:]),
         )
         for case, missing, bad in refusals:
             got, refused = measure_boot(pkg, scratch, image, bad, envs)
@@ -2277,13 +2308,13 @@ def test_measured_boot(pkg: str, passed: list):
             passed.append(f"measured boot: {case}")
 
         # Its allow pair: a range ending exactly at image_len (the first of
-        # the three that can move there without overlapping the others).
+        # the five that can move there without overlapping the others).
         for i, (_, length) in enumerate(ranges):
             moved_ranges = ranges[:i] + [(image_len - length, length)] + ranges[i + 1:]
             if not measure.check_ranges(image_len, moved_ranges):
                 break
         else:
-            raise Fail("no envelope range can end at image_len without overlap")
+            raise Fail("no range can end at image_len without overlap")
         edge = with_ranges(moved_ranges)
         got, refused = measure_boot(pkg, scratch, image, edge, envs)
         if refused or got is None:
@@ -2453,7 +2484,7 @@ def test_sealed(good: Package, foreign: Package, passed: list):
         passed.append("sealed boot: a PCR 3 extended before PolicyPCR refuses the unseal (policy failure)")
 
         # Envelopes sealed to another TPM's SRK, booted on this one (I10.2).
-        child, con = sealed_boot(Package(foreign.dir, good.state))
+        child, con = sealed_boot(Package(foreign.dir, good.state, good.slots))
         try:
             key_outcomes(con, {"key-core": "SrkMismatch", "pqkey-core": "SrkMismatch", "tlskey-core": "SrkMismatch"},
                          "foreign TPM")
@@ -2494,6 +2525,12 @@ def test_sealed(good: Package, foreign: Package, passed: list):
             if g != w:
                 raise Fail(f"PCR {i} after the shipped boot is {g.hex()}, the twin of {FIRMWARE} gives {w.hex()}")
         passed.append("sealed boot: PCRs 0-7 as the firmware twin computes")
+        # M8 plan C4, D3: U-Boot measured slot A, then slot B, over BUNDLE_MAX.
+        slot_want = measure.expected_pcr9(*good.slot_bytes())
+        if pcrs[measure.SLOT_PCR] != slot_want:
+            raise Fail(f"PCR 9 after the shipped boot is {pcrs[measure.SLOT_PCR].hex()}, the slot twin gives "
+                       f"{slot_want.hex()}")
+        passed.append("sealed boot: PCR 9 as the slot twin computes")
         if got != want:
             capped = "uncapped" if got == measure.expected_pcr8(desc, image) else "unexpected"
             raise Fail(f"cap: PCR 8 after the boot is {got.hex()} ({capped}), want {want.hex()}")
@@ -2842,7 +2879,8 @@ def test_release_boot(pkg: Package, release: str, deploy: str, fi_net: Package, 
     pcrs = [bytes.fromhex(p) for p in fields["pcrs"].split(",")]
     image, desc, firmware = (os.path.join(release, n) for n in ("published.img", "boot.desc", "flash.bin"))
     media = [(image, measure.LOAD_IMAGE), (desc, measure.LOAD_DESC)] + \
-        list(zip(map(pkg.path, ("secrets.env", "pq_secrets.env", "tls_secrets.env")), measure.LOAD_ENVELOPES))
+        list(zip(map(pkg.path, ("secrets.env", "pq_secrets.env", "tls_secrets.env")), measure.LOAD_ENVELOPES)) + \
+        list(zip(pkg.slots, measure.LOAD_SLOTS, strict=True))
     for path, key in ((firmware, "firmware_sha256"), (image, "loader_img_sha256"), (desc, "boot_desc_sha256")):
         if file_sha256(path) != fields[key]:
             raise Fail(f"release boot: {os.path.basename(path)} is not the manifest's {key}")
@@ -3574,11 +3612,14 @@ def py_installed(conf: str, gw_pub: bytes, rp: Rosenpass, deadline: float, trace
 
 def rust_usize(rel: str, name: str) -> int:
     """`pub const NAME: usize = <literal>;`, or `= OTHER;` naming another
-    such constant of the same file."""
-    m = re.search(rf"pub const {name}: (?:usize|u\d+) = (0x[0-9a-fA-F_]+|[0-9_]+|[A-Z][A-Z0-9_]*);",
+    such constant of the same file, or `= limits::OTHER;` (the bounds the
+    M8 bundle shares, crates/limits)."""
+    m = re.search(rf"pub const {name}: (?:usize|u\d+) = (0x[0-9a-fA-F_]+|[0-9_]+|(?:limits::)?[A-Z][A-Z0-9_]*);",
                   open(os.path.join(ROOT, rel)).read())
     if not m:
         raise Fail(f"{name} not found in {rel}")
+    if m.group(1).startswith("limits::"):
+        return rust_usize("crates/limits/src/lib.rs", m.group(1).removeprefix("limits::"))
     if m.group(1)[0].isalpha():
         return rust_usize(rel, m.group(1))
     return int(m.group(1), 0)
@@ -7054,7 +7095,8 @@ def read_srk(state: str, out: str, ca: str):
 def provision_tpm(root: str, name: str) -> tuple:
     """One deployment's TPM (C14): a swtpm state initialised once and its
     SRK public read (state directory, SRK public file). Every boot runs on a
-    copy of the state; a copy's SRK must be the same one."""
+    copy of the state. Provisioning clears the TPM first (M8 plan D5, S18),
+    so provisioning a copy again must give another SRK (deviation D-7)."""
     state = os.path.join(root, f"tpm-{name}")
     os.mkdir(state, 0o700)
     ca = ek_ca(root)
@@ -7070,8 +7112,8 @@ def provision_tpm(root: str, name: str) -> tuple:
     try:
         shutil.copy2(os.path.join(state, SWTPM_PERMALL), copy)
         read_srk(copy, again, ca)
-        if open(again, "rb").read() != open(srk, "rb").read():
-            raise Fail(f"TPM {name}: a copy of the provisioned state has another SRK")
+        if open(again, "rb").read() == open(srk, "rb").read():
+            raise Fail(f"TPM {name}: provisioning a copy again kept the SRK (no TPM2_Clear)")
     finally:
         shutil.rmtree(copy)
         with contextlib.suppress(FileNotFoundError):
@@ -7091,6 +7133,9 @@ def build(tmp: str):
                         os.path.join(ROOT, "config/gateway.toml"), "--peers", peers, "--out",
                         os.path.join(tmp, name), *extra], check=True, cwd=ROOT)
     swap_rp_records(os.path.join(tmp, "c/gateway.toml"))
+    # The node's bundle slots (M8 plan C4): no `policy` PD reads them yet, so
+    # two distinct random fills, which PCR 9's twin tells apart in order.
+    write_slots(tmp, os.urandom(measure.BUNDLE_MAX), os.urandom(measure.BUNDLE_MAX))
     _, srk_a = provision_tpm(tmp, "a")
     _, srk_c = provision_tpm(tmp, "c")
     _, srk_foreign = provision_tpm(tmp, "foreign")
@@ -7160,13 +7205,15 @@ PACKAGE_OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env"
 
 
 def packages(tmp: str) -> dict:
-    """The packages build() made, with the TPM state each boots on."""
-    return {"good": Package(os.path.join(tmp, "a/pkg"), os.path.join(tmp, "tpm-a")),
-            "mismatched": Package(os.path.join(tmp, "b/pkg"), os.path.join(tmp, "tpm-a")),
-            "binding": Package(os.path.join(tmp, "c/pkg"), os.path.join(tmp, "tpm-c")),
-            "foreign": Package(os.path.join(tmp, "a/pkg-foreign"), os.path.join(tmp, "tpm-foreign")),
-            "tls_mismatch": Package(os.path.join(tmp, "a/pkg-tls-mismatch"), os.path.join(tmp, "tpm-a")),
-            **{f"fi_{v}": Package(os.path.join(tmp, f"a/pkg-fi-{v}"), os.path.join(tmp, "tpm-a"))
+    """The packages build() made, with the TPM state each boots on and the
+    bundle slots build() wrote."""
+    slots = (os.path.join(tmp, "slot-a.bin"), os.path.join(tmp, "slot-b.bin"))
+    return {"good": Package(os.path.join(tmp, "a/pkg"), os.path.join(tmp, "tpm-a"), slots),
+            "mismatched": Package(os.path.join(tmp, "b/pkg"), os.path.join(tmp, "tpm-a"), slots),
+            "binding": Package(os.path.join(tmp, "c/pkg"), os.path.join(tmp, "tpm-c"), slots),
+            "foreign": Package(os.path.join(tmp, "a/pkg-foreign"), os.path.join(tmp, "tpm-foreign"), slots),
+            "tls_mismatch": Package(os.path.join(tmp, "a/pkg-tls-mismatch"), os.path.join(tmp, "tpm-a"), slots),
+            **{f"fi_{v}": Package(os.path.join(tmp, f"a/pkg-fi-{v}"), os.path.join(tmp, "tpm-a"), slots)
                for v in FAULT_INJECT_VARIANTS}}
 
 
@@ -7235,7 +7282,7 @@ def in_netns(tmp: str) -> int:
              ("rp gate boot", lambda: test_rp_gate(good, deploy, passed)),
              ("peer binding", lambda: test_peer_binding(binding, os.path.join(os.path.dirname(deploy), "c"), passed)),
              ("mismatched blob halts key", single("mismatched blob", lambda: test_mismatched_blob(mismatched))),
-             ("measured boot", lambda: test_measured_boot(good.dir, passed)),
+             ("measured boot", lambda: test_measured_boot(good.dir, good.slot_bytes(), passed)),
              ("sealed boot", lambda: test_sealed(good, foreign, passed)),
              ("tpm proxy", lambda: test_tpm_proxy(good, passed)),
              ("firmware", lambda: test_firmware(good, passed)),

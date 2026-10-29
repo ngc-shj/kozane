@@ -1,4 +1,5 @@
-"""tools/provision (M7 plan C5) against real swtpms and a CA made for the run.
+"""tools/provision (M7 plan C5, M8 plan C3) against real swtpms and a CA made
+for the run.
 
 Allow: a TPM whose EK certificate chains to the CA gets its SRK record,
 byte-equal to the SRK public the TPM reports. Deny, each exiting non-zero
@@ -9,6 +10,16 @@ public with fixedTPM clear. The last three read a substituted file through
 a PATH shim for one tpm2-tools command; the comparison, the template check
 and the activation stay the real ones.
 
+M8 plan C3: every provisioning clears the TPM (the SRK changes); the `nv`
+step defines the two indices only from a ledger `tools/policy verify
+--ledger` accepts (a build pinned to this run's roster, as
+tests/tools/test_policy.py builds it) and a provisioning record two pinned
+record keys signed for this TPM's SRK. Its denies (each naming its cause,
+writing no slot and defining nothing) pair with the allow, which also
+checks the logical version, the Names against tools/measure.py's twin and
+reset_at_provision. Existing indices are refused without the two delete
+authorizations and replaced with them.
+
 Everything lives in one per-run directory, removed in `finally`; a
 directory that survives fails the run.
 
@@ -18,7 +29,9 @@ Prints "PROVISION-FIXTURES <n>" and exits non-zero on any mismatch.
 
 import os
 import pathlib
+import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -26,6 +39,19 @@ import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools/provision"
+sys.path.insert(0, str(ROOT / "tools"))
+sys.path.insert(0, str(ROOT / "tests/tools"))
+import measure  # noqa: E402
+import test_policy  # noqa: E402  (its pinned tools/policy build and ledger fixture)
+
+# Runs tools/provision with its pinned record keys pointed at a run's file:
+# the tool has no flag for that (M8 plan C3), so the test sets the module
+# global, as tests/tools/test_package.py loads tools/package.
+LAUNCH = ("import pathlib, sys; src = sys.argv[1]; g = {'__file__': src, '__name__': 'provision'}; "
+          "exec(compile(open(src).read(), src, 'exec'), g); g['RECORD_KEYS'] = pathlib.Path(sys.argv[2]); "
+          "sys.argv = [src] + sys.argv[3:]; sys.exit(g['main']())")
+RECORD_DOMAIN = b"kozane-reprovision-v1\0"
+FIXTURES = 24
 
 
 def make_ca(run_dir: pathlib.Path, name: str) -> pathlib.Path:
@@ -106,11 +132,245 @@ cp {substitute} "$out"
     return {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"}
 
 
+def tool(record_keys: pathlib.Path, *args) -> tuple:
+    r = subprocess.run([sys.executable, "-c", LAUNCH, str(TOOL), str(record_keys), *map(str, args)],
+                       capture_output=True, text=True, cwd=ROOT)
+    return r.returncode, r.stdout + r.stderr
+
+
+def openssl(*args) -> bytes:
+    r = subprocess.run(["openssl", *map(str, args)], capture_output=True)
+    if r.returncode != 0:
+        raise SystemExit(f"openssl {args[0]}: {r.stderr.decode(errors='replace')}")
+    return r.stdout
+
+
+def name_of(tcti: str, run_dir: pathlib.Path) -> str:
+    """The SRK Name the storage template gives in this TPM now."""
+    ctx, name = run_dir / "name.ctx", run_dir / "name.bin"
+    tool_out(tcti, "tpm2_createprimary", "-Q", "-C", "o", "-G", "ecc256:aes128cfb", "-g", "sha256", "-a",
+             "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda|restricted|decrypt", "-c", str(ctx))
+    tool_out(tcti, "tpm2_readpublic", "-Q", "-c", str(ctx), "-n", str(name))
+    tool_out(tcti, "tpm2_flushcontext", "-t")
+    return name.read_bytes().hex()
+
+
+def record(**fields) -> bytes:
+    return "".join(f"{k}={fields[k]}\n" for k in ("body_sha256", "fleet_id", "node", "srk_name", "v0")).encode()
+
+
+def raw_sig(run_dir: pathlib.Path, name: str, body: bytes, key: pathlib.Path, domain: bytes = RECORD_DOMAIN,
+            ecdsa: bool = False) -> pathlib.Path:
+    """A `sig=` line made outside the tool: another domain, or an ECDSA key."""
+    msg = run_dir / f"{name}.msg"
+    msg.write_bytes(domain + body)
+    spki = openssl("pkey", "-in", key, "-pubout", "-outform", "DER")
+    sig = openssl("dgst", "-sha256", "-sign", key, msg) if ecdsa else \
+        openssl("pkeyutl", "-sign", "-inkey", key, "-rawin", "-in", msg)
+    out = run_dir / f"{name}.sig"
+    out.write_text(f"sig={spki.hex()}:{sig.hex()}\n")
+    return out
+
+
+class Ledger:
+    """test_policy's fixture: a pinned tools/policy, a ledger whose head is
+    version 1 (v0 for this node), its keys and the head's bytes."""
+
+    def __init__(self, d: pathlib.Path):
+        base = test_policy.build_binary()
+        session = d / "approvers"
+        session.mkdir(parents=True)
+        for a in ("alice", "bob", "carol", "dave"):
+            rc, out = test_policy.run(base, "approver-keygen", "--dir", session / a, "--forbid", ROOT)
+            assert rc == 0, out
+        roster = session / "roster.toml"
+        roster.write_text(test_policy.roster_toml({a: test_policy.pubkey(session, a)
+                                                   for a in ("alice", "bob", "carol")}))
+        test_policy.APPROVERS = session
+        test_policy.BIN = test_policy.build_binary(test_policy._digest(base, roster))
+        self.bin = test_policy.BIN
+        (d / "fixture").mkdir()
+        self.ctx = test_policy.Ctx(d / "fixture")
+        rc, out = self.ctx.sign(self.ctx.draft1, [self.ctx.a1, self.ctx.b1], d / "slot1.bin")
+        assert rc == 0, out
+        self.dir, self.keys, self.fleet_id = self.ctx.ledger, self.ctx.keys, test_policy.FLEET_ID
+        self.head = (self.dir / "entries/0000000001.bin").read_bytes()
+        self.body = {v: self.approval_field(v, "body_sha256") for v in (0, 1)}
+
+    def approval_field(self, version: int, key: str) -> str:
+        path = sorted((self.dir / "approvals" / f"{version:010}").glob("*"))[0]
+        return dict(line.split("=", 1) for line in path.read_text().splitlines())[key]
+
+
 def provision(tcti: str, ca: pathlib.Path, out: pathlib.Path, env=None):
     r = subprocess.run([sys.executable, str(TOOL), "--tcti", tcti, "--ek-root", str(ca / "swtpm-localca-rootca-cert.pem"),
                         "--ek-intermediates", str(ca / "issuercert.pem"), "--out", str(out)],
                        env=env, capture_output=True, text=True, cwd=ROOT)
     return r.returncode, r.stdout + r.stderr
+
+
+def nv_fixtures(run_dir: pathlib.Path, ca: pathlib.Path, other: Swtpm, tpms: list, results: list):
+    tpm = Swtpm(make_tpm(run_dir, "n", "a"))
+    tpms.append(tpm)
+    env = {**os.environ, "TPM2TOOLS_TCTI": tpm.tcti}
+
+    # D5, S18: provisioning clears the TPM first, so the same TPM provisioned
+    # again holds another SRK, and the SRK it wrote is the one it now holds.
+    first, second = run_dir / "srk-n1.pub", run_dir / "srk-n2.pub"
+    rc1, text1 = provision(tpm.tcti, ca, first)
+    rc2, text2 = provision(tpm.tcti, ca, second)
+    results.append(("allow: each provisioning clears the TPM, so the SRK changes",
+                    rc1 == 0 and rc2 == 0 and first.read_bytes() != second.read_bytes(), text1 + text2))
+
+    ledger = Ledger(run_dir / "ledger-fixture")
+    keys = {}
+    for k in ("r1", "r2", "r3"):
+        keys[k] = run_dir / f"{k}.pem"
+        openssl("genpkey", "-algorithm", "ed25519", "-out", keys[k])
+    for k in ("op1", "op2"):
+        keys[k] = run_dir / f"{k}.pem"
+        openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", keys[k])
+        keys[f"{k}.pub"] = run_dir / f"{k}.pub.pem"
+        openssl("ec", "-in", keys[k], "-pubout", "-out", keys[f"{k}.pub"])
+    pinned = run_dir / "record-keys"
+    pinned.write_text("# the run's fleet\n" + "".join(
+        f"{ledger.fleet_id} {openssl('pkey', '-in', keys[k], '-pubout', '-outform', 'DER')[-32:].hex()}\n"
+        for k in ("r1", "r2")))
+
+    def make_record(name: str) -> pathlib.Path:
+        out = run_dir / f"{name}.record"
+        rc, text = tool(pinned, "record", "--tcti", tpm.tcti, "--ledger", ledger.dir, "--keys-pub", ledger.keys,
+                        "--node", "n1", "--out", out, "--policy-bin", ledger.bin)
+        if rc != 0:
+            raise SystemExit(f"provision record: {text}")
+        return out
+
+    def sign(rec: pathlib.Path, key: str, name: str) -> pathlib.Path:
+        out = run_dir / f"{name}.sig"
+        rc, text = tool(pinned, "record-sign", "--record", rec, "--key", keys[key], "--out", out)
+        if rc != 0:
+            raise SystemExit(f"provision record-sign: {text}")
+        return out
+
+    def nv(rec, sigs, slot, ledger_dir=None, delete_keys=()):
+        extra = ["--delete-keys", *delete_keys] if delete_keys else []
+        return tool(pinned, "nv", "--tcti", tpm.tcti, "--ledger", ledger_dir or ledger.dir, "--keys-pub",
+                    ledger.keys, "--node", "n1", "--record", rec, "--record-sigs", *sigs, "--delete-pub",
+                    keys["op1.pub"], keys["op2.pub"], "--slot-a", slot, "--policy-bin", ledger.bin, *extra)
+
+    def nv_defined() -> set:
+        out = tool_out(tpm.tcti, "tpm2_getcap", "handles-nv-index").decode()
+        return {int(h, 16) for h in re.findall(r"^- (0x[0-9a-f]+)$", out, re.M)} \
+            & {measure.NV_POLICY_CTR, measure.NV_POLICY_BASE}
+
+    def nv_deny(name, rec, sigs, needle, ledger_dir=None):
+        slot = run_dir / f"slot-{len(results)}.bin"
+        rc, text = nv(rec, sigs, slot, ledger_dir)
+        results.append((name, rc != 0 and needle in text and not slot.exists() and not nv_defined(), text))
+
+    # A record signed before the second Clear: replayed after it.
+    replayed = make_record("replayed")
+    replayed_sigs = [sign(replayed, "r1", "replayed-r1"), sign(replayed, "r2", "replayed-r2")]
+    rc, text = provision(tpm.tcti, ca, run_dir / "srk-n3.pub")
+    assert rc == 0, text
+
+    good = make_record("good")
+    body = good.read_bytes()
+    fields = dict(line.split("=", 1) for line in body.decode().splitlines())
+    s1, s2 = sign(good, "r1", "good-r1"), sign(good, "r2", "good-r2")
+
+    def signed(name: str, **change) -> tuple:
+        path = run_dir / f"{name}.record"
+        path.write_bytes(record(**{**fields, **change}))
+        return path, [sign(path, "r1", f"{name}-r1"), sign(path, "r2", f"{name}-r2")]
+
+    tampered = run_dir / "ledger-tampered"
+    shutil.copytree(ledger.dir, tampered)
+    entry = tampered / "entries/0000000001.bin"
+    data = bytearray(entry.read_bytes())
+    data[100] ^= 1
+    entry.write_bytes(bytes(data))
+    nv_deny("deny: v0 from a ledger tools/policy does not verify", good, [s1, s2],
+            "failed: policy: ledger: version 1:", tampered)
+    nv_deny("deny: a record with one signature", good, [s1], "needs two signatures, has 1")
+    nv_deny("deny: a record signed twice by the same key", good, [s1, s1], "signed twice by the same key")
+    nv_deny("deny: a record signed by a delete key", good,
+            [s1, raw_sig(run_dir, "by-delete", body, keys["op1"], ecdsa=True)], "signed by a delete key")
+    nv_deny("deny: a record signed by an unpinned key", good, [s1, sign(good, "r3", "good-r3")],
+            "not a pinned record key")
+    nv_deny("deny: a record bound to another TPM's SRK", *signed("other-srk", srk_name=name_of(other.tcti, run_dir)),
+            "the record's srk_name")
+    nv_deny("deny: a record replayed from an earlier provisioning", replayed, replayed_sigs, "the record's srk_name")
+    nv_deny("deny: a record for another fleet", *signed("other-fleet", fleet_id="cd" * 16), "the record's fleet_id")
+    nv_deny("deny: a record signed under another domain", good,
+            [s1, raw_sig(run_dir, "other-domain", body, keys["r2"], domain=b"kozane-policy-approval-v1\0")],
+            "does not verify")
+    nv_deny("deny: a record whose v0 is not the ledger head", *signed("old-v0", v0="0", body_sha256=ledger.body[0]),
+            "the record's v0 0 is not the ledger head")
+    nv_deny("deny: a record whose body is not the ledger head's", *signed("other-body", body_sha256="00" * 32),
+            "the record's body_sha256")
+
+    # Allow, then what it left in the TPM.
+    slot = run_dir / "slot-a.bin"
+    rc, text = nv(good, [s1, s2], slot)
+    printed = dict(line.split("=", 1) for line in text.splitlines() if re.fullmatch(r"[a-z_]+=\w+", line))
+    reset = re.search(r"reset_count: (\d+)", tool_out(tpm.tcti, "tpm2_readclock").decode()).group(1)
+    results.append(("allow: nv defines the indices and writes the ledger head into slot A",
+                    rc == 0 and slot.read_bytes() == ledger.head and nv_defined() == {measure.NV_POLICY_CTR,
+                                                                                         measure.NV_POLICY_BASE}
+                    and printed.get("reset_at_provision") == reset, text))
+
+    def logical() -> int:
+        out = run_dir / "nv.bin"
+        values = []
+        for index in (measure.NV_POLICY_CTR, measure.NV_POLICY_BASE):
+            out.unlink(missing_ok=True)
+            tool_out(tpm.tcti, "tpm2_nvread", f"{index:#x}", "-C", f"{index:#x}", "-s", "8", "-o", str(out))
+            values.append(struct.unpack(">Q", out.read_bytes())[0])
+        return (values[0] - values[1]) % 2**64
+
+    def names_match() -> bool:
+        names = []
+        for k in ("op1", "op2"):
+            tool_out(tpm.tcti, "tpm2_loadexternal", "-Q", "-C", "n", "-G", "ecc", "-u", str(keys[f"{k}.pub"]),
+                     "-c", str(run_dir / "op.ctx"), "-n", str(run_dir / "op.name"))
+            tool_out(tpm.tcti, "tpm2_flushcontext", "-t")
+            names.append((run_dir / "op.name").read_bytes())
+        want = [n.hex() for n in measure.expected_nv_names(measure.delete_policy(names))]
+        got = [re.search(r"name: ([0-9a-f]+)", tool_out(tpm.tcti, "tpm2_nvreadpublic", f"{i:#x}").decode()).group(1)
+               for i in (measure.NV_POLICY_CTR, measure.NV_POLICY_BASE)]
+        return got == want == [printed.get("nv_ctr_name"), printed.get("nv_base_name")]
+
+    results.append(("allow: the logical version after provisioning is v0", logical() == 1, ""))
+    results.append(("allow: both Names are tools/measure.py's twin and what nv printed", names_match(), text))
+
+    before = [tool_out(tpm.tcti, "tpm2_nvreadpublic", f"{i:#x}") for i in (measure.NV_POLICY_CTR,
+                                                                           measure.NV_POLICY_BASE)]
+    again = run_dir / "slot-again.bin"
+    rc, text = nv(good, [s1, s2], again)
+    results.append(("deny: existing indices without the two delete authorizations",
+                    rc != 0 and "already exists; deleting it needs" in text and not again.exists()
+                    and before == [tool_out(tpm.tcti, "tpm2_nvreadpublic", f"{i:#x}")
+                                   for i in (measure.NV_POLICY_CTR, measure.NV_POLICY_BASE)], text))
+    tool_out(tpm.tcti, "tpm2_nvincrement", f"{measure.NV_POLICY_CTR:#x}", "-C", f"{measure.NV_POLICY_CTR:#x}")
+    rc, text = nv(good, [s1, s2], again, delete_keys=(keys["op1"], keys["op2"]))
+    printed = dict(line.split("=", 1) for line in text.splitlines() if re.fullmatch(r"[a-z_]+=\w+", line))
+    results.append(("allow: with both delete authorizations the indices are deleted and redefined at v0",
+                    rc == 0 and again.read_bytes() == ledger.head and logical() == 1 and names_match(), text))
+
+    # The operator's delete signer refuses a digest without a session nonce
+    # (S23): its allow is the delete above.
+    g = {"__file__": str(TOOL), "__name__": "provision"}
+    exec(compile(TOOL.read_text(), str(TOOL), "exec"), g)
+    name = bytes.fromhex(printed.get("nv_ctr_name", "00"))
+    tbs = bytes(4) + measure.undefine_special_cphash(name) + measure.NV_DELETE_REF
+    try:
+        g["sign_delete"](tbs, str(keys["op1"]), name, run_dir / "empty-nonce.sig")
+        why = "signed"
+    except g["Refused"] as e:
+        why = str(e)
+    results.append(("deny: the delete signer refuses an empty session nonce",
+                    why == "provision: delete signing refused: the session nonce is empty", why))
 
 
 def main() -> int:
@@ -180,6 +440,8 @@ def main() -> int:
         out = run_dir / "srk-loose-out.pub"
         rc, text = provision(tpm_a.tcti, ca_a, out, shim(run_dir, "tpm2_readpublic", loose))
         deny("deny: an SRK public with fixedTPM clear", rc, text, out, "not the SRK storage template")
+
+        nv_fixtures(run_dir, ca_a, tpm_b, tpms, results)
     finally:
         for t in tpms:
             t.close()
@@ -192,7 +454,7 @@ def main() -> int:
         print(f"FAIL the run directory {run_dir} survived")
         failures += 1
     print(f"PROVISION-FIXTURES {len(results)}")
-    return 1 if failures or len(results) != 6 else 0
+    return 1 if failures or len(results) != FIXTURES else 0
 
 
 if __name__ == "__main__":

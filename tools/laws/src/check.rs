@@ -26,6 +26,7 @@ pub fn check(system: &System, policy: &Policy) -> Vec<Finding> {
     check_dma_setvar_present(system, policy, &mut findings);
     check_irq_duplicates(system, &mut findings);
     check_data_confinement(system, policy, &mut findings);
+    check_bundle_slot(system, policy, &mut findings);
     check_availability(system, policy, &tainted, &mut findings);
     check_stack_guard(system, &mut findings);
 
@@ -434,8 +435,9 @@ fn supervisor_channel_is_exempt(
 /// L1 (tainted pds map no secret mr) and L2 (M3 plan amendment): every
 /// secrets mr is mapped only by its policy owner and only read-only, each `key`-role pd maps
 /// exactly its own secrets mr and nothing else, `prefill_path` appears
-/// only on secrets mrs, no pd holds `pp` channels to two key pds, and no
-/// key pd has two `pp` callers (M6 plan C12).
+/// only on secrets or bundle_slot mrs (M8 plan C11), no pd holds `pp`
+/// channels to two key pds, and no key pd has two `pp` callers (M6 plan
+/// C12).
 fn check_secrets_and_taint(
     system: &System,
     policy: &Policy,
@@ -492,10 +494,12 @@ fn check_secrets_and_taint(
     }
 
     for mr in &system.mrs {
-        if mr.prefill_path.is_some() && !matches!(policy.mrs.get(mr.name.as_str()), Some(MrPolicy::Secrets { .. })) {
+        if mr.prefill_path.is_some()
+            && !matches!(policy.mrs.get(mr.name.as_str()), Some(MrPolicy::Secrets { .. } | MrPolicy::BundleSlot { .. }))
+        {
             findings.push(Finding::new(
                 LawId::L2,
-                format!("prefill_path is only allowed on secrets mrs, not '{}'", mr.name),
+                format!("prefill_path is only allowed on secrets or bundle_slot mrs, not '{}'", mr.name),
             ));
         }
     }
@@ -993,6 +997,33 @@ fn check_data_confinement(system: &System, policy: &Policy, findings: &mut Vec<F
                 findings.push(Finding::new(
                     LawId::L3,
                     format!("consumer pd '{}' must map data mr '{}' read-only", pd.name, m.mr),
+                ));
+            }
+        }
+    }
+}
+
+/// MR kind `bundle_slot` (M8 plan C1, C6, C11): a peer-policy bundle slot
+/// filled at boot by U-Boot and never written by any pd. The same
+/// allowlist shape `plain`'s share table gets in `check_default_deny`
+/// (L4, default deny), fixed to read-only: no pd may map it with `w` or
+/// `x`, and every pd that maps it must be one of its policy `readers`
+/// (which may be empty, an unmapped slot). It never seeds taint (L1): it
+/// is not a `Device` mr, so `compute_taint`'s seed filter already excludes
+/// it; verifying the bytes inside is `policy`'s job (C6), not the laws'.
+fn check_bundle_slot(system: &System, policy: &Policy, findings: &mut Vec<Finding>) {
+    for pd in &system.pds {
+        for m in mrs_mapped_by(pd) {
+            let Some(MrPolicy::BundleSlot { readers }) = policy.mrs.get(m.mr.as_str()) else { continue };
+            if m.perms.w || m.perms.x {
+                findings.push(Finding::new(
+                    LawId::L4,
+                    format!("pd '{}' maps bundle_slot mr '{}' with 'w' or 'x', never allowed on a bundle slot", pd.name, m.mr),
+                ));
+            } else if !readers.contains(&pd.name) {
+                findings.push(Finding::new(
+                    LawId::L4,
+                    format!("pd '{}' maps bundle_slot mr '{}' but is not listed in its policy readers", pd.name, m.mr),
                 ));
             }
         }

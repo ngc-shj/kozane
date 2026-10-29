@@ -1,11 +1,22 @@
 #!/usr/bin/env python3
 """Provisions one TPM for packaging (M7 plan C5): writes the SRK public that
 `tools/package` seals to, only once that SRK is proven to live in a TPM
-whose EK certificate chains to the pinned CA.
+whose EK certificate chains to the pinned CA; then (M8 plan C3, D2, D5) the
+node's anti-rollback NV state and its first bundle.
 
 Usage: provision --tcti TCTI --ek-root CERT --ek-intermediates CERTS --out FILE
+       provision record --tcti TCTI --ledger DIR --keys-pub DIR --node NAME --out FILE
+                        [--policy-bin BIN]
+       provision record-sign --record FILE --key PEM --out FILE
+       provision nv --tcti TCTI --ledger DIR --keys-pub DIR --node NAME --record FILE
+                    --record-sigs SIG SIG --delete-pub PEM PEM [--delete-keys PEM PEM]
+                    --slot-a FILE [--policy-bin BIN]
 
-The flow, failing at the first step that fails:
+The SRK flow, failing at the first step that fails:
+  0. TPM2_Clear under the platform hierarchy, always (M8 plan D5, S18): no
+     envelope sealed before this provisioning unseals after it. A Clear
+     that fails aborts; the SRK created below must have another Name than
+     the one the TPM held before, when it held one;
   1. read the RSA EK certificate from its NV index (TCG EK credential
      profile, 0x01c00002), verify its chain to --ek-root through
      --ek-intermediates, and check its public key is the TPM's EK public
@@ -19,22 +30,62 @@ The flow, failing at the first step that fails:
   4. only then write those same bytes to --out (a new file, renamed into
      place).
 
+`record` prints (and writes to --out) the provisioning record two operators
+sign after that Clear: canonical `key=value` lines (keys sorted, LF ends)
+`body_sha256`, `fleet_id`, `node`, `srk_name`, `v0`, where `srk_name` is
+read from the TPM itself and `v0`, `body_sha256` and `fleet_id` are the head
+of a ledger `tools/policy verify --ledger` accepts. `record-sign` signs it
+with one operator record key (openssl, Ed25519 over the domain
+`kozane-reprovision-v1\0` then the record), writing one
+`sig=<signer SubjectPublicKeyInfo, hex>:<signature, hex>` line.
+
+`nv` (M8 plan C3) re-reads all of that and refuses unless the ledger
+verifies, the record carries two signatures by two distinct keys pinned for
+the ledger's fleet in tools/provision-record-keys (never a delete key), and
+its fields are this fleet, this node, this TPM's SRK Name and the ledger's
+head version and body. It then defines NV_POLICY_CTR and NV_POLICY_BASE
+under the platform hierarchy with the delete policy of the two operator
+delete keys (--delete-pub, ECC P-256), increments the counter once, writes
+`base = counter - v0 (mod 2^64)` and write-locks it, reads both back
+(logical value == v0), checks both Names against tools/measure.py's twin,
+writes the head bundle to --slot-a, and as its last TPM act reads
+`reset_count`. It prints `nv_ctr_name`, `nv_base_name` and
+`reset_at_provision`. If either index already exists it is deleted first,
+only through TPM2_NV_UndefineSpaceSpecial with both operators' PolicySigned
+(--delete-keys, in --delete-pub's order); without them, `nv` refuses.
+
 Everything else lives in a fresh 0700 scratch directory removed on every
 path. Control class: fail-closed gate at provisioning; adjudicated by the
-X.509 chain check (openssl) and the TPM's ActivateCredential. A missing
-tool, input or certificate is a refusal naming it.
+X.509 chain check (openssl), the TPM's ActivateCredential, Clear and NV
+attributes, `tools/policy verify --ledger` and the record's two Ed25519
+signatures (openssl). A missing tool, input or certificate is a refusal
+naming it.
 """
 
 import argparse
 import os
 import pathlib
+import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "tools"))
+import measure  # noqa: E402  (the NV index twins, BUNDLE_MAX)
+
 EK_CERT_NV_RSA = "0x01c00002"
+SRK_TEMPLATE = ["-G", "ecc256:aes128cfb", "-g", "sha256", "-a",
+                "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda|restricted|decrypt"]
+POLICY_BIN = ROOT / "build/policy/target/release/policy"
+# The fleets' record keys (M8 plan C3): a tracked file, not a flag.
+RECORD_KEYS = ROOT / "tools/provision-record-keys"
+RECORD_DOMAIN = b"kozane-reprovision-v1\0"
+RECORD_FIELDS = ("body_sha256", "fleet_id", "node", "srk_name", "v0")
+# DER SubjectPublicKeyInfo of an Ed25519 key, before its 32 raw bytes.
+ED25519_SPKI = bytes.fromhex("302a300506032b6570032100")
 
 
 class Refused(Exception):
@@ -56,11 +107,35 @@ def spki_der(pem: bytes, what: str) -> bytes:
     return run(what, ["openssl", "pkey", "-pubin", "-outform", "DER"], input=pem)
 
 
+def tpm_env(tcti: str) -> dict:
+    return {**os.environ, "TPM2TOOLS_TCTI": tcti}
+
+
+def srk_name(env: dict, scratch: pathlib.Path) -> bytes:
+    """The Name of the SRK the storage template gives in this TPM now."""
+    ctx, name = scratch / "srk-name.ctx", scratch / "srk.name"
+    run("SRK", ["tpm2_createprimary", "-Q", "-C", "o", *SRK_TEMPLATE, "-c", str(ctx)], env)
+    try:
+        run("SRK", ["tpm2_readpublic", "-Q", "-c", str(ctx), "-n", str(name)], env)
+    finally:
+        subprocess.run(["tpm2_flushcontext", "-t"], env=env, capture_output=True)
+    return name.read_bytes()
+
+
 def provision(a, scratch: pathlib.Path) -> bytes:
-    env = {**os.environ, "TPM2TOOLS_TCTI": a.tcti}
+    env = tpm_env(a.tcti)
     for path, what in ((a.ek_root, "--ek-root"), (a.ek_intermediates, "--ek-intermediates")):
         if not pathlib.Path(path).is_file():
             raise Refused(f"provision: {what} {path} is missing")
+
+    # 0. TPM2_Clear (M8 plan D5, S18): a fresh storage seed, so the SRK and
+    # every envelope sealed to it before are gone. The old Name is read
+    # first where the owner hierarchy still gives one.
+    try:
+        before = srk_name(env, scratch)
+    except Refused:
+        before = None
+    run("TPM2_Clear", ["tpm2_clear", "-c", "p"], env)
 
     # 1. The EK certificate and the EK it certifies.
     cert = scratch / "ek.der"
@@ -78,9 +153,7 @@ def provision(a, scratch: pathlib.Path) -> bytes:
 
     # 2. The SRK, read once; its Name from exactly these bytes.
     srk_ctx, srk_pub = scratch / "srk.ctx", scratch / "srk.pub"
-    run("SRK", ["tpm2_createprimary", "-Q", "-C", "o", "-G", "ecc256:aes128cfb", "-g", "sha256", "-a",
-                "fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda|restricted|decrypt",
-                "-c", str(srk_ctx)], env)
+    run("SRK", ["tpm2_createprimary", "-Q", "-C", "o", *SRK_TEMPLATE, "-c", str(srk_ctx)], env)
     run("SRK", ["tpm2_readpublic", "-Q", "-c", str(srk_ctx), "-o", str(srk_pub)], env)
     run("SRK", ["tpm2_flushcontext", "-t"], env)
     srk = srk_pub.read_bytes()
@@ -89,6 +162,8 @@ def provision(a, scratch: pathlib.Path) -> bytes:
     name = out.strip().removeprefix("name=")
     if out.strip() == name or len(name) != 68:
         raise Refused(f"provision: mksecrets check-srk printed no Name: {out!r}")
+    if before is not None and before.hex() == name:
+        raise Refused("provision: the SRK Name did not change across TPM2_Clear")
 
     # 3. The credential: made on the host to the certificate's key, opened
     # by the TPM only if the SRK with that Name lives beside that EK.
@@ -115,7 +190,355 @@ def provision(a, scratch: pathlib.Path) -> bytes:
     return srk
 
 
+# ---------------------------------------------------------------- M8 plan C3
+
+
+def write_new(path: pathlib.Path, data: bytes, mode: int = 0o644):
+    """A new file, staged beside it and renamed into place; never replaces."""
+    if path.exists() or path.is_symlink():
+        raise Refused(f"provision: {path} already exists")
+    staged = path.with_name(f".{path.name}.provision")
+    fd = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    os.rename(staged, path)
+
+
+class Head:
+    """The verified ledger's head: what v0 and the record's body must be."""
+
+    def __init__(self, version: int, bundle: bytes, body_sha256: str, fleet_id: str):
+        self.version, self.bundle, self.body_sha256, self.fleet_id = version, bundle, body_sha256, fleet_id
+
+
+def ledger_head(a, scratch: pathlib.Path) -> Head:
+    """Copies the ledger into scratch and has `tools/policy verify --ledger`
+    accept the copy (every signature, prev link and approval under the
+    compiled-in genesis pin); then reads the head from that same copy. The
+    head's approvals (each verified, each bound to sha256(body)) give its
+    body_sha256 and fleet_id; `verify --slot` re-checks the head's
+    signatures and version."""
+    copy = scratch / "ledger"
+    try:
+        shutil.copytree(a.ledger, copy, symlinks=False)
+    except OSError as e:
+        raise Refused(f"provision: cannot copy the ledger {a.ledger}: {e}")
+    policy = str(a.policy_bin or POLICY_BIN)
+    out = run("ledger", [policy, "verify", "--ledger", str(copy), "--keys-pub", a.keys_pub]).decode()
+    m = re.fullmatch(r"policy: ledger verifies up to version (\d+)\n", out)
+    if not m:
+        raise Refused(f"provision: the ledger holds no signed version: {out.strip()}")
+    version = int(m.group(1))
+    entry = copy / "entries" / f"{version:010}.bin"
+    out = run("ledger head", [policy, "verify", "--keys-pub", a.keys_pub, "--slot", str(entry)]).decode()
+    if f" version={version} " not in out:
+        raise Refused(f"provision: the ledger head is not version {version}: {out.strip()}")
+    approvals = sorted((copy / "approvals" / f"{version:010}").glob("*"))
+    fields = set()
+    for path in approvals:
+        lines = dict(line.split("=", 1) for line in path.read_text().splitlines() if "=" in line)
+        fields.add((lines.get("version"), lines.get("body_sha256"), lines.get("fleet_id")))
+    if len(fields) != 1 or next(iter(fields))[0] != str(version) or None in next(iter(fields)):
+        raise Refused(f"provision: the ledger head's approvals disagree on its body: {sorted(fields)}")
+    _, body_sha256, fleet_id = next(iter(fields))
+    bundle = entry.read_bytes()
+    if len(bundle) != measure.BUNDLE_MAX:
+        raise Refused(f"provision: the ledger head is {len(bundle)} bytes, not a {measure.BUNDLE_MAX:#x}-byte slot")
+    return Head(version, bundle, body_sha256, fleet_id)
+
+
+def render_record(fields: dict) -> bytes:
+    return "".join(f"{k}={fields[k]}\n" for k in RECORD_FIELDS).encode()
+
+
+def parse_record(data: bytes) -> dict:
+    """Canonical only: exactly RECORD_FIELDS, sorted, one each, printable
+    non-empty values, LF ends; anything else is refused."""
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError:
+        raise Refused("provision: the record is not ASCII")
+    lines = text.split("\n")
+    if lines[-1] != "" or any(not line for line in lines[:-1]):
+        raise Refused("provision: the record is not LF-terminated key=value lines")
+    pairs = [line.split("=", 1) for line in lines[:-1]]
+    if any(len(p) != 2 or not p[1] or not p[1].isprintable() for p in pairs) \
+            or [k for k, _ in pairs] != list(RECORD_FIELDS):
+        raise Refused(f"provision: the record's keys are not exactly {', '.join(RECORD_FIELDS)}, sorted")
+    return dict(pairs)
+
+
+def spki_of(path: str, private: bool) -> bytes:
+    """A key file's public key as DER SubjectPublicKeyInfo."""
+    if not pathlib.Path(path).is_file():
+        raise Refused(f"provision: key {path} is missing")
+    args = ["openssl", "pkey", "-in", path, "-pubout", "-outform", "DER"] if private else \
+        ["openssl", "pkey", "-pubin", "-in", path, "-outform", "DER"]
+    return run("key", args)
+
+
+def pinned_record_keys(fleet_id: str) -> set:
+    """The fleet's record keys (SPKI), from RECORD_KEYS."""
+    keys = set()
+    for n, line in enumerate(RECORD_KEYS.read_text().splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        if len(parts) != 2 or not re.fullmatch(r"[0-9a-f]{32}", parts[0]) or not re.fullmatch(r"[0-9a-f]{64}", parts[1]):
+            raise Refused(f"provision: {RECORD_KEYS.name} line {n} is not `<fleet_id> <ed25519 public key>`")
+        if parts[0] == fleet_id:
+            keys.add(ED25519_SPKI + bytes.fromhex(parts[1]))
+    if len(keys) < 2:
+        raise Refused(f"provision: fewer than two record keys are pinned for fleet {fleet_id}")
+    return keys
+
+
+def verify_record(record: bytes, sigs: list, pinned: set, delete_keys: list, scratch: pathlib.Path) -> dict:
+    """Two signatures over RECORD_DOMAIN || record, by two distinct pinned
+    record keys; a delete key never counts."""
+    fields = parse_record(record)
+    if len(sigs) != 2:
+        raise Refused(f"provision: the record needs two signatures, has {len(sigs)}")
+    if pinned & set(delete_keys):
+        raise Refused("provision: a delete key is pinned as a record key")
+    msg = scratch / "record.msg"
+    msg.write_bytes(RECORD_DOMAIN + record)
+    signers = []
+    for n, path in enumerate(sigs):
+        m = re.fullmatch(r"sig=([0-9a-f]+):([0-9a-f]+)\n", pathlib.Path(path).read_text())
+        if not m:
+            raise Refused(f"provision: {path} is not one `sig=<spki>:<signature>` line")
+        spki, sig = bytes.fromhex(m.group(1)), bytes.fromhex(m.group(2))
+        if spki in delete_keys:
+            raise Refused("provision: the record is signed by a delete key")
+        if spki not in pinned:
+            raise Refused(f"provision: the record is signed by a key that is not a pinned record key ({path})")
+        if spki in signers:
+            raise Refused("provision: the record is signed twice by the same key")
+        signers.append(spki)
+        (scratch / f"signer{n}.der").write_bytes(spki)
+        (scratch / f"sig{n}").write_bytes(sig)
+        r = subprocess.run(["openssl", "pkeyutl", "-verify", "-pubin", "-keyform", "DER", "-inkey",
+                            str(scratch / f"signer{n}.der"), "-rawin", "-in", str(msg), "-sigfile",
+                            str(scratch / f"sig{n}")], capture_output=True)
+        if r.returncode != 0:
+            raise Refused(f"provision: the record signature in {path} does not verify")
+    return fields
+
+
+def nv_indices(env: dict) -> set:
+    out = run("NV", ["tpm2_getcap", "handles-nv-index"], env).decode()
+    return {int(h, 16) for h in re.findall(r"^- (0x[0-9a-fA-F]+)$", out, re.M)}
+
+
+def nv_name_now(env: dict, index: int) -> bytes:
+    out = run("NV", ["tpm2_nvreadpublic", f"{index:#x}"], env).decode()
+    m = re.search(r"^\s+name: ([0-9a-f]+)$", out, re.M)
+    if not m:
+        raise Refused(f"provision: no Name for NV index {index:#x}: {out.strip()}")
+    return bytes.fromhex(m.group(1))
+
+
+def nv_read_u64(env: dict, index: int, scratch: pathlib.Path) -> int:
+    path = scratch / f"nv-{index:x}.bin"
+    path.unlink(missing_ok=True)
+    run("NV", ["tpm2_nvread", f"{index:#x}", "-C", f"{index:#x}", "-s", "8", "-o", str(path)], env)
+    data = path.read_bytes()
+    if len(data) != 8:
+        raise Refused(f"provision: NV index {index:#x} read {len(data)} bytes, not 8")
+    return struct.unpack(">Q", data)[0]
+
+
+def sign_delete(tbs: bytes, key: str, index_name: bytes, out: pathlib.Path):
+    """The operator's delete signature (M8 plan C3, S13, S23): signs only a
+    PolicySigned digest bound to the session's own non-empty nonceTPM, with
+    expiration 0 (no ticket), cpHashA of NV_UndefineSpaceSpecial of exactly
+    this index, and the fixed policyRef. tbs = nonceTPM || expiration ||
+    cpHashA || policyRef (TPM 2.0 Part 3, 23.3)."""
+    ref = measure.NV_DELETE_REF
+    nonce_len = len(tbs) - 4 - 32 - len(ref)
+    if nonce_len <= 0:
+        raise Refused("provision: delete signing refused: the session nonce is empty")
+    expiration = tbs[nonce_len:nonce_len + 4]
+    cphash = tbs[nonce_len + 4:nonce_len + 36]
+    if expiration != bytes(4):
+        raise Refused("provision: delete signing refused: expiration is not 0")
+    if cphash != measure.undefine_special_cphash(index_name):
+        raise Refused("provision: delete signing refused: cpHash is not NV_UndefineSpaceSpecial of this index")
+    if tbs[nonce_len + 36:] != ref:
+        raise Refused("provision: delete signing refused: another policyRef")
+    tbs_path = out.with_suffix(".tbs")
+    tbs_path.write_bytes(tbs)
+    run("delete signature", ["openssl", "dgst", "-sha256", "-sign", key, "-out", str(out), str(tbs_path)])
+
+
+def undefine_special(env: dict, index: int, op_ctx: list, delete_keys: list, ref: pathlib.Path,
+                     scratch: pathlib.Path):
+    """TPM2_NV_UndefineSpaceSpecial under the delete policy: one policy
+    session, PolicyCommandCode, then each operator's PolicySigned over this
+    session's nonce (the transient contexts flushed around each, P1)."""
+    name = nv_name_now(env, index)
+    session, cphash = scratch / f"delete-{index:x}.session", scratch / f"delete-{index:x}.cphash"
+    subprocess.run(["tpm2_flushcontext", "-t"], env=env, capture_output=True)
+    run("NV delete", ["tpm2_startauthsession", "--policy-session", "-S", str(session)], env)
+    try:
+        run("NV delete", ["tpm2_policycommandcode", "-S", str(session), "TPM2_CC_NV_UndefineSpaceSpecial"], env)
+        run("NV delete", ["tpm2_nvundefine", "-C", "p", f"{index:#x}", "--with-policydelete", "-S", str(session),
+                          "--cphash", str(cphash)], env)
+        for n, (ctx, key) in enumerate(zip(op_ctx, delete_keys, strict=True)):
+            tbs, sig = scratch / f"delete-{index:x}-{n}.raw", scratch / f"delete-{index:x}-{n}.sig"
+            subprocess.run(["tpm2_flushcontext", "-t"], env=env, capture_output=True)
+            run("NV delete", ["tpm2_policysigned", "-S", str(session), "-g", "sha256", "-c", str(ctx), "-x", "-t", "0",
+                              "-q", str(ref), "--cphash-input", str(cphash), "--raw-data", str(tbs)], env)
+            sign_delete(tbs.read_bytes(), key, name, sig)
+            subprocess.run(["tpm2_flushcontext", "-t"], env=env, capture_output=True)
+            run("NV delete", ["tpm2_policysigned", "-S", str(session), "-g", "sha256", "-c", str(ctx), "-x", "-t", "0",
+                              "-q", str(ref), "--cphash-input", str(cphash), "-s", str(sig), "-f", "ecdsa"], env)
+        run("NV delete", ["tpm2_nvundefine", "-C", "p", f"{index:#x}", "--with-policydelete", "-S", str(session)], env)
+    finally:
+        subprocess.run(["tpm2_flushcontext", str(session)], env=env, capture_output=True)
+        subprocess.run(["tpm2_flushcontext", "-t"], env=env, capture_output=True)
+
+
+def cmd_record(a, scratch: pathlib.Path) -> str:
+    head = ledger_head(a, scratch)
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", a.node):
+        raise Refused(f"provision: node name {a.node!r} is not [a-z0-9_-]+")
+    record = render_record({"body_sha256": head.body_sha256, "fleet_id": head.fleet_id, "node": a.node,
+                            "srk_name": srk_name(tpm_env(a.tcti), scratch).hex(), "v0": str(head.version)})
+    write_new(pathlib.Path(a.out), record)
+    return record.decode()
+
+
+def cmd_record_sign(a, scratch: pathlib.Path) -> str:
+    record = pathlib.Path(a.record).read_bytes()
+    parse_record(record)
+    spki = spki_of(a.key, True)
+    if not spki.startswith(ED25519_SPKI):
+        raise Refused(f"provision: {a.key} is not an Ed25519 key")
+    msg, sig = scratch / "record.msg", scratch / "record.sig"
+    msg.write_bytes(RECORD_DOMAIN + record)
+    run("record signature", ["openssl", "pkeyutl", "-sign", "-inkey", a.key, "-rawin", "-in", str(msg),
+                             "-out", str(sig)])
+    line = f"sig={spki.hex()}:{sig.read_bytes().hex()}\n"
+    write_new(pathlib.Path(a.out), line.encode())
+    return f"provision: signed the record as {spki[len(ED25519_SPKI):].hex()}"
+
+
+def cmd_nv(a, scratch: pathlib.Path) -> str:
+    env = tpm_env(a.tcti)
+    slot_a = pathlib.Path(a.slot_a)
+    if slot_a.exists() or slot_a.is_symlink():
+        raise Refused(f"provision: {slot_a} already exists")
+    head = ledger_head(a, scratch)
+    delete_pub = [spki_of(p, False) for p in a.delete_pub]
+    if delete_pub[0] == delete_pub[1]:
+        raise Refused("provision: the two delete keys are one key")
+    pinned = pinned_record_keys(head.fleet_id)
+    fields = verify_record(pathlib.Path(a.record).read_bytes(), a.record_sigs, pinned, delete_pub, scratch)
+    srk = srk_name(env, scratch).hex()
+    for key, want, what in (("fleet_id", head.fleet_id, "the ledger's fleet"), ("node", a.node, "--node"),
+                            ("srk_name", srk, "this TPM's SRK"), ("v0", str(head.version), "the ledger head"),
+                            ("body_sha256", head.body_sha256, "the ledger head's body")):
+        if fields[key] != want:
+            raise Refused(f"provision: the record's {key} {fields[key]} is not {what} ({want})")
+
+    # The delete policy, from the operators' key Names as the TPM computes them.
+    ref = scratch / "delete.ref"
+    ref.write_bytes(measure.NV_DELETE_REF)
+    op_ctx, names = [], []
+    for n, pub in enumerate(a.delete_pub):
+        ctx, name = scratch / f"op{n}.ctx", scratch / f"op{n}.name"
+        run("delete key", ["tpm2_loadexternal", "-Q", "-C", "n", "-G", "ecc", "-u", pub, "-c", str(ctx),
+                           "-n", str(name)], env)
+        subprocess.run(["tpm2_flushcontext", "-t"], env=env, capture_output=True)
+        op_ctx.append(ctx)
+        names.append(name.read_bytes())
+    if names[0] == names[1]:
+        raise Refused("provision: the two delete keys have one Name")
+    policy = measure.delete_policy(names)
+    (scratch / "delete.policy").write_bytes(policy)
+
+    existing = sorted(nv_indices(env) & {measure.NV_POLICY_CTR, measure.NV_POLICY_BASE})
+    if existing:
+        if not a.delete_keys:
+            raise Refused(f"provision: NV index {', '.join(f'{i:#x}' for i in existing)} already exists; deleting "
+                          "it needs both operators' delete authorizations (--delete-keys)")
+        for key, pub in zip(a.delete_keys, delete_pub, strict=True):
+            if spki_of(key, True) != pub:
+                raise Refused(f"provision: --delete-keys {key} is not the matching --delete-pub key")
+        for index in existing:
+            undefine_special(env, index, op_ctx, a.delete_keys, ref, scratch)
+
+    ctr, base_idx = f"{measure.NV_POLICY_CTR:#x}", f"{measure.NV_POLICY_BASE:#x}"
+    for index, attrs in ((ctr, measure.NV_CTR_ATTRS), (base_idx, measure.NV_BASE_ATTRS)):
+        run("NV define", ["tpm2_nvdefine", index, "-C", "p", "-s", str(measure.NV_SIZE), "-L",
+                          str(scratch / "delete.policy"), "-a", f"{attrs:#x}"], env)
+    run("NV increment", ["tpm2_nvincrement", ctr, "-C", ctr], env)
+    counter = nv_read_u64(env, measure.NV_POLICY_CTR, scratch)
+    base = (counter - head.version) % 2**64
+    (scratch / "base.bin").write_bytes(struct.pack(">Q", base))
+    run("NV base", ["tpm2_nvwrite", base_idx, "-C", base_idx, "-i", str(scratch / "base.bin")], env)
+    run("NV base", ["tpm2_nvwritelock", base_idx, "-C", base_idx], env)
+    logical = (nv_read_u64(env, measure.NV_POLICY_CTR, scratch) - nv_read_u64(env, measure.NV_POLICY_BASE, scratch)) \
+        % 2**64
+    if logical != head.version:
+        raise Refused(f"provision: the logical version reads {logical}, not v0 {head.version}")
+    want = measure.expected_nv_names(policy)
+    got = (nv_name_now(env, measure.NV_POLICY_CTR), nv_name_now(env, measure.NV_POLICY_BASE))
+    if got != want:
+        raise Refused(f"provision: the NV Names {[n.hex() for n in got]} differ from the twin's "
+                      f"{[n.hex() for n in want]}")
+    write_new(slot_a, head.bundle)
+    # The last TPM act (M8 plan C10): every later reset counts from here.
+    clock = run("ReadClock", ["tpm2_readclock"], env).decode()
+    m = re.search(r"^\s*reset_count:\s*(\d+)$", clock, re.M)
+    if not m:
+        raise Refused(f"provision: tpm2_readclock printed no reset_count: {clock.strip()}")
+    return (f"nv_ctr_name={got[0].hex()}\nnv_base_name={got[1].hex()}\nreset_at_provision={m.group(1)}\n"
+            f"provision: NV state at version {head.version}; wrote {slot_a}")
+
+
+SUBCOMMANDS = {"record": cmd_record, "record-sign": cmd_record_sign, "nv": cmd_nv}
+
+
+def subcommand(name: str, argv: list) -> int:
+    ap = argparse.ArgumentParser(prog=f"provision {name}")
+    if name in ("record", "nv"):
+        for opt in ("tcti", "ledger", "keys-pub", "node"):
+            ap.add_argument(f"--{opt}", required=True)
+        ap.add_argument("--policy-bin")
+    if name == "record":
+        ap.add_argument("--out", required=True)
+    if name == "record-sign":
+        for opt in ("record", "key", "out"):
+            ap.add_argument(f"--{opt}", required=True)
+    if name == "nv":
+        ap.add_argument("--record", required=True)
+        ap.add_argument("--record-sigs", nargs="+", required=True)
+        ap.add_argument("--delete-pub", nargs=2, required=True)
+        ap.add_argument("--delete-keys", nargs=2)
+        ap.add_argument("--slot-a", required=True)
+    a = ap.parse_args(argv)
+    scratch = pathlib.Path(tempfile.mkdtemp(prefix="kozane-provision-"))
+    try:
+        print(SUBCOMMANDS[name](a, scratch))
+        status = 0
+    except Refused as e:
+        print(e)
+        status = 1
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if scratch.exists():
+        print(f"provision: scratch directory {scratch} survived")
+        return 1
+    return status
+
+
 def main() -> int:
+    if sys.argv[1:2] and sys.argv[1] in SUBCOMMANDS:
+        return subcommand(sys.argv[1], sys.argv[2:])
     ap = argparse.ArgumentParser()
     for opt in ("tcti", "ek-root", "ek-intermediates", "out"):
         ap.add_argument(f"--{opt}", required=True)

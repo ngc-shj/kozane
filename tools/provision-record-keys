@@ -1,0 +1,6 @@
+# Provisioning-record keys, pinned per fleet (M8 plan C3): one line per key,
+# `<fleet_id, 32 hex digits> <Ed25519 public key, 64 hex digits>`. Every
+# provisioning record needs signatures by two distinct keys listed for the
+# ledger's fleet. A fleet's genesis ceremony (C12) adds its lines; with none,
+# tools/provision refuses every record. Record keys are used for nothing
+# else, and none may be an NV delete key.

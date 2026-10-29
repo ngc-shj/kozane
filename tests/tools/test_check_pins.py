@@ -848,6 +848,15 @@ CASES = [
      lambda t: append(t / "tools/policy/src/main.rs", "// there is no --force and no --roster\n")),
     ("allow the signer's --new-roster", set(),
      lambda t: append(t / "tools/policy/src/main.rs", 'const F: &str = "--new-roster";\n')),
+    # P29 (M8 plan C3): NV writes only in the gate's refused set.
+    ("P29 a PD naming NV_Write's command code", {"P29"},
+     lambda t: append(t / "crates/pds/tpm/src/main.rs", "const X: u32 = tpm2_wire::CC_NV_WRITE;\n")),
+    ("P29 a tpm2 builder naming Clear's command code", {"P29"},
+     lambda t: append(t / "crates/tpm2/src/client.rs", "const X: u32 = tpm2_wire::CC_CLEAR;\n")),
+    ("allow NV_Read's command code in a PD", set(),
+     lambda t: append(t / "crates/pds/tpm/src/main.rs", "const X: u32 = tpm2_wire::CC_NV_READ;\n")),
+    ("allow the refused set in the gate", set(),
+     lambda t: append(t / "crates/tpm2-wire/src/gate.rs", "const X: u32 = CC_NV_WRITE_LOCK;\n")),
 ]
 
 

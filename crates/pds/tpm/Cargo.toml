@@ -6,6 +6,8 @@ license.workspace = true
 
 [dependencies]
 boot-stage = { path = "../../boot-stage" }
+# The policy indices' expected Names (M8 plan C3).
+config = { path = "../../config" }
 cpu = { path = "../../cpu" }
 layout = { path = "../../layout" }
 sel4-microkit = { workspace = true }

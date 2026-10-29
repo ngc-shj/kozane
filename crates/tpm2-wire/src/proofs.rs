@@ -1,9 +1,12 @@
 //! Kani harnesses for the response parsers and the `tpm` gate (M5 plan
-//! C9, C10). Run with `cargo kani -p tpm2-wire`. The gate's symbolic state
-//! is kept small: concrete command shapes with symbolic handles, codes and
-//! clients.
+//! C9, C10; M8 plan C3, I3.1 and I3.2). Run with `cargo kani -p
+//! tpm2-wire`. The gate's symbolic state is kept small: concrete command
+//! shapes with symbolic handles, codes and clients, and a policy device
+//! with symbolic NV values and faults.
 
-use super::gate::{ALLOWED, CAP_ATTEMPTS, CapStatus, CapTransport, Gate, Refusal};
+use super::gate::{
+    ALLOWED, CAP_ATTEMPTS, CapStatus, CapTransport, Gate, POLICY_COMMANDS, PolicyRefusal, PolicyTransport, REFUSED, Refusal,
+};
 use super::*;
 
 const MAX_LEN: usize = 64;
@@ -36,9 +39,16 @@ fn response_parsers_are_total_and_in_bounds() {
     if let Ok(p) = parse_import(bytes) {
         assert!(inside(bytes, p) && p.len() <= MAX_PRIVATE);
     }
+    if let Ok(r) = parse_nv_read_public(bytes) {
+        assert!(inside(bytes, r.public) && inside(bytes, r.name));
+        assert!(r.public.len() <= MAX_NV_PUBLIC && r.name.len() <= NAME_LEN);
+    }
     let _ = parse_empty(bytes);
     let _ = parse_pcr_extend(bytes);
     let _ = parse_pcr_read(bytes);
+    let _ = parse_slot_pcr_read(bytes);
+    let _ = parse_nv_read(bytes);
+    let _ = parse_nv_increment(bytes);
 }
 
 const UNSEAL_MAX: usize = 120;
@@ -411,4 +421,240 @@ fn cap_status_is_pure_and_never_confirmed_before_a_confirmed_extend() {
     kani::cover!(status == Ok(CapStatus::Confirmed), "a confirmed cap");
     kani::cover!(status == Ok(CapStatus::Failed), "a failed cap");
     kani::cover!(status == Ok(CapStatus::Pending), "a pending cap");
+}
+
+// The policy client (M8 plan C3).
+
+const N_CTR: [u8; NAME_LEN] = [1; NAME_LEN];
+const N_BASE: [u8; NAME_LEN] = [2; NAME_LEN];
+
+/// The two indices and PCR 9 over symbolic values: every command is
+/// answered as a TPM would, or (a symbolic choice per call) not at all, the
+/// increment counted as done either way. Asserts I3.2's side: every
+/// command it is sent is of `POLICY_COMMANDS`, on one of the two indices,
+/// NV_Increment on the counter only, the PCR read PCR 9's.
+struct NvDevice {
+    counter: u64,
+    base: u64,
+    names_ok: bool,
+    calls: usize,
+    increments: usize,
+    rsp: [u8; 128],
+}
+
+impl NvDevice {
+    fn any() -> Self {
+        NvDevice { counter: kani::any(), base: kani::any(), names_ok: kani::any(), calls: 0, increments: 0, rsp: [0; 128] }
+    }
+
+    fn answer(&mut self, cmd: &[u8]) -> Option<usize> {
+        let mut r = Reader::new(cmd);
+        r.take(6).ok()?;
+        let cc = r.u32().ok()?;
+        let handle = r.u32().ok()?;
+        assert!(POLICY_COMMANDS.contains(&cc));
+        let nv = handle == NV_POLICY_CTR || handle == NV_POLICY_BASE;
+        let (counter, base, names_ok) = (self.counter, self.base, self.names_ok);
+        let mut w = Writer::new(&mut self.rsp);
+        match cc {
+            CC_NV_READ_PUBLIC => {
+                assert!(nv);
+                w.u16(ST_NO_SESSIONS)?;
+                w.u32(0)?;
+                w.u32(0)?;
+                w.tpm2b(&[0; NV_PUBLIC_LEN])?;
+                let name = if !names_ok { [3; NAME_LEN] } else if handle == NV_POLICY_CTR { N_CTR } else { N_BASE };
+                w.tpm2b(&name)?;
+            }
+            CC_NV_READ | CC_NV_INCREMENT => {
+                assert!(nv);
+                w.u16(ST_SESSIONS)?;
+                w.u32(0)?;
+                w.u32(0)?;
+                if cc == CC_NV_READ {
+                    w.u32(10)?;
+                    w.u16(NV_DATA_SIZE)?;
+                    w.bytes(&(if handle == NV_POLICY_CTR { counter } else { base }).to_be_bytes())?;
+                } else {
+                    assert!(handle == NV_POLICY_CTR);
+                    self.increments = self.increments.saturating_add(1);
+                    self.counter = counter.wrapping_add(1);
+                    w.u32(0)?;
+                }
+                w.tpm2b(&[])?;
+                w.u8(SESSION_CONTINUE)?;
+                w.tpm2b(&[])?;
+            }
+            _ => {
+                let mut pcr9 = [0u8; PCR_READ_CMD_LEN];
+                let n = slot_pcr_read(&mut pcr9)?;
+                assert!(cmd == pcr9.get(..n)?);
+                w.u16(ST_NO_SESSIONS)?;
+                w.u32(0)?;
+                w.u32(0)?;
+                w.u32(0)?;
+                w.bytes(&SLOT_PCR_SELECTION)?;
+                w.u32(1)?;
+                w.tpm2b(&[9; DIGEST_LEN])?;
+            }
+        }
+        w.finish()
+    }
+}
+
+impl PolicyTransport for NvDevice {
+    fn transact(&mut self, cmd: &[u8]) -> Option<&[u8]> {
+        self.calls = self.calls.saturating_add(1);
+        let n = self.answer(cmd);
+        let lost: bool = kani::any();
+        if lost {
+            return None;
+        }
+        self.rsp.get(..n?)
+    }
+}
+
+/// One symbolic policy operation; true if it succeeded.
+fn any_policy_op(g: &mut Gate, device: &mut NvDevice) -> bool {
+    let op: u8 = kani::any();
+    match op % 3 {
+        0 => g.policy_state(device).is_ok(),
+        1 => g.policy_advance(kani::any(), device).is_ok(),
+        _ => g.policy_finish().is_ok(),
+    }
+}
+
+/// I3.1: once capped, with or without a `policy` PD, whatever the policy
+/// client did before, every policy operation is refused and the device is
+/// not asked.
+#[kani::proof]
+#[kani::unwind(36)]
+fn no_policy_operation_succeeds_after_the_cap() {
+    let present: bool = kani::any();
+    let mut g = Gate::with_policy(present, N_CTR, N_BASE);
+    let mut device = NvDevice::any();
+    let stated: bool = kani::any();
+    if stated {
+        let _ = g.policy_state(&mut device);
+    }
+    for client in 0..gate::CLIENTS {
+        let ok: bool = kani::any();
+        assert!(g.finish(client, ok).is_ok());
+    }
+    assert!(g.policy_finish().is_ok() == present);
+    let mut cap = [0u8; PCR_EXTEND_CMD_LEN];
+    assert!(g.cap(&mut cap).is_some());
+    kani::cover!(present && stated, "a stated policy client, then the cap");
+    let calls = device.calls;
+    assert!(!any_policy_op(&mut g, &mut device));
+    assert!(device.calls == calls);
+}
+
+/// I3.1, both values of `policy_present` (D-6): the cap is due exactly when
+/// every raw client finished and, with a `policy` PD, the policy client
+/// did; without one, exactly when every raw client finished (the M7 cap).
+#[kani::proof]
+#[kani::unwind(12)]
+fn the_cap_waits_for_the_policy_client_only_when_present() {
+    let present: bool = kani::any();
+    let mut g = Gate::with_policy(present, N_CTR, N_BASE);
+    let finished: [bool; gate::CLIENTS] = kani::any();
+    for (client, done) in finished.iter().enumerate() {
+        if *done {
+            let ok: bool = kani::any();
+            assert!(g.finish(client, ok).is_ok());
+        }
+    }
+    let policy_done: bool = kani::any();
+    if policy_done {
+        assert!(g.policy_finish().is_ok() == present);
+    }
+    let all = finished.iter().all(|f| *f);
+    let mut cap = [0u8; PCR_EXTEND_CMD_LEN];
+    let capped = g.cap(&mut cap).is_some();
+    assert!(capped == (all && (!present || policy_done)));
+    if !present {
+        assert!(capped == all);
+    }
+    kani::cover!(present && all && !policy_done, "the cap withheld for the policy client alone");
+    kani::cover!(present && capped, "the cap after the policy client");
+    kani::cover!(!present && capped, "the cap without a policy PD");
+}
+
+/// I3.1 and I3.2: over any three policy operations in any order, on any NV
+/// values, Names and lost responses, the device sees only the policy
+/// commands on the two indices (asserted by the device) and at most one
+/// increment; an Advance succeeds only after a successful State, on the
+/// one increment.
+#[kani::proof]
+#[kani::unwind(36)]
+fn the_policy_client_sends_only_its_reads_and_at_most_one_increment() {
+    let mut g = Gate::with_policy(true, N_CTR, N_BASE);
+    let mut device = NvDevice::any();
+    let mut stated = false;
+    let mut advanced = false;
+    for _ in 0..3 {
+        let op: u8 = kani::any();
+        match op % 3 {
+            0 => stated |= g.policy_state(&mut device).is_ok(),
+            1 => {
+                if g.policy_advance(kani::any(), &mut device).is_ok() {
+                    assert!(stated && !advanced);
+                    advanced = true;
+                }
+            }
+            _ => {
+                let _ = g.policy_finish();
+            }
+        }
+        assert!(device.increments <= 1);
+    }
+    if advanced {
+        assert!(device.increments == 1);
+    }
+    kani::cover!(stated, "a successful State");
+    kani::cover!(advanced, "a successful Advance");
+}
+
+/// Deny (I3.2): each command of the refused set, whatever else the command
+/// holds, is refused for every raw client, with or without a `policy` PD,
+/// and nothing changes.
+#[kani::proof]
+#[kani::unwind(36)]
+fn the_refused_set_is_refused_for_every_raw_client() {
+    let which: usize = kani::any();
+    kani::assume(which < REFUSED.len());
+    let cc = REFUSED.get(which).copied().unwrap_or(0);
+    let mut buf: [u8; CMD_MAX] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len >= HEADER_LEN && len <= CMD_MAX);
+    if let Some(field) = buf.get_mut(6..10) {
+        field.copy_from_slice(&cc.to_be_bytes());
+    }
+    let client: usize = kani::any();
+    kani::assume(client < gate::CLIENTS);
+    let mut g = Gate::with_policy(kani::any(), N_CTR, N_BASE);
+    let before = g.clone();
+    assert!(g.command(client, buf.get(..len).unwrap_or(&[])) == Err(Refusal::NotAllowed));
+    assert!(g == before);
+    for (i, refused) in REFUSED.iter().enumerate() {
+        kani::cover!(which == i && *refused == cc);
+    }
+}
+
+/// The policy operations refuse with a reason, never panic: Absent without
+/// a `policy` PD whatever is asked.
+#[kani::proof]
+#[kani::unwind(12)]
+fn without_a_policy_pd_every_policy_operation_is_absent() {
+    let mut g = Gate::with_policy(false, N_CTR, N_BASE);
+    let mut device = NvDevice::any();
+    let op: u8 = kani::any();
+    let r = match op % 3 {
+        0 => g.policy_state(&mut device).map(|_| ()),
+        1 => g.policy_advance(kani::any(), &mut device).map(|_| ()),
+        _ => g.policy_finish(),
+    };
+    assert!(r == Err(PolicyRefusal::Absent));
+    assert!(device.calls == 0);
 }

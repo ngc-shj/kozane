@@ -548,3 +548,56 @@ fn compiled_tls_cert_holds_the_compiled_tls_public() {
     assert!(crate::TLS_PORTS.1 >= 8);
     assert!(crate::NEIGHBORS.iter().any(|n| n.ip == crate::BACKEND.0));
 }
+
+// M8 plan C3: the policy indices' expected Names.
+
+const CTR_NAME_HEX: &str = "000b1111111111111111111111111111111111111111111111111111111111111111";
+const BASE_NAME_HEX: &str = "000b2222222222222222222222222222222222222222222222222222222222222222";
+
+fn with_policy(ctr: &str, base_name: &str) -> String {
+    std::format!("{}\n[policy]\nnv_ctr_name = \"{ctr}\"\nnv_base_name = \"{base_name}\"\n", base())
+}
+
+#[test]
+fn policy_names_are_decoded_and_rendered() {
+    let c = check(&with_policy(CTR_NAME_HEX, BASE_NAME_HEX), 4).unwrap();
+    let mut ctr = [0x11; validate::NV_NAME_LEN];
+    ctr[..2].copy_from_slice(&[0x00, 0x0B]);
+    let mut base_name = [0x22; validate::NV_NAME_LEN];
+    base_name[..2].copy_from_slice(&[0x00, 0x0B]);
+    assert_eq!((c.nv_ctr_name, c.nv_base_name), (ctr, base_name));
+    let r = validate::render(&c, "gw.pk", &[]);
+    assert!(r.contains(&std::format!("pub const NV_CTR_NAME: [u8; 34] = {ctr:?};\n")));
+    assert!(r.contains(&std::format!("pub const NV_BASE_NAME: [u8; 34] = {base_name:?};\n")));
+}
+
+/// Absent means fail closed: an all-zero Name, which no index has.
+#[test]
+fn without_a_policy_table_the_names_render_all_zero() {
+    let c = check(&base(), 4).unwrap();
+    assert_eq!((c.nv_ctr_name, c.nv_base_name), ([0; 34], [0; 34]));
+    let zero = std::format!("pub const NV_CTR_NAME: [u8; 34] = {:?};\n", [0u8; 34]);
+    assert!(validate::render(&c, "gw.pk", &[]).contains(&zero));
+    // The compiled default configuration has no [policy] yet.
+    assert_eq!((crate::NV_CTR_NAME, crate::NV_BASE_NAME), ([0; 34], [0; 34]));
+}
+
+#[test]
+fn malformed_policy_names_are_rejected() {
+    let bad = [
+        &CTR_NAME_HEX[..66],
+        &std::format!("{CTR_NAME_HEX}11"),
+        &CTR_NAME_HEX.replacen("11", "1g", 1),
+        &CTR_NAME_HEX.replacen("000b", "000c", 1),
+        &std::format!("000b{}", "00".repeat(32)),
+    ];
+    for name in bad {
+        assert!(err(&with_policy(name, BASE_NAME_HEX)).contains("expected 68 hex digits"), "{name}");
+        assert!(err(&with_policy(CTR_NAME_HEX, name)).contains("expected 68 hex digits"), "{name}");
+    }
+    assert!(err(&with_policy(CTR_NAME_HEX, CTR_NAME_HEX)).contains("are the same Name"));
+    let renamed = with_policy(CTR_NAME_HEX, BASE_NAME_HEX).replace("nv_base_name", "nv_other_name");
+    assert!(err(&renamed).contains("unknown field"));
+    let one = std::format!("{}\n[policy]\nnv_ctr_name = \"{CTR_NAME_HEX}\"\n", base());
+    assert!(err(&one).contains("missing field `nv_base_name`"));
+}

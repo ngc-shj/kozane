@@ -264,13 +264,16 @@ fn fmt1_error(rc: u32) -> u32 {
 const RC_BAD_AUTH: u32 = 0x0A2;
 const RC_POLICY_FAIL: u32 = 0x09D;
 
-fn tool(swtpm: &Swtpm, args: &[&str]) {
+/// Runs a tpm2-tools command (or another tool) on `swtpm`; returns its
+/// standard output.
+fn tool(swtpm: &Swtpm, args: &[&str]) -> String {
     let out = Command::new(args[0])
         .args(&args[1..])
         .env("TPM2TOOLS_TCTI", swtpm.tcti())
         .output()
         .unwrap_or_else(|e| panic!("{}: {e}", args[0]));
     assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 fn read(path: &Path) -> Vec<u8> {
@@ -837,4 +840,228 @@ fn every_key_pd_unseals_concurrently_through_the_pd_model_and_pcr8_is_capped() {
     assert!(pd.gate.is_capped());
     assert_eq!(pd.tpm.pcr8(), extend(&expected_pcr8(), &CAP_DIGEST), "PCR 8 after the cap");
     eprintln!("busy replies: {}", pd.busy);
+}
+
+// The policy anti-rollback indices (M8 plan C3; P1's facts, P4's deferred
+// half): defined with tpm2-tools exactly as build/probes/p1/define.sh does,
+// read and advanced through the crate's builders, parsers and the gate.
+
+use tpm2_wire::gate::{PolicyPhase, PolicyRefusal, PolicyState, PolicyTransport};
+use tpm2_wire::{
+    NV_BASE_ATTRIBUTES, NV_CTR_ATTRIBUTES, NV_DATA_SIZE, NV_POLICY_BASE, NV_POLICY_CTR, NV_WRITELOCKED, NV_WRITTEN,
+};
+
+const CC_POLICY_COMMAND_CODE: u32 = 0x16C;
+const CC_POLICY_SIGNED: u32 = 0x160;
+/// The delete policy's fixed policyRef (P1).
+const DELETE_POLICY_REF: &[u8] = b"kozane-nv-delete";
+
+/// The delete policy (C3): PolicyCommandCode(NV_UndefineSpaceSpecial) ∧
+/// PolicySigned(op1) ∧ PolicySigned(op2), as P1's twin computes it.
+fn delete_policy(names: &[Vec<u8>]) -> [u8; 32] {
+    let special = tpm2_wire::CC_NV_UNDEFINE_SPACE_SPECIAL.to_be_bytes();
+    let mut d = crypto::sha256(&[&[0u8; 32], &CC_POLICY_COMMAND_CODE.to_be_bytes(), &special]);
+    for n in names {
+        d = crypto::sha256(&[&crypto::sha256(&[&d, &CC_POLICY_SIGNED.to_be_bytes(), n]), DELETE_POLICY_REF]);
+    }
+    d
+}
+
+/// define.sh: two operator P-256 keys loaded external, the delete policy
+/// over their Names, then both indices under the platform hierarchy with
+/// P1's attributes. Returns the delete policy.
+fn define_policy_indices(swtpm: &Swtpm) -> [u8; 32] {
+    let mut names = Vec::new();
+    for k in ["op1", "op2"] {
+        let pem = swtpm.dir.join(format!("{k}.pem"));
+        let public = swtpm.dir.join(format!("{k}.pub.pem"));
+        let (pem, public) = (pem.to_str().unwrap(), public.to_str().unwrap());
+        tool(swtpm, &["openssl", "ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", pem]);
+        tool(swtpm, &["openssl", "ec", "-in", pem, "-pubout", "-out", public]);
+        let ctx = swtpm.dir.join(format!("{k}.ctx"));
+        let name = swtpm.dir.join(format!("{k}.name"));
+        let (ctx, name_file) = (ctx.to_str().unwrap(), name.to_str().unwrap());
+        tool(swtpm, &["tpm2_loadexternal", "-Q", "-C", "n", "-G", "ecc", "-u", public, "-c", ctx, "-n", name_file]);
+        names.push(read(&name));
+    }
+    // tpm2-tools leaves loadexternal objects loaded (P1's note).
+    tool(swtpm, &["tpm2_flushcontext", "-t"]);
+    let policy = delete_policy(&names);
+    let file = swtpm.dir.join("del.policy");
+    std::fs::write(&file, policy).unwrap();
+    for (index, attributes) in [(NV_POLICY_CTR, NV_CTR_ATTRIBUTES), (NV_POLICY_BASE, NV_BASE_ATTRIBUTES)] {
+        tool(
+            swtpm,
+            &[
+                "tpm2_nvdefine",
+                &format!("{index:#x}"),
+                "-C",
+                "p",
+                "-s",
+                "8",
+                "-L",
+                file.to_str().unwrap(),
+                "-a",
+                &format!("{attributes:#x}"),
+            ],
+        );
+    }
+    policy
+}
+
+impl Tpm {
+    fn nv_value(&mut self, index: u32) -> u64 {
+        let mut buf = [0u8; IPC_MSG_BYTES];
+        let n = tpm2_wire::nv_read(&mut buf, index).unwrap();
+        tpm2_wire::parse_nv_read(&self.transact(&buf[..n])).unwrap()
+    }
+}
+
+/// probe.sh's provisioning: one increment, then the base set so the
+/// logical version is `v0`, written and write-locked. Returns the delete
+/// policy and the base.
+fn provision_policy(swtpm: &mut Swtpm, v0: u32) -> ([u8; 32], u64) {
+    let policy = define_policy_indices(swtpm);
+    let ctr = format!("{NV_POLICY_CTR:#x}");
+    let base_index = format!("{NV_POLICY_BASE:#x}");
+    tool(swtpm, &["tpm2_nvincrement", &ctr, "-C", &ctr]);
+    let counter = swtpm.connect().nv_value(NV_POLICY_CTR);
+    let base = counter.wrapping_sub(u64::from(v0));
+    let file = swtpm.dir.join("base.bin");
+    std::fs::write(&file, base.to_be_bytes()).unwrap();
+    tool(swtpm, &["tpm2_nvwrite", &base_index, "-C", &base_index, "-i", file.to_str().unwrap()]);
+    tool(swtpm, &["tpm2_nvwritelock", &base_index, "-C", &base_index]);
+    (policy, base)
+}
+
+/// The Names `tools/provision` compiles in: with WRITTEN, and WRITELOCKED
+/// for the base.
+fn provisioned_names(policy: &[u8; 32]) -> ([u8; 34], [u8; 34]) {
+    (
+        crypto::nv_name(NV_POLICY_CTR, NV_CTR_ATTRIBUTES | NV_WRITTEN, policy, NV_DATA_SIZE).unwrap(),
+        crypto::nv_name(NV_POLICY_BASE, NV_BASE_ATTRIBUTES | NV_WRITTEN | NV_WRITELOCKED, policy, NV_DATA_SIZE).unwrap(),
+    )
+}
+
+/// The policy operations' device: swtpm, which always answers.
+struct NvDevice<'t> {
+    tpm: &'t mut Tpm,
+    rsp: Vec<u8>,
+}
+
+impl PolicyTransport for NvDevice<'_> {
+    fn transact(&mut self, cmd: &[u8]) -> Option<&[u8]> {
+        self.rsp = self.tpm.transact(cmd);
+        Some(&self.rsp)
+    }
+}
+
+#[test]
+fn nv_public_areas_and_names_match_tpm2_tools_and_the_twin() {
+    let mut swtpm = Swtpm::start("nv-names", false);
+    let (policy, _) = provision_policy(&mut swtpm, 7);
+    let (ctr_name, base_name) = provisioned_names(&policy);
+    let mut tpm = swtpm.connect();
+    let mut buf = [0u8; IPC_MSG_BYTES];
+    for (index, attributes, name) in [
+        (NV_POLICY_CTR, NV_CTR_ATTRIBUTES | NV_WRITTEN, ctr_name),
+        (NV_POLICY_BASE, NV_BASE_ATTRIBUTES | NV_WRITTEN | NV_WRITELOCKED, base_name),
+    ] {
+        let n = tpm2_wire::nv_read_public(&mut buf, index).unwrap();
+        let rsp = tpm.transact(&buf[..n]);
+        let r = tpm2_wire::parse_nv_read_public(&rsp).unwrap();
+        let mut public = [0u8; tpm2_wire::NV_PUBLIC_LEN];
+        tpm2_wire::nv_public(&mut public, index, attributes, &policy, NV_DATA_SIZE).unwrap();
+        assert_eq!(r.public, &public[..], "{index:#x}: TPMS_NV_PUBLIC");
+        assert_eq!(r.name, &name[..], "{index:#x}: the TPM's Name and the twin's");
+    }
+    drop(tpm);
+    for (index, name) in [(NV_POLICY_CTR, ctr_name), (NV_POLICY_BASE, base_name)] {
+        let out = tool(&swtpm, &["tpm2_nvreadpublic", &format!("{index:#x}")]);
+        let oracle = out.lines().find_map(|l| l.trim().strip_prefix("name: ")).expect("a name line");
+        let hex: String = name.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(oracle, hex, "{index:#x}: tpm2_nvreadpublic's Name");
+    }
+}
+
+#[test]
+fn the_gate_reads_the_logical_version_and_pcr9_and_advances_once() {
+    let mut swtpm = Swtpm::start("nv-advance", false);
+    let (policy, base) = provision_policy(&mut swtpm, 7);
+    let (slot_a, slot_b) = ([0xA1u8; 32], [0xB2u8; 32]);
+    for d in [slot_a, slot_b] {
+        let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
+        tool(&swtpm, &["tpm2_pcrextend", &format!("9:sha256={hex}")]);
+    }
+    let (ctr_name, base_name) = provisioned_names(&policy);
+    let mut g = Gate::with_policy(true, ctr_name, base_name);
+    let mut tpm = swtpm.connect();
+    let mut device = NvDevice { tpm: &mut tpm, rsp: Vec::new() };
+    let pcr9 = extend(&extend(&[0; 32], &slot_a), &slot_b);
+    assert_eq!(g.policy_state(&mut device), Ok(PolicyState { current: 7, pcr9 }));
+    assert_eq!(g.policy_advance(7, &mut device), Ok(8));
+    assert_eq!(g.policy_advance(8, &mut device), Err(PolicyRefusal::Order), "one increment per boot");
+    assert_eq!(tpm.nv_value(NV_POLICY_CTR), base.wrapping_add(8));
+    assert_eq!(tpm.nv_value(NV_POLICY_BASE), base);
+    assert_eq!(tpm.pcr8(), [0; 32], "PCR 8 untouched");
+    // The cap waits for the policy client, then follows on swtpm.
+    for c in 0..tpm2_wire::gate::CLIENTS {
+        g.finish(c, true).unwrap();
+    }
+    assert_eq!(g.run_cap(&mut CapDevice { tpm: &mut tpm, rsp: Vec::new() }), None);
+    g.policy_finish().unwrap();
+    assert_eq!(g.run_cap(&mut CapDevice { tpm: &mut tpm, rsp: Vec::new() }), Some(CapVerdict::Confirmed));
+    assert_eq!(tpm.pcr8(), extend(&[0; 32], &CAP_DIGEST));
+    assert_eq!(g.policy_state(&mut NvDevice { tpm: &mut tpm, rsp: Vec::new() }), Err(PolicyRefusal::Capped));
+}
+
+#[test]
+fn a_stale_advance_leaves_the_counter_where_it_was() {
+    let mut swtpm = Swtpm::start("nv-stale", false);
+    let (policy, base) = provision_policy(&mut swtpm, 7);
+    let (ctr_name, base_name) = provisioned_names(&policy);
+    let mut g = Gate::with_policy(true, ctr_name, base_name);
+    let mut tpm = swtpm.connect();
+    let mut device = NvDevice { tpm: &mut tpm, rsp: Vec::new() };
+    assert_eq!(g.policy_state(&mut device).map(|s| s.current), Ok(7));
+    assert_eq!(g.policy_advance(6, &mut device), Err(PolicyRefusal::Stale));
+    assert_eq!(g.policy_phase(), PolicyPhase::Spent);
+    assert_eq!(tpm.nv_value(NV_POLICY_CTR), base.wrapping_add(7));
+}
+
+/// The Name binds the attributes: an index without POLICY_DELETE (as one
+/// redefined after a delete would be, C3's acceptance fixture) or a base
+/// that was never write-locked is not the expected index.
+#[test]
+fn names_of_other_attributes_are_refused_on_a_real_tpm() {
+    let mut swtpm = Swtpm::start("nv-name-refused", false);
+    let (policy, _) = provision_policy(&mut swtpm, 7);
+    let (ctr_name, base_name) = provisioned_names(&policy);
+    const POLICY_DELETE: u32 = 0x0000_0400;
+    let unlocked = crypto::nv_name(NV_POLICY_BASE, NV_BASE_ATTRIBUTES | NV_WRITTEN, &policy, NV_DATA_SIZE).unwrap();
+    let deletable_attributes = (NV_CTR_ATTRIBUTES | NV_WRITTEN) & !POLICY_DELETE;
+    let deletable = crypto::nv_name(NV_POLICY_CTR, deletable_attributes, &policy, NV_DATA_SIZE).unwrap();
+    let mut tpm = swtpm.connect();
+    for (ctr, base) in [(ctr_name, unlocked), (deletable, base_name)] {
+        let mut g = Gate::with_policy(true, ctr, base);
+        assert_eq!(g.policy_state(&mut NvDevice { tpm: &mut tpm, rsp: Vec::new() }), Err(PolicyRefusal::Name));
+    }
+    let mut g = Gate::with_policy(true, ctr_name, base_name);
+    assert!(g.policy_state(&mut NvDevice { tpm: &mut tpm, rsp: Vec::new() }).is_ok());
+}
+
+/// C3: phEnableNV clear → refused. With it clear the TPM hides the
+/// platform-created indices, so the first NV_ReadPublic fails.
+#[test]
+fn with_ph_enable_nv_clear_the_state_is_refused() {
+    let mut swtpm = Swtpm::start("nv-phenablenv", false);
+    let (policy, _) = provision_policy(&mut swtpm, 7);
+    let (ctr_name, base_name) = provisioned_names(&policy);
+    tool(&swtpm, &["tpm2_hierarchycontrol", "-C", "p", "phEnableNV", "clear"]);
+    let mut tpm = swtpm.connect();
+    let mut buf = [0u8; IPC_MSG_BYTES];
+    let n = tpm2_wire::nv_read_public(&mut buf, NV_POLICY_CTR).unwrap();
+    assert!(matches!(tpm2_wire::parse_nv_read_public(&tpm.transact(&buf[..n])), Err(RspError::Tpm(_))));
+    let mut g = Gate::with_policy(true, ctr_name, base_name);
+    assert_eq!(g.policy_state(&mut NvDevice { tpm: &mut tpm, rsp: Vec::new() }), Err(PolicyRefusal::Device));
 }

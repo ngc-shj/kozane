@@ -11,6 +11,10 @@ pub struct RawConfig {
     #[serde(default)]
     pub neighbors: Vec<RawNeighbor>,
     pub peers: Vec<RawPeer>,
+    /// The policy NV indices (M8 plan C3); absent until a node is
+    /// provisioned for M8.
+    #[serde(default)]
+    pub policy: Option<RawPolicy>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -43,6 +47,17 @@ pub struct RawGateway {
     /// public key: the uncompressed P-256 point in hex (M6 plan C11).
     pub tls_cert: String,
     pub tls_public: String,
+}
+
+/// The expected Names of `NV_POLICY_CTR` and `NV_POLICY_BASE` as
+/// `tools/provision` computed them (with WRITTEN, and WRITELOCKED for the
+/// base): nameAlg ‖ SHA-256 digest, in hex. `tpm` refuses the policy state
+/// unless the TPM's Names equal these.
+#[derive(Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawPolicy {
+    pub nv_ctr_name: String,
+    pub nv_base_name: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -110,6 +125,9 @@ pub struct Checked {
     pub backend: ([u8; 4], u16),
     pub tls_cert: Vec<u8>,
     pub tls_public: [u8; TLS_PUBLIC_LEN],
+    /// The policy indices' expected Names; all zero without `[policy]`.
+    pub nv_ctr_name: [u8; NV_NAME_LEN],
+    pub nv_base_name: [u8; NV_NAME_LEN],
 }
 
 pub fn decode_key(s: &str) -> Result<[u8; 32], String> {
@@ -181,6 +199,27 @@ pub fn decode_tls_public(s: &str) -> Result<[u8; TLS_PUBLIC_LEN], String> {
         *o = u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| bad())?;
     }
     if out[0] != 0x04 {
+        return Err(bad());
+    }
+    Ok(out)
+}
+
+/// An NV index's Name with a SHA-256 nameAlg: 0x000B ‖ digest.
+pub const NV_NAME_LEN: usize = 34;
+
+/// A policy index's Name written as 68 hex digits. A zero digest is
+/// refused: all zero is what an absent `[policy]` renders, so it must not
+/// also be a configured Name.
+pub fn decode_nv_name(s: &str) -> Result<[u8; NV_NAME_LEN], String> {
+    let bad = || format!("config: NV name {s:?}: expected 68 hex digits of a SHA-256 Name (000b...)");
+    if s.len() != 2 * NV_NAME_LEN || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(bad());
+    }
+    let mut out = [0u8; NV_NAME_LEN];
+    for (o, i) in out.iter_mut().zip((0..s.len()).step_by(2)) {
+        *o = u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| bad())?;
+    }
+    if out[..2] != [0x00, 0x0B] || out[2..].iter().all(|b| *b == 0) {
         return Err(bad());
     }
     Ok(out)
@@ -382,6 +421,16 @@ pub fn check(text: &str, max_peers: usize, load: &dyn Fn(&str) -> Result<Vec<u8>
     }
     let tls_public = decode_tls_public(&g.tls_public)?;
     let tls_cert = load_tls_cert(&g.tls_cert, &tls_public, load)?;
+    let (nv_ctr_name, nv_base_name) = match &raw.policy {
+        Some(p) => {
+            let names = (decode_nv_name(&p.nv_ctr_name)?, decode_nv_name(&p.nv_base_name)?);
+            if names.0 == names.1 {
+                return Err("config: policy nv_ctr_name and nv_base_name are the same Name".into());
+            }
+            names
+        }
+        None => ([0; NV_NAME_LEN], [0; NV_NAME_LEN]),
+    };
     Ok(Checked {
         gateway_public,
         listen_port: g.listen_port,
@@ -399,6 +448,8 @@ pub fn check(text: &str, max_peers: usize, load: &dyn Fn(&str) -> Result<Vec<u8>
         backend: (backend_ip, g.backend.port),
         tls_cert,
         tls_public,
+        nv_ctr_name,
+        nv_base_name,
     })
 }
 
@@ -430,6 +481,9 @@ pub fn render(c: &Checked, gateway_rp_file: &str, peer_rp_files: &[String]) -> S
     s += &format!("pub const TLS_CERT: &[u8] = &{:?};\n", c.tls_cert);
     s += "/// The certificate's public key, the uncompressed P-256 point `tlskey` checks its scalar against.\n";
     s += &format!("pub const TLS_PUBLIC: [u8; {TLS_PUBLIC_LEN}] = {:?};\n", c.tls_public);
+    s += "/// The policy NV indices' expected Names (`tpm`); all zero without `[policy]`, which no index's Name equals.\n";
+    s += &format!("pub const NV_CTR_NAME: [u8; {NV_NAME_LEN}] = {:?};\n", c.nv_ctr_name);
+    s += &format!("pub const NV_BASE_NAME: [u8; {NV_NAME_LEN}] = {:?};\n", c.nv_base_name);
     s += "pub const NEIGHBORS: &[Neighbor] = &[\n";
     for (ip, mac) in &c.neighbors {
         s += &format!("    Neighbor {{ ip: {ip:?}, mac: {mac:?} }},\n");

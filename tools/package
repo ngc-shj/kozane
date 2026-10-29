@@ -17,8 +17,10 @@ Usage: package --secrets FILE --pq-secrets FILE --tls-secrets FILE
 writes (mksecrets seal checks it is the storage template). The flow:
 
   1. microkit builds the system with size-correct, random stand-ins as the
-     three prefills: where they land are the envelope ranges;
-  2. the descriptor names those ranges, and PCRs 0-8 are computed from
+     three secrets prefills and the two bundle slots' (`policy_a`,
+     `policy_b`; M8 plan C4): where they land are the descriptor's five
+     ranges;
+  2. the descriptor (v3) names those ranges, and PCRs 0-8 are computed from
      the firmware (PCR 0: what TF-A will extend), the descriptor and the
      published image (PCR 8: what U-Boot will extend; tools/measure.py);
   3. `mksecrets seal` seals each blob to that SRK and those PCRs, each
@@ -28,9 +30,9 @@ writes (mksecrets seal checks it is the storage template). The flow:
      image byte for byte.
 
 Each build is accepted only if, against the placeholder build:
-  - the .system differs in nothing but the three secrets mrs' prefill_path;
+  - the .system differs in nothing but the five stand-in mrs' prefill_path;
   - (stand-ins) the images have equal length, differ somewhere, and every
-    differing byte lies inside one of the three places the stand-ins appear,
+    differing byte lies inside one of the five places the stand-ins appear,
     where the placeholder image held zeros;
 and each blob must be a full region of its own kind (magic, version, the
 TLS blob's zero reserved word, checksum, zero padding), each envelope a
@@ -118,6 +120,13 @@ TLS = BlobKind("tls_secrets", b"SOSTLSK1", 1, 4096, lambda _blob: 80)
 # In descriptor range order (tools/measure.py).
 KINDS = (KEY, PQ, TLS)
 SECRETS_MRS = tuple(k.mr for k in KINDS)
+# The bundle slots (M8 plan C4), after the envelopes in descriptor order:
+# zero in every image tools/package builds; U-Boot copies a node's slots
+# over them at boot.
+SLOT_MRS = ("policy_a", "policy_b")
+# Every mr a stand-in build fills, in descriptor range order.
+STANDIN_MRS = SECRETS_MRS + SLOT_MRS
+STANDIN_SIZES = tuple(k.size for k in KINDS) + (measure.BUNDLE_MAX,) * len(SLOT_MRS)
 # `mksecrets seal --kind` and the envelope's kind code (tpm2::envelope).
 SEAL_KINDS = {"secrets": ("key", 1), "pq_secrets": ("pq", 2), "tls_secrets": ("tls", 3)}
 ENVELOPE_MAGIC = b"SOSSEAL1"
@@ -312,7 +321,7 @@ def _diff_elements(a: ET.Element, b: ET.Element, where: str, errors: list):
         errors.append(f"package: {where}: element <{a.tag}> became <{b.tag}>")
         return
     attrs_a, attrs_b = dict(a.attrib), dict(b.attrib)
-    if a.tag == "memory_region" and a.get("name") == b.get("name") and a.get("name") in SECRETS_MRS:
+    if a.tag == "memory_region" and a.get("name") == b.get("name") and a.get("name") in STANDIN_MRS:
         attrs_a.pop("prefill_path", None)
         attrs_b.pop("prefill_path", None)
     if attrs_a != attrs_b:
@@ -329,25 +338,35 @@ def _diff_elements(a: ET.Element, b: ET.Element, where: str, errors: list):
 
 def check_systems(placeholder: str, package: str) -> list:
     """The package .system must equal the placeholder one except for the
-    three secrets mrs' prefill_paths, which must be set in both."""
+    five stand-in mrs' prefill_paths, which must be set in both."""
     a, b = ET.fromstring(placeholder), ET.fromstring(package)
     errors = []
     _diff_elements(a, b, a.tag, errors)
     for name, root in (("placeholder", a), ("package", b)):
-        for mr in SECRETS_MRS:
+        for mr in STANDIN_MRS:
             mrs = [m for m in root.iter("memory_region") if m.get("name") == mr]
             if len(mrs) != 1 or not mrs[0].get("prefill_path"):
                 errors.append(f"package: {name} system needs one '{mr}' mr with a prefill_path")
     return errors
 
 
+def _first_diff(a: bytes, b: bytes, at: int, end: int, step: int) -> int:
+    """The first (step 1) or last (step -1) index in [at, end) where a and b
+    differ; the caller knows one does."""
+    i = at if step == 1 else end - 1
+    while a[i] == b[i]:
+        i += step
+    return i
+
+
 def check_images(placeholder: bytes, package: bytes, blobs: list) -> list:
     """Every differing byte must lie inside one of the blobs' ranges, each
-    blob appearing exactly once, the ranges disjoint and zero beforehand."""
+    blob appearing exactly once, the ranges disjoint and zero beforehand.
+    Compared a span at a time: two bundle slots make the image too large to
+    walk byte by byte."""
     if len(placeholder) != len(package):
         return ["package: image length changed"]
-    diffs = [i for i, (x, y) in enumerate(zip(placeholder, package)) if x != y]
-    if not diffs:
+    if placeholder == package:
         return ["package: image is identical to the placeholder build"]
     ranges = []
     for blob in blobs:
@@ -362,17 +381,20 @@ def check_images(placeholder: bytes, package: bytes, blobs: list) -> list:
     for at, end in ranges:
         if any(placeholder[at:end]):
             errors.append(f"package: placeholder image is not zero where a blob lands ({at:#x}..{end:#x})")
-    outside = [i for i in diffs if not any(at <= i < end for at, end in ranges)]
+    gaps = [(prev_end, at) for (_, prev_end), (at, _) in zip([(0, 0)] + ranges, ranges + [(len(package), 0)])]
+    outside = [(at, end) for at, end in gaps if placeholder[at:end] != package[at:end]]
     if outside:
         spans = ", ".join(f"{at:#x}..{end:#x}" for at, end in ranges)
-        errors.append(f"package: image differs outside the blobs ({outside[0]:#x}..{outside[-1]:#x} vs {spans})")
+        first = _first_diff(placeholder, package, *outside[0], 1)
+        last = _first_diff(placeholder, package, *outside[-1], -1)
+        errors.append(f"package: image differs outside the blobs ({first:#x}..{last:#x} vs {spans})")
     return errors
 
 
 def with_prefill(system: str, blob_paths: dict) -> str:
-    """Points each secrets mr, found by name, at its blob."""
+    """Points each mr `blob_paths` names, found by name, at its blob."""
     root = ET.fromstring(system)
-    for mr in SECRETS_MRS:
+    for mr in blob_paths:
         mrs = [m for m in root.iter("memory_region") if m.get("name") == mr]
         if len(mrs) != 1:
             raise SystemExit(f"package: system needs exactly one '{mr}' mr")
@@ -561,8 +583,8 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
     srk_copy.write_bytes(srk)
 
     # 1. Stand-ins: where microkit puts each prefill.
-    standins = {mr: os.urandom(kind.size) for mr, kind in zip(SECRETS_MRS, KINDS)}
-    standin_paths = {mr: out / f"standin-{mr}.bin" for mr in SECRETS_MRS}
+    standins = {mr: os.urandom(size) for mr, size in zip(STANDIN_MRS, STANDIN_SIZES)}
+    standin_paths = {mr: out / f"standin-{mr}.bin" for mr in STANDIN_MRS}
     for mr, path in standin_paths.items():
         path.write_bytes(standins[mr])
     system = out / "standin.system"
@@ -570,13 +592,13 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
     microkit(a, system, out / "standin.img", out / "standin-report.txt")
     standin_img = (out / "standin.img").read_bytes()
     errors = check_systems(placeholder_system, system.read_text())
-    errors += check_images(published, standin_img, [standins[mr] for mr in SECRETS_MRS])
+    errors += check_images(published, standin_img, [standins[mr] for mr in STANDIN_MRS])
     if errors:
         print("\n".join(errors))
         return 1
 
     # 2. The descriptor and the PCRs 0-8 TF-A and U-Boot will produce.
-    ranges = [(standin_img.find(standins[mr]), len(standins[mr])) for mr in SECRETS_MRS]
+    ranges = [(standin_img.find(standins[mr]), len(standins[mr])) for mr in STANDIN_MRS]
     try:
         # The ranges are where microkit placed each stand-in; check_images
         # above already proved they are the only bytes that differ from the
@@ -614,8 +636,10 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
     system.write_text(with_prefill(placeholder_system, {mr: str(out / f"{mr}.env") for mr in SECRETS_MRS}))
     microkit(a, system, out / "envelope.img", out / "report.txt")
     errors = check_systems(placeholder_system, system.read_text())
-    errors += check_assembly(published, desc, [envelopes[mr] for mr in SECRETS_MRS],
-                             (out / "envelope.img").read_bytes())
+    # The slots keep the placeholder's zeros: a node's bundles are copied
+    # in at boot, never built into an image.
+    errors += check_assembly(published, desc, [envelopes[mr] for mr in SECRETS_MRS]
+                             + [bytes(measure.BUNDLE_MAX)] * len(SLOT_MRS), (out / "envelope.img").read_bytes())
     if errors:
         print("\n".join(errors))
         return 1
@@ -630,9 +654,10 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
 
 
 def check_assembly(published: bytes, desc: bytes, envelopes: list, built: bytes) -> list:
-    """The image U-Boot assembles (the published image with each envelope at
-    its descriptor range, by the shared helper) must be the one microkit
-    built with the envelopes as prefills, byte for byte (M5 plan C8 F2)."""
+    """The image U-Boot assembles (the published image with each envelope and
+    slot at its descriptor range, by the shared helper) must be the one
+    microkit built with the envelopes as prefills, byte for byte (M5 plan C8
+    F2)."""
     try:
         assembled = measure.assemble(published, desc, envelopes)
     except measure.DescriptorError as e:

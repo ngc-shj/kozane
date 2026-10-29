@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <memory_region name="policy_a" size="0x1000" />
+
+    <protection_domain name="policy" priority="1">
+        <program_image path="policy.elf" />
+        <map mr="policy_a" vaddr="0x1_000_000" perms="rw" />
+    </protection_domain>
+</system>

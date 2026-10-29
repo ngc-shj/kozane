@@ -19,7 +19,9 @@ import fip_fixture  # noqa: E402
 
 RELEASE = [sys.executable, str(ROOT / "tools/release.py")]
 BIN = str(ROOT / "build/release/target/release/release")
-RANGES = [(0x1000, 0x400), (0x2000, 0x800), (0x3000, 0x400)]
+SLOT = measure.BUNDLE_MAX
+# The three envelopes, then the two bundle slots (descriptor v3).
+RANGES = [(0x1000, 0x400), (0x2000, 0x800), (0x3000, 0x400), (0x4000, SLOT), (0x4000 + SLOT, SLOT)]
 
 
 def run(*args) -> tuple:
@@ -34,12 +36,11 @@ def setup(d: pathlib.Path) -> None:
             raise SystemExit(f"keygen failed: {out}")
     pkg = d / "pkg"
     pkg.mkdir()
-    # Code-like bytes everywhere except the three envelope ranges, which hold
-    # the zero placeholder as a published image does.
-    image = bytearray(bytes(range(1, 256)) * 65)[:0x4000]
-    image[0x1000:0x1400] = bytes(0x400)
-    image[0x2000:0x2800] = bytes(0x800)
-    image[0x3000:0x3400] = bytes(0x400)
+    # Code-like bytes everywhere except the five ranges, which hold the zero
+    # placeholder as a published image does.
+    image = bytearray(bytes(range(1, 256)) * 65)[:0x4000] + bytes(2 * SLOT) + bytes(range(1, 256))
+    for at, length in RANGES:
+        image[at:at + length] = bytes(length)
     image = bytes(image)
     desc = measure.pack(len(image), RANGES)
     (pkg / "published.img").write_bytes(image)
@@ -225,13 +226,19 @@ def case_range2_over_code(d):
     return ok and "range 2" in out, out
 
 
-def case_v1_descriptor(d):
-    """M5's 64-byte, two-envelope descriptor is refused (M6 plan Re-plan R1)."""
+def case_slot_over_code(d):
+    """A bundle slot's range is checked like an envelope's (M8 plan C4)."""
+    ok, out = case_range_over_code(d, at=0x4000 + 2 * SLOT - 1)
+    return ok and "range 4" in out, out
+
+
+def case_v2_descriptor(d):
+    """M6's 80-byte, three-envelope descriptor is refused (M8 plan C4)."""
     image = (d / "pkg/published.img").read_bytes()
-    desc = struct.pack("<8sIIQQQQQQ", measure.MAGIC, 1, 2, len(image), *RANGES[0], *RANGES[1], 0)
+    desc = struct.pack("<8sIIQQQQQQQQ", measure.MAGIC, 2, 3, len(image), *RANGES[0], *RANGES[1], *RANGES[2], 0)
     (d / "pkg/boot.desc").write_bytes(desc)
     rc, out = make(d)
-    return rc == 1 and "descriptor is 64 bytes, expected 80" in out and not (d / "rel").exists(), out
+    return rc == 1 and "descriptor is 80 bytes, expected 112" in out and not (d / "rel").exists(), out
 
 
 def fault_inject_image(d) -> bytes:
@@ -283,7 +290,8 @@ CASES = [
     ("verify refuses a signed image holding a fault-inject PD", case_verify_fault_inject),
     ("a descriptor range over non-zero image bytes is refused", case_range_over_code),
     ("a descriptor range 2 over non-zero image bytes is refused", case_range2_over_code),
-    ("a version-1 descriptor is refused", case_v1_descriptor),
+    ("a bundle slot range over non-zero image bytes is refused", case_slot_over_code),
+    ("a version-2 descriptor is refused", case_v2_descriptor),
     ("verify takes --kind tls", case_kind_tls),
 ]
 

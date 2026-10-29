@@ -183,6 +183,13 @@ the only guard for pqkey-core's wrappers. L8's adjudicating control is
   P28 no single-person signing (M8 plan C2): tools/policy/src names no
      `--force`, `--single`, `skip_approval` or a `--roster` flag (the roster
      comes from the verified ledger only)
+  P29 the device never defines, writes or deletes NV (M8 plan C3): the
+     command codes of NV_DefineSpace, NV_UndefineSpace(Special), NV_Write,
+     NV_WriteLock, Clear and HierarchyChangeAuth (`CC_...`) appear under
+     crates/ only in crates/tpm2-wire/src/{lib.rs (their definitions),
+     gate.rs (the refused set), tests.rs, proofs.rs} and in
+     crates/tpm2/tests (the interop tests drive swtpm directly). A
+     tripwire: the gate's per-client allowlist is the control
 """
 
 import argparse
@@ -198,7 +205,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P18",
-         "P19", "P20", "P21", "P22", "P23", "P24", "P25", "P26", "P27", "P28"]
+         "P19", "P20", "P21", "P22", "P23", "P24", "P25", "P26", "P27", "P28", "P29"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
                "crates/tls-core", "crates/tlskey-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data",
@@ -1102,6 +1109,21 @@ def check_policy(root: pathlib.Path, out: list):
                 out.append(f"P28 {rel}:{n}: a bypass or caller-supplied roster in the signer (M8 plan C2)")
 
 
+# P29: no NV define/write/delete or Clear outside the gate's refused set.
+NV_FORBIDDEN = re.compile(r"\bCC_(NV_UNDEFINE_SPACE(_SPECIAL)?|NV_WRITE(_LOCK)?|NV_DEFINE_SPACE|CLEAR|HIERARCHY_CHANGE_AUTH)\b")
+NV_ALLOWED = ("crates/tpm2-wire/src/lib.rs", "crates/tpm2-wire/src/gate.rs", "crates/tpm2-wire/src/tests.rs",
+              "crates/tpm2-wire/src/proofs.rs", "crates/tpm2/tests/")
+
+
+def check_nv_writes(root: pathlib.Path, out: list):
+    for rel, text in crate_sources(root, "crates"):
+        if rel.startswith(NV_ALLOWED):
+            continue
+        for n, line in enumerate(text.splitlines(), 1):
+            if NV_FORBIDDEN.search(line):
+                out.append(f"P29 {rel}:{n}: an NV define/write/delete or Clear command outside the gate's refused set (M8 plan C3)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
@@ -1121,6 +1143,7 @@ def main() -> int:
     check_waivers(root, out)
     check_forbidden(root, out)
     check_policy(root, out)
+    check_nv_writes(root, out)
     check_secret_derives(root, out)
     check_secret_copies(root, out)
     check_cookie_compares(root, out)

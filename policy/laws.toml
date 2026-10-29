@@ -45,7 +45,7 @@
 #     transport-key-holding pd of later milestones.
 #
 #   [mrs.<name>]
-#   kind = "device" | "dma" | "secrets" | "data" | "plain"
+#   kind = "device" | "dma" | "secrets" | "data" | "plain" | "bundle_slot"
 #     device: owner = "<driver, timer, service or tpm pd>", phys_addr = <addr>, size = <bytes>,
 #             console = <bool, default false>, tpm = <bool, default false>
 #       MMIO owned by exactly that driver, page-granular (L5): only the
@@ -84,6 +84,17 @@
 #       Any other mr shared between pds (e.g. a ring's free/used metadata,
 #       which both sides mutate): each listed pd's actual `.system` map
 #       perms must be within what is listed here.
+#     bundle_slot: readers = ["<pd>", ...]
+#       A peer-policy bundle slot (M8 plan C1, C6, C11): filled at boot by
+#       U-Boot from its descriptor range, measured into PCR 9, never
+#       written after. `prefill_path` is valid on it (the "prefill only
+#       on secrets mrs" rule gains this kind and no other). No pd may map
+#       it with `w` or `x`; every pd that maps it must be listed in
+#       `readers` and map it `r`; `readers` may be empty (an unmapped
+#       slot) but the key itself is required, a policy error if missing.
+#       A bundle_slot mr does not seed taint (L1) — its consumers treat
+#       it as untrusted until `policy` has verified it, which is C6's
+#       job, not the laws'.
 #
 #   [[channels]]
 #   between = ["<pd>", "<pd>"]
@@ -279,6 +290,16 @@ owner = "pqkey"
 [mrs.tls_secrets]
 kind = "secrets"
 owner = "tlskey"
+
+# M8 plan C1, C4, C6, C11: the two peer-policy bundle slots. Unmapped for
+# now (slice 1/2); the `policy` PD (slice 3) gains `readers`.
+[mrs.policy_a]
+kind = "bundle_slot"
+readers = []
+
+[mrs.policy_b]
+kind = "bundle_slot"
+readers = []
 
 # net_rx: eth_out -> ingress, outside frames in
 [mrs.net_rx_used]

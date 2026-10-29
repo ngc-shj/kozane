@@ -183,10 +183,19 @@ pub mod rng {
 /// PPC protocol. One call carries one TPM command or response in the
 /// message registers, little-endian bytes packed into words, its byte
 /// length in the label: `label = kind << KIND_SHIFT | arg`.
+///
+/// M8 (plan C3): the `policy` PD's channel carries the four policy
+/// requests only, never a TPM command.
 pub mod tpm {
     pub const CH_KEY: usize = 1;
     pub const CH_PQKEY: usize = 2;
     pub const CH_TLSKEY: usize = 3;
+    /// The `policy` PD (M8 plan C3, C5); 4 is left for `auditkey` (C10).
+    pub const CH_POLICY: usize = 5;
+    /// Whether the system has the `policy` PD (M8 deviation D-6): `tpm`'s
+    /// cap waits for its Done or Failed only then. Set in the same change
+    /// that adds the PD to `system/kozane.system`; a test ties the two.
+    pub const POLICY_PRESENT: bool = false;
 
     /// seL4's IPC buffer carries 120 message words.
     pub const MSG_WORDS: usize = 120;
@@ -212,6 +221,23 @@ pub mod tpm {
     /// RSP_BUSY while the cap is pending, RSP_OK once confirmed, and
     /// RSP_REFUSED with `REFUSED_CAP_FAILED` once failed.
     pub const REQ_CAP_STATUS: u64 = 4;
+    /// The policy requests (M8 plan C3), on `CH_POLICY` alone. State: no
+    /// words in; answered RSP_OK with `POLICY_STATE_LEN` bytes
+    /// (`encode_state`), or RSP_REFUSED with the refusal's code.
+    pub const REQ_POLICY_STATE: u64 = 5;
+    /// Advance: the expected version, `POLICY_VALUE_LEN` bytes (u32,
+    /// little-endian); answered RSP_OK with the version read after the
+    /// increment in the same form, or RSP_REFUSED.
+    pub const REQ_POLICY_ADVANCE: u64 = 6;
+    /// Done and Failed: no words; answered RSP_OK (the cap's verdict goes
+    /// to the key PDs' cap barrier, not to `policy`).
+    pub const REQ_POLICY_DONE: u64 = 7;
+    pub const REQ_POLICY_FAILED: u64 = 8;
+
+    /// The State reply: the logical version (u32, little-endian), then PCR 9.
+    pub const POLICY_STATE_LEN: usize = 4 + 32;
+    /// The Advance request and reply: one version (u32, little-endian).
+    pub const POLICY_VALUE_LEN: usize = 4;
 
     /// Replies. `arg`: the response's byte length (for Done and Failed, 0).
     pub const RSP_OK: u64 = 1;
@@ -239,6 +265,28 @@ pub mod tpm {
 
     pub const fn arg(label: u64) -> usize {
         (label & ARG_MASK) as usize
+    }
+
+    pub fn encode_state(current: u32, pcr9: &[u8; 32]) -> [u8; POLICY_STATE_LEN] {
+        let mut out = [0u8; POLICY_STATE_LEN];
+        let (version, pcr) = out.split_at_mut(POLICY_VALUE_LEN);
+        version.copy_from_slice(&current.to_le_bytes());
+        pcr.copy_from_slice(pcr9);
+        out
+    }
+
+    /// The State reply's version and PCR 9, if `bytes` is exactly one.
+    pub fn decode_state(bytes: &[u8]) -> Option<(u32, [u8; 32])> {
+        if bytes.len() != POLICY_STATE_LEN {
+            return None;
+        }
+        let (version, pcr) = bytes.split_at(POLICY_VALUE_LEN);
+        Some((decode_value(version)?, pcr.try_into().ok()?))
+    }
+
+    /// One version, if `bytes` is exactly `POLICY_VALUE_LEN` long.
+    pub fn decode_value(bytes: &[u8]) -> Option<u32> {
+        Some(u32::from_le_bytes(bytes.try_into().ok()?))
     }
 
     /// Words that carry `len` bytes.

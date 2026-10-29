@@ -75,13 +75,20 @@ fn dma_regions_match() {
 }
 
 #[test]
+fn bundle_slots_are_bundle_max() {
+    // U-Boot measures and copies exactly BUNDLE_MAX into each (M8 plan C1, C4).
+    assert_eq!(mr_sizes()["policy_a"], limits::BUNDLE_MAX);
+    assert_eq!(mr_sizes()["policy_b"], limits::BUNDLE_MAX);
+}
+
+#[test]
 fn every_region_is_a_link_an_audit_ring_or_a_named_singleton() {
     let mut expected: std::vec::Vec<String> = LINKS
         .iter()
         .flat_map(|l| ["used", "free", "data"].map(|s| std::format!("{l}_{s}")))
         .chain(AUDITS.iter().map(|a| String::from(*a)))
         .chain(
-            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "tpm_mmio", "rng_mmio", "rng_dma", "supervisor_record", "secrets", "pq_secrets", "tls_secrets"]
+            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "tpm_mmio", "rng_mmio", "rng_dma", "supervisor_record", "secrets", "pq_secrets", "tls_secrets", "policy_a", "policy_b"]
                 .map(String::from),
         )
         .collect();
@@ -139,6 +146,62 @@ fn tpm_labels_carry_kind_and_length() {
     for req in [tpm::REQ_COMMAND, tpm::REQ_DONE, tpm::REQ_FAILED] {
         assert_ne!(tpm::REQ_CAP_STATUS, req);
     }
+}
+
+/// M8 plan C3: the policy requests are kinds of their own, distinct from
+/// every raw request, and each fits the label's kind field.
+#[test]
+fn tpm_policy_requests_are_distinct_kinds() {
+    let kinds = [
+        tpm::REQ_COMMAND,
+        tpm::REQ_DONE,
+        tpm::REQ_FAILED,
+        tpm::REQ_CAP_STATUS,
+        tpm::REQ_POLICY_STATE,
+        tpm::REQ_POLICY_ADVANCE,
+        tpm::REQ_POLICY_DONE,
+        tpm::REQ_POLICY_FAILED,
+    ];
+    for (i, a) in kinds.iter().enumerate() {
+        assert_eq!(tpm::kind(tpm::label(*a, tpm::POLICY_STATE_LEN)), *a);
+        for b in &kinds[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+    for ch in [tpm::CH_KEY, tpm::CH_PQKEY, tpm::CH_TLSKEY] {
+        assert_ne!(tpm::CH_POLICY, ch);
+    }
+}
+
+#[test]
+fn tpm_policy_replies_round_trip_and_refuse_other_lengths() {
+    let state = tpm::encode_state(0x0102_0304, &[0xAB; 32]);
+    assert_eq!(state[..4], [4, 3, 2, 1]);
+    assert_eq!(tpm::decode_state(&state), Some((0x0102_0304, [0xAB; 32])));
+    assert_eq!(tpm::decode_state(&state[..tpm::POLICY_STATE_LEN - 1]), None);
+    let mut long = state.to_vec();
+    long.push(0);
+    assert_eq!(tpm::decode_state(&long), None);
+    assert_eq!(tpm::decode_value(&u32::MAX.to_le_bytes()), Some(u32::MAX));
+    assert_eq!(tpm::decode_value(&[1, 2, 3]), None);
+    assert_eq!(tpm::decode_value(&[1, 2, 3, 4, 5]), None);
+    // Through the message words, as `tpm` replies.
+    let mut words = [0u64; tpm::MSG_WORDS];
+    let n = tpm::pack(&state, &mut words).unwrap();
+    let mut out = [0u8; tpm::POLICY_STATE_LEN];
+    tpm::unpack(&words[..n], tpm::POLICY_STATE_LEN, &mut out).unwrap();
+    assert_eq!(tpm::decode_state(&out), Some((0x0102_0304, [0xAB; 32])));
+}
+
+/// M8 deviation D-6: `POLICY_PRESENT` says whether the system gives `tpm`
+/// a `policy` caller on `CH_POLICY`; the cap waits for it only then.
+#[test]
+fn policy_present_matches_the_system() {
+    let policy_end = |x: &(String, usize), y: &(String, usize)| x.0 == "tpm" && x.1 == tpm::CH_POLICY && y.0 == "policy";
+    let in_system = channel_ids().iter().any(|(a, b)| policy_end(a, b) || policy_end(b, a));
+    let pd = system_text().contains("<protection_domain name=\"policy\"");
+    assert_eq!(tpm::POLICY_PRESENT, in_system);
+    assert_eq!(tpm::POLICY_PRESENT, pd);
 }
 
 #[test]

@@ -38,6 +38,12 @@
          placeholder; `make package` swaps this prefill_path too
          (secret_blob::tls). -->
     <memory_region name="tls_secrets" size="0x1000" prefill_path="tls-secrets-placeholder.bin" />
+    <!-- M8 plan C4, D3: the two peer-policy bundle slots, BUNDLE_MAX each,
+         zero placeholders here. U-Boot measures both into PCR 9 and copies
+         each over its range; no PD maps them until the `policy` PD
+         (slice 3, C11). -->
+    <memory_region name="policy_a" size="0x480_000" prefill_path="policy-slot-placeholder.bin" />
+    <memory_region name="policy_b" size="0x480_000" prefill_path="policy-slot-placeholder.bin" />
 
     <!-- net_rx: eth_out -> ingress, outside frames in -->
     <memory_region name="net_rx_used" size="0x1000" />

@@ -770,6 +770,7 @@ name = "layout"
 version = "0.1.0"
 dependencies = [
  "audit-event",
+ "limits",
  "ring",
  "roxmltree",
  "supervisor-core",
@@ -1351,6 +1352,7 @@ name = "pd-tpm"
 version = "0.1.0"
 dependencies = [
  "boot-stage",
+ "config",
  "cpu",
  "layout",
  "sel4-microkit",

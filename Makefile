@@ -95,8 +95,14 @@ $(BUILD)/tls-secrets-placeholder.bin:
 	mkdir -p $(BUILD)
 	head -c 4096 /dev/zero > $@
 
+# Zero bundle slots (M8 plan C4), BUNDLE_MAX each, as tools/measure.py reads
+# it from crates/limits.
+$(BUILD)/policy-slot-placeholder.bin: crates/limits/src/lib.rs tools/measure.py
+	mkdir -p $(BUILD)
+	python3 -c 'import sys; sys.path.insert(0, "tools"); import measure; sys.stdout.buffer.write(bytes(measure.BUNDLE_MAX))' > $@
+
 # The laws checker runs on the exact file handed to the Microkit tool.
-image: pds kernel-config $(BUILD)/secrets-placeholder.bin $(BUILD)/pq-secrets-placeholder.bin $(BUILD)/tls-secrets-placeholder.bin
+image: pds kernel-config $(BUILD)/secrets-placeholder.bin $(BUILD)/pq-secrets-placeholder.bin $(BUILD)/tls-secrets-placeholder.bin $(BUILD)/policy-slot-placeholder.bin
 	cargo run --locked -q -p laws -- check --system $(system) --policy $(policy) --search-path $(BUILD)
 	$(MICROKIT_SDK)/bin/microkit $(system) \
 		--search-path $(BUILD) \

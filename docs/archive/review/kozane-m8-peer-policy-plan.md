@@ -999,3 +999,30 @@ code.
   `render, diff, approve, sign, verify, ledger, fleet`;
   `tests/tools/test_policy.py` (POLICY-FIXTURES); `Makefile` `pins` and
   `audit` wiring; check-pins forbidden patterns for C1 and C2.
+
+### Slice 2 (C3, C4)
+
+- `crates/tpm2-wire`: builders and parsers for `NV_ReadPublic`,
+  `NV_Read` and `NV_Increment` (password session, empty auth), and
+  `PCR_Read` with a PCR 9 selection; the NV Name of a public area.
+- `crates/tpm2-wire/src/gate.rs`: the `policy` client, which is not a raw
+  client: high-level STATE / ADVANCE / DONE / FAILED, `policy_finished`,
+  refused after the cap, and a cap that waits for it only when the system
+  has a `policy` PD (`layout::tpm::POLICY_PRESENT`, false until slice 3).
+  Kani I3.1/I3.2 extend `proofs.rs`.
+- `crates/layout`: the `REQ_POLICY_*` labels and `POLICY_PRESENT`.
+- `crates/pds/tpm`: dispatch for the policy requests. The expected NV
+  Names come from `config` (`[policy] nv_ctr_name`, `nv_base_name`).
+- `crates/tpm2/tests/swtpm_interop.rs`: round trips of the new commands
+  (P4's deferred half).
+- `tools/provision`: TPM2_Clear first (abort if it fails; the SRK Name
+  must change), then the NV step that defines and locks the two indices
+  and writes slot A. The record is checked through `tools/policy verify
+  --ledger`.
+- `tools/measure.py`: the NV-Name twin and `expected_pcr9`; descriptor v3
+  (`COUNT` 5, per-kind room, the pair list).
+- `support/u-boot/boot.cmd`, `tools/uboot-config`, `tools/package`,
+  `tools/release.py`, `tests/integration/run.py` (`Package.media`, loader
+  addresses, `read_pcrs` with PCR 9, `read_srk`'s second-provisioning
+  check), `tests/tools/test_{provision,measure,package,release}.py`, and
+  the check-selftest `measure-*` cases.

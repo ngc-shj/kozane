@@ -209,6 +209,8 @@ CASES_FOR_GATE = {
              "laws-tls-pqkey", "laws-tls-budget", "laws-tls-priority", "laws-tls-hd", "laws-hs-tls-share-key",
              "laws-supervisor-smc"},
     "test": {"measure-twin", "measure-wrap", "measure-pair-01", "measure-pair-02", "measure-pair-12",
+             "measure-pair-03", "measure-pair-04", "measure-pair-13", "measure-pair-14", "measure-pair-23",
+             "measure-pair-24", "measure-pair-34", "measure-pcr9-twin",
              "measure-range2-wrap", "measure-version", "measure-halt", "measure-poweroff", "measure-ctrlc", "key-wipe", "sealed-pcr-unbound", "sealed-srk-name", "sealed-cap", "tpm-proxy-hmac",
              "integration", "integration-count", "integration-residue", "integration-cookie",
              "integration-pq-residue", "l8-fallback", "integration-rp-src-meter", "integration-rotation",
@@ -774,7 +776,8 @@ CASES = {
     # 64 bits passes the signed compares and is copied.
     "measure-wrap": (["test", "it_boots=measured boot"], lambda t: edit(
         t, "support/u-boot/boot.cmd",
-        "for v in $o0 $l0 $o1 $l1 $o2 $l2; do setexpr hi 0x$v / 0x100000000; if test 0x$hi -ne 0; then REFUSE; fi; done\n",
+        "for v in $o0 $l0 $o1 $l1 $o2 $l2 $o3 $l3 $o4 $l4; do setexpr hi 0x$v / 0x100000000; "
+        "if test 0x$hi -ne 0; then REFUSE; fi; done\n",
         ""),
         "a wrapping range was not refused"),
     # M6 plan Re-plan R1 (descriptor v2): each pair's disjointness check is
@@ -789,15 +792,27 @@ CASES = {
     "measure-pair-12": (["test", "it_boots=measured boot"], lambda t: edit(
         t, "support/u-boot/boot.cmd", "if test 0x$e1 -gt 0x$o2 && test 0x$e2 -gt 0x$o1; then REFUSE; fi\n", ""),
         "the 1-2 overlap was not refused"),
+    # M8 plan C4 (descriptor v3, deviation D-5): each pair with a bundle slot
+    # is its own control too; the envelope moves into the slot (slot A one
+    # byte into slot B), clear of every other range.
+    **{f"measure-pair-{i}{j}": (["test", "it_boots=measured boot"], lambda t, i=i, j=j: edit(
+        t, "support/u-boot/boot.cmd",
+        f"if test 0x$e{i} -gt 0x$o{j} && test 0x$e{j} -gt 0x$o{i}; then REFUSE; fi\n", ""),
+        f"the {i}-{j} overlap was not refused") for i, j in ((0, 3), (0, 4), (1, 3), (1, 4), (2, 3), (2, 4), (3, 4))},
+    # M8 plan C4, D3: U-Boot stops extending PCR 9 with slot A, so PCR 9
+    # after a shipped boot no longer matches the host twin.
+    "measure-pcr9-twin": (["test", "it_boots=sealed boot"], lambda t: edit(
+        t, "support/u-boot/boot.cmd", "tpm2 pcr_extend 9 0x6fb00060 || REFUSE\n", ""),
+        "FAIL [sealed boot]: Fail: PCR 9 after the shipped boot is"),
     # Range 2's no-wrap form (len <= image_len - offset): without it, a range
     # 2 running past image_len within 32 bits is copied.
     "measure-range2-wrap": (["test", "it_boots=measured boot"], lambda t: edit(
         t, "support/u-boot/boot.cmd", "setexpr room 0x$img - 0x$o2; if test 0x$l2 -gt 0x$room; then REFUSE; fi\n", ""),
         "the range-2 wrap was not refused"),
-    # Without the version compare, M5's version 1 at v2's length is measured.
+    # Without the version compare, M6's version 2 at v3's length is measured.
     "measure-version": (["test", "it_boots=measured boot"], lambda t: edit(
-        t, "support/u-boot/boot.cmd", "setexpr.l ver *0x6ff00008; if test 0x$ver -ne 2; then REFUSE; fi\n", ""),
-        "the version-1 descriptor was not refused"),
+        t, "support/u-boot/boot.cmd", "setexpr.l ver *0x6ff00008; if test 0x$ver -ne 3; then REFUSE; fi\n", ""),
+        "the version-2 descriptor was not refused"),
     # M5 plan C14. The PCR binding gone from both sides (the seal policy
     # PolicyAuthValue alone, the client skipping PolicyPCR): another image
     # unseals.

@@ -228,3 +228,75 @@ Run in a scratch worktree (`build/probes/p3/tree`, since removed).
     cannot be reached through `sign`.
 - check-pins P28 matches the bypass flags only as quoted literals, and
   skips comment lines, because the tool's docs name them.
+
+## Slice 2
+
+### D-5 — five descriptor ranges now, the sixth with `auditkey` (C4)
+
+- C4's sixth range is the audit envelope, and the `auditkey` PD that owns
+  it lands in slice 5. Slice 2 builds descriptor v3 with five ranges (the
+  three envelopes and the two slots), and slice 5 adds the sixth with its
+  pair cases.
+- Anti-Deferral: a sixth range sealed now would be a placeholder with no
+  owner and no test that can fail. The cost is one more descriptor
+  revision inside M8, and v3 is not released before M8 ends.
+
+### D-6 — the cap waits for `policy` only once `policy` exists (C3)
+
+- With the cap waiting on `policy_finished`, today's image, which has no
+  `policy` PD, would never cap, and every key PD would time out.
+- `layout::tpm::POLICY_PRESENT` gates that term. Slice 3 sets it to true
+  in the same commit that adds the PD, and a laws/layout test ties the
+  constant to the `.system` file.
+- Kani I3.1 is proved for both values.
+
+### D-7 — provisioning's TPM Clear ends the "same SRK twice" check
+
+- `run.py`'s `read_srk` provisions a copy of the state a second time and
+  requires the same SRK. With TPM2_Clear first (D5), the storage seed is
+  fresh each time, so the two SRKs differ by design.
+- That check becomes: the second provisioning's SRK differs from the
+  first. That is S18's "the SRK Name changed", now asserted on every
+  provisioning.
+
+### D-8 — C3's forbidden pattern is scoped (check-pins P29)
+
+- The plan's literal pattern `NV_?(UNDEFINE|WRITE|DEFINE)|Clear\b` over
+  `crates/` would match three things:
+  - the refused-set constants the gate needs (I3.2 lists them);
+  - the attribute names `NV_WRITTEN`/`NV_WRITELOCKED`;
+  - a comment ("Clear that stack").
+- P29 matches the command-code constants `CC_NV_{UNDEFINE_SPACE[_SPECIAL],
+  WRITE[_LOCK], DEFINE_SPACE}`, `CC_CLEAR` and `CC_HIERARCHY_CHANGE_AUTH`.
+  They are allowed only where they are defined, in the gate's refused set,
+  in that crate's tests and proofs, and in `crates/tpm2/tests` (the swtpm
+  interop tests drive swtpm directly).
+- It remains a tripwire. The control is the gate's per-client allowlist,
+  proved by Kani I3.2.
+
+### D-9 — slot ranges are exactly `BUNDLE_MAX`
+
+- The delegated boot.cmd and measure.py accepted any slot length up to
+  `BUNDLE_MAX`. U-Boot hashes the whole load slot for PCR 9, so a shorter
+  range would copy fewer bytes than it measures.
+- Both now require `len == BUNDLE_MAX`, as C1's "slot media is always
+  exactly `BUNDLE_MAX`" does. test_measure has the shorter and longer
+  denies, and its boot.cmd line check expects `-ne` for slots.
+
+### D-10 — the slot MRs and the `bundle_slot` laws kind land in slice 2
+
+- `tools/package` can only emit descriptor v3 when the system file has
+  the slot MRs. The laws refused them (L2: prefill only on secrets MRs;
+  L4: an MR not in the policy).
+- So the slot-MR part of C11 moved up from slice 3:
+  - the MR kind `bundle_slot` (prefill allowed, never mapped `w`/`x`,
+    readers listed);
+  - both slots declared with `readers = []` and mapped into no PD.
+- Slice 3 adds `policy` and the barrier PDs as readers.
+
+### Note — a delegated agent used `git stash` briefly
+
+- During slice 2, the Rust batch ran `git stash` / `git stash pop` once
+  while the provisioning batch was editing `tools/` and `tests/`. The
+  stash list is empty, and every file both batches reported is present.
+- The gates for this slice re-run every suite on the final tree.

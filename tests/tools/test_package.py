@@ -45,6 +45,8 @@ SYSTEM = """<system>
         <program_image path="pd-tlskey.elf" />
         <map mr="tls_secrets" vaddr="0x8_000_000" perms="r" />
     </protection_domain>
+    <memory_region name="policy_a" size="0x480000" prefill_path="slot-placeholder.bin" />
+    <memory_region name="policy_b" size="0x480000" prefill_path="slot-placeholder.bin" />
 </system>"""
 
 
@@ -83,6 +85,13 @@ import fip_fixture  # noqa: E402
 FLASH = fip_fixture.flash()
 PACKAGE_IMG = b"\x7fELF" + PAD + BLOB + PAD + PQ_BLOB + PAD + TLS_BLOB + PAD
 SPANS = f"{KEY_AT:#x}..{KEY_AT + len(BLOB):#x}, {PQ_AT:#x}..{PQ_END:#x}, {TLS_AT:#x}..{TLS_END:#x}"
+# The placeholder image `build` sees: the two bundle slots' zeros after the
+# envelopes' (M8 plan C4).
+SLOT = pkg.measure.BUNDLE_MAX
+SLOT_A_AT = len(PLACEHOLDER_IMG)
+SLOT_B_AT = SLOT_A_AT + SLOT + len(PAD)
+BUILD_IMG = PLACEHOLDER_IMG + bytes(SLOT) + PAD + bytes(SLOT) + PAD
+BUILD_SPANS = f"{SPANS}, {SLOT_A_AT:#x}..{SLOT_A_AT + SLOT:#x}, {SLOT_B_AT:#x}..{SLOT_B_AT + SLOT:#x}"
 GEN_DEBUG = "/* x */\n#define CONFIG_DEBUG_BUILD  1\n#define CONFIG_PRINTING  1\n" \
     "#define CONFIG_KERNEL_MCS  1\n#define CONFIG_MAX_NUM_NODES  1\n"
 GEN_RELEASE = "/* disabled: CONFIG_DEBUG_BUILD */\n/* disabled: CONFIG_PRINTING */\n" \
@@ -625,8 +634,9 @@ def build_case(variant=None):
     for: microkit puts each prefill where the placeholder image holds its
     zeros, seal writes a fake envelope. The blobs must reach seal only as
     private copies of the checked bytes and never reach microkit, the
-    descriptor must name where the stand-ins landed, PCR 8 must be the one
-    measure computes, and OUT must hold the six outputs alone. `variant`
+    descriptor must name where the stand-ins landed (the three envelopes and
+    the two bundle slots), PCR 8 must be the one measure computes, and OUT
+    must hold the outputs alone. `variant`
     breaks one step: "tamper" (the .system microkit consumed changes),
     "standin" (the stand-in image differs outside the ranges), "envelope"
     (seal writes the plaintext), "swap" (seal writes the secrets and the
@@ -646,8 +656,9 @@ def _build_case(variant):
     real_run = pkg.subprocess.run
     microkit_saw, sealed = [], {}
     try:
-        (d / "system.xml").write_text(SYSTEM)
-        (d / "placeholder.img").write_bytes(PLACEHOLDER_IMG)
+        (d / "slot.bin").write_bytes(bytes(SLOT))
+        (d / "system.xml").write_text(SYSTEM.replace("slot-placeholder.bin", str(d / "slot.bin")))
+        (d / "placeholder.img").write_bytes(BUILD_IMG)
         (d / "flash.bin").write_bytes(FLASH)
         staging = d / "staging"
         staging.mkdir()
@@ -668,8 +679,9 @@ def _build_case(variant):
             if cmd[0] == "cargo":
                 return
             system = pathlib.Path(cmd[1])
-            img = bytearray(PLACEHOLDER_IMG)
-            for mr, at in (("secrets", KEY_AT), ("pq_secrets", PQ_AT), ("tls_secrets", TLS_AT)):
+            img = bytearray(BUILD_IMG)
+            for mr, at in (("secrets", KEY_AT), ("pq_secrets", PQ_AT), ("tls_secrets", TLS_AT),
+                           ("policy_a", SLOT_A_AT), ("policy_b", SLOT_B_AT)):
                 prefill = [m.get("prefill_path") for m in pkg.ET.fromstring(system.read_text())
                            .iter("memory_region") if m.get("name") == mr][0]
                 data = pathlib.Path(prefill).read_bytes()
@@ -696,12 +708,15 @@ def _build_case(variant):
         errors = [] if status == 0 else [f"build failed ({status}): {captured.getvalue()}"]
         if any(data in (BLOB, PQ_BLOB, TLS_BLOB) for data in microkit_saw):
             errors.append("a blob reached microkit")
-        if len(microkit_saw) != 6:
-            errors.append(f"microkit saw {len(microkit_saw)} prefills, want two builds of three")
+        if len(microkit_saw) != 10:
+            errors.append(f"microkit saw {len(microkit_saw)} prefills, want two builds of five")
+        if microkit_saw[8:] != [bytes(SLOT)] * 2:
+            errors.append("the envelope build's slots are not the placeholder's zeros")
         desc = (staging / "boot.desc").read_bytes() if (staging / "boot.desc").exists() else b""
-        if desc and pkg.measure.parse(desc)[1] != [(KEY_AT, len(BLOB)), (PQ_AT, len(PQ_BLOB)), (TLS_AT, len(TLS_BLOB))]:
+        if desc and pkg.measure.parse(desc)[1] != [(KEY_AT, len(BLOB)), (PQ_AT, len(PQ_BLOB)), (TLS_AT, len(TLS_BLOB)),
+                                                   (SLOT_A_AT, SLOT), (SLOT_B_AT, SLOT)]:
             errors.append(f"descriptor ranges {pkg.measure.parse(desc)[1]}")
-        want_pcrs = pkg.measure.expected_pcrs(FLASH, desc, PLACEHOLDER_IMG) if desc else []
+        want_pcrs = pkg.measure.expected_pcrs(FLASH, desc, BUILD_IMG) if desc else []
         for mr in pkg.SECRETS_MRS:
             path, data, srk, pcrs = sealed.get(mr, ("", b"", b"", ""))
             if not path.startswith(str(staging)) or data != BLOBS[mr]:
@@ -717,7 +732,7 @@ def _build_case(variant):
             errors.append("pcrs are not the firmware's, the descriptor's and the published image's")
         if (staging / "flash.bin").exists() and (staging / "flash.bin").read_bytes() != FLASH:
             errors.append("flash.bin is not the firmware the PCRs came from")
-        if (staging / "published.img").exists() and (staging / "published.img").read_bytes() != PLACEHOLDER_IMG:
+        if (staging / "published.img").exists() and (staging / "published.img").read_bytes() != BUILD_IMG:
             errors.append("published.img is not the published image")
         return errors
     finally:
@@ -771,18 +786,20 @@ IMAGE_BLOBS = [BLOB, PQ_BLOB, TLS_BLOB]
 # for accept; check)
 def assembly(tamper=False):
     """check_assembly (M5 plan C8 F2) on a synthetic image: the image built
-    with the envelopes is the published one with each at its range."""
+    with the envelopes is the published one with each at its range, the
+    slots' zeros left as they were."""
     def run():
         key, pq, tls = b"K" * 0x100, b"Q" * 0x200, b"T" * 0x100
-        published = bytes(0x1000)
+        published = bytes(0x1000 + 2 * SLOT)
         built = bytearray(published)
         built[0x400:0x500] = key
         built[0x800:0xa00] = pq
         built[0xc00:0xd00] = tls
         if tamper:
             built[0x10] = 1
-        desc = pkg.measure.pack(len(published), [(0x400, 0x100), (0x800, 0x200), (0xc00, 0x100)])
-        return pkg.check_assembly(published, desc, [key, pq, tls], bytes(built))
+        desc = pkg.measure.pack(len(published), [(0x400, 0x100), (0x800, 0x200), (0xc00, 0x100),
+                                                 (0x1000, SLOT), (0x1000 + SLOT, SLOT)])
+        return pkg.check_assembly(published, desc, [key, pq, tls, bytes(SLOT), bytes(SLOT)], bytes(built))
     return run
 
 
@@ -914,6 +931,13 @@ CASES = [
     ("package system without the tls mr's prefill_path",
      ["package: package system needs one 'tls_secrets' mr with a prefill_path"],
      lambda: pkg.check_systems(SYSTEM, package_system().replace('prefill_path="/elsewhere/tls.bin"', 'prefill_path=""'))),
+    ("package system without a bundle slot's prefill_path",
+     ["package: package system needs one 'policy_b' mr with a prefill_path"],
+     lambda: pkg.check_systems(SYSTEM, package_system().replace(
+         '<memory_region name="policy_b" size="0x480000" prefill_path="slot-placeholder.bin" />',
+         '<memory_region name="policy_b" size="0x480000" prefill_path="" />'))),
+    ("a bundle slot's prefill_path swapped for a stand-in is accepted", None,
+     lambda: pkg.check_systems(SYSTEM, pkg.with_prefill(package_system(), {"policy_a": "/elsewhere/standin.bin"}))),
     ("element added", "children",
      lambda: pkg.check_systems(SYSTEM, package_system().replace("</system>", '<memory_region name="x" size="0x1000" /></system>'))),
     # Only release kernels (M5 plan C7), judged from gen_config.h.
@@ -1011,12 +1035,12 @@ CASES = [
     ("staging that resolves into a forbidden root is refused", None, staging_in_forbidden_root),
     ("a failed staging removal fails loudly", None, failed_staging_removal_is_reported),
     ("a signal during the staging removal waits for it", None, signal_during_removal_does_not_cut_it_short),
-    ("the blobs are sealed from private copies, never reach microkit, and OUT holds the six outputs", None,
+    ("the blobs are sealed from private copies, never reach microkit, and OUT holds the outputs", None,
      build_case()),
     ("a consumed .system that differs from the generated one is refused",
      ["package: system/protection_domain[3]: attributes of <protection_domain> changed"], build_case("tamper")),
     ("a stand-in image that differs outside the ranges is refused",
-     [f"package: image differs outside the blobs (0x2..0x2 vs {SPANS})"], build_case("standin")),
+     [f"package: image differs outside the blobs (0x2..0x2 vs {BUILD_SPANS})"], build_case("standin")),
     ("an envelope that is not sealed is refused",
      ["package: 'secrets' envelope has no SOSSEAL1 magic", "package: 'pq_secrets' envelope has no SOSSEAL1 magic",
       "package: 'tls_secrets' envelope has no SOSSEAL1 magic"],

@@ -6,9 +6,14 @@
 //! domains), one flow per client and one flow at a time (Busy), and the
 //! cap of PCR 8 once every client sent Done or Failed, and the cap status
 //! each Done client asks for before it releases its key (post-M6 plan P3).
-//! The TIS FIFO is polled with bounded CNTPCT timeouts, so a device that
-//! stops answering gets the caller an error reply, never a hang. No audit
-//! channel and no console: what happened shows in the clients' replies.
+//! The `policy` PD (M8 plan C3) is served on a channel of its own with four
+//! high-level requests, never a TPM command: the gate reads, checks and
+//! advances the anti-rollback indices itself, against the Names compiled
+//! into `config`, and with `layout::tpm::POLICY_PRESENT` the cap also waits
+//! for its Done or Failed. The TIS FIFO is polled with bounded CNTPCT
+//! timeouts, so a device that stops answering gets the caller an error
+//! reply, never a hang. No audit channel and no console: what happened shows
+//! in the clients' replies.
 
 #![no_std]
 #![no_main]
@@ -19,13 +24,16 @@ use layout::tpm::{self as ipc, MSG_BYTES, MSG_WORDS};
 use sel4_microkit::{
     Channel, Handler, Infallible, MessageInfo, protection_domain, var, with_msg_regs, with_msg_regs_mut,
 };
-use tpm2_wire::gate::{CLIENTS, CapStatus, CapTransport, CapVerdict, Gate, Refusal};
+use tpm2_wire::gate::{CLIENTS, CapStatus, CapTransport, CapVerdict, Gate, PolicyRefusal, PolicyTransport, Refusal};
 
 const _: () = assert!(MSG_BYTES == tpm2_wire::IPC_MSG_BYTES);
 
 const KEY: Channel = Channel::new(ipc::CH_KEY);
 const PQKEY: Channel = Channel::new(ipc::CH_PQKEY);
 const TLSKEY: Channel = Channel::new(ipc::CH_TLSKEY);
+/// Not in the system until the `policy` PD is (M8 slice 3): no PPC arrives
+/// on it before then.
+const POLICY: Channel = Channel::new(ipc::CH_POLICY);
 
 /// The gate's client index of each caller.
 fn client(channel: Channel) -> Option<usize> {
@@ -206,6 +214,20 @@ impl CapTransport for CapDevice<'_> {
     }
 }
 
+/// The policy operations on the TIS. Each command waits as a client's does
+/// (no overall deadline beyond the TIS timeouts).
+struct PolicyDevice<'t> {
+    tis: &'t Tis,
+    rsp: &'t mut [u8; MSG_BYTES],
+}
+
+impl PolicyTransport for PolicyDevice<'_> {
+    fn transact(&mut self, cmd: &[u8]) -> Option<&[u8]> {
+        let n = self.tis.transact(cmd, self.rsp, u64::MAX).ok()?;
+        self.rsp.get(..n)
+    }
+}
+
 /// RSP_REFUSED's arg. Busy is never a refusal: it is answered RSP_BUSY.
 const fn refusal_code(r: Refusal) -> usize {
     match r {
@@ -222,6 +244,22 @@ const fn refusal_code(r: Refusal) -> usize {
     }
 }
 const _: () = assert!(ipc::REFUSED_CAP_FAILED > refusal_code(Refusal::NotDone));
+
+/// RSP_REFUSED's arg on the policy channel: above every raw refusal's and
+/// the cap's.
+const fn policy_code(r: PolicyRefusal) -> usize {
+    match r {
+        PolicyRefusal::Absent => 12,
+        PolicyRefusal::Capped => 13,
+        PolicyRefusal::Finished => 14,
+        PolicyRefusal::Order => 15,
+        PolicyRefusal::Name => 16,
+        PolicyRefusal::Range => 17,
+        PolicyRefusal::Stale => 18,
+        PolicyRefusal::Device => 19,
+    }
+}
+const _: () = assert!(policy_code(PolicyRefusal::Absent) > ipc::REFUSED_CAP_FAILED);
 
 /// The reply to the Done (or Failed) that ran the cap, and to the cap
 /// status once it ran: a cap the device did not confirm is answered as a
@@ -273,6 +311,57 @@ impl Tpm {
         }
     }
 
+    /// The reply to one policy request, its bytes in `self.rsp`.
+    fn policy(&mut self, label: u64, words: &[u64]) -> u64 {
+        let len = ipc::arg(label);
+        let refused = |r| ipc::label(ipc::RSP_REFUSED, policy_code(r));
+        match ipc::kind(label) {
+            ipc::REQ_POLICY_STATE if len == 0 && words.is_empty() => {
+                let r = self.gate.policy_state(&mut PolicyDevice { tis: &self.tis, rsp: &mut self.rsp });
+                self.rsp.fill(0);
+                match r {
+                    Ok(s) => self.reply(&ipc::encode_state(s.current, &s.pcr9)),
+                    Err(r) => refused(r),
+                }
+            }
+            ipc::REQ_POLICY_ADVANCE if len == ipc::POLICY_VALUE_LEN && words.len() == ipc::words(len) => {
+                let mut value = [0u8; ipc::POLICY_VALUE_LEN];
+                let Some(expected) = ipc::unpack(words, len, &mut value).and_then(|()| ipc::decode_value(&value)) else {
+                    return ipc::label(ipc::RSP_BAD_REQUEST, 0);
+                };
+                let r = self.gate.policy_advance(expected, &mut PolicyDevice { tis: &self.tis, rsp: &mut self.rsp });
+                self.rsp.fill(0);
+                match r {
+                    Ok(v) => self.reply(&v.to_le_bytes()),
+                    Err(r) => refused(r),
+                }
+            }
+            // The cap's verdict, if this ran it, reaches the key PDs through
+            // their cap barrier; `policy` holds no key to withhold.
+            ipc::REQ_POLICY_DONE | ipc::REQ_POLICY_FAILED if len == 0 && words.is_empty() => {
+                match self.gate.policy_finish() {
+                    Ok(()) => {
+                        let _ = self.cap();
+                        ipc::label(ipc::RSP_OK, 0)
+                    }
+                    Err(r) => refused(r),
+                }
+            }
+            _ => ipc::label(ipc::RSP_BAD_REQUEST, 0),
+        }
+    }
+
+    /// Puts `bytes` in `self.rsp` and labels them RSP_OK.
+    fn reply(&mut self, bytes: &[u8]) -> u64 {
+        match self.rsp.get_mut(..bytes.len()) {
+            Some(dst) => {
+                dst.copy_from_slice(bytes);
+                ipc::label(ipc::RSP_OK, bytes.len())
+            }
+            None => ipc::label(ipc::RSP_BAD_REQUEST, 0),
+        }
+    }
+
     fn command(&mut self, client: usize, len: usize) -> u64 {
         let cmd = self.cmd.get(..len).unwrap_or(&[]);
         let fwd = match self.gate.command(client, cmd) {
@@ -315,7 +404,8 @@ fn init() -> Tpm {
 fn start() -> Tpm {
     let vaddr = *var!(tpm_mmio_vaddr: usize = 0);
     let base = NonNull::new(vaddr as *mut u8).unwrap_or_else(|| panic!("tpm: no mmio mapping"));
-    Tpm { tis: Tis { base }, gate: Gate::new(), cmd: [0; MSG_BYTES], rsp: [0; MSG_BYTES] }
+    let gate = Gate::with_policy(ipc::POLICY_PRESENT, config::NV_CTR_NAME, config::NV_BASE_NAME);
+    Tpm { tis: Tis { base }, gate, cmd: [0; MSG_BYTES], rsp: [0; MSG_BYTES] }
 }
 
 impl Handler for Tpm {
@@ -324,16 +414,20 @@ impl Handler for Tpm {
     fn protected(&mut self, channel: Channel, msg_info: MessageInfo) -> Result<MessageInfo, Self::Error> {
         let mut words = [0u64; MSG_WORDS];
         let count = msg_info.count();
-        let label = match client(channel) {
-            Some(c) if count <= MSG_WORDS => {
-                with_msg_regs(|mrs| {
-                    for (dst, src) in words.iter_mut().zip(mrs.iter().take(count)) {
-                        *dst = *src;
-                    }
-                });
-                self.handle(c, msg_info.label(), words.get(..count).unwrap_or(&[]))
+        let served = client(channel).is_some() || channel == POLICY;
+        let label = if served && count <= MSG_WORDS {
+            with_msg_regs(|mrs| {
+                for (dst, src) in words.iter_mut().zip(mrs.iter().take(count)) {
+                    *dst = *src;
+                }
+            });
+            let words = words.get(..count).unwrap_or(&[]);
+            match client(channel) {
+                Some(c) => self.handle(c, msg_info.label(), words),
+                None => self.policy(msg_info.label(), words),
             }
-            _ => ipc::label(ipc::RSP_BAD_REQUEST, 0),
+        } else {
+            ipc::label(ipc::RSP_BAD_REQUEST, 0)
         };
         words.fill(0);
         let n = if ipc::kind(label) == ipc::RSP_OK {

@@ -2,7 +2,7 @@
 //! HMAC-SHA256, P-256 ECDH) and RustCrypto's `aes` (the block cipher; CFB
 //! is the few lines below): KDFa (SP 800-108 counter mode, §11.4.10.2),
 //! KDFe (SP 800-56A concatenation KDF, §11.4.10.3), CFB-128 (§11.4.6.3),
-//! the policy digest and object Names.
+//! the policy digest, and object and NV index Names.
 //!
 //! libcrux's and `aes`' internal stack state (hash states, HMAC pads) is
 //! not zeroized by them; values owned here are. `aes` wipes its round keys
@@ -14,8 +14,8 @@ use aes::cipher::{BlockEncrypt, KeyInit};
 use libcrux_p256::P256;
 use libcrux_p256::ecdh_api::EcdhArrayref;
 use libcrux_sha2::{Digest, Sha256};
-use tpm2_wire::{ALG_SHA256, CC_POLICY_AUTH_VALUE, CC_POLICY_PCR, COORD_LEN, DIGEST_LEN, NAME_LEN, POLICY_PCR_COUNT,
-    POLICY_PCR_SELECTION};
+use tpm2_wire::{ALG_SHA256, CC_POLICY_AUTH_VALUE, CC_POLICY_PCR, COORD_LEN, DIGEST_LEN, NAME_LEN, NV_PUBLIC_LEN,
+    POLICY_PCR_COUNT, POLICY_PCR_SELECTION};
 use zeroize::Zeroize;
 
 use crate::Secret;
@@ -132,6 +132,15 @@ pub fn name(public: &[u8]) -> [u8; NAME_LEN] {
     alg.copy_from_slice(&ALG_SHA256.to_be_bytes());
     digest.copy_from_slice(&sha256(&[public]));
     out
+}
+
+/// An NV index's Name (M8 plan C3): nameAlg ‖ SHA-256(TPMS_NV_PUBLIC) of
+/// a SHA-256 index with these attributes, authPolicy and size; what
+/// `tools/provision` compiles into `[policy]` and `tpm` compares.
+pub fn nv_name(index: u32, attributes: u32, auth_policy: &[u8; DIGEST_LEN], data_size: u16) -> Option<[u8; NAME_LEN]> {
+    let mut public = [0u8; NV_PUBLIC_LEN];
+    tpm2_wire::nv_public(&mut public, index, attributes, auth_policy, data_size)?;
+    Some(name(&public))
 }
 
 /// The values of PCRs 0-8, in index order: what the seal policy names.

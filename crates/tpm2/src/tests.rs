@@ -66,6 +66,25 @@ fn kdfa_matches_sp800_108_counter_mode_known_answers() {
     );
 }
 
+/// The NV Names of the policy indices as they are once provisioned (M8
+/// plan C3): known answers from P1's host twin (build/probes/p1/twin.py,
+/// Python hashlib) for authPolicy ab..ab.
+#[test]
+fn nv_name_matches_the_twin_known_answers() {
+    use tpm2_wire::{
+        NV_BASE_ATTRIBUTES, NV_CTR_ATTRIBUTES, NV_DATA_SIZE, NV_POLICY_BASE, NV_POLICY_CTR, NV_WRITELOCKED, NV_WRITTEN,
+    };
+    let policy = [0xAB; 32];
+    assert_eq!(
+        crypto::nv_name(NV_POLICY_CTR, NV_CTR_ATTRIBUTES | NV_WRITTEN, &policy, NV_DATA_SIZE),
+        Some(hex::<34>("000bb1bc34e6976a38820737bb36fd15c768a51a097b18d6e4051b5c96e20262d55d"))
+    );
+    let base = crypto::nv_name(NV_POLICY_BASE, NV_BASE_ATTRIBUTES | NV_WRITTEN | NV_WRITELOCKED, &policy, NV_DATA_SIZE);
+    assert_eq!(base, Some(hex::<34>("000b0dda273320c428f1eac791a8ce016190f2724ac61ba6c2c0ca32edd300300061")));
+    // WRITELOCKED is in the Name: the unlocked base does not match.
+    assert_ne!(crypto::nv_name(NV_POLICY_BASE, NV_BASE_ATTRIBUTES | NV_WRITTEN, &policy, NV_DATA_SIZE), base);
+}
+
 #[test]
 fn kdfe_matches_sp800_56a_concatenation_kdf_known_answer() {
     let mut out = Secret::<32>::zero();

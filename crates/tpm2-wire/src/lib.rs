@@ -1,9 +1,10 @@
 //! TPM 2.0 marshalling for the one flow kozane runs (M5 plan C9, C10):
 //! the commands of an offline-sealed unseal (CreatePrimary →
 //! StartAuthSession → PolicyPCR → PolicyAuthValue → Import → Load → Unseal
-//! → FlushContext), PCR_Read and the cap's PCR_Extend, their response
-//! parsers, the two public areas the flow uses, and the `tpm` PD's gate
-//! ([`gate`]). Free of cryptography, so that Kani checks it without
+//! → FlushContext), PCR_Read and the cap's PCR_Extend, the policy state's
+//! NV_ReadPublic, NV_Read, NV_Increment and PCR 9 read (M8 plan C3), their
+//! response parsers, the public areas the flow and the NV indices use, and
+//! the `tpm` PD's gate ([`gate`]). Free of cryptography, so that Kani checks it without
 //! compiling libcrux; the session crypto is the `tpm2` crate's.
 //!
 //! Every parser is total and checks every length: the TPM bus is A7's.
@@ -37,6 +38,18 @@ pub const CC_START_AUTH_SESSION: u32 = 0x176;
 pub const CC_PCR_READ: u32 = 0x17E;
 pub const CC_POLICY_PCR: u32 = 0x17F;
 pub const CC_PCR_EXTEND: u32 = 0x182;
+pub const CC_NV_INCREMENT: u32 = 0x134;
+pub const CC_NV_READ: u32 = 0x14E;
+pub const CC_NV_READ_PUBLIC: u32 = 0x169;
+/// Commands the device never issues (M8 plan C3, I3.2): named so the gate's
+/// refused set can list them.
+pub const CC_NV_UNDEFINE_SPACE_SPECIAL: u32 = 0x11F;
+pub const CC_NV_UNDEFINE_SPACE: u32 = 0x122;
+pub const CC_CLEAR: u32 = 0x126;
+pub const CC_HIERARCHY_CHANGE_AUTH: u32 = 0x129;
+pub const CC_NV_DEFINE_SPACE: u32 = 0x12A;
+pub const CC_NV_WRITE: u32 = 0x137;
+pub const CC_NV_WRITE_LOCK: u32 = 0x138;
 
 pub const RH_OWNER: u32 = 0x4000_0001;
 pub const RH_NULL: u32 = 0x4000_0007;
@@ -64,6 +77,11 @@ pub const POLICY_PCR_COUNT: usize = 9;
 pub const POLICY_PCR_SELECTION: [u8; 10] = [0, 0, 0, 1, 0x00, 0x0B, 3, 0xFF, 0x01, 0x00];
 /// TPML_PCR_SELECTION {sha256: {8}}: the cap's PCR_Read.
 pub const CAP_PCR_SELECTION: [u8; 10] = [0, 0, 0, 1, 0x00, 0x0B, 3, 0x00, 0x01, 0x00];
+/// The PCR U-Boot extends with both policy slots' digests (M8 plan D3):
+/// measured, not sealed to.
+pub const SLOT_PCR_INDEX: u32 = 9;
+/// TPML_PCR_SELECTION {sha256: {9}}: the policy state's PCR_Read.
+pub const SLOT_PCR_SELECTION: [u8; 10] = [0, 0, 0, 1, 0x00, 0x0B, 3, 0x00, 0x02, 0x00];
 
 // I4.2: the cap reads a subset of what the policy names, on the same bank
 // and header, and the policy's bitmap names PCRs 0-8, POLICY_PCR_COUNT of
@@ -75,6 +93,33 @@ const _: () = {
     assert!(c7 & !p7 == 0 && c8 & !p8 == 0 && c9 & !p9 == 0);
     assert!(p7 == 0xFF && p8 == 0x01 && p9 == 0x00 && POLICY_PCR_COUNT == 9);
 };
+
+// M8 plan D3: PCR 9 is read on the same bank and header, and the seal
+// policy does not name it.
+const _: () = {
+    let [p0, p1, p2, p3, p4, p5, p6, p7, p8, p9] = POLICY_PCR_SELECTION;
+    let [s0, s1, s2, s3, s4, s5, s6, s7, s8, s9] = SLOT_PCR_SELECTION;
+    assert!(p0 == s0 && p1 == s1 && p2 == s2 && p3 == s3 && p4 == s4 && p5 == s5 && p6 == s6);
+    assert!(s7 & p7 == 0 && s8 & p8 == 0 && s9 & p9 == 0 && s7 == 0 && s8 == 0x02 && s9 == 0);
+    assert!(SLOT_PCR_INDEX == 9);
+};
+
+/// The policy anti-rollback indices (M8 plan C3, D2): the counter and its
+/// write-locked base; the logical version is `counter - base` (wrapping).
+pub const NV_POLICY_CTR: u32 = 0x0150_0100;
+pub const NV_POLICY_BASE: u32 = 0x0150_0101;
+/// TPMA_NV of the counter as defined (P1): TPM_NT_COUNTER, AUTHWRITE,
+/// AUTHREAD, NO_DA, POLICY_DELETE, PLATFORMCREATE.
+pub const NV_CTR_ATTRIBUTES: u32 = 0x4204_0414;
+/// The base: the same bits with WRITEDEFINE, an ordinary index.
+pub const NV_BASE_ATTRIBUTES: u32 = 0x4204_2404;
+/// Set by the TPM once the index is written (the counter's first increment,
+/// the base's write); both are in the Name `tpm` expects.
+pub const NV_WRITTEN: u32 = 0x2000_0000;
+/// Set on the base by its NV_WriteLock; in its expected Name.
+pub const NV_WRITELOCKED: u32 = 0x0000_0800;
+/// Both indices hold a big-endian u64.
+pub const NV_DATA_SIZE: u16 = 8;
 
 pub const HEADER_LEN: usize = 10;
 pub const DIGEST_LEN: usize = 32;
@@ -145,6 +190,15 @@ pub const UNSEAL_CMD_LEN: usize = HEADER_LEN + 4 + 4 + POLICY_SESSION_LEN;
 pub const FLUSH_CONTEXT_CMD_LEN: usize = HEADER_LEN + 4;
 pub const PCR_READ_CMD_LEN: usize = HEADER_LEN + CAP_PCR_SELECTION.len();
 pub const PCR_EXTEND_CMD_LEN: usize = HEADER_LEN + 4 + PW_AUTH_LEN + 4 + 2 + DIGEST_LEN;
+pub const NV_READ_PUBLIC_CMD_LEN: usize = HEADER_LEN + 4;
+pub const NV_READ_CMD_LEN: usize = HEADER_LEN + 8 + PW_AUTH_LEN + 2 + 2;
+pub const NV_INCREMENT_CMD_LEN: usize = HEADER_LEN + 8 + PW_AUTH_LEN;
+/// TPMS_NV_PUBLIC with a SHA-256 authPolicy: nvIndex, nameAlg, attributes,
+/// authPolicy (32), dataSize.
+pub const NV_PUBLIC_LEN: usize = 4 + 2 + 4 + 2 + DIGEST_LEN + 2;
+/// The longest TPMS_NV_PUBLIC NV_ReadPublic may return (an authPolicy up to
+/// `MAX_DIGEST`); the gate compares the Name, not this.
+pub const MAX_NV_PUBLIC: usize = 4 + 2 + 4 + 2 + MAX_DIGEST + 2;
 
 const fn max(a: usize, b: usize) -> usize {
     if a > b { a } else { b }
@@ -155,7 +209,10 @@ pub const MAX_COMMAND: usize = max(
     max(max(CREATE_PRIMARY_CMD_LEN, START_AUTH_SESSION_CMD_LEN), max(POLICY_PCR_CMD_LEN, POLICY_AUTH_VALUE_CMD_LEN)),
     max(
         max(max(IMPORT_CMD_LEN, MAX_LOAD_CMD_LEN), max(UNSEAL_CMD_LEN, FLUSH_CONTEXT_CMD_LEN)),
-        max(PCR_READ_CMD_LEN, PCR_EXTEND_CMD_LEN),
+        max(
+            max(PCR_READ_CMD_LEN, PCR_EXTEND_CMD_LEN),
+            max(NV_READ_PUBLIC_CMD_LEN, max(NV_READ_CMD_LEN, NV_INCREMENT_CMD_LEN)),
+        ),
     ),
 );
 
@@ -431,11 +488,20 @@ pub fn flush_context(out: &mut [u8], handle: u32) -> Option<usize> {
     w.finish()
 }
 
-pub fn pcr_read(out: &mut [u8]) -> Option<usize> {
+fn pcr_read_of(out: &mut [u8], selection: &[u8; 10]) -> Option<usize> {
     let mut w = Writer::new(out);
     header(&mut w, ST_NO_SESSIONS, CC_PCR_READ)?;
-    w.bytes(&CAP_PCR_SELECTION)?;
+    w.bytes(selection)?;
     w.finish()
+}
+
+pub fn pcr_read(out: &mut [u8]) -> Option<usize> {
+    pcr_read_of(out, &CAP_PCR_SELECTION)
+}
+
+/// PCR_Read of PCR 9 alone (M8 plan C3's STATE).
+pub fn slot_pcr_read(out: &mut [u8]) -> Option<usize> {
+    pcr_read_of(out, &SLOT_PCR_SELECTION)
 }
 
 /// TPM2_PCR_Extend of PCR 8's sha256 bank with `digest`.
@@ -447,6 +513,38 @@ pub fn pcr_extend(out: &mut [u8], digest: &[u8; DIGEST_LEN]) -> Option<usize> {
     w.u32(1)?;
     w.u16(ALG_SHA256)?;
     w.bytes(digest)?;
+    w.finish()
+}
+
+/// TPM2_NV_ReadPublic of `index`: no sessions, no authorization.
+pub fn nv_read_public(out: &mut [u8], index: u32) -> Option<usize> {
+    let mut w = Writer::new(out);
+    header(&mut w, ST_NO_SESSIONS, CC_NV_READ_PUBLIC)?;
+    w.u32(index)?;
+    w.finish()
+}
+
+/// TPM2_NV_Read of `index`'s 8 bytes from offset 0, authorized by the index
+/// itself (AUTHREAD) with the empty password.
+pub fn nv_read(out: &mut [u8], index: u32) -> Option<usize> {
+    let mut w = Writer::new(out);
+    header(&mut w, ST_SESSIONS, CC_NV_READ)?;
+    w.u32(index)?;
+    w.u32(index)?;
+    pw_auth(&mut w)?;
+    w.u16(NV_DATA_SIZE)?;
+    w.u16(0)?;
+    w.finish()
+}
+
+/// TPM2_NV_Increment of the counter `index`, authorized by the index itself
+/// (AUTHWRITE) with the empty password.
+pub fn nv_increment(out: &mut [u8], index: u32) -> Option<usize> {
+    let mut w = Writer::new(out);
+    header(&mut w, ST_SESSIONS, CC_NV_INCREMENT)?;
+    w.u32(index)?;
+    w.u32(index)?;
+    pw_auth(&mut w)?;
     w.finish()
 }
 
@@ -605,9 +703,18 @@ pub fn parse_unseal(bytes: &[u8]) -> Result<UnsealRsp<'_>, RspError> {
 /// PCR_Read of PCR 8 (sha256): the selection must come back as asked, with
 /// one digest.
 pub fn parse_pcr_read(bytes: &[u8]) -> Result<&[u8; DIGEST_LEN], RspError> {
+    parse_pcr_read_of(bytes, &CAP_PCR_SELECTION)
+}
+
+/// PCR_Read of PCR 9 (sha256), as `parse_pcr_read`.
+pub fn parse_slot_pcr_read(bytes: &[u8]) -> Result<&[u8; DIGEST_LEN], RspError> {
+    parse_pcr_read_of(bytes, &SLOT_PCR_SELECTION)
+}
+
+fn parse_pcr_read_of<'a>(bytes: &'a [u8], selection: &[u8; 10]) -> Result<&'a [u8; DIGEST_LEN], RspError> {
     let mut r = response_header(bytes, ST_NO_SESSIONS)?;
     r.u32()?; // pcrUpdateCounter
-    if r.array::<10>()? != &CAP_PCR_SELECTION {
+    if r.array::<10>()? != selection {
         return Err(RspError::Malformed);
     }
     if r.u32()? != 1 {
@@ -625,6 +732,60 @@ pub fn parse_pcr_read(bytes: &[u8]) -> Result<&[u8; DIGEST_LEN], RspError> {
 pub fn parse_pcr_extend(bytes: &[u8]) -> Result<(), RspError> {
     let s = password_response(bytes, false)?;
     if s.params.is_empty() { Ok(()) } else { Err(RspError::Malformed) }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NvReadPublicRsp<'a> {
+    /// TPMS_NV_PUBLIC.
+    pub public: &'a [u8],
+    pub name: &'a [u8],
+}
+
+/// NV_ReadPublic's response: the public area and the Name the TPM computed
+/// over it. The caller compares the Name with the one it expects.
+pub fn parse_nv_read_public(bytes: &[u8]) -> Result<NvReadPublicRsp<'_>, RspError> {
+    let mut r = response_header(bytes, ST_NO_SESSIONS)?;
+    let public = r.tpm2b(MAX_NV_PUBLIC)?;
+    let name = r.tpm2b(NAME_LEN)?;
+    r.end()?;
+    Ok(NvReadPublicRsp { public, name })
+}
+
+/// NV_Read's response (a password session): exactly `NV_DATA_SIZE` bytes,
+/// as the big-endian u64 the indices hold.
+pub fn parse_nv_read(bytes: &[u8]) -> Result<u64, RspError> {
+    let s = password_response(bytes, false)?;
+    let mut r = Reader::new(s.params);
+    if r.u16()? != NV_DATA_SIZE {
+        return Err(RspError::Malformed);
+    }
+    let value = u64::from_be_bytes(*r.array::<8>()?);
+    r.end()?;
+    Ok(value)
+}
+
+/// NV_Increment's response (a password session, no parameters).
+pub fn parse_nv_increment(bytes: &[u8]) -> Result<(), RspError> {
+    let s = password_response(bytes, false)?;
+    if s.params.is_empty() { Ok(()) } else { Err(RspError::Malformed) }
+}
+
+/// Writes TPMS_NV_PUBLIC of a SHA-256 index: what its Name hashes (the
+/// `tpm2` crate computes the Name; this crate has no hash).
+pub fn nv_public(
+    out: &mut [u8; NV_PUBLIC_LEN],
+    index: u32,
+    attributes: u32,
+    auth_policy: &[u8; DIGEST_LEN],
+    data_size: u16,
+) -> Option<()> {
+    let mut w = Writer::new(out);
+    w.u32(index)?;
+    w.u16(ALG_SHA256)?;
+    w.u32(attributes)?;
+    w.tpm2b(auth_policy)?;
+    w.u16(data_size)?;
+    (w.len() == NV_PUBLIC_LEN).then_some(())
 }
 
 /// The SRK's public point, if `public` is the SRK template's public area

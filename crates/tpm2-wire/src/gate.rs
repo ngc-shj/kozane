@@ -32,15 +32,32 @@
 //!   before it releases its key: Pending until the cap has run, then its
 //!   verdict. Every other client is refused, so a domain whose flow failed
 //!   holds no key to release anyway.
+//! - The `policy` client (M8 plan C3) is not a raw client: it sends no TPM
+//!   command. The gate runs its four operations itself on the device
+//!   ([`PolicyTransport`]): State (NV_ReadPublic of both indices, each Name
+//!   compared with the expected one, NV_Read of both, PCR_Read of PCR 9),
+//!   at most one Advance (the same reads, NV_Increment of the counter only
+//!   if the version is the one the client expects, the reads again), then
+//!   Done or Failed. They use no handle slot and no flow, so they
+//!   interleave with the raw flows. Each operation is spent when it starts,
+//!   so a failed State allows no Advance and no Advance runs twice: at most
+//!   one increment per boot.
+//! - With a `policy` PD in the system (`policy_present`, M8 deviation D-6)
+//!   the cap also waits for its Done or Failed; without one, every policy
+//!   operation is refused and the cap is exactly the M7 one.
 //!
 //! The device's responses are A7's: a handle that is not of the expected
 //! kind, or that is already recorded, fails the client instead of being
 //! recorded.
 
 use crate::{
-    CC_CREATE_PRIMARY, CC_FLUSH_CONTEXT, CC_IMPORT, CC_LOAD, CC_PCR_READ, CC_POLICY_AUTH_VALUE, CC_POLICY_PCR,
-    CC_START_AUTH_SESSION, CC_UNSEAL, DIGEST_LEN, IPC_MSG_BYTES, PCR_EXTEND_CMD_LEN, RH_NULL, RH_OWNER, RS_PW, Reader,
-    ST_NO_SESSIONS, ST_SESSIONS, parse_pcr_extend,
+    CC_CLEAR, CC_CREATE_PRIMARY, CC_FLUSH_CONTEXT, CC_HIERARCHY_CHANGE_AUTH, CC_IMPORT, CC_LOAD, CC_NV_DEFINE_SPACE,
+    CC_NV_INCREMENT, CC_NV_READ, CC_NV_READ_PUBLIC, CC_NV_UNDEFINE_SPACE, CC_NV_UNDEFINE_SPACE_SPECIAL, CC_NV_WRITE,
+    CC_NV_WRITE_LOCK, CC_PCR_EXTEND, CC_PCR_READ, CC_POLICY_AUTH_VALUE, CC_POLICY_PCR, CC_START_AUTH_SESSION, CC_UNSEAL,
+    DIGEST_LEN, IPC_MSG_BYTES, NAME_LEN, NV_INCREMENT_CMD_LEN, NV_POLICY_BASE, NV_POLICY_CTR, NV_READ_CMD_LEN,
+    NV_READ_PUBLIC_CMD_LEN, PCR_EXTEND_CMD_LEN, PCR_READ_CMD_LEN, RH_NULL, RH_OWNER, RS_PW, Reader, ST_NO_SESSIONS,
+    ST_SESSIONS, nv_increment, nv_read, nv_read_public, parse_nv_increment, parse_nv_read, parse_nv_read_public,
+    parse_pcr_extend, parse_slot_pcr_read, slot_pcr_read,
 };
 
 pub const CLIENTS: usize = 3;
@@ -107,6 +124,44 @@ pub const ALLOWED: [u32; 9] = [
     CC_PCR_READ,
 ];
 
+/// Commands no raw client may send (M8 plan C3, I3.2), each off
+/// `ALLOWED`: the device never defines, writes, deletes or clears, and the
+/// policy indices are read and incremented by the gate alone.
+pub const REFUSED: [u32; 10] = [
+    CC_NV_INCREMENT,
+    CC_NV_READ,
+    CC_NV_UNDEFINE_SPACE,
+    CC_NV_UNDEFINE_SPACE_SPECIAL,
+    CC_NV_WRITE,
+    CC_NV_WRITE_LOCK,
+    CC_NV_DEFINE_SPACE,
+    CC_CLEAR,
+    CC_HIERARCHY_CHANGE_AUTH,
+    CC_PCR_EXTEND,
+];
+
+/// Every command the policy operations send, all on the two policy indices
+/// or PCR 9; NV_Increment on the counter only.
+pub const POLICY_COMMANDS: [u32; 4] = [CC_NV_READ_PUBLIC, CC_NV_READ, CC_NV_INCREMENT, CC_PCR_READ];
+
+const fn listed(list: &[u32], cc: u32) -> bool {
+    match list {
+        [] => false,
+        [first, rest @ ..] => *first == cc || listed(rest, cc),
+    }
+}
+
+const fn disjoint(refused: &[u32], allowed: &[u32]) -> bool {
+    match refused {
+        [] => true,
+        [first, rest @ ..] => !listed(allowed, *first) && disjoint(rest, allowed),
+    }
+}
+
+const _: () = assert!(disjoint(&REFUSED, &ALLOWED));
+// `read_version` builds NV_ReadPublic and NV_Read in one buffer.
+const _: () = assert!(NV_READ_PUBLIC_CMD_LEN <= NV_READ_CMD_LEN);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
     Fresh,
@@ -138,6 +193,72 @@ pub enum Refusal {
     Busy,
     /// The cap status, asked by a client that has not sent Done.
     NotDone,
+}
+
+/// The device the policy operations go to (the `tpm` PD's TIS).
+pub trait PolicyTransport {
+    /// Sends `cmd` and returns the device's response, or None if the
+    /// device did not answer.
+    fn transact(&mut self, cmd: &[u8]) -> Option<&[u8]>;
+}
+
+/// Where the `policy` client is in its one sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyPhase {
+    /// Nothing asked yet: State is next.
+    Fresh,
+    /// State answered: Advance, Done or Failed.
+    Stated,
+    /// A State that failed, or an Advance (whatever its outcome): Done or
+    /// Failed only.
+    Spent,
+    /// Done or Failed: nothing more.
+    Finished,
+}
+
+/// Why a policy operation was refused. Every refusal of State or Advance
+/// is final for the boot: the operation is spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyRefusal {
+    /// The system has no `policy` PD (`policy_present` false).
+    Absent,
+    /// PCR 8 is capped.
+    Capped,
+    /// The client sent Done or Failed.
+    Finished,
+    /// Out of sequence: a second State, an Advance without a successful
+    /// State, or a second Advance.
+    Order,
+    /// An index's Name is not the expected one, or no Name is expected
+    /// (all zero: the configuration has no `[policy]`).
+    Name,
+    /// `counter - base` is above `u32::MAX`.
+    Range,
+    /// Advance's expected version is not the current one: no increment.
+    Stale,
+    /// The device did not answer, or answered an error or a malformed
+    /// response.
+    Device,
+}
+
+/// What State answers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PolicyState {
+    /// The logical version, `counter - base`.
+    pub current: u32,
+    pub pcr9: [u8; DIGEST_LEN],
+}
+
+/// One command to the device and its response, parsed by `parse` into an
+/// owned value; any failure is `Device`.
+fn exchange<T>(
+    device: &mut impl PolicyTransport,
+    cmd: Option<usize>,
+    buf: &[u8],
+    parse: impl FnOnce(&[u8]) -> Result<T, crate::RspError>,
+) -> Result<T, PolicyRefusal> {
+    let cmd = buf.get(..cmd.ok_or(PolicyRefusal::Device)?).ok_or(PolicyRefusal::Device)?;
+    parse(device.transact(cmd).ok_or(PolicyRefusal::Device)?).map_err(|_| PolicyRefusal::Device)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,6 +308,12 @@ pub struct Gate {
     capped: bool,
     /// The cap's verdict, set by `run_cap` alone.
     verdict: Option<CapVerdict>,
+    /// The system has a `policy` PD: its operations are served and the cap
+    /// waits for its Done or Failed (D-6).
+    policy_present: bool,
+    policy: PolicyPhase,
+    /// The expected Names of `NV_POLICY_CTR` and `NV_POLICY_BASE`.
+    names: [[u8; NAME_LEN]; 2],
 }
 
 impl Default for Gate {
@@ -205,8 +332,24 @@ fn kind_matches(kind: Kind, handle: u32) -> bool {
 }
 
 impl Gate {
+    /// A gate without a `policy` client: the M7 gate.
     pub const fn new() -> Self {
-        Self { states: [State::Fresh; CLIENTS], once: [0; CLIENTS], slots: [None; SLOTS], capped: false, verdict: None }
+        Self::with_policy(false, [0; NAME_LEN], [0; NAME_LEN])
+    }
+
+    /// A gate that serves the `policy` client iff `present`, expecting the
+    /// counter's and the base's Names `ctr_name` and `base_name`.
+    pub const fn with_policy(present: bool, ctr_name: [u8; NAME_LEN], base_name: [u8; NAME_LEN]) -> Self {
+        Self {
+            states: [State::Fresh; CLIENTS],
+            once: [0; CLIENTS],
+            slots: [None; SLOTS],
+            capped: false,
+            verdict: None,
+            policy_present: present,
+            policy: PolicyPhase::Fresh,
+            names: [ctr_name, base_name],
+        }
     }
 
     pub fn state(&self, client: usize) -> Option<State> {
@@ -215,6 +358,16 @@ impl Gate {
 
     pub fn is_capped(&self) -> bool {
         self.capped
+    }
+
+    pub fn policy_phase(&self) -> PolicyPhase {
+        self.policy
+    }
+
+    /// What the cap waits for besides the raw clients: the `policy`
+    /// client's Done or Failed, if the system has one.
+    fn policy_finished(&self) -> bool {
+        !self.policy_present || self.policy == PolicyPhase::Finished
     }
 
     fn owns(&self, client: usize, handle: u32, kind: Option<Kind>) -> bool {
@@ -395,10 +548,11 @@ impl Gate {
         Ok(())
     }
 
-    /// Once every client is Done or Failed: the cap's PCR_Extend, exactly
-    /// once. The core is capped from here on, whatever the device answers.
+    /// Once every client is Done or Failed (the `policy` client too, if
+    /// present): the cap's PCR_Extend, exactly once. The core is capped from here on, whatever the device answers.
     pub fn cap(&mut self, out: &mut [u8]) -> Option<usize> {
-        if self.capped || !self.states.iter().all(|s| matches!(s, State::Done | State::Failed)) {
+        let raw_finished = self.states.iter().all(|s| matches!(s, State::Done | State::Failed));
+        if self.capped || !raw_finished || !self.policy_finished() {
             return None;
         }
         let len = crate::pcr_extend(out, &CAP_DIGEST)?;
@@ -441,5 +595,88 @@ impl Gate {
             Some(CapVerdict::Confirmed) => CapStatus::Confirmed,
             Some(CapVerdict::Failed) => CapStatus::Failed,
         })
+    }
+    /// Whether a policy operation may start in `phase`.
+    fn policy_open(&self, phase: PolicyPhase) -> Result<(), PolicyRefusal> {
+        if !self.policy_present {
+            return Err(PolicyRefusal::Absent);
+        }
+        if self.capped {
+            return Err(PolicyRefusal::Capped);
+        }
+        if self.policy == PolicyPhase::Finished {
+            return Err(PolicyRefusal::Finished);
+        }
+        if self.policy != phase {
+            return Err(PolicyRefusal::Order);
+        }
+        Ok(())
+    }
+
+    /// The logical version on `device`: both Names checked first, then both
+    /// values read. An all-zero expected Name is refused before the device
+    /// is asked (fail-closed when the configuration names none).
+    fn read_version(&self, device: &mut impl PolicyTransport) -> Result<u32, PolicyRefusal> {
+        let mut buf = [0u8; NV_READ_CMD_LEN];
+        for (index, name) in [NV_POLICY_CTR, NV_POLICY_BASE].into_iter().zip(self.names.iter()) {
+            if name.iter().all(|b| *b == 0) {
+                return Err(PolicyRefusal::Name);
+            }
+            let n = nv_read_public(&mut buf, index);
+            let got = exchange(device, n, &buf, |r| parse_nv_read_public(r).map(|p| p.name == name.as_slice()))?;
+            if !got {
+                return Err(PolicyRefusal::Name);
+            }
+        }
+        let n = nv_read(&mut buf, NV_POLICY_CTR);
+        let counter = exchange(device, n, &buf, parse_nv_read)?;
+        let n = nv_read(&mut buf, NV_POLICY_BASE);
+        let base = exchange(device, n, &buf, parse_nv_read)?;
+        u32::try_from(counter.wrapping_sub(base)).map_err(|_| PolicyRefusal::Range)
+    }
+
+    /// The policy client's State: the logical version and PCR 9. Spent
+    /// whatever the device answers.
+    pub fn policy_state(&mut self, device: &mut impl PolicyTransport) -> Result<PolicyState, PolicyRefusal> {
+        self.policy_open(PolicyPhase::Fresh)?;
+        self.policy = PolicyPhase::Spent;
+        let current = self.read_version(device)?;
+        let mut buf = [0u8; PCR_READ_CMD_LEN];
+        let n = slot_pcr_read(&mut buf);
+        let pcr9 = exchange(device, n, &buf, |r| parse_slot_pcr_read(r).copied())?;
+        self.policy = PolicyPhase::Stated;
+        Ok(PolicyState { current, pcr9 })
+    }
+
+    /// The policy client's Advance: after a successful State, once. The
+    /// counter is incremented only if the version read now is `expected`;
+    /// the answer is the version read after the increment, which the
+    /// client compares with `expected + 1` itself.
+    pub fn policy_advance(&mut self, expected: u32, device: &mut impl PolicyTransport) -> Result<u32, PolicyRefusal> {
+        self.policy_open(PolicyPhase::Stated)?;
+        self.policy = PolicyPhase::Spent;
+        if self.read_version(device)? != expected {
+            return Err(PolicyRefusal::Stale);
+        }
+        let mut buf = [0u8; NV_INCREMENT_CMD_LEN];
+        let n = nv_increment(&mut buf, NV_POLICY_CTR);
+        exchange(device, n, &buf, parse_nv_increment)?;
+        self.read_version(device)
+    }
+
+    /// The policy client's Done or Failed, from any phase but Finished. The
+    /// caller then runs the cap, which may now be due.
+    pub fn policy_finish(&mut self) -> Result<(), PolicyRefusal> {
+        if !self.policy_present {
+            return Err(PolicyRefusal::Absent);
+        }
+        if self.capped {
+            return Err(PolicyRefusal::Capped);
+        }
+        if self.policy == PolicyPhase::Finished {
+            return Err(PolicyRefusal::Finished);
+        }
+        self.policy = PolicyPhase::Finished;
+        Ok(())
     }
 }

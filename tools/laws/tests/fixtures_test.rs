@@ -941,3 +941,55 @@ fn existing_laws_hold_under_nesting() {
         &["L2: secrets mr 'secrets' (owner 'key') is mapped into pd 'hs'"],
     );
 }
+
+// M8 plan C1, C6, C11: MR kind `bundle_slot`, a peer-policy bundle slot
+// filled at boot by U-Boot and never written by any pd.
+
+#[test]
+fn bundle_slot_mapped_rw_is_l4() {
+    assert_deny_exactly(
+        "bundle_slot_write_deny",
+        &["L4: pd 'policy' maps bundle_slot mr 'policy_a' with 'w' or 'x', never allowed on a bundle slot"],
+    );
+}
+
+#[test]
+fn bundle_slot_mapped_by_a_non_reader_is_l4() {
+    assert_deny_exactly(
+        "bundle_slot_non_reader_deny",
+        &["L4: pd 'ingress' maps bundle_slot mr 'policy_a' but is not listed in its policy readers"],
+    );
+}
+
+#[test]
+fn bundle_slot_mapped_read_only_by_a_listed_reader_is_allowed() {
+    assert_allow("bundle_slot_reader_allow");
+}
+
+#[test]
+fn an_unmapped_bundle_slot_with_prefill_is_allowed() {
+    assert_allow("bundle_slot_unmapped_prefill_allow");
+}
+
+/// Adding `bundle_slot` as a second kind the prefill rule admits must not
+/// loosen it for `plain`: a prefill'd plain mr is still L2 even beside an
+/// unmapped bundle_slot mr.
+#[test]
+fn prefill_on_a_plain_mr_beside_a_bundle_slot_is_still_l2() {
+    assert_deny_exactly(
+        "bundle_slot_prefill_plain_deny",
+        &["L2: prefill_path is only allowed on secrets or bundle_slot mrs, not 'ring_mr'"],
+    );
+}
+
+#[test]
+fn bundle_slot_without_a_readers_key_is_a_policy_error() {
+    assert_parse_error_naming("bundle_slot_no_readers_deny", "bundle_slot mr 'policy_a' has no readers");
+}
+
+/// Allow neighbour: the same shape with `readers = []` given explicitly
+/// loads and passes (an unmapped slot is legal).
+#[test]
+fn bundle_slot_with_an_explicit_empty_readers_list_is_allowed() {
+    assert_allow("bundle_slot_no_readers_allow");
+}

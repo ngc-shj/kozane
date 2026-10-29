@@ -137,6 +137,12 @@ pub enum MrPolicy {
     Data { producer: String, consumers: BTreeSet<String> },
     /// Any other shared buffer (e.g. a ring region): explicit per-pd perms.
     Plain { shares: BTreeMap<String, SharePerms> },
+    /// A peer-policy bundle slot (M8 plan C1, C6, C11): filled at boot by
+    /// U-Boot, never written by any pd. `readers` lists the pds allowed to
+    /// map it, read-only; a pd absent from it may not map it at all, and
+    /// `readers` may be empty (an unmapped slot). Not a `Device` mr, so it
+    /// never seeds taint (L1) on its own.
+    BundleSlot { readers: BTreeSet<String> },
 }
 
 impl MrPolicy {
@@ -244,6 +250,11 @@ enum RawMr {
     Secrets { owner: Option<String> },
     Data { producer: String, consumers: Vec<String> },
     Plain { shares: BTreeMap<String, String> },
+    // `Option` so a missing `readers` key gets a bundle_slot-specific
+    // policy error rather than serde's generic "missing field" error, the
+    // same reason `Secrets`'s `owner` is one; an empty list is a
+    // legitimate "unmapped slot" and must still be given explicitly.
+    BundleSlot { readers: Option<Vec<String>> },
 }
 
 #[derive(Debug, Deserialize)]
@@ -404,6 +415,22 @@ impl Policy {
                         parsed.insert(pd, SharePerms::parse(&perms)?);
                     }
                     MrPolicy::Plain { shares: parsed }
+                }
+                RawMr::BundleSlot { readers } => {
+                    let readers = readers.ok_or_else(|| {
+                        err(format!(
+                            "bundle_slot mr '{name}' has no readers (M8 plan C11: every bundle_slot mr names its \
+                             readers, which may be empty)"
+                        ))
+                    })?;
+                    let mut set = BTreeSet::new();
+                    for r in readers {
+                        require_pd(&pds, &r)?;
+                        if !set.insert(r.clone()) {
+                            return Err(err(format!("duplicate reader '{r}' for bundle_slot mr '{name}'")));
+                        }
+                    }
+                    MrPolicy::BundleSlot { readers: set }
                 }
             };
             if mrs.insert(name.clone(), policy_mr).is_some() {
