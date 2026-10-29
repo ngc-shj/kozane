@@ -14,8 +14,8 @@ use core::fmt::{self, Write};
 use core::ptr::NonNull;
 
 use audit_event::{
-    Decoded, HTTP_REFUSED_NAMES, Record, TCP_LIMIT_NAMES, TLS_CLOSED_NAMES, TLS_REFUSED_NAMES, TLS_TIMEOUT_NAMES,
-    UnknownCodes, decode,
+    Decoded, HTTP_REFUSED_NAMES, POLICY_REASON_NAMES, POLICY_SLOT_NAMES, POLICY_STATE_REFUSED, Record, TCP_LIMIT_NAMES,
+    TLS_CLOSED_NAMES, TLS_REFUSED_NAMES, TLS_TIMEOUT_NAMES, UnknownCodes, decode, log,
 };
 use layout::{AUDIT_RING_SLOTS, audit as ch};
 use ring::shmem::ShmRing;
@@ -80,8 +80,16 @@ struct Source {
     reported_corrupt: bool,
 }
 
+/// `policy`'s log page (M8 plan C10), mapped read-only here: the count it
+/// published and how far this PD printed, which only this PD knows.
+struct PolicyLog {
+    page: NonNull<u64>,
+    printed: usize,
+}
+
 struct Audit {
     sources: [Source; 8],
+    policy: PolicyLog,
     unknown: UnknownCodes,
     uart: Uart,
     /// The supervisor's record page (M7 plan C8), read-only here, and the
@@ -116,9 +124,10 @@ fn start() -> Audit {
         source("pq", ch::CH_PQ, memory_region_symbol!(audit_pq: *mut u8)),
         source("tls", ch::CH_TLS, memory_region_symbol!(audit_tls: *mut u8)),
     ];
+    let policy = PolicyLog { page: memory_region_symbol!(audit_policy: *mut [u64; log::WORDS]).cast(), printed: 0 };
     println!(uart, "audit: ready");
     let record = memory_region_symbol!(supervisor_record: *mut [u64; supervisor_core::RECORD_WORDS]);
-    Audit { sources, unknown: UnknownCodes::new(), uart, record, last_seq: 0 }
+    Audit { sources, policy, unknown: UnknownCodes::new(), uart, record, last_seq: 0 }
 }
 
 fn drop_reason(r: u16) -> Option<DropReason> {
@@ -201,6 +210,40 @@ impl Audit {
                 println!(uart, "audit: src={} KeyUnavailable code={} lost={}", src, r.a, r.b);
                 true
             }
+            // M8 plan C9: the version lines the runbook reads.
+            Decoded::PolicyAccepted(slot) => match POLICY_SLOT_NAMES.get(usize::from(slot)) {
+                Some(slot) => {
+                    println!(uart, "{}: accepted version={} slot={} lost={}", src, r.a, slot, r.b);
+                    true
+                }
+                None => false,
+            },
+            Decoded::ReleaseSeq => {
+                println!(uart, "{}: release_seq={} lost={}", src, r.a, r.b);
+                true
+            }
+            Decoded::PolicyUnavailable(reason) => match POLICY_REASON_NAMES.get(usize::from(reason)) {
+                // No current version is known when the state was refused,
+                // whatever `a` holds.
+                Some(name) if reason == POLICY_STATE_REFUSED => {
+                    println!(uart, "{}: unavailable reason={} current=unknown lost={}", src, name, r.b);
+                    true
+                }
+                Some(name) => {
+                    println!(uart, "{}: unavailable reason={} current={} lost={}", src, name, r.a, r.b);
+                    true
+                }
+                None => false,
+            },
+            Decoded::PolicyRejected { slot, reason } => {
+                match (POLICY_SLOT_NAMES.get(usize::from(slot)), POLICY_REASON_NAMES.get(usize::from(reason))) {
+                    (Some(slot), Some(name)) => {
+                        println!(uart, "{}: rejected slot={} reason={} lost={}", src, slot, name, r.b);
+                        true
+                    }
+                    _ => false,
+                }
+            }
             Decoded::Unknown => false,
         };
         if !named && let Some(total) = self.unknown.record() {
@@ -209,10 +252,31 @@ impl Audit {
     }
 }
 
+impl Audit {
+    /// Prints what `policy` published since the last read: at most
+    /// `log::SLOTS` records, whatever the page's count says.
+    fn drain_policy(&mut self) {
+        let page = self.policy.page;
+        // SAFETY: the page is mapped r into this PD and rw into `policy`
+        // alone (laws), page-aligned, at least `log::WORDS` words, for the
+        // life of the system; every index read is below `log::WORDS`.
+        let read = |at: usize| if at < log::WORDS { unsafe { page.add(at).read_volatile() } } else { 0 };
+        let pending = log::pending(read(0), self.policy.printed);
+        self.policy.printed = pending.end;
+        for i in pending {
+            let at = log::slot_word(i);
+            self.print("policy", log::decode([read(at), read(at.saturating_add(1))]));
+        }
+    }
+}
+
 impl Handler for Audit {
     type Error = Infallible;
 
     fn notified(&mut self, channels: ChannelSet) -> Result<(), Self::Error> {
+        if channels.contains(Channel::new(ch::CH_POLICY)) {
+            self.drain_policy();
+        }
         if channels.contains(Channel::new(ch::CH_SUPERVISOR)) {
             // SAFETY: the record page is mapped r into this PD and rw into
             // the supervisor alone (laws), page-aligned, for the life of

@@ -23,6 +23,7 @@ pub fn check(system: &System, policy: &Policy) -> Vec<Finding> {
     check_tpm(system, policy, &tainted, &mut findings);
     check_rng(system, policy, &tainted, &mut findings);
     check_supervisor(system, policy, &tainted, &mut findings);
+    check_policy(system, policy, &tainted, &mut findings);
     check_dma_setvar_present(system, policy, &mut findings);
     check_irq_duplicates(system, &mut findings);
     check_data_confinement(system, policy, &mut findings);
@@ -224,10 +225,12 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
     for pds in mappers.values() {
         for (a, a_writes) in pds {
             for (b, _) in pds {
-                // The supervisor's record page (M7 plan C8): a reader that
-                // cannot write it carries nothing into the supervisor.
-                let into_supervisor = policy.role(b) == Some(Role::Supervisor) && !a_writes;
-                if a != b && !into_supervisor {
+                // The supervisor's record page (M7 plan C8), and `policy`'s
+                // log page and bundle slots (M8 plan C11): a reader that
+                // cannot write it carries nothing into the supervisor or
+                // `policy`.
+                let into_untainted_writer = matches!(policy.role(b), Some(Role::Supervisor | Role::Policy)) && !a_writes;
+                if a != b && !into_untainted_writer {
                     add_edge(a, b);
                 }
             }
@@ -247,6 +250,8 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
             Some(Role::Timer) => timer_channel_is_exempt(system, policy, a, b, findings),
             Some(Role::Rng) => rng_channel_is_exempt(system, policy, a, b, findings),
             Some(Role::Supervisor) => supervisor_channel_is_exempt(a, b, findings),
+            Some(Role::Policy) if a.pp && b_role == Some(Role::Tpm) => false,
+            Some(Role::Policy) => policy_channel_is_exempt(system, policy, a, b, findings),
             _ => false,
         };
         let b_exempt = match b_role {
@@ -255,6 +260,8 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
             Some(Role::Timer) => timer_channel_is_exempt(system, policy, b, a, findings),
             Some(Role::Rng) => rng_channel_is_exempt(system, policy, b, a, findings),
             Some(Role::Supervisor) => supervisor_channel_is_exempt(b, a, findings),
+            Some(Role::Policy) if b.pp && a_role == Some(Role::Tpm) => false,
+            Some(Role::Policy) => policy_channel_is_exempt(system, policy, b, a, findings),
             _ => false,
         };
 
@@ -430,6 +437,102 @@ fn supervisor_channel_is_exempt(
         ));
     }
     ok
+}
+
+/// Whether `peer` can carry anything into `policy_end` (a `policy`-role
+/// pd) over their channel (M8 plan C11): it may call `policy` (the key
+/// exemption's shape, for the barrier pds) or only be notified by it (the
+/// supervisor's shape, for `audit`), but `policy` has pp=false on its end
+/// and `peer` cannot notify it, and `policy` maps nothing a peer could
+/// write into (bundle slots and pages every other mapper only reads). Its
+/// PPC to `tpm` is no exemption: taint crosses it both ways. A failure is
+/// L1.
+fn policy_channel_is_exempt(
+    system: &System,
+    policy: &Policy,
+    policy_end: &crate::sdf::ChannelEnd,
+    peer: &crate::sdf::ChannelEnd,
+    findings: &mut Vec<Finding>,
+) -> bool {
+    let ok = !policy_end.pp && !peer.notify && policy_maps_only_readonly_shares(system, policy, &policy_end.pd);
+    if !ok {
+        findings.push(Finding::new(
+            LawId::L1,
+            format!(
+                "channel between policy pd '{}' and '{}' does not meet the policy exemption \
+                 (policy pp=false, peer notify=false, policy maps only bundle slots and pages others only read)",
+                policy_end.pd, peer.pd
+            ),
+        ));
+    }
+    ok
+}
+
+/// What a `policy`-role pd may map (M8 plan C11): bundle slots, and pages
+/// no other pd maps writable; never a device or secrets mr.
+fn policy_may_map(system: &System, policy: &Policy, pd: &str, mr: &str) -> bool {
+    match policy.mrs.get(mr) {
+        Some(MrPolicy::BundleSlot { .. }) => true,
+        Some(MrPolicy::Device { .. } | MrPolicy::Secrets { .. } | MrPolicy::Dma { .. }) => false,
+        _ => !system.pds.iter().filter(|o| o.name != pd).flat_map(mrs_mapped_by).any(|o| o.mr == mr && o.perms.w),
+    }
+}
+
+fn policy_maps_only_readonly_shares(system: &System, policy: &Policy, pd: &str) -> bool {
+    pd_by_name(system, pd).into_iter().flat_map(mrs_mapped_by).all(|m| policy_may_map(system, policy, pd, &m.mr))
+}
+
+/// The `policy` role (M8 plan C5, C11). L1 as amended: a `policy` pd is
+/// untainted, maps only bundle slots and pages every other mapper only
+/// reads, and has channels only to a `tpm` pd (pp on its own end), to
+/// `audit` (a `service` pd it notifies), and from its callers, the barrier
+/// pds (`untrusted_input` and `data`, pp on theirs); every other end of it
+/// is pp=false. L13: it is passive (its callers' scheduling contexts run
+/// every call).
+fn check_policy(system: &System, policy: &Policy, tainted: &BTreeSet<String>, findings: &mut Vec<Finding>) {
+    for pd in system.pds.iter().filter(|pd| policy.role(&pd.name) == Some(Role::Policy)) {
+        if tainted.contains(&pd.name) {
+            findings.push(Finding::new(LawId::L1, format!("policy pd '{}' is tainted", pd.name)));
+        }
+        if !pd.passive {
+            findings.push(Finding::new(LawId::L13, format!("policy pd '{}' must be passive", pd.name)));
+        }
+        for m in mrs_mapped_by(pd) {
+            if !policy_may_map(system, policy, &pd.name, &m.mr) {
+                findings.push(Finding::new(
+                    LawId::L1,
+                    format!(
+                        "policy pd '{}' maps mr '{}', which is neither a bundle slot nor a page others only read",
+                        pd.name, m.mr
+                    ),
+                ));
+            }
+        }
+    }
+    for channel in &system.channels {
+        let [a, b] = &channel.ends;
+        for (end, peer) in [(a, b), (b, a)] {
+            if policy.role(&end.pd) != Some(Role::Policy) {
+                continue;
+            }
+            let ok = match policy.role(&peer.pd) {
+                Some(Role::Tpm) => end.pp,
+                Some(Role::Service) => !end.pp && !peer.pp,
+                Some(Role::UntrustedInput | Role::Data) => !end.pp && peer.pp,
+                _ => false,
+            };
+            if !ok {
+                findings.push(Finding::new(
+                    LawId::L1,
+                    format!(
+                        "policy pd '{}' has a channel to '{}' that is not its call to tpm, its notification of audit, \
+                         or a barrier pd's call",
+                        end.pd, peer.pd
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 /// L1 (tainted pds map no secret mr) and L2 (M3 plan amendment): every
@@ -855,8 +958,8 @@ fn check_supervisor(system: &System, policy: &Policy, tainted: &BTreeSet<String>
 /// The `tpm` role (M5 plan C9). L5 as amended: a tpm mr is pinned at the
 /// TIS page, at most one is declared, and a `tpm` pd owns no other device.
 /// L1 as amended: a `tpm` pd is untainted, maps nothing but its tpm mr, has
-/// channels only to `key` pds and is their callee (never pp on its own
-/// end); a `key` pd has at most one channel with pp on its own end, and it
+/// channels only to `key` pds and the `policy` pd (M8 plan C11) and is
+/// their callee (never pp on its own end); a `key` pd has at most one channel with pp on its own end, and it
 /// leads to a `tpm` pd (a pp end towards anything else is the key
 /// exemption's finding).
 fn check_tpm(system: &System, policy: &Policy, tainted: &BTreeSet<String>, findings: &mut Vec<Finding>) {
@@ -912,9 +1015,9 @@ fn check_tpm(system: &System, policy: &Policy, tainted: &BTreeSet<String>, findi
         for (end, peer) in [(a, b), (b, a)] {
             let peer_role = policy.role(&peer.pd);
             match policy.role(&end.pd) {
-                Some(Role::Tpm) if peer_role != Some(Role::Key) => findings.push(Finding::new(
+                Some(Role::Tpm) if !matches!(peer_role, Some(Role::Key | Role::Policy)) => findings.push(Finding::new(
                     LawId::L1,
-                    format!("tpm pd '{}' has a channel to '{}', which is not a key pd", end.pd, peer.pd),
+                    format!("tpm pd '{}' has a channel to '{}', which is not a key or policy pd", end.pd, peer.pd),
                 )),
                 Some(Role::Tpm) if end.pp => findings.push(Finding::new(
                     LawId::L1,

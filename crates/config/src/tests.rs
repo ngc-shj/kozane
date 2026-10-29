@@ -45,6 +45,9 @@ fn load(name: &str) -> Result<Vec<u8>, String> {
         "big.der" => Ok(cert_for(&TLS_PUBLIC, validate::MAX_TLS_CERT + 1 - cert_for(&TLS_PUBLIC, 0).len())),
         "other.der" => Ok(cert_for(&other, 0)),
         "noprefix.der" => Ok([&[0x30u8, 0x00][..], &TLS_PUBLIC[..]].concat()),
+        "mldsa.pk" => Ok(std::vec![0x33; validate::MLDSA65_PUB_LEN]),
+        "mldsa-short.pk" => Ok(std::vec![0x33; validate::MLDSA65_PUB_LEN - 1]),
+        "mldsa-zero.pk" => Ok(std::vec![0; validate::MLDSA65_PUB_LEN]),
         _ => name
             .strip_prefix("rp-")
             .and_then(|n| n.strip_suffix(".pk"))
@@ -554,8 +557,19 @@ fn compiled_tls_cert_holds_the_compiled_tls_public() {
 const CTR_NAME_HEX: &str = "000b1111111111111111111111111111111111111111111111111111111111111111";
 const BASE_NAME_HEX: &str = "000b2222222222222222222222222222222222222222222222222222222222222222";
 
+const FLEET_HEX: &str = "0123456789abcdef0123456789abcdef";
+const ED_HEX: &str = "4444444444444444444444444444444444444444444444444444444444444444";
+
+fn policy_table(fleet: &str, ed: &str, mldsa: &str, ctr: &str, base_name: &str) -> String {
+    std::format!(
+        "{}\n[policy]\nfleet_id = \"{fleet}\"\ned25519_pub = \"{ed}\"\nmldsa65_pub = \"{mldsa}\"\n\
+         nv_ctr_name = \"{ctr}\"\nnv_base_name = \"{base_name}\"\n",
+        base()
+    )
+}
+
 fn with_policy(ctr: &str, base_name: &str) -> String {
-    std::format!("{}\n[policy]\nnv_ctr_name = \"{ctr}\"\nnv_base_name = \"{base_name}\"\n", base())
+    policy_table(FLEET_HEX, ED_HEX, "mldsa.pk", ctr, base_name)
 }
 
 #[test]
@@ -598,6 +612,62 @@ fn malformed_policy_names_are_rejected() {
     assert!(err(&with_policy(CTR_NAME_HEX, CTR_NAME_HEX)).contains("are the same Name"));
     let renamed = with_policy(CTR_NAME_HEX, BASE_NAME_HEX).replace("nv_base_name", "nv_other_name");
     assert!(err(&renamed).contains("unknown field"));
-    let one = std::format!("{}\n[policy]\nnv_ctr_name = \"{CTR_NAME_HEX}\"\n", base());
+    let one = with_policy(CTR_NAME_HEX, BASE_NAME_HEX).replace(&std::format!("nv_base_name = \"{BASE_NAME_HEX}\"\n"), "");
     assert!(err(&one).contains("missing field `nv_base_name`"));
+}
+
+// M8 plan C5, C7: the fleet ID and the bundle signing keys.
+
+#[test]
+fn policy_fleet_id_and_keys_are_decoded_and_rendered() {
+    let c = check(&with_policy(CTR_NAME_HEX, BASE_NAME_HEX), 4).unwrap();
+    let fleet: [u8; 16] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+    assert_eq!((c.fleet_id, c.ed25519_pub), (fleet, [0x44; 32]));
+    assert_eq!(c.mldsa65_pub, std::vec![0x33; validate::MLDSA65_PUB_LEN]);
+    let r = validate::render(&c, "gw.pk", &[]);
+    assert!(r.contains(&std::format!("pub const FLEET_ID: [u8; 16] = {fleet:?};\n")));
+    assert!(r.contains(&std::format!("pub const POLICY_ED25519_PUB: [u8; 32] = {:?};\n", [0x44u8; 32])));
+    assert!(r.contains(&std::format!("pub const POLICY_MLDSA65_PUB: [u8; 1952] = {:?};\n", std::vec![0x33u8; 1952])));
+}
+
+/// Absent means fail closed: all-zero keys, which `policy` refuses before
+/// any verifier runs, and a fleet ID no signed bundle carries.
+#[test]
+fn without_a_policy_table_the_fleet_and_keys_render_all_zero() {
+    let c = check(&base(), 4).unwrap();
+    assert_eq!((c.fleet_id, c.ed25519_pub), ([0; 16], [0; 32]));
+    assert_eq!(c.mldsa65_pub, std::vec![0; validate::MLDSA65_PUB_LEN]);
+    let r = validate::render(&c, "gw.pk", &[]);
+    assert!(r.contains(&std::format!("pub const POLICY_MLDSA65_PUB: [u8; 1952] = {:?};\n", std::vec![0u8; 1952])));
+    assert_eq!((crate::FLEET_ID, crate::POLICY_ED25519_PUB), ([0; 16], [0; 32]));
+    assert!(crate::POLICY_MLDSA65_PUB.iter().all(|b| *b == 0));
+}
+
+#[test]
+fn malformed_policy_fleet_id_and_keys_are_rejected() {
+    let table = |fleet: &str, ed: &str, mldsa: &str| policy_table(fleet, ed, mldsa, CTR_NAME_HEX, BASE_NAME_HEX);
+    for fleet in [&FLEET_HEX[..30], &std::format!("{FLEET_HEX}00"), &FLEET_HEX.replacen('0', "g", 1), &"00".repeat(16)] {
+        assert!(err(&table(fleet, ED_HEX, "mldsa.pk")).contains("policy fleet_id"), "{fleet}");
+    }
+    for ed in [&ED_HEX[..62], &std::format!("{ED_HEX}44"), &ED_HEX.replacen('4', "x", 1), &"00".repeat(32)] {
+        assert!(err(&table(FLEET_HEX, ed, "mldsa.pk")).contains("policy ed25519_pub"), "{ed}");
+    }
+    assert!(err(&table(FLEET_HEX, ED_HEX, "mldsa-short.pk")).contains("1951 bytes, expected 1952"));
+    assert!(err(&table(FLEET_HEX, ED_HEX, "mldsa-zero.pk")).contains("is all zero"));
+    assert!(err(&table(FLEET_HEX, ED_HEX, "missing.pk")).contains("no such file"));
+    let no_fleet = with_policy(CTR_NAME_HEX, BASE_NAME_HEX).replace(&std::format!("fleet_id = \"{FLEET_HEX}\"\n"), "");
+    assert!(err(&no_fleet).contains("missing field `fleet_id`"));
+}
+
+/// `node_config()` is the compiled configuration, field by field.
+#[test]
+fn node_config_is_the_compiled_configuration() {
+    let n = crate::node_config();
+    assert_eq!(n.fleet_id, crate::FLEET_ID);
+    assert_eq!(n.inside_prefix, crate::INSIDE_PREFIX);
+    assert!(n.inside_prefix.contains(crate::INSIDE_IP));
+    assert_eq!((n.inside_ip, n.outside_ip), (crate::INSIDE_IP, crate::OUTSIDE_IP));
+    let ips: Vec<[u8; 4]> = crate::NEIGHBORS.iter().map(|x| x.ip).collect();
+    assert_eq!(n.neighbors, ips.as_slice());
+    assert_eq!((n.gateway_wg_public, n.gateway_rp_digest), (crate::GATEWAY_PUBLIC, crate::GATEWAY_RP_HASH));
 }

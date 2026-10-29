@@ -1026,3 +1026,36 @@ code.
   addresses, `read_pcrs` with PCR 9, `read_srk`'s second-provisioning
   check), `tests/tools/test_{provision,measure,package,release}.py`, and
   the check-selftest `measure-*` cases.
+
+### Slice 3 (C5, C6, C7, C11; `release-seq` from C9)
+
+Batch A, the `policy` PD:
+- the PD lockfile gains `libcrux-ml-dsa` and `libcrux-ed25519` (P2: the
+  only two new packages);
+- `crates/release-seq` (`RELEASE_SEQ`, read only by `policy`; C9's
+  manifest key and check-pins tie come in slice 4);
+- `crates/pds/policy` (C5): the `policy-wire` step machine, verification,
+  STATE/ADVANCE/DONE/FAILED through `tpm` `CH_POLICY`, serving `Await`,
+  and its own audit ring;
+- `crates/layout` (the policy channels and the audit source);
+  `crates/supervisor-core` `CHILDREN`; `tools/supervisor-allowlist`;
+- `system/kozane.system` (the PD, its channels, `policy_a`/`policy_b`
+  mapped `r` into `policy`); `layout::tpm::POLICY_PRESENT = true`;
+- `policy/laws.toml` and `tools/laws` (role `Policy`, its callee
+  exemption, priority `untrusted_input < policy < tpm`, `tpm`'s channels,
+  `bundle_slot` readers);
+- `crates/audit-event` (Policy* event codes, F41 encoding) and
+  `crates/pds/audit` (the source and its printer);
+- Makefile `pds`, the manifest, and `[policy]` in `config` (`fleet_id`,
+  `ed25519_pub`, `mldsa65_pub`).
+
+Batch B, the barrier and the consumers (after A):
+- `crates/policy-client` (`Await` PPC, the slot symbol, `open`);
+- `hs`, `pq`, `ingress`, `data`, `inner`: `Await` in init, boot-stop
+  `POLICY_UNAVAILABLE`, peers from the bundle;
+- `rosenpass-core` `Responder` slice API;
+- secret-blob v3, `key`/`key-core`, `mksecrets`, `tpm2` envelope sizes,
+  `tools/package`'s blob parser;
+- `config` drops `[[peers]]`;
+- `run.py` deployments built on signed bundles (`tools/policy`), and the
+  self-test needles C7 rewrites.

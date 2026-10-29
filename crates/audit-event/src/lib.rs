@@ -124,6 +124,62 @@ pub const HTTP_REFUSED_NAMES: [&str; 5] = ["400", "413", "417", "431", "501"];
 /// `tls_core::conn::Timeout`'s variants, by stage.
 pub const TLS_TIMEOUT_NAMES: [&str; 5] = ["Handshake", "Head", "BackendConnect", "Idle", "Lifetime"];
 
+/// The `policy` PD's boot lines (M8 plan C9, C10, F41): each a value-carrying
+/// edge, raised at most once per boot, with the reason and slot riding in
+/// code ranges as `FRAME_DROPPED_BASE + reason` does, so `Record.b` stays
+/// the producer's lost count. Every range keeps its last code as its own
+/// unknown (`Decoded::Unknown`), so an out-of-range slot or reason is never
+/// clamped onto a real one (F45).
+///
+/// The slots, A and B (`policy_wire::Slot`), by index.
+pub const POLICY_SLOTS: u16 = 2;
+pub const POLICY_SLOT_NAMES: [&str; POLICY_SLOTS as usize] = ["A", "B"];
+/// `policy_wire::Reject`'s variants, by code; `policy` asserts at compile
+/// time that this table matches the enum (this crate depends on neither).
+pub const POLICY_REASONS: u16 = 12;
+pub const POLICY_REASON_NAMES: [&str; POLICY_REASONS as usize] = [
+    "Malformed",
+    "WrongFleet",
+    "BadSignature",
+    "RolledBack",
+    "Skipped",
+    "BelowFloor",
+    "PrevMismatch",
+    "Equivocation",
+    "Empty",
+    "MeasureMismatch",
+    "AdvanceFailed",
+    "StateRefused",
+];
+/// `StateRefused`'s code: `tpm` refused the state, so no current version
+/// is known, and its line says `current=unknown` whatever `a` holds.
+pub const POLICY_STATE_REFUSED: u16 = 11;
+/// `POLICY_ACCEPTED_BASE + slot`, `a` = the accepted version; the code
+/// after slot B is the range's unknown.
+pub const POLICY_ACCEPTED_BASE: u16 = 0x0300;
+/// This release's `RELEASE_SEQ`, `a` = its value.
+pub const RELEASE_SEQ: u16 = 0x0308;
+/// `POLICY_UNAVAILABLE_BASE + reason`, `a` = the current version; the code
+/// after the last reason is the range's unknown.
+pub const POLICY_UNAVAILABLE_BASE: u16 = 0x0310;
+/// `POLICY_REJECTED_BASE + slot × POLICY_REASON_CODES + reason`, `a` = the
+/// slot's version (0 unless its signatures verified): per slot, the reasons
+/// and that slot's unknown; after both slots, the code an out-of-range slot
+/// encodes to, `POLICY_REJECTED_UNKNOWN`.
+pub const POLICY_REJECTED_BASE: u16 = 0x0320;
+/// Codes per slot in the rejected range: every reason and its unknown.
+pub const POLICY_REASON_CODES: u16 = POLICY_REASONS + 1;
+pub const POLICY_REJECTED_UNKNOWN: u16 = POLICY_REJECTED_BASE + POLICY_SLOTS * POLICY_REASON_CODES;
+/// The last code of every policy range: the rejected range's unknown.
+const POLICY_LAST_CODE: u16 = POLICY_REJECTED_UNKNOWN;
+/// Codes of both slots' reasons and unknowns, before `POLICY_REJECTED_UNKNOWN`.
+const POLICY_REJECTED_CODES: u16 = POLICY_REJECTED_UNKNOWN - POLICY_REJECTED_BASE;
+// The ranges, in order, each within its own block and none past the next.
+const _: () = assert!(POLICY_ACCEPTED_BASE + POLICY_SLOTS < RELEASE_SEQ);
+const _: () = assert!(RELEASE_SEQ < POLICY_UNAVAILABLE_BASE);
+const _: () = assert!(POLICY_UNAVAILABLE_BASE + POLICY_REASONS < POLICY_REJECTED_BASE);
+const _: () = assert!(POLICY_LAST_CODE < 0x0340);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     ArpReplied,
@@ -299,6 +355,20 @@ pub enum Event {
     /// producer halts (post-M6 plan P3). Raised after `KeyUnavailable`,
     /// once per boot (an edge; never coalesced).
     TpmCapFailed,
+    /// `policy` accepted the bundle in `slot` (0 = A, 1 = B) at `version`,
+    /// which travels as `a` (M8 plan C9; never coalesced, once per boot).
+    PolicyAccepted { slot: u16, version: u32 },
+    /// The release's `RELEASE_SEQ`, as `a` (M8 plan C9; never coalesced,
+    /// once per boot, beside `PolicyAccepted`).
+    ReleaseSeq { seq: u32 },
+    /// `policy` has no usable bundle this boot: `reason` is a
+    /// `policy_wire::Reject` code, `current` (`a`) the logical version
+    /// `tpm` reported (meaningless for `StateRefused`; never coalesced).
+    PolicyUnavailable { reason: u16, current: u32 },
+    /// `policy` refused the bundle in `slot` for `reason`; `version` (`a`)
+    /// is the slot's version if its signatures verified, else 0 (never
+    /// coalesced, at most once per slot and boot).
+    PolicyRejected { slot: u16, reason: u16, version: u32 },
 }
 
 impl Event {
@@ -383,6 +453,20 @@ impl Event {
             Event::TlsClosed { reason } => tls_code(TLS_CLOSED_BASE, reason),
             Event::HttpRefused { status } => tls_code(HTTP_REFUSED_BASE, status),
             Event::TlsTimeout { stage } => tls_code(TLS_TIMEOUT_BASE, stage),
+            // Bounded below each range's width (asserted below), so the
+            // wrapping operations never wrap.
+            Event::PolicyAccepted { slot, .. } => {
+                POLICY_ACCEPTED_BASE.wrapping_add(if slot < POLICY_SLOTS { slot } else { POLICY_SLOTS })
+            }
+            Event::ReleaseSeq { .. } => RELEASE_SEQ,
+            Event::PolicyUnavailable { reason, .. } => POLICY_UNAVAILABLE_BASE.wrapping_add(policy_reason(reason)),
+            Event::PolicyRejected { slot, reason, .. } => {
+                if slot < POLICY_SLOTS {
+                    POLICY_REJECTED_BASE.wrapping_add(slot.wrapping_mul(POLICY_REASON_CODES)).wrapping_add(policy_reason(reason))
+                } else {
+                    POLICY_REJECTED_UNKNOWN
+                }
+            }
         }
     }
 
@@ -535,6 +619,10 @@ impl Event {
             Event::TlsClosed { .. } => "TlsClosed",
             Event::HttpRefused { .. } => "HttpRefused",
             Event::TlsTimeout { .. } => "TlsTimeout",
+            Event::PolicyAccepted { .. } => "PolicyAccepted",
+            Event::ReleaseSeq { .. } => "ReleaseSeq",
+            Event::PolicyUnavailable { .. } => "PolicyUnavailable",
+            Event::PolicyRejected { .. } => "PolicyRejected",
         }
     }
 
@@ -561,7 +649,11 @@ impl Event {
             | Event::KeyUnavailable { .. }
             | Event::KeyStackHighWater { .. }
             | Event::KeyWaitHighWater { .. }
-            | Event::TlsSignHighWater { .. } => false,
+            | Event::TlsSignHighWater { .. }
+            | Event::PolicyAccepted { .. }
+            | Event::ReleaseSeq { .. }
+            | Event::PolicyUnavailable { .. }
+            | Event::PolicyRejected { .. } => false,
             Event::ArpReplied
             | Event::UdpEchoed
             | Event::FrameDropped { .. }
@@ -632,6 +724,10 @@ impl Event {
             Event::KeyStackHighWater { bytes } => Some(bytes),
             Event::KeyWaitHighWater { us } => Some(us),
             Event::TlsSignHighWater { us } => Some(us),
+            Event::PolicyAccepted { version, .. } => Some(version),
+            Event::ReleaseSeq { seq } => Some(seq),
+            Event::PolicyUnavailable { current, .. } => Some(current),
+            Event::PolicyRejected { version, .. } => Some(version),
             _ => None,
         }
     }
@@ -729,6 +825,14 @@ impl Event {
                 let k = if kind > MAX_TCP_LIMIT { MAX_TCP_LIMIT } else { kind };
                 TCP_LIMITED_SLOT.saturating_add(k as usize)
             }
+            // One slot per policy code, POLICY_SLOT..: `code` keeps every
+            // policy event inside POLICY_ACCEPTED_BASE..=POLICY_LAST_CODE.
+            Event::PolicyAccepted { .. }
+            | Event::ReleaseSeq { .. }
+            | Event::PolicyUnavailable { .. }
+            | Event::PolicyRejected { .. } => {
+                POLICY_SLOT.saturating_add(self.code().saturating_sub(POLICY_ACCEPTED_BASE) as usize)
+            }
         }
     }
 }
@@ -749,7 +853,13 @@ const TLS_CLOSED_SLOT: usize = TLS_REFUSED_SLOT + MAX_TLS_KIND as usize + 1;
 const HTTP_REFUSED_SLOT: usize = TLS_CLOSED_SLOT + MAX_TLS_KIND as usize + 1;
 const TLS_TIMEOUT_SLOT: usize = HTTP_REFUSED_SLOT + MAX_TLS_KIND as usize + 1;
 const TLS_KIND_UNKNOWN_SLOT: usize = TLS_TIMEOUT_SLOT + MAX_TLS_KIND as usize + 1;
-const SLOTS: usize = TLS_KIND_UNKNOWN_SLOT + 1;
+const POLICY_SLOT: usize = TLS_KIND_UNKNOWN_SLOT + 1;
+const SLOTS: usize = POLICY_SLOT + (POLICY_LAST_CODE - POLICY_ACCEPTED_BASE) as usize + 1;
+
+/// A policy reason inside its range: the reason, or the range's unknown.
+const fn policy_reason(reason: u16) -> u16 {
+    if reason < POLICY_REASONS { reason } else { POLICY_REASONS }
+}
 
 /// A `tls` kind's code: `base + v` inside its 32 codes, else
 /// `TLS_KIND_UNKNOWN` (never clamped onto a real code).
@@ -868,6 +978,15 @@ pub enum Decoded {
     HttpRefused(u16),
     /// `tls_core::conn::Timeout` stage.
     TlsTimeout(u16),
+    /// `PolicyAccepted`: the slot (< `POLICY_SLOTS`); `a` is the version.
+    PolicyAccepted(u16),
+    /// `ReleaseSeq`: `a` is the release's sequence number.
+    ReleaseSeq,
+    /// `PolicyUnavailable`: the reason (< `POLICY_REASONS`); `a` is the
+    /// current version unless the reason is `POLICY_STATE_REFUSED`.
+    PolicyUnavailable(u16),
+    /// `PolicyRejected`: the slot and the reason; `a` is the slot's version.
+    PolicyRejected { slot: u16, reason: u16 },
     Unknown,
 }
 
@@ -911,6 +1030,21 @@ pub fn decode(code: u16) -> Decoded {
     }
     if let Some(v) = tls_kind(TLS_TIMEOUT_BASE) {
         return Decoded::TlsTimeout(v);
+    }
+    if code == RELEASE_SEQ {
+        return Decoded::ReleaseSeq;
+    }
+    if let Some(slot) = code.checked_sub(POLICY_ACCEPTED_BASE).filter(|s| *s < POLICY_SLOTS) {
+        return Decoded::PolicyAccepted(slot);
+    }
+    if let Some(reason) = code.checked_sub(POLICY_UNAVAILABLE_BASE).filter(|r| *r < POLICY_REASONS) {
+        return Decoded::PolicyUnavailable(reason);
+    }
+    if let Some(i) = code.checked_sub(POLICY_REJECTED_BASE).filter(|i| *i < POLICY_REJECTED_CODES)
+        && let (Some(slot), Some(reason)) = (i.checked_div(POLICY_REASON_CODES), i.checked_rem(POLICY_REASON_CODES))
+        && reason < POLICY_REASONS
+    {
+        return Decoded::PolicyRejected { slot, reason };
     }
     match code.checked_sub(FRAME_DROPPED_BASE) {
         Some(r) if r <= MAX_DROP_REASON => Decoded::FrameDropped(r),
@@ -1000,5 +1134,10 @@ impl UnknownCodes {
     }
 }
 
+pub mod log;
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(kani)]
+mod proofs;

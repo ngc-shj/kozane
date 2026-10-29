@@ -33,6 +33,12 @@ case " ${MIR_CRATES:-} " in
     *) exit 0 ;;
 esac
 [ "$lib" = 1 ] || exit 0
+# The shipped run captures only units built for the PD target: a crate that
+# is also a host build-dependency (policy-wire, under config's build.rs) is
+# compiled there for the host too, and that unit never ships.
+if [ -n "${MIR_TARGET_ONLY:-}" ]; then
+    case " $* " in *" --target "*) ;; *) exit 0 ;; esac
+fi
 mkdir -p "$MIR_OUT"
 key=$(printf '%s\n' "${args[@]}" | sha256sum | cut -c1-16)
 "$rustc" "${args[@]}" -Zunpretty=mir -Zmir-opt-level=0 > "$MIR_OUT/$crate.$key.mir"

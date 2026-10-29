@@ -75,6 +75,9 @@ pub mod audit {
     pub const CH_DATA: usize = 6;
     pub const CH_PQ: usize = 7;
     pub const CH_TLS: usize = 8;
+    /// M8 plan C10: `policy`'s log page (`audit_event::log`), which `audit`
+    /// maps read-only; it never notifies `policy`.
+    pub const CH_POLICY: usize = 10;
 }
 
 #[cfg(test)]
@@ -163,6 +166,23 @@ pub mod supervisor {
     pub const CH_AUDIT: usize = 1;
 }
 
+/// M8: the peer-policy verifier (plan C5), a passive callee: it reads the
+/// two bundle slots, asks `tpm` for the anti-rollback state on `CH_TPM`
+/// and reports to `audit` through its log page. Its callers (the barrier
+/// PDs, M8 plan C6) get their channels in slice 3 batch B. One PPC label:
+/// `AWAIT` (no words in) answers `VERIFIED` with
+/// `policy_wire::VERIFIED_REPLY_LEN` bytes packed into words
+/// (`tpm::pack`), or `UNAVAILABLE` with the `policy_wire::Reject` code in
+/// one word; anything else is `BAD_REQUEST`.
+pub mod policy {
+    pub const CH_TPM: usize = 1;
+    pub const CH_AUDIT: usize = 2;
+    pub const AWAIT: u64 = 0;
+    pub const VERIFIED: u64 = 0;
+    pub const UNAVAILABLE: u64 = 1;
+    pub const BAD_REQUEST: u64 = 2;
+}
+
 /// M7: the entropy driver (plan C6), callee of the PDs that draw
 /// randomness; one id per caller, `rng_core::Caller`'s order. One PPC label:
 /// `SEED` (no words in) answers `SEED` with the 32-byte seed in four words,
@@ -195,7 +215,7 @@ pub mod tpm {
     /// Whether the system has the `policy` PD (M8 deviation D-6): `tpm`'s
     /// cap waits for its Done or Failed only then. Set in the same change
     /// that adds the PD to `system/kozane.system`; a test ties the two.
-    pub const POLICY_PRESENT: bool = false;
+    pub const POLICY_PRESENT: bool = true;
 
     /// seL4's IPC buffer carries 120 message words.
     pub const MSG_WORDS: usize = 120;

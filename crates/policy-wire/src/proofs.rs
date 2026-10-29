@@ -205,3 +205,23 @@ fn verified_next_version_needs_a_matching_advance_reply() {
         }
     }
 }
+
+// --- the `policy` PD's audit helper (M8 slice 3) ---------------------------
+
+/// `not_candidate` says "candidate" exactly when the independent reference
+/// does, and never names `Equivocation`, `PrevMismatch` or a state reason
+/// (it judges one slot alone), so a `PolicyRejected` line never contradicts
+/// `select`.
+#[kani::proof]
+fn not_candidate_agrees_with_the_candidate_reference() {
+    let current: u32 = kani::any();
+    let release_seq: u32 = kani::any();
+    let view = any_slot_view();
+    let r = not_candidate(current, release_seq, view);
+    assert!(r.is_none() == is_valid_candidate(current, release_seq, view));
+    assert!(!matches!(
+        r,
+        Some(Reject::Equivocation | Reject::PrevMismatch | Reject::StateRefused | Reject::MeasureMismatch | Reject::AdvanceFailed | Reject::WrongFleet)
+    ));
+    kani::cover!(r.is_none());
+}

@@ -176,9 +176,44 @@ pub enum Reject {
 }
 
 impl Reject {
+    /// Every reason, in code order (`ALL[i].code() == i`).
+    pub const ALL: [Reject; 12] = [
+        Reject::Malformed,
+        Reject::WrongFleet,
+        Reject::BadSignature,
+        Reject::RolledBack,
+        Reject::Skipped,
+        Reject::BelowFloor,
+        Reject::PrevMismatch,
+        Reject::Equivocation,
+        Reject::Empty,
+        Reject::MeasureMismatch,
+        Reject::AdvanceFailed,
+        Reject::StateRefused,
+    ];
+
     /// A stable code for audit lines (M8 plan C9).
     pub const fn code(self) -> u8 {
         self as u8
+    }
+
+    /// The name the audit lines print (`audit_event::POLICY_REASON_NAMES`,
+    /// which the `policy` PD checks against this at compile time).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Reject::Malformed => "Malformed",
+            Reject::WrongFleet => "WrongFleet",
+            Reject::BadSignature => "BadSignature",
+            Reject::RolledBack => "RolledBack",
+            Reject::Skipped => "Skipped",
+            Reject::BelowFloor => "BelowFloor",
+            Reject::PrevMismatch => "PrevMismatch",
+            Reject::Equivocation => "Equivocation",
+            Reject::Empty => "Empty",
+            Reject::MeasureMismatch => "MeasureMismatch",
+            Reject::AdvanceFailed => "AdvanceFailed",
+            Reject::StateRefused => "StateRefused",
+        }
     }
 }
 
@@ -659,6 +694,17 @@ pub enum Slot {
     B,
 }
 
+impl Slot {
+    /// 0 for A, 1 for B: the `Await` reply's slot byte and the audit
+    /// lines' slot index (M8 plan C9).
+    pub const fn index(self) -> u8 {
+        match self {
+            Slot::A => 0,
+            Slot::B => 1,
+        }
+    }
+}
+
 /// Proof that `policy` has already verified and selected a slot's bundle
 /// (M8 plan C5/C6): no public fields and no public constructor besides
 /// [`Verified::from_reply`] (I1.2), so [`open`] is reachable only through
@@ -673,7 +719,20 @@ pub struct Verified {
 
 /// `Verified`'s wire form in the `policy` PD's `Await` reply: `slot (0=A,
 /// 1=B) ‖ version (u32 BE) ‖ body_sha256 [32]`.
-const VERIFIED_REPLY_LEN: usize = 1 + 4 + 32;
+pub const VERIFIED_REPLY_LEN: usize = 1 + 4 + 32;
+
+/// The `Await` reply's bytes for an [`Outcome::Verified`], as the `policy`
+/// PD sends them. Bytes only: a consumer still gets a [`Verified`] through
+/// [`Verified::from_reply`] alone (I1.2).
+pub fn verified_reply(slot: Slot, version: u32, body_sha256: &[u8; 32]) -> [u8; VERIFIED_REPLY_LEN] {
+    let mut out = [0u8; VERIFIED_REPLY_LEN];
+    let (head, digest) = out.split_at_mut(5);
+    let (slot_byte, version_bytes) = head.split_at_mut(1);
+    slot_byte.copy_from_slice(&[slot.index()]);
+    version_bytes.copy_from_slice(&version.to_be_bytes());
+    digest.copy_from_slice(body_sha256);
+    out
+}
 
 impl Verified {
     pub fn slot(&self) -> Slot {
@@ -765,6 +824,17 @@ fn classify(current: u32, release_seq: u32, view: SlotView) -> Classification {
                 Classification::NotCandidate(Reject::Skipped)
             }
         }
+    }
+}
+
+/// Why `select` does not consider `view` a candidate at `current` and
+/// `release_seq` (the same classification it uses), or `None` if it is one.
+/// For the `policy` PD's `PolicyRejected` lines on the slot it did not
+/// select; it decides nothing.
+pub fn not_candidate(current: u32, release_seq: u32, view: SlotView) -> Option<Reject> {
+    match classify(current, release_seq, view) {
+        Classification::NotCandidate(r) => Some(r),
+        Classification::Candidate { .. } => None,
     }
 }
 

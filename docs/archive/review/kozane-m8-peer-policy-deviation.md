@@ -300,3 +300,41 @@ Run in a scratch worktree (`build/probes/p3/tree`, since removed).
   while the provisioning batch was editing `tools/` and `tests/`. The
   stash list is empty, and every file both batches reported is present.
 - The gates for this slice re-run every suite on the final tree.
+
+## Slice 3
+
+### D-11 — `policy`'s audit source is a write-once log page, not a ring
+
+- An SPSC audit ring has its consumer (`audit`, tainted) write the read
+  index into the shared page. That would carry taint into `policy`, from
+  `policy` into `tpm` through the policy PPC, and from `tpm` into the key
+  PDs, which L1 refuses.
+- `audit_event::log` is a count word plus eight two-word records. `policy`
+  maps it `rw` and `audit` maps it `r`, keeping its own read position.
+  `policy` writes at most four lines a boot.
+- The laws carry nothing into a `policy` PD from a mapper that cannot
+  write the page. That is the supervisor record page's rule, extended.
+  The MR keeps the name `audit_policy` (kind `plain`, `{policy = rw,
+  audit = r}`).
+
+### D-12 — `policy`'s callers are checked by role until batch B names them
+
+- C11 says `policy`'s PPC callers are exactly the barrier set. Batch A has
+  no callers yet, and its rule admits callers of role `untrusted_input`
+  or `data`, which would also let `tls` in.
+- Batch B replaces the role check with the named set `hs, pq, ingress,
+  data, inner`, with a `tls` deny fixture.
+- Batch A also adds `["data", "policy"]` to the priority order, because
+  `data` is in the barrier set.
+
+### Risk — `policy`'s verification stack and the P2 TCG timing
+
+- With the all-zero keys of today's deployments, the verifier is compiled
+  out, and `policy` refuses at STATE first.
+- A scratch build with keys links no_std with 244 KiB of text and 4.7 MiB
+  of `bss`. The `bss` is a static `DOMAIN ‖ body` buffer, needed because
+  the libcrux verifiers take one contiguous message and the slot is
+  read-only.
+- ML-DSA-65's stack depth inside the PD's 256 KiB stack, and P2's TCG
+  timing, are first observed in batch B, whose harness boots signed
+  bundles. If either fails, it is fixed there, not carried forward.

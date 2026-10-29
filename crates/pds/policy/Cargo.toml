@@ -1,0 +1,24 @@
+[package]
+name = "pd-policy"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+audit-event = { path = "../../audit-event" }
+boot-stage = { path = "../../boot-stage" }
+# The node's facts, fleet ID and bundle signing keys (M8 plan C7).
+config = { path = "../../config" }
+layout = { path = "../../layout" }
+# The bundle signature pair (M8 plan D1), at tools/release's and
+# tools/policy's pins; core only (probe P2). Only this PD links them (D10).
+libcrux-ed25519 = { version = "=0.0.10", default-features = false }
+libcrux-ml-dsa = { version = "=0.0.11", default-features = false, features = ["mldsa65"] }
+libcrux-sha2 = { version = "=0.0.9", default-features = false }
+limits = { path = "../../limits" }
+# `parse` without a token: this PD verified the signatures itself (check-pins P27).
+policy-wire = { path = "../../policy-wire", features = ["verifier"] }
+release-seq = { path = "../../release-seq" }
+# BLAKE2s, the gateway's rp digest (`config`'s rp_hash).
+secret-blob = { path = "../../secret-blob" }
+sel4-microkit = { workspace = true }

@@ -16,9 +16,11 @@
 
 /// The supervisor's children, by Microkit child id (the `.system` gives
 /// each its index here as `id`; `layout`'s tests check the two agree).
-pub const CHILDREN: [&str; 15] = [
+/// New children take the next id, so a record's id keeps naming the same
+/// PD across releases.
+pub const CHILDREN: [&str; 16] = [
     "eth_out", "eth_in", "timer", "tpm", "rng", "key", "pqkey", "tlskey", "hs", "pq", "ingress", "data", "inner",
-    "tls", "audit",
+    "tls", "audit", "policy",
 ];
 
 /// What the supervisor does with a fault: always a reset. The child and

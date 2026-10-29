@@ -825,6 +825,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "libcrux-ed25519"
+version = "0.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "55de36c252a9fd97a202c03535deecbe988c525eb16901b2ea17ed99e737edc9"
+dependencies = [
+ "libcrux-hacl-rs",
+ "libcrux-macros",
+ "libcrux-sha2",
+]
+
+[[package]]
 name = "libcrux-hacl-rs"
 version = "0.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -875,6 +886,21 @@ checksum = "2afdd4da30d6e23f76bd6f3ad61be5c773720349eef3e791f8b79cfea3fe1436"
 dependencies = [
  "quote",
  "syn 3.0.9",
+]
+
+[[package]]
+name = "libcrux-ml-dsa"
+version = "0.0.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31f8706f014055bed7b2706efb8e646e4590d95e447dfc146be2ed4705920dda"
+dependencies = [
+ "core-models",
+ "hax-lib 0.4.2",
+ "libcrux-intrinsics",
+ "libcrux-macros",
+ "libcrux-platform",
+ "libcrux-secrets",
+ "libcrux-sha3",
 ]
 
 [[package]]
@@ -1238,6 +1264,24 @@ dependencies = [
  "tpm2",
  "wg-core",
  "zeroize",
+]
+
+[[package]]
+name = "pd-policy"
+version = "0.1.0"
+dependencies = [
+ "audit-event",
+ "boot-stage",
+ "config",
+ "layout",
+ "libcrux-ed25519",
+ "libcrux-ml-dsa",
+ "libcrux-sha2",
+ "limits",
+ "policy-wire",
+ "release-seq",
+ "secret-blob",
+ "sel4-microkit",
 ]
 
 [[package]]
@@ -1641,6 +1685,10 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "release-seq"
+version = "0.1.0"
 
 [[package]]
 name = "rfc6979"

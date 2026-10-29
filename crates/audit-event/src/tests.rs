@@ -196,7 +196,11 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::KeyUnavailable { .. }
         | Event::KeyStackHighWater { .. }
         | Event::KeyWaitHighWater { .. }
-        | Event::TlsSignHighWater { .. } => false,
+        | Event::TlsSignHighWater { .. }
+        | Event::PolicyAccepted { .. }
+        | Event::ReleaseSeq { .. }
+        | Event::PolicyUnavailable { .. }
+        | Event::PolicyRejected { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
     assert_eq!(Event::FIXED.len(), 64);
@@ -731,4 +735,174 @@ fn tpm_cap_failed_is_emitted_on_every_occurrence_on_its_own_counter() {
     let got: Vec<_> = out.iter().map(|r| (r.code, r.a)).collect();
     assert_eq!(got, [(0x005a, 1), (0x005b, 1), (0x005b, 2)]);
     assert_eq!(Event::TpmCapFailed.name(), "TpmCapFailed");
+}
+
+// M8 plan C9, C10 (F41, F45): the `policy` PD's lines.
+
+/// Per slot, every real reason decodes as itself, the reserved last code
+/// as `Unknown`, and an out-of-range reason encodes to that reserved code.
+#[test]
+fn policy_rejected_decodes_each_slots_reasons_and_reserves_its_last_code() {
+    for slot in 0..POLICY_SLOTS {
+        for reason in 0..POLICY_REASONS {
+            let code = Event::PolicyRejected { slot, reason, version: 7 }.code();
+            assert_eq!(decode(code), Decoded::PolicyRejected { slot, reason }, "slot {slot} reason {reason}");
+        }
+        let reserved = POLICY_REJECTED_BASE + slot * POLICY_REASON_CODES + POLICY_REASONS;
+        assert_eq!(decode(reserved), Decoded::Unknown, "slot {slot}");
+        for reason in [POLICY_REASONS, POLICY_REASONS + 1, u16::MAX] {
+            assert_eq!(Event::PolicyRejected { slot, reason, version: 0 }.code(), reserved, "slot {slot} reason {reason}");
+        }
+    }
+}
+
+#[test]
+fn policy_rejected_with_an_out_of_range_slot_encodes_to_its_own_unknown() {
+    for slot in [POLICY_SLOTS, 3, u16::MAX] {
+        for reason in [0, POLICY_REASONS - 1, u16::MAX] {
+            assert_eq!(Event::PolicyRejected { slot, reason, version: 0 }.code(), POLICY_REJECTED_UNKNOWN);
+        }
+    }
+    assert_eq!(decode(POLICY_REJECTED_UNKNOWN), Decoded::Unknown);
+    assert_eq!(POLICY_REJECTED_UNKNOWN, POLICY_REJECTED_BASE + 2 * POLICY_REASON_CODES);
+}
+
+#[test]
+fn policy_unavailable_decodes_every_reason_and_reserves_its_last_code() {
+    for reason in 0..POLICY_REASONS {
+        let code = Event::PolicyUnavailable { reason, current: 3 }.code();
+        assert_eq!(decode(code), Decoded::PolicyUnavailable(reason), "{reason}");
+    }
+    let reserved = POLICY_UNAVAILABLE_BASE + POLICY_REASONS;
+    assert_eq!(decode(reserved), Decoded::Unknown);
+    for reason in [POLICY_REASONS, u16::MAX] {
+        assert_eq!(Event::PolicyUnavailable { reason, current: 0 }.code(), reserved);
+    }
+}
+
+#[test]
+fn policy_accepted_decodes_both_slots_and_reserves_its_last_code() {
+    assert_eq!(decode(Event::PolicyAccepted { slot: 0, version: 1 }.code()), Decoded::PolicyAccepted(0));
+    assert_eq!(decode(Event::PolicyAccepted { slot: 1, version: 1 }.code()), Decoded::PolicyAccepted(1));
+    let reserved = POLICY_ACCEPTED_BASE + POLICY_SLOTS;
+    assert_eq!(decode(reserved), Decoded::Unknown);
+    for slot in [POLICY_SLOTS, u16::MAX] {
+        assert_eq!(Event::PolicyAccepted { slot, version: 0 }.code(), reserved);
+    }
+    assert_eq!(decode(Event::ReleaseSeq { seq: 1 }.code()), Decoded::ReleaseSeq);
+}
+
+/// The value rides in `a`, never a running total; `b` stays the lost count.
+#[test]
+fn policy_events_carry_their_value_in_a_and_are_never_coalesced() {
+    let events = [
+        (Event::PolicyAccepted { slot: 1, version: 41 }, 41),
+        (Event::ReleaseSeq { seq: 9 }, 9),
+        (Event::PolicyUnavailable { reason: 3, current: 5 }, 5),
+        (Event::PolicyRejected { slot: 0, reason: 2, version: 6 }, 6),
+    ];
+    for (ev, a) in events {
+        let mut c = Coalescer::new();
+        let mut out = Vec::new();
+        run(&mut c, ev, 2, &mut out);
+        assert_eq!(out.len(), 2, "{}", ev.name());
+        assert!(out.iter().all(|r| r.a == a && r.b == 0 && r.code == ev.code()), "{}", ev.name());
+        assert!(!ev.is_coalesced());
+    }
+}
+
+/// `StateRefused` is a reason code of its own (no sentinel current value).
+#[test]
+fn state_refused_is_the_last_reason_and_named_so() {
+    assert_eq!(POLICY_REASON_NAMES[usize::from(POLICY_STATE_REFUSED)], "StateRefused");
+    assert_eq!(POLICY_STATE_REFUSED, POLICY_REASONS - 1);
+    assert_eq!(decode(POLICY_UNAVAILABLE_BASE + POLICY_STATE_REFUSED), Decoded::PolicyUnavailable(POLICY_STATE_REFUSED));
+}
+
+/// Every policy range and `POLICY_REJECTED_UNKNOWN` lie apart from each
+/// other and from every older code (the M6 test's ranges and singles).
+#[test]
+fn policy_code_ranges_are_disjoint_from_each_other_and_from_every_other_code() {
+    let ranges = [
+        (FRAME_DROPPED_BASE, 0x40),
+        (TCP_LIMITED_BASE, 0x20),
+        (TLS_REFUSED_BASE, 0x20),
+        (TLS_CLOSED_BASE, 0x20),
+        (HTTP_REFUSED_BASE, 0x20),
+        (TLS_TIMEOUT_BASE, 0x20),
+        (TLS_KIND_UNKNOWN, 1),
+        (POLICY_ACCEPTED_BASE, POLICY_SLOTS + 1),
+        (RELEASE_SEQ, 1),
+        (POLICY_UNAVAILABLE_BASE, POLICY_REASONS + 1),
+        (POLICY_REJECTED_BASE, POLICY_SLOTS * POLICY_REASON_CODES),
+        (POLICY_REJECTED_UNKNOWN, 1),
+    ];
+    for (i, (a, n)) in ranges.iter().enumerate() {
+        for (b, m) in &ranges[i + 1..] {
+            assert!(a + n <= *b || b + m <= *a, "{a:#x} overlaps {b:#x}");
+        }
+    }
+    let low = ranges.iter().map(|(a, _)| *a).min().unwrap();
+    assert!(Event::FIXED.iter().all(|e| e.code() < low));
+    for c in [COST_HIGH_WATER, STACK_HIGH_WATER, HALTED, KEY_UNAVAILABLE, KEY_STACK_HIGH_WATER, KEY_WAIT_HIGH_WATER, TLS_SIGN_HIGH_WATER] {
+        assert!(c < low, "{c:#x}");
+    }
+}
+
+/// Each policy code counts in a slot of its own, apart from every other
+/// kind's (a policy record never moves another kind's running total).
+#[test]
+fn policy_events_have_their_own_counter_slots() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::PolicyRejected { slot: 1, reason: POLICY_REASONS - 1, version: 0 }, 1, &mut out);
+    run(&mut c, Event::PolicyRejected { slot: 9, reason: 0, version: 0 }, 1, &mut out);
+    run(&mut c, Event::ArpReplied, 1, &mut out);
+    run(&mut c, Event::TlsTimeout { stage: 99 }, 1, &mut out);
+    assert_eq!(out.len(), 4);
+    assert_eq!((out[2].code, out[2].a), (Event::ArpReplied.code(), 1));
+    assert_eq!((out[3].code, out[3].a), (TLS_KIND_UNKNOWN, 1));
+}
+
+#[test]
+fn a_log_record_round_trips_through_its_words() {
+    let r = Record { code: 0xbeef, _reserved: 0x1234, a: u32::MAX - 1, b: 0x8000_0001 };
+    assert_eq!(log::decode(log::encode(r)), r);
+    assert_eq!(log::decode([u64::MAX, u64::MAX]).b, u32::MAX);
+}
+
+/// The writer fills each slot once, publishes the count after the record,
+/// and refuses past the last slot without writing.
+#[test]
+fn the_log_writer_publishes_each_record_after_writing_it() {
+    let mut page = [0u64; log::WORDS];
+    let mut order = Vec::new();
+    let mut w = log::Writer::new();
+    for i in 0..log::SLOTS {
+        let r = Record { code: i as u16, _reserved: 0, a: i as u32, b: 0 };
+        assert!(w.push(r, |at, v| {
+            order.push(at);
+            page[at] = v;
+        }));
+        assert_eq!(order.last(), Some(&0), "the count is written last");
+        assert_eq!(page[0], i as u64 + 1);
+        assert_eq!(log::decode([page[log::slot_word(i)], page[log::slot_word(i) + 1]]), r);
+    }
+    let before = page;
+    assert!(!w.push(Record::default(), |at, v| page[at] = v));
+    assert_eq!(page, before);
+    assert_eq!(log::slot_word(log::SLOTS - 1) + 2, log::WORDS);
+}
+
+/// `audit` prints what was published since its last read, whatever the
+/// count says: a count past the slots is clamped, a printed index past the
+/// count yields nothing.
+#[test]
+fn the_log_reader_prints_only_published_slots() {
+    assert_eq!(log::pending(0, 0), 0..0);
+    assert_eq!(log::pending(3, 0), 0..3);
+    assert_eq!(log::pending(3, 2), 2..3);
+    assert_eq!(log::pending(3, 3), 3..3);
+    assert_eq!(log::pending(u64::MAX, 1), 1..log::SLOTS);
+    assert!(log::pending(2, 5).is_empty());
 }

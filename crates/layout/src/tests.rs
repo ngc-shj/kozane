@@ -88,7 +88,7 @@ fn every_region_is_a_link_an_audit_ring_or_a_named_singleton() {
         .flat_map(|l| ["used", "free", "data"].map(|s| std::format!("{l}_{s}")))
         .chain(AUDITS.iter().map(|a| String::from(*a)))
         .chain(
-            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "tpm_mmio", "rng_mmio", "rng_dma", "supervisor_record", "secrets", "pq_secrets", "tls_secrets", "policy_a", "policy_b"]
+            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "tpm_mmio", "rng_mmio", "rng_dma", "supervisor_record", "secrets", "pq_secrets", "tls_secrets", "policy_a", "policy_b", "audit_policy"]
                 .map(String::from),
         )
         .collect();
@@ -282,6 +282,8 @@ fn channel_ids_match_layout() {
         (("pqkey", pqkey::CH_RNG), ("rng", rng::CH_PQKEY)),
         (("tlskey", tlskey::CH_RNG), ("rng", rng::CH_TLSKEY)),
         (("supervisor", supervisor::CH_AUDIT), ("audit", audit::CH_SUPERVISOR)),
+        (("policy", policy::CH_TPM), ("tpm", tpm::CH_POLICY)),
+        (("policy", policy::CH_AUDIT), ("audit", audit::CH_POLICY)),
     ];
     for (a, b) in expected {
         assert!(has_channel(a, b), "{a:?} <-> {b:?}");
@@ -434,3 +436,25 @@ fn child_ids_name_the_supervisor_children() {
     assert_eq!(all, seen + 1, "a pd outside the supervisor");
 }
 
+
+/// M8 plan C5, C10, C11: `policy` is passive, between its future callers
+/// and `tpm` in priority, maps both slots read-only and its log page
+/// read-write, which `audit` maps read-only and which holds the log.
+#[test]
+fn policy_is_a_passive_verifier_on_the_planned_schedule() {
+    let attr = |a| pd_attribute("policy", a).expect(a);
+    assert_eq!(attr("passive"), "true");
+    assert_eq!(parse_num(&attr("priority")), 125);
+    for pd in ["hs", "pq", "ingress", "data", "inner"] {
+        assert!(parse_num(&pd_attribute(pd, "priority").expect(pd)) < 125, "{pd}");
+    }
+    assert!(parse_num(&pd_attribute("tpm", "priority").expect("tpm")) > 125);
+    for slot in ["policy_a", "policy_b"] {
+        assert_eq!(map_of("policy", slot).map(|m| m.1).as_deref(), Some("r"), "{slot}");
+    }
+    let (a, b) = (map_of("policy", "policy_a").expect("a").0, map_of("policy", "policy_b").expect("b").0);
+    assert!(a + limits::BUNDLE_MAX <= b || b + limits::BUNDLE_MAX <= a, "the slot windows overlap");
+    assert_eq!(map_of("policy", "audit_policy").map(|m| m.1).as_deref(), Some("rw"));
+    assert_eq!(map_of("audit", "audit_policy").map(|m| m.1).as_deref(), Some("r"));
+    assert!(mr_sizes()["audit_policy"] >= audit_event::log::WORDS * 8);
+}

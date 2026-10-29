@@ -281,8 +281,9 @@ def check_reason_list_matches_rust():
 
 
 # QEMU's serial console ends lines with "\r\r\n". `audit` prints these for
-# each PD's `Ready` record, and its own.
-READY_LINE = re.compile(r"(eth_out|eth_in|ingress|inner|data|hs|audit|pq|tls): ready\r*\n")
+# each PD's `Ready` record, and its own. `policy` (M8 plan C5) prints its
+# ready whatever its outcome: readiness is that it answers `Await`.
+READY_LINE = re.compile(r"(eth_out|eth_in|ingress|inner|data|hs|audit|pq|tls|policy): ready\r*\n")
 
 
 def start_without_stop_signals(thread: threading.Thread):
@@ -1337,6 +1338,18 @@ def test_wireguard(pkg: "Package", deploy: str, passed: list):
             raise Fail("wireguard-go's PSK is not the prelude's key_out")
         passed.append("rosenpass interop (master)")
         print("\nPASS [rosenpass master interop: the gateway's OSK is the client's key_out]")
+
+        # M8 plan C3, C5 (slice 3 batch A): this deployment compiles in no
+        # [policy], so `tpm` refuses `policy`'s state (no NV Name to check
+        # against) and `policy` is Unavailable for the boot, says so, and
+        # still sends Failed: the cap ran, as the handshake above (keys
+        # released only past the cap barrier) shows.
+        con.wait_for(r"policy: unavailable reason=StateRefused current=unknown lost=0\r*\n", strip_ready=True)
+        con.wait_for(r"policy: ready\r*\n", strip_ready=True)
+        if con.count(r"policy: (accepted|release_seq|rejected)"):
+            raise Fail("policy: an accepted, release or rejected line without a state")
+        passed.append("policy unavailable without [policy], cap confirmed")
+        print("\nPASS [policy: unavailable (StateRefused) without [policy], the cap still confirmed]")
 
         def initiator(conf: str, psk: bytes, static=None):
             return wg_mod.Initiator(static or b64(conf_value(conf, "PrivateKey")), gw_pub, psk,

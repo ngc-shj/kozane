@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <memory_region name="nic" size="0x1000" phys_addr="0xa003000" />
+    <memory_region name="tis" size="0x1000" phys_addr="0xc000000" />
+    <memory_region name="secrets" size="0x1000" />
+    <memory_region name="policy_a" size="0x1000" />
+    <memory_region name="log" size="0x1000" />
+    <protection_domain name="eth" priority="9" budget="1_000" period="10_000">
+        <program_image path="eth.elf" />
+        <map mr="nic" vaddr="0x2000000" perms="rw" cached="false" />
+    </protection_domain>
+    <protection_domain name="audit" priority="1" budget="1_000" period="10_000">
+        <program_image path="audit.elf" />
+        <map mr="log" vaddr="0x2000000" perms="rw" />
+    </protection_domain>
+    <protection_domain name="hs" priority="2" budget="1_000" period="10_000">
+        <program_image path="hs.elf" />
+        <map mr="policy_a" vaddr="0x2000000" perms="r" />
+    </protection_domain>
+    <protection_domain name="key" priority="3" passive="true">
+        <program_image path="key.elf" />
+        <map mr="secrets" vaddr="0x2000000" perms="r" />
+    </protection_domain>
+    <protection_domain name="policy" priority="4" passive="true">
+        <program_image path="policy.elf" />
+        <map mr="policy_a" vaddr="0x2000000" perms="r" />
+        <map mr="log" vaddr="0x7000000" perms="rw" />
+    </protection_domain>
+    <protection_domain name="tpm" priority="6" passive="true">
+        <program_image path="tpm.elf" />
+        <map mr="tis" vaddr="0x2000000" perms="rw" cached="false" />
+    </protection_domain>
+    <channel>
+        <end pd="eth" id="1" />
+        <end pd="audit" id="1" />
+    </channel>
+    <channel>
+        <end pd="eth" id="2" />
+        <end pd="hs" id="1" />
+    </channel>
+    <channel>
+        <end pd="hs" id="2" pp="true" notify="false" />
+        <end pd="key" id="1" pp="false" />
+    </channel>
+    <channel>
+        <end pd="key" id="3" pp="true" notify="false" />
+        <end pd="tpm" id="1" pp="false" notify="false" />
+    </channel>
+    <channel>
+        <end pd="policy" id="1" pp="true" notify="false" />
+        <end pd="tpm" id="5" pp="false" notify="false" />
+    </channel>
+    <channel>
+        <end pd="policy" id="2" />
+        <end pd="audit" id="10" notify="false" />
+    </channel>
+    <channel>
+        <end pd="hs" id="3" pp="true" notify="false" />
+        <end pd="policy" id="3" pp="false" />
+    </channel>
+</system>

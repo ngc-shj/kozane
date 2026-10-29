@@ -46,6 +46,13 @@ pub enum Role {
     /// reads, and its one channel notifies `audit` and is never signalled
     /// back (L1, L4 as amended).
     Supervisor,
+    /// The peer-policy verifier (M8 plan C5, C11): passive and untainted;
+    /// it maps only bundle slots and pages every other mapper only reads
+    /// (its log page), calls a `tpm` pd, notifies `audit` without being
+    /// signalled back, and has `key`'s callee exemption towards its callers
+    /// (the barrier pds, tainted). A mapper that cannot write a page it
+    /// shares carries nothing into it.
+    Policy,
 }
 
 impl Role {
@@ -60,9 +67,10 @@ impl Role {
             "tpm" => Ok(Role::Tpm),
             "rng" => Ok(Role::Rng),
             "supervisor" => Ok(Role::Supervisor),
+            "policy" => Ok(Role::Policy),
             other => Err(err(format!(
-                "unknown role '{other}' (expected driver, untrusted_input, key, data, service, timer, tpm, rng or \
-                 supervisor)"
+                "unknown role '{other}' (expected driver, untrusted_input, key, data, service, timer, tpm, rng, \
+                 supervisor or policy)"
             ))),
         }
     }
@@ -789,6 +797,25 @@ mod tests {
     fn a_tpm_mr_owned_by_a_driver_is_rejected() {
         let e = Policy::load(&tpm_policy("driver")).unwrap_err().to_string();
         assert!(e.contains("is marked tpm but its owner 'tpm' is not a tpm pd"), "{e}");
+    }
+
+    /// M8 plan C11: the `policy` role loads, and may own no device.
+    #[test]
+    fn a_policy_pd_loads_and_owns_no_device() {
+        let p = Policy::load(&tpm_policy("policy").replace("tpm = true", "")).unwrap_err().to_string();
+        assert!(p.contains("device mr 'tis' owner 'tpm' must have role"), "{p}");
+        let text = format!(
+            r#"
+            [pds.policy]
+            role = "policy"
+
+            [budgets]
+            ratio_cap = 0.2
+            ratio_sum_cap = 0.5
+            {BOARD}
+        "#
+        );
+        assert_eq!(Policy::load(&text).unwrap().role("policy"), Some(Role::Policy));
     }
 
     #[test]

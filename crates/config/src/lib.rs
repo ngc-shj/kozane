@@ -27,6 +27,21 @@ pub struct Neighbor {
 
 include!(concat!(env!("OUT_DIR"), "/config.rs"));
 
+/// The compiled facts a peer-policy bundle is validated against (M8 plan
+/// C1, C7): `policy-wire`'s `NodeConfig`, built from this configuration
+/// alone.
+pub const fn node_config() -> policy_wire::NodeConfig<'static> {
+    policy_wire::NodeConfig {
+        fleet_id: FLEET_ID,
+        inside_prefix: INSIDE_PREFIX,
+        inside_ip: INSIDE_IP,
+        outside_ip: OUTSIDE_IP,
+        neighbors: NEIGHBOR_IPS,
+        gateway_wg_public: GATEWAY_PUBLIC,
+        gateway_rp_digest: GATEWAY_RP_HASH,
+    }
+}
+
 /// The peer whose allowed IPs contain `ip` (allowed IPs never overlap).
 pub fn peer_for(ip: [u8; 4]) -> Option<usize> {
     PEERS.iter().position(|p| p.allowed.iter().any(|a| a.contains(ip)))

@@ -49,13 +49,19 @@ pub struct RawGateway {
     pub tls_public: String,
 }
 
-/// The expected Names of `NV_POLICY_CTR` and `NV_POLICY_BASE` as
-/// `tools/provision` computed them (with WRITTEN, and WRITELOCKED for the
-/// base): nameAlg ‖ SHA-256 digest, in hex. `tpm` refuses the policy state
-/// unless the TPM's Names equal these.
+/// The node's peer-policy facts (M8 plan C3, C7). The expected Names of
+/// `NV_POLICY_CTR` and `NV_POLICY_BASE` as `tools/provision` computed them
+/// (with WRITTEN, and WRITELOCKED for the base): nameAlg ‖ SHA-256 digest,
+/// in hex; `tpm` refuses the policy state unless the TPM's Names equal
+/// these. The fleet's ID (32 hex digits) and the bundle signing keys:
+/// Ed25519 in hex, ML-DSA-65 as a file of its raw public key, relative to
+/// this file; `policy` verifies every bundle under both.
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawPolicy {
+    pub fleet_id: String,
+    pub ed25519_pub: String,
+    pub mldsa65_pub: String,
     pub nv_ctr_name: String,
     pub nv_base_name: String,
 }
@@ -128,6 +134,12 @@ pub struct Checked {
     /// The policy indices' expected Names; all zero without `[policy]`.
     pub nv_ctr_name: [u8; NV_NAME_LEN],
     pub nv_base_name: [u8; NV_NAME_LEN],
+    /// The fleet ID and the bundle signing keys; all zero without
+    /// `[policy]`, which `policy` refuses (a zero key never verifies).
+    pub fleet_id: [u8; FLEET_ID_LEN],
+    pub ed25519_pub: [u8; 32],
+    pub mldsa65_pub: Vec<u8>,
+    pub inside_prefix: Prefix,
 }
 
 pub fn decode_key(s: &str) -> Result<[u8; 32], String> {
@@ -223,6 +235,40 @@ pub fn decode_nv_name(s: &str) -> Result<[u8; NV_NAME_LEN], String> {
         return Err(bad());
     }
     Ok(out)
+}
+
+/// A bundle's fleet ID (M8 plan C1).
+pub const FLEET_ID_LEN: usize = 16;
+/// An ML-DSA-65 public key (FIPS 204).
+pub const MLDSA65_PUB_LEN: usize = 1952;
+
+/// `N` bytes written as `2N` hex digits, not all zero: all zero is what an
+/// absent `[policy]` renders, so it must not also be a configured value.
+pub fn decode_policy_hex<const N: usize>(what: &str, s: &str) -> Result<[u8; N], String> {
+    let bad = || format!("config: policy {what} {s:?}: expected {} hex digits, not all zero", 2 * N);
+    if s.len() != 2 * N || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(bad());
+    }
+    let mut out = [0u8; N];
+    for (o, i) in out.iter_mut().zip((0..s.len()).step_by(2)) {
+        *o = u8::from_str_radix(&s[i..i + 2], 16).map_err(|_| bad())?;
+    }
+    if out.iter().all(|b| *b == 0) {
+        return Err(bad());
+    }
+    Ok(out)
+}
+
+/// Reads the ML-DSA-65 public key through `load` and checks its size.
+fn load_mldsa65_pub(path: &str, load: &dyn Fn(&str) -> Result<Vec<u8>, String>) -> Result<Vec<u8>, String> {
+    let public = load(path)?;
+    if public.len() != MLDSA65_PUB_LEN {
+        return Err(format!("config: policy mldsa65_pub {path}: {} bytes, expected {MLDSA65_PUB_LEN}", public.len()));
+    }
+    if public.iter().all(|b| *b == 0) {
+        return Err(format!("config: policy mldsa65_pub {path} is all zero"));
+    }
+    Ok(public)
 }
 
 /// Reads the certificate through `load` and checks that it carries
@@ -421,15 +467,21 @@ pub fn check(text: &str, max_peers: usize, load: &dyn Fn(&str) -> Result<Vec<u8>
     }
     let tls_public = decode_tls_public(&g.tls_public)?;
     let tls_cert = load_tls_cert(&g.tls_cert, &tls_public, load)?;
-    let (nv_ctr_name, nv_base_name) = match &raw.policy {
+    let (nv_ctr_name, nv_base_name, fleet_id, ed25519_pub, mldsa65_pub) = match &raw.policy {
         Some(p) => {
             let names = (decode_nv_name(&p.nv_ctr_name)?, decode_nv_name(&p.nv_base_name)?);
             if names.0 == names.1 {
                 return Err("config: policy nv_ctr_name and nv_base_name are the same Name".into());
             }
-            names
+            (
+                names.0,
+                names.1,
+                decode_policy_hex("fleet_id", &p.fleet_id)?,
+                decode_policy_hex("ed25519_pub", &p.ed25519_pub)?,
+                load_mldsa65_pub(&p.mldsa65_pub, load)?,
+            )
         }
-        None => ([0; NV_NAME_LEN], [0; NV_NAME_LEN]),
+        None => ([0; NV_NAME_LEN], [0; NV_NAME_LEN], [0; FLEET_ID_LEN], [0; 32], Vec::from([0; MLDSA65_PUB_LEN])),
     };
     Ok(Checked {
         gateway_public,
@@ -450,6 +502,10 @@ pub fn check(text: &str, max_peers: usize, load: &dyn Fn(&str) -> Result<Vec<u8>
         tls_public,
         nv_ctr_name,
         nv_base_name,
+        fleet_id,
+        ed25519_pub,
+        mldsa65_pub,
+        inside_prefix,
     })
 }
 
@@ -484,9 +540,19 @@ pub fn render(c: &Checked, gateway_rp_file: &str, peer_rp_files: &[String]) -> S
     s += "/// The policy NV indices' expected Names (`tpm`); all zero without `[policy]`, which no index's Name equals.\n";
     s += &format!("pub const NV_CTR_NAME: [u8; {NV_NAME_LEN}] = {:?};\n", c.nv_ctr_name);
     s += &format!("pub const NV_BASE_NAME: [u8; {NV_NAME_LEN}] = {:?};\n", c.nv_base_name);
+    s += "/// The fleet ID and the bundle signing keys (`policy`); all zero without `[policy]`, and a zero key never verifies.\n";
+    s += &format!("pub const FLEET_ID: [u8; {FLEET_ID_LEN}] = {:?};\n", c.fleet_id);
+    s += &format!("pub const POLICY_ED25519_PUB: [u8; 32] = {:?};\n", c.ed25519_pub);
+    s += &format!("pub const POLICY_MLDSA65_PUB: [u8; {MLDSA65_PUB_LEN}] = {:?};\n", c.mldsa65_pub);
+    s += "/// The inside network (`policy_wire::NodeConfig`).\n";
+    s += &format!("pub const INSIDE_PREFIX: Prefix = Prefix {{ addr: {:?}, len: {} }};\n", c.inside_prefix.addr, c.inside_prefix.len);
     s += "pub const NEIGHBORS: &[Neighbor] = &[\n";
     for (ip, mac) in &c.neighbors {
         s += &format!("    Neighbor {{ ip: {ip:?}, mac: {mac:?} }},\n");
+    }
+    s += "];\n/// `NEIGHBORS`' addresses alone (`policy_wire::NodeConfig`).\npub const NEIGHBOR_IPS: &[[u8; 4]] = &[\n";
+    for (ip, _) in &c.neighbors {
+        s += &format!("    {ip:?},\n");
     }
     s += "];\npub const PEERS: &[Peer] = &[\n";
     for q in &c.peers {

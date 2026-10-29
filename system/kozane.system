@@ -40,8 +40,8 @@
     <memory_region name="tls_secrets" size="0x1000" prefill_path="tls-secrets-placeholder.bin" />
     <!-- M8 plan C4, D3: the two peer-policy bundle slots, BUNDLE_MAX each,
          zero placeholders here. U-Boot measures both into PCR 9 and copies
-         each over its range; no PD maps them until the `policy` PD
-         (slice 3, C11). -->
+         each over its range; mapped read-only, into `policy` alone until
+         the barrier PDs read them (C6, C11). -->
     <memory_region name="policy_a" size="0x480_000" prefill_path="policy-slot-placeholder.bin" />
     <memory_region name="policy_b" size="0x480_000" prefill_path="policy-slot-placeholder.bin" />
 
@@ -126,6 +126,9 @@
     <memory_region name="audit_data" size="0x1000" />
     <memory_region name="audit_pq" size="0x1000" />
     <memory_region name="audit_tls" size="0x1000" />
+    <!-- M8 plan C10: `policy`'s log page (audit_event::log), rw in policy,
+         r in audit, so nothing of audit reaches the untainted policy. -->
+    <memory_region name="audit_policy" size="0x1000" />
 
     <!-- M7 plan C8: the parent of every PD below, so each one's fault
          reaches it; just below audit, so audit prints the record before
@@ -211,6 +214,18 @@
         <protection_domain name="tlskey" id="7" priority="135" budget="2_000" period="10_000" passive="true" stack_size="0x20_000">
             <program_image path="pd-tlskey.elf" />
             <map mr="tls_secrets" vaddr="0x2_000_000" perms="r" setvar_vaddr="tls_secrets" />
+        </protection_domain>
+
+        <!-- M8 plan C5: the peer-policy verifier. Passive: every Await runs on
+             its caller's scheduling context; this budget covers init (both
+             slots hashed and verified). Above the parsing PDs that will
+             call it (C6), below tpm, which it calls; its stack holds
+             ML-DSA-65's verification. -->
+        <protection_domain name="policy" id="15" priority="125" budget="2_000" period="10_000" passive="true" stack_size="0x40_000">
+            <program_image path="pd-policy.elf" />
+            <map mr="policy_a" vaddr="0x2_000_000" perms="r" setvar_vaddr="policy_a" />
+            <map mr="policy_b" vaddr="0x3_000_000" perms="r" setvar_vaddr="policy_b" />
+            <map mr="audit_policy" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_policy" />
         </protection_domain>
 
         <protection_domain name="hs" id="8" priority="110" budget="2_000" period="10_000" stack_size="0x20_000">
@@ -358,6 +373,7 @@
             <map mr="audit_pq" vaddr="0x7_006_000" perms="rw" setvar_vaddr="audit_pq" />
             <map mr="audit_tls" vaddr="0x7_007_000" perms="rw" setvar_vaddr="audit_tls" />
             <map mr="supervisor_record" vaddr="0x9_000_000" perms="r" setvar_vaddr="supervisor_record" />
+            <map mr="audit_policy" vaddr="0x7_008_000" perms="r" setvar_vaddr="audit_policy" />
         </protection_domain>
     </protection_domain>
 
@@ -514,5 +530,17 @@
     <channel>
         <end pd="supervisor" id="1" />
         <end pd="audit" id="9" notify="false" />
+    </channel>
+
+    <!-- M8 plan C3, C5: policy's four requests on tpm's policy channel (no
+         TPM command), and its log notifications to audit, which never
+         signals it back. -->
+    <channel>
+        <end pd="policy" id="1" pp="true" notify="false" />
+        <end pd="tpm" id="5" pp="false" notify="false" />
+    </channel>
+    <channel>
+        <end pd="policy" id="2" />
+        <end pd="audit" id="10" notify="false" />
     </channel>
 </system>

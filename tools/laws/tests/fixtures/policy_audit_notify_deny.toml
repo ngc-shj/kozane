@@ -1,0 +1,82 @@
+[pds.eth]
+role = "driver"
+
+[pds.audit]
+role = "service"
+
+[pds.hs]
+role = "untrusted_input"
+
+[pds.key]
+role = "key"
+
+[pds.policy]
+role = "policy"
+
+[pds.tpm]
+role = "tpm"
+
+[mrs.nic]
+kind = "device"
+owner = "eth"
+phys_addr = 0xa003000
+size = 0x1000
+
+[mrs.tis]
+kind = "device"
+owner = "tpm"
+phys_addr = 0xc000000
+size = 0x1000
+tpm = true
+
+[mrs.secrets]
+kind = "secrets"
+owner = "key"
+
+[mrs.policy_a]
+kind = "bundle_slot"
+readers = ["policy", "hs"]
+
+[mrs.log]
+kind = "plain"
+shares = { policy = "rw", audit = "r" }
+
+[[channels]]
+between = ["eth", "audit"]
+
+[[channels]]
+between = ["eth", "hs"]
+
+[[channels]]
+between = ["hs", "key"]
+pp = { hs = true, key = false }
+notify = { hs = false }
+
+[[channels]]
+between = ["key", "tpm"]
+pp = { key = true, tpm = false }
+notify = { key = false, tpm = false }
+
+[[channels]]
+between = ["policy", "tpm"]
+pp = { policy = true, tpm = false }
+notify = { policy = false, tpm = false }
+
+[[channels]]
+between = ["policy", "audit"]
+notify = { audit = true }
+
+[[channels]]
+between = ["hs", "policy"]
+pp = { hs = true, policy = false }
+notify = { hs = false }
+
+[priority]
+below = [["untrusted_input", "key"], ["key", "tpm"], ["untrusted_input", "policy"], ["policy", "tpm"]]
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

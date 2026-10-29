@@ -10,7 +10,8 @@
 # Schema:
 #
 #   [pds.<name>]
-#   role = "driver" | "untrusted_input" | "key" | "data" | "service" | "timer" | "tpm"
+#   role = "driver" | "untrusted_input" | "key" | "data" | "service" | "timer" | "tpm" | "rng"
+#        | "supervisor" | "policy"
 #   irqs = [<n>, ...]
 #     Every pd in the `.system` must have an entry here. `driver` pds may
 #     own device/dma mrs (L5) and claim the hardware IRQ numbers listed in
@@ -36,7 +37,17 @@
 #     crosses it both ways. `tpm` (C9) owns the TIS device mr (below) and
 #     nothing else, must be untainted, maps nothing but its tpm mr, has
 #     channels only to `key` pds and is their callee only (pp=false on its
-#     own end), and claims no irq; `untrusted_input`,
+#     own end), and claims no irq; as amended by the M8 plan (C11) `tpm`
+#     also serves the `policy` pd, whose channel carries its four policy
+#     requests (C3), never a TPM command. `policy` (M8 plan C5) is passive
+#     and untainted: it maps only bundle_slot mrs and pages every other
+#     mapper only reads (its log page, which `audit` maps `r`), calls a
+#     `tpm` pd (pp on its end), notifies `audit` (pp=false both ends,
+#     audit notify=false) and is called by the barrier pds
+#     (`untrusted_input`/`data`, pp on theirs, notify=false: the key
+#     exemption's shape); a reader that cannot write a page it shares with
+#     `policy` carries nothing into it, as for the supervisor's record
+#     page. `untrusted_input`,
 #     `data` and `service` carry no extra mr privileges of their own but
 #     matter for taint reporting and priority ordering (below). Any role,
 #     including `driver`, may be the producer of a `data`-kind mr (below)
@@ -224,6 +235,9 @@ role = "untrusted_input"
 [pds.tlskey]
 role = "key"
 
+[pds.policy]
+role = "policy"
+
 [mrs.eth_out_mmio]
 kind = "device"
 owner = "eth_out"
@@ -291,15 +305,20 @@ owner = "pqkey"
 kind = "secrets"
 owner = "tlskey"
 
-# M8 plan C1, C4, C6, C11: the two peer-policy bundle slots. Unmapped for
-# now (slice 1/2); the `policy` PD (slice 3) gains `readers`.
+# M8 plan C1, C4, C6, C11: the two peer-policy bundle slots, read by
+# `policy` (the barrier pds join in slice 3 batch B).
 [mrs.policy_a]
 kind = "bundle_slot"
-readers = []
+readers = ["policy"]
 
 [mrs.policy_b]
 kind = "bundle_slot"
-readers = []
+readers = ["policy"]
+
+# M8 plan C10: `policy`'s log page, written by `policy` alone.
+[mrs.audit_policy]
+kind = "plain"
+shares = { policy = "rw", audit = "r" }
 
 # net_rx: eth_out -> ingress, outside frames in
 [mrs.net_rx_used]
@@ -771,11 +790,26 @@ between = ["tlskey", "rng"]
 pp = { tlskey = true, rng = false }
 notify = { tlskey = false }
 
+# M8 plan C3, C5: policy's requests to tpm, and its log notifications to
+# audit (never signalled back).
+[[channels]]
+between = ["policy", "tpm"]
+pp = { policy = true, tpm = false }
+notify = { policy = false, tpm = false }
+
+[[channels]]
+between = ["policy", "audit"]
+notify = { audit = false }
+
 [priority]
 # L13: untrusted-input and tunnel PDs run strictly below `key` and `timer`;
 # `tpm`, the key pds' callee, above `key` (M5 plan C9).
 below = [
     ["key", "tpm"],
+    # M8 plan C11: the barrier pds call `policy`, which calls `tpm`.
+    ["untrusted_input", "policy"],
+    ["data", "policy"],
+    ["policy", "tpm"],
     ["key", "rng"],
     ["untrusted_input", "rng"],
     ["untrusted_input", "key"],

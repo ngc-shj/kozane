@@ -772,3 +772,44 @@ fn fuzz_one(bytes: &[u8]) {
 fn fuzz_render_round_trips_and_parse_never_panics() {
     bolero::check!().for_each(fuzz_one);
 }
+
+// --- the `policy` PD's reply and audit helpers (M8 slice 3) ---------------
+
+#[test]
+fn a_verified_reply_decodes_to_the_same_token() {
+    for (slot, version, body) in [(Slot::A, 0, [0; 32]), (Slot::B, u32::MAX, [0xA5; 32]), (Slot::A, 0x0102_0304, [7; 32])] {
+        let reply = verified_reply(slot, version, &body);
+        let token = Verified::from_reply(&reply).unwrap();
+        assert_eq!((token.slot(), token.version(), token.body_sha256()), (slot, version, &body));
+    }
+    assert_eq!(verified_reply(Slot::B, 0x0102_0304, &[7; 32])[..5], [1, 1, 2, 3, 4]);
+    assert_eq!((Slot::A.index(), Slot::B.index()), (0, 1));
+}
+
+/// `not_candidate` is `select`'s own classification: the version window
+/// `{current, current+1}` and the floor's boundary triple (C9: below,
+/// equal, above `release_seq`).
+#[test]
+fn not_candidate_follows_selects_classification() {
+    assert_eq!(not_candidate(5, 0, SlotView::Empty), Some(Reject::Empty));
+    assert_eq!(not_candidate(5, 0, SlotView::Malformed), Some(Reject::Malformed));
+    assert_eq!(not_candidate(5, 0, SlotView::BadSignature), Some(Reject::BadSignature));
+    assert_eq!(not_candidate(5, 0, valid(4, 0, [0; 32], [1; 32])), Some(Reject::RolledBack));
+    assert_eq!(not_candidate(5, 0, valid(5, 0, [0; 32], [1; 32])), None);
+    assert_eq!(not_candidate(5, 0, valid(6, 0, [0; 32], [1; 32])), None);
+    assert_eq!(not_candidate(5, 0, valid(7, 0, [0; 32], [1; 32])), Some(Reject::Skipped));
+    assert_eq!(not_candidate(5, 3, valid(5, 2, [0; 32], [1; 32])), None);
+    assert_eq!(not_candidate(5, 3, valid(5, 3, [0; 32], [1; 32])), None);
+    assert_eq!(not_candidate(5, 3, valid(5, 4, [0; 32], [1; 32])), Some(Reject::BelowFloor));
+    assert_eq!(not_candidate(u32::MAX, 0, valid(0, 0, [0; 32], [1; 32])), Some(Reject::RolledBack));
+}
+
+/// `Reject::ALL` lists every reason once, in code order, under its Debug
+/// name (the audit table the `policy` PD checks mirrors it).
+#[test]
+fn reject_all_is_every_reason_in_code_order() {
+    for (i, r) in Reject::ALL.iter().enumerate() {
+        assert_eq!(usize::from(r.code()), i);
+        assert_eq!(r.name(), std::format!("{r:?}"));
+    }
+}

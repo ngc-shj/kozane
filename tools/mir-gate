@@ -128,7 +128,7 @@ def main() -> int:
     env = dict(os.environ, RUSTC_WRAPPER=str(ROOT / "tools/mir-capture"),
                MIR_CRATES=" ".join(lib_name(c) for c in crates))
     run(["make", "pds", "MICROKIT_CONFIG=release", f"pd_target={out / 'pd-target'}"],
-        dict(env, MIR_OUT=str(out / "shipped")), out / "shipped.log")
+        dict(env, MIR_OUT=str(out / "shipped"), MIR_TARGET_ONLY="1"), out / "shipped.log")
     # One cargo invocation per member, as the proof gates verify one crate at
     # a time: members selected together would unify their features.
     for c in crates:

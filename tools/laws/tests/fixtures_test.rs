@@ -387,7 +387,7 @@ fn a_second_pp_channel_from_a_key_pd_is_l1() {
 
 #[test]
 fn a_tpm_channel_to_a_non_key_pd_is_l1() {
-    assert_deny_exactly("tpm_channel_non_key_deny", &["L1: tpm pd 'tpm' has a channel to 'hs', which is not a key pd"]);
+    assert_deny_exactly("tpm_channel_non_key_deny", &["L1: tpm pd 'tpm' has a channel to 'hs', which is not a key or policy pd"]);
 }
 
 #[test]
@@ -992,4 +992,98 @@ fn bundle_slot_without_a_readers_key_is_a_policy_error() {
 #[test]
 fn bundle_slot_with_an_explicit_empty_readers_list_is_allowed() {
     assert_allow("bundle_slot_no_readers_allow");
+}
+
+// M8 plan C5, C11: the `policy` role. The allow fixture has a tainted
+// caller (`hs`) that reads a bundle slot `policy` reads, `policy`'s log
+// page read-only in a tainted `audit`, and `policy` calling `tpm`.
+
+#[test]
+fn a_policy_pd_with_a_tainted_caller_and_a_read_only_log_is_allowed() {
+    assert_allow("policy_allow");
+}
+
+#[test]
+fn a_policy_log_page_audit_can_write_taints_policy_and_tpm() {
+    assert_deny_exactly(
+        "policy_log_writable_by_audit_deny",
+        &[
+            "L1: channel between policy pd 'policy' and 'audit' does not meet the policy exemption (policy pp=false, \
+             peer notify=false, policy maps only bundle slots and pages others only read)",
+            "L1: channel between policy pd 'policy' and 'hs' does not meet the policy exemption (policy pp=false, \
+             peer notify=false, policy maps only bundle slots and pages others only read)",
+            "L1: policy pd 'policy' is tainted",
+            "L1: policy pd 'policy' maps mr 'log', which is neither a bundle slot nor a page others only read",
+            "L1: tainted pd 'key' maps secrets mr 'secrets'",
+            "L1: tpm pd 'tpm' is tainted",
+            "L13: tainted pd 'key' needs an explicit budget < period",
+            "L13: tainted pd 'policy' needs an explicit budget < period",
+            "L13: tainted pd 'tpm' needs an explicit budget < period",
+        ],
+    );
+}
+
+#[test]
+fn a_policy_pd_that_is_not_passive_is_l13() {
+    assert_deny_exactly("policy_not_passive_deny", &["L13: policy pd 'policy' must be passive"]);
+}
+
+#[test]
+fn a_policy_channel_to_a_driver_is_l1() {
+    assert_deny_exactly(
+        "policy_channel_to_driver_deny",
+        &["L1: policy pd 'policy' has a channel to 'eth' that is not its call to tpm, its notification of audit, or a \
+           barrier pd's call"],
+    );
+}
+
+/// The callee exemption, as `key`'s: a caller that can notify `policy`
+/// taints it, and through its call `tpm` and the key pds.
+#[test]
+fn a_policy_caller_that_can_notify_it_is_l1() {
+    assert_deny_exactly(
+        "policy_caller_notify_deny",
+        &[
+            "L1: channel between policy pd 'policy' and 'hs' does not meet the policy exemption (policy pp=false, \
+             peer notify=false, policy maps only bundle slots and pages others only read)",
+            "L1: policy pd 'policy' is tainted",
+            "L1: tainted pd 'key' maps secrets mr 'secrets'",
+            "L1: tpm pd 'tpm' is tainted",
+            "L13: tainted pd 'key' needs an explicit budget < period",
+            "L13: tainted pd 'policy' needs an explicit budget < period",
+            "L13: tainted pd 'tpm' needs an explicit budget < period",
+        ],
+    );
+}
+
+#[test]
+fn an_audit_that_can_notify_policy_is_l1() {
+    assert_deny_exactly(
+        "policy_audit_notify_deny",
+        &[
+            "L1: channel between policy pd 'policy' and 'audit' does not meet the policy exemption (policy pp=false, \
+             peer notify=false, policy maps only bundle slots and pages others only read)",
+            "L1: policy pd 'policy' is tainted",
+            "L1: tainted pd 'key' maps secrets mr 'secrets'",
+            "L1: tpm pd 'tpm' is tainted",
+            "L13: tainted pd 'key' needs an explicit budget < period",
+            "L13: tainted pd 'policy' needs an explicit budget < period",
+            "L13: tainted pd 'tpm' needs an explicit budget < period",
+        ],
+    );
+}
+
+#[test]
+fn policy_at_or_above_tpm_is_l13() {
+    assert_deny_exactly("policy_above_tpm_deny", &["L13: pd 'policy' (priority 7) must be strictly below pd 'tpm' (priority 6)"]);
+}
+
+#[test]
+fn policy_below_one_of_its_callers_is_l13() {
+    assert_deny_exactly("policy_below_caller_deny", &["L13: pd 'hs' (priority 2) must be strictly below pd 'policy' (priority 1)"]);
+}
+
+#[test]
+fn tpm_calling_policy_back_is_l1() {
+    assert_deny_exactly("policy_tpm_calls_back_deny", &["L1: tpm pd 'tpm' has pp=true on its channel to 'policy'; it is a callee only"]);
 }
