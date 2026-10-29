@@ -6,18 +6,9 @@
 #[cfg(test)]
 extern crate std;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Prefix {
-    pub addr: [u8; 4],
-    pub len: u8,
-}
-
-impl Prefix {
-    pub const fn contains(&self, ip: [u8; 4]) -> bool {
-        let mask = if self.len == 0 { 0 } else { u32::MAX << (32 - self.len as u32) };
-        (u32::from_be_bytes(ip) & mask) == (u32::from_be_bytes(self.addr) & mask)
-    }
-}
+/// An IPv4 prefix (M8 plan C1 R2): `policy-wire`'s type, so the bundle and
+/// the build-time configuration share one `contains`/`overlaps`.
+pub use policy_wire::Prefix;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Peer {

@@ -1,0 +1,778 @@
+//! The peer-policy signing toolchain (M8 plan C2, D11): draft, approve,
+//! sign and verify a peer-policy bundle, and keep the two-person-approved
+//! ledger that is its signed history.
+//!
+//!   policy keygen --dir <new dir> [--forbid <path>]...
+//!   policy approver-keygen --dir <new dir> [--forbid <path>]...
+//!   policy fleet --out <file> --fleet-id <hex32> <gateway.toml>...
+//!   policy render --input peers.toml --fleet <file> --ledger <dir> --out draft.bin [--set-roster <file>]
+//!   policy diff --ledger <dir> --draft draft.bin
+//!   policy approve --ledger <dir> --draft draft.bin --approver-key <file> --approver-id <id> --head <file> --out A.approval
+//!   policy sign --ledger <dir> --draft draft.bin --approvals A B ... --keys <dir> --out slot.bin [--new-roster <file>]
+//!   policy verify --keys-pub <dir> --slot slot.bin [--fleet <file>]
+//!   policy verify --ledger <dir> --keys-pub <dir>
+//!   policy ledger init --dir <dir> --genesis-roster <roster.toml>
+//!   policy ledger approve-restore --from <copy> --approver-key <file> --approver-id <id> --out R.approval
+//!   policy ledger restore --from <copy> --dir <dir> --approvals R1 R2 --keys-pub <dir> --head <file>...
+//!   policy roster-digest <roster.toml>                    (prints the hex digest to pin, for operators and fixtures)
+//!
+//! Keys are dev keys (owner decision, residual RM8-1, as tools/release's
+//! RM5-1): `keygen`/`approver-keygen` refuse a directory under any
+//! `--forbid` root, create it 0700 and the private key files 0600.
+//! The genesis-roster pin is compiled in; no flag bypasses an approval, the
+//! roster lookup or the ledger chain (M8 plan C2).
+
+mod approval;
+mod diff;
+mod fleet;
+mod ledger;
+mod peers;
+mod record;
+mod roster;
+mod sig;
+mod util;
+mod wire_header;
+
+// Shared with `config`'s build.rs and `tools/mksecrets`: the `fleet`
+// command renders each node's `NodeConfig` through the exact checks the
+// image build runs, never a second parser.
+#[allow(dead_code)]
+mod validate {
+    include!("../../../crates/config/src/validate.rs");
+}
+
+#[cfg(test)]
+mod tests;
+
+use std::fs;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+
+use sha2::{Digest, Sha256};
+
+use roster::Roster;
+
+fn arg(args: &[String], name: &str) -> Result<String, String> {
+    let i = args.iter().position(|a| a == name).ok_or(format!("missing {name}"))?;
+    args.get(i + 1).cloned().ok_or(format!("{name} needs a value"))
+}
+
+fn arg_opt(args: &[String], name: &str) -> Option<String> {
+    let i = args.iter().position(|a| a == name)?;
+    args.get(i + 1).cloned()
+}
+
+/// Every value that follows any occurrence of `name`, up to the next
+/// `--flag` or the end: covers both `--approvals A B C` and a flag given
+/// more than once (`--head f1 --head f2`).
+fn arg_list(args: &[String], name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == name {
+            i += 1;
+            while i < args.len() && !args[i].starts_with("--") {
+                out.push(args[i].clone());
+                i += 1;
+            }
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Positional arguments: everything not consumed as one of `flags`' value.
+fn positional(args: &[String], flags: &[&str]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        if flags.contains(&args[i].as_str()) {
+            i += 2;
+        } else {
+            out.push(args[i].clone());
+            i += 1;
+        }
+    }
+    out
+}
+
+fn hex(b: &[u8]) -> String {
+    sig::hex(b)
+}
+
+fn write_new(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
+    fs::OpenOptions::new().write(true).create_new(true).mode(mode).open(path).and_then(|mut f| {
+        use std::io::Write;
+        f.write_all(data)
+    }).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// A key directory must not resolve under any forbidden root (as
+/// `tools/release`'s `keygen`).
+fn check_location(dir: &Path, forbid: &[PathBuf]) -> Result<(), String> {
+    let parent = dir.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let parent = parent.canonicalize().map_err(|e| format!("{}: {e}", parent.display()))?;
+    for root in forbid {
+        let root = root.canonicalize().map_err(|e| format!("{}: {e}", root.display()))?;
+        if parent.starts_with(&root) {
+            return Err(format!("{} is inside {}; keys must live elsewhere", dir.display(), root.display()));
+        }
+    }
+    Ok(())
+}
+
+fn forbid_roots(args: &[String]) -> Vec<PathBuf> {
+    args.windows(2).filter(|w| w[0] == "--forbid").map(|w| PathBuf::from(&w[1])).collect()
+}
+
+fn read_hex_file(path: &Path) -> Result<Vec<u8>, String> {
+    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    sig::unhex(text.trim_end_matches('\n')).ok_or(format!("{}: not lowercase hex", path.display()))
+}
+
+// --- keygen / approver-keygen -------------------------------------------
+
+fn cmd_keygen(args: &[String]) -> Result<(), String> {
+    let dir = PathBuf::from(arg(args, "--dir")?);
+    check_location(&dir, &forbid_roots(args))?;
+    fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let (sk, pk) = sig::bundle_keygen(&mut sig::urandom).map_err(|e| e.to_string())?;
+    write_new(&dir.join("ed25519.key"), format!("{}\n", hex(&sk.ed25519)).as_bytes(), 0o600)?;
+    write_new(&dir.join("ml-dsa-65.key"), format!("{}\n", hex(sk.ml_dsa.as_ref())).as_bytes(), 0o600)?;
+    write_new(&dir.join("ed25519.pub"), format!("{}\n", hex(&pk.ed25519)).as_bytes(), 0o644)?;
+    write_new(&dir.join("ml-dsa-65.pub"), format!("{}\n", hex(pk.ml_dsa.as_ref())).as_bytes(), 0o644)?;
+    println!("policy: dev bundle-signing keys in {}", dir.display());
+    Ok(())
+}
+
+fn cmd_approver_keygen(args: &[String]) -> Result<(), String> {
+    let dir = PathBuf::from(arg(args, "--dir")?);
+    check_location(&dir, &forbid_roots(args))?;
+    fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let (sk, pk) = sig::approver_keygen(&mut sig::urandom).map_err(|e| e.to_string())?;
+    write_new(&dir.join("ed25519.key"), format!("{}\n", hex(&sk)).as_bytes(), 0o600)?;
+    write_new(&dir.join("ed25519.pub"), format!("{}\n", hex(&pk)).as_bytes(), 0o644)?;
+    println!("policy: dev approver key in {}", dir.display());
+    Ok(())
+}
+
+fn load_bundle_signing(dir: &Path) -> Result<sig::BundleSigningKeys, String> {
+    use libcrux_ml_dsa::ml_dsa_65::MLDSA65SigningKey;
+    let mut keys = sig::BundleSigningKeys { ed25519: [0; 32], ml_dsa: MLDSA65SigningKey::zero() };
+    let ed = read_hex_file(&dir.join("ed25519.key"))?;
+    if ed.len() != 32 {
+        return Err("ed25519.key: wrong length".into());
+    }
+    keys.ed25519.copy_from_slice(&ed);
+    let ml = read_hex_file(&dir.join("ml-dsa-65.key"))?;
+    if ml.len() != MLDSA65SigningKey::len() {
+        return Err("ml-dsa-65.key: wrong length".into());
+    }
+    keys.ml_dsa.as_ref_mut().copy_from_slice(&ml);
+    Ok(keys)
+}
+
+fn load_bundle_verifying(dir: &Path) -> Result<sig::BundleVerifyingKeys, String> {
+    use libcrux_ml_dsa::ml_dsa_65::MLDSA65VerificationKey;
+    let ed_bytes = read_hex_file(&dir.join("ed25519.pub"))?;
+    if ed_bytes.len() != 32 {
+        return Err("ed25519.pub: wrong length".into());
+    }
+    let mut ed = [0u8; 32];
+    ed.copy_from_slice(&ed_bytes);
+    let mut ml = MLDSA65VerificationKey::zero();
+    let bytes = read_hex_file(&dir.join("ml-dsa-65.pub"))?;
+    if bytes.len() != MLDSA65VerificationKey::len() {
+        return Err("ml-dsa-65.pub: wrong length".into());
+    }
+    ml.as_ref_mut().copy_from_slice(&bytes);
+    Ok(sig::BundleVerifyingKeys { ed25519: ed, ml_dsa: ml })
+}
+
+fn load_approver_signing(path: &Path) -> Result<sig::ApproverSigningKey, String> {
+    let b = read_hex_file(path)?;
+    if b.len() != 32 {
+        return Err(format!("{}: wrong length", path.display()));
+    }
+    let mut sk = [0u8; 32];
+    sk.copy_from_slice(&b);
+    Ok(sig::ApproverSigningKey(sk))
+}
+
+// --- fleet ---------------------------------------------------------------
+
+fn rp_digest(key: &[u8; limits::SPK_LEN]) -> [u8; 32] {
+    secret_blob::blake2s(&[key.as_slice()])
+}
+
+fn cmd_fleet(args: &[String]) -> Result<(), String> {
+    let out = PathBuf::from(arg(args, "--out")?);
+    let fleet_id = util::hex_n::<16>(&arg(args, "--fleet-id")?, "--fleet-id")?;
+    let gateway_paths = positional(args, &["--out", "--fleet-id"]);
+    if gateway_paths.is_empty() {
+        return Err("fleet: need at least one gateway.toml".into());
+    }
+    let mut nodes = Vec::new();
+    for path in &gateway_paths {
+        let path = Path::new(path);
+        let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
+        let load = |name: &str| -> Result<Vec<u8>, String> { fs::read(dir.join(name)).map_err(|e| format!("{}: {e}", dir.join(name).display())) };
+        let raw: validate::RawConfig = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+        let inside_prefix = validate::parse_prefix(&raw.gateway.inside_prefix).map_err(|e| format!("{}: {e}", path.display()))?;
+        let checked = validate::check(&text, validate::MAX_PEERS, &load).map_err(|e| format!("{}: {e}", path.display()))?;
+        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("node").to_string();
+        if nodes.iter().any(|n: &fleet::Node| n.name == name) {
+            return Err(format!("fleet: two gateway.toml files both name the node {name:?}"));
+        }
+        nodes.push(fleet::Node {
+            name,
+            fleet_id,
+            inside_prefix,
+            inside_ip: checked.inside_ip,
+            outside_ip: checked.outside_ip,
+            neighbors: checked.neighbors.iter().map(|(ip, _)| *ip).collect(),
+            gateway_wg_public: checked.gateway_public,
+            gateway_rp_digest: checked.gateway_rp.hash,
+        });
+    }
+    nodes.sort_by_key(|n| n.name.clone());
+    let built = fleet::Fleet { fleet_id, nodes };
+    write_new(&out, built.render().as_bytes(), 0o644)?;
+    println!("policy: fleet of {} node(s) in {}", built.nodes.len(), out.display());
+    Ok(())
+}
+
+// --- the compiled-in genesis-roster pin ----------------------------------
+
+/// The fleet's genesis-roster digest, compiled in (D11): the tool's own
+/// build is what fixes it, so whoever runs the tool cannot swap it.
+/// `genesis-roster.sha256` ships as 64 zero hex digits, which no roster
+/// hashes to, so every command fails closed until a fleet's genesis
+/// ceremony (C12) commits its digest there. The integration and tool tests
+/// build their own binary with `KOZANE_POLICY_GENESIS_PIN` set instead: a
+/// build-time input, like the file, never a run-time flag.
+const GENESIS_PIN_HEX: &str = match option_env!("KOZANE_POLICY_GENESIS_PIN") {
+    Some(pin) => pin,
+    None => include_str!("../genesis-roster.sha256"),
+};
+
+fn read_pin() -> Result<[u8; 32], String> {
+    util::hex_n::<32>(GENESIS_PIN_HEX.trim_end_matches('\n'), "the compiled-in genesis-roster pin")
+}
+
+// --- render ---------------------------------------------------------------
+
+fn head_body_sha256(slot: &[u8]) -> Result<[u8; 32], String> {
+    let u = policy_wire::split(slot).map_err(|e| format!("{e:?}"))?;
+    Ok(Sha256::digest(u.body()).into())
+}
+
+fn cmd_render(args: &[String]) -> Result<(), String> {
+    let input = PathBuf::from(arg(args, "--input")?);
+    let fleet_path = PathBuf::from(arg(args, "--fleet")?);
+    let ledger_dir = PathBuf::from(arg(args, "--ledger")?);
+    let out = PathBuf::from(arg(args, "--out")?);
+    let set_roster = arg_opt(args, "--set-roster").map(PathBuf::from);
+
+    let draft = peers::Draft::load(&input)?;
+    let fleet = fleet::Fleet::parse(&fs::read_to_string(&fleet_path).map_err(|e| format!("{}: {e}", fleet_path.display()))?)?;
+    if draft.fleet_id != fleet.fleet_id {
+        return Err("render: peers.toml's fleet_id does not match the fleet file's".into());
+    }
+
+    let ledger = ledger::Ledger::open(&ledger_dir);
+    let height = ledger.height()?;
+    let (version, prev_sha256, current_roster) = match height {
+        None => {
+            let pinned = read_pin()?;
+            (0u32, [0u8; 32], ledger.load_roster(&pinned).map_err(|e| format!("render: genesis roster: {e}"))?)
+        }
+        Some(h) => {
+            let head = ledger.read_entry(h)?;
+            let header = wire_header::read(&head)?;
+            let roster = ledger.load_roster(&header.roster_sha256).map_err(|e| format!("render: current roster: {e}"))?;
+            (h.checked_add(1).ok_or("render: version overflow")?, head_body_sha256(&head)?, roster)
+        }
+    };
+    let roster_sha256 = match &set_roster {
+        None => current_roster.digest(),
+        Some(p) => {
+            let text = fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            Roster::parse(&text)?.digest()
+        }
+    };
+
+    let mut rp_bufs: Vec<[u8; limits::SPK_LEN]> = Vec::with_capacity(draft.peers.len());
+    for p in &draft.peers {
+        let mut buf = [0u8; limits::SPK_LEN];
+        buf.copy_from_slice(&p.rp_pub);
+        rp_bufs.push(buf);
+    }
+    let plain_peers: Vec<policy_wire::render::PlainPeer<'_>> = draft
+        .peers
+        .iter()
+        .zip(&rp_bufs)
+        .map(|(p, rp)| policy_wire::render::PlainPeer { wg_pub: p.wg_pub, rp_pub: rp, groups: p.groups, allowed: &p.allowed })
+        .collect();
+    let plain_groups: Vec<policy_wire::render::PlainGroup<'_>> = draft.groups.iter().map(|g| policy_wire::render::PlainGroup { rules: &g.rules }).collect();
+    let plain = policy_wire::render::PlainBundle {
+        fleet_id: draft.fleet_id,
+        version,
+        min_release: draft.min_release,
+        prev_sha256,
+        roster_sha256,
+        peers: &plain_peers,
+        groups: &plain_groups,
+        sig_ed25519: [0; 64],
+        sig_mldsa65: [0; 3309],
+    };
+    let slot = policy_wire::render::render(&plain);
+    if slot.len() != limits::BUNDLE_MAX {
+        return Err(format!("render: internal: rendered {} bytes, expected {}", slot.len(), limits::BUNDLE_MAX));
+    }
+
+    for node in &fleet.nodes {
+        policy_wire::parse(&slot, &node.as_node_config(), &rp_digest).map_err(|e| format!("render: node {} rejects the draft: {e:?}", node.name))?;
+    }
+
+    write_new(&out, &slot, 0o644)?;
+    if let Some(p) = &set_roster {
+        let sidecar = out.with_extension("roster.toml");
+        fs::copy(p, &sidecar).map_err(|e| format!("{}: {e}", sidecar.display()))?;
+        println!("policy: new roster saved alongside the draft as {}", sidecar.display());
+    }
+    println!("policy: draft version {version} written to {}", out.display());
+    Ok(())
+}
+
+// --- diff -------------------------------------------------------------
+
+/// The ledger head as `diff` needs it: no signature re-verification (the
+/// diff is read-only bookkeeping; `sign` is the actual gate).
+fn head_for_diff(ledger: &ledger::Ledger) -> Result<Option<(wire_header::Header, Vec<u8>)>, String> {
+    let Some(h) = ledger.height()? else { return Ok(None) };
+    let slot = ledger.read_entry(h)?;
+    let header = wire_header::read(&slot)?;
+    let body = policy_wire::split(&slot).map_err(|e| format!("{e:?}"))?.body().to_vec();
+    Ok(Some((header, body)))
+}
+
+fn compute_diff(ledger: &ledger::Ledger, draft: &[u8]) -> Result<(String, [u8; 32]), String> {
+    let header = wire_header::read(draft)?;
+    let body = policy_wire::split(draft).map_err(|e| format!("{e:?}"))?.body();
+    let old = head_for_diff(ledger)?;
+    let text = diff::render(old.as_ref().map(|(h, b)| (h, b.as_slice())), &header, body);
+    let digest = diff::sha256(&text);
+    Ok((text, digest))
+}
+
+fn cmd_diff(args: &[String]) -> Result<(), String> {
+    let ledger = ledger::Ledger::open(Path::new(&arg(args, "--ledger")?));
+    let draft = fs::read(arg(args, "--draft")?).map_err(|e| e.to_string())?;
+    let (text, digest) = compute_diff(&ledger, &draft)?;
+    print!("{text}");
+    println!("diff_sha256={}", hex(&digest));
+    Ok(())
+}
+
+// --- approve ------------------------------------------------------------
+
+fn read_head_file(path: &Path) -> Result<Option<(u32, [u8; 32])>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let fields = record::parse(&bytes, &["body_sha256", "version"]).map_err(|e| format!("{}: {e}", path.display()))?;
+    let version: u32 = record::get(&fields, "version").ok_or("head file: missing version")?.parse().map_err(|_| "head file: bad version")?;
+    let digest = util::hex_n::<32>(record::get(&fields, "body_sha256").ok_or("head file: missing body_sha256")?, "head file: body_sha256")?;
+    Ok(Some((version, digest)))
+}
+
+fn write_head_file(path: &Path, version: u32, digest: [u8; 32]) -> Result<(), String> {
+    let bytes = record::render(&[("body_sha256", &hex(&digest)), ("version", &version.to_string())], &["body_sha256", "version"]);
+    fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+fn cmd_approve(args: &[String]) -> Result<(), String> {
+    let ledger = ledger::Ledger::open(Path::new(&arg(args, "--ledger")?));
+    let draft = fs::read(arg(args, "--draft")?).map_err(|e| e.to_string())?;
+    let approver_key_path = arg(args, "--approver-key")?;
+    let approver_id = arg(args, "--approver-id")?;
+    let out = PathBuf::from(arg(args, "--out")?);
+    let head_path = arg_opt(args, "--head").map(PathBuf::from);
+
+    let pinned = read_pin()?;
+    let state = ledger.verify_chain_unsigned(pinned)?;
+
+    if let Some(head_path) = &head_path
+        && let Some((recorded_version, recorded_digest)) = read_head_file(head_path)?
+    {
+        match state.height {
+            None => return Err(format!("approve: the ledger is empty, behind this approver's recorded head (version {recorded_version})")),
+            Some(h) if h < recorded_version => {
+                return Err(format!("approve: the ledger (height {h}) is behind this approver's recorded head (version {recorded_version})"));
+            }
+            _ => {}
+        }
+        let at = ledger.read_entry(recorded_version)?;
+        let got = head_body_sha256(&at)?;
+        if got != recorded_digest {
+            return Err(format!(
+                "approve: the ledger's version {recorded_version} digest does not match this approver's recorded head (tampered or forked ledger)"
+            ));
+        }
+    }
+
+    let header = wire_header::read(&draft)?;
+    let body = policy_wire::split(&draft).map_err(|e| format!("{e:?}"))?.body();
+    let body_sha256: [u8; 32] = Sha256::digest(body).into();
+    let old = head_for_diff(&ledger)?;
+    let diff_text = diff::render(old.as_ref().map(|(h, b)| (h, b.as_slice())), &header, body);
+    let diff_sha256 = diff::sha256(&diff_text);
+
+    let sk = load_approver_signing(Path::new(&approver_key_path))?;
+    let fields = approval::ApprovalFields {
+        approver_id: approver_id.clone(),
+        body_sha256,
+        diff_sha256,
+        fleet_id: header.fleet_id,
+        prev_sha256: header.prev_sha256,
+        roster_sha256: header.roster_sha256,
+        ts: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+        version: header.version,
+    };
+    let record = approval::sign(&sk, &fields, &mut sig::urandom)?;
+    write_new(&out, &record, 0o644)?;
+    if let Some(head_path) = &head_path {
+        write_head_file(head_path, header.version, body_sha256)?;
+    }
+    println!("policy: {approver_id} approved version {} ({})", header.version, out.display());
+    Ok(())
+}
+
+// --- sign -----------------------------------------------------------------
+
+fn cmd_sign(args: &[String]) -> Result<(), String> {
+    let ledger = ledger::Ledger::open(Path::new(&arg(args, "--ledger")?));
+    let draft = fs::read(arg(args, "--draft")?).map_err(|e| e.to_string())?;
+    if draft.len() != limits::BUNDLE_MAX {
+        return Err(format!("sign: draft is {} bytes, expected {}", draft.len(), limits::BUNDLE_MAX));
+    }
+    let approval_paths = arg_list(args, "--approvals");
+    if approval_paths.len() < 2 {
+        return Err("sign: at least two --approvals are required".into());
+    }
+    let keys_dir = PathBuf::from(arg(args, "--keys")?);
+    let out = PathBuf::from(arg(args, "--out")?);
+    let new_roster_path = arg_opt(args, "--new-roster").map(PathBuf::from);
+
+    let header = wire_header::read(&draft)?;
+    let pinned = read_pin()?;
+    let keys_pub = load_bundle_verifying(&keys_dir)?;
+    let state = ledger.verify_chain(&keys_pub, pinned)?;
+
+    let next_version = match state.height {
+        None => 0u32,
+        Some(h) => h.checked_add(1).ok_or("sign: version overflow")?,
+    };
+    if header.version != next_version {
+        return Err(format!("sign: draft version {} does not match the ledger head+1 ({next_version})", header.version));
+    }
+    let expected_prev = match &state.head_body {
+        None => [0u8; 32],
+        Some(b) => Sha256::digest(b).into(),
+    };
+    if header.prev_sha256 != expected_prev {
+        return Err("sign: the draft's prev_sha256 is not the ledger head's body".into());
+    }
+
+    let new_roster = if header.roster_sha256 == state.roster.digest() {
+        if new_roster_path.is_some() {
+            return Err("sign: --new-roster was given but the draft does not change roster_sha256".into());
+        }
+        None
+    } else {
+        let p = new_roster_path.ok_or("sign: the draft changes roster_sha256 but no --new-roster was given")?;
+        let text = fs::read_to_string(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let nr = Roster::parse(&text)?;
+        if nr.digest() != header.roster_sha256 {
+            return Err("sign: --new-roster does not hash to the draft's roster_sha256".into());
+        }
+        Some(nr)
+    };
+
+    let body = policy_wire::split(&draft).map_err(|e| format!("{e:?}"))?.body();
+    let body_sha256: [u8; 32] = Sha256::digest(body).into();
+    let old = state.head_header.as_ref().zip(state.head_body.as_ref());
+    let diff_text = diff::render(old.map(|(h, b)| (h, b.as_slice())), &header, body);
+    let diff_sha256 = diff::sha256(&diff_text);
+
+    let mut approval_bytes = Vec::new();
+    let mut approver_ids = Vec::new();
+    for path in &approval_paths {
+        let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path))?;
+        let fields = approval::parse_and_verify(&bytes, &state.roster).map_err(|e| format!("sign: {path}: {e}"))?;
+        if fields.version != header.version {
+            return Err(format!("sign: {path}: approval is bound to version {}, draft is version {}", fields.version, header.version));
+        }
+        if fields.fleet_id != header.fleet_id {
+            return Err(format!("sign: {path}: approval is bound to another fleet_id"));
+        }
+        if fields.prev_sha256 != header.prev_sha256 {
+            return Err(format!("sign: {path}: approval is bound to another prev_sha256"));
+        }
+        if fields.roster_sha256 != header.roster_sha256 {
+            return Err(format!("sign: {path}: approval is bound to another roster_sha256"));
+        }
+        if fields.body_sha256 != body_sha256 {
+            return Err(format!("sign: {path}: approval is bound to another body (the draft changed after approval)"));
+        }
+        if fields.diff_sha256 != diff_sha256 {
+            return Err(format!("sign: {path}: approval is bound to another diff"));
+        }
+        if approver_ids.contains(&fields.approver_id) {
+            return Err(format!("sign: approver {} approved twice", fields.approver_id));
+        }
+        approver_ids.push(fields.approver_id);
+        approval_bytes.push(bytes);
+    }
+    if approver_ids.len() < 2 {
+        return Err("sign: at least two distinct roster entries must approve".into());
+    }
+
+    let signing = load_bundle_signing(&keys_dir)?;
+    let sig_start = body.len();
+    let (sig_ed, sig_ml) = sig::bundle_sign(&signing, policy_wire::DOMAIN, body, &mut sig::urandom).map_err(|e| e.to_string())?;
+    let mut slot = draft.clone();
+    slot.get_mut(sig_start..sig_start + 64).ok_or("sign: internal: slot too short for sig_ed25519")?.copy_from_slice(&sig_ed);
+    slot.get_mut(sig_start + 64..sig_start + 64 + 3309).ok_or("sign: internal: slot too short for sig_mldsa65")?.copy_from_slice(&sig_ml);
+
+    ledger.append(header.version, &slot, &approval_bytes, &state.roster, new_roster.as_ref())?;
+    write_new(&out, &slot, 0o644)?;
+    println!("policy: signed version {} ({})", header.version, out.display());
+    Ok(())
+}
+
+// --- verify ---------------------------------------------------------------
+
+fn cmd_verify(args: &[String]) -> Result<(), String> {
+    if let Some(slot_path) = arg_opt(args, "--slot") {
+        let keys_pub = load_bundle_verifying(Path::new(&arg(args, "--keys-pub")?))?;
+        let slot = fs::read(&slot_path).map_err(|e| format!("{slot_path}: {e}"))?;
+        if slot.len() != limits::BUNDLE_MAX {
+            return Err(format!("verify: slot is {} bytes, expected {}", slot.len(), limits::BUNDLE_MAX));
+        }
+        let split = policy_wire::split(&slot).map_err(|e| format!("verify: {e:?}"))?;
+        sig::bundle_verify(&keys_pub, policy_wire::DOMAIN, split.body(), split.sig_ed25519(), split.sig_mldsa65()).map_err(|e| format!("verify: {e}"))?;
+        let header = wire_header::read(&slot)?;
+        if let Some(fleet_path) = arg_opt(args, "--fleet") {
+            let fleet = fleet::Fleet::parse(&fs::read_to_string(&fleet_path).map_err(|e| format!("{fleet_path}: {e}"))?)?;
+            for node in &fleet.nodes {
+                policy_wire::parse(&slot, &node.as_node_config(), &rp_digest).map_err(|e| format!("verify: node {} rejects the slot: {e:?}", node.name))?;
+            }
+        }
+        println!("policy: both signatures verify; version={} min_release={} peer_count={}", header.version, header.min_release, header.peer_count);
+        return Ok(());
+    }
+    if let Some(dir) = arg_opt(args, "--ledger") {
+        let ledger = ledger::Ledger::open(Path::new(&dir));
+        let keys_pub = load_bundle_verifying(Path::new(&arg(args, "--keys-pub")?))?;
+        let pinned = read_pin()?;
+        let state = ledger.verify_chain(&keys_pub, pinned)?;
+        match state.height {
+            None => println!("policy: ledger verifies (genesis, empty)"),
+            Some(h) => println!("policy: ledger verifies up to version {h}"),
+        }
+        return Ok(());
+    }
+    Err("verify: need --slot or --ledger".into())
+}
+
+// --- ledger init / restore -----------------------------------------------
+
+fn cmd_ledger(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("init") => {
+            let dir = PathBuf::from(arg(&args[1..], "--dir")?);
+            let roster_path = arg(&args[1..], "--genesis-roster")?;
+            let pinned = read_pin()?;
+            let text = fs::read_to_string(&roster_path).map_err(|e| format!("{roster_path}: {e}"))?;
+            let genesis_roster = Roster::parse(&text)?;
+            ledger::Ledger::init(&dir, &genesis_roster, pinned)?;
+            println!("policy: ledger initialised at {}", dir.display());
+            Ok(())
+        }
+        // Not in the plan's literal command list, which only says restore
+        // approvals exist (D11); something has to produce them for an
+        // approver to hand to `ledger restore`, so this is that signer,
+        // built the same way `approve` signs a bundle approval.
+        Some("approve-restore") => {
+            let args = &args[1..];
+            let from = PathBuf::from(arg(args, "--from")?);
+            let approver_key_path = arg(args, "--approver-key")?;
+            let approver_id = arg(args, "--approver-id")?;
+            let out = PathBuf::from(arg(args, "--out")?);
+            let pinned = read_pin()?;
+
+            let copy = ledger::Ledger::open(&from);
+            let state = copy.verify_chain_unsigned(pinned)?;
+            let Some(version) = state.height else {
+                return Err("ledger approve-restore: the copy is empty; nothing to restore".into());
+            };
+            let head_body_sha256: [u8; 32] = Sha256::digest(state.head_body.as_ref().ok_or("ledger approve-restore: internal")?).into();
+            let fleet_id = state.head_header.as_ref().ok_or("ledger approve-restore: internal")?.fleet_id;
+
+            let sk = load_approver_signing(Path::new(&approver_key_path))?;
+            let fields = approval::RestoreFields {
+                approver_id: approver_id.clone(),
+                fleet_id,
+                head_body_sha256,
+                head_version: version,
+                ts: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
+            };
+            let record = approval::sign_restore(&sk, &fields, &mut sig::urandom)?;
+            write_new(&out, &record, 0o644)?;
+            println!("policy: {approver_id} approved restoring head version {version} ({})", out.display());
+            Ok(())
+        }
+        Some("restore") => {
+            let args = &args[1..];
+            let from = PathBuf::from(arg(args, "--from")?);
+            let dir = PathBuf::from(arg(args, "--dir")?);
+            let approval_paths = arg_list(args, "--approvals");
+            let head_paths = arg_list(args, "--head");
+            let keys_pub = load_bundle_verifying(Path::new(&arg(args, "--keys-pub")?))?;
+            let pinned = read_pin()?;
+
+            let copy = ledger::Ledger::open(&from);
+            let state = copy.verify_chain(&keys_pub, pinned).map_err(|e| format!("ledger restore: the copy's chain does not verify: {e}"))?;
+            let Some(restored_version) = state.height else {
+                return Err("ledger restore: the copy is empty; nothing to restore".into());
+            };
+            let restored_body_sha256: [u8; 32] = Sha256::digest(state.head_body.as_ref().ok_or("ledger restore: internal")?).into();
+            let fleet_id = state.head_header.as_ref().ok_or("ledger restore: internal")?.fleet_id;
+
+            for head_path in &head_paths {
+                let Some((recorded_version, recorded_digest)) = read_head_file(Path::new(head_path))? else { continue };
+                if restored_version < recorded_version {
+                    return Err(format!("ledger restore: the copy (version {restored_version}) is behind the head in {head_path} (version {recorded_version})"));
+                }
+                let at = copy.read_entry(recorded_version)?;
+                let got = head_body_sha256(&at)?;
+                if got != recorded_digest {
+                    return Err(format!("ledger restore: the copy's version {recorded_version} does not match the head in {head_path} (contains or extends, never diverges)"));
+                }
+            }
+
+            if approval_paths.len() < 2 {
+                return Err("ledger restore: at least two --approvals are required".into());
+            }
+            let mut approver_ids = Vec::new();
+            let mut approval_bytes = Vec::new();
+            for path in &approval_paths {
+                let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+                let fields = approval::parse_and_verify_restore(&bytes, &state.roster).map_err(|e| format!("ledger restore: {path}: {e}"))?;
+                if fields.head_version != restored_version {
+                    return Err(format!("ledger restore: {path}: bound to head version {}, not {restored_version}", fields.head_version));
+                }
+                // The fleet first: another fleet's head differs in its body
+                // too, and this order keeps the fleet binding observable.
+                if fields.fleet_id != fleet_id {
+                    return Err(format!("ledger restore: {path}: bound to another fleet_id"));
+                }
+                if fields.head_body_sha256 != restored_body_sha256 {
+                    return Err(format!("ledger restore: {path}: bound to another head digest"));
+                }
+                if approver_ids.contains(&fields.approver_id) {
+                    return Err(format!("ledger restore: approver {} approved twice", fields.approver_id));
+                }
+                approver_ids.push(fields.approver_id);
+                approval_bytes.push(bytes);
+            }
+            if approver_ids.len() < 2 {
+                return Err("ledger restore: at least two distinct roster entries must approve the restore".into());
+            }
+
+            if dir.exists() {
+                return Err(format!("ledger restore: {} already exists", dir.display()));
+            }
+            copy_ledger_tree(&from, &dir)?;
+            let restore_dir = dir.join("restore-approvals");
+            fs::create_dir_all(&restore_dir).map_err(|e| e.to_string())?;
+            for (i, bytes) in approval_bytes.iter().enumerate() {
+                fs::write(restore_dir.join(format!("{i}.approval")), bytes).map_err(|e| e.to_string())?;
+            }
+            println!("policy: ledger restored to {} (version {restored_version})", dir.display());
+            Ok(())
+        }
+        _ => Err("usage: policy ledger init|restore ...".into()),
+    }
+}
+
+/// Copies the known ledger layout (`entries/`, `roster/`, `approvals/`,
+/// the pin file) from a verified copy into a fresh directory.
+fn copy_ledger_tree(from: &Path, to: &Path) -> Result<(), String> {
+    fn copy_dir(from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::create_dir_all(to)?;
+        for entry in std::fs::read_dir(from)? {
+            let entry = entry?;
+            let dest = to.join(entry.file_name());
+            if entry.file_type()?.is_dir() {
+                copy_dir(&entry.path(), &dest)?;
+            } else {
+                std::fs::copy(entry.path(), &dest)?;
+            }
+        }
+        Ok(())
+    }
+    std::fs::create_dir_all(to).map_err(|e| format!("{}: {e}", to.display()))?;
+    for name in ["entries", "roster", "approvals"] {
+        let src = from.join(name);
+        if src.is_dir() {
+            copy_dir(&src, &to.join(name)).map_err(|e| format!("{}: {e}", src.display()))?;
+        }
+    }
+    let pin = from.join("genesis-roster.sha256");
+    if pin.exists() {
+        std::fs::copy(&pin, to.join("genesis-roster.sha256")).map_err(|e| format!("{}: {e}", pin.display()))?;
+    }
+    Ok(())
+}
+
+fn run(args: &[String]) -> Result<(), String> {
+    match args.first().map(String::as_str) {
+        Some("keygen") => cmd_keygen(&args[1..]),
+        Some("approver-keygen") => cmd_approver_keygen(&args[1..]),
+        Some("fleet") => cmd_fleet(&args[1..]),
+        Some("render") => cmd_render(&args[1..]),
+        Some("diff") => cmd_diff(&args[1..]),
+        Some("approve") => cmd_approve(&args[1..]),
+        Some("sign") => cmd_sign(&args[1..]),
+        Some("verify") => cmd_verify(&args[1..]),
+        Some("ledger") => cmd_ledger(&args[1..]),
+        // Not a signing or verification step, just a convenience so a
+        // caller (an operator, or the fixture harness) can learn a
+        // roster's digest to pin without re-implementing the hash.
+        Some("roster-digest") => {
+            let path = args.get(1).ok_or("usage: policy roster-digest <roster.toml>")?;
+            let text = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+            println!("{}", hex(&Roster::parse(&text)?.digest()));
+            Ok(())
+        }
+        _ => Err("usage: policy keygen|approver-keygen|fleet|render|diff|approve|sign|verify|ledger|roster-digest ...".into()),
+    }
+}
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match run(&args) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("policy: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}

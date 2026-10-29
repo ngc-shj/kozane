@@ -24,14 +24,14 @@ loader := $(BUILD)/loader.img
 counts := $(BUILD)/counts
 
 pds := supervisor eth-out eth-in ingress audit timer tpm rng key hs inner data pq pqkey tls tlskey
-host_crates := wire ring boot-stage rng-core supervisor-core audit-event drbg ingress-core inner-core layout laws supervisor-allowlist config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct limits tlskey-core secret
+host_crates := wire ring boot-stage rng-core supervisor-core audit-event drbg ingress-core inner-core layout laws supervisor-allowlist config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct limits tlskey-core secret policy-wire
 empty :=
 space := $(empty) $(empty)
 # A crate shipped in more than one feature set is proved in each
 # (`kani_variants_<crate>`, cargo arguments, `;`-separated) and tools/mir-gate
 # compares each shipped variant with the proof build of its own features.
 kani_variants_boot-stage := --features boot-stop
-kani_crates := wire ring boot-stage drbg rng-core supervisor-core ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire
+kani_crates := wire ring boot-stage drbg rng-core supervisor-core ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire policy-wire
 
 .PHONY: clean-counts
 .PHONY: all image package run test check check-selftest repro mir audit lint lint-pds unit kani verus ct ct-harness ct-shape bolero fuzz-long laws pins manifest kernel-config clean
@@ -267,6 +267,7 @@ ct-shape: ct-harness | $(counts)
 	grep '^CT-SHAPE-SYMBOLS ' $(counts)/ct-shape.log > $(counts)/ct-shape
 
 bolero_targets := wire/tests::fuzz_parse_never_panics_and_round_trips \
+	policy-wire/tests::fuzz_render_round_trips_and_parse_never_panics \
 	wg-wire/tests::fuzz_parsers_never_panic_and_round_trip \
 	rosenpass-wire/tests::fuzz_parsers_never_panic_and_round_trip \
 	tpm2-wire/tests::fuzz_response_parsers_never_panic_and_stay_in_bounds \
@@ -310,13 +311,16 @@ audit: | $(counts)
 	tools/audit-gate > $(counts)/audit.log 2>&1 || { cat $(counts)/audit.log; exit 1; }
 	# The release tool's own workspace (M5 plan C13) is checked too.
 	tools/audit-gate --lock tools/release/Cargo.lock --ignore policy/audit-ignore-release.toml > $(counts)/audit-release.log 2>&1 || { cat $(counts)/audit-release.log; exit 1; }
+	# The policy tool's own workspace (M8 plan C2): the same libcrux build
+	# chain as tools/release's, so the same exception file applies.
+	tools/audit-gate --lock tools/policy/Cargo.lock --ignore policy/audit-ignore-release.toml > $(counts)/audit-policy.log 2>&1 || { cat $(counts)/audit-policy.log; exit 1; }
 	grep '^AUDIT-ADVISORIES' $(counts)/audit.log > $(counts)/audit
 
 laws: | $(counts)
 	cargo run --locked -q -p laws -- check --system $(system) --policy $(policy) --search-path $(BUILD) --no-elf-check
 	echo "LAWS-SYSTEMS 1" > $(counts)/laws
 
-pins: release-tool | $(counts)
+pins: release-tool policy-tool | $(counts)
 	tools/check-pins > $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	# M7 plan C8: what the supervisor's source may name (RM7-5).
 	cargo run --locked -q -p supervisor-allowlist -- crates/pds/supervisor/src >> $(counts)/pins.log \
@@ -344,13 +348,19 @@ pins: release-tool | $(counts)
 	python3 tests/tools/test_release.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_provision.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_mkcert.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	python3 tests/tools/test_policy.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	cargo clippy --locked --manifest-path tools/release/Cargo.toml --target-dir $(BUILD)/release/target --all-targets -- -D warnings \
 		> $(counts)/release-lint.log 2>&1 || { cat $(counts)/release-lint.log; exit 1; }
 	cargo test --locked --manifest-path tools/release/Cargo.toml --target-dir $(BUILD)/release/target \
 		> $(counts)/release-unit.log 2>&1 || { cat $(counts)/release-unit.log; exit 1; }
 	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-RELEASE-TOOL", n + 0 }' $(counts)/release-unit.log >> $(counts)/pins.log
+	cargo clippy --locked --manifest-path tools/policy/Cargo.toml --target-dir $(BUILD)/policy/target --all-targets -- -D warnings \
+		> $(counts)/policy-lint.log 2>&1 || { cat $(counts)/policy-lint.log; exit 1; }
+	cargo test --locked --manifest-path tools/policy/Cargo.toml --target-dir $(BUILD)/policy/target \
+		> $(counts)/policy-unit.log 2>&1 || { cat $(counts)/policy-unit.log; exit 1; }
+	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-POLICY-TOOL", n + 0 }' $(counts)/policy-unit.log >> $(counts)/pins.log
 	tools/verus-pairing >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES|UNIT-COUNTS-FIXTURES|PROOF-LOCK-FIXTURES|SELFTEST-SPLIT-FIXTURES|KANI-GUARD-FIXTURES|VERUS-PAIRING-FIXTURES|VERUS-PAIRED|MIR-GATE-FIXTURES|MEASURE-FIXTURES|RELEASE-FIXTURES|PROVISION-FIXTURES|MKCERT-FIXTURES|UNIT-RELEASE-TOOL)' $(counts)/pins.log > $(counts)/pins
+	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES|UNIT-COUNTS-FIXTURES|PROOF-LOCK-FIXTURES|SELFTEST-SPLIT-FIXTURES|KANI-GUARD-FIXTURES|VERUS-PAIRING-FIXTURES|VERUS-PAIRED|MIR-GATE-FIXTURES|MEASURE-FIXTURES|RELEASE-FIXTURES|PROVISION-FIXTURES|MKCERT-FIXTURES|POLICY-FIXTURES|UNIT-RELEASE-TOOL|UNIT-POLICY-TOOL)' $(counts)/pins.log > $(counts)/pins
 
 # Builds its own deployment (fresh keys, generated config, release package);
 # see run.py. Packaging a release kernel needs the C9 pass record, hence
@@ -436,6 +446,12 @@ release: release-tool
 release-verify: release-tool
 	test -n "$(PUB)" -a -n "$(REL)" || { echo "release-verify: set PUB= REL="; exit 1; }
 	python3 tools/release.py verify --pub $(PUB) --release $(REL) $(if $(ENVELOPE),--envelope $(ENVELOPE) --kind $(KIND))
+
+# M8 plan C2, D11: the peer-policy signing toolchain, its own workspace as
+# tools/release's.
+.PHONY: policy-tool
+policy-tool:
+	cargo build --locked --release --manifest-path tools/policy/Cargo.toml --target-dir $(BUILD)/policy/target
 
 # M5 plan C4: the MIR each PD ships from a verified crate equals the MIR the
 # proof configuration compiles (tools/mir-gate).

@@ -6,13 +6,18 @@ license.workspace = true
 build = "build.rs"
 
 [dependencies]
+# `Prefix` (M8 plan C1 R2): `config` reuses it instead of its own type.
+policy-wire = { path = "../policy-wire" }
 
 [build-dependencies]
+limits = { path = "../limits" }
+policy-wire = { path = "../policy-wire" }
 secret-blob = { path = "../secret-blob" }
 serde = { version = "=1.0.229", features = ["derive"] }
 toml = "=0.9.8"
 
 [dev-dependencies]
+limits = { path = "../limits" }
 secret-blob = { path = "../secret-blob" }
 serde = { version = "=1.0.229", features = ["derive"] }
 toml = "=0.9.8"

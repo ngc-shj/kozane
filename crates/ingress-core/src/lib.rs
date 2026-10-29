@@ -950,9 +950,9 @@ pub const RP_CONF_GLOBAL_INTERVAL_NS: u64 = 50_000_000;
 // The Rosenpass cookie gate (M3b plan, "Load state", "Lanes", "Session
 // binding"). Proposed values; the assertions below may not be weakened.
 
-/// `config::MAX_PEERS`, which this crate does not depend on (the PD asserts
-/// the two agree).
-pub const RP_MAX_PEERS: usize = 8;
+/// `limits::MAX_PEERS`, which `config::MAX_PEERS` also equals (M8 plan C1
+/// R2).
+pub const RP_MAX_PEERS: usize = limits::MAX_PEERS;
 /// Load holds this long after its last trigger: three per-source periods.
 /// An uncookied InitHello under load is not a trigger (rosenpass 0.2.3
 /// would never get through), so load clears under a sustained spoof; the

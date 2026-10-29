@@ -2,6 +2,8 @@
 // that reject a configuration at build time are unit-tested directly.
 // Plain std; never compiled into a PD.
 
+use policy_wire::Prefix;
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
@@ -74,26 +76,6 @@ pub struct RawPeer {
     pub rp_pub_path: String,
     pub rp_hash: String,
     pub allowed_ips: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Prefix {
-    pub addr: [u8; 4],
-    pub len: u8,
-}
-
-impl Prefix {
-    fn range(&self) -> (u32, u32) {
-        let a = u32::from_be_bytes(self.addr);
-        let mask = if self.len == 0 { 0 } else { u32::MAX << (32 - u32::from(self.len)) };
-        let lo = a & mask;
-        (lo, lo | !mask)
-    }
-
-    fn contains(&self, ip: [u8; 4]) -> bool {
-        let (lo, hi) = self.range();
-        (lo..=hi).contains(&u32::from_be_bytes(ip))
-    }
 }
 
 /// A McEliece public key read from its file and checked against its hash.
@@ -265,18 +247,14 @@ pub fn parse_prefix(s: &str) -> Result<Prefix, String> {
     if len > 32 {
         return Err(format!("bad prefix length in {s:?}"));
     }
-    let p = Prefix { addr: parse_ip(ip)?, len };
-    if p.range().0 != u32::from_be_bytes(p.addr) {
-        return Err(format!("prefix {s:?} has host bits set"));
-    }
-    Ok(p)
+    let addr = parse_ip(ip)?;
+    Prefix::checked(addr, len).ok_or_else(|| format!("prefix {s:?} has host bits set"))
 }
 
-/// Most peers an image can serve: `data` keeps three sessions per peer and
-/// its replay windows dominate its memory (deviation log). Rendered into the
-/// config crate as `MAX_PEERS`, so every PD sizes its tables from this one
-/// value; build.rs asserts it fits the secrets region (secret_blob::MAX_PEERS).
-pub const MAX_PEERS: usize = 8;
+/// `limits::MAX_PEERS` (M8 plan C1 R2). Rendered into the config crate as
+/// `MAX_PEERS`, so every PD sizes its tables from this one value; build.rs
+/// asserts it fits the secrets region (secret_blob::MAX_PEERS).
+pub const MAX_PEERS: usize = limits::MAX_PEERS;
 /// Most static inside neighbors (`inner`'s table), rendered as `MAX_NEIGHBORS`.
 pub const MAX_NEIGHBORS: usize = 64;
 
@@ -314,9 +292,7 @@ pub fn check(text: &str, max_peers: usize, load: &dyn Fn(&str) -> Result<Vec<u8>
     let all: Vec<(usize, &Prefix)> = peers.iter().enumerate().flat_map(|(i, q)| q.allowed.iter().map(move |p| (i, p))).collect();
     for (i, (pi, a)) in all.iter().enumerate() {
         for (pj, b) in &all[i + 1..] {
-            let (a0, a1) = a.range();
-            let (b0, b1) = b.range();
-            if a0 <= b1 && b0 <= a1 {
+            if a.overlaps(b) {
                 return Err(format!("config: allowed IPs of peers {pi} and {pj} overlap"));
             }
         }
@@ -364,8 +340,7 @@ pub fn check(text: &str, max_peers: usize, load: &dyn Fn(&str) -> Result<Vec<u8>
             }
             // Any overlap with the inside network would let the peer speak
             // as an inside host, listed as a neighbor or not.
-            let ((a0, a1), (b0, b1)) = (p.range(), inside_prefix.range());
-            if a0 <= b1 && b0 <= a1 {
+            if p.overlaps(&inside_prefix) {
                 return Err(format!("config: allowed IPs of peer {i} overlap inside_prefix"));
             }
         }

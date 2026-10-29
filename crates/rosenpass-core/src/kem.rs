@@ -6,7 +6,7 @@ use rosenpass_wire::{ECT_LEN, EPK_LEN, SCT_LEN};
 use crate::{KEY_LEN, Secret};
 
 /// Classic McEliece 460896 (round 3) public key.
-pub const SPK_LEN: usize = 524_160;
+pub const SPK_LEN: usize = limits::SPK_LEN;
 /// Both KEMs' shared secret.
 pub const SHK_LEN: usize = 32;
 

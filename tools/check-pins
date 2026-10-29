@@ -174,6 +174,15 @@ L12 is the compiler: `Secret<N>` is not Clone/Copy/Debug, so a derive on a
 type wrapping it does not build; `Zeroizing<[u8; N]>` is Clone, so P9 is
 the only guard for pqkey-core's wrappers. L8's adjudicating control is
 `PskTable::fresh` being the only constructor of `FreshPsk`.
+  P27 the peer-policy slots (M8 plan C1, C6): `policy-wire`'s `verifier`
+     feature (parse without a token) is enabled only by crates/pds/policy and
+     tools/policy, and `memory_region_symbol!(policy_a|policy_b ...)` appears
+     only in crates/pds/policy and crates/policy-client. A tripwire over
+     source text; the boundary is the laws' read-only slot MR (C11) and
+     `open` needing a `Verified` token
+  P28 no single-person signing (M8 plan C2): tools/policy/src names no
+     `--force`, `--single`, `skip_approval` or a `--roster` flag (the roster
+     comes from the verified ledger only)
 """
 
 import argparse
@@ -189,7 +198,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P18",
-         "P19", "P20", "P21", "P22", "P23", "P24", "P25", "P26"]
+         "P19", "P20", "P21", "P22", "P23", "P24", "P25", "P26", "P27", "P28"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
                "crates/tls-core", "crates/tlskey-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data",
@@ -1063,6 +1072,36 @@ def check_boot_stage(root: pathlib.Path, out: list):
                 out.append(f"P26 {rel}:{n}: abort_trap; rust-sel4's weak trap stays, so every stop faults (C9)")
 
 
+# P27, P28: the peer-policy slots and the signer (M8 plan C1, C2).
+VERIFIER_USERS = ("crates/pds/policy/Cargo.toml", "tools/policy/Cargo.toml")
+SLOT_READERS = ("crates/pds/policy/", "crates/policy-client/")
+SLOT_SYMBOL = re.compile(r"memory_region_symbol!\(\s*policy_[ab]\b")
+# A flag the signer would parse is a string literal; skip_approval is an
+# identifier. Comment lines may name them (the tool's own docs do).
+BYPASS_FLAG = re.compile(r"[\"']--(force|single|roster)[\"']|\bskip_approval\b")
+
+
+def check_policy(root: pathlib.Path, out: list):
+    for p in sorted(root.glob("**/Cargo.toml")):
+        rel = str(p.relative_to(root))
+        if any(part in ("target", "build", "third_party") for part in p.relative_to(root).parts) or rel in VERIFIER_USERS:
+            continue
+        for n, line in enumerate(p.read_text().splitlines(), 1):
+            code = line.split("#", 1)[0]
+            if "policy-wire" in code and "verifier" in code or re.search(r"policy-wire/verifier", code):
+                out.append(f"P27 {rel}:{n}: policy-wire's verifier feature outside the policy PD and tools/policy (M8 plan C1)")
+    for rel, text in crate_sources(root, "crates"):
+        if rel.startswith(SLOT_READERS):
+            continue
+        for n, line in enumerate(text.splitlines(), 1):
+            if SLOT_SYMBOL.search(line):
+                out.append(f"P27 {rel}:{n}: a policy slot read outside policy and policy-client (M8 plan C6)")
+    for rel, text in crate_sources(root, "tools/policy/src"):
+        for n, line in enumerate(text.splitlines(), 1):
+            if not line.lstrip().startswith("//") and BYPASS_FLAG.search(line):
+                out.append(f"P28 {rel}:{n}: a bypass or caller-supplied roster in the signer (M8 plan C2)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
@@ -1081,6 +1120,7 @@ def main() -> int:
     check_makefile((root / "Makefile").read_text(), "Makefile", out)
     check_waivers(root, out)
     check_forbidden(root, out)
+    check_policy(root, out)
     check_secret_derives(root, out)
     check_secret_copies(root, out)
     check_cookie_compares(root, out)

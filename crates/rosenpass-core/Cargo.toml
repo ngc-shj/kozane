@@ -8,6 +8,9 @@ license.workspace = true
 # The workspace's constant-time compare, re-exported as
 # `rosenpass_core::crypto::ct_eq`.
 ct = { path = "../ct" }
+# `SPK_LEN` (M8 plan C1 R2): the single source of truth for every crate's
+# McEliece public key length.
+limits = { path = "../limits" }
 rosenpass-wire = { path = "../rosenpass-wire" }
 # The shared secret container, re-exported as `rosenpass_core::Secret`
 # (L12, M3 plan S12).

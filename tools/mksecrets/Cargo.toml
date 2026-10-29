@@ -5,6 +5,9 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# `validate.rs` (M8 plan C1 R2), shared with `config`'s build.rs.
+limits = { path = "../../crates/limits" }
+policy-wire = { path = "../../crates/policy-wire" }
 secret-blob = { path = "../../crates/secret-blob" }
 libc = "=0.2.191"
 libcrux-curve25519 = { version = "=0.0.9", default-features = false }

@@ -826,6 +826,28 @@ CASES = [
      lambda t: append(t / "crates/pds/timer/src/main.rs", "#[protection_domain]\nfn other() {}\n")),
     ("P26 the abort trap overridden", {"P26"},
      lambda t: append(t / "crates/pdkit/src/lib.rs", "#[unsafe(no_mangle)]\nfn sel4_runtime_abort_trap() {}\n")),
+    # P27, P28 (M8 plan C1, C2): the slots and the signer.
+    ("P27 a consumer enabling policy-wire's verifier", {"P27"},
+     lambda t: append(t / "crates/config/Cargo.toml", '\n[features]\nv = ["policy-wire/verifier"]\n')),
+    ("P27 a consumer depending on policy-wire with verifier", {"P27"},
+     lambda t: edit(t / "tools/mksecrets/Cargo.toml", 'policy-wire = { path = "../../crates/policy-wire" }',
+                    'policy-wire = { path = "../../crates/policy-wire", features = ["verifier"] }')),
+    ("allow policy-wire without verifier and the feature named in a comment", set(),
+     lambda t: append(t / "crates/config/Cargo.toml", "# policy-wire's verifier is not for config\n")),
+    ("P27 a slot read outside policy", {"P27"},
+     lambda t: append(t / "crates/wire/src/lib.rs", "fn f() { let _ = memory_region_symbol!(policy_a: *const u8); }\n")),
+    ("allow a slot read in policy-client", set(),
+     lambda t: write(t / "crates/policy-client/src/lib.rs", "fn f() { let _ = memory_region_symbol!(policy_b: *const u8); }\n")),
+    ("allow a different region named policy_ab", set(),
+     lambda t: append(t / "crates/wire/src/lib.rs", "fn f() { let _ = memory_region_symbol!(policy_ab: *const u8); }\n")),
+    ("P28 a force flag in the signer", {"P28"},
+     lambda t: append(t / "tools/policy/src/main.rs", 'const F: &str = "--force";\n')),
+    ("P28 a roster flag in the signer", {"P28"},
+     lambda t: append(t / "tools/policy/src/main.rs", 'const F: &str = "--roster";\n')),
+    ("allow the bypass flags named in a signer comment", set(),
+     lambda t: append(t / "tools/policy/src/main.rs", "// there is no --force and no --roster\n")),
+    ("allow the signer's --new-roster", set(),
+     lambda t: append(t / "tools/policy/src/main.rs", 'const F: &str = "--new-roster";\n')),
 ]
 
 

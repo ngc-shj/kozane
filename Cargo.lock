@@ -265,6 +265,8 @@ checksum = "0c9ea0ac24bc397ab3c98583a3c9ba74fa56b09a4449bbe172b9b1ddb016027a"
 name = "config"
 version = "0.1.0"
 dependencies = [
+ "limits",
+ "policy-wire",
  "secret-blob",
  "serde",
  "toml",
@@ -1024,7 +1026,9 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "libcrux-curve25519",
+ "limits",
  "mce460896",
+ "policy-wire",
  "secret-blob",
  "serde",
  "toml",
@@ -1421,6 +1425,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
+name = "policy-wire"
+version = "0.1.0"
+dependencies = [
+ "bolero",
+ "limits",
+]
+
+[[package]]
 name = "ppv-lite86"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1672,6 +1684,7 @@ dependencies = [
  "libcrux-blake2",
  "libcrux-chacha20poly1305",
  "libcrux-ml-kem",
+ "limits",
  "mce460896",
  "rosenpass-wire",
  "secret",

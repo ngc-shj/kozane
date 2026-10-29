@@ -961,3 +961,41 @@ Slice order:
 4. C8, C9.
 5. C10.
 6. C12, C13, the solo `make check`, then the split self-test.
+
+## Implementation Checklist
+
+Appended slice by slice (Step 2-1); each slice's list is written before its
+code.
+
+### Slice 1 (C1, C2)
+
+- `crates/limits`: add `MAX_PEERS` (8), `MAX_ALLOWED` (8), `MAX_GROUPS`
+  (8), `MAX_RULES` (16), `SPK_LEN` (524 160), `BUNDLE_MAX` (`0x480_000`),
+  each with the reason it has that value; unit tests.
+- New `crates/policy-wire` (no_std, depends on `limits` only): format,
+  `parse`, `render` (host feature), `select`, the init step machine (I5.1),
+  `open`, `NodeConfig`, `Reject`; `proofs.rs` (I1.1 generic over the key
+  length, I5.1, I5.3), `tests.rs`, compile-fail tests (I1.2), one bolero
+  target (I1.3).
+- Reuse, do not re-implement:
+  - `config::Prefix::contains` and `validate.rs`'s `range()` overlap rule
+    (`crates/config/src/validate.rs:86`) move into `policy-wire`'s
+    `Prefix`, and `config` re-uses it;
+  - `config::MAX_PEERS` (`validate.rs:279`), `ingress_core::RP_MAX_PEERS`
+    (`ingress-core/src/lib.rs:955`) and `rosenpass_core::SPK_LEN`
+    (`rosenpass-core/src/kem.rs:9`) become imports of, or const asserts
+    against, `limits` (R2).
+- `NodeConfig` fields, from `config`'s current checks
+  (`validate.rs:286-…`): inside prefix, inside IP, outside IP, neighbour
+  IPs, the gateway's WireGuard public key (a peer may not use it), and the
+  gateway's rp digest. The digest is BLAKE2s, already rendered as
+  `rp_hash`, and the caller supplies it as a digest function so that
+  `policy-wire` takes no hash dependency.
+- Root `Cargo.toml` `members`, `Makefile` `host_crates` and
+  `kani_crates`, and `tests/manifest.txt` (UNIT-/KANI-POLICY-WIRE,
+  UNIT-LIMITS, LINT-CRATES, BOLERO-TARGETS).
+- New `tools/policy` (own workspace, `libcrux-ml-dsa =0.0.11` with
+  `std, mldsa65`, `libcrux-ed25519 =0.0.10`, as `tools/release`):
+  `render, diff, approve, sign, verify, ledger, fleet`;
+  `tests/tools/test_policy.py` (POLICY-FIXTURES); `Makefile` `pins` and
+  `audit` wiring; check-pins forbidden patterns for C1 and C2.
