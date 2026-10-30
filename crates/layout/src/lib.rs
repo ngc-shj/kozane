@@ -63,6 +63,8 @@ pub mod ingress {
     pub const CH_PQ: usize = 6;
     pub const CH_TLS: usize = 7;
     pub const CH_RNG: usize = 8;
+    /// `Await` on `policy` (M8 plan C6), once, in init.
+    pub const CH_POLICY: usize = 9;
 }
 
 pub mod audit {
@@ -106,6 +108,8 @@ pub mod hs {
     pub const CH_AUDIT: usize = 5;
     pub const CH_PQ: usize = 6;
     pub const CH_RNG: usize = 7;
+    /// `Await` on `policy` (M8 plan C6), once, in init.
+    pub const CH_POLICY: usize = 8;
 }
 
 pub mod data {
@@ -114,6 +118,8 @@ pub mod data {
     pub const CH_INNER: usize = 3;
     pub const CH_TIMER: usize = 4;
     pub const CH_AUDIT: usize = 5;
+    /// `Await` on `policy` (M8 plan C6), once, in init.
+    pub const CH_POLICY: usize = 6;
 }
 
 pub mod inner {
@@ -121,6 +127,8 @@ pub mod inner {
     pub const CH_DATA: usize = 2;
     pub const CH_AUDIT: usize = 3;
     pub const CH_TLS: usize = 4;
+    /// `Await` on `policy` (M8 plan C6), once, in init.
+    pub const CH_POLICY: usize = 5;
 }
 
 /// M3: the Rosenpass responder (plan C3).
@@ -131,6 +139,8 @@ pub mod pq {
     pub const CH_TIMER: usize = 4;
     pub const CH_AUDIT: usize = 5;
     pub const CH_RNG: usize = 6;
+    /// `Await` on `policy` (M8 plan C6), once, in init.
+    pub const CH_POLICY: usize = 7;
 }
 
 /// M6: the HTTPS endpoint (plan C1, C3): TCP and TLS on packets `ingress`
@@ -168,8 +178,8 @@ pub mod supervisor {
 
 /// M8: the peer-policy verifier (plan C5), a passive callee: it reads the
 /// two bundle slots, asks `tpm` for the anti-rollback state on `CH_TPM`
-/// and reports to `audit` through its log page. Its callers (the barrier
-/// PDs, M8 plan C6) get their channels in slice 3 batch B. One PPC label:
+/// and reports to `audit` through its log page. Its callers are the barrier
+/// PDs (M8 plan C6), one channel each. One PPC label:
 /// `AWAIT` (no words in) answers `VERIFIED` with
 /// `policy_wire::VERIFIED_REPLY_LEN` bytes packed into words
 /// (`tpm::pack`), or `UNAVAILABLE` with the `policy_wire::Reject` code in
@@ -177,10 +187,20 @@ pub mod supervisor {
 pub mod policy {
     pub const CH_TPM: usize = 1;
     pub const CH_AUDIT: usize = 2;
+    pub const CH_HS: usize = 3;
+    pub const CH_PQ: usize = 4;
+    pub const CH_INGRESS: usize = 5;
+    pub const CH_DATA: usize = 6;
+    pub const CH_INNER: usize = 7;
     pub const AWAIT: u64 = 0;
     pub const VERIFIED: u64 = 0;
     pub const UNAVAILABLE: u64 = 1;
     pub const BAD_REQUEST: u64 = 2;
+    /// The `Halted` reason every barrier PD boot-stops with when `policy`
+    /// answers anything but `VERIFIED`, or `open` refuses the verified slot
+    /// (M8 plan C6): one shared value, above every PD's own halt table
+    /// (the largest, `ingress`'s, ends at 8).
+    pub const HALT_UNAVAILABLE: u32 = 16;
 }
 
 /// M7: the entropy driver (plan C6), callee of the PDs that draw

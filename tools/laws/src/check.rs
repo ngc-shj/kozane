@@ -515,10 +515,13 @@ fn check_policy(system: &System, policy: &Policy, tainted: &BTreeSet<String>, fi
             if policy.role(&end.pd) != Some(Role::Policy) {
                 continue;
             }
+            // Its callers are named (C11: exactly the barrier set), not
+            // admitted by role: `tls` shares a barrier pd's role but is no
+            // caller.
             let ok = match policy.role(&peer.pd) {
                 Some(Role::Tpm) => end.pp,
                 Some(Role::Service) => !end.pp && !peer.pp,
-                Some(Role::UntrustedInput | Role::Data) => !end.pp && peer.pp,
+                _ if policy.is_named_caller(&end.pd, &peer.pd) => !end.pp && peer.pp,
                 _ => false,
             };
             if !ok {
@@ -526,7 +529,7 @@ fn check_policy(system: &System, policy: &Policy, tainted: &BTreeSet<String>, fi
                     LawId::L1,
                     format!(
                         "policy pd '{}' has a channel to '{}' that is not its call to tpm, its notification of audit, \
-                         or a barrier pd's call",
+                         or a named caller's call",
                         end.pd, peer.pd
                     ),
                 ));

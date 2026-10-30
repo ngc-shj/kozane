@@ -60,9 +60,9 @@ def le32(n: int) -> bytes:
     return n.to_bytes(4, "little")
 
 
-# `key` blob v2 with one peer; `pqkey` blob v1; `tlskey` blob v1
+# `key` blob v4 (no peers, M8 plan C7); `pqkey` blob v1; `tlskey` blob v1
 # (crates/secret-blob).
-KEY_BODY = b"SOSSECR1" + le32(2) + le32(1) + bytes(range(1, 97))
+KEY_BODY = b"SOSSECR1" + le32(4) + le32(0) + bytes(range(1, 65))
 BLOB = seal(KEY_BODY, 4096)
 PQ_BODY = b"SOSPQKY1" + le32(1) + bytes((i * 7 + 3) % 256 for i in range(13904 - 12))
 PQ_BLOB = seal(PQ_BODY, 16384)
@@ -856,13 +856,17 @@ CASES = [
     ("all-zero blob", "all zero", lambda: pkg.check_blob(pkg.KEY, bytes(4096))),
     ("short blob", "expected 4096", lambda: pkg.check_blob(pkg.KEY, BLOB[:-1])),
     ("blob without magic", "no SOSSECR1 magic", lambda: pkg.check_blob(pkg.KEY, b"X" + BLOB[1:])),
-    ("key blob version 1", ["package: 'secrets' blob is version 1, expected 2"],
+    ("key blob version 1", ["package: 'secrets' blob is version 1, expected 4"],
      lambda: pkg.check_blob(pkg.KEY, resealed(BLOB, 8, le32(1), len(KEY_BODY)))),
+    # M8 plan C7: the peers left the blob, so the v2 blob (bound to them) is refused.
+    ("key blob version 2", ["package: 'secrets' blob is version 2, expected 4"],
+     lambda: pkg.check_blob(pkg.KEY, resealed(BLOB, 8, le32(2), len(KEY_BODY)))),
     # M6 plan Re-plan R1: the TLS scalar left `key`, so the v3 blob is refused.
-    ("key blob version 3", ["package: 'secrets' blob is version 3, expected 2"],
+    ("key blob version 3", ["package: 'secrets' blob is version 3, expected 4"],
      lambda: pkg.check_blob(pkg.KEY, resealed(BLOB, 8, le32(3), len(KEY_BODY)))),
-    ("key blob peer count zero", ["package: 'secrets' blob peer count is out of range"],
-     lambda: pkg.check_blob(pkg.KEY, resealed(BLOB, 12, le32(0), len(KEY_BODY)))),
+    # A v2 blob's peer count where v4 keeps a zero word.
+    ("key blob non-zero reserved word", ["package: 'secrets' blob has a non-zero reserved word"],
+     lambda: pkg.check_blob(pkg.KEY, resealed(BLOB, 12, le32(1), len(KEY_BODY)))),
     ("key blob checksum mismatch", ["package: 'secrets' blob checksum mismatch"],
      lambda: pkg.check_blob(pkg.KEY, flip(BLOB, 20))),
     ("key blob non-zero padding", ["package: 'secrets' blob has non-zero padding"],

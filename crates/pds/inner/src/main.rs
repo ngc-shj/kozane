@@ -4,6 +4,7 @@
 //! Also the HTTPS backend link (M6 plan C4): the backend's segments to
 //! `tls` go to `ntl`, and `tls`'s segments from `tln` leave only towards the
 //! backend; both are proxied plaintext, which this PD sees by design.
+//! It reads nothing before `policy` has verified a bundle (M8 plan C6).
 
 #![no_std]
 #![no_main]
@@ -44,12 +45,29 @@ struct Inner {
     scratch: Buf,
 }
 
-#[protection_domain]
-fn init() -> Inner {
-    boot_stage::run_init(|_| start())
+/// `Halted` reasons (the record's `a`), stable per M5 plan C6.
+mod halt {
+    /// `policy` verified no bundle, or its slot did not open (M8 plan C6).
+    pub const POLICY_UNAVAILABLE: u32 = layout::policy::HALT_UNAVAILABLE;
 }
 
-fn start() -> Inner {
+/// `Await` on `policy`, then the slot it verified (M8 plan C6). The bundle
+/// itself is not used yet: group authorization (C8) reads it.
+fn barrier() -> Result<(), policy_wire::Reject> {
+    let token = policy_client::await_verified(Channel::new(ch::CH_POLICY))?;
+    policy_client::open(&token, &config::node_config()).map(|_| ())
+}
+
+// The closure names this init in run_init's symbol (ct-shape's stage check).
+#[allow(clippy::redundant_closure)]
+#[protection_domain]
+fn init() -> pdkit::Stage<Inner> {
+    boot_stage::run_init(|init| start(init))
+}
+
+/// Init proper. Its one refusal, the barrier's, is a boot stop (M7 plan
+/// C9): `inner` is a leaf PD.
+fn start(init: &boot_stage::Init) -> pdkit::Stage<Inner> {
     // SAFETY: each link's regions are mapped into this PD and its one peer
     // only, sized as in `layout`; receive data regions are read-only here.
     let (from_driver, to_driver, to_data, from_data, from_tls, to_tls, mut audit) = unsafe {
@@ -87,12 +105,18 @@ fn start() -> Inner {
             Audit::new(memory_region_symbol!(audit_inner: *mut u8), Channel::new(ch::CH_AUDIT)),
         )
     };
+    // The barrier (M8 plan C6): no LAN frame or backend segment is read
+    // before `policy` has verified a bundle; until then they wait in the
+    // rings.
+    if barrier().is_err() {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::POLICY_UNAVAILABLE));
+    }
     let mut neighbors = [([0u8; 4], [0u8; 6]); MAX_NEIGHBORS];
     for (dst, n) in neighbors.iter_mut().zip(config::NEIGHBORS) {
         *dst = (n.ip, n.mac);
     }
     audit.ready();
-    Inner {
+    pdkit::Stage::Run(Inner {
         from_driver,
         to_driver,
         to_data,
@@ -105,7 +129,7 @@ fn start() -> Inner {
         buf: [0; layout::NET_BUF_SIZE],
         reply: [0; layout::NET_BUF_SIZE],
         scratch: [0; layout::NET_BUF_SIZE],
-    }
+    })
 }
 
 #[derive(Default)]

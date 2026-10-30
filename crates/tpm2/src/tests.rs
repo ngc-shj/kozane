@@ -11,7 +11,7 @@ use tpm2_wire::{CC_FLUSH_CONTEXT, CC_IMPORT, CC_LOAD, CC_START_AUTH_SESSION, CC_
 use super::Secret;
 use super::client::{CLIENT_ENTROPY_LEN, Cause, Client, Failure, Step, UNSEAL_ATTRIBUTES};
 use super::crypto;
-use super::envelope::{self, EnvError, Envelope, HEADER_LEN, KEY_MAX_PEERS, Kind, SEAL_ENTROPY_LEN};
+use super::envelope::{self, EnvError, Envelope, HEADER_LEN, Kind, SEAL_ENTROPY_LEN};
 
 fn hex<const N: usize>(s: &str) -> [u8; N] {
     let mut out = [0u8; N];
@@ -263,7 +263,7 @@ fn sealed_envelope_parses_and_opens_to_the_region_every_kind() {
 #[test]
 fn a_key_envelope_is_refused_as_tls_and_a_tls_envelope_as_key() {
     let mut key = [0u8; secret_blob::REGION_SIZE];
-    secret_blob::write(&mut key, &[1; 32], &[2; 32], &[[3; 32]]).unwrap();
+    secret_blob::write(&mut key, &[1; 32], &[2; 32]).unwrap();
     let mut tls = [0u8; secret_blob::tls::REGION_SIZE];
     secret_blob::tls::write(&mut tls, &[4; 32], &[5; 32]).unwrap();
     let key_env = sealed(Kind::Key, &key, 1);
@@ -384,19 +384,17 @@ fn seal_refuses_a_payload_past_the_capacity_and_a_short_region() {
     assert_eq!(envelope::seal(&mut out, Kind::Key, &fits[..100], &srk_public(), &PCRS, &e), Err(EnvError::Seal));
 }
 
+/// M8 plan C7: the `key` blob (no peers) seals whole and opens back to a
+/// blob `secret_blob` parses.
 #[test]
-fn a_key_blob_with_key_max_peers_seals_and_one_more_does_not() {
-    let blob = |peers: usize| {
-        let mut r = Box::new([0u8; secret_blob::REGION_SIZE]);
-        let publics: Vec<[u8; 32]> = (0..peers).map(|i| [i as u8 | 1; 32]).collect();
-        secret_blob::write(&mut r, &[1; 32], &[2; 32], &publics).unwrap();
-        r
-    };
-    let mut out = vec![0u8; Kind::Key.region_size()];
-    let e = seal_entropy(1);
-    assert_eq!(envelope::seal(&mut out, Kind::Key, &blob(KEY_MAX_PEERS)[..], &srk_public(), &PCRS, &e), Ok(()));
-    let r = envelope::seal(&mut out, Kind::Key, &blob(KEY_MAX_PEERS + 1)[..], &srk_public(), &PCRS, &e);
-    assert_eq!(r, Err(EnvError::Seal));
+fn a_key_blob_seals_whole_and_opens_to_a_blob_that_parses() {
+    let mut blob = [0u8; secret_blob::REGION_SIZE];
+    secret_blob::write(&mut blob, &[1; 32], &[2; 32]).unwrap();
+    let env = sealed(Kind::Key, &blob, 1);
+    assert_eq!(Envelope::parse(&env, Kind::Key).unwrap().payload_len(), secret_blob::USED_LEN);
+    let (r, out) = open(&env, Kind::Key, &kek(1));
+    assert!(r == Ok(()) && out == blob);
+    assert_eq!(secret_blob::Blob::parse(&out).unwrap().boot_seed(), &[2; 32]);
 }
 
 #[test]
@@ -920,7 +918,7 @@ fn another_tpms_srk_is_srk_mismatch() {
 #[test]
 fn a_plaintext_blob_is_envelope_invalid_and_reaches_no_tpm_command() {
     let mut blob = Box::new([0u8; secret_blob::REGION_SIZE]);
-    secret_blob::write(&mut blob, &[1; 32], &[2; 32], &[[3; 32]]).unwrap();
+    secret_blob::write(&mut blob, &[1; 32], &[2; 32]).unwrap();
     let env = sealed(Kind::Key, &region(Kind::Key, 500), 3);
     let mut ppc = FakePpc::new(&env);
     let (r, out) = boot_unseal(&blob[..], &mut ppc);

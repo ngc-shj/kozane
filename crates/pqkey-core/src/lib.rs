@@ -196,7 +196,7 @@ impl BootError {
         match self {
             BootError::Blob(BlobError::BadMagic) => 1,
             BootError::Blob(BlobError::BadVersion) => 2,
-            BootError::Blob(BlobError::BadPeerCount) => 3,
+            // 3 was the key blob's BadPeerCount (gone in M8, plan C7).
             BootError::Blob(BlobError::BadChecksum) => 4,
             BootError::Blob(BlobError::NonZeroPadding) => 5,
             BootError::Blob(BlobError::TooSmall) => 6,

@@ -12,6 +12,7 @@ role = "key"
 
 [pds.policy]
 role = "policy"
+callers = ["hs"]
 
 [pds.tpm]
 role = "tpm"

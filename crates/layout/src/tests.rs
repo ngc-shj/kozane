@@ -284,6 +284,11 @@ fn channel_ids_match_layout() {
         (("supervisor", supervisor::CH_AUDIT), ("audit", audit::CH_SUPERVISOR)),
         (("policy", policy::CH_TPM), ("tpm", tpm::CH_POLICY)),
         (("policy", policy::CH_AUDIT), ("audit", audit::CH_POLICY)),
+        (("hs", hs::CH_POLICY), ("policy", policy::CH_HS)),
+        (("pq", pq::CH_POLICY), ("policy", policy::CH_PQ)),
+        (("ingress", ingress::CH_POLICY), ("policy", policy::CH_INGRESS)),
+        (("data", data::CH_POLICY), ("policy", policy::CH_DATA)),
+        (("inner", inner::CH_POLICY), ("policy", policy::CH_INNER)),
     ];
     for (a, b) in expected {
         assert!(has_channel(a, b), "{a:?} <-> {b:?}");
@@ -457,4 +462,74 @@ fn policy_is_a_passive_verifier_on_the_planned_schedule() {
     assert_eq!(map_of("policy", "audit_policy").map(|m| m.1).as_deref(), Some("rw"));
     assert_eq!(map_of("audit", "audit_policy").map(|m| m.1).as_deref(), Some("r"));
     assert!(mr_sizes()["audit_policy"] >= audit_event::log::WORDS * 8);
+}
+
+/// The barrier set (M8 plan C6): the PDs that call `policy`'s `Await`.
+const BARRIER: [&str; 5] = ["hs", "pq", "ingress", "data", "inner"];
+
+/// M8 plan C6, C11: each barrier PD calls `policy` (pp on its end,
+/// notify=false, `policy` pp=false: the key exemption's shape), and no
+/// other PD has a channel to it but `tpm` and `audit`.
+#[test]
+fn policy_callers_are_exactly_the_barrier_set() {
+    let text = system_text();
+    let doc = roxmltree::Document::parse(&text).expect("parse .system");
+    let mut callers = std::vec::Vec::new();
+    for c in doc.descendants().filter(|n| n.has_tag_name("channel")) {
+        let ends: std::vec::Vec<roxmltree::Node> = c.children().filter(|e| e.has_tag_name("end")).collect();
+        let Some(i) = ends.iter().position(|e| e.attribute("pd") == Some("policy")) else { continue };
+        let (own, peer) = (ends[i], ends[1 - i]);
+        let name = peer.attribute("pd").expect("pd");
+        if name == "tpm" || name == "audit" {
+            continue;
+        }
+        assert_eq!(own.attribute("pp"), Some("false"), "{name}");
+        assert_eq!((peer.attribute("pp"), peer.attribute("notify")), (Some("true"), Some("false")), "{name}");
+        callers.push(name);
+    }
+    callers.sort_unstable();
+    let mut want = BARRIER;
+    want.sort_unstable();
+    assert_eq!(callers, want);
+}
+
+/// M8 plan C6, C11: each barrier PD maps both slots read-only, at windows
+/// that do not overlap each other or anything else it maps; no other PD but
+/// `policy` maps a slot.
+#[test]
+fn barrier_pds_map_both_slots_read_only_apart_from_their_other_maps() {
+    let text = system_text();
+    let doc = roxmltree::Document::parse(&text).expect("parse .system");
+    let sizes = mr_sizes();
+    for pd in doc.descendants().filter(|n| n.has_tag_name("protection_domain")) {
+        let name = pd.attribute("name").expect("name");
+        let maps: std::vec::Vec<(usize, usize, &str)> = pd
+            .children()
+            .filter(|m| m.has_tag_name("map"))
+            .map(|m| {
+                let mr = m.attribute("mr").expect("mr");
+                (parse_num(m.attribute("vaddr").expect("vaddr")), sizes[mr], mr)
+            })
+            .collect();
+        let slots = maps.iter().filter(|m| m.2.starts_with("policy_")).count();
+        if BARRIER.contains(&name) || name == "policy" {
+            assert_eq!(slots, 2, "{name}");
+            for slot in ["policy_a", "policy_b"] {
+                assert_eq!(map_of(name, slot).map(|m| m.1).as_deref(), Some("r"), "{name} {slot}");
+            }
+        } else {
+            assert_eq!(slots, 0, "{name} maps a bundle slot");
+        }
+        for (i, a) in maps.iter().enumerate() {
+            for b in &maps[i + 1..] {
+                assert!(a.0 + a.1 <= b.0 || b.0 + b.1 <= a.0, "{name}: {} and {} overlap", a.2, b.2);
+            }
+        }
+    }
+}
+
+/// M8 plan C6: the shared boot-stop reason, pinned (the harness matches it).
+#[test]
+fn policy_unavailable_halt_code_is_pinned() {
+    assert_eq!(policy::HALT_UNAVAILABLE, 16);
 }

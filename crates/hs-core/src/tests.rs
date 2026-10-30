@@ -31,7 +31,7 @@ fn peer_pub() -> [u8; 32] {
 
 fn region() -> [u8; secret_blob::REGION_SIZE] {
     let mut r = [0u8; secret_blob::REGION_SIZE];
-    secret_blob::write(&mut r, clamped(GW_PRIVATE).as_bytes(), &[0x99; 32], &[peer_pub()]).unwrap();
+    secret_blob::write(&mut r, clamped(GW_PRIVATE).as_bytes(), &[0x99; 32]).unwrap();
     r
 }
 
@@ -50,8 +50,7 @@ impl KeyCall for &mut Direct<'_> {
 }
 
 fn direct(r: &[u8], burst: u64) -> Direct<'_> {
-    let peers = [peer_pub()];
-    let blob = key_core::validate(r, &gw_pub(), peers.iter()).unwrap();
+    let blob = key_core::validate(r, &gw_pub()).unwrap();
     Direct { oracle: Oracle::new(blob, Key32::from_bytes([0x5e; 32])), bucket: Bucket::new(burst, 1), calls: 0 }
 }
 

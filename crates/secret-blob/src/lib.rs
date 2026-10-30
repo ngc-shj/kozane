@@ -6,15 +6,17 @@
 //! `mksecrets` (writing) and the config checks, so each layout is defined
 //! once.
 //!
-//! `key` layout, version 2 (little-endian):
-//!   magic[8] = "SOSSECR1" | version u32 = 2 | peer_count u32
+//! `key` layout, version 4 (little-endian; M8 plan C7's "v3"):
+//!   magic[8] = "SOSSECR1" | version u32 = 4 | reserved u32 = 0
 //!   gateway_private[32] | boot_seed[32]
-//!   peer_count × peer_public_hash[32] = BLAKE2s-256(peer public key)
 //!   checksum[32] = BLAKE2s-256(all preceding bytes)
 //! The region has a fixed size (`REGION_SIZE`); bytes after the checksum are
 //! zero. Version 1 carried a static PSK per peer; it is refused (M3 plan C2,
 //! L8: WireGuard PSKs come only from Rosenpass). Version 3 (M6 slice 2)
-//! carried the TLS scalar, which now has its own blob; it is refused too.
+//! carried the TLS scalar, which now has its own blob; it is refused too,
+//! and its number is not reused. Version 2 bound the blob to the peers'
+//! keys (a hash each); the peers now come from the signed bundle (M8 plan
+//! D4, C7), so a policy update never needs a re-seal, and it is refused.
 
 #![no_std]
 #![deny(
@@ -30,23 +32,24 @@ pub mod pq;
 pub mod tls;
 
 pub const MAGIC: [u8; 8] = *b"SOSSECR1";
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 4;
 pub const REGION_SIZE: usize = 4096;
 const HEADER: usize = 8 + 4 + 4;
 /// Byte offsets of the fixed secrets, pinned numerically by the tests (the
 /// integration harness reads them from a blob file).
 pub const GATEWAY_PRIVATE_AT: usize = HEADER;
 pub const BOOT_SEED_AT: usize = GATEWAY_PRIVATE_AT + 32;
-const FIXED: usize = BOOT_SEED_AT + 32;
-const PER_PEER: usize = 32;
+pub const CHECKSUM_AT: usize = BOOT_SEED_AT + 32;
 const CHECKSUM: usize = 32;
-pub const MAX_PEERS: usize = (REGION_SIZE - FIXED - CHECKSUM) / PER_PEER;
+/// Bytes in use; the rest of the region is zero.
+pub const USED_LEN: usize = CHECKSUM_AT + CHECKSUM;
+
+const _: () = assert!(USED_LEN <= REGION_SIZE);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlobError {
     BadMagic,
     BadVersion,
-    BadPeerCount,
     BadChecksum,
     NonZeroPadding,
     TooSmall,
@@ -58,7 +61,6 @@ impl BlobError {
         match self {
             BlobError::BadMagic => "secrets: bad magic",
             BlobError::BadVersion => "secrets: unsupported version",
-            BlobError::BadPeerCount => "secrets: peer count out of range",
             BlobError::BadChecksum => "secrets: checksum mismatch",
             BlobError::NonZeroPadding => "secrets: non-zero padding",
             BlobError::TooSmall => "secrets: region too small",
@@ -81,7 +83,6 @@ pub fn blake2s(parts: &[&[u8]]) -> [u8; 32] {
 /// A validated view of the region. Borrowed; secrets are not copied.
 pub struct Blob<'a> {
     bytes: &'a [u8],
-    peers: usize,
 }
 
 fn field<const N: usize>(b: &[u8], at: usize) -> Option<&[u8; N]> {
@@ -128,34 +129,22 @@ impl Writer<'_> {
     }
 }
 
-/// Callers bound `peers` by MAX_PEERS, so this cannot overflow.
-const fn body_len(peers: usize) -> usize {
-    FIXED.saturating_add(peers.saturating_mul(PER_PEER))
-}
-
 impl<'a> Blob<'a> {
-    /// Validates magic, version, peer count (must equal `expected_peers`),
-    /// checksum and zero padding.
-    pub fn parse(bytes: &'a [u8], expected_peers: usize) -> Result<Self, BlobError> {
+    /// Validates magic, version and reserved word (a reserved word other
+    /// than zero is a version this parser does not know), checksum and zero
+    /// padding.
+    pub fn parse(bytes: &'a [u8]) -> Result<Self, BlobError> {
         if bytes.len() < REGION_SIZE {
             return Err(BlobError::TooSmall);
         }
         if field::<8>(bytes, 0) != Some(&MAGIC) {
             return Err(BlobError::BadMagic);
         }
-        if u32_at(bytes, 8) != Some(VERSION) {
+        if u32_at(bytes, 8) != Some(VERSION) || u32_at(bytes, 12) != Some(0) {
             return Err(BlobError::BadVersion);
         }
-        let peers = u32_at(bytes, 12).and_then(|n| usize::try_from(n).ok()).ok_or(BlobError::BadPeerCount)?;
-        if peers == 0 || peers > MAX_PEERS || peers != expected_peers {
-            return Err(BlobError::BadPeerCount);
-        }
-        check_sealed(bytes, body_len(peers))?;
-        Ok(Self { bytes, peers })
-    }
-
-    pub fn peer_count(&self) -> usize {
-        self.peers
+        check_sealed(bytes, CHECKSUM_AT)?;
+        Ok(Self { bytes })
     }
 
     pub fn gateway_private(&self) -> &[u8; 32] {
@@ -165,32 +154,17 @@ impl<'a> Blob<'a> {
     pub fn boot_seed(&self) -> &[u8; 32] {
         field::<32>(self.bytes, BOOT_SEED_AT).unwrap_or(&[0; 32])
     }
-
-    /// Hash of peer `i`'s public key.
-    pub fn peer(&self, i: usize) -> Option<&[u8; 32]> {
-        if i >= self.peers {
-            return None;
-        }
-        field::<32>(self.bytes, FIXED.checked_add(i.checked_mul(PER_PEER)?)?)
-    }
 }
 
-/// Writes a region. `peers` are the peers' public keys. Returns the number
-/// of bytes used before zero padding, or None if it does not fit.
-pub fn write(out: &mut [u8; REGION_SIZE], gateway_private: &[u8; 32], boot_seed: &[u8; 32], peers: &[[u8; 32]]) -> Option<usize> {
-    if peers.is_empty() || peers.len() > MAX_PEERS {
-        return None;
-    }
+/// Writes a region. Returns the number of bytes used before zero padding.
+pub fn write(out: &mut [u8; REGION_SIZE], gateway_private: &[u8; 32], boot_seed: &[u8; 32]) -> Option<usize> {
     out.fill(0);
     let mut w = Writer { out, at: 0 };
     w.put(&MAGIC)?;
     w.put(&VERSION.to_le_bytes())?;
-    w.put(&u32::try_from(peers.len()).ok()?.to_le_bytes())?;
+    w.put(&0u32.to_le_bytes())?;
     w.put(gateway_private)?;
     w.put(boot_seed)?;
-    for public in peers {
-        w.put(&blake2s(&[public]))?;
-    }
     w.seal()
 }
 

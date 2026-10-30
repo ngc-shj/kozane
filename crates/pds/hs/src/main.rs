@@ -12,6 +12,7 @@ use hs_core::{Handshaker, HedgedEntropy, KeyCall, KeyClient, Outcome, Peers, Psk
 use key_core::MAX_WORDS;
 use layout::hs as ch;
 use pdkit::{Audit, Buf, Rx, Tx};
+use policy_wire::Bundle;
 use sel4_microkit::{
     Channel, ChannelSet, Handler, Infallible, MessageInfo, memory_region_symbol, protection_domain, with_msg_regs,
     with_msg_regs_mut,
@@ -22,9 +23,6 @@ const INGRESS: Channel = Channel::new(ch::CH_INGRESS);
 const DATA: Channel = Channel::new(ch::CH_DATA);
 const PQ: Channel = Channel::new(ch::CH_PQ);
 const MAX_PEERS: usize = config::MAX_PEERS;
-// The configuration was validated against this bound at build time; the
-// assertion keeps the PD's tables from silently diverging from it.
-const _: () = assert!(config::PEERS.len() <= MAX_PEERS);
 
 /// `key` over PPC. Request and reply registers are zeroed after each call.
 /// Each call's wall time is measured (M6 plan C5, kept by C12): `key`
@@ -113,6 +111,14 @@ mod halt {
     pub const INIT_FAILED: u32 = 3;
     /// `rng` gave no seed in `RNG_INIT_TRIES` tries (M7 plan C7).
     pub const RNG_UNAVAILABLE: u32 = 4;
+    /// `policy` verified no bundle, or its slot did not open (M8 plan C6).
+    pub const POLICY_UNAVAILABLE: u32 = layout::policy::HALT_UNAVAILABLE;
+}
+
+/// `Await` on `policy`, then the slot it verified (M8 plan C6).
+fn barrier() -> Result<Bundle<'static>, policy_wire::Reject> {
+    let token = policy_client::await_verified(Channel::new(ch::CH_POLICY))?;
+    policy_client::open(&token, &config::node_config())
 }
 
 // The closure names this init in run_init's symbol (ct-shape's stage check).
@@ -153,6 +159,11 @@ fn start(init: &boot_stage::Init) -> pdkit::Stage<Hs> {
             Audit::new(memory_region_symbol!(audit_hs: *mut u8), Channel::new(ch::CH_AUDIT)),
         )
     };
+    // The barrier (M8 plan C6): no initiation is read before `policy` has
+    // verified the peers; until then they wait in the rings.
+    let Ok(bundle) = barrier() else {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::POLICY_UNAVAILABLE));
+    };
     if cpu::checked_frequency(cpu::cntfrq()).is_none() {
         return pdkit::Stage::Dormant(audit.boot_stop(init, halt::NO_CLOCK));
     }
@@ -179,9 +190,10 @@ fn start(init: &boot_stage::Init) -> pdkit::Stage<Hs> {
     let Ok(handshaker) = Handshaker::new(&config::GATEWAY_PUBLIC, &seed) else {
         return pdkit::Stage::Dormant(audit.boot_stop(init, halt::INIT_FAILED));
     };
+    // The bundle's peer order is the peer id `data`, `ingress` and `pq` use.
     let mut peers = [[0u8; 32]; MAX_PEERS];
-    for (dst, p) in peers.iter_mut().zip(config::PEERS) {
-        *dst = p.public;
+    for (i, dst) in (0..bundle.peer_count()).zip(peers.iter_mut()) {
+        *dst = bundle.peer(i).map_or([0; 32], |p| *p.wg_pub());
     }
     audit.ready();
     let mut hs = Hs {
@@ -196,7 +208,7 @@ fn start(init: &boot_stage::Init) -> pdkit::Stage<Hs> {
         handshaker,
         psks: PskTable::new(),
         peers,
-        peer_count: config::PEERS.len(),
+        peer_count: usize::from(bundle.peer_count()).min(MAX_PEERS),
         input: [0; layout::NET_BUF_SIZE],
         psk_input: [0; layout::NET_BUF_SIZE],
         install: [0; layout::NET_BUF_SIZE],

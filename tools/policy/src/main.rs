@@ -222,7 +222,7 @@ fn cmd_fleet(args: &[String]) -> Result<(), String> {
         let load = |name: &str| -> Result<Vec<u8>, String> { fs::read(dir.join(name)).map_err(|e| format!("{}: {e}", dir.join(name).display())) };
         let raw: validate::RawConfig = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         let inside_prefix = validate::parse_prefix(&raw.gateway.inside_prefix).map_err(|e| format!("{}: {e}", path.display()))?;
-        let checked = validate::check(&text, validate::MAX_PEERS, &load).map_err(|e| format!("{}: {e}", path.display()))?;
+        let checked = validate::check(&text, &load).map_err(|e| format!("{}: {e}", path.display()))?;
         let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("node").to_string();
         if nodes.iter().any(|n: &fleet::Node| n.name == name) {
             return Err(format!("fleet: two gateway.toml files both name the node {name:?}"));

@@ -143,13 +143,13 @@ pub(crate) fn replay_mceliece() -> ReplayEncaps<SPK_LEN, SCT_LEN> {
 }
 
 /// A responder for the captured peer whose first biscuit key is upstream's.
-pub(crate) fn upstream_responder() -> Responder<'static, 1> {
-    let mut r = Responder::new(SPKM, [SPKT], &mut CountRng(0)).unwrap();
+pub(crate) fn upstream_responder() -> Responder<'static> {
+    let mut r = Responder::new(SPKM, &[SPKT], &mut CountRng(0)).unwrap();
     r.tick(0, &mut QueueRng(VecDeque::from([v("biscuit.key")]))).unwrap();
     r
 }
 
-fn upstream_resp_hello(r: &mut Responder<'static, 1>) -> [u8; RESP_HELLO_LEN] {
+fn upstream_resp_hello(r: &mut Responder<'static>) -> [u8; RESP_HELLO_LEN] {
     let mut rng = QueueRng(VecDeque::from([v("rhr1.sidr"), v("biscuit.nonce_drawn")]));
     let (mut d, mut k, mut m) = (replay_decaps(), replay_kyber(), replay_mceliece());
     let mut seams = Seams { decaps: &mut d, kyber: &mut k, mceliece: &mut m, rng: &mut rng };

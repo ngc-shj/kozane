@@ -13,5 +13,7 @@ layout = { path = "../../layout" }
 msgs = { path = "../../msgs" }
 boot-stage = { path = "../../boot-stage" }
 pdkit = { path = "../../pdkit", features = ["boot-stop"] }
+policy-client = { path = "../../policy-client" }
+policy-wire = { path = "../../policy-wire" }
 ring = { path = "../../ring" }
 sel4-microkit.workspace = true

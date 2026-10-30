@@ -191,8 +191,7 @@ fn all_boot_errors() -> std::vec::Vec<BootError> {
     fn next(e: BlobError) -> Option<BlobError> {
         match e {
             BlobError::BadMagic => Some(BlobError::BadVersion),
-            BlobError::BadVersion => Some(BlobError::BadPeerCount),
-            BlobError::BadPeerCount => Some(BlobError::BadChecksum),
+            BlobError::BadVersion => Some(BlobError::BadChecksum),
             BlobError::BadChecksum => Some(BlobError::NonZeroPadding),
             BlobError::NonZeroPadding => Some(BlobError::TooSmall),
             BlobError::TooSmall => None,

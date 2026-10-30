@@ -113,10 +113,9 @@ fn boot() -> Result<Oracle<'static>, BootError> {
     // SAFETY: as above. From here the buffer is only read, for the life of
     // the system (the oracle borrows it).
     let plain: &'static [u8] = unsafe { &*buf };
-    let peers = config::PEERS.iter().map(|p| &p.public);
     // Every failure after the unseal wipes the plaintext, not only
     // validation's: an Unavailable `key` holds no secret (M5 plan C6).
-    Oracle::boot(plain, &config::GATEWAY_PUBLIC, peers, &mut Hw).inspect_err(|_| {
+    Oracle::boot(plain, &config::GATEWAY_PUBLIC, &mut Hw).inspect_err(|_| {
         // SAFETY: the failed boot's borrow ended with its error, and nothing
         // reads the buffer again.
         unsafe { &mut *buf }.zeroize();

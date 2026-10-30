@@ -47,7 +47,7 @@ pub const MAX_TRANSPORT: usize = MTU + TRANSPORT_MIN_LEN;
 const PAD: usize = 16;
 
 /// Peer allowed IPs, supplied by the caller (the PD implements it over the
-/// compiled-in configuration, whose allowed IPs never overlap).
+/// peer-policy bundle `policy` verified, whose allowed IPs never overlap).
 pub trait AllowedIps {
     fn contains(&self, peer: usize, ip: Ipv4) -> bool;
 }

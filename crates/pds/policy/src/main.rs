@@ -34,9 +34,15 @@ use sel4_microkit::{Channel, Handler, Infallible, MessageInfo, memory_region_sym
 
 const TPM: Channel = Channel::new(ch::CH_TPM);
 const AUDIT: Channel = Channel::new(ch::CH_AUDIT);
-/// The `Await` callers: the barrier PDs, wired in slice 3 batch B (C6).
-/// None yet, so every call is a bad request.
-const CALLERS: [Channel; 0] = [];
+/// The `Await` callers: the barrier PDs (C6), one channel each; a call on
+/// any other channel is a bad request.
+const CALLERS: [Channel; 5] = [
+    Channel::new(ch::CH_HS),
+    Channel::new(ch::CH_PQ),
+    Channel::new(ch::CH_INGRESS),
+    Channel::new(ch::CH_DATA),
+    Channel::new(ch::CH_INNER),
+];
 
 // `audit` names the reasons from its own table; this PD sees both.
 const _: () = assert!(reasons_match());

@@ -93,7 +93,7 @@ CT_ROOT = ROOT
 
 class BlobKind(NamedTuple):
     """One secrets region (crates/secret-blob). `body` gives the length the
-    checksum covers, or None for a malformed header field."""
+    checksum covers."""
     mr: str
     magic: bytes
     version: int
@@ -101,16 +101,9 @@ class BlobKind(NamedTuple):
     body: object
 
 
-KEY_MAX_PEERS = (4096 - 80 - 32) // 32
-
-
-def _key_body(blob: bytes):
-    peers = int.from_bytes(blob[12:16], "little")
-    return 80 + 32 * peers if 1 <= peers <= KEY_MAX_PEERS else None
-
-
-# `key` blob v2: header 16 B, gateway key and boot seed, 32 B per peer.
-KEY = BlobKind("secrets", b"SOSSECR1", 2, 4096, _key_body)
+# `key` blob v4 (M8 plan C7): header 16 B (reserved u32 0 at 12), gateway
+# key and boot seed: the checksum covers [..80] (secret_blob); no peers.
+KEY = BlobKind("secrets", b"SOSSECR1", 4, 4096, lambda _blob: 80)
 # `pqkey` blob v1: header 12 B, McEliece sk 13608 B, then 4 x 32 B and a
 # 188 B ciphertext: the checksum covers [..13904] (secret_blob::pq).
 PQ = BlobKind("pq_secrets", b"SOSPQKY1", 1, 16384, lambda _blob: 13904)
@@ -246,11 +239,9 @@ def check_blob(kind: BlobKind, blob: bytes) -> list:
     version = int.from_bytes(blob[8:12], "little")
     if version != kind.version:
         return [f"{name} is version {version}, expected {kind.version}"]
-    if kind is TLS and any(blob[12:16]):
+    if kind in (KEY, TLS) and any(blob[12:16]):
         return [f"{name} has a non-zero reserved word"]
     body = kind.body(blob)
-    if body is None:
-        return [f"{name} peer count is out of range"]
     if hashlib.blake2s(blob[:body]).digest() != blob[body:body + 32]:
         return [f"{name} checksum mismatch"]
     if any(blob[body + 32:]):

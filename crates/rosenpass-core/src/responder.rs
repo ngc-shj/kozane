@@ -18,6 +18,9 @@ use crate::chain::Chain;
 use crate::crypto::{self, CryptoError, Domains, KEY_LEN, NONCE_LEN, XNONCE_LEN};
 use crate::kem::{Decaps, DecapsError, Encaps, EncapsError, Rng, SPK_LEN};
 
+/// The most peers a responder serves: a bundle's bound (M8 plan C1, C7).
+pub const MAX_PEERS: usize = limits::MAX_PEERS;
+
 const NS_PER_S: u64 = 1_000_000_000;
 /// A biscuit key seals for one epoch and opens for two (upstream
 /// `BISCUIT_EPOCH`), so a rotation keeps the previous key one more epoch.
@@ -56,7 +59,8 @@ pub enum Error {
     BiscuitReplay,
     /// Two configured peers share a key.
     DuplicatePeer,
-    /// A buffer size or counter limit (a build error, not attacker-reachable).
+    /// A buffer size or counter limit, or more than `MAX_PEERS` peers at
+    /// construction (a build or caller error, not attacker-reachable).
     Internal,
 }
 
@@ -196,9 +200,10 @@ fn trace(label: &'static str, v: &[u8]) {
 #[cfg(not(test))]
 fn trace(_: &'static str, _: &[u8]) {}
 
-/// The responder for up to `P` peers. Public keys are borrowed (the PD
-/// embeds them in its ELF), never copied.
-pub struct Responder<'k, const P: usize> {
+/// The responder for up to `MAX_PEERS` peers. Public keys are borrowed
+/// (the PD reads them from the verified bundle's slot, M8 plan C7), never
+/// copied.
+pub struct Responder<'k> {
     d: Domains,
     spkm: &'k [u8; SPK_LEN],
     /// The chaining key after IHR1, KH(ckinit, spkm): public and constant.
@@ -207,7 +212,10 @@ pub struct Responder<'k, const P: usize> {
     mac_key: [u8; KEY_LEN],
     /// KH(biscuit_ad, spkm), the constant prefix of every biscuit's ad.
     biscuit_ad_m: [u8; KEY_LEN],
-    peers: [Peer<'k>; P],
+    /// The first `peer_count` are the peers, in the order given to `new`;
+    /// the rest are unused (spkm, zero id) and never looked at.
+    peers: [Peer<'k>; MAX_PEERS],
+    peer_count: usize,
     biscuit_keys: [Option<BiscuitKey>; 2],
     /// The slot of the newest key; it doubles as the nonce's top bit.
     active: usize,
@@ -216,19 +224,31 @@ pub struct Responder<'k, const P: usize> {
     known_key: Secret<KEY_LEN>,
 }
 
-impl<'k, const P: usize> Responder<'k, P> {
-    /// Hashes every public key once. Biscuit keys start empty: call `tick`
-    /// (or let the first InitHello rotate one in).
-    pub fn new<R: Rng>(spkm: &'k [u8; SPK_LEN], spkts: [&'k [u8; SPK_LEN]; P], rng: &mut R) -> Result<Self, Error> {
+impl<'k> Responder<'k> {
+    /// Hashes every public key once; `spkts` are the peers, at most
+    /// `MAX_PEERS` (more is `Internal`), their index the peer id. Biscuit
+    /// keys start empty: call `tick` (or let the first InitHello rotate one
+    /// in).
+    pub fn new<R: Rng>(spkm: &'k [u8; SPK_LEN], spkts: &[&'k [u8; SPK_LEN]], rng: &mut R) -> Result<Self, Error> {
+        if spkts.len() > MAX_PEERS {
+            return Err(Error::Internal);
+        }
         let d = Domains::v02()?;
-        let mut peers =
-            spkts.map(|spkt| Peer { spkt, pid: [0; KEY_LEN], mac_key: [0; KEY_LEN], biscuit_used: 0, known: None });
-        for p in peers.iter_mut() {
+        let mut peers: [Peer<'k>; MAX_PEERS] = core::array::from_fn(|i| Peer {
+            spkt: spkts.get(i).copied().unwrap_or(spkm),
+            pid: [0; KEY_LEN],
+            mac_key: [0; KEY_LEN],
+            biscuit_used: 0,
+            known: None,
+        });
+        let peer_count = spkts.len();
+        let active = peers.get_mut(..peer_count).ok_or(Error::Internal)?;
+        for p in active.iter_mut() {
             p.pid = peer_id(&d, p.spkt)?;
             p.mac_key = mac_key(&d, p.spkt)?;
         }
-        for (i, a) in peers.iter().enumerate() {
-            if peers.iter().take(i).any(|b| b.pid == a.pid) {
+        for (i, a) in active.iter().enumerate() {
+            if active.iter().take(i).any(|b| b.pid == a.pid) {
                 return Err(Error::DuplicatePeer);
             }
         }
@@ -241,6 +261,7 @@ impl<'k, const P: usize> Responder<'k, P> {
             d,
             spkm,
             peers,
+            peer_count,
             biscuit_keys: [None, None],
             active: 0,
             // Upstream starts at 1 (LSB first); fresh keys per boot make an
@@ -260,7 +281,20 @@ impl<'k, const P: usize> Responder<'k, P> {
     }
 
     pub fn peer_id(&self, peer: usize) -> Option<&[u8; KEY_LEN]> {
-        self.peers.get(peer).map(|p| &p.pid)
+        self.active().get(peer).map(|p| &p.pid)
+    }
+
+    /// How many peers `new` was given.
+    pub fn peer_count(&self) -> usize {
+        self.peer_count
+    }
+
+    fn active(&self) -> &[Peer<'k>] {
+        self.peers.get(..self.peer_count).unwrap_or(&[])
+    }
+
+    fn active_mut(&mut self) -> &mut [Peer<'k>] {
+        self.peers.get_mut(..self.peer_count).unwrap_or(&mut [])
     }
 
     /// Rotates the biscuit key when the newest one no longer seals. A failed
@@ -288,7 +322,7 @@ impl<'k, const P: usize> Responder<'k, P> {
     fn find_peer(&self, pid: &[u8; KEY_LEN]) -> Option<usize> {
         // No early exit, so the time does not depend on which peer matched.
         let mut found = None;
-        for (i, p) in self.peers.iter().enumerate() {
+        for (i, p) in self.active().iter().enumerate() {
             if crypto::ct_eq(&p.pid, pid) {
                 found = Some(i);
             }
@@ -334,7 +368,7 @@ impl<'k, const P: usize> Responder<'k, P> {
         c.decrypt_and_mix(&ih.pidi_ct, &mut pidi)?;
         let peer = self.find_peer(&pidi).ok_or(Error::UnknownPeer)?;
         trace("ck.ihr6", c.ck().expose());
-        let p = self.peers.get(peer).ok_or(Error::Internal)?;
+        let p = self.active().get(peer).ok_or(Error::Internal)?;
         let (spkt, pidt, peer_mac_key) = (p.spkt, p.pid, p.mac_key);
         // IHR7: no PSK (SC25), so upstream's all-zero default.
         c.mix(spkt)?.mix(&[0; KEY_LEN])?;
@@ -411,7 +445,7 @@ impl<'k, const P: usize> Responder<'k, P> {
         // Before handle_init_conf proper (M3 plan F17): an exact
         // retransmission is answered from the cache and never re-exported.
         let request = self.known_hash(msg)?;
-        for (i, p) in self.peers.iter_mut().enumerate() {
+        for (i, p) in self.active_mut().iter_mut().enumerate() {
             if p.known.as_ref().is_some_and(|k| now.saturating_sub(k.at) >= KNOWN_RESPONSE_TTL_NS) {
                 p.known = None;
             }
@@ -449,7 +483,7 @@ impl<'k, const P: usize> Responder<'k, P> {
         trace("ck.icr4", c.ck().expose());
         // ICR5: equal means a retransmission, which the cache answered if
         // its OSK was installed.
-        let p = self.peers.get(peer).ok_or(Error::Internal)?;
+        let p = self.active().get(peer).ok_or(Error::Internal)?;
         if biscuit_no <= p.biscuit_used {
             return Err(Error::BiscuitReplay);
         }
@@ -475,7 +509,7 @@ impl<'k, const P: usize> Responder<'k, P> {
     /// ICR6 and the cache insert, once `PskInstall` was sent. Returns the
     /// EmptyData to send; the OSK is zeroized when `pending` drops here.
     pub fn commit_conf(&mut self, pending: PendingExport, now: u64) -> Result<[u8; EMPTY_DATA_LEN], Error> {
-        let p = self.peers.get_mut(pending.peer).ok_or(Error::Internal)?;
+        let p = self.active_mut().get_mut(pending.peer).ok_or(Error::Internal)?;
         // Re-checked: a commit must never move biscuit_used backwards.
         if pending.biscuit_no <= p.biscuit_used {
             return Err(Error::BiscuitReplay);

@@ -1033,7 +1033,7 @@ fn a_policy_channel_to_a_driver_is_l1() {
     assert_deny_exactly(
         "policy_channel_to_driver_deny",
         &["L1: policy pd 'policy' has a channel to 'eth' that is not its call to tpm, its notification of audit, or a \
-           barrier pd's call"],
+           named caller's call"],
     );
 }
 
@@ -1086,4 +1086,41 @@ fn policy_below_one_of_its_callers_is_l13() {
 #[test]
 fn tpm_calling_policy_back_is_l1() {
     assert_deny_exactly("policy_tpm_calls_back_deny", &["L1: tpm pd 'tpm' has pp=true on its channel to 'policy'; it is a callee only"]);
+}
+
+// M8 plan C6, C11 (deviation D-12 closed): `policy`'s callers are named,
+// exactly the barrier set, not admitted by role.
+
+#[test]
+fn policy_callers_of_two_roles_named_in_the_policy_are_allowed() {
+    assert_allow("policy_named_callers_allow");
+}
+
+/// `tls` has a barrier pd's role and the key exemption's channel shape,
+/// but is not a named caller.
+#[test]
+fn a_policy_caller_not_named_in_the_policy_is_l1() {
+    assert_deny_exactly(
+        "policy_unnamed_caller_deny",
+        &["L1: policy pd 'policy' has a channel to 'tls' that is not its call to tpm, its notification of audit, or a \
+           named caller's call"],
+    );
+}
+
+#[test]
+fn a_bundle_slot_mapped_by_a_pd_outside_its_readers_is_l4() {
+    assert_deny_exactly(
+        "policy_unlisted_reader_deny",
+        &["L4: pd 'tls' maps bundle_slot mr 'policy_a' but is not listed in its policy readers"],
+    );
+}
+
+#[test]
+fn callers_on_a_pd_that_is_not_a_policy_pd_is_a_policy_error() {
+    assert_parse_error_naming("policy_callers_on_non_policy_deny", "pd 'hs' declares callers but its role is not 'policy'");
+}
+
+#[test]
+fn a_policy_caller_naming_an_undeclared_pd_is_a_policy_error() {
+    assert_parse_error_naming("policy_caller_undeclared_deny", "policy references undeclared pd 'tls'");
 }

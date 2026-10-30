@@ -879,12 +879,12 @@ CASES = {
     # Unavailable key keeps the opened blob in guest RAM.
     "key-wipe": (["test", "it_boots=mismatched blob halts key"], lambda t: edit(
         t, "crates/pds/key/src/main.rs",
-        "    Oracle::boot(plain, &config::GATEWAY_PUBLIC, peers, &mut Hw).inspect_err(|_| {\n"
+        "    Oracle::boot(plain, &config::GATEWAY_PUBLIC, &mut Hw).inspect_err(|_| {\n"
         "        // SAFETY: the failed boot's borrow ended with its error, and nothing\n"
         "        // reads the buffer again.\n"
         "        unsafe { &mut *buf }.zeroize();\n"
         "    })\n",
-        "    let _ = buf;\n    Oracle::boot(plain, &config::GATEWAY_PUBLIC, peers, &mut Hw)\n"),
+        "    let _ = buf;\n    Oracle::boot(plain, &config::GATEWAY_PUBLIC, &mut Hw)\n"),
         "key's opened blob (an Unavailable key must hold no secret) still in guest RAM"),
     # S-BOOT-5 (R3-N2): without AUTOBOOT_KEYED, the Ctrl-C measure_boot sends
     # as U-Boot starts is read by the boot command's first poll, and the

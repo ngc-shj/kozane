@@ -33,7 +33,7 @@ pub use kem::{
     Decaps, DecapsError, Encaps, EncapsError, HedgeHw, Hedged, Kyber512, McEliece460896, Rng, RngError, SHK_LEN, SPK_LEN,
 };
 pub use responder::{
-    BISCUIT_EPOCH_NS, Conf, Error, KNOWN_RESPONSE_TTL_NS, PendingExport, PskInstall, Responder, Seams, envelope_mac,
+    BISCUIT_EPOCH_NS, Conf, Error, KNOWN_RESPONSE_TTL_NS, MAX_PEERS, PendingExport, PskInstall, Responder, Seams, envelope_mac,
     mac_key, peer_id,
 };
 /// The one container for every value derived from ck, a KEM shared secret,

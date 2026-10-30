@@ -87,7 +87,6 @@ pub const KEY_BOOT_CALLS: u64 = 1;
 pub enum BootError {
     Blob(BlobError),
     GatewayKeyMismatch,
-    PeerMismatch,
     /// RNDR failed while drawing the boot seed's samples.
     RngUnavailable,
     /// Hashing the boot seed failed.
@@ -131,7 +130,6 @@ impl BootError {
         match self {
             BootError::Blob(e) => e.message(),
             BootError::GatewayKeyMismatch => "secrets: gateway key does not match the configuration",
-            BootError::PeerMismatch => "secrets: peer keys do not match the configuration",
             BootError::RngUnavailable => "rng unavailable",
             BootError::SeedDerivation => "boot seed derivation failed",
             BootError::EnvelopeInvalid => "secrets: not a sealed envelope for key",
@@ -150,12 +148,12 @@ impl BootError {
         match self {
             BootError::Blob(BlobError::BadMagic) => 1,
             BootError::Blob(BlobError::BadVersion) => 2,
-            BootError::Blob(BlobError::BadPeerCount) => 3,
+            // 3 was BadPeerCount and 8 PeerMismatch: the blob carries no
+            // peers since M8 (plan C7); the codes are not reused.
             BootError::Blob(BlobError::BadChecksum) => 4,
             BootError::Blob(BlobError::NonZeroPadding) => 5,
             BootError::Blob(BlobError::TooSmall) => 6,
             BootError::GatewayKeyMismatch => 7,
-            BootError::PeerMismatch => 8,
             BootError::RngUnavailable => 9,
             BootError::SeedDerivation => 10,
             BootError::EnvelopeInvalid => 11,
@@ -190,24 +188,15 @@ pub fn unavailable(caller: Option<Caller>, code: u32, reply: &mut [u64]) -> (u64
     }
 }
 
-/// Checks the region against the compiled configuration: format, the
-/// public key derived from the private key, and each peer's key hash in
-/// configuration order.
-pub fn validate<'a, 'p>(
-    region: &'a [u8],
-    gateway_public: &[u8; 32],
-    peers: impl ExactSizeIterator<Item = &'p [u8; 32]>,
-) -> Result<Blob<'a>, BootError> {
-    let blob = Blob::parse(region, peers.len()).map_err(BootError::Blob)?;
+/// Checks the region against the compiled configuration: format, and the
+/// public key derived from the private key. The peers are no part of it
+/// (M8 plan C7): they come from the signed bundle, so a policy update never
+/// needs a re-seal.
+pub fn validate<'a>(region: &'a [u8], gateway_public: &[u8; 32]) -> Result<Blob<'a>, BootError> {
+    let blob = Blob::parse(region).map_err(BootError::Blob)?;
     let private = Key32::copy_from(blob.gateway_private());
     if !crypto::ct_eq(&crypto::public_key(&private), gateway_public) {
         return Err(BootError::GatewayKeyMismatch);
-    }
-    for (i, public) in peers.enumerate() {
-        let hash = blob.peer(i).ok_or(BootError::PeerMismatch)?;
-        if !crypto::ct_eq(hash, &secret_blob::blake2s(&[public])) {
-            return Err(BootError::PeerMismatch);
-        }
     }
     Ok(blob)
 }
@@ -292,13 +281,8 @@ impl<'a> Oracle<'a> {
     /// fallible call, so the PD wipes the region on any of its failures
     /// with a single guard, as `pqkey` does (M5 plan C6: an Unavailable
     /// `key` holds no secret).
-    pub fn boot<'p>(
-        region: &'a [u8],
-        gateway_public: &[u8; 32],
-        peers: impl ExactSizeIterator<Item = &'p [u8; 32]>,
-        entropy: &mut impl BootEntropy,
-    ) -> Result<Self, BootError> {
-        let blob = validate(region, gateway_public, peers)?;
+    pub fn boot(region: &'a [u8], gateway_public: &[u8; 32], entropy: &mut impl BootEntropy) -> Result<Self, BootError> {
+        let blob = validate(region, gateway_public)?;
         // Both wipe themselves on drop (tpm2::Secret), on every return.
         let mut samples = tpm2::Secret::<{ SEED_SAMPLES * 8 }>::zero();
         if !entropy.fill_random(samples.as_mut_bytes()) {

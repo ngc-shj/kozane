@@ -184,7 +184,6 @@ fn boot_error_messages_are_distinct() {
         BootError::TpmCapFailed,
         BootError::Blob(BlobError::BadMagic),
         BootError::Blob(BlobError::BadVersion),
-        BootError::Blob(BlobError::BadPeerCount),
         BootError::Blob(BlobError::BadChecksum),
         BootError::Blob(BlobError::NonZeroPadding),
         BootError::Blob(BlobError::TooSmall),

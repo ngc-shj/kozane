@@ -40,8 +40,9 @@
     <memory_region name="tls_secrets" size="0x1000" prefill_path="tls-secrets-placeholder.bin" />
     <!-- M8 plan C4, D3: the two peer-policy bundle slots, BUNDLE_MAX each,
          zero placeholders here. U-Boot measures both into PCR 9 and copies
-         each over its range; mapped read-only, into `policy` alone until
-         the barrier PDs read them (C6, C11). -->
+         each over its range; mapped read-only into `policy` and the barrier
+         PDs (hs, pq, ingress, data, inner), which read the one `policy`
+         verified (C6, C11), always at 0x2_000_000 (A) and 0x3_000_000 (B). -->
     <memory_region name="policy_a" size="0x480_000" prefill_path="policy-slot-placeholder.bin" />
     <memory_region name="policy_b" size="0x480_000" prefill_path="policy-slot-placeholder.bin" />
 
@@ -218,7 +219,7 @@
 
         <!-- M8 plan C5: the peer-policy verifier. Passive: every Await runs on
              its caller's scheduling context; this budget covers init (both
-             slots hashed and verified). Above the parsing PDs that will
+             slots hashed and verified). Above the parsing PDs that
              call it (C6), below tpm, which it calls; its stack holds
              ML-DSA-65's verification. -->
         <protection_domain name="policy" id="15" priority="125" budget="2_000" period="10_000" passive="true" stack_size="0x40_000">
@@ -243,6 +244,8 @@
             <map mr="pqh_free" vaddr="0x6_007_000" perms="rw" setvar_vaddr="pqh_free" />
             <map mr="pqh_data" vaddr="0x10_300_000" perms="r" setvar_vaddr="pqh_data" />
             <map mr="audit_hs" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_hs" />
+            <map mr="policy_a" vaddr="0x2_000_000" perms="r" setvar_vaddr="policy_a" />
+            <map mr="policy_b" vaddr="0x3_000_000" perms="r" setvar_vaddr="policy_b" />
         </protection_domain>
 
         <!-- 0.05 covers 8 peers' rekeys every 120 s (about 2.9% measured).
@@ -260,6 +263,8 @@
             <map mr="pqi_data" vaddr="0x10_100_000" perms="rw" setvar_vaddr="pqi_data" />
             <map mr="pqh_data" vaddr="0x10_200_000" perms="rw" setvar_vaddr="pqh_data" />
             <map mr="audit_pq" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_pq" />
+            <map mr="policy_a" vaddr="0x2_000_000" perms="r" setvar_vaddr="policy_a" />
+            <map mr="policy_b" vaddr="0x3_000_000" perms="r" setvar_vaddr="policy_b" />
         </protection_domain>
 
         <protection_domain name="ingress" id="10" priority="100" budget="1_000" period="10_000" stack_size="0x20_000">
@@ -295,6 +300,8 @@
             <map mr="itl_data" vaddr="0x10_800_000" perms="rw" setvar_vaddr="itl_data" />
             <map mr="tli_data" vaddr="0x10_900_000" perms="r" setvar_vaddr="tli_data" />
             <map mr="audit_ingress" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_ingress" />
+            <map mr="policy_a" vaddr="0x2_000_000" perms="r" setvar_vaddr="policy_a" />
+            <map mr="policy_b" vaddr="0x3_000_000" perms="r" setvar_vaddr="policy_b" />
         </protection_domain>
 
         <protection_domain name="data" id="11" priority="100" budget="2_000" period="10_000" stack_size="0x40_000">
@@ -315,6 +322,8 @@
             <map mr="dn_data" vaddr="0x10_300_000" perms="rw" setvar_vaddr="dn_data" />
             <map mr="nd_data" vaddr="0x10_400_000" perms="r" setvar_vaddr="nd_data" />
             <map mr="audit_data" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_data" />
+            <map mr="policy_a" vaddr="0x2_000_000" perms="r" setvar_vaddr="policy_a" />
+            <map mr="policy_b" vaddr="0x3_000_000" perms="r" setvar_vaddr="policy_b" />
         </protection_domain>
 
         <protection_domain name="inner" id="12" priority="100" budget="1_000" period="10_000" stack_size="0x10_000">
@@ -338,6 +347,8 @@
             <map mr="tln_data" vaddr="0x10_400_000" perms="r" setvar_vaddr="tln_data" />
             <map mr="ntl_data" vaddr="0x10_500_000" perms="rw" setvar_vaddr="ntl_data" />
             <map mr="audit_inner" vaddr="0x7_000_000" perms="rw" setvar_vaddr="audit_inner" />
+            <map mr="policy_a" vaddr="0x2_000_000" perms="r" setvar_vaddr="policy_a" />
+            <map mr="policy_b" vaddr="0x3_000_000" perms="r" setvar_vaddr="policy_b" />
         </protection_domain>
 
         <!-- M6: the HTTPS endpoint (plan C1, C3). TCP via smoltcp on IP packets
@@ -542,5 +553,29 @@
     <channel>
         <end pd="policy" id="2" />
         <end pd="audit" id="10" notify="false" />
+    </channel>
+
+    <!-- M8 plan C6, C11: the barrier PDs' Await on policy, once each in
+         init: the key exemption's shape (caller pp, notify=false; policy
+         pp=false), and no other PD calls it. -->
+    <channel>
+        <end pd="hs" id="8" pp="true" notify="false" />
+        <end pd="policy" id="3" pp="false" />
+    </channel>
+    <channel>
+        <end pd="pq" id="7" pp="true" notify="false" />
+        <end pd="policy" id="4" pp="false" />
+    </channel>
+    <channel>
+        <end pd="ingress" id="9" pp="true" notify="false" />
+        <end pd="policy" id="5" pp="false" />
+    </channel>
+    <channel>
+        <end pd="data" id="6" pp="true" notify="false" />
+        <end pd="policy" id="6" pp="false" />
+    </channel>
+    <channel>
+        <end pd="inner" id="5" pp="true" notify="false" />
+        <end pd="policy" id="7" pp="false" />
     </channel>
 </system>

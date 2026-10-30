@@ -32,15 +32,15 @@ fn keyed(key: [u8; 32]) -> QueueRng {
 }
 
 /// A responder for the captured peer with `key` rotated in at `now`.
-fn responder(now: u64, key: [u8; 32]) -> Responder<'static, 1> {
-    let mut r = Responder::new(SPKM, [SPKT], &mut CountRng(0)).unwrap();
+fn responder(now: u64, key: [u8; 32]) -> Responder<'static> {
+    let mut r = Responder::new(SPKM, &[SPKT], &mut CountRng(0)).unwrap();
     r.tick(now, &mut keyed(key)).unwrap();
     r
 }
 
 /// The captured InitHello again, drawing from `rng`; also returns how many
 /// decapsulations it asked for.
-fn hello_with<R: Rng>(r: &mut Responder<'static, 1>, now: u64, rng: &mut R) -> (Result<usize, Error>, usize) {
+fn hello_with<R: Rng>(r: &mut Responder<'static>, now: u64, rng: &mut R) -> (Result<usize, Error>, usize) {
     let (mut d, mut k, mut m) = (replay_decaps(), replay_kyber(), replay_mceliece());
     let mut out = [0u8; RESP_HELLO_LEN];
     let res = r.handle_init_hello(
@@ -53,7 +53,7 @@ fn hello_with<R: Rng>(r: &mut Responder<'static, 1>, now: u64, rng: &mut R) -> (
 }
 
 /// The captured InitHello again, with fresh sidr and nonce from `seed`.
-fn hello(r: &mut Responder<'static, 1>, now: u64, seed: u64) -> [u8; RESP_HELLO_LEN] {
+fn hello(r: &mut Responder<'static>, now: u64, seed: u64) -> [u8; RESP_HELLO_LEN] {
     let (mut d, mut k, mut m) = (replay_decaps(), replay_kyber(), replay_mceliece());
     let mut rng = CountRng(seed);
     let mut out = [0u8; RESP_HELLO_LEN];
@@ -96,7 +96,7 @@ fn reseal(msg: &mut [u8]) {
     msg[off..off + 16].copy_from_slice(&mac);
 }
 
-fn fresh(r: &mut Responder<'static, 1>, ic: &[u8], now: u64) -> PendingExport {
+fn fresh(r: &mut Responder<'static>, ic: &[u8], now: u64) -> PendingExport {
     match r.handle_init_conf(ic, now) {
         Ok(Conf::Fresh(p)) => p,
         Ok(Conf::Retransmission { .. }) => panic!("cached answer where an export was expected"),
@@ -104,7 +104,7 @@ fn fresh(r: &mut Responder<'static, 1>, ic: &[u8], now: u64) -> PendingExport {
     }
 }
 
-fn outcome(r: &mut Responder<'static, 1>, ic: &[u8], now: u64) -> Result<&'static str, Error> {
+fn outcome(r: &mut Responder<'static>, ic: &[u8], now: u64) -> Result<&'static str, Error> {
     r.handle_init_conf(ic, now).map(|c| match c {
         Conf::Fresh(_) => "fresh",
         Conf::Retransmission { .. } => "retransmission",
@@ -224,7 +224,7 @@ fn a_failed_rotation_refuses_hello_and_conf_until_a_good_rotation() {
 
 #[test]
 fn the_first_init_hello_rotates_a_key_in_and_fails_closed_without_randomness() {
-    let mut r = Responder::new(SPKM, [SPKT], &mut CountRng(0)).unwrap();
+    let mut r = Responder::new(SPKM, &[SPKT], &mut CountRng(0)).unwrap();
     assert_eq!(hello_with(&mut r, 1, &mut FailRng), (Err(Error::Rng), 0));
     assert_eq!(hello_with(&mut r, 1, &mut CountRng(9)), (Ok(0), 1));
 }
@@ -271,14 +271,14 @@ fn malformed_messages_are_refused() {
 #[test]
 fn an_init_hello_from_an_unconfigured_peer_is_refused() {
     // Configured with another key: the decrypted initiator id matches nobody.
-    let mut r = Responder::new(SPKM, [SPKM], &mut CountRng(0)).unwrap();
+    let mut r = Responder::new(SPKM, &[SPKM], &mut CountRng(0)).unwrap();
     assert_eq!(hello_with(&mut r, 1, &mut CountRng(1)).0, Err(Error::UnknownPeer));
 }
 
 #[test]
 fn duplicate_peer_keys_are_refused() {
-    assert!(matches!(Responder::new(SPKM, [SPKT, SPKT], &mut CountRng(0)), Err(Error::DuplicatePeer)));
-    assert!(matches!(Responder::new(SPKM, [SPKT], &mut FailRng), Err(Error::Rng)));
+    assert!(matches!(Responder::new(SPKM, &[SPKT, SPKT], &mut CountRng(0)), Err(Error::DuplicatePeer)));
+    assert!(matches!(Responder::new(SPKM, &[SPKT], &mut FailRng), Err(Error::Rng)));
 }
 
 #[test]
@@ -294,4 +294,37 @@ fn a_decapsulation_refusal_aborts_the_handshake() {
     let mut out = [0u8; RESP_HELLO_LEN];
     let seams = &mut Seams { decaps: &mut Limited, kyber: &mut k, mceliece: &mut m, rng: &mut CountRng(0) };
     assert_eq!(r.handle_init_hello(init_hello(), 1, seams, &mut out), Err(Error::Decaps(DecapsError::RateLimited)));
+}
+
+/// A distinct stand-in public key, leaked for the responder's borrow.
+fn other_key(fill: u8) -> &'static [u8; SPK_LEN] {
+    let v: Vec<u8> = std::vec![fill; SPK_LEN];
+    (&*Vec::leak(v)).try_into().unwrap()
+}
+
+/// M8 plan C7: the peer table is a slice from the bundle; a peer's index in
+/// it is the peer id the responder reports.
+#[test]
+fn a_peer_is_found_at_its_index_in_the_slice() {
+    let mut r = Responder::new(SPKM, &[other_key(1), other_key(2), SPKT], &mut CountRng(0)).unwrap();
+    assert_eq!(r.peer_count(), 3);
+    r.tick(0, &mut keyed(KEY_A)).unwrap();
+    assert_eq!(hello_with(&mut r, 1, &mut CountRng(1)).0, Ok(2));
+}
+
+#[test]
+fn a_responder_with_no_peers_knows_nobody() {
+    let mut r = Responder::new(SPKM, &[], &mut CountRng(0)).unwrap();
+    assert_eq!((r.peer_count(), r.peer_id(0)), (0, None));
+    r.tick(0, &mut keyed(KEY_A)).unwrap();
+    assert_eq!(hello_with(&mut r, 1, &mut CountRng(1)).0, Err(Error::UnknownPeer));
+}
+
+#[test]
+fn more_than_max_peers_is_refused_and_max_peers_is_not() {
+    let keys: Vec<&'static [u8; SPK_LEN]> = (0..=MAX_PEERS as u8).map(|i| other_key(i + 1)).collect();
+    assert!(matches!(Responder::new(SPKM, &keys, &mut CountRng(0)), Err(Error::Internal)));
+    let r = Responder::new(SPKM, &keys[..MAX_PEERS], &mut CountRng(0)).unwrap();
+    assert_eq!(r.peer_count(), MAX_PEERS);
+    assert!(r.peer_id(MAX_PEERS - 1).is_some() && r.peer_id(MAX_PEERS).is_none());
 }

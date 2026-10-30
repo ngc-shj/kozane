@@ -179,6 +179,9 @@ impl MrPolicy {
 pub struct PdPolicy {
     pub role: Role,
     pub irqs: BTreeSet<u64>,
+    /// A `policy`-role pd's PPC callers, by name (M8 plan C11: exactly the
+    /// barrier set); empty for every other role.
+    pub callers: BTreeSet<String>,
 }
 
 /// Per-end `pp`/`notify` the `.system` must match exactly (L4). A pd name
@@ -236,6 +239,8 @@ struct RawPd {
     role: String,
     #[serde(default)]
     irqs: Vec<u64>,
+    #[serde(default)]
+    callers: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -321,7 +326,16 @@ impl Policy {
             if !irqs.is_empty() && !role.owns_hardware() {
                 return Err(err(format!("pd '{name}' declares irqs but its role is not 'driver' or 'timer'")));
             }
-            if pds.insert(name.clone(), PdPolicy { role, irqs }).is_some() {
+            if !pd.callers.is_empty() && role != Role::Policy {
+                return Err(err(format!("pd '{name}' declares callers but its role is not 'policy'")));
+            }
+            let mut callers = BTreeSet::new();
+            for c in pd.callers {
+                if !callers.insert(c.clone()) {
+                    return Err(err(format!("duplicate caller '{c}' declared for pd '{name}'")));
+                }
+            }
+            if pds.insert(name.clone(), PdPolicy { role, irqs, callers }).is_some() {
                 return Err(err(format!("duplicate pd '{name}' in policy")));
             }
         }
@@ -333,6 +347,11 @@ impl Policy {
                 Err(err(format!("policy references undeclared pd '{name}'")))
             }
         };
+        for pd in pds.values() {
+            for c in &pd.callers {
+                require_pd(&pds, c)?;
+            }
+        }
         let require_role = |pds: &BTreeMap<String, PdPolicy>, name: &str, want: Role| -> Result<(), PolicyError> {
             require_pd(pds, name)?;
             if pds.get(name).map(|p| p.role) == Some(want) {
@@ -524,6 +543,12 @@ impl Policy {
     /// The driver irqs declared for `pd`, or `None` if `pd` is undeclared.
     pub fn irqs(&self, pd: &str) -> Option<&BTreeSet<u64>> {
         self.pds.get(pd).map(|p| &p.irqs)
+    }
+
+    /// Whether `caller` is one of the named PPC callers of the
+    /// `policy`-role pd `pd` (M8 plan C11).
+    pub fn is_named_caller(&self, pd: &str, caller: &str) -> bool {
+        self.pds.get(pd).is_some_and(|p| p.callers.contains(caller))
     }
 
     /// The declared policy for the channel between `a` and `b` (order

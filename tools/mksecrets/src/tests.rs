@@ -55,17 +55,17 @@ fn fake_issue(asked: &Asked) -> impl Fn(&str, &str, bool) -> Result<Files, Strin
     }
 }
 
-fn generated(peers: usize, endpoint: &str, tls_name: Option<&str>, mismatch_blob: bool) -> Result<(Deployment, Vec<Request>), String> {
+fn generated(clients: usize, endpoint: &str, tls_name: Option<&str>, mismatch_blob: bool) -> Result<(Deployment, Vec<Request>), String> {
     let asked = Asked::default();
     let d = {
         let issue = fake_issue(&asked);
         let tls = TlsOptions { name: tls_name, negative: false, mismatch_blob, issue: &issue };
-        generate(TEMPLATE, peers, endpoint, None, &tls)?
+        generate(TEMPLATE, clients, endpoint, None, &tls)?
     };
     Ok((d, asked.into_inner().unwrap()))
 }
 
-/// One two-peer deployment shared (read-only) by the tests that inspect a
+/// One two-client deployment shared (read-only) by the tests that inspect a
 /// deployment: McEliece keygen dominates their run time in debug builds.
 /// It has the TLS-mismatch blob.
 fn deployment() -> &'static (Deployment, Vec<Request>) {
@@ -79,18 +79,12 @@ fn loader(d: &Deployment) -> impl Fn(&str) -> Result<Vec<u8>, String> + '_ {
         if name == GATEWAY_RP_PUBLIC {
             return Ok(d.gateway_rp_public.to_vec());
         }
-        if let Some((_, c)) = d.certs.iter().find(|(n, _)| n == name) {
-            return Ok(c.clone());
-        }
-        (0..d.peers.len())
-            .find(|i| peer_rp_public(*i) == name)
-            .map(|i| d.peers[i].rp_public.to_vec())
-            .ok_or_else(|| format!("{name}: not in the deployment"))
+        d.certs.iter().find(|(n, _)| n == name).map(|(_, c)| c.clone()).ok_or_else(|| format!("{name}: not in the deployment"))
     }
 }
 
 fn checked(d: &Deployment) -> validate::Checked {
-    validate::check(&d.config, validate::MAX_PEERS, &loader(d)).unwrap_or_else(|e| panic!("{e}"))
+    validate::check(&d.config, &loader(d)).unwrap_or_else(|e| panic!("{e}"))
 }
 
 fn decapsulate(sk: &[u8; pq::SK_LEN], ct: &[u8; pq::CT_LEN]) -> [u8; 32] {
@@ -103,14 +97,33 @@ fn decapsulate(sk: &[u8; pq::SK_LEN], ct: &[u8; pq::CT_LEN]) -> [u8; 32] {
 fn generated_blob_matches_generated_config() {
     let d = &deployment().0;
     let checked = checked(d);
-    let blob = secret_blob::Blob::parse(&d.blob[..], 2).unwrap_or_else(|e| panic!("{}", e.message()));
+    let blob = secret_blob::Blob::parse(&d.blob[..]).unwrap_or_else(|e| panic!("{}", e.message()));
 
     let mut public = [0u8; 32];
     libcrux_curve25519::secret_to_public(&mut public, blob.gateway_private());
     assert_eq!(public, checked.gateway_public);
-    for (i, peer) in checked.peers.iter().enumerate() {
-        let hash = blob.peer(i).unwrap_or_else(|| panic!("peer {i} missing"));
-        assert_eq!(*hash, secret_blob::blake2s(&[&peer.public]));
+}
+
+/// M8 plan D4, C7: neither the config nor the key blob names a client; the
+/// clients are listed in `clients.toml` for tools/policy instead, each with
+/// the public key of its wg config's private key, its rp key file and its
+/// address.
+#[test]
+fn clients_are_listed_for_the_bundle_and_nowhere_in_the_deployment() {
+    let d = &deployment().0;
+    assert!(!d.config.contains("[[peers]]"), "{}", d.config);
+    let t: toml::Table = toml::from_str(&d.clients_toml).unwrap_or_else(|e| panic!("{e}"));
+    let peers = t["peers"].as_array().unwrap();
+    assert_eq!(peers.len(), d.peers.len());
+    for (i, (entry, bundle)) in peers.iter().zip(&d.peers).enumerate() {
+        let private = bundle.wg_conf.lines().find_map(|l| l.strip_prefix("PrivateKey = ")).unwrap();
+        let private: [u8; 32] = validate::decode_key(private).unwrap();
+        let mut public = [0u8; 32];
+        libcrux_curve25519::secret_to_public(&mut public, &private);
+        assert_eq!(entry["wg_pub"].as_str(), Some(encode_key(&public).as_str()));
+        assert_eq!(entry["rp_pub_path"].as_str(), Some(peer_rp_public(i).as_str()));
+        assert_eq!(entry["allowed_ips"].as_array().unwrap()[0].as_str(), Some(format!("{}/32", peer_ip(i)).as_str()));
+        assert!(!d.blob.windows(32).any(|w| w == public), "client {i}'s key is in the key blob");
     }
 }
 
@@ -127,16 +140,14 @@ fn pqkey_blob_binds_the_configured_gateway_key_and_its_kat_decapsulates() {
     assert!(blob.secret_key().iter().any(|b| *b != 0));
     let shk = decapsulate(blob.secret_key(), blob.kat_ct());
     assert_eq!(secret_blob::blake2s(&[&shk]), *blob.kat_shk_hash());
-    assert_ne!(blob.blob_seed(), secret_blob::Blob::parse(&d.blob[..], 2).map(|b| *b.boot_seed()).unwrap_or_default().as_slice());
+    assert_ne!(blob.blob_seed(), secret_blob::Blob::parse(&d.blob[..]).map(|b| *b.boot_seed()).unwrap_or_default().as_slice());
 }
 
 #[test]
 fn client_mceliece_key_is_exported_in_the_liboqs_layout() {
     let d = &deployment().0;
-    let checked = checked(d);
     let mut rng = Urandom::open().unwrap();
-    for (bundle, peer) in d.peers.iter().zip(&checked.peers) {
-        assert_eq!(peer.rp.hash, secret_blob::blake2s(&[&bundle.rp_public[..]]));
+    for bundle in &d.peers {
         let mut ct = [0u8; pq::CT_LEN];
         let mut shared = [0u8; 32];
         mce460896::encaps(&bundle.rp_public, &mut |out| rng.fill(out), &mut ct, &mut shared).unwrap();
@@ -187,10 +198,11 @@ fn two_runs_produce_different_keys() {
 }
 
 #[test]
-fn rejects_peer_counts_outside_the_deployable_range() {
-    assert!(generated(0, "x:1", None, false).is_err());
+fn a_deployment_needs_no_client_and_takes_at_most_a_bundles_peers() {
+    let (d, _) = generated(0, "x:1", None, false).unwrap_or_else(|e| panic!("{e}"));
+    assert!(d.peers.is_empty());
     let e = generated(validate::MAX_PEERS + 1, "x:1", None, false).err().unwrap_or_default();
-    assert!(e.contains("--peers must be 1..=8"), "{e}");
+    assert!(e.contains("--clients must be 0..=8"), "{e}");
 }
 
 // Upstream interop (M3 plan C6/T11): a committed `rp genkey` output from
@@ -277,14 +289,14 @@ fn the_repository_is_a_forbidden_root() {
 }
 
 #[test]
-fn run_writes_the_three_blobs_the_key_files_and_one_bundle_per_peer() {
+fn run_writes_the_three_blobs_the_key_files_and_one_bundle_per_client() {
     let s = Scratch::new("run");
     let out = s.0.join("deploy");
     let template = format!("{}/../../config/gateway.toml", env!("CARGO_MANIFEST_DIR"));
     let args: Vec<String> = [
         "--template",
         &template,
-        "--peers",
+        "--clients",
         "1",
         "--out",
         out.to_str().unwrap(),
@@ -299,6 +311,7 @@ fn run_writes_the_three_blobs_the_key_files_and_one_bundle_per_peer() {
         std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
     names.sort();
     let want = [
+        "clients.toml",
         "devca.pem",
         "gateway.rp.pk",
         "gateway.toml",
@@ -326,7 +339,7 @@ fn run_writes_the_three_blobs_the_key_files_and_one_bundle_per_peer() {
     // The written config builds against the written key files.
     let text = std::fs::read_to_string(out.join("gateway.toml")).unwrap();
     let load = |name: &str| std::fs::read(out.join(name)).map_err(|e| e.to_string());
-    assert!(validate::check(&text, validate::MAX_PEERS, &load).is_ok());
+    assert!(validate::check(&text, &load).is_ok());
 }
 
 fn scratch(tag: &str) -> PathBuf {
@@ -604,7 +617,7 @@ fn the_tls_mismatch_blob_differs_from_the_tls_blob_in_its_scalar_alone() {
 #[test]
 fn the_tls_blob_has_its_own_boot_seed_and_the_key_blob_no_tls_scalar() {
     let (d, _) = deployment();
-    let key = secret_blob::Blob::parse(&d.blob[..], 2).unwrap();
+    let key = secret_blob::Blob::parse(&d.blob[..]).unwrap();
     let tls = secret_blob::tls::Blob::parse(&d.tls_blob[..]).unwrap();
     assert_ne!(key.boot_seed(), tls.boot_seed());
     assert!(!d.blob.windows(32).any(|w| w == tls.tls_private()), "the TLS scalar is in key's blob");
@@ -622,7 +635,6 @@ fn config_carries_the_template_tls_ports_and_backend() {
     let checked = checked(d);
     let template = validate::check(
         TEMPLATE,
-        validate::MAX_PEERS,
         &|n: &str| std::fs::read(format!("{}/../../config/{n}", env!("CARGO_MANIFEST_DIR"))).map_err(|e| e.to_string()),
     )
     .unwrap_or_else(|e| panic!("{e}"));

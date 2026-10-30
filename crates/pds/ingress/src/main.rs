@@ -40,9 +40,6 @@ const DATA: Channel = Channel::new(ch::CH_DATA);
 const PQ: Channel = Channel::new(ch::CH_PQ);
 const TLS: Channel = Channel::new(ch::CH_TLS);
 const MAX_PEERS: usize = config::MAX_PEERS;
-// The configuration was validated against this bound at build time; the
-// assertion keeps the PD's tables from silently diverging from it.
-const _: () = assert!(config::PEERS.len() <= MAX_PEERS);
 const BUCKETS: usize = 64;
 // The Gate's backlog and TX-reserve thresholds are fractions of the ring
 // size it was written against.
@@ -146,6 +143,9 @@ struct Ingress {
     /// Rosenpass CookieReplies, apart from every other buffer.
     rp_cookie_out: [u8; RP_COOKIE_REPLY_LEN],
     endpoints: [Option<Endpoint>; MAX_PEERS],
+    /// The verified bundle's peer count (M8 plan C7): the peer ids `data`
+    /// and `pq` may name.
+    peer_count: usize,
     frame: Buf,
     reply: Buf,
     msg: Buf,
@@ -179,6 +179,8 @@ mod halt {
     /// Frame B of the fault-inject selftest variant (M7 plan C8).
     #[cfg(feature = "fault-inject")]
     pub const FAULT_INJECT: u32 = 8;
+    /// `policy` verified no bundle, or its slot did not open (M8 plan C6).
+    pub const POLICY_UNAVAILABLE: u32 = layout::policy::HALT_UNAVAILABLE;
 }
 
 /// M7 plan C8's selftest variant: a UDP datagram on the WireGuard port
@@ -207,6 +209,14 @@ static ENTROPY: rng_client::Global = rng_client::Global::new();
 
 fn fill_random(out: &mut [u8]) -> bool {
     ENTROPY.fill(out)
+}
+
+/// `Await` on `policy`, then the slot it verified (M8 plan C6): its peer
+/// count, all `ingress` takes from it (C7).
+fn barrier() -> Result<usize, policy_wire::Reject> {
+    let token = policy_client::await_verified(Channel::new(ch::CH_POLICY))?;
+    let bundle = policy_client::open(&token, &config::node_config())?;
+    Ok(usize::from(bundle.peer_count()).min(MAX_PEERS))
 }
 
 // The closure names this init in run_init's symbol (ct-shape's stage check).
@@ -277,6 +287,11 @@ fn start(init: &boot_stage::Init) -> pdkit::Stage<Ingress> {
             Audit::new(memory_region_symbol!(audit_ingress: *mut u8), Channel::new(ch::CH_AUDIT)),
         )
     };
+    // The barrier (M8 plan C6): no frame is read before `policy` has
+    // verified the peers; until then they wait in the driver ring.
+    let Ok(peer_count) = barrier() else {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::POLICY_UNAVAILABLE));
+    };
     if cpu::checked_frequency(cpu::cntfrq()).is_none() {
         // Without a clock the cookie secret would never age out (L12).
         return pdkit::Stage::Dormant(audit.boot_stop(init, halt::NO_CLOCK));
@@ -329,6 +344,7 @@ fn start(init: &boot_stage::Init) -> pdkit::Stage<Ingress> {
         rp_cookie,
         rp_cookie_out: [0; RP_COOKIE_REPLY_LEN],
         endpoints: [None; MAX_PEERS],
+        peer_count,
         frame: [0; layout::NET_BUF_SIZE],
         reply: [0; layout::NET_BUF_SIZE],
         msg: [0; layout::NET_BUF_SIZE],
@@ -642,7 +658,8 @@ impl Ingress {
     /// side only moves bytes. Returns the replies relayed.
     fn sync_pq(&mut self, wake: &mut Wake) -> usize {
         let mut rp = core::mem::take(&mut self.rp);
-        let outcome = ingress_core::sync_pq(&mut rp, &mut PqLink { ingress: self, wake }, config::PEERS.len(), cpu::now_ns());
+        let peers = self.peer_count;
+        let outcome = ingress_core::sync_pq(&mut rp, &mut PqLink { ingress: self, wake }, peers, cpu::now_ns());
         self.rp = rp;
         match outcome {
             SyncOutcome::Synced { relayed } => relayed,
@@ -717,7 +734,7 @@ impl Ingress {
                 (dst, msg.len())
             }
             Ok(ToIngress::EndpointUpdate { peer, endpoint }) => {
-                if usize::from(peer) < config::PEERS.len()
+                if usize::from(peer) < self.peer_count
                     && let Some(slot) = self.endpoints.get_mut(usize::from(peer))
                 {
                     *slot = Some(Endpoint { ip: endpoint.ip, port: endpoint.port });

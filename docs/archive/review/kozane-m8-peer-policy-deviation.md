@@ -338,3 +338,73 @@ Run in a scratch worktree (`build/probes/p3/tree`, since removed).
 - ML-DSA-65's stack depth inside the PD's 256 KiB stack, and P2's TCG
   timing, are first observed in batch B, whose harness boots signed
   bundles. If either fails, it is fixed there, not carried forward.
+
+### D-13 — `open` does not re-hash the rp keys
+
+- `policy_wire::open` ran the gateway-rp-key check too. That check
+  BLAKE2s-hashes every peer's 512 KiB key, so up to 4 MiB in each of the
+  five barrier PDs, on every boot, under TCG.
+- `policy` has already run the check on the same bytes, and no PD can
+  write them (C11). `open` now skips it (`parse_unchecked(.., None)`).
+  `parse`, the verifier side, keeps it.
+- `open_does_not_rehash_the_rp_keys` pins the narrowing. policy-client
+  loses its digest helper and its secret-blob dependency.
+
+### D-14 — the key blob is v4, not "v3"
+
+- C7 names the peerless key blob "v3", but v3 is already M6 slice 2's
+  TLS-scalar format in `secret-blob`. The peerless key blob is version 4:
+  `magic | 4 | reserved 0 | gateway_private@16 | boot_seed@48 |
+  checksum@80`, `USED_LEN` 112.
+- Versions 1–3 are refused. The offsets the harness reads are unchanged.
+
+### D-15 — test peers come from `mksecrets --clients`
+
+- `mksecrets --peers` is gone; the blob and config name no peer.
+- mksecrets is still the only McEliece keygen, so `--clients N` writes the
+  client configs and keys, plus a `clients.toml` in `tools/policy`'s
+  peers.toml schema, for the harness to render into a bundle.
+
+### Counts that fell (C7), and where the tests went
+
+- UNIT-CONFIG 63 → 44: peer validation moved to `policy-wire`, whose
+  tests cover it.
+- UNIT-KEY-CORE 22 → 21: the PeerMismatch tests went, and a test that v2
+  blobs are refused came in.
+- UNIT-SECRET-BLOB 20 → 18: the per-peer tests went.
+- CONFIG-BUILD-FIXTURES 11 → 8: the peer cases went, and a
+  `[[peers]]`-refused case and a neighbour case came in.
+- UNIT-POLICY-CLIENT 11 → 10: its digest helper and test went with D-13.
+- UNIT-MKSECRETS rose by one (`--clients`) instead of falling as C7
+  predicted.
+
+### Gap — `rosenpass-core`'s slice API has unit tests only
+
+- `Responder` now takes a slice of at most `MAX_PEERS` keys. The crate is
+  not in `kani_crates` and has no harnesses: a symbolic Responder would
+  run over BLAKE2, which is beyond a bounded harness.
+- Three unit tests cover the active-peer bound, an empty slice and a
+  slice over `MAX_PEERS`.
+
+### P2 and the stack risk, observed (slice 3, batch B2)
+
+- **Boot time.** With a real signed bundle, `policy` accepts 5.4–7.6 s
+  after `audit: ready`, verifying both signatures under TCG on its own
+  2 ms / 10 ms budget. QEMU start to `pq: ready` went from 2.6 s
+  (batch A) to 8.0 s; the worst seen is 10.8 s, against
+  `BOOT_TIMEOUT_S` 60.
+  - That keeps P2's ≥ 30 % headroom. P2's TCG half is closed with these
+    numbers.
+- **Stack.** No `supervisor: fault pd=policy` line appeared in the full
+  run, so the 0x40_000 stack held.
+  - `policy` reports no stack high-water mark, so there is no depth
+    figure, only "no fault". C10 (slice 5) adds the high-water record to
+    `policy`'s log page.
+- **A harness defect the barrier exposed.** `wait_arp_ready`'s 1 s probes
+  queue in the driver ring while `ingress` waits on the barrier, and are
+  all answered once it starts. The surplus replies made the raw-frames
+  flood take a stale reply as its FIFO barrier, so batches overlapped and
+  overran the 64-buffer link (`eth_out RxNoBuffer`, every time).
+  `wait_arp_ready` now drains them. The device is unchanged.
+- **`make run`.** `run_interactive` still boots zero slots, so every
+  barrier PD halts with 16. It gets the fixtures in slice 6 (C13).

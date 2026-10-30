@@ -22,14 +22,12 @@ fn peer_publics() -> [[u8; 32]; 2] {
 
 fn region() -> [u8; secret_blob::REGION_SIZE] {
     let mut r = [0u8; secret_blob::REGION_SIZE];
-    let p = peer_publics();
-    secret_blob::write(&mut r, clamped(GW_PRIVATE).as_bytes(), &[0x99; 32], &p).unwrap();
+    secret_blob::write(&mut r, clamped(GW_PRIVATE).as_bytes(), &[0x99; 32]).unwrap();
     r
 }
 
 fn oracle(r: &[u8]) -> Oracle<'_> {
-    let peers = peer_publics();
-    let blob = validate(r, &gw_public(), peers.iter()).unwrap();
+    let blob = validate(r, &gw_public()).unwrap();
     Oracle::new(blob, Key32::from_bytes(SEED))
 }
 
@@ -41,41 +39,31 @@ const HS: Option<Caller> = Some(Caller::Hs);
 
 #[test]
 fn valid_region_passes_validation() {
-    let r = region();
-    let peers = peer_publics();
-    assert!(validate(&r, &gw_public(), peers.iter()).is_ok());
+    assert!(validate(&region(), &gw_public()).is_ok());
 }
 
 #[test]
 fn wrong_gateway_key_is_a_distinct_boot_error() {
-    let r = region();
-    let peers = peer_publics();
-    assert_eq!(validate(&r, &[0x44; 32], peers.iter()).err(), Some(BootError::GatewayKeyMismatch));
+    assert_eq!(validate(&region(), &[0x44; 32]).err(), Some(BootError::GatewayKeyMismatch));
 }
 
 #[test]
-fn mismatched_peer_key_is_a_distinct_boot_error() {
-    let r = region();
-    let mut peers = peer_publics();
-    peers[1][0] ^= 1;
-    assert_eq!(validate(&r, &gw_public(), peers.iter()).err(), Some(BootError::PeerMismatch));
-}
-
-#[test]
-fn peers_in_another_order_do_not_validate() {
-    let r = region();
-    let peers = peer_publics();
-    assert_eq!(validate(&r, &gw_public(), peers.iter().rev()).err(), Some(BootError::PeerMismatch));
-}
-
-#[test]
-fn peer_count_mismatch_and_bad_format_report_the_blob_error() {
-    let r = region();
-    let peers = peer_publics();
-    assert_eq!(validate(&r, &gw_public(), peers[..1].iter()).err(), Some(BootError::Blob(BlobError::BadPeerCount)));
-    let mut bad = r;
+fn bad_format_reports_the_blob_error() {
+    let mut bad = region();
     bad[0] ^= 1;
-    assert_eq!(validate(&bad, &gw_public(), peers.iter()).err(), Some(BootError::Blob(BlobError::BadMagic)));
+    assert_eq!(validate(&bad, &gw_public()).err(), Some(BootError::Blob(BlobError::BadMagic)));
+}
+
+/// M8 plan C7: a version 2 blob, bound to the peers it was sealed with, is
+/// refused as an unknown version rather than read with its peers ignored.
+#[test]
+fn a_peer_bound_version_2_blob_is_refused() {
+    let mut r = region();
+    r[8] = 2;
+    r[12] = 1;
+    let sum = secret_blob::blake2s(&[&r[..secret_blob::CHECKSUM_AT]]);
+    r[secret_blob::CHECKSUM_AT..secret_blob::USED_LEN].copy_from_slice(&sum);
+    assert_eq!(validate(&r, &gw_public()).err(), Some(BootError::Blob(BlobError::BadVersion)));
 }
 
 #[test]
@@ -88,22 +76,21 @@ fn boot_error_messages_are_distinct() {
     }
 }
 
-/// Every BootError: the eleven plain kinds, then each BlobError reached by
+/// Every BootError: the ten plain kinds, then each BlobError reached by
 /// `next`. The walk must visit every BlobError and BootError must have
-/// exactly the twelve kinds listed, or this fails.
-fn all_boot_errors(next: impl Fn(BlobError) -> Option<BlobError>) -> [BootError; 17] {
-    let mut all = [BootError::GatewayKeyMismatch; 17];
-    all[1] = BootError::PeerMismatch;
-    all[2] = BootError::RngUnavailable;
-    all[3] = BootError::SeedDerivation;
-    all[4] = BootError::EnvelopeInvalid;
-    all[5] = BootError::TpmUnavailable;
-    all[6] = BootError::SrkMismatch;
-    all[7] = BootError::UnsealRefused;
-    all[8] = BootError::TpmResponseInvalid;
-    all[9] = BootError::EnvelopeOpen;
-    all[10] = BootError::TpmCapFailed;
-    let mut n = 11;
+/// exactly the eleven kinds listed, or this fails.
+fn all_boot_errors(next: impl Fn(BlobError) -> Option<BlobError>) -> [BootError; 15] {
+    let mut all = [BootError::GatewayKeyMismatch; 15];
+    all[1] = BootError::RngUnavailable;
+    all[2] = BootError::SeedDerivation;
+    all[3] = BootError::EnvelopeInvalid;
+    all[4] = BootError::TpmUnavailable;
+    all[5] = BootError::SrkMismatch;
+    all[6] = BootError::UnsealRefused;
+    all[7] = BootError::TpmResponseInvalid;
+    all[8] = BootError::EnvelopeOpen;
+    all[9] = BootError::TpmCapFailed;
+    let mut n = 10;
     let mut e = Some(BlobError::BadMagic);
     while let Some(v) = e {
         all[n] = BootError::Blob(v);
@@ -111,8 +98,8 @@ fn all_boot_errors(next: impl Fn(BlobError) -> Option<BlobError>) -> [BootError;
         e = next(v);
     }
     assert_eq!(n, all.len(), "every BlobError listed");
-    assert_eq!(n - 11, core::mem::variant_count::<BlobError>());
-    assert_eq!(core::mem::variant_count::<BootError>(), 12);
+    assert_eq!(n - 10, core::mem::variant_count::<BlobError>());
+    assert_eq!(core::mem::variant_count::<BootError>(), 11);
     all
 }
 
@@ -123,8 +110,7 @@ fn all_boot_errors(next: impl Fn(BlobError) -> Option<BlobError>) -> [BootError;
 fn blob_successor(e: BlobError) -> Option<BlobError> {
     match e {
         BlobError::BadMagic => Some(BlobError::BadVersion),
-        BlobError::BadVersion => Some(BlobError::BadPeerCount),
-        BlobError::BadPeerCount => Some(BlobError::BadChecksum),
+        BlobError::BadVersion => Some(BlobError::BadChecksum),
         BlobError::BadChecksum => Some(BlobError::NonZeroPadding),
         BlobError::NonZeroPadding => Some(BlobError::TooSmall),
         BlobError::TooSmall => None,
@@ -188,7 +174,7 @@ fn unavailable_answers_every_label_with_the_code_and_no_data() {
 #[test]
 fn unavailable_refuses_an_unknown_caller_as_a_bad_request() {
     let mut reply = [u64::MAX; MAX_WORDS];
-    assert_eq!(unavailable(None, BootError::PeerMismatch.code(), &mut reply), (ERR_BAD_REQUEST, 0));
+    assert_eq!(unavailable(None, BootError::GatewayKeyMismatch.code(), &mut reply), (ERR_BAD_REQUEST, 0));
     assert_eq!(reply, [0; MAX_WORDS]);
 }
 
@@ -321,8 +307,7 @@ impl BootEntropy for FakeEntropy {
 #[test]
 fn boot_validates_and_derives_the_seed_in_one_step() {
     let r = region();
-    let peers = peer_publics();
-    let o = Oracle::boot(&r, &gw_public(), peers.iter(), &mut FakeEntropy(true)).unwrap();
+    let o = Oracle::boot(&r, &gw_public(), &mut FakeEntropy(true)).unwrap();
     let mut reply = [0u64; MAX_WORDS];
     assert_eq!(o.handle(HS, &mut bucket(), 0, LABEL_BOOT_SEED, &[], &mut reply).0, 0);
 }
@@ -332,9 +317,8 @@ fn boot_validates_and_derives_the_seed_in_one_step() {
 #[test]
 fn boot_with_rndr_failing_after_validation_is_refused() {
     let r = region();
-    let peers = peer_publics();
     assert!(matches!(
-        Oracle::boot(&r, &gw_public(), peers.iter(), &mut FakeEntropy(false)),
+        Oracle::boot(&r, &gw_public(), &mut FakeEntropy(false)),
         Err(BootError::RngUnavailable)
     ));
 }

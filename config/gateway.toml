@@ -2,6 +2,8 @@
 # The keys below are placeholders for builds without a deployment config;
 # integration tests generate their own config and secrets (tools/mksecrets).
 # Key files are relative to this file; rp_hash is BLAKE2s-256 of the file.
+# No peers: they arrive in the signed peer-policy bundle (M8 plan D4, C7),
+# and no node serves one until `[policy]` names its fleet and keys.
 # The TLS certificate is a placeholder too: tools/mkcert issued it for
 # 10.0.2.15 to a P-256 key that was discarded, so no blob matches it
 # (`tlskey` refuses it as Mismatch, code 8; mksecrets writes a matching pair).
@@ -29,9 +31,3 @@ tls_public = "0479fa8395eb4c1695b78fe7fadd6130e94680031e5fea030b57baa7b2a952ccff
 [[neighbors]]
 ip = "10.99.0.2"
 mac = "02:00:00:00:99:02"
-
-[[peers]]
-wg_pub = "YBS8Ds6hLNV9RKN63rn+Z7o/7hO6Iwmh1xhxEHInuGg="
-rp_pub_path = "keys/peer-0.rp.pk"
-rp_hash = "dca15eb47af3a4a3022bc1baa044231b27bdd6c98f1abd8b1294b8c971f37fb3"
-allowed_ips = ["10.200.0.2/32"]

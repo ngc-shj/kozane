@@ -1,8 +1,10 @@
 //! Rosenpass PD (M3 plan C3): the V02 responder. InitHello and InitConf
 //! arrive from `ingress`; RespHello and EmptyData go back to it, and each
 //! fresh OSK goes to `hs` as a `PskInstall` over a scrubbing link. The
-//! McEliece secret stays in `pqkey` (PPC); the public keys are embedded in
-//! this ELF from the compiled configuration (law L6). Tainted (law L1).
+//! McEliece secret stays in `pqkey` (PPC); our public key is embedded in
+//! this ELF from the compiled configuration (law L6), the peers' are read
+//! in place from the bundle `policy` verified (M8 plan C7). Tainted (law
+//! L1).
 
 #![no_std]
 #![no_main]
@@ -11,6 +13,7 @@ use audit_event::{CostHighWater, Event};
 use layout::pq as ch;
 use msgs::{RP_NO_PEER, RpDatagram, RpReply};
 use pdkit::{Audit, Buf, Rx, Take, Tx};
+use policy_wire::Bundle;
 use pqkey_core::{LABEL_PQ_BOOT_SEED, LABEL_PQ_DECAPS, LABEL_PQ_STACK_MARK, MAX_WORDS, OK, PQ_DECAPS_REQ_WORDS};
 use ring::link::Taken;
 use ring::pass::{any_full, drain, run_passes};
@@ -29,19 +32,14 @@ const INGRESS: Channel = Channel::new(ch::CH_INGRESS);
 const HS: Channel = Channel::new(ch::CH_HS);
 const TIMER: Channel = Channel::new(ch::CH_TIMER);
 
-const PEERS: usize = config::PEERS.len();
-// The configuration was validated against this bound at build time; the
-// assertion keeps the responder's table from silently diverging from it.
-const _: () = assert!(PEERS <= config::MAX_PEERS);
-// A configured peer's index travels in `RpReply` as one byte, apart from
-// `RP_NO_PEER`.
+// The responder's table holds every peer a bundle can name, and a peer's
+// index travels in `RpReply` as one byte, apart from `RP_NO_PEER`.
+const _: () = assert!(rosenpass_core::MAX_PEERS == config::MAX_PEERS);
 const _: () = assert!(config::MAX_PEERS < RP_NO_PEER as usize);
 
-/// Our McEliece public key and each peer's, in `config::PEERS` order (about
-/// 4.5 MiB). Only `pq` expands both macros; `ingress` expands
-/// `gateway_rp_public!` alone, to derive its mac key.
+/// Our McEliece public key (512 KiB). `ingress` embeds it too, to derive
+/// its mac key; the peers' keys stay in the slot (M8 plan C7).
 static SPKM: &[u8; SPK_LEN] = config::gateway_rp_public!();
-static SPKTS: [&[u8; SPK_LEN]; PEERS] = config::peer_rp_publics!();
 
 /// Messages taken from `ingress` per pass. One: an InitHello costs seconds
 /// of wall time at pq's budget (MCE-COST: 8.5 s median, 16.1 s max), and
@@ -162,7 +160,7 @@ struct Pq {
     to_ingress: Tx,
     to_hs: Tx,
     audit: Audit,
-    responder: Responder<'static, PEERS>,
+    responder: Responder<'static>,
     rng: Hedged<Cpu>,
     cost: CostHighWater,
     freq: u64,
@@ -185,8 +183,8 @@ mod halt {
     pub const NO_CLOCK: u32 = 1;
     /// The embedded gateway McEliece public key does not match its rp_hash.
     pub const GATEWAY_RP_HASH: u32 = 2;
-    /// An embedded peer McEliece public key does not match its rp_hash.
-    pub const PEER_RP_HASH: u32 = 3;
+    // 3 was PEER_RP_HASH: the peers' keys come from the signed bundle now
+    // (M8 plan C7), whose signature covers them.
     /// `pqkey` refused the boot seed (after `KeyUnavailable`, if it is
     /// Unavailable).
     pub const NO_BOOT_SEED: u32 = 4;
@@ -196,6 +194,14 @@ mod halt {
     pub const INIT_FAILED: u32 = 6;
     /// `rng` gave no seed in `RNG_INIT_TRIES` tries (M7 plan C7).
     pub const RNG_UNAVAILABLE: u32 = 7;
+    /// `policy` verified no bundle, or its slot did not open (M8 plan C6).
+    pub const POLICY_UNAVAILABLE: u32 = layout::policy::HALT_UNAVAILABLE;
+}
+
+/// `Await` on `policy`, then the slot it verified (M8 plan C6).
+fn barrier() -> Result<Bundle<'static>, policy_wire::Reject> {
+    let token = policy_client::await_verified(Channel::new(ch::CH_POLICY))?;
+    policy_client::open(&token, &config::node_config())
 }
 
 // The closure names this init in run_init's symbol (ct-shape's stage check).
@@ -233,6 +239,11 @@ fn start(init: &boot_stage::Init) -> pdkit::Stage<Pq> {
             Audit::new(memory_region_symbol!(audit_pq: *mut u8), Channel::new(ch::CH_AUDIT)),
         )
     };
+    // The barrier (M8 plan C6): no message is read before `policy` has
+    // verified the peers; until then they wait in the rings.
+    let Ok(bundle) = barrier() else {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::POLICY_UNAVAILABLE));
+    };
     let Some(freq) = cpu::checked_frequency(cpu::cntfrq()) else {
         return pdkit::Stage::Dormant(audit.boot_stop(init, halt::NO_CLOCK));
     };
@@ -240,12 +251,16 @@ fn start(init: &boot_stage::Init) -> pdkit::Stage<Pq> {
         return pdkit::Stage::Dormant(audit.boot_stop(init, halt::RNG_UNAVAILABLE));
     };
     let hw = Cpu(entropy);
-    // The embedded keys must be the configured ones (M3 plan S8).
+    // The embedded key must be the configured one (M3 plan S8). The peers'
+    // are the signed bundle's, read in place (M8 plan C7).
     if secret_blob::blake2s(&[SPKM]) != config::GATEWAY_RP_HASH {
         return pdkit::Stage::Dormant(audit.boot_stop(init, halt::GATEWAY_RP_HASH));
     }
-    if SPKTS.iter().zip(config::PEERS).any(|(spkt, peer)| secret_blob::blake2s(&[*spkt]) != peer.rp_hash) {
-        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::PEER_RP_HASH));
+    let mut spkts: [&'static [u8; SPK_LEN]; config::MAX_PEERS] = [SPKM; config::MAX_PEERS];
+    let mut peers = 0;
+    for (dst, p) in spkts.iter_mut().zip((0..bundle.peer_count()).map_while(|i| bundle.peer(i))) {
+        *dst = p.rp_pub();
+        peers += 1;
     }
     // Once per boot, the first call to `pqkey`: an Unavailable `pqkey` shows
     // here first and is audited once, as pq then halts. No PSK ever reaches
@@ -270,7 +285,7 @@ fn start(init: &boot_stage::Init) -> pdkit::Stage<Pq> {
         audit.record(Event::KeyStackHighWater { bytes });
     }
     let mut rng = Hedged::new(seed, hw);
-    let mut responder = match Responder::new(SPKM, SPKTS, &mut rng) {
+    let mut responder = match Responder::new(SPKM, spkts.get(..peers).unwrap_or(&[]), &mut rng) {
         Ok(r) => r,
         Err(Error::Rng) => return pdkit::Stage::Dormant(audit.boot_stop(init, halt::RNG)),
         Err(_) => return pdkit::Stage::Dormant(audit.boot_stop(init, halt::INIT_FAILED)),
@@ -428,8 +443,8 @@ impl Pq {
                 return None;
             }
         };
-        // `PEERS <= MAX_PEERS` (asserted above), so the index fits a byte
-        // and never collides with `RP_NO_PEER`.
+        // A peer index is below `MAX_PEERS` (asserted above), so it fits a
+        // byte and never collides with `RP_NO_PEER`.
         let index = u8::try_from(peer).ok().filter(|i| *i != RP_NO_PEER)?;
         let dst = reply.get_mut(..response.len())?;
         dst.copy_from_slice(&response);

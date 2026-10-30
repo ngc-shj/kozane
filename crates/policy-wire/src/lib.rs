@@ -42,7 +42,7 @@
 //! ```no_run
 //! # let node: policy_wire::NodeConfig = todo!();
 //! # let token = policy_wire::Verified::from_reply(&[0; 37]).unwrap();
-//! let _ = policy_wire::open(&token, &[], &node, &|_| [0; 32]);
+//! let _ = policy_wire::open(&token, &[], &node);
 //! ```
 
 #![no_std]
@@ -626,10 +626,17 @@ pub fn split(slot: &[u8]) -> Result<Unverified<'_>, Reject> {
 /// a consumer gets a `Bundle` through `open` and its token alone (C1, I1.2).
 #[cfg(any(test, kani, feature = "verifier"))]
 pub fn parse<'a>(slot: &'a [u8], node: &NodeConfig<'_>, rp_digest: &dyn Fn(&[u8; SPK_LEN]) -> [u8; 32]) -> Result<Bundle<'a>, Reject> {
-    parse_unchecked(slot, node, rp_digest)
+    parse_unchecked(slot, node, Some(rp_digest))
 }
 
-fn parse_unchecked<'a>(slot: &'a [u8], node: &NodeConfig<'_>, rp_digest: &dyn Fn(&[u8; SPK_LEN]) -> [u8; 32]) -> Result<Bundle<'a>, Reject> {
+/// How the caller hashes an rp public key (BLAKE2s-256 in `config` and
+/// `policy`).
+type RpDigest<'f> = dyn Fn(&[u8; SPK_LEN]) -> [u8; 32] + 'f;
+
+/// `rp_digest` is `None` for `open`: `policy` has run that check on these
+/// very bytes, which no PD can write, and hashing up to eight 512 KiB keys
+/// again in each of five consumers would only cost boot time (D-13).
+fn parse_unchecked<'a>(slot: &'a [u8], node: &NodeConfig<'_>, rp_digest: Option<&RpDigest<'_>>) -> Result<Bundle<'a>, Reject> {
     let layout = walk(slot)?;
 
     let fleet_id: [u8; 16] = read_array(slot, FLEET_ID_AT)?;
@@ -650,7 +657,7 @@ fn parse_unchecked<'a>(slot: &'a [u8], node: &NodeConfig<'_>, rp_digest: &dyn Fn
         if *p.wg_pub() == node.gateway_wg_public {
             return Err(Reject::Malformed);
         }
-        if rp_digest(p.rp_pub()) == node.gateway_rp_digest {
+        if rp_digest.is_some_and(|d| d(p.rp_pub()) == node.gateway_rp_digest) {
             return Err(Reject::Malformed);
         }
         if rp_pubs.iter().take(i).any(|prev| prev.is_some_and(|prev| prev == p.rp_pub())) {
@@ -771,8 +778,8 @@ impl Verified {
 /// still matches, but does not re-verify a signature or re-hash the slot
 /// (M8 plan C1: no PD maps the slot writable, so the bytes cannot change
 /// between `policy`'s `parse` and this `open`).
-pub fn open<'a>(token: &Verified, slot: &'a [u8], node: &NodeConfig<'_>, rp_digest: &dyn Fn(&[u8; SPK_LEN]) -> [u8; 32]) -> Result<Bundle<'a>, Reject> {
-    let bundle = parse_unchecked(slot, node, rp_digest)?;
+pub fn open<'a>(token: &Verified, slot: &'a [u8], node: &NodeConfig<'_>) -> Result<Bundle<'a>, Reject> {
+    let bundle = parse_unchecked(slot, node, None)?;
     if bundle.version() != token.version {
         return Err(Reject::Malformed);
     }

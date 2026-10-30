@@ -12,6 +12,8 @@ layout = { path = "../../layout" }
 msgs = { path = "../../msgs" }
 boot-stage = { path = "../../boot-stage" }
 pdkit = { path = "../../pdkit", features = ["boot-stop"] }
+policy-client = { path = "../../policy-client" }
+policy-wire = { path = "../../policy-wire" }
 rng-client = { path = "../../rng-client" }
 pqkey-core = { path = "../../pqkey-core" }
 ring = { path = "../../ring" }

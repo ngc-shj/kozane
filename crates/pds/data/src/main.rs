@@ -10,6 +10,7 @@ use data_core::{AllowedIps, Data, InboundOutcome, InstallOutcome, OutboundOutcom
 use layout::data as ch;
 use msgs::ToIngress;
 use pdkit::{Audit, Buf, Rx, Tx};
+use policy_wire::Bundle;
 use ring::pass::drain;
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, memory_region_symbol, protection_domain};
 
@@ -17,16 +18,14 @@ const INGRESS: Channel = Channel::new(ch::CH_INGRESS);
 const HS: Channel = Channel::new(ch::CH_HS);
 const INNER: Channel = Channel::new(ch::CH_INNER);
 const MAX_PEERS: usize = config::MAX_PEERS;
-// The configuration was validated against this bound at build time; the
-// assertion keeps the PD's tables from silently diverging from it.
-const _: () = assert!(config::PEERS.len() <= MAX_PEERS);
 
-/// Allowed IPs from the compiled configuration (law L6).
-struct Config;
+/// Allowed IPs from the bundle `policy` verified (M8 plan C7, L6 as
+/// amended), which never overlap across peers.
+struct Allowed(Bundle<'static>);
 
-impl AllowedIps for Config {
+impl AllowedIps for Allowed {
     fn contains(&self, peer: usize, ip: [u8; 4]) -> bool {
-        config::PEERS.get(peer).is_some_and(|p| p.allowed.iter().any(|a| a.contains(ip)))
+        u8::try_from(peer).ok().and_then(|i| self.0.peer(i)).is_some_and(|p| p.allowed().any(|a| a.contains(ip)))
     }
 }
 
@@ -43,6 +42,7 @@ struct DataPd {
     from_inner: Rx,
     to_inner: Tx,
     audit: Audit,
+    allowed: Allowed,
     data: Data<MAX_PEERS>,
     buf: Buf,
     out: Buf,
@@ -55,6 +55,14 @@ mod halt {
     /// CNTFRQ is 0: without a counter frequency no session would ever
     /// expire (L12).
     pub const NO_CLOCK: u32 = 1;
+    /// `policy` verified no bundle, or its slot did not open (M8 plan C6).
+    pub const POLICY_UNAVAILABLE: u32 = layout::policy::HALT_UNAVAILABLE;
+}
+
+/// `Await` on `policy`, then the slot it verified (M8 plan C6).
+fn barrier() -> Result<Bundle<'static>, policy_wire::Reject> {
+    let token = policy_client::await_verified(Channel::new(ch::CH_POLICY))?;
+    policy_client::open(&token, &config::node_config())
 }
 
 // The closure names this init in run_init's symbol (ct-shape's stage check).
@@ -97,6 +105,11 @@ fn start(init: &boot_stage::Init) -> pdkit::Stage<DataPd> {
             Audit::new(memory_region_symbol!(audit_data: *mut u8), Channel::new(ch::CH_AUDIT)),
         )
     };
+    // The barrier (M8 plan C6): no packet is read before `policy` has
+    // verified the peers; until then they wait in the rings.
+    let Ok(bundle) = barrier() else {
+        return pdkit::Stage::Dormant(audit.boot_stop(init, halt::POLICY_UNAVAILABLE));
+    };
     if cpu::checked_frequency(cpu::cntfrq()).is_none() {
         return pdkit::Stage::Dormant(audit.boot_stop(init, halt::NO_CLOCK));
     }
@@ -108,6 +121,7 @@ fn start(init: &boot_stage::Init) -> pdkit::Stage<DataPd> {
         from_inner,
         to_inner,
         audit,
+        allowed: Allowed(bundle),
         data: Data::new(),
         buf: [0; layout::NET_BUF_SIZE],
         out: [0; layout::NET_BUF_SIZE],
@@ -159,8 +173,8 @@ impl DataPd {
             self.audit.record(Event::BadDescriptor);
             return true;
         };
-        let Self { data, out, to_ingress, to_inner, scratch, audit, .. } = self;
-        match data.inbound(&Config, t.src, t.msg, cpu::now_ns(), out) {
+        let Self { data, allowed, out, to_ingress, to_inner, scratch, audit, .. } = self;
+        match data.inbound(&*allowed, t.src, t.msg, cpu::now_ns(), out) {
             InboundOutcome::Authenticated { peer, endpoint, promoted, payload } => {
                 if promoted {
                     audit.record(Event::SessionPromoted);
@@ -199,7 +213,7 @@ impl DataPd {
     fn outbound_one(&mut self, wake: &mut Wake) -> bool {
         let Some(n) = pdkit::recv(&mut self.from_inner, &mut self.buf, &mut self.audit) else { return false };
         wake.inner = true;
-        let r = self.data.outbound(&Config, self.buf.get(..n).unwrap_or(&[]), cpu::now_ns(), &mut self.msg);
+        let r = self.data.outbound(&self.allowed, self.buf.get(..n).unwrap_or(&[]), cpu::now_ns(), &mut self.msg);
         self.buf.fill(0);
         match r {
             OutboundOutcome::Sealed { peer, len, unacked } => {

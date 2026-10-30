@@ -1173,6 +1173,8 @@ dependencies = [
  "layout",
  "msgs",
  "pdkit",
+ "policy-client",
+ "policy-wire",
  "ring",
  "sel4-microkit",
 ]
@@ -1209,6 +1211,8 @@ dependencies = [
  "key-core",
  "layout",
  "pdkit",
+ "policy-client",
+ "policy-wire",
  "rng-client",
  "sel4-microkit",
  "wg-core",
@@ -1226,6 +1230,8 @@ dependencies = [
  "layout",
  "msgs",
  "pdkit",
+ "policy-client",
+ "policy-wire",
  "ring",
  "rng-client",
  "rosenpass-core",
@@ -1245,6 +1251,8 @@ dependencies = [
  "inner-core",
  "layout",
  "pdkit",
+ "policy-client",
+ "policy-wire",
  "ring",
  "sel4-microkit",
 ]
@@ -1295,6 +1303,8 @@ dependencies = [
  "layout",
  "msgs",
  "pdkit",
+ "policy-client",
+ "policy-wire",
  "pqkey-core",
  "ring",
  "rng-client",
@@ -1469,6 +1479,16 @@ name = "pkg-config"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
+
+[[package]]
+name = "policy-client"
+version = "0.1.0"
+dependencies = [
+ "layout",
+ "limits",
+ "policy-wire",
+ "sel4-microkit",
+]
 
 [[package]]
 name = "policy-wire"

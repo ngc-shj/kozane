@@ -13,6 +13,7 @@
 #   role = "driver" | "untrusted_input" | "key" | "data" | "service" | "timer" | "tpm" | "rng"
 #        | "supervisor" | "policy"
 #   irqs = [<n>, ...]
+#   callers = ["<pd>", ...]
 #     Every pd in the `.system` must have an entry here. `driver` pds may
 #     own device/dma mrs (L5) and claim the hardware IRQ numbers listed in
 #     `irqs` (L4: an undeclared irq, or any irq on a non-driver, is a
@@ -43,9 +44,11 @@
 #     and untainted: it maps only bundle_slot mrs and pages every other
 #     mapper only reads (its log page, which `audit` maps `r`), calls a
 #     `tpm` pd (pp on its end), notifies `audit` (pp=false both ends,
-#     audit notify=false) and is called by the barrier pds
-#     (`untrusted_input`/`data`, pp on theirs, notify=false: the key
-#     exemption's shape); a reader that cannot write a page it shares with
+#     audit notify=false) and is called by the pds its `callers` names,
+#     exactly the barrier set (M8 plan C6, C11; pp on theirs,
+#     notify=false: the key exemption's shape) and by no other pd, whatever
+#     its role; `callers` is a policy error on any other role, and every
+#     name in it must be a declared pd; a reader that cannot write a page it shares with
 #     `policy` carries nothing into it, as for the supervisor's record
 #     page. `untrusted_input`,
 #     `data` and `service` carry no extra mr privileges of their own but
@@ -237,6 +240,10 @@ role = "key"
 
 [pds.policy]
 role = "policy"
+# The barrier set (M8 plan C6): the pds that parse traffic and wait on
+# `Await` in init. `tls` is not one (its client input comes only through
+# `ingress`, its backend link through `inner`).
+callers = ["hs", "pq", "ingress", "data", "inner"]
 
 [mrs.eth_out_mmio]
 kind = "device"
@@ -306,14 +313,14 @@ kind = "secrets"
 owner = "tlskey"
 
 # M8 plan C1, C4, C6, C11: the two peer-policy bundle slots, read by
-# `policy` (the barrier pds join in slice 3 batch B).
+# `policy` and the barrier pds (which open only the slot `policy` verified).
 [mrs.policy_a]
 kind = "bundle_slot"
-readers = ["policy"]
+readers = ["policy", "hs", "pq", "ingress", "data", "inner"]
 
 [mrs.policy_b]
 kind = "bundle_slot"
-readers = ["policy"]
+readers = ["policy", "hs", "pq", "ingress", "data", "inner"]
 
 # M8 plan C10: `policy`'s log page, written by `policy` alone.
 [mrs.audit_policy]
@@ -800,6 +807,33 @@ notify = { policy = false, tpm = false }
 [[channels]]
 between = ["policy", "audit"]
 notify = { audit = false }
+
+# M8 plan C6, C11: each barrier pd's `Await` on `policy`.
+
+[[channels]]
+between = ["hs", "policy"]
+pp = { hs = true, policy = false }
+notify = { hs = false }
+
+[[channels]]
+between = ["pq", "policy"]
+pp = { pq = true, policy = false }
+notify = { pq = false }
+
+[[channels]]
+between = ["ingress", "policy"]
+pp = { ingress = true, policy = false }
+notify = { ingress = false }
+
+[[channels]]
+between = ["data", "policy"]
+pp = { data = true, policy = false }
+notify = { data = false }
+
+[[channels]]
+between = ["inner", "policy"]
+pp = { inner = true, policy = false }
+notify = { inner = false }
 
 [priority]
 # L13: untrusted-input and tunnel PDs run strictly below `key` and `timer`;

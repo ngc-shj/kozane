@@ -157,7 +157,6 @@ impl BootError {
         match self {
             BootError::Blob(BlobError::BadMagic) => "tls secrets: bad magic",
             BootError::Blob(BlobError::BadVersion) => "tls secrets: unsupported version",
-            BootError::Blob(BlobError::BadPeerCount) => "tls secrets: peer count out of range",
             BootError::Blob(BlobError::BadChecksum) => "tls secrets: checksum mismatch",
             BootError::Blob(BlobError::NonZeroPadding) => "tls secrets: non-zero padding",
             BootError::Blob(BlobError::TooSmall) => "tls secrets: region too small",
@@ -184,7 +183,7 @@ impl BootError {
             | match self {
                 BootError::Blob(BlobError::BadMagic) => 1,
                 BootError::Blob(BlobError::BadVersion) => 2,
-                BootError::Blob(BlobError::BadPeerCount) => 3,
+                // 3 was the key blob's BadPeerCount (gone in M8, plan C7).
                 BootError::Blob(BlobError::BadChecksum) => 4,
                 BootError::Blob(BlobError::NonZeroPadding) => 5,
                 BootError::Blob(BlobError::TooSmall) => 6,

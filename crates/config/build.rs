@@ -11,9 +11,6 @@ mod validate {
 
 use std::path::{Path, PathBuf};
 
-// The secrets region must hold every peer an image can serve.
-const _: () = assert!(validate::MAX_PEERS <= secret_blob::MAX_PEERS);
-
 fn main() {
     // CARGO_MANIFEST_DIR is read when the script runs, not baked in when it
     // is compiled: a build-script binary reused from another tree's build
@@ -38,9 +35,10 @@ fn main() {
         println!("cargo:rerun-if-changed={}", file.display());
         std::fs::read(&file).map_err(|e| format!("cannot read {}: {e}", file.display()))
     };
-    let checked = validate::check(&text, validate::MAX_PEERS, &load).unwrap_or_else(|e| panic!("{path}: {e}"));
+    let checked = validate::check(&text, &load).unwrap_or_else(|e| panic!("{path}: {e}"));
 
-    // Copies of the McEliece public keys, for `include_bytes!` in `pq` only.
+    // A copy of the gateway's McEliece public key, for `include_bytes!` in
+    // `pq` and `ingress` only.
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").expect("OUT_DIR"));
     let copy = |name: String, key: &validate::RpKey| -> String {
         let file = out_dir.join(name);
@@ -48,6 +46,5 @@ fn main() {
         file.to_str().unwrap_or_else(|| panic!("{}: not UTF-8", file.display())).to_string()
     };
     let gateway_rp = copy("rp-gateway.pk".into(), &checked.gateway_rp);
-    let peer_rps: Vec<String> = checked.peers.iter().enumerate().map(|(i, p)| copy(format!("rp-peer-{i}.pk"), &p.rp)).collect();
-    std::fs::write(out_dir.join("config.rs"), validate::render(&checked, &gateway_rp, &peer_rps)).expect("write config.rs");
+    std::fs::write(out_dir.join("config.rs"), validate::render(&checked, &gateway_rp)).expect("write config.rs");
 }

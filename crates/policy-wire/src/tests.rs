@@ -374,6 +374,22 @@ fn a_peer_using_the_gateways_rp_key_is_malformed() {
     assert_eq!(parse(&slot, &node(), &fake_digest).unwrap_err(), Reject::Malformed);
 }
 
+/// `open` leaves the gateway-rp check to `policy`, which ran it on the same
+/// read-only bytes (D-13): the slot `parse` refuses above opens.
+#[test]
+fn open_does_not_rehash_the_rp_keys() {
+    let rp = rp_fill(GATEWAY_RP_FILL);
+    let allowed = [Prefix { addr: [10, 100, 0, 0], len: 24 }];
+    let peer = PlainPeer { wg_pub: [1; 32], rp_pub: rp.as_slice().try_into().unwrap(), groups: 0, allowed: &allowed };
+    let groups = one_group();
+    let peers = [peer];
+    let plain = base_bundle(&peers, &groups);
+    let slot = render(&plain);
+    let reply = reply_bytes(Slot::A, plain.version, [0; 32]);
+    let token = Verified::from_reply(&reply).unwrap();
+    assert!(open(&token, &slot, &node()).is_ok());
+}
+
 #[test]
 fn duplicate_rp_pub_across_distinct_peers_is_malformed() {
     let rp = rp_fill(1);
@@ -502,14 +518,14 @@ fn open_accepts_a_token_matching_the_slots_version() {
     let slot = valid_slot();
     let b = parse(&slot, &node(), &fake_digest).unwrap();
     let token = Verified::from_reply(&reply_bytes(Slot::A, b.version(), [0; 32])).unwrap();
-    assert!(open(&token, &slot, &node(), &fake_digest).is_ok());
+    assert!(open(&token, &slot, &node()).is_ok());
 }
 
 #[test]
 fn open_refuses_a_token_at_the_wrong_version() {
     let slot = valid_slot();
     let token = Verified::from_reply(&reply_bytes(Slot::A, 999, [0; 32])).unwrap();
-    assert_eq!(open(&token, &slot, &node(), &fake_digest).unwrap_err(), Reject::Malformed);
+    assert_eq!(open(&token, &slot, &node()).unwrap_err(), Reject::Malformed);
 }
 
 // --- render -> parse round trip -----------------------------------------

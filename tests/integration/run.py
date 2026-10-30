@@ -3,8 +3,10 @@
 Usage: run.py            (from `make test`)
 
 Generates fresh keys with tools/mksecrets into a temporary directory
-(removed on every exit path), provisions a swtpm state per deployment and
-reads its SRK, builds the image against that configuration and packages it
+(removed on every exit path), signs each deployment's peers into a v0
+bundle with tools/policy (M8 plan C13), provisions a swtpm state per
+deployment, reads its SRK and writes its NV state and slot A, builds the
+image against that configuration and packages it
 on a release kernel (M5 plan C7: no debug printing; every line on the
 console is `audit`'s, C6) with its secrets sealed to that SRK (C11). Then
 it re-runs itself inside `unshare -rn` (no NET_ADMIN in the container;
@@ -29,8 +31,8 @@ removed after the boot. The boots:
      Rosenpass 0.2.3 interop and mac/bucket pairs, the passive keepalive
      case, then the paired cookie case under a below-capacity flood;
      cookie-b the cookie-under-flood case;
-  5. peer binding (M3 plan C7): a deployment whose peer records pair each
-     WireGuard key with the other peer's Rosenpass key;
+  5. peer binding (M3 plan C7): a deployment whose bundle pairs each
+     WireGuard key with the other client's Rosenpass key;
   6. a blob whose public key does not match the configuration: `key`
      stays up Unavailable and `hs`, its only caller, audits `KeyUnavailable`
      with the boot error's code, then halts; `tls`, on `tlskey`, gets ready;
@@ -324,6 +326,7 @@ class Console:
         self.times = []
         self.lock = threading.Lock()
         self.alive = True
+        self.started = time.monotonic()
         start_without_stop_signals(threading.Thread(target=self._drain, daemon=True))
 
     def _drain(self):
@@ -912,14 +915,27 @@ def arp_roundtrip(w: Wire, timeout=REPLY_TIMEOUT_S):
 
 
 def wait_arp_ready(w: Wire, con: Console):
+    """ARP round trips until the gateway answers (boot done). Requests sent
+    before `ingress` serves wait in the driver ring (M8 plan C6: the barrier
+    holds them while `policy` verifies) and each is answered once it does;
+    those late replies are drained here, or a later arp_roundtrip would take
+    one as its FIFO barrier and return before its own frames were handled."""
     deadline = time.monotonic() + BOOT_TIMEOUT_S
+    sent = 0
     while time.monotonic() < deadline:
+        sent += 1
         try:
             arp_roundtrip(w, timeout=1)
-            return
         except Fail:
             if not con.alive:
                 raise Fail("QEMU exited during boot")
+            continue
+        for _ in range(sent - 1):
+            try:
+                w.recv_matching(is_arp_reply, timeout=1)
+            except Fail:
+                break
+        return
     raise Fail("no ARP reply after boot")
 
 
@@ -1309,6 +1325,11 @@ def test_wireguard(pkg: "Package", deploy: str, passed: list):
         # it is the L8 pair's.
         con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
         prelude = con.mark()
+        # The boot's budget against BOOT_TIMEOUT_S (M8 plan P2: `policy`
+        # verifies a signed bundle under TCG before any barrier PD serves).
+        accepted = con.text.find("\n", con.text.find("policy: accepted"))
+        print(f"\nboot timing: pq ready {time.monotonic() - con.started:.1f} s after QEMU started, policy accepted "
+              f"at {con.time_at(accepted) - con.started if accepted >= 0 else float('nan'):.1f} s", flush=True)
         rp0 = Rosenpass(deploy, 0, rp_endpoint)
         rps.append(rp0)
         osk0 = exported(con, rp0, prelude, "prelude: ")
@@ -1339,17 +1360,18 @@ def test_wireguard(pkg: "Package", deploy: str, passed: list):
         passed.append("rosenpass interop (master)")
         print("\nPASS [rosenpass master interop: the gateway's OSK is the client's key_out]")
 
-        # M8 plan C3, C5 (slice 3 batch A): this deployment compiles in no
-        # [policy], so `tpm` refuses `policy`'s state (no NV Name to check
-        # against) and `policy` is Unavailable for the boot, says so, and
-        # still sends Failed: the cap ran, as the handshake above (keys
-        # released only past the cap barrier) shows.
-        con.wait_for(r"policy: unavailable reason=StateRefused current=unknown lost=0\r*\n", strip_ready=True)
+        # M8 plan C5, C9: NV provisioned at v0 = 0, the signed v0 bundle in
+        # slot A and slot B empty, so `policy` uses slot A (version ==
+        # current), says so with the release, and rejects nothing; the
+        # peers the handshake above used came from that bundle.
+        con.wait_for(r"policy: accepted version=0 slot=A lost=0\r*\n", strip_ready=True)
+        release = rust_usize("crates/release-seq/src/lib.rs", "RELEASE_SEQ")
+        con.wait_for(rf"policy: release_seq={release} lost=0\r*\n", strip_ready=True)
         con.wait_for(r"policy: ready\r*\n", strip_ready=True)
-        if con.count(r"policy: (accepted|release_seq|rejected)"):
-            raise Fail("policy: an accepted, release or rejected line without a state")
-        passed.append("policy unavailable without [policy], cap confirmed")
-        print("\nPASS [policy: unavailable (StateRefused) without [policy], the cap still confirmed]")
+        if con.count(r"policy: (unavailable|rejected)") or con.count(r"audit: src=\w+ Halted reason="):
+            raise Fail("policy: an unavailable or rejected line, or a PD halted, with a valid v0 in slot A")
+        passed.append("policy accepted v0 from slot A")
+        print(f"\nPASS [policy: accepted version=0 slot=A, release_seq={release}]")
 
         def initiator(conf: str, psk: bytes, static=None):
             return wg_mod.Initiator(static or b64(conf_value(conf, "PrivateKey")), gw_pub, psk,
@@ -1546,14 +1568,14 @@ def test_wireguard(pkg: "Package", deploy: str, passed: list):
         # does not prove the window covers `hd` itself. That is pinned by the
         # check-selftest case `integration-residue`, which removes the
         # reclaim and requires this check to fail.
-        wait_absent(mon, install_bytes(1, good), good.recv_key, scratch)
+        wait_absent(mon, install_bytes(peer_id(deploy, 1), good), good.recv_key, scratch)
         passed.append("spoofed inner source, install scrubbed")
         print("\nPASS [spoofed inner source dropped, install scrubbed]")
 
         # pq->hs link residue [R2-T-N7]: the PskInstall for peer 1 (its OSK
         # is the client's key_out) is gone from guest RAM once hs took it.
         # Control: the OSK itself, live in hs's PSK table until expiry.
-        wait_absent(mon, psk_install_bytes(1, osk1), osk1, scratch, what="PskInstall message",
+        wait_absent(mon, psk_install_bytes(peer_id(deploy, 1), osk1), osk1, scratch, what="PskInstall message",
                     control_what="peer 1's live OSK")
         passed.append("pq->hs link scrubbed")
         print("\nPASS [pq->hs link: the PskInstall is scrubbed, the OSK lives only in hs's table]")
@@ -1651,24 +1673,16 @@ def test_wireguard(pkg: "Package", deploy: str, passed: list):
 # ---------------------------------------------------------------- peer binding (M3 plan C7)
 
 
-def swap_rp_records(path: str):
-    """Deployment `c` [S8, R3-T-M5]: peer records 0 and 1 trade their
-    Rosenpass keys, giving {wg0, rp1} and {wg1, rp0}; nothing else moves."""
-    text = open(path).read()
-    recs = list(re.finditer(r'^rp_pub_path = "peer-(\d+)\.rp\.pk"\nrp_hash = "[0-9a-f]+"$', text, re.M))
-    if [m.group(1) for m in recs][:2] != ["0", "1"]:
-        raise Fail(f"{path}: peer records 0 and 1 not found in order")
-    a, b = recs[0], recs[1]
-    text = text[:a.start()] + b.group(0) + text[a.end():b.start()] + a.group(0) + text[b.end():]
-    with open(path, "w") as f:
-        f.write(text)
-
-
 def test_peer_binding(pkg: "Package", deploy: str, passed: list):
     """Only client 0 runs, with WireGuard key wg0 and Rosenpass key rp0, on
-    deployment `c`, where rp0 belongs to record 1: its PSK lands at record 1,
-    so wg0 is refused, while wg1 with that PSK is accepted [R5-T-R1]. The
-    correctly bound allow side is boot 2's interop."""
+    deployment `c`, whose bundle pairs rp0 with wg1: its PSK lands at wg1's
+    peer, so wg0 is refused, while wg1 with that PSK is accepted [R5-T-R1].
+    The correctly bound allow side is boot 2's interop."""
+    peers = bundle_peers(pkg.slot_bytes()[0])
+    for client, other in ((0, 1), (1, 0)):
+        with open(os.path.join(deploy, f"peer-{other}.rp.pk"), "rb") as f:
+            if peers[peer_id(deploy, client)][1] != f.read():
+                raise Fail(f"peer binding: the bundle does not pair wg{client} with rp{other}")
     hostfwd = free_udp_port()
     rp_fwd = free_udp_port()
     child, con = boot(pkg, f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT},"
@@ -1695,15 +1709,15 @@ def test_peer_binding(pkg: "Package", deploy: str, passed: list):
 
         mark = con.mark()
         if wait_response(sock, initiation(0, osk), REPLY_TIMEOUT_S) is not None:
-            raise Fail("peer binding: wg0 got a handshake response with the PSK rp0 exported to record 1")
+            raise Fail("peer binding: wg0 got a handshake response with the PSK rp0 exported to wg1's peer")
         con.wait_for(r"audit: src=hs HandshakePskMissing total=1 ", since=mark)
         i = initiation(1, osk)
         r = wait_response(sock, i, REPLY_TIMEOUT_S)
         if r is None or not i.consume_response(r):
-            raise Fail("peer binding: wg1 with client 0's key_out was not accepted; the PSK did not land at record 1")
+            raise Fail("peer binding: wg1 with client 0's key_out was not accepted; the PSK did not land at wg1's peer")
         con.wait_for(r"audit: src=hs HandshakeOk total=1 ", since=mark)
         passed.append("peer binding")
-        print("\nPASS [peer binding: rp0's PSK is record 1's; wg0 refused, wg1 accepted with it]")
+        print("\nPASS [peer binding: rp0's PSK is wg1's peer's; wg0 refused, wg1 accepted with it]")
     finally:
         try:
             with signals_held():
@@ -7069,12 +7083,13 @@ def ek_ca(root: str) -> str:
     return ca
 
 
-def read_srk(state: str, out: str, ca: str):
+def read_srk(state: str, out: str, ca: str, then=None):
     """Starts swtpm on `state` with a data socket, provisions it with
     tools/provision against the run's EK CA `ca` (M7 plan C5: the SRK
-    public is written only once activated against the certified EK), and
-    kills it again (nothing volatile is saved, so a boot's TPM2_Startup
-    finds a fresh TPM)."""
+    public is written only once activated against the certified EK), runs
+    `then(tcti)` on the same TPM if given (M8 plan C3: the NV step, after
+    the Clear), and kills it again (nothing volatile is saved, so a boot's
+    TPM2_Startup finds a fresh TPM)."""
     # tpm2-tss's swtpm TCTI finds the control socket at the data path + ".ctrl".
     data = os.path.join(state, "tpm.sock")
     ctrl = data + ".ctrl"
@@ -7094,6 +7109,8 @@ def read_srk(state: str, out: str, ca: str):
                            capture_output=True, text=True, cwd=ROOT)
         if r.returncode != 0:
             raise Fail(f"provisioning {state}: {r.stdout}{r.stderr}")
+        if then is not None:
+            then(f"swtpm:path={data}")
     finally:
         proc.kill()
         proc.wait()
@@ -7105,11 +7122,13 @@ def read_srk(state: str, out: str, ca: str):
         raise Fail(f"provisioned swtpm state holds {sorted(os.listdir(state))}, want {SWTPM_PERMALL} alone")
 
 
-def provision_tpm(root: str, name: str) -> tuple:
+def provision_tpm(root: str, name: str, nv=None) -> tuple:
     """One deployment's TPM (C14): a swtpm state initialised once and its
-    SRK public read (state directory, SRK public file). Every boot runs on a
-    copy of the state. Provisioning clears the TPM first (M8 plan D5, S18),
-    so provisioning a copy again must give another SRK (deviation D-7)."""
+    SRK public read, then `nv(tcti)` (M8 plan C3: the anti-rollback indices
+    and the first bundle) on the same TPM; (state directory, SRK public
+    file). Every boot runs on a copy of the state. Provisioning clears the
+    TPM first (M8 plan D5, S18), so provisioning a copy again must give
+    another SRK (deviation D-7)."""
     state = os.path.join(root, f"tpm-{name}")
     os.mkdir(state, 0o700)
     ca = ek_ca(root)
@@ -7119,7 +7138,7 @@ def provision_tpm(root: str, name: str) -> tuple:
     if r.returncode != 0:
         raise Fail(f"swtpm_setup {name}: {r.stdout}{r.stderr}")
     srk = os.path.join(root, f"tpm-{name}.srk.pub")
-    read_srk(state, srk, ca)
+    read_srk(state, srk, ca, nv)
     copy = tempfile.mkdtemp(prefix=f"tpm-{name}-copy-", dir=root)
     again = copy + ".srk.pub"
     try:
@@ -7134,24 +7153,248 @@ def provision_tpm(root: str, name: str) -> tuple:
     return state, srk
 
 
+# ---------------------------------------------------------------- peer policy (M8 plan C2, C3, C13)
+
+# This run's tools/policy, its genesis-roster pin compiled in from the run's
+# roster (a build-time input, deviation D-4; never a run-time flag), in its
+# own target directory: tests/tools/test_policy.py pins another roster into
+# build/policy/target-pinned.
+POLICY_TARGET = "build/policy/target-it"
+POLICY_APPROVERS = ("alice", "bob")
+# The ML-DSA-65 public key [policy] names, beside gateway.toml.
+POLICY_MLDSA65_PUB = "policy-mldsa65.pub"
+SLOT_FILES = ("slot-a.bin", "slot-b.bin")
+
+
+def policy_build(pin: str = "") -> str:
+    env = {k: v for k, v in os.environ.items() if k != "KOZANE_POLICY_GENESIS_PIN"}
+    if pin:
+        env["KOZANE_POLICY_GENESIS_PIN"] = pin
+    r = subprocess.run(["cargo", "build", "--locked", "--release", "--manifest-path", "tools/policy/Cargo.toml",
+                        "--target-dir", POLICY_TARGET], cwd=ROOT, env=env, capture_output=True, text=True)
+    if r.returncode:
+        raise Fail(f"building tools/policy failed:\n{r.stdout[-2000:]}{r.stderr[-2000:]}")
+    return os.path.join(ROOT, POLICY_TARGET, "release/policy")
+
+
+def policy_tool(binary: str, *args) -> str:
+    r = subprocess.run([binary, *map(str, args)], cwd=ROOT, capture_output=True, text=True)
+    if r.returncode:
+        raise Fail(f"tools/policy {args[0]} failed: {r.stdout}{r.stderr}")
+    return r.stdout
+
+
+def openssl(*args):
+    r = subprocess.run(["openssl", *map(str, args)], capture_output=True)
+    if r.returncode:
+        raise Fail(f"openssl {args[0]} failed: {r.stderr.decode(errors='replace')}")
+    return r.stdout
+
+
+class Fleet:
+    """One deployment's fleet: its ID, signing keys (dev keys, public and
+    private in one directory), fleet file, ledger and signed v0 bundle."""
+
+    def __init__(self, root: str, fleet_id: str):
+        self.dir, self.fleet_id = root, fleet_id
+        self.keys = os.path.join(root, "keys")
+        self.fleet_file = os.path.join(root, "fleet.toml")
+        self.ledger = os.path.join(root, "ledger")
+        self.v0 = os.path.join(root, "v0.bin")
+
+
+class PolicyFixtures:
+    """The run's peer-policy fixtures (M8 plan C13 Fixtures, F40), all under
+    `root` in the run's temp dir, never in the repo: two approver keys and
+    their roster, tools/policy pinned to that roster, two operator record
+    keys and two operator delete keys. tools/provision reads its record
+    keys only from its pinned file; the run points that at its own file
+    through the test hook tests/tools/test_provision.py documents (the
+    module global, set by a launcher), never a flag."""
+
+    def __init__(self, root: str):
+        self.root = root
+        os.mkdir(root, 0o700)
+        base = policy_build()
+        roster = []
+        for a in POLICY_APPROVERS:
+            policy_tool(base, "approver-keygen", "--dir", os.path.join(root, a), "--forbid", ROOT)
+            pub = open(os.path.join(root, a, "ed25519.pub")).read().strip()
+            roster.append(f'[[approver]]\nid = "{a}"\ned25519_pub = "{pub}"\n')
+        self.roster = os.path.join(root, "roster.toml")
+        with open(self.roster, "w") as f:
+            f.write("\n".join(roster))
+        self.bin = policy_build(policy_tool(base, "roster-digest", self.roster).strip())
+        self.record_keys = [os.path.join(root, f"record-{n}.pem") for n in (1, 2)]
+        for key in self.record_keys:
+            openssl("genpkey", "-algorithm", "ed25519", "-out", key)
+        self.delete_keys, self.delete_pub = [], []
+        for n in (1, 2):
+            key, pub = os.path.join(root, f"delete-{n}.pem"), os.path.join(root, f"delete-{n}.pub.pem")
+            openssl("ecparam", "-name", "prime256v1", "-genkey", "-noout", "-out", key)
+            openssl("ec", "-in", key, "-pubout", "-out", pub)
+            self.delete_keys.append(key)
+            self.delete_pub.append(pub)
+        self.pinned = os.path.join(root, "record-keys")
+        with open(self.pinned, "w") as f:
+            f.write("# this run's fleets\n")
+
+    def fleet(self, deploy: str, name: str, swap_rp: bool = False) -> Fleet:
+        """A fleet of the one node `deploy`, and its v0 bundle: the clients
+        mksecrets wrote (clients.toml), one group with a rule over the inside
+        network for every client (C8's authorization is slice 4), rendered,
+        approved by both approvers and signed."""
+        fleet = Fleet(os.path.join(self.root, name), secrets.token_hex(16))
+        os.mkdir(fleet.dir, 0o700)
+        policy_tool(self.bin, "keygen", "--dir", fleet.keys, "--forbid", ROOT)
+        policy_tool(self.bin, "fleet", "--out", fleet.fleet_file, "--fleet-id", fleet.fleet_id,
+                    os.path.join(deploy, "gateway.toml"))
+        policy_tool(self.bin, "ledger", "init", "--dir", fleet.ledger, "--genesis-roster", self.roster)
+        peers = os.path.join(deploy, "peers.toml")
+        with open(peers, "w") as f:
+            f.write(peers_toml(deploy, fleet.fleet_id, swap_rp))
+        draft = os.path.join(fleet.dir, "draft0.bin")
+        policy_tool(self.bin, "render", "--input", peers, "--fleet", fleet.fleet_file, "--ledger", fleet.ledger,
+                    "--out", draft)
+        approvals = []
+        for a in POLICY_APPROVERS:
+            approvals.append(os.path.join(fleet.dir, f"{a}0.approval"))
+            policy_tool(self.bin, "approve", "--ledger", fleet.ledger, "--draft", draft, "--approver-key",
+                        os.path.join(self.root, a, "ed25519.key"), "--approver-id", a, "--head",
+                        os.path.join(fleet.dir, f"{a}.head"), "--out", approvals[-1])
+        policy_tool(self.bin, "sign", "--ledger", fleet.ledger, "--draft", draft, "--approvals", *approvals,
+                    "--keys", fleet.keys, "--out", fleet.v0)
+        with open(self.pinned, "a") as f:
+            for key in self.record_keys:
+                f.write(f"{fleet.fleet_id} {openssl('pkey', '-in', key, '-pubout', '-outform', 'DER')[-32:].hex()}\n")
+        return fleet
+
+    def provision(self, tcti: str, fleet: Fleet, deploy: str, node: str) -> dict:
+        """tools/provision's NV step on a TPM just cleared (M8 plan C3): the
+        record read from this TPM, both record keys' signatures, then the
+        indices at v0 = the ledger head and slot A. Returns what it printed
+        (the NV Names)."""
+        sys.path.insert(0, os.path.join(ROOT, "tests/tools"))
+        import test_provision  # noqa: E402  (its launcher: the record-key test hook)
+
+        def tool(*args) -> str:
+            rc, text = test_provision.tool(self.pinned, *args)
+            if rc:
+                raise Fail(f"tools/provision {args[0]} for {node}: {text}")
+            return text
+        record = os.path.join(fleet.dir, f"{node}.record")
+        tool("record", "--tcti", tcti, "--ledger", fleet.ledger, "--keys-pub", fleet.keys, "--node", node,
+             "--out", record, "--policy-bin", self.bin)
+        sigs = [os.path.join(fleet.dir, f"{node}.record.sig{n}") for n in (1, 2)]
+        for key, sig in zip(self.record_keys, sigs):
+            tool("record-sign", "--record", record, "--key", key, "--out", sig)
+        slot_a = os.path.join(deploy, SLOT_FILES[0])
+        text = tool("nv", "--tcti", tcti, "--ledger", fleet.ledger, "--keys-pub", fleet.keys, "--node", node,
+                    "--record", record, "--record-sigs", *sigs, "--delete-pub", *self.delete_pub,
+                    "--slot-a", slot_a, "--policy-bin", self.bin)
+        printed = dict(line.split("=", 1) for line in text.splitlines() if re.fullmatch(r"[a-z_]+=\w+", line))
+        if open(slot_a, "rb").read() != open(fleet.v0, "rb").read():
+            raise Fail(f"{node}: slot A is not the signed v0 bundle")
+        return printed
+
+    def configure(self, deploy: str, fleet: Fleet, printed: dict):
+        """[policy] for the image (M8 plan C3, C7), from the fleet and the
+        Names provisioning printed; slot B stays empty."""
+        if not all(re.fullmatch(r"000b[0-9a-f]{64}", printed.get(k, "")) for k in ("nv_ctr_name", "nv_base_name")):
+            raise Fail(f"{deploy}: provisioning printed no NV Names: {printed}")
+        with open(os.path.join(deploy, POLICY_MLDSA65_PUB), "wb") as f:
+            f.write(bytes.fromhex(open(os.path.join(fleet.keys, "ml-dsa-65.pub")).read().strip()))
+        ed25519 = open(os.path.join(fleet.keys, "ed25519.pub")).read().strip()
+        with open(os.path.join(deploy, "gateway.toml"), "a") as f:
+            f.write(f'\n[policy]\nfleet_id = "{fleet.fleet_id}"\ned25519_pub = "{ed25519}"\n'
+                    f'mldsa65_pub = "{POLICY_MLDSA65_PUB}"\nnv_ctr_name = "{printed["nv_ctr_name"]}"\n'
+                    f'nv_base_name = "{printed["nv_base_name"]}"\n')
+        with open(os.path.join(deploy, SLOT_FILES[1]), "wb") as f:
+            f.write(bytes(measure.BUNDLE_MAX))
+
+
+def peers_toml(deploy: str, fleet_id: str, swap_rp: bool) -> str:
+    """tools/policy's peers.toml from mksecrets' clients.toml (in client
+    order), with `swap_rp` trading clients 0 and 1's Rosenpass keys."""
+    clients = tomllib.load(open(os.path.join(deploy, "clients.toml"), "rb"))["peers"]
+    if swap_rp:
+        clients[0]["rp_pub_path"], clients[1]["rp_pub_path"] = clients[1]["rp_pub_path"], clients[0]["rp_pub_path"]
+    inside = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))["gateway"]["inside_prefix"]
+    out = [f'fleet_id = "{fleet_id}"', "min_release = 0", ""]
+    for c in clients:
+        out += ["[[peers]]", f'wg_pub = "{c["wg_pub"]}"', f'rp_pub_path = "{c["rp_pub_path"]}"',
+                "allowed_ips = [" + ", ".join(f'"{a}"' for a in c["allowed_ips"]) + "]", 'groups = ["inside"]', ""]
+    out += ["[[groups]]", 'name = "inside"']
+    for proto, lo, hi in (("icmp", 0, 0), ("tcp", 0, 65535), ("udp", 0, 65535)):
+        out += ["[[groups.rules]]", f'dst = "{inside}"', f'proto = "{proto}"', f"port_lo = {lo}", f"port_hi = {hi}"]
+    return "\n".join(out) + "\n"
+
+
+def bundle_peers(slot: bytes) -> list:
+    """A signed bundle's peers as (wg_pub, rp_pub, allowed IPs), in the
+    bundle's canonical order (ascending raw wg_pub, M8 plan C1): a peer's
+    index here is its peer id on the device."""
+    src = open(os.path.join(ROOT, "crates/policy-wire/src/lib.rs")).read()
+    m = re.search(r"^const PEER_COUNT_AT: usize = (\d+);$", src, re.M)
+    spk = rust_usize("crates/limits/src/lib.rs", "SPK_LEN")
+    if not m or slot[:4] != b"KZPP":
+        raise Fail("bundle_peers: not a bundle, or policy-wire's PEER_COUNT_AT moved")
+    pos = int(m.group(1))
+    count, pos = slot[pos], pos + 2
+    peers = []
+    for _ in range(count):
+        wg, rp = slot[pos:pos + 32], slot[pos + 32:pos + 32 + spk]
+        pos += 32 + spk + 1
+        n, pos = slot[pos], pos + 1
+        allowed = [f"{'.'.join(map(str, slot[pos + 5 * k:pos + 5 * k + 4]))}/{slot[pos + 5 * k + 4]}" for k in range(n)]
+        pos += 5 * n
+        peers.append((wg, rp, allowed))
+    return peers
+
+
+def peer_id(deploy: str, client: int) -> int:
+    """mksecrets client `client`'s peer id: its index in the deployment's
+    bundle (slot A), found by its wg_pub."""
+    wg = b64(tomllib.load(open(os.path.join(deploy, "clients.toml"), "rb"))["peers"][client]["wg_pub"])
+    ids = [i for i, (w, _, _) in enumerate(bundle_peers(open(os.path.join(deploy, SLOT_FILES[0]), "rb").read()))
+           if w == wg]
+    if len(ids) != 1:
+        raise Fail(f"client {client} is {len(ids)} peers of {deploy}'s bundle, not one")
+    return ids[0]
+
+
 def build(tmp: str):
     """Three deployments, each package sealed to a provisioned TPM: A
-    (three peers: the third is the Rosenpass 0.2.3 client's), B (only its
-    `key` blob, packaged with A's on A's image and TPM for the mismatch
-    case) and C (two peers with their Rosenpass keys swapped, its own image
-    and TPM: the peer binding case). A is packaged a second time, sealed to
-    a third TPM that never boots (the foreign-TPM case)."""
-    for name, peers, extra in (("a", "3", ["--tls-mismatch-blob"]), ("b", "3", []), ("c", "2", [])):
+    (three clients: the third is the Rosenpass 0.2.3 client's), B (only its
+    `key` blob, packaged with A's on A's image, TPM and slots for the
+    mismatch case) and C (two clients whose bundle pairs each WireGuard key
+    with the other's Rosenpass key, its own fleet, image and TPM: the peer
+    binding case). A is packaged a second time, sealed to a third TPM that
+    never boots (the foreign-TPM case).
+
+    M8 plan C13: A and C are each a fleet with its own signing keys and
+    ledger; their peers come only from a v0 bundle `tools/policy` rendered,
+    two approvers approved and it signed, which `tools/provision nv` wrote
+    into slot A over NV state at v0 (slot B empty); the [policy] the image
+    compiles in names that fleet, its keys and the NV Names."""
+    for name, clients, extra in (("a", "3", ["--tls-mismatch-blob"]), ("b", "0", []), ("c", "2", [])):
         subprocess.run(["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "--template",
-                        os.path.join(ROOT, "config/gateway.toml"), "--peers", peers, "--out",
+                        os.path.join(ROOT, "config/gateway.toml"), "--clients", clients, "--out",
                         os.path.join(tmp, name), *extra], check=True, cwd=ROOT)
-    swap_rp_records(os.path.join(tmp, "c/gateway.toml"))
-    # The node's bundle slots (M8 plan C4): no `policy` PD reads them yet, so
-    # two distinct random fills, which PCR 9's twin tells apart in order.
-    write_slots(tmp, os.urandom(measure.BUNDLE_MAX), os.urandom(measure.BUNDLE_MAX))
-    _, srk_a = provision_tpm(tmp, "a")
-    _, srk_c = provision_tpm(tmp, "c")
+    fixtures = PolicyFixtures(os.path.join(tmp, "policy"))
+    fleets = {"a": fixtures.fleet(os.path.join(tmp, "a"), "a"),
+              # Deployment C [S8, R3-T-M5]: clients 0 and 1 trade their
+              # Rosenpass keys in the bundle, {wg0, rp1} and {wg1, rp0}.
+              "c": fixtures.fleet(os.path.join(tmp, "c"), "c", swap_rp=True)}
+    srks = {}
+    for name, fleet in fleets.items():
+        deploy = os.path.join(tmp, name)
+        printed = {}
+        _, srks[name] = provision_tpm(tmp, name, lambda tcti, f=fleet, d=deploy, n=name, out=printed:
+                                      out.update(fixtures.provision(tcti, f, d, n)))
+        fixtures.configure(deploy, fleet, printed)
     _, srk_foreign = provision_tpm(tmp, "foreign")
+    srk_a, srk_c = srks["a"], srks["c"]
     env = {**os.environ, "KOZANE_CONFIG": os.path.join(tmp, "a/gateway.toml")}
     make("image", env=env)
     make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
@@ -7218,12 +7461,12 @@ PACKAGE_OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env"
 
 
 def packages(tmp: str) -> dict:
-    """The packages build() made, with the TPM state each boots on and the
-    bundle slots build() wrote."""
-    slots = (os.path.join(tmp, "slot-a.bin"), os.path.join(tmp, "slot-b.bin"))
+    """The packages build() made, with the TPM state each boots on and its
+    node's bundle slots (A's for every package on A's image)."""
+    slots, slots_c = (tuple(os.path.join(tmp, d, f) for f in SLOT_FILES) for d in ("a", "c"))
     return {"good": Package(os.path.join(tmp, "a/pkg"), os.path.join(tmp, "tpm-a"), slots),
             "mismatched": Package(os.path.join(tmp, "b/pkg"), os.path.join(tmp, "tpm-a"), slots),
-            "binding": Package(os.path.join(tmp, "c/pkg"), os.path.join(tmp, "tpm-c"), slots),
+            "binding": Package(os.path.join(tmp, "c/pkg"), os.path.join(tmp, "tpm-c"), slots_c),
             "foreign": Package(os.path.join(tmp, "a/pkg-foreign"), os.path.join(tmp, "tpm-foreign"), slots),
             "tls_mismatch": Package(os.path.join(tmp, "a/pkg-tls-mismatch"), os.path.join(tmp, "tpm-a"), slots),
             **{f"fi_{v}": Package(os.path.join(tmp, f"a/pkg-fi-{v}"), os.path.join(tmp, "tpm-a"), slots)
@@ -7232,9 +7475,11 @@ def packages(tmp: str) -> dict:
 
 def check_harness_matches_config(deploy: str):
     """Every address the harness plays or expects comes from the generated
-    config (template plus mksecrets' peer addresses); fail by name before
-    any boot if one moves."""
+    config (the template) or the deployment's bundle (mksecrets' client
+    addresses, M8 plan C7); fail by name before any boot if one moves."""
     cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
+    peers = bundle_peers(open(os.path.join(deploy, SLOT_FILES[0]), "rb").read())
+    bundle = lambda client: peers[peer_id(deploy, client)]  # noqa: E731
     g = cfg["gateway"]
     ip = lambda b: ".".join(map(str, b))  # noqa: E731
     mac = lambda b: b.hex(":")  # noqa: E731
@@ -7251,15 +7496,20 @@ def check_harness_matches_config(deploy: str):
         # The https boots' raw backend plays neighbors[0] on the inside tap.
         "gateway.backend": (g["backend"], {"ip": ip(HOST_IP), "port": BACKEND_PORT}),
         "neighbors[0].mac": (cfg["neighbors"][0]["mac"], mac(HOST_MAC)),
-        "peers[0].allowed_ips": (cfg["peers"][0]["allowed_ips"], ["10.200.0.2/32"]),
-        # Case 4 sends from 10.200.0.99 as peer 1, which must not own it.
-        "peers[1].allowed_ips": (cfg["peers"][1]["allowed_ips"], ["10.200.0.3/32"]),
-        # The Rosenpass 0.2.3 client's, pinged from as peer 2.
-        "peers[2].allowed_ips": (cfg["peers"][2]["allowed_ips"], [ip(PEER2_IP) + "/32"]),
+        # Client i is peer-i.conf; its bundle peer is found by its wg_pub.
+        "client 0 allowed_ips": (bundle(0)[2], ["10.200.0.2/32"]),
+        # Case 4 sends from 10.200.0.99 as client 1, which must not own it.
+        "client 1 allowed_ips": (bundle(1)[2], ["10.200.0.3/32"]),
+        # The Rosenpass 0.2.3 client's, pinged from as client 2.
+        "client 2 allowed_ips": (bundle(2)[2], [ip(PEER2_IP) + "/32"]),
+        "bundle peers": (len(peers), 3),
     }
+    for client in range(3):
+        with open(os.path.join(deploy, f"peer-{client}.rp.pk"), "rb") as f:
+            expected[f"client {client} rp_pub"] = (bundle(client)[1] == f.read(), True)
     wrong = [f"{k}={got!r} (harness uses {want!r})" for k, (got, want) in expected.items() if got != want]
     if wrong:
-        raise Fail("config/gateway.toml no longer matches the harness: " + "; ".join(wrong))
+        raise Fail("the generated config or bundle no longer matches the harness: " + "; ".join(wrong))
 
 
 def in_netns(tmp: str) -> int:
