@@ -467,3 +467,340 @@ fn a_bare_rst_ack_leaves_one_buffer_above_the_inside_tier_edge() {
     let edge = INNER_TX_RESERVE + TLS_TX_SHARE_INSIDE;
     assert!(matches!(from_tls(&CFG, &rst, edge + 1, &mut [0u8; MAX_FRAME]), FromTls::Emitted(_)));
 }
+
+// ---- Group authorization and the flow table (M8 plan C8, T26) ----
+
+mod flows {
+    use super::{HOST_IP, OTHER_HOST_IP, PEER_IP, datagram, std, tcp};
+    use crate::flow::*;
+    use policy_wire::{PROTO_ICMP, PROTO_TCP, PROTO_UDP, Prefix, Rule};
+    use wire::{DropReason, Ipv4, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
+
+    /// Peer X (0) is in groups 0 (TCP 8000 on the host), 2 (ICMP echo to the
+    /// inside /24) and 3 (all UDP to the inside /24); Y (1) only in group 1
+    /// (TCP 9000 on the host); Z (2) in none. The bundle names three peers.
+    const X: u8 = 0;
+    const Y: u8 = 1;
+    const Z: u8 = 2;
+    const Y_IP: Ipv4 = [10, 200, 0, 3];
+    const P: u16 = 8000;
+    const Q: u16 = 8001;
+    const R: u16 = 9000;
+    const HOST: Prefix = Prefix { addr: HOST_IP, len: 32 };
+    const INSIDE: Prefix = Prefix { addr: [10, 99, 0, 0], len: 24 };
+    const G0: &[Rule] = &[Rule { dst: HOST, proto: PROTO_TCP, port_lo: P, port_hi: P }];
+    const G1: &[Rule] = &[Rule { dst: HOST, proto: PROTO_TCP, port_lo: R, port_hi: R }];
+    const G2: &[Rule] = &[Rule { dst: INSIDE, proto: PROTO_ICMP, port_lo: 0, port_hi: 0 }];
+    const G3: &[Rule] = &[Rule { dst: INSIDE, proto: PROTO_UDP, port_lo: 0, port_hi: 65535 }];
+    const GROUPS: &[&[Rule]] = &[G0, G1, G2, G3];
+    const PEERS: &[u8] = &[0b1101, 0b0010, 0];
+    const RULES: ModelRules<'static> = ModelRules { peers: PEERS, groups: GROUPS };
+    const T0: u64 = 1_000_000_000;
+
+    fn tcp_in(src: Ipv4, sport: u16, dport: u16, flags: u8) -> Packet {
+        Packet { src, dst: HOST_IP, transport: Transport::Tcp { sport, dport, flags } }
+    }
+
+    /// The LAN host's segment back to `dst`.
+    fn tcp_out(dst: Ipv4, dport: u16, sport: u16, flags: u8) -> Packet {
+        Packet { src: HOST_IP, dst, transport: Transport::Tcp { sport, dport, flags } }
+    }
+
+    fn icmp(src: Ipv4, dst: Ipv4, transport: Transport) -> Packet {
+        Packet { src, dst, transport }
+    }
+
+    fn inbound(t: &mut FlowTable, peer: u8, p: Packet, now: u64) -> Inbound {
+        t.authorize_inbound(&RULES, peer, &p, now)
+    }
+
+    fn outbound(t: &mut FlowTable, p: Packet, now: u64) -> Outbound {
+        t.authorize_outbound(&p, now)
+    }
+
+    fn no_flow(dst: Ipv4) -> Outbound {
+        Outbound::Deny { reason: Denied::NoFlow, dst }
+    }
+
+    /// X opens 40000 → host:P with a SYN at T0.
+    fn opened() -> FlowTable {
+        let mut t = FlowTable::new();
+        assert_eq!(inbound(&mut t, X, tcp_in(PEER_IP, 40000, P, TCP_SYN), T0), Inbound::Allow);
+        t
+    }
+
+    fn reply(flags: u8) -> Packet {
+        tcp_out(PEER_IP, 40000, P, flags)
+    }
+
+    #[test]
+    fn a_peer_reaches_its_groups_rule_port_and_not_the_next_one() {
+        let mut t = FlowTable::new();
+        assert_eq!(inbound(&mut t, X, tcp_in(PEER_IP, 40000, P, TCP_SYN), T0), Inbound::Allow);
+        assert_eq!(inbound(&mut t, X, tcp_in(PEER_IP, 40001, Q, TCP_SYN), T0), Inbound::Deny(Denied::NoRule));
+        assert_eq!((t.live(X, T0), t.live(Y, T0)), (1, 0));
+    }
+
+    #[test]
+    fn a_peer_outside_a_group_is_denied_its_rule_but_reaches_its_own() {
+        let mut t = FlowTable::new();
+        assert_eq!(inbound(&mut t, Y, tcp_in(Y_IP, 40000, P, TCP_SYN), T0), Inbound::Deny(Denied::NoRule));
+        assert_eq!(inbound(&mut t, Y, tcp_in(Y_IP, 40000, R, TCP_SYN), T0), Inbound::Allow);
+        assert_eq!(inbound(&mut t, X, tcp_in(PEER_IP, 40000, R, TCP_SYN), T0), Inbound::Deny(Denied::NoRule));
+    }
+
+    #[test]
+    fn a_peer_with_no_groups_reaches_nothing() {
+        let mut t = FlowTable::new();
+        let echo = icmp(PEER_IP, HOST_IP, Transport::EchoRequest { id: 1 });
+        for p in [tcp_in(PEER_IP, 40000, P, TCP_SYN), echo] {
+            assert_eq!(inbound(&mut t, Z, p, T0), Inbound::Deny(Denied::NoRule));
+            assert_eq!(inbound(&mut t, X, p, T0), Inbound::Allow);
+        }
+        assert_eq!(t.live(Z, T0), 0);
+    }
+
+    #[test]
+    fn a_peer_the_bundle_does_not_name_is_unknown() {
+        let mut t = FlowTable::new();
+        let p = tcp_in(PEER_IP, 40000, P, TCP_SYN);
+        for peer in [3, 7, 8, 200, u8::MAX] {
+            assert_eq!(inbound(&mut t, peer, p, T0), Inbound::Deny(Denied::UnknownPeer), "peer {peer}");
+        }
+        assert_eq!(inbound(&mut t, X, p, T0), Inbound::Allow);
+        // The byte path refuses it before parsing anything.
+        assert_eq!(t.inbound(&RULES, 3, b"not even ipv4", T0), Inbound::Deny(Denied::UnknownPeer));
+    }
+
+    #[test]
+    fn icmp_rules_admit_echo_requests_only() {
+        let mut t = FlowTable::new();
+        let to = [10, 99, 0, 7];
+        assert_eq!(inbound(&mut t, X, icmp(PEER_IP, to, Transport::EchoRequest { id: 7 }), T0), Inbound::Allow);
+        assert_eq!(inbound(&mut t, X, icmp(PEER_IP, to, Transport::EchoReply { id: 7 }), T0), Inbound::Deny(Denied::NoRule));
+        assert_eq!(inbound(&mut t, X, icmp(PEER_IP, to, Transport::Other), T0), Inbound::Deny(Denied::NoRule));
+        assert_eq!(inbound(&mut t, X, icmp(PEER_IP, to, Transport::IcmpError), T0), Inbound::Deny(Denied::IcmpError));
+        // Outside the rule's prefix.
+        let away = icmp(PEER_IP, [10, 98, 0, 7], Transport::EchoRequest { id: 7 });
+        assert_eq!(inbound(&mut t, X, away, T0), Inbound::Deny(Denied::NoRule));
+    }
+
+    #[test]
+    fn an_icmp_echo_reply_passes_only_with_the_requests_id() {
+        let mut t = FlowTable::new();
+        let request = icmp(PEER_IP, HOST_IP, Transport::EchoRequest { id: 7 });
+        assert_eq!(inbound(&mut t, X, request, T0), Inbound::Allow);
+        assert_eq!(outbound(&mut t, icmp(HOST_IP, PEER_IP, Transport::EchoReply { id: 7 }), T0), Outbound::Allow { peer: X });
+        assert_eq!(outbound(&mut t, icmp(HOST_IP, PEER_IP, Transport::EchoReply { id: 8 }), T0), no_flow(PEER_IP));
+        // The LAN cannot ping the peer back on the same id.
+        assert_eq!(outbound(&mut t, icmp(HOST_IP, PEER_IP, Transport::EchoRequest { id: 7 }), T0), no_flow(PEER_IP));
+    }
+
+    #[test]
+    fn icmp_errors_from_the_lan_are_dropped_even_on_a_live_flow() {
+        let mut t = opened();
+        let error = icmp(HOST_IP, PEER_IP, Transport::IcmpError);
+        assert_eq!(outbound(&mut t, error, T0), Outbound::Deny { reason: Denied::IcmpError, dst: PEER_IP });
+        assert_eq!(outbound(&mut t, reply(TCP_SYN | TCP_ACK), T0), Outbound::Allow { peer: X });
+    }
+
+    #[test]
+    fn an_unsolicited_lan_packet_is_denied_and_a_reply_passes() {
+        let mut t = FlowTable::new();
+        assert_eq!(outbound(&mut t, reply(TCP_SYN | TCP_ACK), T0), no_flow(PEER_IP));
+        let mut t = opened();
+        assert_eq!(outbound(&mut t, reply(TCP_SYN | TCP_ACK), T0), Outbound::Allow { peer: X });
+        // Another LAN host, or another port, is not the flow's other end.
+        assert_eq!(outbound(&mut t, Packet { src: OTHER_HOST_IP, ..reply(TCP_ACK) }, T0), no_flow(PEER_IP));
+        assert_eq!(outbound(&mut t, tcp_out(PEER_IP, 40000, Q, TCP_ACK), T0), no_flow(PEER_IP));
+        // A LAN-opened connection to the peer is no reply either.
+        assert_eq!(outbound(&mut t, tcp_out(PEER_IP, 22, 50000, TCP_SYN), T0), no_flow(PEER_IP));
+    }
+
+    #[test]
+    fn a_reply_on_xs_flow_never_leaves_as_peer_y() {
+        let mut t = opened();
+        assert_eq!(inbound(&mut t, Y, tcp_in(Y_IP, 40000, R, TCP_SYN), T0), Inbound::Allow);
+        assert_eq!(outbound(&mut t, reply(TCP_SYN | TCP_ACK), T0), Outbound::Allow { peer: X });
+        assert_eq!(outbound(&mut t, tcp_out(Y_IP, 40000, R, TCP_SYN | TCP_ACK), T0), Outbound::Allow { peer: Y });
+        // Y's flow is from Y's address: a reply to X's address on Y's ports
+        // matches neither.
+        assert_eq!(outbound(&mut t, tcp_out(PEER_IP, 40000, R, TCP_ACK), T0), no_flow(PEER_IP));
+    }
+
+    #[test]
+    fn a_full_share_evicts_the_peers_own_least_recently_used_flow_only() {
+        let mut t = FlowTable::new();
+        assert_eq!(inbound(&mut t, Y, tcp_in(Y_IP, 40000, R, TCP_SYN), T0), Inbound::Allow);
+        for i in 0..QUOTA as u16 {
+            assert_eq!(inbound(&mut t, X, tcp_in(PEER_IP, 1000 + i, P, TCP_SYN), T0 + 1 + u64::from(i)), Inbound::Allow);
+        }
+        let later = T0 + 1000;
+        // The oldest of X's flows is still there while the share has room.
+        assert_eq!(t.live(X, later), QUOTA);
+        // Used again, the first is no longer the least recently used.
+        assert_eq!(outbound(&mut t, tcp_out(PEER_IP, 1000, P, TCP_ACK), later), Outbound::Allow { peer: X });
+        assert_eq!(inbound(&mut t, X, tcp_in(PEER_IP, 2000, P, TCP_SYN), later + 1), Inbound::Allow);
+        assert_eq!(t.live(X, later + 1), QUOTA);
+        assert_eq!(outbound(&mut t, tcp_out(PEER_IP, 1001, P, TCP_ACK), later + 2), no_flow(PEER_IP));
+        assert_eq!(outbound(&mut t, tcp_out(PEER_IP, 1000, P, TCP_ACK), later + 2), Outbound::Allow { peer: X });
+        assert_eq!(outbound(&mut t, tcp_out(PEER_IP, 2000, P, TCP_ACK), later + 2), Outbound::Allow { peer: X });
+        // Y's one flow, older than all of X's, was never a candidate.
+        assert_eq!(t.live(Y, later + 2), 1);
+        assert_eq!(outbound(&mut t, tcp_out(Y_IP, 40000, R, TCP_ACK), later + 2), Outbound::Allow { peer: Y });
+    }
+
+    #[test]
+    fn a_flow_ends_after_the_idle_time_by_the_clock_input() {
+        let mut t = opened();
+        assert_eq!(outbound(&mut t, reply(TCP_ACK), T0 + limits::FLOW_IDLE_NS), Outbound::Allow { peer: X });
+        let mut t = opened();
+        assert_eq!(outbound(&mut t, reply(TCP_ACK), T0 + limits::FLOW_IDLE_NS + 1), no_flow(PEER_IP));
+        assert_eq!(t.live(X, T0 + limits::FLOW_IDLE_NS + 1), 0);
+    }
+
+    #[test]
+    fn traffic_either_way_keeps_a_flow_alive() {
+        let mut t = opened();
+        let half = limits::FLOW_IDLE_NS / 2 + 1;
+        assert_eq!(outbound(&mut t, reply(TCP_ACK), T0 + half), Outbound::Allow { peer: X });
+        assert_eq!(inbound(&mut t, X, tcp_in(PEER_IP, 40000, P, TCP_ACK), T0 + 2 * half), Inbound::Allow);
+        assert_eq!(outbound(&mut t, reply(TCP_ACK), T0 + 3 * half), Outbound::Allow { peer: X });
+    }
+
+    #[test]
+    fn a_half_closed_flow_stays_until_both_fins_and_the_linger() {
+        let linger = limits::FLOW_LINGER_NS;
+        let mut t = opened();
+        assert_eq!(inbound(&mut t, X, tcp_in(PEER_IP, 40000, P, TCP_FIN | TCP_ACK), T0), Inbound::Allow);
+        // One FIN only: the LAN's data still flows well past the linger.
+        let t1 = T0 + 2 * linger;
+        assert_eq!(outbound(&mut t, reply(TCP_ACK), t1), Outbound::Allow { peer: X });
+        assert_eq!(outbound(&mut t, reply(TCP_FIN | TCP_ACK), t1), Outbound::Allow { peer: X });
+        // Both FINs seen at t1: the last ACKs pass for the linger, then not.
+        assert_eq!(inbound(&mut t, X, tcp_in(PEER_IP, 40000, P, TCP_ACK), t1 + linger), Inbound::Allow);
+        assert_eq!(outbound(&mut t, reply(TCP_ACK), t1 + linger), Outbound::Allow { peer: X });
+        assert_eq!(outbound(&mut t, reply(TCP_ACK), t1 + linger + 1), no_flow(PEER_IP));
+    }
+
+    #[test]
+    fn a_fin_from_the_lan_alone_keeps_the_flow() {
+        let mut t = opened();
+        assert_eq!(outbound(&mut t, reply(TCP_FIN | TCP_ACK), T0), Outbound::Allow { peer: X });
+        let t1 = T0 + 2 * limits::FLOW_LINGER_NS;
+        assert_eq!(inbound(&mut t, X, tcp_in(PEER_IP, 40000, P, TCP_ACK), t1), Inbound::Allow);
+        assert_eq!(outbound(&mut t, reply(TCP_ACK), t1), Outbound::Allow { peer: X });
+    }
+
+    #[test]
+    fn a_reset_from_the_peer_ends_its_flow() {
+        let mut t = opened();
+        assert_eq!(inbound(&mut t, X, tcp_in(PEER_IP, 40000, P, TCP_RST), T0), Inbound::Allow);
+        assert_eq!(outbound(&mut t, reply(TCP_ACK), T0), no_flow(PEER_IP));
+        // Allow side: the same reply without the reset passes.
+        let mut t = opened();
+        assert_eq!(outbound(&mut t, reply(TCP_ACK), T0), Outbound::Allow { peer: X });
+    }
+
+    #[test]
+    fn a_reset_from_the_lan_passes_and_ends_the_flow() {
+        let mut t = opened();
+        assert_eq!(outbound(&mut t, reply(TCP_RST | TCP_ACK), T0), Outbound::Allow { peer: X });
+        assert_eq!(outbound(&mut t, reply(TCP_ACK), T0), no_flow(PEER_IP));
+        // A reset of nothing tracked opens nothing.
+        let mut t = FlowTable::new();
+        assert_eq!(inbound(&mut t, X, tcp_in(PEER_IP, 40000, P, TCP_RST), T0), Inbound::Allow);
+        assert_eq!(t.live(X, T0), 0);
+    }
+
+    #[test]
+    fn a_reset_in_a_spoofed_direction_leaves_the_flow() {
+        let mut t = opened();
+        // From the LAN but on the forward tuple, as if the peer had sent it.
+        let forward = Packet { src: PEER_IP, dst: HOST_IP, transport: Transport::Tcp { sport: 40000, dport: P, flags: TCP_RST } };
+        assert_eq!(outbound(&mut t, forward, T0), no_flow(HOST_IP));
+        // From peer Y with X's tuple: Y has no rule for P, and X's share is
+        // not Y's to touch.
+        assert_eq!(inbound(&mut t, Y, tcp_in(PEER_IP, 40000, P, TCP_RST), T0), Inbound::Deny(Denied::NoRule));
+        assert_eq!(outbound(&mut t, reply(TCP_ACK), T0), Outbound::Allow { peer: X });
+    }
+
+    #[test]
+    fn a_new_syn_reopens_a_lingering_tuple() {
+        let mut t = opened();
+        assert_eq!(inbound(&mut t, X, tcp_in(PEER_IP, 40000, P, TCP_FIN | TCP_ACK), T0), Inbound::Allow);
+        assert_eq!(outbound(&mut t, reply(TCP_FIN | TCP_ACK), T0), Outbound::Allow { peer: X });
+        assert_eq!(inbound(&mut t, X, tcp_in(PEER_IP, 40000, P, TCP_SYN), T0 + 1), Inbound::Allow);
+        let t1 = T0 + 2 * limits::FLOW_LINGER_NS;
+        assert_eq!(outbound(&mut t, reply(TCP_SYN | TCP_ACK), t1), Outbound::Allow { peer: X });
+    }
+
+    #[test]
+    fn udp_rules_admit_any_port_inside_the_prefix_only() {
+        let mut t = FlowTable::new();
+        let udp = |dst, dport| Packet { src: PEER_IP, dst, transport: Transport::Udp { sport: 5000, dport } };
+        assert_eq!(inbound(&mut t, X, udp([10, 99, 0, 9], 53), T0), Inbound::Allow);
+        assert_eq!(inbound(&mut t, X, udp([10, 99, 1, 9], 53), T0), Inbound::Deny(Denied::NoRule));
+        assert_eq!(inbound(&mut t, Y, udp([10, 99, 0, 9], 53), T0), Inbound::Deny(Denied::NoRule));
+        let back = Packet { src: [10, 99, 0, 9], dst: PEER_IP, transport: Transport::Udp { sport: 53, dport: 5000 } };
+        assert_eq!(outbound(&mut t, back, T0), Outbound::Allow { peer: X });
+    }
+
+    #[test]
+    fn classify_reads_tcp_udp_and_icmp_from_the_bytes() {
+        let p = classify(&tcp(PEER_IP, 40000, HOST_IP, P, TCP_SYN)).unwrap();
+        assert_eq!(p, tcp_in(PEER_IP, 40000, P, TCP_SYN));
+        let p = classify(&datagram(PEER_IP, HOST_IP)).unwrap();
+        assert_eq!(p.transport, Transport::Udp { sport: 1, dport: 2 });
+        let mut echo = std::vec![0x45, 0, 0, 28, 0, 0, 0x40, 0, 64, 1, 0, 0];
+        echo.extend_from_slice(&PEER_IP);
+        echo.extend_from_slice(&HOST_IP);
+        let c = super::checksum(&echo, 0);
+        echo[10..12].copy_from_slice(&c.to_be_bytes());
+        echo.extend_from_slice(&[8, 0, 0, 0, 0, 9, 0, 1]);
+        assert_eq!(classify(&echo).unwrap().transport, Transport::EchoRequest { id: 9 });
+        echo[20] = 0;
+        assert_eq!(classify(&echo).unwrap().transport, Transport::EchoReply { id: 9 });
+        echo[20] = 11;
+        assert_eq!(classify(&echo).unwrap().transport, Transport::IcmpError);
+        echo[20] = 13;
+        assert_eq!(classify(&echo).unwrap().transport, Transport::Other);
+    }
+
+    #[test]
+    fn classify_refuses_a_bad_udp_length_and_a_fragment() {
+        let mut d = datagram(PEER_IP, HOST_IP);
+        assert!(classify(&d).is_ok());
+        d[25] ^= 1; // UDP length
+        assert_eq!(classify(&d), Err(DropReason::UdpBadLength));
+        let mut f = datagram(PEER_IP, HOST_IP);
+        f[6] = 0x20; // MF, the header checksum made right again
+        f[10..12].copy_from_slice(&[0, 0]);
+        let c = super::checksum(&f[..20], 0);
+        f[10..12].copy_from_slice(&c.to_be_bytes());
+        assert_eq!(classify(&f), Err(DropReason::Ipv4Fragment));
+    }
+
+    #[test]
+    fn the_byte_paths_authorize_as_the_packet_paths_do() {
+        let mut t = FlowTable::new();
+        let syn = tcp(PEER_IP, 40000, HOST_IP, P, TCP_SYN);
+        assert_eq!(t.inbound(&RULES, X, &syn, T0), Inbound::Allow);
+        assert_eq!(t.inbound(&RULES, Y, &syn, T0), Inbound::Deny(Denied::NoRule));
+        let mut bad = syn.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        assert_eq!(t.inbound(&RULES, X, &bad, T0), Inbound::Malformed(DropReason::TcpBadChecksum));
+        assert_eq!(t.outbound(&tcp(HOST_IP, P, PEER_IP, 40000, TCP_SYN | TCP_ACK), T0), Outbound::Allow { peer: X });
+        assert_eq!(t.outbound(&tcp(HOST_IP, P, PEER_IP, 40001, TCP_SYN | TCP_ACK), T0), no_flow(PEER_IP));
+    }
+
+    #[test]
+    fn the_reasons_have_stable_codes_and_names() {
+        for (i, d) in Denied::ALL.iter().enumerate() {
+            assert_eq!(usize::from(d.code()), i);
+        }
+        let names: std::vec::Vec<&str> = Denied::ALL.iter().map(|d| d.name()).collect();
+        assert_eq!(names, ["NoRule", "UnknownPeer", "NoFlow", "IcmpError"]);
+        assert_eq!(QUOTA * limits::MAX_PEERS, MAX_FLOWS);
+    }
+}

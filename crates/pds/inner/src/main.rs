@@ -4,15 +4,22 @@
 //! Also the HTTPS backend link (M6 plan C4): the backend's segments to
 //! `tls` go to `ntl`, and `tls`'s segments from `tln` leave only towards the
 //! backend; both are proxied plaintext, which this PD sees by design.
-//! It reads nothing before `policy` has verified a bundle (M8 plan C6).
+//! It reads nothing before `policy` has verified a bundle (M8 plan C6), and
+//! the bundle's groups decide what each peer reaches on the LAN and what
+//! may answer it (M8 plan C8, `inner_core::flow`).
 
 #![no_std]
 #![no_main]
 
+use core::cell::UnsafeCell;
+
 use audit_event::Event;
+use inner_core::flow::{Denied, FlowTable, Inbound, Outbound, Rules};
 use inner_core::{Config, FromLan, FromTls, TLS_REFUSED, ToLan, from_lan, from_tls, to_lan};
 use layout::inner as ch;
+use msgs::TunnelPacket;
 use pdkit::{Audit, Buf, Rx, Tx};
+use policy_wire::{Bundle, Rule};
 use ring::pass::drain;
 use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, memory_region_symbol, protection_domain};
 
@@ -28,6 +35,68 @@ const _: () = assert!(inner_core::NET_BUFFERS == layout::NET_BUFFERS, "inner-cor
 /// for the next notification; `tls` retransmits what the tier refused.
 const TLS_DRAIN: usize = layout::NET_BUFFERS;
 
+// `audit` names the drops from its own table, by peer block; this PD sees
+// both sides.
+const _: () = assert!(reasons_match());
+const _: () = assert!(audit_event::INNER_PEERS as usize == limits::MAX_PEERS, "InnerDenied's peer blocks");
+
+// Both run only at compile time, where an out-of-bounds index or an
+// overflow is a build error.
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+const fn str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+#[allow(clippy::indexing_slicing, clippy::arithmetic_side_effects)]
+const fn reasons_match() -> bool {
+    use audit_event::{INNER_REASON_NAMES, INNER_REASONS};
+    let all = Denied::ALL;
+    if all.len() != INNER_REASON_NAMES.len() || all.len() + 1 != INNER_REASONS as usize {
+        return false;
+    }
+    let mut i = 0;
+    while i < all.len() {
+        if all[i].code() as usize != i || !str_eq(all[i].name(), INNER_REASON_NAMES[i]) {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// The flow table (M8 plan C8): about 20 KiB, so a static rather than part
+/// of the handler state, which lives on the 64 KiB stack.
+struct Flows(UnsafeCell<FlowTable>);
+
+// SAFETY: a PD runs one thread, and `start` hands the table out once.
+unsafe impl Sync for Flows {}
+
+static FLOWS: Flows = Flows(UnsafeCell::new(FlowTable::new()));
+
+/// The verified bundle's groups and rules (M8 plan C1, C8).
+struct Groups(Bundle<'static>);
+
+impl Rules for Groups {
+    fn groups(&self, peer: u8) -> Option<u8> {
+        self.0.peer(peer).map(|p| p.groups())
+    }
+
+    fn any_rule_in(&self, group: u8, mut f: impl FnMut(&Rule) -> bool) -> bool {
+        self.0.group(group).is_some_and(|g| g.rules().any(|r| f(&r)))
+    }
+}
+
 struct Inner {
     from_driver: Rx,
     to_driver: Tx,
@@ -38,6 +107,8 @@ struct Inner {
     from_tls: Rx,
     to_tls: Tx,
     audit: Audit,
+    groups: Groups,
+    flows: &'static mut FlowTable,
     neighbors: [([u8; 4], [u8; 6]); MAX_NEIGHBORS],
     neighbor_count: usize,
     buf: Buf,
@@ -51,11 +122,11 @@ mod halt {
     pub const POLICY_UNAVAILABLE: u32 = layout::policy::HALT_UNAVAILABLE;
 }
 
-/// `Await` on `policy`, then the slot it verified (M8 plan C6). The bundle
-/// itself is not used yet: group authorization (C8) reads it.
-fn barrier() -> Result<(), policy_wire::Reject> {
+/// `Await` on `policy`, then the slot it verified (M8 plan C6), whose groups
+/// authorize the tunnel's traffic (C8).
+fn barrier() -> Result<Bundle<'static>, policy_wire::Reject> {
     let token = policy_client::await_verified(Channel::new(ch::CH_POLICY))?;
-    policy_client::open(&token, &config::node_config()).map(|_| ())
+    policy_client::open(&token, &config::node_config())
 }
 
 // The closure names this init in run_init's symbol (ct-shape's stage check).
@@ -108,9 +179,12 @@ fn start(init: &boot_stage::Init) -> pdkit::Stage<Inner> {
     // The barrier (M8 plan C6): no LAN frame or backend segment is read
     // before `policy` has verified a bundle; until then they wait in the
     // rings.
-    if barrier().is_err() {
+    let Ok(bundle) = barrier() else {
         return pdkit::Stage::Dormant(audit.boot_stop(init, halt::POLICY_UNAVAILABLE));
-    }
+    };
+    // SAFETY: `start` runs once, and this is the only reference to the
+    // table ever made (see `Flows`).
+    let flows = unsafe { &mut *FLOWS.0.get() };
     let mut neighbors = [([0u8; 4], [0u8; 6]); MAX_NEIGHBORS];
     for (dst, n) in neighbors.iter_mut().zip(config::NEIGHBORS) {
         *dst = (n.ip, n.mac);
@@ -124,6 +198,8 @@ fn start(init: &boot_stage::Init) -> pdkit::Stage<Inner> {
         from_tls,
         to_tls,
         audit,
+        groups: Groups(bundle),
+        flows,
         neighbors,
         neighbor_count: config::NEIGHBORS.len(),
         buf: [0; layout::NET_BUF_SIZE],
@@ -166,7 +242,20 @@ impl Inner {
                 }
                 FromLan::Forward(len) => {
                     let p = reply.get(..len).unwrap_or(&[]);
-                    wake.data |= pdkit::send(&mut self.to_data, &mut self.scratch, p, &mut self.audit);
+                    // Only as the reverse of a flow a peer opened (M8 plan
+                    // C8, D9); `data` routes it by allowed IPs.
+                    match self.flows.outbound(p, cpu::now_ns()) {
+                        Outbound::Allow { .. } => {
+                            wake.data |= pdkit::send(&mut self.to_data, &mut self.scratch, p, &mut self.audit);
+                        }
+                        Outbound::Deny { reason, dst } => {
+                            // Named for the peer it was headed for; an address
+                            // no peer owns counts as an unknown peer.
+                            let peer = self.groups.0.owner_of(dst).map_or(audit_event::INNER_PEERS, u16::from);
+                            self.audit.record(Event::InnerDenied { peer, reason: reason.code() });
+                        }
+                        Outbound::Malformed(reason) => self.audit.record(Event::FrameDropped { reason: reason as u16 }),
+                    }
                 }
                 FromLan::Tls(len) => {
                     let p = reply.get(..len).unwrap_or(&[]);
@@ -183,9 +272,25 @@ impl Inner {
     fn drain_tunnel(&mut self, wake: &mut Wake) {
         while let Some(n) = pdkit::recv(&mut self.from_data, &mut self.buf, &mut self.audit) {
             wake.data = true;
+            let Ok(m) = TunnelPacket::decode(self.buf.get(..n).unwrap_or(&[])) else {
+                self.audit.record(Event::BadDescriptor);
+                continue;
+            };
+            // The peer's groups decide (M8 plan C8): default deny.
+            match self.flows.inbound(&self.groups, m.peer, m.packet, cpu::now_ns()) {
+                Inbound::Allow => {}
+                Inbound::Deny(reason) => {
+                    self.audit.record(Event::InnerDenied { peer: u16::from(m.peer), reason: reason.code() });
+                    continue;
+                }
+                Inbound::Malformed(reason) => {
+                    self.audit.record(Event::FrameDropped { reason: reason as u16 });
+                    continue;
+                }
+            }
             let cfg = lan_config(self.neighbors.get(..self.neighbor_count).unwrap_or(&[]));
             let frame = &mut self.reply;
-            match to_lan(&cfg, self.buf.get(..n).unwrap_or(&[]), frame) {
+            match to_lan(&cfg, m.packet, frame) {
                 ToLan::Emitted(len) => {
                     let f = frame.get(..len).unwrap_or(&[]);
                     wake.driver |= pdkit::send(&mut self.to_driver, &mut self.scratch, f, &mut self.audit);

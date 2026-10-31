@@ -113,6 +113,10 @@ INSIDE_IP = bytes([10, 99, 0, 1])
 HOST_MAC = bytes.fromhex("0200000099" "02")
 HOST_IP = bytes([10, 99, 0, 2])
 BCAST = b"\xff" * 6
+# M8 plan C8 [T15]: the inside host's TCP ports the A bundle's groups name.
+# Client 0 (group "web") reaches P, client 1 (group "ops") reaches R, and no
+# group names Q; the inside host answers a SYN at all three.
+IT_PORT_P, IT_PORT_Q, IT_PORT_R = 7001, 7002, 7003
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
 
@@ -998,9 +1002,28 @@ def icmp_echo(src: bytes, dst: bytes, kind: int, ident: int, seq: int, data: byt
     return ip_hdr(src, dst, 1, len(icmp)) + icmp
 
 
+def tcp_packet(src: bytes, dst: bytes, sport: int, dport: int, flags: int, seq: int = 1, ack: int = 0) -> bytes:
+    """An IPv4/TCP segment with no payload, both checksums right."""
+    seg = struct.pack("!HHIIBBHHH", sport, dport, seq, ack, 5 << 4, flags, 65535, 0, 0)
+    c = csum(src + dst + struct.pack("!BBH", 0, 6, len(seg)) + seg)
+    seg = seg[:16] + struct.pack("!H", c) + seg[18:]
+    return ip_hdr(src, dst, 6, len(seg)) + seg
+
+
+def ttl_set(packet: bytes, ttl: int) -> bytes:
+    """`packet` with its TTL replaced and the header checksum redone."""
+    p = bytearray(packet)
+    p[8] = ttl
+    p[10:12] = b"\0\0"
+    p[10:12] = struct.pack("!H", csum(bytes(p[:20])))
+    return bytes(p)
+
+
 class InsideHost(threading.Thread):
-    """10.99.0.2 on the inside NIC: answers ICMP echo from the tunnel and
-    records every IPv4 datagram it receives."""
+    """10.99.0.2 on the inside NIC: answers ICMP echo from the tunnel, and a
+    TCP SYN to IT_PORT_P, Q or R with a SYN-ACK (a listener on each, so a
+    connection that fails there was dropped on the way), and records every
+    IPv4 datagram it receives."""
 
     def __init__(self, w: Wire):
         super().__init__(daemon=True)
@@ -1025,6 +1048,11 @@ class InsideHost(threading.Thread):
                 ident, seq = struct.unpack("!HH", ip[24:28])
                 reply = icmp_echo(HOST_IP, ip[12:16], 0, ident, seq, ip[28:])
                 self.w.send(eth(INSIDE_MAC, HOST_MAC, 0x0800, reply))
+            elif ip[9] == 6 and len(ip) >= 40 and ip[16:20] == HOST_IP and ip[33] & (TCP_SYN | TCP_ACK) == TCP_SYN:
+                sport, dport, seq = struct.unpack("!HHI", ip[20:28])
+                if dport in (IT_PORT_P, IT_PORT_Q, IT_PORT_R):
+                    reply = tcp_packet(HOST_IP, ip[12:16], dport, sport, TCP_SYN | TCP_ACK, 1000, (seq + 1) & 0xFFFFFFFF)
+                    self.w.send(eth(INSIDE_MAC, HOST_MAC, 0x0800, reply))
 
 
 def b64(s: str) -> bytes:
@@ -1289,6 +1317,142 @@ class Pinger(threading.Thread):
             self.sent += 1
             self.lost += not ok
             time.sleep(max(0.0, t + PING_LOOP_S - time.monotonic()))
+
+
+# C8 [T15]: client 0's tunnel address (wireguard-go's in the wireguard boot),
+# and the time the group cases need from peer 1's session.
+CLIENT0_IP = bytes([10, 200, 0, 2])
+C8_BUDGET_S = 40.0
+
+
+def udp_arrived(host: InsideHost, src: bytes, sport: int, dport: int, what: str):
+    """Waits for the inside host to receive a UDP datagram src:sport ->
+    dport."""
+    deadline = time.monotonic() + REPLY_TIMEOUT_S
+    while time.monotonic() < deadline:
+        if any(ip[9] == 17 and ip[12:16] == src and struct.unpack("!HH", ip[20:24]) == (sport, dport)
+               for ip in list(host.received)):
+            return
+        time.sleep(0.05)
+    raise Fail(f"{what} did not reach the inside host")
+
+
+def udp_received(sock: socket.socket, until: bytes = None, timeout: float = REPLY_TIMEOUT_S) -> list:
+    """The datagrams `sock` receives within `timeout`, stopping early once
+    `until` arrives."""
+    got = []
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        sock.settimeout(max(0.01, deadline - time.monotonic()))
+        try:
+            got.append(sock.recv(2048))
+        except socket.timeout:
+            break
+        if until is not None and got[-1] == until:
+            break
+    return got
+
+
+def group_authorization_cases(con: Console, deploy: str, host: InsideHost, inside: Wire, good, out: socket.socket,
+                              hostfwd: int, passed: list):
+    """M8 plan C8 [T15] on the A bundle's groups (peers_toml): X is client 0
+    (wireguard-go, group "web": TCP to the inside host's port P), Y client 1
+    (the Python peer `good`, group "ops": port R). The inside host answers
+    a SYN at P, Q and R alike and records every datagram, so each drop is
+    `inner`'s, seen both as an InnerDenied line naming the peer and reason
+    and as a datagram the host never got; each deny follows its allow."""
+    x, y = peer_id(deploy, 0), peer_id(deploy, 1)
+    gw = ("127.0.0.1", hostfwd)
+
+    def syns(src: bytes, port: int) -> list:
+        return [ip for ip in list(host.received) if ip[9] == 6 and ip[12:16] == src and ip[16:20] == HOST_IP
+                and struct.unpack("!H", ip[22:24])[0] == port and ip[33] & TCP_SYN]
+
+    def denied(reason: str, peer: int, mark: int):
+        con.wait_for(rf"audit: src=inner InnerDenied\({reason}\) peer={peer} total=1 lost=\d+", since=mark)
+
+    # X reaches P: the kernel's connect completes on the host's SYN-ACK, which
+    # came back only on the flow X's SYN opened. Closed with a reset.
+    s = socket.create_connection((ip_str(HOST_IP), IT_PORT_P), timeout=REPLY_TIMEOUT_S)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    s.close()
+    if not syns(CLIENT0_IP, IT_PORT_P):
+        raise Fail("C8: X connected to port P, but the inside host saw no SYN")
+    passed.append("group rule: X reaches its group's port")
+    print("\nPASS [C8: peer X (group web) connects to the inside host's port P]")
+
+    # X -> Q: the host listens there too, but no group of X names it.
+    mark = con.mark()
+    try:
+        socket.create_connection((ip_str(HOST_IP), IT_PORT_Q), timeout=3.0).close()
+        raise Fail("C8: X connected to port Q, which no group of X names")
+    except TimeoutError:
+        pass
+    denied("NoRule", x, mark)
+    if syns(CLIENT0_IP, IT_PORT_Q):
+        raise Fail("C8: X's SYN to port Q reached the inside host")
+    passed.append("group rule: X refused a port its groups do not name")
+    print(f"\nPASS [C8: X -> port Q dropped, InnerDenied(NoRule) peer={x}]")
+
+    # Y's tunnel is up: its SYN to its own rule's port R draws the host's
+    # SYN-ACK back through the tunnel. Then Y -> P is dropped.
+    def y_syn(port: int, sport: int):
+        out.sendto(good.transport(tcp_packet(PEER1_IP, HOST_IP, sport, port, TCP_SYN, 5000)), gw)
+
+    def y_syn_ack(sport: int, port: int) -> bool:
+        deadline = time.monotonic() + REPLY_TIMEOUT_S
+        try:
+            while time.monotonic() < deadline:
+                out.settimeout(max(0.01, deadline - time.monotonic()))
+                try:
+                    d = out.recv(2048)
+                except socket.timeout:
+                    return False
+                try:
+                    _, plain = good.open_transport(d)
+                except Exception:
+                    continue
+                if len(plain) >= 40 and plain[9] == 6 and plain[12:16] == HOST_IP and plain[16:20] == PEER1_IP \
+                        and struct.unpack("!HH", plain[20:24]) == (port, sport) \
+                        and plain[33] & (TCP_SYN | TCP_ACK) == TCP_SYN | TCP_ACK:
+                    return True
+            return False
+        finally:
+            out.settimeout(REPLY_TIMEOUT_S)
+
+    y_syn(IT_PORT_R, 41000)
+    if not y_syn_ack(41000, IT_PORT_R):
+        raise Fail("C8: Y's SYN to port R (its group ops) drew no SYN-ACK through the tunnel")
+    mark = con.mark()
+    y_syn(IT_PORT_P, 41001)
+    denied("NoRule", y, mark)
+    if syns(PEER1_IP, IT_PORT_P) or y_syn_ack(41001, IT_PORT_P):
+        raise Fail("C8: Y's SYN to port P (group web, not Y's) reached the inside host")
+    passed.append("group rule: Y refused another group's port")
+    print(f"\nPASS [C8: Y reaches port R; Y -> port P dropped, InnerDenied(NoRule) peer={y}]")
+
+    # An unsolicited LAN datagram for X is dropped; X's own request opens
+    # the flow, and the host's reply on it passes.
+    u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        u.bind((ip_str(CLIENT0_IP), 0))
+        port = u.getsockname()[1]
+        mark = con.mark()
+        inside.send(eth(INSIDE_MAC, HOST_MAC, 0x0800, udp_packet(HOST_IP, CLIENT0_IP, 7777, port, b"unsolicited")))
+        denied("NoFlow", x, mark)
+        early = udp_received(u, timeout=1.0)
+        if early:
+            raise Fail(f"C8: an unsolicited LAN datagram reached X: {early}")
+        u.sendto(b"request", (ip_str(HOST_IP), 7777))
+        udp_arrived(host, CLIENT0_IP, port, 7777, "C8: X's request")
+        inside.send(eth(INSIDE_MAC, HOST_MAC, 0x0800, udp_packet(HOST_IP, CLIENT0_IP, 7777, port, b"reply")))
+        got = udp_received(u, b"reply")
+        if got != [b"reply"]:
+            raise Fail(f"C8: X received {got} on its own flow, want the host's reply")
+    finally:
+        u.close()
+    passed.append("flows: unsolicited LAN datagram dropped, the reply on a peer's flow passes")
+    print(f"\nPASS [C8: LAN -> X unsolicited dropped, InnerDenied(NoFlow) peer={x}; X's reply traffic passes]")
 
 
 def test_wireguard(pkg: "Package", deploy: str, passed: list):
@@ -1580,27 +1744,32 @@ def test_wireguard(pkg: "Package", deploy: str, passed: list):
         passed.append("pq->hs link scrubbed")
         print("\nPASS [pq->hs link: the PskInstall is scrubbed, the OSK lives only in hs's table]")
 
-        # Case 5: an inside datagram with TTL 1 must not be forwarded into
-        # the tunnel; TTL 2 still is (the boundary).
-        mark = con.mark()
-        for ttl in (1, 2):
-            pkt = bytearray(icmp_echo(HOST_IP, bytes([10, 200, 0, 2]), 8, 7, ttl, b"ttl"))
-            pkt[8] = ttl
-            pkt[10:12] = b"\0\0"
-            pkt[10:12] = struct.pack("!H", csum(bytes(pkt[:20])))
-            inside.send(eth(INSIDE_MAC, HOST_MAC, 0x0800, bytes(pkt)))
-        con.wait_for(r"audit: src=inner FrameDropped\(TtlExpired\) total=1 ", since=mark)
-        # Allow side: the TTL 2 request crossed the tunnel and wireguard-go's
-        # host answered it; the TTL 1 one never got an answer.
-        deadline = time.monotonic() + REPLY_TIMEOUT_S
+        # M8 plan C8 [T15], while peer 1's session `good` is fresh.
+        if time.monotonic() - accepted_at > reject_s - EXPIRY_ALLOW_S - C8_BUDGET_S:
+            raise Fail("C8: too little of peer 1's session left for the group cases (slow run); precondition broken")
+        group_authorization_cases(con, deploy, host, inside, good, out, hostfwd, passed)
 
-        def replies(seq):
-            return [ip for ip in list(host.received) if ip[9] == 1 and ip[20] == 0
-                    and ip[12:16] == bytes([10, 200, 0, 2]) and ip[24:28] == struct.pack("!HH", 7, seq)]
-        while not replies(2) and time.monotonic() < deadline:
-            time.sleep(0.05)
-        if not replies(2) or replies(1):
-            raise Fail(f"TTL boundary: replies to seq 2 {len(replies(2))}, to seq 1 {len(replies(1))}")
+        # Case 5: an inside datagram with TTL 1 must not be forwarded into
+        # the tunnel; TTL 2 still is (the boundary). Both answer a UDP flow
+        # wireguard-go's host opened: since C8 the inside can open none.
+        x = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            x.bind((ip_str(CLIENT0_IP), 0))
+            port = x.getsockname()[1]
+            x.sendto(b"open", (ip_str(HOST_IP), 7))
+            udp_arrived(host, CLIENT0_IP, port, 7, "TTL boundary: the flow's opening datagram")
+            mark = con.mark()
+            for ttl in (1, 2):
+                pkt = ttl_set(udp_packet(HOST_IP, CLIENT0_IP, 7, port, f"ttl{ttl}".encode()), ttl)
+                inside.send(eth(INSIDE_MAC, HOST_MAC, 0x0800, pkt))
+            con.wait_for(r"audit: src=inner FrameDropped\(TtlExpired\) total=1 ", since=mark)
+            # Allow side: the TTL 2 reply crossed the tunnel to wireguard-go's
+            # host; the TTL 1 one, sent first on the same FIFO path, did not.
+            got = udp_received(x, b"ttl2")
+        finally:
+            x.close()
+        if b"ttl1" in got or b"ttl2" not in got:
+            raise Fail(f"TTL boundary: wireguard-go's host received {got}, want ttl2 only")
         ping(tries=3)
         passed.append("ttl expiry")
         print("\nPASS [TTL 1 dropped, TTL 2 forwarded at the inside hop]")
@@ -7241,9 +7410,8 @@ class PolicyFixtures:
 
     def fleet(self, deploy: str, name: str, swap_rp: bool = False) -> Fleet:
         """A fleet of the one node `deploy`, and its v0 bundle: the clients
-        mksecrets wrote (clients.toml), one group with a rule over the inside
-        network for every client (C8's authorization is slice 4), rendered,
-        approved by both approvers and signed."""
+        mksecrets wrote (clients.toml) in the groups peers_toml gives them
+        (C8), rendered, approved by both approvers and signed."""
         fleet = Fleet(os.path.join(self.root, name), secrets.token_hex(16))
         os.mkdir(fleet.dir, 0o700)
         policy_tool(self.bin, "keygen", "--dir", fleet.keys, "--forbid", ROOT)
@@ -7320,13 +7488,23 @@ def peers_toml(deploy: str, fleet_id: str, swap_rp: bool) -> str:
     if swap_rp:
         clients[0]["rp_pub_path"], clients[1]["rp_pub_path"] = clients[1]["rp_pub_path"], clients[0]["rp_pub_path"]
     inside = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))["gateway"]["inside_prefix"]
+    host = f"{ip_str(HOST_IP)}/32"
+    # M8 plan C8 [T15]: every client pings and sends UDP inside ("inside");
+    # TCP reaches only the inside host's port P for client 0 ("web") and
+    # port R for client 1 ("ops").
+    groups = {0: ["inside", "web"], 1: ["inside", "ops"]}
+    rules = {"inside": [("icmp", inside, 0, 0), ("udp", inside, 0, 65535)],
+             "ops": [("tcp", host, IT_PORT_R, IT_PORT_R)],
+             "web": [("tcp", host, IT_PORT_P, IT_PORT_P)]}
     out = [f'fleet_id = "{fleet_id}"', "min_release = 0", ""]
-    for c in clients:
+    for i, c in enumerate(clients):
+        member = ", ".join(f'"{g}"' for g in groups.get(i, ["inside"]))
         out += ["[[peers]]", f'wg_pub = "{c["wg_pub"]}"', f'rp_pub_path = "{c["rp_pub_path"]}"',
-                "allowed_ips = [" + ", ".join(f'"{a}"' for a in c["allowed_ips"]) + "]", 'groups = ["inside"]', ""]
-    out += ["[[groups]]", 'name = "inside"']
-    for proto, lo, hi in (("icmp", 0, 0), ("tcp", 0, 65535), ("udp", 0, 65535)):
-        out += ["[[groups.rules]]", f'dst = "{inside}"', f'proto = "{proto}"', f"port_lo = {lo}", f"port_hi = {hi}"]
+                "allowed_ips = [" + ", ".join(f'"{a}"' for a in c["allowed_ips"]) + "]", f"groups = [{member}]", ""]
+    for name, group in rules.items():
+        out += ["[[groups]]", f'name = "{name}"']
+        for proto, dst, lo, hi in group:
+            out += ["[[groups.rules]]", f'dst = "{dst}"', f'proto = "{proto}"', f"port_lo = {lo}", f"port_hi = {hi}"]
     return "\n".join(out) + "\n"
 
 

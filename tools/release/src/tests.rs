@@ -24,6 +24,7 @@ fn good_manifest() -> Vec<u8> {
         ("firmware_sha256", "ab"),
         ("pcrs", "d0,d1,d2,d3,d4,d5,d6,d7,d8"),
         ("cargo_lock_sha256", "ee"),
+        ("release_seq", "1"),
         ("verus", "0.2026.10.04.426d8b0"),
         ("kani", "0.68.0"),
     ])
@@ -165,4 +166,25 @@ fn uppercase_hex_in_a_signature_file_is_refused() {
     let (pk, m, s) = signed();
     let t = String::from_utf8(s).unwrap().to_uppercase().replace("ED25519=", "ed25519=").replace("ML-DSA-65=", "ml-dsa-65=");
     assert_eq!(sig::verify(&pk, &m, t.as_bytes()), Err(SigError::Format("bad Ed25519 signature")));
+}
+
+/// M8 plan C9: `release_seq` is signed with the rest and has one spelling.
+#[test]
+fn release_seq_is_a_signed_canonical_key() {
+    let m = good_manifest();
+    let text = String::from_utf8(m.clone()).unwrap();
+    assert!(text.contains("\npcrs=d0,d1,d2,d3,d4,d5,d6,d7,d8\nrelease_seq=1\nversion="));
+    let (pk, _, s) = signed();
+    let raised = text.replace("release_seq=1\n", "release_seq=2\n");
+    assert_eq!(sig::verify(&pk, raised.as_bytes(), &s), Err(SigError::Ed25519Invalid));
+    for bad in ["01", "+1", "-1", "1x", "4294967296", " 1"] {
+        let m = text.replace("release_seq=1\n", &format!("release_seq={bad}\n"));
+        assert!(matches!(manifest::parse(m.as_bytes()), Err(ManifestError::BadValue(_))), "{bad}");
+    }
+    for good in ["0", "7", "4294967295"] {
+        let m = text.replace("release_seq=1\n", &format!("release_seq={good}\n"));
+        assert!(manifest::parse(m.as_bytes()).is_ok(), "{good}");
+    }
+    let missing: Vec<u8> = m.split_inclusive(|&b| b == b'\n').filter(|l| !l.starts_with(b"release_seq=")).flatten().copied().collect();
+    assert_eq!(manifest::parse(&missing), Err(ManifestError::Missing("release_seq".into())));
 }

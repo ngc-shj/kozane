@@ -200,7 +200,8 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::PolicyAccepted { .. }
         | Event::ReleaseSeq { .. }
         | Event::PolicyUnavailable { .. }
-        | Event::PolicyRejected { .. } => false,
+        | Event::PolicyRejected { .. }
+        | Event::InnerDenied { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
     assert_eq!(Event::FIXED.len(), 64);
@@ -836,6 +837,8 @@ fn policy_code_ranges_are_disjoint_from_each_other_and_from_every_other_code() {
         (POLICY_UNAVAILABLE_BASE, POLICY_REASONS + 1),
         (POLICY_REJECTED_BASE, POLICY_SLOTS * POLICY_REASON_CODES),
         (POLICY_REJECTED_UNKNOWN, 1),
+        (INNER_DENIED_BASE, INNER_PEERS * INNER_REASONS),
+        (INNER_DENIED_UNKNOWN, 1),
     ];
     for (i, (a, n)) in ranges.iter().enumerate() {
         for (b, m) in &ranges[i + 1..] {
@@ -905,4 +908,65 @@ fn the_log_reader_prints_only_published_slots() {
     assert_eq!(log::pending(3, 3), 3..3);
     assert_eq!(log::pending(u64::MAX, 1), 1..log::SLOTS);
     assert!(log::pending(2, 5).is_empty());
+}
+
+// M8 plan C8, C9 (F43, F45): `inner`'s InnerDenied.
+
+/// Per peer, every real reason decodes as itself (the last one included),
+/// the reserved last code of the block as `Unknown`, and an out-of-range
+/// reason encodes to that reserved code.
+#[test]
+fn inner_denied_decodes_each_peers_reasons_and_reserves_its_last_code() {
+    let last = INNER_REASONS - 2;
+    for peer in 0..INNER_PEERS {
+        for reason in 0..=last {
+            let code = Event::InnerDenied { peer, reason }.code();
+            assert_eq!(decode(code), Decoded::InnerDenied { peer, reason }, "peer {peer} reason {reason}");
+        }
+        let reserved = INNER_DENIED_BASE + peer * INNER_REASONS + INNER_REASONS - 1;
+        assert_eq!(decode(reserved), Decoded::Unknown, "peer {peer}");
+        for reason in [last + 1, last + 2, u16::MAX] {
+            assert_eq!(Event::InnerDenied { peer, reason }.code(), reserved, "peer {peer} reason {reason}");
+        }
+    }
+    assert_eq!(usize::from(INNER_REASONS), INNER_REASON_NAMES.len() + 1);
+    assert_eq!(INNER_REASON_NAMES[usize::from(last)], "IcmpError");
+}
+
+/// A peer id at or above `INNER_PEERS` encodes to the one code outside
+/// every peer's block, whatever the reason, and that code names nothing.
+#[test]
+fn inner_denied_with_an_out_of_range_peer_encodes_to_its_own_unknown() {
+    for peer in [INNER_PEERS, INNER_PEERS + 1, u16::MAX] {
+        for reason in [0, INNER_REASONS - 2, u16::MAX] {
+            assert_eq!(Event::InnerDenied { peer, reason }.code(), INNER_DENIED_UNKNOWN);
+        }
+    }
+    assert_eq!(decode(INNER_DENIED_UNKNOWN), Decoded::Unknown);
+    assert_eq!(INNER_DENIED_UNKNOWN, INNER_DENIED_BASE + 8 * INNER_REASONS);
+    // The allow side: the last real peer is still in range.
+    assert_eq!(decode(Event::InnerDenied { peer: INNER_PEERS - 1, reason: 0 }.code()),
+               Decoded::InnerDenied { peer: INNER_PEERS - 1, reason: 0 });
+}
+
+/// Coalesced per peer and reason: `a` is the running total, `b` the lost
+/// count, and another peer's or reason's drops never move it.
+#[test]
+fn inner_denied_is_coalesced_per_peer_and_reason() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::InnerDenied { peer: 1, reason: 2 }, 65, &mut out);
+    run(&mut c, Event::InnerDenied { peer: 2, reason: 2 }, 1, &mut out);
+    run(&mut c, Event::InnerDenied { peer: 1, reason: 0 }, 1, &mut out);
+    run(&mut c, Event::InnerDenied { peer: 9, reason: 0 }, 1, &mut out);
+    run(&mut c, Event::NotForUs, 1, &mut out);
+    let seen: Vec<(u16, u32)> = out.iter().map(|r| (r.code, r.a)).collect();
+    let code = |peer, reason| Event::InnerDenied { peer, reason }.code();
+    assert_eq!(
+        seen,
+        [(code(1, 2), 1), (code(1, 2), 65), (code(2, 2), 1), (code(1, 0), 1), (INNER_DENIED_UNKNOWN, 1), (Event::NotForUs.code(), 1)]
+    );
+    assert!(out.iter().all(|r| r.b == 0));
+    assert!(Event::InnerDenied { peer: 0, reason: 0 }.is_coalesced());
+    assert_eq!(Event::InnerDenied { peer: 0, reason: 0 }.value(), None);
 }

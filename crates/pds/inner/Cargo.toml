@@ -8,8 +8,11 @@ license.workspace = true
 boot-stage = { path = "../../boot-stage" }
 audit-event = { path = "../../audit-event" }
 config = { path = "../../config" }
+cpu = { path = "../../cpu" }
 inner-core = { path = "../../inner-core" }
 layout = { path = "../../layout" }
+limits = { path = "../../limits" }
+msgs = { path = "../../msgs" }
 pdkit = { path = "../../pdkit", features = ["boot-stop"] }
 policy-client = { path = "../../policy-client" }
 policy-wire = { path = "../../policy-wire" }

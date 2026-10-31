@@ -627,6 +627,21 @@ fn a_below_floor_slot_is_refused() {
     assert_eq!(select(5, 0, valid(5, 1, [0; 32], [1; 32]), SlotView::Empty), Decision::Refuse { reason: Reject::BelowFloor });
 }
 
+/// C9 [T17]: the boundary triple of the floor against the release `policy`
+/// passes in (`RELEASE_SEQ` there): a bundle whose `min_release` is below or
+/// equal to it is used, one above it is `BelowFloor`.
+#[test]
+fn min_release_below_equal_and_above_the_release_seq() {
+    let release_seq = 7;
+    for (min_release, want) in [
+        (release_seq - 1, Decision::Use { slot: Slot::A }),
+        (release_seq, Decision::Use { slot: Slot::A }),
+        (release_seq + 1, Decision::Refuse { reason: Reject::BelowFloor }),
+    ] {
+        assert_eq!(select(5, release_seq, valid(5, min_release, [0; 32], [1; 32]), SlotView::Empty), want, "{min_release}");
+    }
+}
+
 #[test]
 fn a_bad_signature_slot_is_refused() {
     assert_eq!(select(5, 0, SlotView::BadSignature, SlotView::Empty), Decision::Refuse { reason: Reject::BadSignature });

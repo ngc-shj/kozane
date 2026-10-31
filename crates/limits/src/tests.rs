@@ -37,6 +37,14 @@ fn the_m8_bounds_are_the_plans_values() {
     assert_eq!(BUNDLE_MAX, 0x480_000);
 }
 
+/// Every peer gets the same whole share of `inner`'s flow table.
+#[test]
+fn the_flow_table_splits_into_equal_peer_quotas() {
+    assert_eq!(MAX_FLOWS % MAX_PEERS, 0);
+    assert_eq!(MAX_FLOWS / MAX_PEERS, 64);
+    assert_eq!((FLOW_IDLE_NS, FLOW_LINGER_NS), (120_000_000_000, 10_000_000_000));
+}
+
 /// `BUNDLE_MAX` must fit the largest bundle the format in `policy-wire` can
 /// encode: the fixed header, `MAX_PEERS` peers each with `MAX_ALLOWED`
 /// prefixes and one `SPK_LEN` rp key, `MAX_GROUPS` groups each with

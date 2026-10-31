@@ -9,7 +9,8 @@
 //! | hs → data       | `Install`: session keys and indices (secret)        |
 //! | ingress → data  | `Transport`: src ip[4] port[2] msg[..]              |
 //! | data → ingress  | tag 1 `Outbound` peer[2] msg[..]; tag 2 `EndpointUpdate` peer[2] ip[4] port[2] |
-//! | data ↔ inner    | a bare IPv4 datagram (validated by `wire`)          |
+//! | data → inner    | `TunnelPacket`: peer[1] packet[..] (M8 plan C8)     |
+//! | inner → data    | a bare IPv4 datagram (validated by `wire`)          |
 //! | ingress → pq    | `RpDatagram`: peer ip[4] port[2] msg[176 or 1092]   |
 //! | pq → ingress    | `RpReply`, one per input: tag 1 `Reply` index[1] msg[1132 or 64]; tag 2 `NoReply` |
 //! | pq → hs         | `PskInstall`: peer[2] osk[32] (secret)              |
@@ -813,6 +814,58 @@ impl<'a> Transport<'a> {
         let src = Endpoint { ip, port };
         let msg = rest(bytes, EP_LEN)?;
         Ok(Self { src, msg })
+    }
+}
+
+/// data → inner (M8 plan C8): a decrypted packet and the peer `data`
+/// authenticated it as (the bundle index), for `inner`'s group rules.
+/// Verified like `Transport`: `packet` is a trailing slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TunnelPacket<'a> {
+    pub peer: u8,
+    pub packet: &'a [u8],
+}
+
+/// The bytes `TunnelPacket::encode` describes: the peer, then the packet
+/// verbatim.
+pub open spec fn spec_encode_tunnel_packet(peer: u8, packet: Seq<u8>) -> Seq<u8> {
+    seq![peer] + packet
+}
+
+impl<'a> TunnelPacket<'a> {
+    pub fn encode(&self, out: &mut [u8]) -> (r: Option<usize>)
+        ensures
+            r is Some <==> old(out)@.len() >= 1 + self.packet@.len() as int,
+            r is Some ==> {
+                &&& r->Some_0 == 1 + self.packet.len()
+                &&& final(out)@.subrange(0, r->Some_0 as int) == spec_encode_tunnel_packet(
+                    self.peer,
+                    self.packet@,
+                )
+            },
+    {
+        assert(old(out)@.len() == out@.len());
+        assert(out@.len() == out.len() as int);
+        let n = 1usize.checked_add(self.packet.len())?;
+        write_at(out, 0, &[self.peer])?;
+        write_at(out, 1, self.packet)?;
+        assert(out@.subrange(0, n as int) =~= spec_encode_tunnel_packet(self.peer, self.packet@));
+        Some(n)
+    }
+
+    pub fn decode(bytes: &'a [u8]) -> (r: Result<Self, Malformed>)
+        ensures
+            r is Ok <==> bytes@.len() >= 1,
+            r is Ok ==> {
+                let m = r->Ok_0;
+                &&& m.peer == bytes@[0]
+                &&& m.packet@ == bytes@.subrange(1, bytes@.len() as int)
+            },
+            r is Err ==> r == Err(Malformed),
+    {
+        let peer = read_array::<1>(bytes, 0)?;
+        let packet = rest(bytes, 1)?;
+        Ok(Self { peer: peer[0], packet })
     }
 }
 

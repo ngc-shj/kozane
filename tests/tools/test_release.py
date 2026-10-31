@@ -7,6 +7,7 @@ Prints "RELEASE-FIXTURES <n>" and exits non-zero on any mismatch.
 
 import hashlib
 import pathlib
+import re
 import struct
 import subprocess
 import sys
@@ -18,6 +19,7 @@ import measure  # noqa: E402
 import fip_fixture  # noqa: E402
 
 RELEASE = [sys.executable, str(ROOT / "tools/release.py")]
+SEQ = re.search(r"^pub const RELEASE_SEQ: u32 = (\d+);$", (ROOT / "crates/release-seq/src/lib.rs").read_text(), re.M)[1]
 BIN = str(ROOT / "build/release/target/release/release")
 SLOT = measure.BUNDLE_MAX
 # The three envelopes, then the two bundle slots (descriptor v3).
@@ -74,7 +76,8 @@ def flip(path: pathlib.Path, at: int = 100):
 def case_allow(d):
     rc, out = make(d)
     rc2, out2 = verify(d)
-    return rc == 0 and rc2 == 0 and "release: verified" in out2, out + out2
+    signed = (d / "rel/manifest").read_text().splitlines() if rc == 0 else []
+    return rc == 0 and rc2 == 0 and "release: verified" in out2 and f"release_seq={SEQ}" in signed, out + out2
 
 
 def case_image(d):
@@ -163,7 +166,7 @@ def case_sign_fails_leaves_nothing(d):
     return rc == 1 and not leftovers and rc2 == 0 and (d / "rel/manifest.sig").exists(), out + out2
 
 
-def signed_release(d, commit: str, image: bytes = None) -> bool:
+def signed_release(d, commit: str, image: bytes = None, seq: str = SEQ) -> bool:
     """A release signed by hand, bypassing `make`'s own refusals, so each of
     verify's checks can be met on its own: OUT is d/rel."""
     rel = d / "rel"
@@ -175,7 +178,7 @@ def signed_release(d, commit: str, image: bytes = None) -> bool:
               "boot_desc_sha256": hashlib.sha256(desc).hexdigest(),
               "firmware_sha256": hashlib.sha256(fip_fixture.flash()).hexdigest(),
               "pcrs": ",".join(p.hex() for p in measure.expected_pcrs(fip_fixture.flash(), desc, img)),
-              "cargo_lock_sha256": "x", "verus": "x", "kani": "x"}
+              "cargo_lock_sha256": "x", "release_seq": seq, "verus": "x", "kani": "x"}
     rc, manifest = run(BIN, "render", *(f"{k}={v}" for k, v in fields.items()))
     (rel / "manifest").write_text(manifest)
     rc2, _ = run(BIN, "sign", "--keys", str(d / "keys"), "--manifest", str(rel / "manifest"),
@@ -262,6 +265,22 @@ def case_verify_fault_inject(d):
     return made and rc == 1 and "fault-inject feature" in out, out
 
 
+def case_release_seq_other(d):
+    """M8 plan C9: a release signed with another release_seq than the
+    source's is refused, though every other field and both signatures hold."""
+    made = signed_release(d, "0" * 40, seq=str(int(SEQ) + 1))
+    rc, out = verify_default(d)
+    return made and rc == 1 and f"release_seq: crates/release-seq says {SEQ}" in out, out
+
+
+def case_release_seq_missing(d):
+    """A manifest without release_seq does not render, so it cannot be
+    signed (the tool's canonical key set)."""
+    rc, out = run(BIN, "render", "version=x", "commit=x", "dev_image=x", "loader_img_sha256=x", "boot_desc_sha256=x",
+                  "firmware_sha256=x", "pcrs=x", "cargo_lock_sha256=x", "verus=x", "kani=x")
+    return rc == 1 and "manifest key release_seq is missing" in out, out
+
+
 def case_kind_tls(d):
     """`--kind tls` is a choice: only the --envelope pairing refuses it."""
     rc, out = verify(d, "keys", "rel", "--kind", "tls")
@@ -285,6 +304,8 @@ CASES = [
     ("a failed signing leaves no OUT and no staging, and the retry succeeds", case_sign_fails_leaves_nothing),
     ("a release from a dirty tree is refused unless accepted", case_dirty_refused),
     ("a clean release verifies by default, no flag", case_clean_default_verify),
+    ("verify refuses a release_seq other than the source's", case_release_seq_other),
+    ("a manifest without release_seq does not render", case_release_seq_missing),
     ("verify refuses a signed range over non-zero image bytes", case_verify_placeholder),
     ("make refuses an image holding a fault-inject PD", case_make_fault_inject),
     ("verify refuses a signed image holding a fault-inject PD", case_verify_fault_inject),

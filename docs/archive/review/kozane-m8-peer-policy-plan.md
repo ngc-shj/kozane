@@ -1059,3 +1059,22 @@ Batch B, the barrier and the consumers (after A):
 - `config` drops `[[peers]]`;
 - `run.py` deployments built on signed bundles (`tools/policy`), and the
   self-test needles C7 rewrites.
+
+### Slice 4 (C8, C9's remainder)
+
+- `crates/msgs`: the `TunnelPacket{peer, packet}` record for the
+  `data → inner` ring. `crates/pds/data` writes it; `run.py` reads the
+  msgs source.
+- `crates/inner-core`: `authorize` (inbound rules) and the flow table:
+  per-peer quota, eviction only within the peer's share, FIN both ways
+  plus linger, RST from a valid direction, idle expiry, ICMP echo only,
+  ICMP errors dropped. `MAX_FLOWS`, `FLOW_IDLE_NS` and `FLOW_LINGER_NS`
+  in `limits`, with the quota const asserts. Kani I8.1–I8.4 over a small
+  `MAX_FLOWS` and a bounded operation sequence.
+- `crates/pds/inner`: group rules from the bundle; drops counted as
+  `InnerDenied{peer, reason}` with the F43 encoding (`audit-event`,
+  `pds/audit`).
+- `run.py`: the C8 integration cases (T15).
+- C9: `release_seq` in `tools/release`'s manifest (signed) and
+  `tools/release.py`; a check-pins rule tying it to
+  `crates/release-seq`; the `min_release` boundary triple in unit tests.

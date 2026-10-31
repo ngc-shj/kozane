@@ -127,6 +127,22 @@ fn clients_are_listed_for_the_bundle_and_nowhere_in_the_deployment() {
     }
 }
 
+/// Client i is the bundle's peer i (M8 plan C1 orders peers by raw
+/// wg_pub), so a test's peer ids do not depend on the random keys.
+#[test]
+fn clients_are_numbered_in_bundle_order() {
+    let d = &deployment().0;
+    let t: toml::Table = toml::from_str(&d.clients_toml).unwrap_or_else(|e| panic!("{e}"));
+    let keys: Vec<[u8; 32]> = t["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| validate::decode_key(e["wg_pub"].as_str().unwrap()).unwrap())
+        .collect();
+    assert!(keys.len() > 1, "the fixture needs at least two clients");
+    assert!(keys.windows(2).all(|w| w[0] < w[1]), "clients are not in ascending wg_pub order");
+}
+
 #[test]
 fn pqkey_blob_binds_the_configured_gateway_key_and_its_kat_decapsulates() {
     let d = &deployment().0;

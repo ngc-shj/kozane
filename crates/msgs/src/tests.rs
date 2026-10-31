@@ -43,6 +43,21 @@ fn transport_keeps_the_whole_message() {
     assert_eq!(Transport::decode(&out[..5]), Err(Malformed));
 }
 
+/// M8 plan C8: the peer id rides in front of the packet, which is kept
+/// whole; an empty input names no peer.
+#[test]
+fn tunnel_packet_carries_the_peer_and_the_whole_packet() {
+    let mut out = [0u8; 64];
+    let m = TunnelPacket { peer: 7, packet: b"\x45 an IPv4 datagram" };
+    let n = m.encode(&mut out).unwrap();
+    assert_eq!(n, 1 + m.packet.len());
+    assert_eq!(out[0], 7);
+    assert_eq!(TunnelPacket::decode(&out[..n]), Ok(m));
+    assert_eq!(TunnelPacket::decode(&[3]), Ok(TunnelPacket { peer: 3, packet: b"" }));
+    assert_eq!(TunnelPacket::decode(&[]), Err(Malformed));
+    assert_eq!(m.encode(&mut out[..n - 1]), None);
+}
+
 #[test]
 fn to_ingress_variants_round_trip_and_unknown_tags_fail() {
     let mut out = [0u8; 64];

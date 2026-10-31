@@ -11,6 +11,10 @@
 //! port from its own ports, and only that backend's segments to those
 //! ports reach `tls`. Both are local delivery, not routed hops, so the TTL
 //! is left alone.
+//!
+//! What a peer may reach through the tunnel, and what may answer it, is
+//! [`flow`]'s (M8 plan C8): the PD asks it before `to_lan` and before a
+//! `from_lan` datagram goes to `data`.
 
 #![no_std]
 #![deny(
@@ -21,6 +25,8 @@
     clippy::panic,
     clippy::arithmetic_side_effects
 )]
+
+pub mod flow;
 
 use wire::{ArpOp, ArpPacket, Body, DropReason, EthAddrs, Frame, IPPROTO_TCP, Ip4Packet, Ipv4, Mac};
 

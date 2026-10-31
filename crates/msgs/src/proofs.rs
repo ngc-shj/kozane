@@ -21,6 +21,11 @@ fn small_decoders_are_total_and_round_trip() {
         kani::cover!(!m.msg.is_empty());
         assert!(m.encode(&mut out) == Some(len) && out.get(..len) == Some(b));
     }
+    if let Ok(m) = TunnelPacket::decode(b) {
+        kani::cover!(!m.packet.is_empty());
+        assert!(b.first() == Some(&m.peer));
+        assert!(m.encode(&mut out) == Some(len) && out.get(..len) == Some(b));
+    }
 }
 
 /// Longest `RpDatagram` on the wire (RespHello) plus one byte, so every

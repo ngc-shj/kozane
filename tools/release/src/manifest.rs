@@ -5,8 +5,9 @@
 
 /// Every key a manifest carries, in its required (sorted) order.
 /// `firmware_sha256` is flash.bin's, and `pcrs` the PCRs 0-8 the envelopes
-/// are sealed to, comma-separated (M7 plan C4).
-pub const KEYS: [&str; 10] = [
+/// are sealed to, comma-separated (M7 plan C4). `release_seq` is the
+/// release's `RELEASE_SEQ` (M8 plan C9, D5), a canonical decimal `u32`.
+pub const KEYS: [&str; 11] = [
     "boot_desc_sha256",
     "cargo_lock_sha256",
     "commit",
@@ -15,6 +16,7 @@ pub const KEYS: [&str; 10] = [
     "kani",
     "loader_img_sha256",
     "pcrs",
+    "release_seq",
     "verus",
     "version",
 ];
@@ -72,6 +74,9 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<(String, String)>, ManifestError> {
         if !KEYS.contains(&key) {
             return Err(ManifestError::Unknown(key.to_string()));
         }
+        if key == "release_seq" && !is_canonical_u32(value) {
+            return Err(ManifestError::BadValue(n));
+        }
         if let Some((last, _)) = fields.last() {
             if last.as_str() == key {
                 return Err(ManifestError::Duplicate(key.to_string()));
@@ -92,6 +97,12 @@ pub fn parse(bytes: &[u8]) -> Result<Vec<(String, String)>, ManifestError> {
         }
     }
     Ok(fields)
+}
+
+/// A `u32` in decimal with no sign, no leading zero (but `0` itself) and no
+/// other byte, so one sequence number has one spelling.
+fn is_canonical_u32(v: &str) -> bool {
+    v.bytes().all(|b| b.is_ascii_digit()) && (v == "0" || !v.starts_with('0')) && v.parse::<u32>().is_ok()
 }
 
 /// The canonical bytes for these fields (each key once; any order in).

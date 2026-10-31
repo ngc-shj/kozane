@@ -14,8 +14,8 @@ use core::fmt::{self, Write};
 use core::ptr::NonNull;
 
 use audit_event::{
-    Decoded, HTTP_REFUSED_NAMES, POLICY_REASON_NAMES, POLICY_SLOT_NAMES, POLICY_STATE_REFUSED, Record, TCP_LIMIT_NAMES,
-    TLS_CLOSED_NAMES, TLS_REFUSED_NAMES, TLS_TIMEOUT_NAMES, UnknownCodes, decode, log,
+    Decoded, HTTP_REFUSED_NAMES, INNER_REASON_NAMES, POLICY_REASON_NAMES, POLICY_SLOT_NAMES, POLICY_STATE_REFUSED,
+    Record, TCP_LIMIT_NAMES, TLS_CLOSED_NAMES, TLS_REFUSED_NAMES, TLS_TIMEOUT_NAMES, UnknownCodes, decode, log,
 };
 use layout::{AUDIT_RING_SLOTS, audit as ch};
 use ring::shmem::ShmRing;
@@ -244,6 +244,14 @@ impl Audit {
                     _ => false,
                 }
             }
+            // M8 plan C8: `inner`'s group-authorization drops, per peer.
+            Decoded::InnerDenied { peer, reason } => match INNER_REASON_NAMES.get(usize::from(reason)) {
+                Some(name) => {
+                    println!(uart, "audit: src={} InnerDenied({}) peer={} total={} lost={}", src, name, peer, r.a, r.b);
+                    true
+                }
+                None => false,
+            },
             Decoded::Unknown => false,
         };
         if !named && let Some(total) = self.unknown.record() {

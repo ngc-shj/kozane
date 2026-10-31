@@ -8,13 +8,17 @@
 flash.bin}. The manifest's image, descriptor and firmware digests and its
 PCRs 0-8 come from the files it ships, the PCRs through tools/measure.py (the
 one host model of TF-A's and the boot command's measurements, M7 plan C4),
-and must agree with the package's own pcrs. A tree with
+and must agree with the package's own pcrs. Its release_seq is read from
+crates/release-seq, the constant the `policy` PD compiles in (M8 plan C9,
+D5), never given on the command line. A tree with
 uncommitted changes to tracked files is refused: the commit a release names
 must be the tree it was built from.
 
 `verify` checks both signatures (tools/release), then recomputes every digest
 and PCRs 0-8 from the shipped files and compares them with the signed
-fields; with --envelope it also checks that the envelope (of --kind: `key`'s,
+fields, and refuses a release_seq other than crates/release-seq's: the
+release is checked against the source it claims to be; with --envelope it
+also checks that the envelope (of --kind: `key`'s,
 `pqkey`'s or `tlskey`'s) has a sealed object that enforces the signed PCRs
 (`mksecrets check-envelope`, the PDs' own parser).
 
@@ -26,6 +30,7 @@ import argparse
 import hashlib
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -36,6 +41,7 @@ sys.path.insert(0, str(ROOT / "tools"))
 import measure  # noqa: E402
 
 RELEASE_BIN = ROOT / "build/release/target/release/release"
+RELEASE_SEQ_SRC = ROOT / "crates/release-seq/src/lib.rs"
 
 
 class Refused(Exception):
@@ -55,6 +61,15 @@ def tool(*args, capture=True) -> str:
 
 def git(*args) -> str:
     return subprocess.run(["git", *args], cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def release_seq() -> str:
+    """crates/release-seq's RELEASE_SEQ, the one place the number is set
+    (check-pins P30)."""
+    found = re.findall(r"^pub const RELEASE_SEQ: u32 = (0|[1-9][0-9]*);$", RELEASE_SEQ_SRC.read_text(), re.M)
+    if len(found) != 1 or int(found[0]) > 0xFFFFFFFF:
+        raise Refused(f"{RELEASE_SEQ_SRC.relative_to(ROOT)}: no single `pub const RELEASE_SEQ: u32 = <n>;`")
+    return found[0]
 
 
 def versions() -> dict:
@@ -95,6 +110,7 @@ def make(a) -> None:
         "firmware_sha256": sha256(firmware),
         "pcrs": ",".join(pcrs),
         "cargo_lock_sha256": sha256(ROOT / "Cargo.lock"),
+        "release_seq": release_seq(),
         **versions(),
     }
     manifest = tool("render", *(f"{k}={v}" for k, v in fields.items()))
@@ -141,6 +157,9 @@ def verify(a) -> None:
     for key, value in want.items():
         if fields.get(key) != value:
             raise Refused(f"{key}: the shipped files give {value}, the signed manifest says {fields.get(key)}")
+    seq = release_seq()
+    if fields.get("release_seq") != seq:
+        raise Refused(f"release_seq: crates/release-seq says {seq}, the signed manifest says {fields.get('release_seq')}")
     if a.envelope:
         r = subprocess.run(["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "check-envelope",
                             "--kind", a.kind, "--envelope", a.envelope, "--pcrs", fields["pcrs"]],

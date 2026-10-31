@@ -19,7 +19,9 @@ FILES = ["docker/Dockerfile", "Makefile", "rust-toolchain.toml", "Cargo.toml", "
          "policy/old-name-allowlist", "tests/integration/run.py", "tests/tools/test_config_build.py",
          "tools/check-pins", "tests/tools/test_check_pins.py",
          # P24: the firmware's flags and the boot path.
-         "support/tf-a/build-flags", "support/u-boot/boot.cmd", "support/u-boot/kozane.config"]
+         "support/tf-a/build-flags", "support/u-boot/boot.cmd", "support/u-boot/kozane.config",
+         # P30: the release script that signs release_seq.
+         "tools/release.py"]
 # P7's cases run on a tree whose crates/ is replaced by a synthetic one.
 # P7 is enforced, so they need no --enforce-pending.
 ENFORCE: list = []
@@ -857,6 +859,20 @@ CASES = [
      lambda t: append(t / "crates/pds/tpm/src/main.rs", "const X: u32 = tpm2_wire::CC_NV_READ;\n")),
     ("allow the refused set in the gate", set(),
      lambda t: append(t / "crates/tpm2-wire/src/gate.rs", "const X: u32 = CC_NV_WRITE_LOCK;\n")),
+    # P30 (M8 plan C9): release_seq comes from crates/release-seq only.
+    ("P30 release.py signing a literal release_seq", {"P30"},
+     lambda t: edit(t / "tools/release.py", '"release_seq": release_seq(),', '"release_seq": "1",')),
+    ("P30 release.py's verify not comparing release_seq", {"P30"},
+     lambda t: edit(t / "tools/release.py", 'if fields.get("release_seq") != seq:', "if False:")),
+    ("P30 a second RELEASE_SEQ in the source", {"P30"},
+     lambda t: append(t / "crates/release-seq/src/lib.rs", "#[cfg(x)]\npub const RELEASE_SEQ: u32 = 2;\n")),
+    ("P30 release_seq dropped from the manifest keys", {"P30"},
+     lambda t: edit(t / "tools/release/src/manifest.rs", '    "release_seq",\n', "")),
+    ("P30 the release tool spelling a release_seq value", {"P30"},
+     lambda t: append(t / "tools/release/src/main.rs", 'const DEFAULT: &str = "release_seq=1";\n')),
+    ("allow release_seq values in the release tool's tests and in comments", set(),
+     lambda t: (append(t / "tools/release/src/tests.rs", 'const X: &str = "release_seq=7";\n'),
+                append(t / "tools/release/src/main.rs", "// e.g. release_seq=7 in a manifest\n"))),
 ]
 
 

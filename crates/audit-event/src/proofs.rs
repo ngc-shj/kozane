@@ -1,4 +1,5 @@
-//! Kani harnesses for the `policy` code ranges (M8 plan C9, F41, F45):
+//! Kani harnesses for the `policy` and `InnerDenied` code ranges (M8 plan
+//! C9, F41, F43, F45):
 //! over every slot, reason and value, the encoding stays in its range and
 //! the decoding names exactly what was encoded, or `Unknown` for an
 //! out-of-range input; and the log never writes past its page.
@@ -65,6 +66,34 @@ fn only_policy_codes_decode_as_policy_kinds() {
     if policy {
         assert!((POLICY_ACCEPTED_BASE..POLICY_REJECTED_UNKNOWN).contains(&code));
     }
+}
+
+/// I9.5 (M8 plan C9, F43, F45): `InnerDenied` decodes as its own peer and
+/// reason when both are in range, and as `Unknown` otherwise (the block's
+/// reserved last code, or `INNER_DENIED_UNKNOWN` for a peer out of range);
+/// no other code decodes as it; its counter slot is in bounds.
+#[kani::proof]
+fn inner_denied_encodes_and_decodes_exactly() {
+    let (peer, reason): (u16, u16) = (kani::any(), kani::any());
+    let ev = Event::InnerDenied { peer, reason };
+    let code = ev.code();
+    assert!((INNER_DENIED_BASE..=INNER_DENIED_UNKNOWN).contains(&code));
+    if peer < INNER_PEERS && usize::from(reason) < INNER_REASON_NAMES.len() {
+        assert!(decode(code) == Decoded::InnerDenied { peer, reason });
+    } else {
+        assert!(decode(code) == Decoded::Unknown);
+    }
+    if peer >= INNER_PEERS {
+        assert!(code == INNER_DENIED_UNKNOWN);
+    }
+    assert!(ev.slot() < SLOTS);
+    assert!(ev.is_coalesced() && ev.value().is_none());
+    let other: u16 = kani::any();
+    if let Decoded::InnerDenied { peer, reason } = decode(other) {
+        assert!(Event::InnerDenied { peer, reason }.code() == other);
+    }
+    kani::cover!(peer == INNER_PEERS - 1 && usize::from(reason) == INNER_REASON_NAMES.len() - 1);
+    kani::cover!(peer < INNER_PEERS && usize::from(reason) == INNER_REASON_NAMES.len());
 }
 
 /// I9.4: the log writer writes only inside its page, and the reader's

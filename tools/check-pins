@@ -190,6 +190,16 @@ the only guard for pqkey-core's wrappers. L8's adjudicating control is
      gate.rs (the refused set), tests.rs, proofs.rs} and in
      crates/tpm2/tests (the interop tests drive swtpm directly). A
      tripwire: the gate's per-client allowlist is the control
+  P30 the release sequence has one source (M8 plan C9, D5):
+     crates/release-seq/src/lib.rs defines exactly one `pub const
+     RELEASE_SEQ: u32 = <n>;`; tools/release/src/manifest.rs keeps
+     "release_seq" among the manifest's KEYS; tools/release.py reads that
+     file (`RELEASE_SEQ_SRC`), `make` signs `"release_seq": release_seq()`
+     and `verify` compares the signed value with `release_seq()`; and no
+     release_seq value is spelled as a literal (`release_seq=<n>`,
+     `"release_seq": "<n>"`) in tools/release.py, the Makefile or
+     tools/release/src outside its tests.rs. A tripwire over source text:
+     the adjudicating control is verify's refusal (test_release.py)
 """
 
 import argparse
@@ -205,7 +215,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P18",
-         "P19", "P20", "P21", "P22", "P23", "P24", "P25", "P26", "P27", "P28", "P29"]
+         "P19", "P20", "P21", "P22", "P23", "P24", "P25", "P26", "P27", "P28", "P29", "P30"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
                "crates/tls-core", "crates/tlskey-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data",
@@ -1124,6 +1134,41 @@ def check_nv_writes(root: pathlib.Path, out: list):
                 out.append(f"P29 {rel}:{n}: an NV define/write/delete or Clear command outside the gate's refused set (M8 plan C3)")
 
 
+# P30: the release sequence's one source and its two readers in release.py.
+RELEASE_SEQ_SRC = "crates/release-seq/src/lib.rs"
+RELEASE_SEQ_CONST = re.compile(r"^pub const RELEASE_SEQ: u32 = (0|[1-9][0-9]*);$", re.M)
+RELEASE_PY = "tools/release.py"
+RELEASE_PY_NEEDS = ('"crates/release-seq/src/lib.rs"', '"release_seq": release_seq(),', "seq = release_seq()",
+                    'fields.get("release_seq") != seq')
+RELEASE_MANIFEST = "tools/release/src/manifest.rs"
+RELEASE_SEQ_LITERAL = re.compile(r"""release_seq["']?\s*[:=]\s*["']?[0-9]""")
+
+
+def check_release_seq(root: pathlib.Path, out: list):
+    src = root / RELEASE_SEQ_SRC
+    consts = RELEASE_SEQ_CONST.findall(src.read_text()) if src.exists() else []
+    named = len(re.findall(r"\bconst RELEASE_SEQ\b", src.read_text())) if src.exists() else 0
+    # A tree without the crate (the synthetic P7 fixtures) does not build;
+    # release.py refuses to sign without the file.
+    if src.parent.parent.is_dir() and (len(consts) != 1 or named != 1):
+        out.append(f"P30 {RELEASE_SEQ_SRC}: not exactly one `pub const RELEASE_SEQ: u32 = <n>;` (M8 plan C9)")
+    py = root / RELEASE_PY
+    text = py.read_text() if py.exists() else ""
+    for needed in RELEASE_PY_NEEDS:
+        if text.count(needed) != 1:
+            out.append(f"P30 {RELEASE_PY}: `{needed}` {text.count(needed)} times, want once: the release_seq "
+                       "make signs and verify checks comes from crates/release-seq (M8 plan C9)")
+    manifest = root / RELEASE_MANIFEST
+    if '    "release_seq",\n' not in (manifest.read_text() if manifest.exists() else ""):
+        out.append(f"P30 {RELEASE_MANIFEST}: release_seq is not a manifest key (M8 plan C9)")
+    scanned = [(RELEASE_PY, text), ("Makefile", (root / "Makefile").read_text())]
+    scanned += [(rel, t) for rel, t in crate_sources(root, "tools/release/src") if not rel.endswith("/tests.rs")]
+    for rel, t in scanned:
+        for n, line in enumerate(t.splitlines(), 1):
+            if not line.lstrip().startswith(("#", "//")) and RELEASE_SEQ_LITERAL.search(line):
+                out.append(f"P30 {rel}:{n}: a release_seq value spelled out; it comes from {RELEASE_SEQ_SRC} (M8 plan C9)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
@@ -1144,6 +1189,7 @@ def main() -> int:
     check_forbidden(root, out)
     check_policy(root, out)
     check_nv_writes(root, out)
+    check_release_seq(root, out)
     check_secret_derives(root, out)
     check_secret_copies(root, out)
     check_cookie_compares(root, out)

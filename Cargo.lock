@@ -699,6 +699,8 @@ dependencies = [
 name = "inner-core"
 version = "0.1.0"
 dependencies = [
+ "limits",
+ "policy-wire",
  "wire",
 ]
 
@@ -1248,8 +1250,11 @@ dependencies = [
  "audit-event",
  "boot-stage",
  "config",
+ "cpu",
  "inner-core",
  "layout",
+ "limits",
+ "msgs",
  "pdkit",
  "policy-client",
  "policy-wire",

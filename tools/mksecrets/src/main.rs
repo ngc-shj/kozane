@@ -360,8 +360,12 @@ fn generate(
     let mut rng = Urandom::open()?;
     let gateway = keypair()?;
     let gateway_rp = mceliece_keypair(&mut rng)?;
-    let peer_keys: Vec<(KeyPair, McEliece)> =
+    let mut peer_keys: Vec<(KeyPair, McEliece)> =
         (0..clients).map(|_| Ok((keypair()?, mceliece_keypair(&mut rng)?))).collect::<Result<_, String>>()?;
+    // Client i is the bundle's peer i: a bundle orders its peers by raw
+    // wg_pub (M8 plan C1), so numbering the clients the same way keeps a
+    // test's peer ids fixed from run to run instead of random.
+    peer_keys.sort_by_key(|(k, _)| k.public);
     // The plan's order (F13): the scalar and tls.pub first, then mkcert,
     // then the config naming the leaf, validated last.
     let (tls_private, tls_public) = p256_keypair()?;

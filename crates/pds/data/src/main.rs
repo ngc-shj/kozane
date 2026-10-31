@@ -1,6 +1,7 @@
 //! `data` (plan C12): transport sessions. Decrypts inbound transport
-//! messages for `inner`, encrypts inside traffic for `ingress`, and is
-//! with `inner` the only reader of tunnelled plaintext (law L3).
+//! messages for `inner`, each tagged with the peer it authenticated (M8
+//! plan C8), encrypts inside traffic for `ingress`, and is with `inner`
+//! the only reader of tunnelled plaintext (law L3).
 
 #![no_std]
 #![no_main]
@@ -8,7 +9,7 @@
 use audit_event::Event;
 use data_core::{AllowedIps, Data, InboundOutcome, InstallOutcome, OutboundOutcome, PassIo, Payload, run_passes};
 use layout::data as ch;
-use msgs::ToIngress;
+use msgs::{ToIngress, TunnelPacket};
 use pdkit::{Audit, Buf, Rx, Tx};
 use policy_wire::Bundle;
 use ring::pass::drain;
@@ -190,11 +191,15 @@ impl DataPd {
                 match payload {
                     Payload::Keepalive => {}
                     Payload::Forward(p) => {
+                        // `inner` authorizes by the peer `data` authenticated
+                        // (M8 plan C8): the bundle index rides in front.
                         let mut copy = [0u8; layout::NET_BUF_SIZE];
-                        let len = p.len();
-                        if let Some(dst) = copy.get_mut(..len) {
-                            dst.copy_from_slice(p);
-                            wake.inner |= pdkit::send(to_inner, scratch, copy.get(..len).unwrap_or(&[]), audit);
+                        let m = u8::try_from(peer).ok().map(|peer| TunnelPacket { peer, packet: p });
+                        match m.and_then(|m| m.encode(&mut copy)) {
+                            Some(len) => {
+                                wake.inner |= pdkit::send(to_inner, scratch, copy.get(..len).unwrap_or(&[]), audit);
+                            }
+                            None => audit.record(Event::FrameTooLong),
                         }
                         copy.fill(0);
                     }

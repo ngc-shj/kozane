@@ -180,6 +180,24 @@ const _: () = assert!(RELEASE_SEQ < POLICY_UNAVAILABLE_BASE);
 const _: () = assert!(POLICY_UNAVAILABLE_BASE + POLICY_REASONS < POLICY_REJECTED_BASE);
 const _: () = assert!(POLICY_LAST_CODE < 0x0340);
 
+/// `inner`'s group-authorization drops (M8 plan C8, C9 F43), coalesced per
+/// peer and reason: `INNER_DENIED_BASE + peer × INNER_REASONS + reason`, `a`
+/// the running total and `b` the lost count as for every coalesced kind.
+/// Each peer's block keeps its last code as its own unknown, and a peer id
+/// at or above `INNER_PEERS` encodes to `INNER_DENIED_UNKNOWN`, outside every
+/// block (F45). `inner_core::flow::Denied`'s variants, by code; `inner`
+/// asserts at compile time that this table matches the enum and that
+/// `INNER_PEERS` is `limits::MAX_PEERS` (this crate depends on neither).
+pub const INNER_REASON_NAMES: [&str; 4] = ["NoRule", "UnknownPeer", "NoFlow", "IcmpError"];
+/// Codes per peer: every reason and the block's unknown.
+pub const INNER_REASONS: u16 = INNER_REASON_CODES_REAL + 1;
+/// The real reasons; the next code in a peer's block is its unknown.
+const INNER_REASON_CODES_REAL: u16 = INNER_REASON_NAMES.len() as u16;
+pub const INNER_PEERS: u16 = 8;
+pub const INNER_DENIED_BASE: u16 = 0x0340;
+pub const INNER_DENIED_UNKNOWN: u16 = INNER_DENIED_BASE + INNER_PEERS * INNER_REASONS;
+const _: () = assert!(INNER_DENIED_UNKNOWN < 0x0380);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
     ArpReplied,
@@ -369,6 +387,10 @@ pub enum Event {
     /// is the slot's version if its signatures verified, else 0 (never
     /// coalesced, at most once per slot and boot).
     PolicyRejected { slot: u16, reason: u16, version: u32 },
+    /// `inner` dropped a packet from or for peer `peer` (the bundle index)
+    /// for `reason`, an `inner_core::flow::Denied` code (coalesced per peer
+    /// and reason, M8 plan C8).
+    InnerDenied { peer: u16, reason: u16 },
 }
 
 impl Event {
@@ -467,6 +489,7 @@ impl Event {
                     POLICY_REJECTED_UNKNOWN
                 }
             }
+            Event::InnerDenied { peer, reason } => inner_denied_code(peer, reason),
         }
     }
 
@@ -623,6 +646,7 @@ impl Event {
             Event::ReleaseSeq { .. } => "ReleaseSeq",
             Event::PolicyUnavailable { .. } => "PolicyUnavailable",
             Event::PolicyRejected { .. } => "PolicyRejected",
+            Event::InnerDenied { .. } => "InnerDenied",
         }
     }
 
@@ -657,6 +681,7 @@ impl Event {
             Event::ArpReplied
             | Event::UdpEchoed
             | Event::FrameDropped { .. }
+            | Event::InnerDenied { .. }
             | Event::TcpLimited { .. }
             | Event::TlsRefused { .. }
             | Event::TlsClosed { .. }
@@ -833,6 +858,9 @@ impl Event {
             | Event::PolicyRejected { .. } => {
                 POLICY_SLOT.saturating_add(self.code().saturating_sub(POLICY_ACCEPTED_BASE) as usize)
             }
+            // One slot per code, INNER_SLOT..: `code` keeps the event inside
+            // INNER_DENIED_BASE..=INNER_DENIED_UNKNOWN.
+            Event::InnerDenied { .. } => INNER_SLOT.saturating_add(self.code().saturating_sub(INNER_DENIED_BASE) as usize),
         }
     }
 }
@@ -854,7 +882,21 @@ const HTTP_REFUSED_SLOT: usize = TLS_CLOSED_SLOT + MAX_TLS_KIND as usize + 1;
 const TLS_TIMEOUT_SLOT: usize = HTTP_REFUSED_SLOT + MAX_TLS_KIND as usize + 1;
 const TLS_KIND_UNKNOWN_SLOT: usize = TLS_TIMEOUT_SLOT + MAX_TLS_KIND as usize + 1;
 const POLICY_SLOT: usize = TLS_KIND_UNKNOWN_SLOT + 1;
-const SLOTS: usize = POLICY_SLOT + (POLICY_LAST_CODE - POLICY_ACCEPTED_BASE) as usize + 1;
+const INNER_SLOT: usize = POLICY_SLOT + (POLICY_LAST_CODE - POLICY_ACCEPTED_BASE) as usize + 1;
+const SLOTS: usize = INNER_SLOT + (INNER_DENIED_UNKNOWN - INNER_DENIED_BASE) as usize + 1;
+
+/// `InnerDenied`'s code: the peer's block and the reason in it, the block's
+/// unknown for an out-of-range reason, `INNER_DENIED_UNKNOWN` for an
+/// out-of-range peer (never clamped onto a real peer or reason).
+const fn inner_denied_code(peer: u16, reason: u16) -> u16 {
+    if peer >= INNER_PEERS {
+        return INNER_DENIED_UNKNOWN;
+    }
+    // Bounded by INNER_PEERS × INNER_REASONS (asserted below 0x0380), so
+    // the wrapping operations never wrap.
+    let r = if reason < INNER_REASON_CODES_REAL { reason } else { INNER_REASON_CODES_REAL };
+    INNER_DENIED_BASE.wrapping_add(peer.wrapping_mul(INNER_REASONS)).wrapping_add(r)
+}
 
 /// A policy reason inside its range: the reason, or the range's unknown.
 const fn policy_reason(reason: u16) -> u16 {
@@ -987,6 +1029,9 @@ pub enum Decoded {
     PolicyUnavailable(u16),
     /// `PolicyRejected`: the slot and the reason; `a` is the slot's version.
     PolicyRejected { slot: u16, reason: u16 },
+    /// `InnerDenied`: the peer (< `INNER_PEERS`) and the reason (an index
+    /// into `INNER_REASON_NAMES`); `a` is the running total.
+    InnerDenied { peer: u16, reason: u16 },
     Unknown,
 }
 
@@ -1045,6 +1090,12 @@ pub fn decode(code: u16) -> Decoded {
         && reason < POLICY_REASONS
     {
         return Decoded::PolicyRejected { slot, reason };
+    }
+    if let Some(i) = code.checked_sub(INNER_DENIED_BASE).filter(|i| *i < INNER_DENIED_UNKNOWN - INNER_DENIED_BASE)
+        && let (Some(peer), Some(reason)) = (i.checked_div(INNER_REASONS), i.checked_rem(INNER_REASONS))
+        && reason < INNER_REASON_CODES_REAL
+    {
+        return Decoded::InnerDenied { peer, reason };
     }
     match code.checked_sub(FRAME_DROPPED_BASE) {
         Some(r) if r <= MAX_DROP_REASON => Decoded::FrameDropped(r),

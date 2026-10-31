@@ -29,5 +29,21 @@ pub const SPK_LEN: usize = 524_160;
 /// so every fleet size fits one slot with no variable-length framing.
 pub const BUNDLE_MAX: usize = 0x480_000;
 
+/// Flows `inner` tracks for peer-opened traffic (M8 plan C8, D9): each peer
+/// owns `MAX_FLOWS / MAX_PEERS` of them (64), room for a device's working
+/// set of LAN connections, while one outbound lookup scans at most 512
+/// entries (about 20 KiB, held in a static, not on `inner`'s stack).
+pub const MAX_FLOWS: usize = 512;
+/// A flow with no packet either way for this long ends: two minutes, the
+/// common NAT/conntrack idle bound for UDP, so a quiet TCP connection (an
+/// idle SSH session) needs its own keepalives, as it would behind any NAT.
+pub const FLOW_IDLE_NS: u64 = 120_000_000_000;
+/// A TCP flow stays this long after FIN was seen both ways, so the last ACK
+/// and a retransmitted FIN still pass: ten seconds, well above a LAN RTT
+/// and short enough that a closed flow frees its slot soon.
+pub const FLOW_LINGER_NS: u64 = 10_000_000_000;
+const _: () = assert!(MAX_FLOWS.is_multiple_of(MAX_PEERS) && MAX_FLOWS / MAX_PEERS >= 1, "MAX_FLOWS must split into per-peer quotas");
+const _: () = assert!(FLOW_LINGER_NS < FLOW_IDLE_NS, "a closed flow outlives an idle one");
+
 #[cfg(test)]
 mod tests;

@@ -408,3 +408,59 @@ Run in a scratch worktree (`build/probes/p3/tree`, since removed).
   `wait_arp_ready` now drains them. The device is unchanged.
 - **`make run`.** `run_interactive` still boots zero slots, so every
   barrier PD halts with 16. It gets the fixtures in slice 6 (C13).
+
+## Slice 4
+
+### D-16 — the PSK residue check's false positive, and deterministic peer ids
+
+- **Symptom.** From slice 3 on, the wireguard group's residue check failed
+  about one run in three: "PskInstall message still in guest RAM". It
+  failed at the same address within a build, and stayed for more than
+  60 s once present.
+  - Slice 2 (be80a94) was clean in 5/5 runs. HEAD 5fbc648 failed 1/3
+    and 2/4, so slice 4 did not introduce it.
+- **Cause.** The needle is the encoded message: `u16 peer (LE) ‖ OSK`.
+  Since slice 3, peer ids follow the bundle's order of random per-run
+  WireGuard keys, so client 1 is peer 0 about a third of the time.
+  - The needle `0000 ‖ OSK` then matches `hs`'s live PSK table entry:
+    tag `1` (`Live`), `installed_at` (e.g. `30da193306000000`, about
+    26.6 s, whose top two bytes are `0000`), then the OSK.
+  - Observed directly: the OSK occurs 5 times, as often as the control,
+    and the match is that entry.
+  - So there is no leak. The live OSK belongs there until REJECT_AFTER_TIME.
+- **Fix.**
+  - `mksecrets --clients` numbers its clients in bundle order (ascending
+    raw `wg_pub`), so client i is always peer i, and the needle begins
+    `0100` as it did before M8.
+  - Test: `clients_are_numbered_in_bundle_order`. Its red-proof is only
+    probabilistic (about 1/2 with two random clients), because the keys
+    are random.
+  - The check itself is unchanged.
+- **Verified.** With the fix, the wireguard group passed 5/5 runs on z1mn
+  (20 cases each).
+
+### D-17 — I8.3 is proved one step at a time
+
+- **Why.** The delegated I8.3 harness ran a sequence of three operations
+  over a symbolic table. It ran CBMC out of memory at the 40 GB cap three
+  times, at about 1.6 M steps: with full-width fields; with fields cut to
+  two values each; and again with the `cfg(kani)` table at one entry a
+  peer and the clock limited to its boundaries.
+- **The restatement.** I8.3 is stated by induction, each step proved from
+  an arbitrary table state:
+  - (a) an outbound `Allow` names a live entry of that peer's share for
+    the reversed tuple;
+  - (b) an outbound packet makes no entry alive;
+  - (c) an inbound `Deny` changes nothing.
+
+  Only an inbound `Allow` makes an entry alive, and I8.1 says that needs a
+  matching rule, so over any sequence an outbound `Allow` answers a flow
+  its peer opened under its rules.
+- **Bounds.** Two values per field, the clock and timestamps free.
+  `cfg(kani)` `MAX_FLOWS = MAX_PEERS`, one entry a peer, so an own-share
+  eviction still happens.
+- **Results.** All six inner-core harnesses verify: (a) 13 s, (b) 29 s,
+  (c) 18 min, I8.1 35 min, I8.2 18 min, I8.4 20 min. Every `cover!` is
+  satisfied.
+- **Red-proof.** On a scratch copy, an `authorize_outbound` naming the
+  wrong peer (`i / QUOTA ^ 1`) makes (a) fail.
