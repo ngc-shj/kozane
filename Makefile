@@ -149,9 +149,11 @@ package: image ct-harness $(firmware)
 # their own; the kernel, the C9 harness and the firmware are the main
 # build's. `net`: ingress faults on frame A and halts on frame B, audit
 # faults on ingress's first WgBadMessage; `timer`: the timer faults on a
-# tick. tools/release.py refuses an image either built.
+# tick; `policy` (M8 plan C13): `policy` stops after a confirmed ADVANCE,
+# before it selects. tools/release.py refuses an image any of them built.
 fault_inject_net := features_ingress=fault-inject features_audit=fault-inject
 fault_inject_timer := features_timer=fault-inject
+fault_inject_policy := features_policy=fault-inject
 package-fault-inject-%: ct-harness $(firmware)
 	$(if $(fault_inject_$*),,$(error no fault-inject variant '$*'))
 	$(MAKE) package BUILD=$(BUILD)/fault-inject-$* $(fault_inject_$*) ct_dir=$(ct_dir) firmware=$(firmware)
@@ -161,10 +163,13 @@ package-fault-inject-%: ct-harness $(firmware)
 # was sealed to (tools/provision, then `make package`), through the one QEMU
 # argv builder the suite uses (tests/integration/run.py). Both NICs as the
 # integration test wires them: outside on user-net with 51820 forwarded to
-# RUN_PORT, inside on a dgram socket.
+# RUN_PORT, inside on a dgram socket. The bundle slots are the node's, never
+# the package's (M8 plan C4): SLOT_A is the slot `tools/provision nv` wrote
+# when it provisioned TPM_STATE, SLOT_B the inactive one (zeros if unset).
+# Without a signed slot A at TPM_STATE's version every barrier PD halts (C6).
 RUN_PORT ?= 51820
 run: $(firmware)
-	python3 tests/integration/run.py --run "$(PKG)" "$(TPM_STATE)" $(RUN_PORT)
+	python3 tests/integration/run.py --run "$(PKG)" "$(TPM_STATE)" $(RUN_PORT) "$(SLOT_A)" "$(SLOT_B)"
 
 # The crate-level clippy denies (indexing, unwrap, arithmetic) only bite here.
 lint: | $(counts)

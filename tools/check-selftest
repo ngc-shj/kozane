@@ -157,6 +157,24 @@ def share_key_with_tls(tree: pathlib.Path):
 
 MIR_SPLIT = "\n{a}\npub fn selftest_split() -> u32 {{\n    1\n}}\n{b}\npub fn selftest_split() -> u32 {{\n    2\n}}\n"
 MIR_NEEDLE = "mir-gate: wire: shipped MIR differs from the proof build"
+def anchor_floor(tree: pathlib.Path):
+    """M8 plan C5's anchor counted only if it passes the release floor
+    (C13 `floor-lowering` says it counts whatever its floor): `select`'s
+    release_seq threaded into resolve_candidate, which then refuses an
+    anchor above it."""
+    rel = "crates/policy-wire/src/lib.rs"
+    edit(tree, rel, "fn resolve_candidate(current: u32, slot: Slot,", "fn resolve_candidate(release_seq: u32, current: u32, slot: Slot,")
+    p = tree / rel
+    text = p.read_text()
+    if text.count("resolve_candidate(current, ") != 5:
+        raise SystemExit(f"selftest: {rel} calls resolve_candidate {text.count('resolve_candidate(current, ')} times, want 5")
+    p.write_text(text.replace("resolve_candidate(current, ", "resolve_candidate(release_seq, current, "))
+    edit(tree, rel, "        match anchor_body_at(other, current) {\n",
+         "        match anchor_body_at(other, current)\n"
+         "            .filter(|_| matches!(other, SlotView::Valid { min_release, .. } if min_release <= release_seq))\n"
+         "        {\n")
+
+
 UNIT_TEST = "\n#[test]\nfn selftest_injected_failure() {\n    assert_eq!(1, 2);\n}\n"
 KANI_HARNESS = (
     "\n#[kani::proof]\nfn selftest_unsatisfiable_cover() {\n"
@@ -220,7 +238,9 @@ CASES_FOR_GATE = {
              "proxy-pd-backend-room", "proxy-pd-backend-rst", "https-syn-flood", "https-per-source-cap",
              "https-recycle-abort", "residue-wipe-state", "https-hello-lockstep", "cap-failure-ignored",
              "cap-barrier-skipped", "supervisor-resume", "c11-refuse-reason", "c11-no-shutdown",
-             "c11-fault-inject-serving", "c7-rndr-fault", "audit-trailer-raw"},
+             "c11-fault-inject-serving", "c7-rndr-fault", "audit-trailer-raw", "policy-pcr9-check",
+             "policy-advance-unverified", "policy-ed25519-skipped", "policy-mldsa-skipped", "policy-anchor-floor",
+             "policy-name-skipped", "policy-equivocation-removed", "policy-prev-removed", "policy-hs-barrier"},
     "repro": {"repro-path-leak", "repro-firmware-timestamp"},
     "mir": {"mir-target-split", "mir-env-split", "mir-debug-split", "mir-feature-split"},
     "manifest": {"manifest"},
@@ -864,6 +884,63 @@ CASES = {
         t, "crates/tpm2/src/boot.rs", "=> cap_barrier(tpm, &mut rsp),", "=> Ok(()),"),
                             re.compile(r"FAIL \[tpm cap failure\]: Fail: tpm cap failure: (hs|pq|tls) became ready "
                                        r"with the cap failed")),
+    # M8 plan C13's injections [T18, T29], each caught by the C13 case named.
+    # The PCR 9 check gone: slot B unmeasured, `policy` still accepts slot A.
+    "policy-pcr9-check": (["test", "it_boots=policy measure-mismatch"], lambda t: edit(
+        t, "crates/policy-wire/src/lib.rs",
+        "    if &pcr9 != expected_pcr9 {\n        return Step::Done(Outcome::Unavailable { reason: Reject::MeasureMismatch });\n    }\n",
+        "    let _ = (pcr9, expected_pcr9);\n"),
+                          "FAIL [policy measure-mismatch]: Fail: measure-mismatch (start 1): policy accepted version=1 "
+                          "slot=A, want unavailable reason=MeasureMismatch current=1"),
+    # ADVANCE on slot B's parsed version before any verification: half-bad's
+    # v2 is refused, yet the counter moved [T39].
+    "policy-advance-unverified": (["test", "it_boots=policy half-bad"], lambda t: edit(
+        t, "crates/pds/policy/src/main.rs", "    let pcr9 = expected_pcr9();\n",
+        "    if slot_bytes(Slot::B).get(22..26).and_then(|v| <[u8; 4]>::try_from(v).ok()).map(u32::from_be_bytes)\n"
+        "        == current.checked_add(1)\n    {\n        let _ = advance(current);\n    }\n"
+        "    let pcr9 = expected_pcr9();\n"),
+                                  "NV_POLICY_CTR reads logical 2, want 1"),
+    # Either half of D1's signature pair skipped: half-bad's v2 with that
+    # half bad is accepted [T38].
+    "policy-ed25519-skipped": (["test", "it_boots=policy half-bad"], lambda t: edit(
+        t, "crates/pds/policy/src/main.rs", "    ed & ml\n", "    let _ = ed;\n    ml\n"),
+                               "FAIL [policy half-bad]: Fail: half-bad (bad Ed25519): policy accepted version=2 slot=B, "
+                               "want accepted version=1 slot=A"),
+    "policy-mldsa-skipped": (["test", "it_boots=policy half-bad"], lambda t: edit(
+        t, "crates/pds/policy/src/main.rs", "    ed & ml\n", "    let _ = ml;\n    ed\n"),
+                             "FAIL [policy half-bad]: Fail: half-bad (bad ML-DSA): policy accepted version=2 slot=B, "
+                             "want accepted version=1 slot=A"),
+    "policy-anchor-floor": (["test", "it_boots=policy floor-lowering"], anchor_floor,
+                            "FAIL [policy floor-lowering]: Fail: floor-lowering (start 1): policy unavailable "
+                            "reason=PrevMismatch current=1, want accepted version=2 slot=B"),
+    # C3: `tpm` reads the counter without checking its Name, so a counter
+    # redefined without POLICY_DELETE is used.
+    "policy-name-skipped": (["test", "it_boots=policy wrong-name"], lambda t: edit(
+        t, "crates/tpm2-wire/src/gate.rs", "            if !got {\n                return Err(PolicyRefusal::Name);\n            }\n",
+        "            let _ = got;\n"),
+                            re.compile(r"FAIL \[policy wrong-name\]: Fail: wrong-name: policy accepted version=\d+ "
+                                       r"slot=A, want unavailable reason=StateRefused current=unknown")),
+    "policy-equivocation-removed": (["test", "it_boots=policy equivocation"], lambda t: edit(
+        t, "crates/policy-wire/src/lib.rs",
+        "            if ba == bb {\n                resolve_candidate(current, Slot::A, pa, na, b)\n            } else {\n"
+        "                Decision::Refuse { reason: Reject::Equivocation }\n            }\n",
+        "            let _ = (ba, bb);\n            resolve_candidate(current, Slot::A, pa, na, b)\n"),
+                                    "FAIL [policy equivocation]: Fail: equivocation (start 1): policy accepted version=1 "
+                                    "slot=A, want unavailable reason=Equivocation current=1"),
+    "policy-prev-removed": (["test", "it_boots=policy prev-mismatch"], lambda t: edit(
+        t, "crates/policy-wire/src/lib.rs", "            Some(anchor_body) if anchor_body == prev_sha256 => Decision::Advance { slot },\n",
+        "            Some(_) => Decision::Advance { slot },\n"),
+                            "FAIL [policy prev-mismatch]: Fail: prev-mismatch (start 1): policy accepted version=2 "
+                            "slot=B, want unavailable reason=PrevMismatch current=1"),
+    # C6 [T24]: hs ignores Unavailable and opens slot A under a token it
+    # made itself. Every other barrier PD still halts, ingress among them,
+    # so no initiation reaches hs; the failure-only evidence is hs serving.
+    "policy-hs-barrier": (["test", "it_boots=policy rolled-back"], lambda t: edit(
+        t, "crates/pds/hs/src/main.rs", "    let token = policy_client::await_verified(Channel::new(ch::CH_POLICY))?;\n",
+        "    let _ = policy_client::await_verified(Channel::new(ch::CH_POLICY));\n"
+        "    let token = policy_wire::Verified::from_reply(&[0; policy_wire::VERIFIED_REPLY_LEN])\n"
+        "        .ok_or(policy_wire::Reject::Malformed)?;\n"),
+                          "FAIL [policy rolled-back]: Fail: rolled-back (start 2): hs became ready with policy unavailable"),
     # I10.1 on the A7 path: without the response HMAC check the flipped
     # outData decrypts to a wrong KEK, refused only by the envelope's AEAD.
     "tpm-proxy-hmac": (["test", "it_boots=tpm proxy"], lambda t: edit(

@@ -84,7 +84,7 @@ make -C docker exec     # shell inside it
 
 make image              # build the PD ELFs and the loader image
 make package ...        # seal secrets to a provisioned TPM (tools/provision)
-make run PKG=<out> TPM_STATE=<swtpm state>   # boot the package as shipped
+make run PKG=<out> TPM_STATE=<swtpm state> SLOT_A=<its slot A>   # boot the package as shipped
 make test               # integration tests: VPN, HTTPS proxy, measured boot
 make check              # every gate: proofs, laws, constant-time, fuzz, repro, tests
 ```

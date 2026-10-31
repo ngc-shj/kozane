@@ -533,3 +533,52 @@ Run in a scratch worktree (`build/probes/p3/tree`, since removed).
 - **check-pins P31**, added on review: `audit`'s single `.pp_call(` is in
   `fn sign`, `CH_AUDITKEY` is named only there, and `ready_input` decodes
   the notification. That is T47's PD-glue pin.
+
+## Slice 6
+
+### D-20 — the supervisor drains for one second before it resets
+
+- **Symptom.** With slice 5, the supervisor group failed in 2 of 4 runs.
+  Inject A's fault reset QEMU while `audit` was in the middle of the ready
+  checkpoint's line, so the fault record never printed.
+- **Cause.**
+  - The supervisor writes the record, notifies `audit` and resets at
+    once. Before M8 this worked only because `audit` (priority 50, above
+    the supervisor's 40) usually preempted and printed first.
+  - Since slice 5, `audit` can be out of budget (500 µs per 10 ms) while
+    it prints a long checkpoint line or waits on `auditkey`'s signature.
+    The supervisor then runs on and resets.
+  - A fault that leaves no line is lost evidence.
+- **Fix.**
+  - `supervisor_core::FAULT_DRAIN_NS` = 1 s. `reset::system_reset` spins
+    on the generic timer for that long before the SMC.
+  - Spinning at the lower priority never blocks `audit`. One second is
+    about 50 ms of `audit`'s CPU, far more than a line plus a signature.
+  - The counter read sits in the reset module, where the supervisor
+    allowlist permits `unsafe`. Its S1–S8 still pass.
+  - Rejected: an acknowledgement page that `audit` writes and the
+    supervisor reads. It would carry `audit`'s taint into the supervisor,
+    which is in every PD's TCB.
+- **Cost.** One second more per fault reset (RM7-6's A11 amplification
+  is unchanged in kind).
+- **Verified.** The supervisor group passed 5/5 runs on gx10. The fix
+  has no deterministic red-proof: the race it closes is timing.
+
+### D-21 — C6's injection needle is hs becoming ready
+
+- The plan's needle for "`hs` ignores Unavailable" is a WireGuard
+  response on the wire. It cannot fire: `ingress`, another barrier PD,
+  still halts and drops the initiation, and `pq` gives no PSK.
+- The failure-only evidence is `hs` printing ready instead of halting
+  with reason 16 in the `rolled-back` case. The injection builds its own
+  token (`Verified::from_reply` of zeros) and calls `open`.
+
+### Note — one harness timeout in the wireguard group
+
+- One full `make test` after D-20 failed `wireguard` with a bare
+  `TimeoutError`. Its `FAIL` line was printed before the rotation case's
+  own `PASS`, so it came from a helper thread, not the case under test.
+- It did not recur: the group passed in the C13 agent's two full runs,
+  in three reruns, and in the next full `make test` (133 cases, rc 0).
+- It is recorded as a harness flake of about 1 in 6. If it recurs in the
+  final `make check`, it gets its own investigation rather than a retry.

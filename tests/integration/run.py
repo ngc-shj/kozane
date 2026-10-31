@@ -82,6 +82,7 @@ import itertools
 import json
 import math
 import os
+import pathlib
 import re
 import secrets
 import select
@@ -482,7 +483,8 @@ def qemu_machine(firmware: str, rng: bool = True) -> list:
 
 def boot(pkg: "Package", outside: str, inside: str, monitor: str = "", media=None, flip=None,
          fail_extend: bool = False, inject_pcr3: bool = False, fail_nth: tuple = None,
-         firmware: str = None, rng: bool = True, shutdown: str = None, resets: tuple = None) -> tuple:
+         firmware: str = None, rng: bool = True, shutdown: str = None, resets: tuple = None,
+         swallow_pcr9: bool = False) -> tuple:
     """Every boot is the shipped one (M5 plan C14): U-Boot measures and
     assembles the package's boot media (`media`, the package's own unless
     given: (path, address) pairs at measure.LOAD_*), and its TPM is a fresh
@@ -502,8 +504,8 @@ def boot(pkg: "Package", outside: str, inside: str, monitor: str = "", media=Non
     tpm = Swtpm(os.path.dirname(pkg.dir), state=pkg.state)
     proxy = None
     try:
-        if flip is not None or fail_extend or inject_pcr3 or fail_nth:
-            proxy = TpmProxy(tpm, bool(flip), fail_extend, inject_pcr3, fail_nth)
+        if flip is not None or fail_extend or inject_pcr3 or fail_nth or swallow_pcr9:
+            proxy = TpmProxy(tpm, bool(flip), fail_extend, inject_pcr3, fail_nth, swallow_pcr9)
         cmd = qemu_machine(firmware or FIRMWARE, rng)
         for path, addr in media or pkg.media():
             cmd += ["-device", f"loader,file={path},addr={addr:#x},force-raw=on"]
@@ -553,18 +555,30 @@ def spawn_qemu(cmd: list, shutdown: str = None, resets: tuple = None, tpm=None, 
     return child, con
 
 
-def run_interactive(pkg_dir: str = "", state: str = "", port: str = "51820") -> int:
+def run_interactive(pkg_dir: str = "", state: str = "", port: str = "51820", slot_a: str = "",
+                    slot_b: str = "") -> int:
     """`make run` (M7 plan I2.1): a package booted interactively the shipped
     way, through qemu_machine's firmware and a per-run copy of the swtpm
     state it was sealed to; both NICs as the suite wires them (outside on
     user-net with the WireGuard port forwarded to `port`, inside on a dgram
-    socket). Not a test: no QMP, and the console is the terminal."""
-    if not pkg_dir or not state:
-        print("run: PKG=<a `make package` OUT> TPM_STATE=<the swtpm state it was sealed to>", file=sys.stderr)
+    socket). Not a test: no QMP, and the console is the terminal.
+
+    The node's slots (M8 plan C4, C13): `slot_a` is the bundle `tools/
+    provision nv` wrote when it provisioned `state`, `slot_b` the inactive
+    slot, zero if not given. The operator brings both, as for the package."""
+    if not pkg_dir or not state or not slot_a:
+        print("run: PKG=<a `make package` OUT> TPM_STATE=<the swtpm state it was sealed to> "
+              "SLOT_A=<the slot `tools/provision nv` wrote for it> [SLOT_B=<the inactive slot>]", file=sys.stderr)
         return 2
-    # No node bundles yet (M8 slice 2): both slots zero, as the image holds.
     slots = tempfile.mkdtemp(prefix="kozane-slots-")
-    pkg = Package(pkg_dir, state, write_slots(slots, bytes(measure.BUNDLE_MAX), bytes(measure.BUNDLE_MAX)))
+    data = []
+    for path in (slot_a, slot_b):
+        data.append(open(path, "rb").read() if path else bytes(measure.BUNDLE_MAX))
+        if len(data[-1]) != measure.BUNDLE_MAX:
+            print(f"run: {path} is {len(data[-1])} bytes, not a {measure.BUNDLE_MAX:#x}-byte slot", file=sys.stderr)
+            shutil.rmtree(slots, ignore_errors=True)
+            return 2
+    pkg = Package(pkg_dir, state, write_slots(slots, *data))
     tpm = Swtpm(tempfile.gettempdir(), state=state)
     try:
         cmd = qemu_machine(FIRMWARE)
@@ -1960,13 +1974,22 @@ HALT_TABLES = {"tls": "crates/tls-core/src/halt.rs"}
 
 
 def halt_reason(pd: str, name: str) -> int:
-    """`pub const <name>: u32 = <n>;` in the PD's `halt` reason table."""
+    """`pub const <name>: u32 = <n>;` in the PD's `halt` reason table, or
+    `= layout::<module>::<const>;` for a code the PDs share (M8 plan C6:
+    every barrier PD's POLICY_UNAVAILABLE is layout::policy's)."""
     rel = HALT_TABLES.get(pd, f"crates/pds/{pd}/src/main.rs")
     src = open(os.path.join(ROOT, rel)).read()
-    m = re.search(rf"^\s*pub const {name}: u32 = (\d+);$", src, re.M)
+    m = re.search(rf"^\s*pub const {name}: u32 = (?:(\d+)|layout::(\w+)::(\w+));$", src, re.M)
     if not m:
         raise Fail(f"no halt reason {name} in {rel}")
-    return int(m.group(1))
+    if m.group(1) is not None:
+        return int(m.group(1))
+    layout = open(os.path.join(ROOT, "crates/layout/src/lib.rs")).read()
+    module = re.search(rf"^pub mod {m.group(2)} \{{\n(.*?)^\}}$", layout, re.M | re.S)
+    value = module and re.search(rf"^\s*pub const {m.group(3)}: u32 = (\d+);$", module.group(1), re.M)
+    if not value:
+        raise Fail(f"halt reason {name} in {rel} names layout::{m.group(2)}::{m.group(3)}, which has no value")
+    return int(value.group(1))
 
 
 def test_mismatched_blob(pkg: "Package"):
@@ -2047,6 +2070,9 @@ class Swtpm:
         self.dir = tempfile.mkdtemp(prefix="swtpm-", dir=parent)
         self.sock = os.path.join(self.dir, "ctrl.sock")
         self.proc = None
+        # M8 plan C13: a case-scoped state directory that close() hands
+        # this TPM's permall back to (a case's next boot starts from it).
+        self.keep = None
         try:
             if state is not None:
                 shutil.copy2(os.path.join(state, SWTPM_PERMALL), self.dir)
@@ -2072,7 +2098,13 @@ class Swtpm:
             if self.proc.poll() is None:
                 self.proc.kill()
             self.proc.wait()
-        shutil.rmtree(self.dir, ignore_errors=True)
+        try:
+            if self.keep is not None:
+                staged = os.path.join(self.keep, f".{SWTPM_PERMALL}")
+                shutil.copy2(os.path.join(self.dir, SWTPM_PERMALL), staged)
+                os.replace(staged, os.path.join(self.keep, SWTPM_PERMALL))
+        finally:
+            shutil.rmtree(self.dir, ignore_errors=True)
         if os.path.exists(self.dir):
             raise Fail(f"swtpm state {self.dir} survived its boot")
 
@@ -2134,41 +2166,118 @@ PCR0_7_SELECTION = bytes.fromhex("00000001" "000b" "03" "ff0000")
 PCR8_9_SELECTION = bytes.fromhex("00000001" "000b" "03" "000300")
 
 
-def read_pcrs(tpm: Swtpm) -> list:
-    """PCRs 0-9 of a swtpm whose QEMU has been killed (T11; M7 plan C3, C4):
-    a second control connection hands swtpm a fresh data socket
-    (CMD_SET_DATAFD; no CMD_INIT, which would restart the TPM), then two
-    TPM2_PCR_Reads. Probed host-side in M5 slice 7: swtpm keeps the TPM
-    running once the killed QEMU's data socket closes. A response that is
-    not the selection as asked with its digests is a named failure."""
+@contextlib.contextmanager
+def tpm_data(tpm: Swtpm, init: bool = False):
+    """A data socket to `tpm` through a control connection of our own
+    (CMD_SET_DATAFD). After a killed QEMU, no CMD_INIT (it would restart the
+    TPM): probed host-side in M5 slice 7, swtpm keeps the TPM running once
+    the killed QEMU's data socket closes. `init` (M8 plan C13: a swtpm no
+    QEMU has started) sends CMD_INIT first."""
     ctrl = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     mine, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         ctrl.settimeout(LINE_TIMEOUT_S)
         ctrl.connect(tpm.sock)
+        if init:
+            ctrl.sendall(struct.pack(">II", SWTPM_CMD_INIT, 0))
+            if recv_exact(ctrl, 4) != bytes(4):
+                raise Fail("swtpm refused CMD_INIT")
         ctrl.sendmsg([struct.pack(">I", SWTPM_CMD_SET_DATAFD)],
                      [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [theirs.fileno()]))])
         if recv_exact(ctrl, 4) != bytes(4):
-            raise Fail("swtpm refused a data socket after QEMU exited")
+            raise Fail("swtpm refused a data socket")
         theirs.close()
         mine.settimeout(LINE_TIMEOUT_S)
-        pcrs = []
+        yield mine
+    finally:
+        for s in (ctrl, mine, theirs):
+            s.close()
+
+
+def tpm_command(sock: socket.socket, tag: int, cc: int, body: bytes) -> bytes:
+    """One TPM command on a data socket: its whole response, which must
+    report success."""
+    sock.sendall(struct.pack(">HII", tag, 10 + len(body), cc) + body)
+    head = recv_exact(sock, 10)
+    rsp = head + recv_exact(sock, struct.unpack(">I", head[2:6])[0] - 10)
+    if rsp[6:10] != bytes(4):
+        raise Fail(f"TPM command {cc:#x} answered {struct.unpack('>I', rsp[6:10])[0]:#x}")
+    return rsp
+
+
+def read_pcrs(tpm: Swtpm) -> list:
+    """PCRs 0-9 of a swtpm whose QEMU has been killed (T11; M7 plan C3, C4):
+    two TPM2_PCR_Reads on a fresh data socket (tpm_data). A response that is
+    not the selection as asked with its digests is a named failure."""
+    pcrs = []
+    with tpm_data(tpm) as sock:
         for selection, count in ((PCR0_7_SELECTION, 8), (PCR8_9_SELECTION, 2)):
-            mine.sendall(struct.pack(">HII", 0x8001, 10 + len(selection), 0x17E) + selection)
-            head = recv_exact(mine, 10)
-            rsp = head + recv_exact(mine, struct.unpack(">I", head[2:6])[0] - 10)
+            rsp = tpm_command(sock, 0x8001, 0x17E, selection)
             # header, pcrUpdateCounter, the selection as asked, then the
             # TPML_DIGEST: count, and (size 32, digest) per PCR.
             digests = rsp[24 + 4:]
-            if (rsp[6:10] != bytes(4) or rsp[14:24] != selection or rsp[24:28] != struct.pack(">I", count)
+            if (rsp[14:24] != selection or rsp[24:28] != struct.pack(">I", count)
                     or len(digests) != 34 * count
                     or any(digests[34 * i:34 * i + 2] != b"\x00\x20" for i in range(count))):
                 raise Fail(f"unexpected PCR_Read response {rsp.hex()}")
             pcrs += [digests[34 * i + 2:34 * i + 34] for i in range(count)]
-    finally:
-        for s in (ctrl, mine, theirs):
-            s.close()
     return pcrs
+
+
+# M8 plan C3, C13: the anti-rollback indices, read and advanced from the
+# host as `tpm` does, under the empty password session.
+CC_NV_INCREMENT = 0x134
+CC_NV_READ = 0x14E
+CC_NV_READ_PUBLIC = 0x169
+CC_SHUTDOWN = 0x145
+SWTPM_CMD_INIT = 2
+PASSWORD_SESSION = struct.pack(">IIHBH", 9, 0x40000009, 0, 0, 0)
+
+
+def nv_checked_u64(sock: socket.socket, index: int, name: bytes) -> int:
+    """An 8-byte NV index's value, once NV_ReadPublic gave exactly `name`."""
+    rsp = tpm_command(sock, 0x8001, CC_NV_READ_PUBLIC, struct.pack(">I", index))
+    n = struct.unpack(">H", rsp[10:12])[0]
+    m = struct.unpack(">H", rsp[12 + n:14 + n])[0]
+    got = rsp[14 + n:14 + n + m]
+    if got != name:
+        raise Fail(f"NV index {index:#x} has the Name {got.hex()}, want {name.hex()}")
+    rsp = tpm_command(sock, 0x8002, CC_NV_READ, struct.pack(">II", index, index) + PASSWORD_SESSION
+                      + struct.pack(">HH", 8, 0))
+    if rsp[14:16] != b"\x00\x08":
+        raise Fail(f"NV_Read of {index:#x}: unexpected response {rsp.hex()}")
+    return struct.unpack(">Q", rsp[16:24])[0]
+
+
+def policy_logical(sock: socket.socket, names: tuple) -> int:
+    """NV_POLICY_CTR minus NV_POLICY_BASE (mod 2^64), each Name checked."""
+    ctr = nv_checked_u64(sock, measure.NV_POLICY_CTR, names[0])
+    base = nv_checked_u64(sock, measure.NV_POLICY_BASE, names[1])
+    return (ctr - base) % 2**64
+
+
+def tpm_start_at(copy: str, k: int, names: tuple):
+    """M8 plan C13's swtpm lifecycle: the provisioned state in `copy`
+    (provisioned at v0 = 0) advanced to logical version k, as `tpm` would:
+    swtpm on the copy, CMD_INIT, CMD_SET_DATAFD, TPM2_Startup(CLEAR), the
+    Names checked, NV_Increment k times under the password session, the
+    logical value read back, Shutdown(CLEAR); then swtpm stopped and its
+    permall handed back to `copy`."""
+    tpm = Swtpm(os.path.dirname(copy), state=copy)
+    try:
+        with tpm_data(tpm, init=True) as sock:
+            tpm_command(sock, 0x8001, CC_STARTUP, struct.pack(">H", 0))
+            if (start := policy_logical(sock, names)) != 0:
+                raise Fail(f"tpm_start_at: the provisioned state is at version {start}, not 0")
+            for _ in range(k):
+                tpm_command(sock, 0x8002, CC_NV_INCREMENT,
+                            struct.pack(">II", measure.NV_POLICY_CTR, measure.NV_POLICY_CTR) + PASSWORD_SESSION)
+            if (got := policy_logical(sock, names)) != k:
+                raise Fail(f"tpm_start_at: logical {got} after {k} increments, want {k}")
+            tpm_command(sock, 0x8001, CC_SHUTDOWN, struct.pack(">H", 0))
+        tpm.keep = copy
+    finally:
+        tpm.close()
 
 
 def read_pcr8(tpm: Swtpm) -> bytes:
@@ -2201,12 +2310,15 @@ class TpmProxy:
     headers. With `flip`, the first byte of every successful Unseal
     response's outData is flipped. With `fail_extend`, every PCR_Extend
     with the cap's digest is answered TPM_RC_FAILURE and never reaches
-    swtpm (U-Boot's measurements, other digests, pass). Feasibility (F6-A):
-    the unmodified relay must pass a sealed boot first."""
+    swtpm (U-Boot's measurements, other digests, pass). With `swallow_pcr9`
+    (M8 plan C13 `measure-mismatch`), the second PCR_Extend of PCR 9 (U-Boot's
+    of slot B) is answered success and never reaches swtpm. Feasibility
+    (F6-A): the unmodified relay must pass a sealed boot first."""
 
     def __init__(self, tpm: Swtpm, flip: bool, fail_extend: bool = False, inject_pcr3: bool = False,
-                 fail_nth: tuple = None):
+                 fail_nth: tuple = None, swallow_pcr9: bool = False):
         self.tpm, self.flip, self.fail_extend, self.inject_pcr3 = tpm, flip, fail_extend, inject_pcr3
+        self.swallow_pcr9, self.pcr9_extends, self.pcr9_swallowed = swallow_pcr9, 0, 0
         # (command code, n): the n-th command with that code is answered
         # TPM_RC_FAILURE and never reaches swtpm (M7 plan C3 I3.2), and
         # `failed` records it once it happened.
@@ -2302,6 +2414,17 @@ class TpmProxy:
         frames, r[2] = self._frames(r[2] + data)
         for cmd in frames:
             cc = struct.unpack(">I", cmd[6:10])[0]
+            if self.swallow_pcr9 and cc == CC_PCR_EXTEND and struct.unpack(">I", cmd[10:14])[0] == measure.SLOT_PCR:
+                self.pcr9_extends += 1
+                if self.pcr9_extends == 2:
+                    if r[4]:
+                        raise Fail("proxy: a PCR_Extend while another command awaits its response")
+                    # Success with an empty parameter area and the password
+                    # session's response (nonce, its attributes, hmac).
+                    nonce = struct.unpack(">H", cmd[22:24])[0]
+                    r[0].sendall(struct.pack(">HIIIHBH", 0x8002, 19, 0, 0, 0, cmd[24 + nonce], 0))
+                    self.pcr9_swallowed += 1
+                    continue
             if self.fail_extend and cc == CC_PCR_EXTEND and bytes(cmd[-len(self.cap):]) == self.cap:
                 # TIS runs one command at a time: none awaits its response.
                 if r[4]:
@@ -2986,7 +3109,7 @@ def test_tpm_cap_failure(pkg: Package, deploy: str, passed: list):
 
 # The fault-inject variants build() packages (Makefile
 # package-fault-inject-%), and the frames ingress's variant acts on.
-FAULT_INJECT_VARIANTS = ("net", "timer")
+FAULT_INJECT_VARIANTS = ("net", "timer", "policy")
 FAULT_FRAME_A = b"KOZANE-FAULT-INJECT-A"
 FAULT_FRAME_B = b"KOZANE-FAULT-INJECT-B"
 SUPERVISOR_RECORD = r"supervisor: fault pd=(\w+) label=(\d+) lost=(\d+)\r*\n"
@@ -3197,14 +3320,14 @@ def test_audit_export(good: Package, fi_net: Package, record: str, passed: list)
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def test_release_boot(pkg: Package, release: str, deploy: str, fi_net: Package, passed: list):
+def test_release_boot(pkg: Package, release: str, deploy: str, fault_inject: dict, passed: list):
     """M7 plan C11: one boot of exactly the files a verified release names
     (build() made and verified it): every file QEMU loads hashes to the
     manifest, PCRs 0-7 read host-side equal its twin values and PCR 8 its
     twin plus the cap, a WireGuard+Rosenpass handshake and an HTTPS
     request are served, and no supervisor record appears (inject A is the
-    positive pair that proves records print). Deny: a fault-inject image
-    is not the manifest's image."""
+    positive pair that proves records print). Deny: no fault-inject image
+    (every FAULT_INJECT_VARIANTS one, M8 plan C13) is the manifest's image."""
     fields = manifest_fields(release)
     pcrs = [bytes.fromhex(p) for p in fields["pcrs"].split(",")]
     image, desc, firmware = (os.path.join(release, n) for n in ("published.img", "boot.desc", "flash.bin"))
@@ -3214,8 +3337,11 @@ def test_release_boot(pkg: Package, release: str, deploy: str, fi_net: Package, 
     for path, key in ((firmware, "firmware_sha256"), (image, "loader_img_sha256"), (desc, "boot_desc_sha256")):
         if file_sha256(path) != fields[key]:
             raise Fail(f"release boot: {os.path.basename(path)} is not the manifest's {key}")
-    if file_sha256(fi_net.path("published.img")) == fields["loader_img_sha256"]:
-        raise Fail("release boot: the fault-inject image is the released one")
+    if sorted(fault_inject) != sorted(FAULT_INJECT_VARIANTS):
+        raise Fail(f"release boot: fault-inject packages {sorted(fault_inject)}, want {sorted(FAULT_INJECT_VARIANTS)}")
+    for variant, fi in fault_inject.items():
+        if file_sha256(fi.path("published.img")) == fields["loader_img_sha256"]:
+            raise Fail(f"release boot: the fault-inject image {variant} is the released one")
     cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
     # HTTPS is served only end to end: the inside tap with the raw backend.
     tap = Tap()
@@ -3271,6 +3397,400 @@ def test_release_boot(pkg: Package, release: str, deploy: str, fi_net: Package, 
 def file_sha256(path: str) -> str:
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
+
+
+# ---------------------------------------------------------------- policy update (M8 plan C13)
+
+# The barrier PDs (M8 plan C6): each serves only once `policy` answered
+# Verified, and halts with POLICY_UNAVAILABLE on Unavailable.
+BARRIER_PDS = ("hs", "pq", "ingress", "data", "inner")
+POLICY_OUTCOME = r"policy: (?P<outcome>accepted version=\d+ slot=[AB]|unavailable reason=\w+ current=\w+) lost=\d+\r*\n"
+POLICY_REJECTED = r"policy: rejected slot=([AB]) reason=(\w+) lost=\d+\r*\n"
+# Deployment A's clients the cases play (D-16: client i is peer i of v0):
+# P, revoked from v1 on, and R, in every bundle.
+CLIENT_P, CLIENT_R = 0, 1
+# How long a LAN probe waits for any frame from the gateway's inside NIC.
+LAN_QUIET_S = 2.0
+
+
+def policy_names(deploy: str) -> tuple:
+    """The NV Names the image compiles in ([policy], M8 plan C3)."""
+    p = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))["policy"]
+    return bytes.fromhex(p["nv_ctr_name"]), bytes.fromhex(p["nv_base_name"])
+
+
+def policy_domain() -> bytes:
+    """policy_wire::DOMAIN, the prefix both bundle signatures cover."""
+    src = open(os.path.join(ROOT, "crates/policy-wire/src/lib.rs")).read()
+    m = re.search(r'^pub const DOMAIN: &\[u8\] = b"([^"]*)";$', src, re.M)
+    if not m:
+        raise Fail("policy-wire's DOMAIN moved")
+    return m.group(1).encode().decode("unicode_escape").encode("latin-1")
+
+
+def half_bad(slot: bytes, half: str, ed_pub: bytes) -> bytes:
+    """`slot` with one byte of one signature flipped (`half` is "ed25519"
+    or "mldsa65"), its body and the other signature intact: checked with
+    the Ed25519 half itself, which must verify on `slot`, still verify with
+    the ML-DSA half bad and fail with its own byte flipped."""
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    start = bundle_walk(slot)[1]
+    at = start + (10 if half == "ed25519" else 64 + 100)
+    bad = bytearray(slot)
+    bad[at] ^= 1
+    key, domain = Ed25519PublicKey.from_public_bytes(ed_pub), policy_domain()
+
+    def ed_ok(s: bytes) -> bool:
+        try:
+            key.verify(s[start:start + 64], domain + s[:start])
+            return True
+        except InvalidSignature:
+            return False
+    if not ed_ok(slot) or ed_ok(bytes(bad)) != (half == "mldsa65") or any(slot[start + 64 + 3309:]):
+        raise Fail(f"half-bad: the {half} byte at {at} is not where bundle_walk puts the signatures")
+    return bytes(bad)
+
+
+class PolicyCase:
+    """One C13 case's TPM state (plan T4, T21, T35): a copy of `state`, at
+    the start version `tpm_start_at` advanced it to (None: as copied), kept
+    in a case-scoped directory across the case's boots and removed with it."""
+
+    def __init__(self, parent: str, name: str, state: str, names: tuple, start: int = None):
+        self.dir = tempfile.mkdtemp(prefix=f"policy-{name}-", dir=parent)
+        self.names = names
+        try:
+            shutil.copy2(os.path.join(state, SWTPM_PERMALL), self.dir)
+            if start is not None:
+                tpm_start_at(self.dir, start, names)
+        except BaseException:
+            self.close()
+            raise
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def close(self):
+        shutil.rmtree(self.dir, ignore_errors=True)
+        if os.path.exists(self.dir):
+            raise Fail(f"policy case state {self.dir} survived its case")
+
+
+class PolicyBoot:
+    """One boot of a C13 case: `pkg`'s image on the case's TPM state with
+    these two slots, outside on user-net (WireGuard and Rosenpass ports
+    forwarded), inside on a dgram wire the harness plays the LAN on."""
+
+    def __init__(self, case: PolicyCase, pkg: Package, slot_a: bytes, slot_b: bytes, relay: bool = False,
+                 swallow_pcr9: bool = False):
+        """`relay` puts the unmodified A7 proxy between QEMU and swtpm (it
+        counts the Unseals); `swallow_pcr9` makes it swallow slot B's PCR 9
+        extend."""
+        self.case, self.hostfwd, self.rp_fwd = case, free_udp_port(), free_udp_port()
+        self.inside = Wire()
+        slots = write_slots(case.dir, slot_a, slot_b)
+        self.child, self.con = boot(Package(pkg.dir, case.dir, slots),
+                                    f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{self.hostfwd}-:{WG_PORT},"
+                                    f"hostfwd=udp:127.0.0.1:{self.rp_fwd}-:{RP_PORT}", self.inside.netdev("n1"),
+                                    flip=False if relay else None, swallow_pcr9=swallow_pcr9)
+
+    def unsealed(self, what: str):
+        """Every key PD's Unseal succeeded (counted by the relay): the
+        refusal is not the seals' (PCR 9 and the NV indices are not sealed)."""
+        proxy = self.child.proxy
+        deadline = time.monotonic() + BOOT_TIMEOUT_S
+        while proxy.unseals < 4 and proxy.error is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if proxy.unseals != 4 or proxy.error is not None:
+            raise Fail(f"{what}: the relay saw {proxy.unseals} successful Unseals (want 4), error {proxy.error!r}")
+
+    def finish(self, want: int, what: str):
+        """C13's counter check [T2, T25]: QEMU killed, NV_POLICY_CTR read
+        (password session, Names checked) at logical `want`; Shutdown(CLEAR)
+        and the state handed back to the case for its next boot."""
+        child = self.child
+        kill_qemu(child)
+        if child.proxy is not None:
+            proxy, child.proxy = child.proxy, None
+            proxy.close()
+        with tpm_data(child.tpm) as sock:
+            got = policy_logical(sock, self.case.names)
+            tpm_command(sock, 0x8001, CC_SHUTDOWN, struct.pack(">H", 0))
+        if got != want:
+            raise Fail(f"{what}: NV_POLICY_CTR reads logical {got}, want {want}")
+        child.tpm.keep = self.case.dir
+        self.close()
+
+    def close(self):
+        try:
+            stop(self.child)
+        finally:
+            self.inside.sock.close()
+
+
+def policy_outcome(con: Console, what: str, want: str, rejected: set):
+    """`policy`'s verdict line is `want`, then its ready line; the slots it
+    rejected are exactly `rejected` ({(slot, reason)})."""
+    m = con.wait_for(POLICY_OUTCOME, timeout=BOOT_TIMEOUT_S, strip_ready=True)
+    if m.group("outcome") != want:
+        raise Fail(f"{what}: policy {m.group('outcome')}, want {want}")
+    con.wait_for(r"policy: ready\r*\n", timeout=LINE_TIMEOUT_S, strip_ready=True)
+    with con.lock:
+        text = READY_LINE.sub("", con.text)
+    got = set(re.findall(POLICY_REJECTED, text))
+    if got != rejected:
+        raise Fail(f"{what}: policy rejected {sorted(got)}, want {sorted(rejected)}")
+
+
+def barrier_serves(con: Console, what: str):
+    """Every barrier PD became ready; none halted."""
+    for pd in BARRIER_PDS:
+        m = con.wait_for(rf"(?P<halt>audit: src={pd} Halted reason=\d+)|{pd}: ready\r*\n", timeout=BOOT_TIMEOUT_S,
+                         strip_ready=True)
+        if m.group("halt") is not None:
+            raise Fail(f"{what}: {pd} halted with a verified bundle ({m.group('halt')})")
+
+
+def barrier_halts(con: Console, what: str):
+    """M8 plan C6: every barrier PD prints its Halted line with
+    POLICY_UNAVAILABLE; one that becomes ready instead served without a
+    verified bundle."""
+    for pd in BARRIER_PDS:
+        want = halt_reason(pd, "POLICY_UNAVAILABLE")
+        m = con.wait_for(rf"(?P<halt>audit: src={pd} Halted reason=(?P<reason>\d+)) lost=\d+\r*\n|{pd}: ready\r*\n",
+                         timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        if m.group("halt") is None:
+            raise Fail(f"{what}: {pd} became ready with policy unavailable")
+        if int(m.group("reason")) != want:
+            raise Fail(f"{what}: {pd} halted with reason={m.group('reason')}, want POLICY_UNAVAILABLE ({want})")
+    no_supervisor_record(con, what)
+
+
+def peer_conf(deploy: str, client: int) -> str:
+    return open(os.path.join(deploy, f"peer-{client}.conf")).read()
+
+
+def gateway_public(deploy: str) -> bytes:
+    return b64(tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))["gateway"]["public_key"])
+
+
+def peer_handshakes(b: PolicyBoot, deploy: str, client: int, what: str):
+    """Client `client` runs Rosenpass against the gateway, then a WireGuard
+    handshake with its key_out as the PSK until the response opens: the
+    peer is one the verified bundle names, end to end."""
+    rp = Rosenpass(deploy, client, f"127.0.0.1:{b.rp_fwd}")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        deadline = time.monotonic() + RP_EXCHANGE_S
+        while True:
+            psk = rp.osk()
+            if psk is not None:
+                i = wg_mod.Initiator(b64(conf_value(peer_conf(deploy, client), "PrivateKey")), gateway_public(deploy),
+                                     psk, sender=secrets.randbits(32))
+                sock.sendto(i.initiation(), ("127.0.0.1", b.hostfwd))
+                r = wait_response(sock, i, REPLY_TIMEOUT_S)
+                if r is not None and i.consume_response(r):
+                    return
+            if time.monotonic() > deadline:
+                raise Fail(f"{what}: client {client} did not handshake within {RP_EXCHANGE_S:.0f} s")
+            time.sleep(PSK_RETRY_S)
+    finally:
+        close_all(rp, sock)
+
+
+def initiation_unanswered(b: PolicyBoot, deploy: str, client: int, what: str):
+    """Client `client`'s WireGuard initiation (no PSK) draws no response."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        i = wg_mod.Initiator(b64(conf_value(peer_conf(deploy, client), "PrivateKey")), gateway_public(deploy),
+                             bytes(32), sender=secrets.randbits(32))
+        sock.sendto(i.initiation(), ("127.0.0.1", b.hostfwd))
+        if wait_response(sock, i, REPLY_TIMEOUT_S) is not None:
+            raise Fail(f"{what}: client {client}'s initiation got a handshake response")
+    finally:
+        sock.close()
+
+
+def lan_frames(b: PolicyBoot) -> list:
+    """The LAN host asks for the gateway's inside address (ARP) and sends a
+    datagram towards client 0's tunnel address; every frame the gateway's
+    inside NIC sends within LAN_QUIET_S, counted."""
+    sock = b.inside.sock
+    sock.settimeout(0)
+    with contextlib.suppress(BlockingIOError):
+        while True:
+            sock.recv(2048)
+    b.inside.send(arp(1, HOST_MAC, HOST_IP, b"\0" * 6, INSIDE_IP))
+    b.inside.send(eth(INSIDE_MAC, HOST_MAC, 0x0800, udp_packet(HOST_IP, CLIENT0_IP, 7, 40000, b"lan")))
+    frames = []
+    deadline = time.monotonic() + LAN_QUIET_S
+    while (left := deadline - time.monotonic()) > 0:
+        sock.settimeout(left)
+        try:
+            frames.append(sock.recv(2048))
+        except socket.timeout:
+            break
+    return frames
+
+
+def policy_cases(good: Package, fi_policy: Package, deploy: str, tmp: str, passed: list) -> list:
+    """M8 plan C13, one named case per row, each from the provisioned v0
+    state advanced to its start version (tpm_start_at), every boot followed
+    by the counter check; and C3's wrong-Name fixture [T14, T42]. The slots
+    are tools/policy's bundles (build(): PolicyFixtures.c13_bundles)."""
+    c13 = os.path.join(tmp, "policy/c13")
+    names = policy_names(deploy)
+    state = os.path.join(tmp, "tpm-a")
+    empty = bytes(measure.BUNDLE_MAX)
+
+    def bundle(name: str) -> bytes:
+        return open(os.path.join(c13, f"{name}.bin"), "rb").read()
+
+    def case(name: str, start: int, run):
+        def go():
+            with PolicyCase(tmp, name, state, names, start) as c:
+                run(c, f"{name} (start {start})")
+        return f"policy {name}", go
+
+    def boot_once(c: PolicyCase, what: str, a: bytes, b: bytes, want: str, rejected: set, counter: int,
+                  pkg: Package = good, then=None, relay: bool = False, swallow_pcr9: bool = False):
+        """One boot: the verdict, the barrier (serving if accepted, halted
+        otherwise), `then(boot)`, and the counter check."""
+        pb = PolicyBoot(c, pkg, a, b, relay, swallow_pcr9)
+        try:
+            policy_outcome(pb.con, what, want, rejected)
+            (barrier_serves if want.startswith("accepted") else barrier_halts)(pb.con, what)
+            if then is not None:
+                then(pb)
+            pb.finish(counter, what)
+        except BaseException:
+            pb.close()
+            raise
+
+    def advance_revoke(c, what):
+        def both(pb):
+            peer_handshakes(pb, deploy, CLIENT_P, f"{what}, v0")
+            peer_handshakes(pb, deploy, CLIENT_R, f"{what}, v0")
+        boot_once(c, f"{what}, v0", bundle("v0"), empty, "accepted version=0 slot=A", set(), 0, then=both)
+        passed.append("policy advance-revoke: v0 from slot A, P and R handshake")
+
+        def revoked(pb):
+            mark = pb.con.mark()
+            initiation_unanswered(pb, deploy, CLIENT_P, f"{what}, v1: revoked P")
+            pb.con.wait_for(r"audit: src=hs HandshakeUnknownPeer total=1 ", since=mark)
+            peer_handshakes(pb, deploy, CLIENT_R, f"{what}, v1")
+        boot_once(c, f"{what}, v1", bundle("v0"), bundle("v1"), "accepted version=1 slot=B", set(), 1, then=revoked)
+        passed.append("policy advance-revoke: v1 advances from slot B, P refused, R handshakes")
+
+    def restore_old(c, what):
+        boot_once(c, what, bundle("v1"), bundle("v0"), "accepted version=1 slot=A", {("B", "RolledBack")}, 1,
+                  then=lambda pb: peer_handshakes(pb, deploy, CLIENT_R, what))
+        passed.append("policy restore-old: v1 kept, the restored v0 rejected, R handshakes")
+
+    def rolled_back(c, what):
+        def denied(pb):
+            initiation_unanswered(pb, deploy, CLIENT_R, what)
+            frames = lan_frames(pb)
+            if frames:
+                raise Fail(f"{what}: the gateway's inside NIC sent {len(frames)} frames to the LAN host's probe")
+        boot_once(c, what, bundle("v0"), bundle("v1"), "unavailable reason=RolledBack current=2",
+                  {("A", "RolledBack"), ("B", "RolledBack")}, 2, then=denied)
+        passed.append("policy rolled-back: both slots behind the counter, every barrier PD halts")
+        # The allow twin: the same slots one version lower.
+        with PolicyCase(tmp, "rolled-back-twin", state, names, 1) as twin:
+            def served(pb):
+                peer_handshakes(pb, deploy, CLIENT_R, f"{what}, twin")
+                if not any(is_arp_reply(f) for f in lan_frames(pb)):
+                    raise Fail(f"{what}, twin: the LAN host's ARP request got no reply")
+            boot_once(twin, f"{what}, twin at start 1", bundle("v0"), bundle("v1"), "accepted version=1 slot=B",
+                      {("A", "RolledBack")}, 1, then=served)
+        passed.append("policy rolled-back twin: the same slots at start 1 accept v1, R handshakes")
+
+    def skipped(c, what):
+        boot_once(c, what, bundle("v1"), bundle("v3"), "accepted version=1 slot=A", {("B", "Skipped")}, 1,
+                  then=lambda pb: peer_handshakes(pb, deploy, CLIENT_R, what))
+        boot_once(c, f"{what}, A empty", empty, bundle("v3"), "unavailable reason=Skipped current=1",
+                  {("B", "Skipped")}, 1)
+        passed.append("policy skipped: v3 rejected beside v1, unavailable alone")
+
+    def equivocation(c, what):
+        boot_once(c, what, bundle("v1"), bundle("v1pp"), "unavailable reason=Equivocation current=1", set(), 1)
+        passed.append("policy equivocation: two bodies for version 1 refused")
+
+    def prev_mismatch(c, what):
+        boot_once(c, what, bundle("v1"), bundle("v2p"), "unavailable reason=PrevMismatch current=1", set(), 1)
+        passed.append("policy prev-mismatch: a v2 not chained to slot A's v1 refused")
+
+    def no_anchor(c, what):
+        boot_once(c, what, empty, bundle("v2"), "unavailable reason=PrevMismatch current=1", set(), 1)
+        boot_once(c, f"{what}, v1 written into A", bundle("v1"), bundle("v2"), "accepted version=2 slot=B", set(), 2,
+                  then=lambda pb: peer_handshakes(pb, deploy, CLIENT_R, f"{what}, recovery"))
+        passed.append("policy no-anchor: v2 without its anchor refused; with v1 in A it advances")
+
+    def floor_lowering(c, what):
+        boot_once(c, what, bundle("v1p"), bundle("v2p"), "accepted version=2 slot=B", {("A", "BelowFloor")}, 2)
+        passed.append("policy floor-lowering: the anchor counts whatever its floor")
+
+    def half_bad_case(c, what):
+        ed_pub = bytes.fromhex(open(os.path.join(tmp, "policy/a/keys/ed25519.pub")).read().strip())
+        for half, label in (("mldsa65", "bad ML-DSA"), ("ed25519", "bad Ed25519")):
+            boot_once(c, f"half-bad ({label})", bundle("v1"), half_bad(bundle("v2"), half, ed_pub),
+                      "accepted version=1 slot=A", {("B", "BadSignature")}, 1)
+            passed.append(f"policy half-bad: v2 with a {label} signature rejected")
+
+    def below_floor(c, what):
+        boot_once(c, what, bundle("v1p"), empty, "unavailable reason=BelowFloor current=1", {("A", "BelowFloor")}, 1)
+        passed.append("policy below-floor: v1 above this release's floor refused")
+
+    def crash_after_advance(c, what):
+        marker = halt_reason("policy", "FAULT_INJECT_ADVANCED")
+        pb = PolicyBoot(c, fi_policy, bundle("v1"), bundle("v2"))
+        try:
+            pb.con.wait_for(rf"audit: src=policy Halted reason={marker} lost=\d+\r*\n", timeout=BOOT_TIMEOUT_S)
+            if pb.con.count(r"policy: (accepted|unavailable)"):
+                raise Fail(f"{what}: the fault-inject image selected after its ADVANCE")
+            pb.finish(2, f"{what}, killed after the ADVANCE")
+        except BaseException:
+            pb.close()
+            raise
+        passed.append("policy crash-after-advance: killed after a confirmed ADVANCE, the counter is at 2")
+        boot_once(c, f"{what}, then the shipped image", bundle("v1"), bundle("v2"), "accepted version=2 slot=B",
+                  {("A", "RolledBack")}, 2, then=lambda pb: peer_handshakes(pb, deploy, CLIENT_R, what))
+        passed.append("policy crash-after-advance: the next boot uses v2 from slot B, R handshakes")
+
+    def measure_mismatch(c, what):
+        def unsealed(pb):
+            if pb.child.proxy.pcr9_swallowed != 1:
+                raise Fail(f"{what}: the relay swallowed {pb.child.proxy.pcr9_swallowed} PCR 9 extends, want 1")
+            pb.unsealed(what)
+        boot_once(c, what, bundle("v1"), empty, "unavailable reason=MeasureMismatch current=1", set(), 1,
+                  then=unsealed, swallow_pcr9=True)
+        passed.append("policy measure-mismatch: slot B unmeasured, refused, secrets still unseal")
+
+    def wrong_name():
+        info = json.load(open(os.path.join(c13, "wrong-name.json")))
+        if not 0 <= info["logical"] <= 3:
+            raise Fail(f"wrong-name: the redefined counter is at {info['logical']}, no bundle has that version")
+        wrong = (bytes.fromhex(info["nv_ctr_name"]), names[1])
+        with PolicyCase(tmp, "wrong-name", os.path.join(tmp, "tpm-a-wrong-name"), wrong) as c:
+            # With the Name check skipped the device would use this slot.
+            boot_once(c, "wrong-name", bundle(f"v{info['logical']}"), empty,
+                      "unavailable reason=StateRefused current=unknown", set(), info["logical"],
+                      then=lambda pb: pb.unsealed("wrong-name"), relay=True)
+        passed.append("policy wrong-name: a counter redefined without POLICY_DELETE is refused (StateRefused)")
+
+    return [case("advance-revoke", 0, advance_revoke), case("restore-old", 1, restore_old),
+            case("rolled-back", 2, rolled_back), case("skipped", 1, skipped), case("equivocation", 1, equivocation),
+            case("prev-mismatch", 1, prev_mismatch), case("no-anchor", 1, no_anchor),
+            case("floor-lowering", 1, floor_lowering), case("half-bad", 1, half_bad_case),
+            case("below-floor", 1, below_floor), case("crash-after-advance", 1, crash_after_advance),
+            case("measure-mismatch", 1, measure_mismatch), ("policy wrong-name", wrong_name)]
 
 
 # ---------------------------------------------------------------- cookie boots (M2.5 plan C6)
@@ -7388,13 +7908,11 @@ def ek_ca(root: str) -> str:
     return ca
 
 
-def read_srk(state: str, out: str, ca: str, then=None):
-    """Starts swtpm on `state` with a data socket, provisions it with
-    tools/provision against the run's EK CA `ca` (M7 plan C5: the SRK
-    public is written only once activated against the certified EK), runs
-    `then(tcti)` on the same TPM if given (M8 plan C3: the NV step, after
-    the Clear), and kills it again (nothing volatile is saved, so a boot's
-    TPM2_Startup finds a fresh TPM)."""
+@contextlib.contextmanager
+def swtpm_server(state: str):
+    """swtpm on `state` with a data socket for tpm2-tools: yields its TCTI,
+    then kills it (nothing volatile is saved, so a boot's TPM2_Startup
+    finds a fresh TPM) and checks only the TPM's own state is left."""
     # tpm2-tss's swtpm TCTI finds the control socket at the data path + ".ctrl".
     data = os.path.join(state, "tpm.sock")
     ctrl = data + ".ctrl"
@@ -7408,14 +7926,7 @@ def read_srk(state: str, out: str, ca: str, then=None):
             if proc.poll() is not None or time.monotonic() > deadline:
                 raise Fail("swtpm did not open its data socket for provisioning")
             time.sleep(0.05)
-        r = subprocess.run([sys.executable, os.path.join(ROOT, "tools/provision"), "--tcti", f"swtpm:path={data}",
-                            "--ek-root", os.path.join(ca, "swtpm-localca-rootca-cert.pem"),
-                            "--ek-intermediates", os.path.join(ca, "issuercert.pem"), "--out", out],
-                           capture_output=True, text=True, cwd=ROOT)
-        if r.returncode != 0:
-            raise Fail(f"provisioning {state}: {r.stdout}{r.stderr}")
-        if then is not None:
-            then(f"swtpm:path={data}")
+        yield f"swtpm:path={data}"
     finally:
         proc.kill()
         proc.wait()
@@ -7425,6 +7936,22 @@ def read_srk(state: str, out: str, ca: str, then=None):
                 os.unlink(path)
     if sorted(os.listdir(state)) != [SWTPM_PERMALL]:
         raise Fail(f"provisioned swtpm state holds {sorted(os.listdir(state))}, want {SWTPM_PERMALL} alone")
+
+
+def read_srk(state: str, out: str, ca: str, then=None):
+    """Provisions the swtpm state `state` with tools/provision against the
+    run's EK CA `ca` (M7 plan C5: the SRK public is written only once
+    activated against the certified EK), then runs `then(tcti)` on the same
+    TPM if given (M8 plan C3: the NV step, after the Clear)."""
+    with swtpm_server(state) as tcti:
+        r = subprocess.run([sys.executable, os.path.join(ROOT, "tools/provision"), "--tcti", tcti,
+                            "--ek-root", os.path.join(ca, "swtpm-localca-rootca-cert.pem"),
+                            "--ek-intermediates", os.path.join(ca, "issuercert.pem"), "--out", out],
+                           capture_output=True, text=True, cwd=ROOT)
+        if r.returncode != 0:
+            raise Fail(f"provisioning {state}: {r.stdout}{r.stderr}")
+        if then is not None:
+            then(tcti)
 
 
 def provision_tpm(root: str, name: str, nv=None) -> tuple:
@@ -7469,6 +7996,8 @@ POLICY_APPROVERS = ("alice", "bob")
 # The ML-DSA-65 public key [policy] names, beside gateway.toml.
 POLICY_MLDSA65_PUB = "policy-mldsa65.pub"
 SLOT_FILES = ("slot-a.bin", "slot-b.bin")
+# TPMA_NV_POLICY_DELETE: the attribute the C3 wrong-Name fixture drops.
+NV_POLICY_DELETE = 0x00000400
 
 
 def policy_build(pin: str = "") -> str:
@@ -7557,21 +8086,112 @@ class PolicyFixtures:
         peers = os.path.join(deploy, "peers.toml")
         with open(peers, "w") as f:
             f.write(peers_toml(deploy, fleet.fleet_id, swap_rp))
-        draft = os.path.join(fleet.dir, "draft0.bin")
-        policy_tool(self.bin, "render", "--input", peers, "--fleet", fleet.fleet_file, "--ledger", fleet.ledger,
-                    "--out", draft)
-        approvals = []
-        for a in POLICY_APPROVERS:
-            approvals.append(os.path.join(fleet.dir, f"{a}0.approval"))
-            policy_tool(self.bin, "approve", "--ledger", fleet.ledger, "--draft", draft, "--approver-key",
-                        os.path.join(self.root, a, "ed25519.key"), "--approver-id", a, "--head",
-                        os.path.join(fleet.dir, f"{a}.head"), "--out", approvals[-1])
-        policy_tool(self.bin, "sign", "--ledger", fleet.ledger, "--draft", draft, "--approvals", *approvals,
-                    "--keys", fleet.keys, "--out", fleet.v0)
+        self.sign_next(fleet, fleet.dir, peers, fleet.v0)
         with open(self.pinned, "a") as f:
             for key in self.record_keys:
                 f.write(f"{fleet.fleet_id} {openssl('pkey', '-in', key, '-pubout', '-outform', 'DER')[-32:].hex()}\n")
         return fleet
+
+    def sign_next(self, fleet: Fleet, ledger_dir: str, peers: str, out: str):
+        """The next version of the ledger in `ledger_dir` (its `ledger`, and
+        each approver's recorded head beside it): `peers` rendered against
+        that head, approved by both approvers and signed into `out`."""
+        ledger = os.path.join(ledger_dir, "ledger")
+        draft = out + ".draft"
+        policy_tool(self.bin, "render", "--input", peers, "--fleet", fleet.fleet_file, "--ledger", ledger,
+                    "--out", draft)
+        approvals = []
+        for a in POLICY_APPROVERS:
+            approvals.append(f"{out}.{a}.approval")
+            policy_tool(self.bin, "approve", "--ledger", ledger, "--draft", draft, "--approver-key",
+                        os.path.join(self.root, a, "ed25519.key"), "--approver-id", a, "--head",
+                        os.path.join(ledger_dir, f"{a}.head"), "--out", approvals[-1])
+        policy_tool(self.bin, "sign", "--ledger", ledger, "--draft", draft, "--approvals", *approvals,
+                    "--keys", fleet.keys, "--out", out)
+
+    def fork(self, fleet: Fleet, to: str) -> str:
+        """A copy of the fleet's ledger as it is now, with the approvers'
+        recorded heads: a second body for the next version is signed from
+        it, which the fleet's own ledger refuses (M8 plan C13 Fixtures)."""
+        os.mkdir(to, 0o700)
+        shutil.copytree(fleet.ledger, os.path.join(to, "ledger"))
+        for a in POLICY_APPROVERS:
+            shutil.copy2(os.path.join(fleet.dir, f"{a}.head"), to)
+        return to
+
+    def c13_bundles(self, fleet: Fleet, deploy: str) -> str:
+        """M8 plan C13's bundles beyond v0, each through render / approve /
+        sign, into `c13/`: v1, v2 and v3 on the fleet's ledger (client 1,
+        "R", alone: client 0, "P", is revoked); from a fork at v0, v1p (v1
+        with min_release = RELEASE_SEQ + 1) and then v2p (prev v1p, the
+        floor lowered to 0); from another fork at v0, v1pp (clients 0 and
+        1, floor within RELEASE_SEQ)."""
+        out = os.path.join(self.root, "c13")
+        os.mkdir(out, 0o700)
+        release = rust_usize("crates/release-seq/src/lib.rs", "RELEASE_SEQ")
+
+        def peers(name: str, clients: list, floor: int) -> str:
+            path = os.path.join(deploy, f"peers-{name}.toml")
+            with open(path, "w") as f:
+                f.write(peers_toml(deploy, fleet.fleet_id, False, clients, floor))
+            return path
+        forks = {n: self.fork(fleet, os.path.join(out, f"fork-{n}")) for n in ("v1p", "v1pp")}
+        for name, ledger_dir, clients, floor in (("v1", fleet.dir, [1], 0), ("v2", fleet.dir, [1], 0),
+                                                 ("v3", fleet.dir, [1], 0), ("v1p", forks["v1p"], [1], release + 1),
+                                                 ("v2p", forks["v1p"], [1], 0), ("v1pp", forks["v1pp"], [0, 1], 0)):
+            self.sign_next(fleet, ledger_dir, peers(name, clients, floor), os.path.join(out, f"{name}.bin"))
+        shutil.copy2(fleet.v0, os.path.join(out, "v0.bin"))
+        return out
+
+    def wrong_name_state(self, tmp: str, state: str, c13: str):
+        """M8 plan C3's test-only fixture [T14, T42]: a copy of the
+        provisioned state `state`, without a Clear (the SRK and the seals
+        survive), whose counter is deleted with both operators' delete
+        authorizations (tools/provision's own NV_UndefineSpaceSpecial) and
+        redefined without POLICY_DELETE, then incremented once (an NV_Read
+        needs it written). Its Name is no longer the one the image compiles
+        in. The copy is tpm-a-wrong-name; its counter's Name and logical
+        version go to c13/wrong-name.json."""
+        copy = os.path.join(tmp, "tpm-a-wrong-name")
+        os.mkdir(copy, 0o700)
+        shutil.copy2(os.path.join(state, SWTPM_PERMALL), copy)
+        src = os.path.join(ROOT, "tools/provision")
+        g = {"__file__": src, "__name__": "provision"}
+        exec(compile(open(src).read(), src, "exec"), g)
+        scratch = pathlib.Path(tempfile.mkdtemp(prefix="wrong-name-", dir=tmp))
+        attrs = measure.NV_CTR_ATTRS & ~NV_POLICY_DELETE
+        ctr = f"{measure.NV_POLICY_CTR:#x}"
+        try:
+            with swtpm_server(copy) as tcti:
+                env = g["tpm_env"](tcti)
+                ref = scratch / "delete.ref"
+                ref.write_bytes(measure.NV_DELETE_REF)
+                op_ctx, names = [], []
+                for n, pub in enumerate(self.delete_pub):
+                    ctx, name = scratch / f"op{n}.ctx", scratch / f"op{n}.name"
+                    g["run"]("delete key", ["tpm2_loadexternal", "-Q", "-C", "n", "-G", "ecc", "-u", pub, "-c",
+                                            str(ctx), "-n", str(name)], env)
+                    subprocess.run(["tpm2_flushcontext", "-t"], env=env, capture_output=True)
+                    op_ctx.append(ctx)
+                    names.append(name.read_bytes())
+                policy = measure.delete_policy(names)
+                (scratch / "delete.policy").write_bytes(policy)
+                g["undefine_special"](env, measure.NV_POLICY_CTR, op_ctx, self.delete_keys, ref, scratch)
+                g["run"]("NV define", ["tpm2_nvdefine", ctr, "-C", "p", "-s", str(measure.NV_SIZE), "-L",
+                                       str(scratch / "delete.policy"), "-a", f"{attrs:#x}"], env)
+                g["run"]("NV increment", ["tpm2_nvincrement", ctr, "-C", ctr], env)
+                name = g["nv_name_now"](env, measure.NV_POLICY_CTR)
+                logical = (g["nv_read_u64"](env, measure.NV_POLICY_CTR, scratch)
+                           - g["nv_read_u64"](env, measure.NV_POLICY_BASE, scratch)) % 2**64
+        except g["Refused"] as e:
+            raise Fail(f"wrong-name fixture: {e}") from None
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        if name != measure.nv_name(measure.NV_POLICY_CTR, attrs | measure.NV_WRITTEN, policy) \
+                or name == measure.expected_nv_names(policy)[0]:
+            raise Fail(f"wrong-name fixture: the redefined counter's Name {name.hex()} is not the twin's")
+        with open(os.path.join(c13, "wrong-name.json"), "w") as f:
+            json.dump({"nv_ctr_name": name.hex(), "logical": logical}, f)
 
     def provision(self, tcti: str, fleet: Fleet, deploy: str, node: str) -> dict:
         """tools/provision's NV step on a TPM just cleared (M8 plan C3): the
@@ -7617,9 +8237,10 @@ class PolicyFixtures:
             f.write(bytes(measure.BUNDLE_MAX))
 
 
-def peers_toml(deploy: str, fleet_id: str, swap_rp: bool) -> str:
+def peers_toml(deploy: str, fleet_id: str, swap_rp: bool, only: list = None, min_release: int = 0) -> str:
     """tools/policy's peers.toml from mksecrets' clients.toml (in client
-    order), with `swap_rp` trading clients 0 and 1's Rosenpass keys."""
+    order), with `swap_rp` trading clients 0 and 1's Rosenpass keys; `only`
+    keeps those clients alone (M8 plan C13)."""
     clients = tomllib.load(open(os.path.join(deploy, "clients.toml"), "rb"))["peers"]
     if swap_rp:
         clients[0]["rp_pub_path"], clients[1]["rp_pub_path"] = clients[1]["rp_pub_path"], clients[0]["rp_pub_path"]
@@ -7632,8 +8253,10 @@ def peers_toml(deploy: str, fleet_id: str, swap_rp: bool) -> str:
     rules = {"inside": [("icmp", inside, 0, 0), ("udp", inside, 0, 65535)],
              "ops": [("tcp", host, IT_PORT_R, IT_PORT_R)],
              "web": [("tcp", host, IT_PORT_P, IT_PORT_P)]}
-    out = [f'fleet_id = "{fleet_id}"', "min_release = 0", ""]
+    out = [f'fleet_id = "{fleet_id}"', f"min_release = {min_release}", ""]
     for i, c in enumerate(clients):
+        if only is not None and i not in only:
+            continue
         member = ", ".join(f'"{g}"' for g in groups.get(i, ["inside"]))
         out += ["[[peers]]", f'wg_pub = "{c["wg_pub"]}"', f'rp_pub_path = "{c["rp_pub_path"]}"',
                 "allowed_ips = [" + ", ".join(f'"{a}"' for a in c["allowed_ips"]) + "]", f"groups = [{member}]", ""]
@@ -7648,13 +8271,23 @@ def bundle_peers(slot: bytes) -> list:
     """A signed bundle's peers as (wg_pub, rp_pub, allowed IPs), in the
     bundle's canonical order (ascending raw wg_pub, M8 plan C1): a peer's
     index here is its peer id on the device."""
+    return bundle_walk(slot)[0]
+
+
+# policy-wire's RULE_LEN: a prefix (4 + 1), proto, port_lo, port_hi.
+BUNDLE_RULE_LEN = 10
+
+
+def bundle_walk(slot: bytes) -> tuple:
+    """A signed bundle's peers (as bundle_peers gives them) and where its
+    signatures start, after the groups (M8 plan C1): its body's length."""
     src = open(os.path.join(ROOT, "crates/policy-wire/src/lib.rs")).read()
     m = re.search(r"^const PEER_COUNT_AT: usize = (\d+);$", src, re.M)
     spk = rust_usize("crates/limits/src/lib.rs", "SPK_LEN")
     if not m or slot[:4] != b"KZPP":
         raise Fail("bundle_peers: not a bundle, or policy-wire's PEER_COUNT_AT moved")
     pos = int(m.group(1))
-    count, pos = slot[pos], pos + 2
+    count, groups, pos = slot[pos], slot[pos + 1], pos + 2
     peers = []
     for _ in range(count):
         wg, rp = slot[pos:pos + 32], slot[pos + 32:pos + 32 + spk]
@@ -7663,7 +8296,9 @@ def bundle_peers(slot: bytes) -> list:
         allowed = [f"{'.'.join(map(str, slot[pos + 5 * k:pos + 5 * k + 4]))}/{slot[pos + 5 * k + 4]}" for k in range(n)]
         pos += 5 * n
         peers.append((wg, rp, allowed))
-    return peers
+    for _ in range(groups):
+        pos += 1 + BUNDLE_RULE_LEN * slot[pos]
+    return peers, pos
 
 
 def peer_id(deploy: str, client: int) -> int:
@@ -7707,6 +8342,9 @@ def build(tmp: str):
         _, srks[name] = provision_tpm(tmp, name, lambda tcti, f=fleet, d=deploy, n=name, out=printed:
                                       out.update(fixtures.provision(tcti, f, d, n)))
         fixtures.configure(deploy, fleet, printed)
+    # M8 plan C13: A's later bundles, signed once A's NV state holds v0.
+    c13 = fixtures.c13_bundles(fleets["a"], os.path.join(tmp, "a"))
+    fixtures.wrong_name_state(tmp, os.path.join(tmp, "tpm-a"), c13)
     _, srk_foreign = provision_tpm(tmp, "foreign")
     srk_a, srk_c = srks["a"], srks["c"]
     env = {**os.environ, "KOZANE_CONFIG": os.path.join(tmp, "a/gateway.toml")}
@@ -7871,17 +8509,22 @@ def in_netns(tmp: str) -> int:
              ("https flood", lambda: test_https_flood(good, deploy, passed)),
              ("tls key failure", lambda: test_tls_key_failure(tls_mismatch, deploy, passed)),
              ("supervisor", lambda: test_supervisor(fi_net, fi_timer, passed)),
-             ("release boot", lambda: test_release_boot(good, release, deploy, fi_net, passed)),
-             ("audit export", lambda: test_audit_export(good, fi_net, os.path.join(tmp, "policy/a/a.record"), passed))]
+             ("release boot", lambda: test_release_boot(good, release, deploy,
+                                                        {v: pkgs[f"fi_{v}"] for v in FAULT_INJECT_VARIANTS}, passed)),
+             ("audit export", lambda: test_audit_export(good, fi_net, os.path.join(tmp, "policy/a/a.record"), passed)),
+             *policy_cases(good, pkgs["fi_policy"], deploy, tmp, passed)]
     # check-selftest's red-proofs need only the boot their injection breaks:
-    # KOZANE_IT_BOOTS names those (comma-separated). A filtered run never
-    # prints INTEGRATION-CASES, so it can never pass `make check`'s manifest.
+    # KOZANE_IT_BOOTS names those (comma-separated), or a group: `policy`
+    # is every M8 plan C13 case. A filtered run never prints
+    # INTEGRATION-CASES, so it can never pass `make check`'s manifest.
+    groups = {"policy": {name for name, _ in cases if name.startswith("policy ")}}
     only = [b for b in os.environ.get("KOZANE_IT_BOOTS", "").split(",") if b]
     if only:
-        unknown = sorted(set(only) - {name for name, _ in cases})
+        unknown = sorted(set(only) - {name for name, _ in cases} - set(groups))
         if unknown:
             print(f"\nFAIL [setup]: KOZANE_IT_BOOTS names no boot: {unknown}", file=sys.stderr)
             return 1
+        only = set(only).union(*(groups.get(b, set()) for b in only))
         cases = [c for c in cases if c[0] in only]
     for name, fn in cases:
         try:

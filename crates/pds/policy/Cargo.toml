@@ -24,3 +24,8 @@ release-seq = { path = "../../release-seq" }
 # BLAKE2s, the gateway's rp digest (`config`'s rp_hash).
 secret-blob = { path = "../../secret-blob" }
 sel4-microkit = { workspace = true }
+
+[features]
+# M8 plan C13 (`crash-after-advance`): a selftest variant only (see
+# pd-audit's), never released (tools/release.py refuses its marker).
+fault-inject = []

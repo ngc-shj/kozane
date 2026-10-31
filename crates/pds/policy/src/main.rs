@@ -45,6 +45,18 @@ const CALLERS: [Channel; 5] = [
     Channel::new(ch::CH_INNER),
 ];
 
+/// Marks an image built with `fault-inject` (M7 plan C8): tools/release.py
+/// refuses one that holds it.
+#[cfg(feature = "fault-inject")]
+#[used]
+static FAULT_INJECT_VARIANT: [u8; 27] = *b"KOZANE-FAULT-INJECT-VARIANT";
+
+/// The `fault-inject` variant's marker (M8 plan C13 `crash-after-advance`):
+/// the `Halted` reason it logs once `tpm` confirmed an ADVANCE, before it
+/// stops without selecting or telling `tpm` Done.
+#[cfg(feature = "fault-inject")]
+pub const FAULT_INJECT_ADVANCED: u32 = 250;
+
 // `audit` names the reasons from its own table; this PD sees both.
 const _: () = assert!(reasons_match());
 
@@ -335,6 +347,19 @@ fn start() -> Policy {
     let page = memory_region_symbol!(audit_policy: *mut [u64; log::WORDS]);
     let mut log = AuditLog { page: page.cast(), writer: log::Writer::new(), coalescer: Coalescer::new(), pending: false };
     let verdict = decide();
+    // M8 plan C13: the crash between a confirmed ADVANCE and its use. The
+    // marker reaches `audit` through the log page; then this PD spins on
+    // its own budget, so lower priorities still run.
+    #[cfg(feature = "fault-inject")]
+    if let (Outcome::Verified { version, .. }, Some(current)) = (verdict.outcome, verdict.current)
+        && current.checked_add(1) == Some(version)
+    {
+        log.record(Event::Halted { reason: FAULT_INJECT_ADVANCED });
+        log.flush();
+        loop {
+            core::hint::spin_loop();
+        }
+    }
     // C5 step 6 (F7): Done only for a verified bundle, Failed on every
     // other exit; the cap's verdict goes to the key PDs, not here.
     let finish = match verdict.outcome {
