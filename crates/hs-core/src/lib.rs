@@ -256,7 +256,9 @@ impl PeerTable for Peers<'_> {
 pub enum Outcome {
     /// `install` holds `msgs::Install` bytes for `data` and `response`
     /// `msgs::Response` bytes for `ingress`; send them in that order.
-    Accepted { peer: PeerId, install_len: usize, response_len: usize },
+    /// `index` is the receiver index chosen for the session (the install's
+    /// `local_index`, the response's sender index), for the audit record.
+    Accepted { peer: PeerId, index: u32, install_len: usize, response_len: usize },
     Rejected(Reject),
     /// The initiation message from `ingress` was malformed.
     BadInput,
@@ -308,7 +310,7 @@ impl<const MAX_PEERS: usize> Handshaker<MAX_PEERS> {
         let response_len = msgs::Response { dst: init.src, msg: &accepted.response }.encode(response);
         match (install_len, response_len) {
             (Some(install_len), Some(response_len)) => {
-                Outcome::Accepted { peer: accepted.peer, install_len, response_len }
+                Outcome::Accepted { peer: accepted.peer, index: accepted.responder_index, install_len, response_len }
             }
             _ => {
                 install.fill(0);

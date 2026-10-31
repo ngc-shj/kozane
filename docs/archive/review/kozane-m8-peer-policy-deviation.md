@@ -582,3 +582,37 @@ Run in a scratch worktree (`build/probes/p3/tree`, since removed).
   in three reruns, and in the next full `make test` (133 cases, rc 0).
 - It is recorded as a harness flake of about 1 in 6. If it recurs in the
   final `make check`, it gets its own investigation rather than a retry.
+
+### D-22 — what writing C12 against the code found
+
+Writing the runbook and the audit map against the code found these
+differences from the plan:
+
+- **No per-peer attribution (fixed).** `HandshakeOk` and
+  `SessionInstalled` were counts without a peer, and no line recorded a
+  peer's outer endpoint, so the audit stream could not say who connected
+  or from where, which is the owner's third add-on. Per-peer handshake
+  and endpoint events are added in the next commit; the audit map cites
+  them.
+- **The C2 fleet digest vs the package (fixed).** `tools/package`
+  recorded no NodeConfig digest, so `verify --fleet` could not compare
+  one. Added in the same commit.
+- **The genesis-pin tie in check-pins (superseded by D-4).** D11 said
+  check-pins ties the genesis-roster pin. D-4 made the pin a
+  compiled-in build input, and its shipped all-zero value fails closed.
+  No separate rule is needed.
+- **`approve` checks the chain without the bundle signatures.** An
+  approver holds no policy public key, so `approve` runs
+  `verify_chain_unsigned`. The runbook has approvers run `policy verify
+  --ledger --keys-pub` first.
+- **Four planned injections are covered by other tests.** The plan named
+  check-selftest injections for `authorize` defaulting to Allow,
+  `auditkey`'s seq rule, the ready gate, and `sign` accepting one
+  approval. They are covered instead by:
+  - Kani I8.1/I8.4 and slice 4's scratch-copy mutants;
+  - `auditkey-core`'s Kani and unit tests;
+  - `audit-core`'s red-proved unit test plus check-pins P31;
+  - `tools/policy`'s fixtures.
+
+  Each of these has failed on its own mutant. A check-selftest case per
+  item would re-run the same evidence through a slower path.

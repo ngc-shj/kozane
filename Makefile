@@ -135,14 +135,18 @@ endif
 # tools/package also runs tools/ct-shape (identity, forbidden, shape,
 # printing) on the PD ELFs it packages against this harness, and wants a C9
 # pass record for it on a non-debug kernel (M4 plan C11), so `make ct` must
-# have passed.
-package: image ct-harness $(firmware)
+# have passed. It records the node's NodeConfig digest from the gateway.toml
+# the image was built from (crates/config's build.rs reads the same file)
+# with tools/policy, for `policy verify --fleet --package-node` (M8 plan C2).
+gateway_config := $(or $(KOZANE_CONFIG),config/gateway.toml)
+package: image ct-harness $(firmware) policy-tool
 	tools/package --secrets $(SECRETS) --pq-secrets $(PQ_SECRETS) --tls-secrets $(TLS_SECRETS) \
 		--audit-secrets $(AUDIT_SECRETS) --srk-public $(SRK_PUBLIC) --firmware $(firmware) --out $(OUT) \
 		--system $(system) --policy $(policy) \
 		--image $(loader) --gen-config $(sdk_config_dir)/include/kernel/gen_config.h \
 		--search-path $(BUILD) --board $(MICROKIT_BOARD) --config $(MICROKIT_CONFIG) \
-		--microkit $(MICROKIT_SDK)/bin/microkit --harness $(ct_harness)
+		--microkit $(MICROKIT_SDK)/bin/microkit --harness $(ct_harness) \
+		--gateway-config $(gateway_config) --policy-bin $(policy_bin)
 
 # M7 plan C8: the fault-inject selftest variants, packaged as `package`
 # does (same arguments) from PDs built with the feature into a BUILD of
@@ -156,7 +160,8 @@ fault_inject_timer := features_timer=fault-inject
 fault_inject_policy := features_policy=fault-inject
 package-fault-inject-%: ct-harness $(firmware)
 	$(if $(fault_inject_$*),,$(error no fault-inject variant '$*'))
-	$(MAKE) package BUILD=$(BUILD)/fault-inject-$* $(fault_inject_$*) ct_dir=$(ct_dir) firmware=$(firmware)
+	$(MAKE) package BUILD=$(BUILD)/fault-inject-$* $(fault_inject_$*) ct_dir=$(ct_dir) firmware=$(firmware) \
+		policy_target=$(policy_target)
 
 # Boots a package interactively, the shipped way (M7 plan I2.1): the
 # shipped firmware measures it into a per-run copy of the swtpm state it
@@ -470,10 +475,13 @@ release-verify: release-tool
 	python3 tools/release.py verify --pub $(PUB) --release $(REL) $(if $(ENVELOPE),--envelope $(ENVELOPE) --kind $(KIND))
 
 # M8 plan C2, D11: the peer-policy signing toolchain, its own workspace as
-# tools/release's.
+# tools/release's. A fault-inject package's sub-make keeps the main build's
+# target directory (`policy_target`).
+policy_target := $(BUILD)/policy/target
+policy_bin = $(policy_target)/release/policy
 .PHONY: policy-tool
 policy-tool:
-	cargo build --locked --release --manifest-path tools/policy/Cargo.toml --target-dir $(BUILD)/policy/target
+	cargo build --locked --release --manifest-path tools/policy/Cargo.toml --target-dir $(policy_target)
 
 # M5 plan C4: the MIR each PD ships from a verified crate equals the MIR the
 # proof configuration compiles (tools/mir-gate).

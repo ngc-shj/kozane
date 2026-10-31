@@ -15,6 +15,7 @@ Usage: package --secrets FILE --pq-secrets FILE --tls-secrets FILE
                --system FILE --policy FILE --image LOADER
                --gen-config gen_config.h --search-path DIR --board BOARD
                --config CONFIG --microkit BIN --harness CT_HARNESS
+               --gateway-config GATEWAY_TOML --policy-bin POLICY
 
 --srk-public is the target TPM's SRK, the TPM2B_PUBLIC `tpm2_readpublic -o`
 writes (mksecrets seal checks it is the storage template). The flow:
@@ -31,7 +32,13 @@ writes (mksecrets seal checks it is the storage template). The flow:
      the same private copy of the audit blob;
   4. microkit builds the system again with the envelopes as prefills, and
      the assembly U-Boot performs (tools/measure.py) must give back that
-     image byte for byte.
+     image byte for byte;
+  5. `policy node-digest` (--policy-bin, tools/policy) records the node's
+     NodeConfig digest from --gateway-config, the gateway.toml the image
+     was built from, as node.sha256: the encoding the fleet file's
+     node_sha256 uses, so `policy verify --fleet F --package-node
+     OUT/node.sha256` refuses a fleet file that does not describe this
+     node (M8 plan C2).
 
 Each build is accepted only if, against the placeholder build:
   - the .system differs in nothing but the six stand-in mrs' prefill_path;
@@ -46,9 +53,9 @@ exist yet: everything is built in a
 fresh 0700 staging directory beside it under umask 077, renamed into place
 only after every check passed, and removed on every failure path. OUT holds
 published.img, boot.desc, secrets.env, pq_secrets.env, tls_secrets.env,
-audit_secrets.env, audit.pub (64 hex digits and a newline), flash.bin (the
---firmware the PCRs were computed from) and pcrs (PCRs 0-8, one hex value a
-line).
+audit_secrets.env, audit.pub (64 hex digits and a newline), node.sha256
+(the same form), flash.bin (the --firmware the PCRs were computed from) and
+pcrs (PCRs 0-8, one hex value a line).
 Only `release` kernels are packaged (M5 plan C7, closing SC20 and
 architecture R4 on shipped images), judged from the kernel's own
 gen_config.h rather than a make variable: no CONFIG_DEBUG_BUILD, no
@@ -136,7 +143,7 @@ ENVELOPE_MAGIC = b"SOSSEAL1"
 # tpm2_wire::SRK_PUBLIC_LEN: the SRK's TPMT_PUBLIC (a P-256 point).
 SRK_PUBLIC_LEN = 90
 OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "tls_secrets.env", "audit_secrets.env",
-           "audit.pub", "flash.bin", "pcrs")
+           "audit.pub", "node.sha256", "flash.bin", "pcrs")
 
 
 def is_debug(gen_config: str) -> bool:
@@ -437,7 +444,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     for opt in ("secrets", "pq-secrets", "tls-secrets", "audit-secrets", "srk-public", "firmware", "out", "system", "policy", "image",
                 "gen-config",
-                "search-path", "board", "config", "microkit", "harness"):
+                "search-path", "board", "config", "microkit", "harness", "gateway-config", "policy-bin"):
         ap.add_argument(f"--{opt}", required=True)
     a = ap.parse_args()
 
@@ -578,15 +585,21 @@ def audit_public(blob: pathlib.Path, out: pathlib.Path):
                     "--out", str(out)], check=True)
 
 
-def check_audit_public(path: pathlib.Path) -> list:
-    """audit.pub as `mksecrets audit-public` writes it: 64 lowercase hex
-    digits and a newline, nothing else."""
+def node_digest(a, out: pathlib.Path):
+    """`policy node-digest`: the NodeConfig digest of --gateway-config."""
+    subprocess.run([a.policy_bin, "node-digest", "--out", str(out), a.gateway_config], check=True)
+
+
+def check_hex_file(path: pathlib.Path) -> list:
+    """audit.pub as `mksecrets audit-public` writes it, node.sha256 as
+    `policy node-digest` does: 64 lowercase hex digits and a newline,
+    nothing else."""
     try:
         text = path.read_bytes()
     except OSError as e:
-        return [f"package: cannot read audit.pub: {e}"]
+        return [f"package: cannot read {path.name}: {e}"]
     if not re.fullmatch(rb"[0-9a-f]{64}\n", text):
-        return ["package: audit.pub is not 64 lowercase hex digits and a newline"]
+        return [f"package: {path.name} is not 64 lowercase hex digits and a newline"]
     return []
 
 
@@ -649,7 +662,7 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
             copy.unlink(missing_ok=True)
     envelopes = {mr: (out / f"{mr}.env").read_bytes() for mr in SECRETS_MRS}
     errors = [e for kind in KINDS for e in check_envelope(kind, envelopes[kind.mr])]
-    errors += check_audit_public(out / "audit.pub")
+    errors += check_hex_file(out / "audit.pub")
     if errors:
         print("\n".join(errors))
         return 1
@@ -670,6 +683,12 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
     (out / "boot.desc").write_bytes(desc)
     (out / "flash.bin").write_bytes(firmware)
     (out / "pcrs").write_text("".join(p.hex() + "\n" for p in pcrs))
+    # 5. The node's NodeConfig digest, for `policy verify --package-node`.
+    node_digest(a, out / "node.sha256")
+    errors = check_hex_file(out / "node.sha256")
+    if errors:
+        print("\n".join(errors))
+        return 1
     for p in out.iterdir():
         if p.name not in OUTPUTS:
             p.unlink()

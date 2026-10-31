@@ -360,3 +360,29 @@ fn a_fleet_node_digest_is_sensitive_to_every_field() {
     changed.gateway_rp_digest = [4; 32];
     assert_ne!(crate::fleet::node_digest(&changed), base_digest);
 }
+
+fn node(name: &str, outside_ip: [u8; 4]) -> crate::fleet::Node {
+    crate::fleet::Node {
+        name: name.into(),
+        fleet_id: [9; 16],
+        inside_prefix: Prefix { addr: [10, 99, 0, 0], len: 24 },
+        inside_ip: [10, 99, 0, 1],
+        outside_ip,
+        neighbors: vec![[10, 99, 0, 2]],
+        gateway_wg_public: [1; 32],
+        gateway_rp_digest: [2; 32],
+    }
+}
+
+/// `verify --package-node` (M8 plan C2): a package's node digest names the
+/// fleet node it equals, and a node differing in any field names none.
+#[test]
+fn a_package_node_digest_matches_only_its_own_fleet_node() {
+    use crate::fleet::{Fleet, node_digest, node_for_digest};
+    let fleet = Fleet { fleet_id: [9; 16], nodes: vec![node("gw1", [10, 0, 2, 15]), node("gw2", [10, 0, 3, 15])] };
+    assert_eq!(node_for_digest(&fleet, &node_digest(&node("pkg", [10, 0, 3, 15]))), Some("gw2"));
+    assert_eq!(node_for_digest(&fleet, &node_digest(&node("pkg", [10, 0, 4, 15]))), None);
+    let mut other_fleet = node("pkg", [10, 0, 2, 15]);
+    other_fleet.fleet_id = [8; 16];
+    assert_eq!(node_for_digest(&fleet, &node_digest(&other_fleet)), None);
+}

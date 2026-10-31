@@ -1189,6 +1189,9 @@ class WgGo:
         if len(shown) < 2 or b64(shown[1]) != psk:
             raise Fail("wireguard-go's preshared key differs from key_out")
 
+    def listen_port(self) -> int:
+        return int(sh("wg", "show", self.dev, "listen-port").stdout)
+
     def latest_handshake(self) -> int:
         out = sh("wg", "show", self.dev, "latest-handshakes").stdout.split()
         return int(out[1]) if len(out) >= 2 else 0
@@ -1505,6 +1508,29 @@ def group_authorization_cases(con: Console, deploy: str, host: InsideHost, insid
     print(f"\nPASS [C8: LAN -> X unsolicited dropped, InnerDenied(NoFlow) peer={x}; X's reply traffic passes]")
 
 
+# What the gateway sees as a client's outer source under QEMU user-net: the
+# hostfwd delivers every client datagram from the slirp host address.
+SLIRP_HOST_IP = "10.0.2.2"
+
+
+def peer_handshake(con: Console, peer: int, since: int, index: int = None) -> int:
+    """M8 plan C12: hs's PeerHandshake line for `peer` (with `index`, that
+    receiver index); returns the index it names."""
+    want = r"[0-9a-f]{8}" if index is None else f"{index:08x}"
+    m = con.wait_for(rf"audit: src=hs PeerHandshake peer={peer} index=0x(?P<index>{want}) lost=\d+\r*\n", since=since)
+    return int(m.group("index"), 16)
+
+
+def peer_endpoint(con: Console, peer: int, since: int) -> tuple:
+    """M8 plan C12: ingress's PeerEndpoint lines for `peer`, the IP and then
+    the port of one change (a checkpoint line may fall between them);
+    returns (ip, port)."""
+    m = con.wait_for(rf"audit: src=ingress PeerEndpoint peer={peer} ip=(?P<ip>\d+\.\d+\.\d+\.\d+) lost=\d+\r*\n"
+                     rf"(?:audit: checkpoint [^\n]*\n)?"
+                     rf"audit: src=ingress PeerEndpoint peer={peer} port=(?P<port>\d+) lost=\d+\r*\n", since=since)
+    return m.group("ip"), int(m.group("port"))
+
+
 def test_wireguard(pkg: "Package", deploy: str, passed: list):
     inside = Wire()
     hostfwd = free_udp_port()
@@ -1560,6 +1586,15 @@ def test_wireguard(pkg: "Package", deploy: str, passed: list):
             raise Fail("wg show reports no handshake")
         con.wait_for(r"audit: src=hs HandshakeOk total=1 ")
         con.wait_for(r"audit: src=data SessionPromoted total=1 ")
+        # M8 plan C12: who and from where. wireguard-go's datagrams reach the
+        # gateway from the slirp host address, from wireguard-go's own port.
+        peer_handshake(con, peer_id(deploy, 0), prelude)
+        endpoint = peer_endpoint(con, peer_id(deploy, 0), prelude)
+        print(f"\npeer {peer_id(deploy, 0)} endpoint as the gateway sees it: {endpoint[0]}:{endpoint[1]}", flush=True)
+        if endpoint != (SLIRP_HOST_IP, wg.listen_port()):
+            raise Fail(f"PeerEndpoint for wireguard-go is {endpoint}, want ({SLIRP_HOST_IP!r}, {wg.listen_port()})")
+        passed.append("per-peer attribution: PeerHandshake and PeerEndpoint for wireguard-go")
+        print("\nPASS [C12: PeerHandshake and PeerEndpoint name wireguard-go's peer and its endpoint]")
         # A routed hop: wireguard-go's echo request (TTL 64) reaches the
         # inside host with TTL 63.
         requests = [ip for ip in host.received if ip[9] == 1 and ip[20] == 8]
@@ -1711,10 +1746,13 @@ def test_wireguard(pkg: "Package", deploy: str, passed: list):
         if wait_response(out, nopsk, REPLY_TIMEOUT_S) is not None:
             raise Fail("L8: peer 1 got a handshake response without a Rosenpass PSK")
         con.wait_for(r"audit: src=hs HandshakePskMissing total=1 ", since=mark)
+        if con.count(rf"audit: src=hs PeerHandshake peer={peer_id(deploy, 1)} ", since=mark):
+            raise Fail("L8: peer 1's refused initiation drew a PeerHandshake line")
         ping(tries=3)
         rp1 = Rosenpass(deploy, 1, rp_endpoint)
         rps.append(rp1)
         good, _ = installed(peer1, rp1, time.monotonic() + RP_EXCHANGE_S)
+        peer_handshake(con, peer_id(deploy, 1), mark, good.receiver)
         accepted_at = time.monotonic()
         # The install is no earlier than the last refused attempt, nor than
         # key_out (written on RespHello, before the install).
@@ -1771,6 +1809,10 @@ def test_wireguard(pkg: "Package", deploy: str, passed: list):
         spoofed = icmp_echo(bytes([10, 200, 0, 99]), HOST_IP, 8, 1, 1, b"spoof")
         out.sendto(good.transport(spoofed), ("127.0.0.1", hostfwd))
         con.wait_for(r"audit: src=data SpoofedSource total=1 ", since=mark)
+        # Its first authenticated packet: peer 1's endpoint is `out`'s port.
+        endpoint = peer_endpoint(con, peer_id(deploy, 1), mark)
+        if endpoint != (SLIRP_HOST_IP, out.getsockname()[1]):
+            raise Fail(f"PeerEndpoint for peer 1 is {endpoint}, want ({SLIRP_HOST_IP!r}, {out.getsockname()[1]})")
         ping(tries=3)
         if any(ip[12:16] == bytes([10, 200, 0, 99]) for ip in host.received):
             raise Fail("spoofed datagram reached the inside host")
@@ -3581,7 +3623,8 @@ def gateway_public(deploy: str) -> bytes:
 def peer_handshakes(b: PolicyBoot, deploy: str, client: int, what: str):
     """Client `client` runs Rosenpass against the gateway, then a WireGuard
     handshake with its key_out as the PSK until the response opens: the
-    peer is one the verified bundle names, end to end."""
+    peer is one the verified bundle names, end to end. Returns the
+    initiator, whose `receiver` is the gateway's index for the session."""
     rp = Rosenpass(deploy, client, f"127.0.0.1:{b.rp_fwd}")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
@@ -3595,7 +3638,7 @@ def peer_handshakes(b: PolicyBoot, deploy: str, client: int, what: str):
                 sock.sendto(i.initiation(), ("127.0.0.1", b.hostfwd))
                 r = wait_response(sock, i, REPLY_TIMEOUT_S)
                 if r is not None and i.consume_response(r):
-                    return
+                    return i
             if time.monotonic() > deadline:
                 raise Fail(f"{what}: client {client} did not handshake within {RP_EXCHANGE_S:.0f} s")
             time.sleep(PSK_RETRY_S)
@@ -3674,9 +3717,13 @@ def policy_cases(good: Package, fi_policy: Package, deploy: str, tmp: str, passe
             raise
 
     def advance_revoke(c, what):
+        # M8 plan C12: each accepted handshake is a PeerHandshake line naming
+        # the peer's id in the bundle in force and the session's index.
         def both(pb):
-            peer_handshakes(pb, deploy, CLIENT_P, f"{what}, v0")
-            peer_handshakes(pb, deploy, CLIENT_R, f"{what}, v0")
+            for client in (CLIENT_P, CLIENT_R):
+                mark = pb.con.mark()
+                i = peer_handshakes(pb, deploy, client, f"{what}, v0")
+                peer_handshake(pb.con, peer_id(deploy, client), mark, i.receiver)
         boot_once(c, f"{what}, v0", bundle("v0"), empty, "accepted version=0 slot=A", set(), 0, then=both)
         passed.append("policy advance-revoke: v0 from slot A, P and R handshake")
 
@@ -3684,7 +3731,12 @@ def policy_cases(good: Package, fi_policy: Package, deploy: str, tmp: str, passe
             mark = pb.con.mark()
             initiation_unanswered(pb, deploy, CLIENT_P, f"{what}, v1: revoked P")
             pb.con.wait_for(r"audit: src=hs HandshakeUnknownPeer total=1 ", since=mark)
-            peer_handshakes(pb, deploy, CLIENT_R, f"{what}, v1")
+            if pb.con.count(r"audit: src=hs PeerHandshake ", since=mark):
+                raise Fail(f"{what}, v1: the revoked P's initiation drew a PeerHandshake line")
+            mark = pb.con.mark()
+            i = peer_handshakes(pb, deploy, CLIENT_R, f"{what}, v1")
+            # R is v1's only peer: id 0.
+            peer_handshake(pb.con, 0, mark, i.receiver)
         boot_once(c, f"{what}, v1", bundle("v0"), bundle("v1"), "accepted version=1 slot=B", set(), 1, then=revoked)
         passed.append("policy advance-revoke: v1 advances from slot B, P refused, R handshakes")
 
@@ -8369,6 +8421,15 @@ def build(tmp: str):
     make("package", f"SECRETS={tmp}/c/secrets.bin", f"PQ_SECRETS={tmp}/c/pqkey-secrets.bin",
          f"TLS_SECRETS={tmp}/c/tls-secrets.bin", f"AUDIT_SECRETS={tmp}/c/audit-secrets.bin",
          f"SRK_PUBLIC={srk_c}", f"OUT={tmp}/c/pkg", env=env_c)
+    # M8 plan C2: each package's node digest is its own fleet's node, and
+    # not the other fleet's (a package and a fleet file of different nodes).
+    for name, other in (("a", "c"), ("c", "a")):
+        digest = f"{tmp}/{name}/pkg/node.sha256"
+        policy_tool(fixtures.bin, "verify", "--fleet", fleets[name].fleet_file, "--package-node", digest)
+        r = subprocess.run([fixtures.bin, "verify", "--fleet", fleets[other].fleet_file, "--package-node", digest],
+                           cwd=ROOT, capture_output=True, text=True)
+        if r.returncode == 0 or "is no node's in the fleet file" not in r.stderr:
+            raise Fail(f"{name}'s package node digest passed against fleet {other}: {r.stdout}{r.stderr}")
     # M7 plan C11: A's package released and verified as a deployer would,
     # each envelope's policy checked against the signed PCRs.
     make("release-tool")
@@ -8409,7 +8470,7 @@ def release_py(*args):
 
 # What tools/package writes: no image with a secret in it (M5 plan C8 F2),
 # and since M8 (plan C10) the audit key's public half.
-PACKAGE_OUTPUTS = ("published.img", "boot.desc", *ENVELOPE_FILES, "flash.bin", "pcrs", "audit.pub")
+PACKAGE_OUTPUTS = ("published.img", "boot.desc", *ENVELOPE_FILES, "flash.bin", "pcrs", "audit.pub", "node.sha256")
 
 
 def packages(tmp: str) -> dict:

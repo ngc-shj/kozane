@@ -11,7 +11,9 @@
 //! Some kinds carry a value instead of a running total: `RpCostHighWater`'s,
 //! `KeyWaitHighWater`'s and `TlsSignHighWater`'s `a` is the measured time in
 //! µs (`CostHighWater` gates how often each fires), the stack marks' `a` is bytes, `Halted`'s a reason code closed
-//! per producer and `KeyUnavailable`'s the key PD's boot error code.
+//! per producer and `KeyUnavailable`'s the key PD's boot error code. The
+//! per-peer kinds (`PeerHandshake`, `PeerEndpointIp`, `PeerEndpointPort`)
+//! carry a receiver index, an IPv4 address or a port.
 //!
 //! No kind names its producer: the producer is the audit ring a record
 //! arrived on (M5 plan C6), so a PD cannot report on another's behalf.
@@ -193,10 +195,33 @@ pub const INNER_REASON_NAMES: [&str; 4] = ["NoRule", "UnknownPeer", "NoFlow", "I
 pub const INNER_REASONS: u16 = INNER_REASON_CODES_REAL + 1;
 /// The real reasons; the next code in a peer's block is its unknown.
 const INNER_REASON_CODES_REAL: u16 = INNER_REASON_NAMES.len() as u16;
-pub const INNER_PEERS: u16 = 8;
+pub const INNER_PEERS: u16 = PEERS;
 pub const INNER_DENIED_BASE: u16 = 0x0340;
 pub const INNER_DENIED_UNKNOWN: u16 = INNER_DENIED_BASE + INNER_PEERS * INNER_REASONS;
-const _: () = assert!(INNER_DENIED_UNKNOWN < 0x0380);
+const _: () = assert!(INNER_DENIED_UNKNOWN < PEER_HANDSHAKE_BASE);
+
+/// Peer ids every per-peer range covers; each PD that raises a per-peer
+/// kind asserts at compile time that this is `limits::MAX_PEERS`.
+pub const PEERS: u16 = 8;
+/// Per-peer attribution (M8 plan C12, "who, from where, when"): edges, never
+/// coalesced, one code per peer, `a` the value and `b` the lost count. Each
+/// range's code after the last peer is its unknown, the one a peer id at or
+/// above `PEERS` encodes to (F45). `PEER_HANDSHAKE_BASE + peer`, `a` = the
+/// receiver index `hs` chose for the session.
+pub const PEER_HANDSHAKE_BASE: u16 = 0x0380;
+pub const PEER_HANDSHAKE_UNKNOWN: u16 = PEER_HANDSHAKE_BASE + PEERS;
+/// `PEER_ENDPOINT_IP_BASE + peer`, `a` = the peer's new outer IPv4 address,
+/// big-endian (`a.b.c.d` is `a << 24 | ...`).
+pub const PEER_ENDPOINT_IP_BASE: u16 = 0x0390;
+pub const PEER_ENDPOINT_IP_UNKNOWN: u16 = PEER_ENDPOINT_IP_BASE + PEERS;
+/// `PEER_ENDPOINT_PORT_BASE + peer`, `a` = its new outer UDP port; raised
+/// right after the IP record of the same change.
+pub const PEER_ENDPOINT_PORT_BASE: u16 = 0x03a0;
+pub const PEER_ENDPOINT_PORT_UNKNOWN: u16 = PEER_ENDPOINT_PORT_BASE + PEERS;
+const PEER_LAST_CODE: u16 = PEER_ENDPOINT_PORT_UNKNOWN;
+const _: () = assert!(PEER_HANDSHAKE_UNKNOWN < PEER_ENDPOINT_IP_BASE);
+const _: () = assert!(PEER_ENDPOINT_IP_UNKNOWN < PEER_ENDPOINT_PORT_BASE);
+const _: () = assert!(PEER_LAST_CODE < 0x03b0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Event {
@@ -391,6 +416,21 @@ pub enum Event {
     /// for `reason`, an `inner_core::flow::Denied` code (coalesced per peer
     /// and reason, M8 plan C8).
     InnerDenied { peer: u16, reason: u16 },
+    /// `hs` completed a handshake with peer `peer` (the bundle index) and
+    /// handed the session to `data`; `index` (`a`) is the receiver index it
+    /// chose, which the response carries in clear as its sender index and
+    /// every transport packet from the peer as its receiver index. Never
+    /// coalesced: at most one per peer per 1/50 s (`HandshakeFlood`), and
+    /// only from a peer holding its static key and current PSK.
+    PeerHandshake { peer: u16, index: u32 },
+    /// `ingress` set or changed peer `peer`'s outer endpoint (from `data`'s
+    /// `EndpointUpdate`): its IPv4 address, big-endian, as `a`. Never
+    /// coalesced: one per change, and a change needs an authenticated
+    /// packet with a new highest counter from another source.
+    PeerEndpointIp { peer: u16, ip: u32 },
+    /// The same change's UDP port, as `a`, recorded right after its
+    /// `PeerEndpointIp`.
+    PeerEndpointPort { peer: u16, port: u16 },
 }
 
 impl Event {
@@ -490,6 +530,9 @@ impl Event {
                 }
             }
             Event::InnerDenied { peer, reason } => inner_denied_code(peer, reason),
+            Event::PeerHandshake { peer, .. } => peer_code(PEER_HANDSHAKE_BASE, peer),
+            Event::PeerEndpointIp { peer, .. } => peer_code(PEER_ENDPOINT_IP_BASE, peer),
+            Event::PeerEndpointPort { peer, .. } => peer_code(PEER_ENDPOINT_PORT_BASE, peer),
         }
     }
 
@@ -647,6 +690,9 @@ impl Event {
             Event::PolicyUnavailable { .. } => "PolicyUnavailable",
             Event::PolicyRejected { .. } => "PolicyRejected",
             Event::InnerDenied { .. } => "InnerDenied",
+            Event::PeerHandshake { .. } => "PeerHandshake",
+            Event::PeerEndpointIp { .. } => "PeerEndpointIp",
+            Event::PeerEndpointPort { .. } => "PeerEndpointPort",
         }
     }
 
@@ -677,7 +723,10 @@ impl Event {
             | Event::PolicyAccepted { .. }
             | Event::ReleaseSeq { .. }
             | Event::PolicyUnavailable { .. }
-            | Event::PolicyRejected { .. } => false,
+            | Event::PolicyRejected { .. }
+            | Event::PeerHandshake { .. }
+            | Event::PeerEndpointIp { .. }
+            | Event::PeerEndpointPort { .. } => false,
             Event::ArpReplied
             | Event::UdpEchoed
             | Event::FrameDropped { .. }
@@ -753,6 +802,9 @@ impl Event {
             Event::ReleaseSeq { seq } => Some(seq),
             Event::PolicyUnavailable { current, .. } => Some(current),
             Event::PolicyRejected { version, .. } => Some(version),
+            Event::PeerHandshake { index, .. } => Some(index),
+            Event::PeerEndpointIp { ip, .. } => Some(ip),
+            Event::PeerEndpointPort { port, .. } => Some(port as u32),
             _ => None,
         }
     }
@@ -861,6 +913,11 @@ impl Event {
             // One slot per code, INNER_SLOT..: `code` keeps the event inside
             // INNER_DENIED_BASE..=INNER_DENIED_UNKNOWN.
             Event::InnerDenied { .. } => INNER_SLOT.saturating_add(self.code().saturating_sub(INNER_DENIED_BASE) as usize),
+            // One slot per code, PEER_SLOT..: `code` keeps the three kinds
+            // inside PEER_HANDSHAKE_BASE..=PEER_LAST_CODE.
+            Event::PeerHandshake { .. } | Event::PeerEndpointIp { .. } | Event::PeerEndpointPort { .. } => {
+                PEER_SLOT.saturating_add(self.code().saturating_sub(PEER_HANDSHAKE_BASE) as usize)
+            }
         }
     }
 }
@@ -883,7 +940,16 @@ const TLS_TIMEOUT_SLOT: usize = HTTP_REFUSED_SLOT + MAX_TLS_KIND as usize + 1;
 const TLS_KIND_UNKNOWN_SLOT: usize = TLS_TIMEOUT_SLOT + MAX_TLS_KIND as usize + 1;
 const POLICY_SLOT: usize = TLS_KIND_UNKNOWN_SLOT + 1;
 const INNER_SLOT: usize = POLICY_SLOT + (POLICY_LAST_CODE - POLICY_ACCEPTED_BASE) as usize + 1;
-const SLOTS: usize = INNER_SLOT + (INNER_DENIED_UNKNOWN - INNER_DENIED_BASE) as usize + 1;
+const PEER_SLOT: usize = INNER_SLOT + (INNER_DENIED_UNKNOWN - INNER_DENIED_BASE) as usize + 1;
+const SLOTS: usize = PEER_SLOT + (PEER_LAST_CODE - PEER_HANDSHAKE_BASE) as usize + 1;
+
+/// A per-peer kind's code: `base + peer`, or the range's unknown, `base +
+/// PEERS`, for a peer id out of range (never clamped onto a real peer).
+const fn peer_code(base: u16, peer: u16) -> u16 {
+    // Bounded by PEERS (each range asserted inside its block), so the
+    // wrapping operation never wraps.
+    base.wrapping_add(if peer < PEERS { peer } else { PEERS })
+}
 
 /// `InnerDenied`'s code: the peer's block and the reason in it, the block's
 /// unknown for an out-of-range reason, `INNER_DENIED_UNKNOWN` for an
@@ -1032,6 +1098,12 @@ pub enum Decoded {
     /// `InnerDenied`: the peer (< `INNER_PEERS`) and the reason (an index
     /// into `INNER_REASON_NAMES`); `a` is the running total.
     InnerDenied { peer: u16, reason: u16 },
+    /// `PeerHandshake`: the peer (< `PEERS`); `a` is the receiver index.
+    PeerHandshake(u16),
+    /// `PeerEndpointIp`: the peer; `a` is the IPv4 address, big-endian.
+    PeerEndpointIp(u16),
+    /// `PeerEndpointPort`: the peer; `a` is the UDP port.
+    PeerEndpointPort(u16),
     Unknown,
 }
 
@@ -1096,6 +1168,16 @@ pub fn decode(code: u16) -> Decoded {
         && reason < INNER_REASON_CODES_REAL
     {
         return Decoded::InnerDenied { peer, reason };
+    }
+    let peer = |base: u16| code.checked_sub(base).filter(|p| *p < PEERS);
+    if let Some(p) = peer(PEER_HANDSHAKE_BASE) {
+        return Decoded::PeerHandshake(p);
+    }
+    if let Some(p) = peer(PEER_ENDPOINT_IP_BASE) {
+        return Decoded::PeerEndpointIp(p);
+    }
+    if let Some(p) = peer(PEER_ENDPOINT_PORT_BASE) {
+        return Decoded::PeerEndpointPort(p);
     }
     match code.checked_sub(FRAME_DROPPED_BASE) {
         Some(r) if r <= MAX_DROP_REASON => Decoded::FrameDropped(r),

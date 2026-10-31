@@ -16,6 +16,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 BIN = ROOT / "build/policy/target/release/policy"
@@ -478,6 +479,66 @@ def case_fleet_digest_differs(d):
     return rc != 0 and "does not match its stored node_sha256" in out, out
 
 
+# --- the package's node digest (C2: the fleet file vs tools/package) --------
+
+MLDSA65_PUB_LEN = 1952
+
+
+def with_policy(gateway: pathlib.Path, fleet_id: str = FLEET_ID) -> None:
+    """The [policy] section a provisioned node's gateway.toml carries (the
+    image compiles its fleet_id in); keys and Names are stand-ins."""
+    (gateway.parent / "mldsa65.pub").write_bytes(bytes([1]) * MLDSA65_PUB_LEN)
+    with gateway.open("a") as f:
+        f.write(f'\n[policy]\nfleet_id = "{fleet_id}"\ned25519_pub = "{"11" * 32}"\nmldsa65_pub = "mldsa65.pub"\n'
+                f'nv_ctr_name = "000b{"aa" * 32}"\nnv_base_name = "000b{"bb" * 32}"\n')
+
+
+def node_digest(d: pathlib.Path, gateway: pathlib.Path) -> tuple:
+    out = d / f"{gateway.stem}.node.sha256"
+    rc, o = run(BIN, "node-digest", "--out", out, gateway)
+    return rc, o, out
+
+
+def case_package_node_in_fleet(d):
+    """Allow: the digest node-digest records for gw1 (as tools/package does)
+    is the fleet file's node_sha256 for gw1, so verify accepts it, alone
+    and beside a slot check."""
+    ctx = Ctx(d)
+    with_policy(ctx.gw1)
+    rc, out, digest = node_digest(d, ctx.gw1)
+    if rc != 0:
+        return False, out
+    stored = [n["node_sha256"] for n in tomllib.loads(ctx.fleet.read_text())["node"] if n["name"] == "gw1"]
+    same = digest.read_text() in [h + "\n" for h in stored]
+    rc1, out1 = run(BIN, "verify", "--fleet", ctx.fleet, "--package-node", digest)
+    rc2, out2 = run(BIN, "verify", "--keys-pub", ctx.keys, "--slot", ctx.slot0, "--fleet", ctx.fleet, "--package-node", digest)
+    ok = same and rc1 == 0 and "node is gw1" in out1 and rc2 == 0 and "node is gw1" in out2
+    return ok, out + out1 + out2 + ("" if same else "node-digest differs from the fleet file's node_sha256")
+
+
+def case_package_node_differs(d):
+    """Deny: gw1's gateway.toml changed after the fleet file was made (its
+    outside address), so the package's digest is no fleet node's."""
+    ctx = Ctx(d)
+    ctx.gw1.write_text(ctx.gw1.read_text().replace('outside_ip = "10.0.2.15"', 'outside_ip = "10.0.2.16"'))
+    with_policy(ctx.gw1)
+    rc, out, digest = node_digest(d, ctx.gw1)
+    if rc != 0:
+        return False, out
+    rc1, out1 = run(BIN, "verify", "--fleet", ctx.fleet, "--package-node", digest)
+    rc2, out2 = run(BIN, "verify", "--keys-pub", ctx.keys, "--slot", ctx.slot0, "--fleet", ctx.fleet, "--package-node", digest)
+    msg = "is no node's in the fleet file"
+    return rc1 != 0 and msg in out1 and rc2 != 0 and msg in out2, out1 + out2
+
+
+def case_node_digest_without_policy(d):
+    """Deny: a gateway.toml without [policy] compiles a zero fleet_id and
+    keys into its image, which accepts no bundle; node-digest refuses it."""
+    ctx = Ctx(d)
+    rc, out, digest = node_digest(d, ctx.gw1)
+    return rc != 0 and "no [policy] section" in out and not digest.exists(), out
+
+
 # --- restore fixtures ------------------------------------------------------
 
 def case_restore_allow(d):
@@ -651,6 +712,9 @@ CASES = [
     ("an approver head at the same version with a different digest is refused", case_approver_head_same_version_different_digest),
     ("a peer overlapping one fleet node's network is refused", case_overlap_with_one_node_of_fleet),
     ("a tampered fleet digest is refused", case_fleet_digest_differs),
+    ("a package node digest equal to the fleet file's (allow)", case_package_node_in_fleet),
+    ("a package node digest differing from the fleet file's is refused", case_package_node_differs),
+    ("node-digest refuses a gateway.toml without [policy]", case_node_digest_without_policy),
     ("a verified ledger restore (allow)", case_restore_allow),
     ("restoring from a replica missing an approver's head is refused", case_restore_missing_approver_head),
     ("a bundle approval used as a restore approval is refused", case_restore_approval_under_bundle_domain),

@@ -201,7 +201,10 @@ fn fixed_list_names_every_non_parameterised_variant() {
         | Event::ReleaseSeq { .. }
         | Event::PolicyUnavailable { .. }
         | Event::PolicyRejected { .. }
-        | Event::InnerDenied { .. } => false,
+        | Event::InnerDenied { .. }
+        | Event::PeerHandshake { .. }
+        | Event::PeerEndpointIp { .. }
+        | Event::PeerEndpointPort { .. } => false,
     };
     assert!(Event::FIXED.iter().all(|e| fixed(*e)));
     assert_eq!(Event::FIXED.len(), 64);
@@ -839,6 +842,9 @@ fn policy_code_ranges_are_disjoint_from_each_other_and_from_every_other_code() {
         (POLICY_REJECTED_UNKNOWN, 1),
         (INNER_DENIED_BASE, INNER_PEERS * INNER_REASONS),
         (INNER_DENIED_UNKNOWN, 1),
+        (PEER_HANDSHAKE_BASE, PEERS + 1),
+        (PEER_ENDPOINT_IP_BASE, PEERS + 1),
+        (PEER_ENDPOINT_PORT_BASE, PEERS + 1),
     ];
     for (i, (a, n)) in ranges.iter().enumerate() {
         for (b, m) in &ranges[i + 1..] {
@@ -969,4 +975,75 @@ fn inner_denied_is_coalesced_per_peer_and_reason() {
     assert!(out.iter().all(|r| r.b == 0));
     assert!(Event::InnerDenied { peer: 0, reason: 0 }.is_coalesced());
     assert_eq!(Event::InnerDenied { peer: 0, reason: 0 }.value(), None);
+}
+
+// M8 plan C12: per-peer attribution (PeerHandshake, PeerEndpointIp/Port).
+
+/// A per-peer kind for one peer: the event, its `Decoded` variant and its
+/// range's base.
+type PeerKind = (Event, fn(u16) -> Decoded, u16);
+
+fn peer_kinds(peer: u16) -> [PeerKind; 3] {
+    [
+        (Event::PeerHandshake { peer, index: 0x1122_3344 }, Decoded::PeerHandshake, PEER_HANDSHAKE_BASE),
+        (Event::PeerEndpointIp { peer, ip: 0x7f00_0001 }, Decoded::PeerEndpointIp, PEER_ENDPOINT_IP_BASE),
+        (Event::PeerEndpointPort { peer, port: 51820 }, Decoded::PeerEndpointPort, PEER_ENDPOINT_PORT_BASE),
+    ]
+}
+
+/// Every peer below `PEERS` (the last one included) decodes as itself, in
+/// the kind it was raised as.
+#[test]
+fn peer_kinds_decode_each_peer_as_itself() {
+    for peer in 0..PEERS {
+        for (ev, decoded, base) in peer_kinds(peer) {
+            assert_eq!(ev.code(), base + peer, "{ev:?}");
+            assert_eq!(decode(ev.code()), decoded(peer), "{ev:?}");
+        }
+    }
+    assert_eq!(PEERS, INNER_PEERS);
+}
+
+/// A peer id at or above `PEERS` encodes to its range's own unknown code,
+/// never onto a real peer, and that code names nothing.
+#[test]
+fn peer_kinds_with_an_out_of_range_peer_encode_to_their_unknown() {
+    for peer in [PEERS, PEERS + 1, u16::MAX] {
+        for ((ev, _, _), unknown) in peer_kinds(peer).into_iter().zip([PEER_HANDSHAKE_UNKNOWN, PEER_ENDPOINT_IP_UNKNOWN,
+                                                                         PEER_ENDPOINT_PORT_UNKNOWN]) {
+            assert_eq!(ev.code(), unknown, "{ev:?}");
+            assert_eq!(decode(unknown), Decoded::Unknown);
+        }
+    }
+}
+
+/// Edges: every occurrence is a record carrying its value in `a`, each
+/// peer's and kind's code counts in a slot of its own, and none moves
+/// another kind's running total.
+#[test]
+fn peer_kinds_are_never_coalesced_and_carry_their_value() {
+    let mut c = Coalescer::new();
+    let mut out = Vec::new();
+    run(&mut c, Event::PeerHandshake { peer: 2, index: 0xdead_beef }, 3, &mut out);
+    run(&mut c, Event::PeerEndpointIp { peer: 2, ip: 0x0a00_0202 }, 1, &mut out);
+    run(&mut c, Event::PeerEndpointPort { peer: 2, port: u16::MAX }, 1, &mut out);
+    run(&mut c, Event::PeerHandshake { peer: 9, index: 7 }, 1, &mut out);
+    run(&mut c, Event::NotForUs, 1, &mut out);
+    let seen: Vec<(u16, u32)> = out.iter().map(|r| (r.code, r.a)).collect();
+    assert_eq!(
+        seen,
+        [
+            (PEER_HANDSHAKE_BASE + 2, 0xdead_beef),
+            (PEER_HANDSHAKE_BASE + 2, 0xdead_beef),
+            (PEER_HANDSHAKE_BASE + 2, 0xdead_beef),
+            (PEER_ENDPOINT_IP_BASE + 2, 0x0a00_0202),
+            (PEER_ENDPOINT_PORT_BASE + 2, 65535),
+            (PEER_HANDSHAKE_UNKNOWN, 7),
+            (Event::NotForUs.code(), 1),
+        ]
+    );
+    for (ev, _, _) in peer_kinds(0) {
+        assert!(!ev.is_coalesced(), "{ev:?}");
+        assert!(ev.slot() < SLOTS, "{ev:?}");
+    }
 }

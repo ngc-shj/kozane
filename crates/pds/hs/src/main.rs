@@ -23,6 +23,7 @@ const INGRESS: Channel = Channel::new(ch::CH_INGRESS);
 const DATA: Channel = Channel::new(ch::CH_DATA);
 const PQ: Channel = Channel::new(ch::CH_PQ);
 const MAX_PEERS: usize = config::MAX_PEERS;
+const _: () = assert!(audit_event::PEERS as usize == MAX_PEERS, "PeerHandshake's peer range");
 
 /// `key` over PPC. Request and reply registers are zeroed after each call.
 /// Each call's wall time is measured (M6 plan C5, kept by C12): `key`
@@ -267,7 +268,7 @@ impl Hs {
                 &mut self.response,
             );
             match out {
-                Outcome::Accepted { install_len, response_len, .. } => {
+                Outcome::Accepted { peer, index, install_len, response_len } => {
                     // Install first: `data` must know the session before
                     // the initiator can use it (plan, Ordering).
                     let installed = pdkit::send(
@@ -289,6 +290,8 @@ impl Hs {
                         ) {
                             to_ingress = true;
                             self.audit.record(Event::HandshakeOk);
+                            // M8 plan C12: who connected, by bundle index.
+                            self.audit.record(Event::PeerHandshake { peer: peer.0, index });
                         }
                     }
                 }

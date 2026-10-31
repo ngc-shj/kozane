@@ -117,6 +117,12 @@ pub fn node_digest(n: &Node) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// The name of the fleet's node whose `node_digest` is `digest`, if any
+/// (`verify --package-node`).
+pub fn node_for_digest<'a>(fleet: &'a Fleet, digest: &[u8; 32]) -> Option<&'a str> {
+    fleet.nodes.iter().find(|n| node_digest(n) == *digest).map(|n| n.name.as_str())
+}
+
 impl Node {
     pub fn as_node_config(&self) -> NodeConfig<'_> {
         NodeConfig {

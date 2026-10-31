@@ -21,7 +21,10 @@ FILES = ["docker/Dockerfile", "Makefile", "rust-toolchain.toml", "Cargo.toml", "
          # P24: the firmware's flags and the boot path.
          "support/tf-a/build-flags", "support/u-boot/boot.cmd", "support/u-boot/kozane.config",
          # P30: the release script that signs release_seq.
-         "tools/release.py"]
+         "tools/release.py",
+         # P32: the audit map and the self-test cases it cites (the
+         # integration cases are run.py's, above; fixtures are copied below).
+         "docs/operations/audit-map.md", "tools/check-selftest"]
 # P7's cases run on a tree whose crates/ is replaced by a synthetic one.
 # P7 is enforced, so they need no --enforce-pending.
 ENFORCE: list = []
@@ -48,6 +51,9 @@ def copy_tree(dst: pathlib.Path):
             if src.is_file() and wanted and "target" not in rel.parts:
                 (dst / rel).parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy(src, dst / rel)
+    # P32: the tool fixtures the audit map cites.
+    for src in (ROOT / "tests/tools").glob("*.py"):
+        shutil.copy(src, dst / "tests/tools" / src.name)
 
 
 def write(path: pathlib.Path, text: str):
@@ -80,6 +86,9 @@ def lock_cmr_at(lock: pathlib.Path, version: str = "2.0.2"):
 # SC23 as the live policy lists it (closed since M4).
 SC23 = '[[waivers]]\nid = "SC23"\nowner = "M4"\nstatus = "closed"\n'
 SECRET = "\npub struct Secret<const N: usize>([u8; N]);\n"
+# P32: the audit map, and a table of its shape with one row to cite from.
+AUDIT_MAP = "docs/operations/audit-map.md"
+AUDIT_ROW = "\n| Question | Mechanism | Evidence | Test |\n|---|---|---|---|\n| q | m | e | {} |\n"
 
 
 def edit(path: pathlib.Path, old: str, new: str):
@@ -890,6 +899,28 @@ CASES = [
      lambda t: edit(t / "crates/pds/audit/src/main.rs", "audit_core::ready_input(", "audit_core::ready_input_unused(")),
     ("allow the call and the channel named in a comment", set(),
      lambda t: append(t / "crates/pds/audit/src/main.rs", "// .pp_call( on CH_AUDITKEY happens in sign only\n")),
+    # P32 (M8 plan C12): the audit map cites only tests the tree has.
+    ("P32 a made-up unit test cited", {"P32"},
+     lambda t: append(t / AUDIT_MAP, AUDIT_ROW.format("`rust:the_audit_map_cites_a_test_nobody_wrote`"))),
+    ("P32 a made-up integration case cited", {"P32"},
+     lambda t: append(t / AUDIT_MAP, AUDIT_ROW.format("`it:policy rollback-ok`"))),
+    ("P32 a fixture cited from the wrong file", {"P32"},
+     lambda t: append(t / AUDIT_MAP, AUDIT_ROW.format("`fixture:test_release.py:case_one_approval_only`"))),
+    ("P32 a Kani harness that is a plain fn", {"P32"},
+     lambda t: append(t / AUDIT_MAP, AUDIT_ROW.format("`kani:a_valid_bundle_parses`"))),
+    ("P32 a test ID without its kind", {"P32"},
+     lambda t: append(t / AUDIT_MAP, AUDIT_ROW.format("`a_valid_bundle_parses`"))),
+    ("P32 the audit map removed", {"P32"}, lambda t: (t / AUDIT_MAP).unlink()),
+    ("P32 a cited unit test deleted", {"P32"},
+     lambda t: edit(t / "crates/inner-core/src/tests.rs", "fn a_peer_with_no_groups_reaches_nothing(",
+                    "fn a_peer_with_no_groups_reaches_nothing_renamed(")),
+    ("allow real IDs of every kind", set(),
+     lambda t: append(t / AUDIT_MAP, AUDIT_ROW.format(
+         "`rust:a_valid_bundle_parses`, `kani:i8_2_unknown_peer_is_denied`, `it:policy`, `it:audit export`, "
+         "`selftest:measure-pair-35`, `fixture:test_policy.py:case_one_approval_only`, "
+         "`fixture:test_audit_verify.py:deny: a deleted line`"))),
+    ("allow unchecked code spans outside the Test column", set(),
+     lambda t: append(t / AUDIT_MAP, "\n| Question | Evidence |\n|---|---|\n| q | `policy: accepted version=<v>` |\n")),
 ]
 
 

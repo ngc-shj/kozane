@@ -161,7 +161,7 @@ fn full_handshake_through_the_real_key_oracle() {
     let (mut install, mut response) = ([0u8; 128], [0u8; 128]);
     let peers = [peer_pub()];
     let out = handshaker().handle(&input(&msg), 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&peers), &live(), &mut install, &mut response);
-    let Outcome::Accepted { peer, install_len, response_len } = out else { panic!("{out:?}") };
+    let Outcome::Accepted { peer, install_len, response_len, .. } = out else { panic!("{out:?}") };
     assert_eq!(peer, PeerId(0));
     assert_eq!(d.calls, 2, "StaticDh for es and ss");
 
@@ -173,6 +173,22 @@ fn full_handshake_through_the_real_key_oracle() {
     assert_eq!(inst.recv, t_send.as_bytes());
     assert_eq!(inst.send, t_recv.as_bytes());
     assert_eq!(resp.msg.len(), RESPONSE_LEN);
+}
+
+/// The index `Accepted` reports (the audit's `PeerHandshake` value) is the
+/// session's: the install's `local_index` and the response's sender index.
+#[test]
+fn accepted_reports_the_sessions_receiver_index() {
+    let r = region();
+    let mut d = direct(&r, 100);
+    let (_, msg) = Initiator::initiation(ts(1));
+    let (mut install, mut response) = ([0u8; 128], [0u8; 128]);
+    let peers = [peer_pub()];
+    let out = handshaker().handle(&input(&msg), 0, &mut KeyClient::new(&mut d), &mut entropy(), &Peers(&peers), &live(), &mut install, &mut response);
+    let Outcome::Accepted { index, install_len, response_len, .. } = out else { panic!("{out:?}") };
+    assert_eq!(msgs::Install::decode(&install[..install_len]).unwrap().local_index, index);
+    let resp = msgs::Response::decode(&response[..response_len]).unwrap();
+    assert_eq!(u32::from_le_bytes(resp.msg[4..8].try_into().unwrap()), index);
 }
 
 #[test]

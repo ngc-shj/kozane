@@ -40,6 +40,7 @@ const DATA: Channel = Channel::new(ch::CH_DATA);
 const PQ: Channel = Channel::new(ch::CH_PQ);
 const TLS: Channel = Channel::new(ch::CH_TLS);
 const MAX_PEERS: usize = config::MAX_PEERS;
+const _: () = assert!(audit_event::PEERS as usize == MAX_PEERS, "PeerEndpoint's peer range");
 const BUCKETS: usize = 64;
 // The Gate's backlog and TX-reserve thresholds are fractions of the ring
 // size it was written against.
@@ -734,10 +735,16 @@ impl Ingress {
                 (dst, msg.len())
             }
             Ok(ToIngress::EndpointUpdate { peer, endpoint }) => {
+                let new = Endpoint { ip: endpoint.ip, port: endpoint.port };
                 if usize::from(peer) < self.peer_count
                     && let Some(slot) = self.endpoints.get_mut(usize::from(peer))
+                    && *slot != Some(new)
                 {
-                    *slot = Some(Endpoint { ip: endpoint.ip, port: endpoint.port });
+                    *slot = Some(new);
+                    // M8 plan C12: from where, on each change only (`data`
+                    // asks only when the source moved). The IP, then the port.
+                    self.audit.record(Event::PeerEndpointIp { peer, ip: u32::from_be_bytes(new.ip) });
+                    self.audit.record(Event::PeerEndpointPort { peer, port: new.port });
                 }
                 return true;
             }

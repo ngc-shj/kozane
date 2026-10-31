@@ -200,7 +200,7 @@ fn owner_setup(g: &mut Gate, client: usize, primary: u32, session: u32, object: 
 /// PolicyAuthValue → Import → Load → Unseal → three flushes all pass, for
 /// any handle values the TPM returns, and Done ends the flow.
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(14)]
 fn the_owners_flow_is_forwarded() {
     let (primary, session, object) = (any_transient(), any_policy_session(), any_transient());
     kani::assume(primary != object);
@@ -230,7 +230,7 @@ fn any_two_clients() -> (usize, usize) {
 /// NotOwned is decided before Busy, so it is what the attacker gets while
 /// the owner's flow is under way (M6 plan C12).
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(14)]
 fn cross_client_handles_are_refused() {
     let (primary, session, object) = (any_transient(), any_policy_session(), any_transient());
     kani::assume(primary != object);
@@ -250,7 +250,7 @@ fn cross_client_handles_are_refused() {
 /// flushing, and has a flow of its own under way, is refused the owner's
 /// handles all the same.
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(14)]
 fn a_later_attacker_is_refused_the_unflushed_handles_of_a_finished_owner() {
     let (primary, session, object) = (any_transient(), any_policy_session(), any_transient());
     kani::assume(primary != object);
@@ -320,7 +320,7 @@ fn the_cap_is_withheld_until_every_client_finishes() {
 /// Deny: once every client is finished the cap is issued, and Unseal is
 /// refused from then on, by any client, even on a handle it owned.
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(14)]
 fn unseal_after_the_cap_is_refused() {
     let (primary, session, object) = (any_transient(), any_policy_session(), any_transient());
     kani::assume(primary != object);
@@ -348,7 +348,7 @@ fn unseal_after_the_cap_is_refused() {
 /// and leaves the gate, its once-bits and every state, exactly as it was;
 /// once the owner has finished, the same client's whole setup is forwarded.
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(14)]
 fn a_fresh_client_is_busy_without_effect_and_runs_after_the_owner_finishes() {
     let (owner, other) = any_two_clients();
     let owner_primary = any_transient();
@@ -373,7 +373,7 @@ fn a_fresh_client_is_busy_without_effect_and_runs_after_the_owner_finishes() {
 /// it to B (after A finished: one flow at a time), and a Fresh third client
 /// is refused it as not its own.
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(14)]
 fn a_flushed_handle_number_is_usable_by_the_other_client() {
     let primary = any_transient();
     let (a, b) = any_two_clients();
@@ -428,7 +428,7 @@ impl CapTransport for ScriptedDevice {
 /// and the device confirmed the extend; whichever subset finished and
 /// however, whether the cap ran or not, whatever the device answered.
 #[kani::proof]
-#[kani::unwind(12)]
+#[kani::unwind(14)]
 fn cap_status_is_pure_and_never_confirmed_before_a_confirmed_extend() {
     let mut g = Gate::new();
     let finished: [bool; gate::CLIENTS] = kani::any();

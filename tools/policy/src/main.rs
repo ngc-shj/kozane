@@ -5,11 +5,13 @@
 //!   policy keygen --dir <new dir> [--forbid <path>]...
 //!   policy approver-keygen --dir <new dir> [--forbid <path>]...
 //!   policy fleet --out <file> --fleet-id <hex32> <gateway.toml>...
+//!   policy node-digest --out <file> <gateway.toml>      (the node's NodeConfig digest, as tools/package records it)
 //!   policy render --input peers.toml --fleet <file> --ledger <dir> --out draft.bin [--set-roster <file>]
 //!   policy diff --ledger <dir> --draft draft.bin
 //!   policy approve --ledger <dir> --draft draft.bin --approver-key <file> --approver-id <id> --head <file> --out A.approval
 //!   policy sign --ledger <dir> --draft draft.bin --approvals A B ... --keys <dir> --out slot.bin [--new-roster <file>]
-//!   policy verify --keys-pub <dir> --slot slot.bin [--fleet <file>]
+//!   policy verify --keys-pub <dir> --slot slot.bin [--fleet <file> [--package-node <file>]]
+//!   policy verify --fleet <file> --package-node <file>
 //!   policy verify --ledger <dir> --keys-pub <dir>
 //!   policy ledger init --dir <dir> --genesis-roster <roster.toml>
 //!   policy ledger approve-restore --from <copy> --approver-key <file> --approver-id <id> --out R.approval
@@ -207,6 +209,65 @@ fn rp_digest(key: &[u8; limits::SPK_LEN]) -> [u8; 32] {
     secret_blob::blake2s(&[key.as_slice()])
 }
 
+/// A node's `NodeConfig` from its `gateway.toml`, through the checks the
+/// image build runs, named by the file's stem. Its `fleet_id` is
+/// `fleet_id` when given (`fleet`), else the file's own `[policy]` one, the
+/// value the image compiles in (`node-digest`); the second value says
+/// whether the file has a `[policy]` section.
+fn load_node(path: &Path, fleet_id: Option<[u8; 16]>) -> Result<(fleet::Node, bool), String> {
+    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
+    let load = |name: &str| -> Result<Vec<u8>, String> { fs::read(dir.join(name)).map_err(|e| format!("{}: {e}", dir.join(name).display())) };
+    let raw: validate::RawConfig = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let inside_prefix = validate::parse_prefix(&raw.gateway.inside_prefix).map_err(|e| format!("{}: {e}", path.display()))?;
+    let checked = validate::check(&text, &load).map_err(|e| format!("{}: {e}", path.display()))?;
+    let node = fleet::Node {
+        name: path.file_stem().and_then(|s| s.to_str()).unwrap_or("node").to_string(),
+        fleet_id: fleet_id.unwrap_or(checked.fleet_id),
+        inside_prefix,
+        inside_ip: checked.inside_ip,
+        outside_ip: checked.outside_ip,
+        neighbors: checked.neighbors.iter().map(|(ip, _)| *ip).collect(),
+        gateway_wg_public: checked.gateway_public,
+        gateway_rp_digest: checked.gateway_rp.hash,
+    };
+    Ok((node, raw.policy.is_some()))
+}
+
+/// The node digest `tools/package` records next to a package (M8 plan C2):
+/// `fleet::node_digest` of the `NodeConfig` the image compiles from this
+/// `gateway.toml`, its `[policy]` `fleet_id` included. A file without
+/// `[policy]` is refused: its image would refuse every bundle.
+fn cmd_node_digest(args: &[String]) -> Result<(), String> {
+    let out = PathBuf::from(arg(args, "--out")?);
+    let paths = positional(args, &["--out"]);
+    let [path] = paths.as_slice() else {
+        return Err("node-digest: need exactly one gateway.toml".into());
+    };
+    let (node, has_policy) = load_node(Path::new(path), None)?;
+    if !has_policy {
+        return Err(format!("node-digest: {path} has no [policy] section, so its image accepts no bundle"));
+    }
+    write_new(&out, format!("{}\n", hex(&fleet::node_digest(&node))).as_bytes(), 0o644)?;
+    println!("policy: node digest of {path} in {}", out.display());
+    Ok(())
+}
+
+/// `verify --package-node`: the digest `tools/package` recorded must be one
+/// node's of the fleet file, else the fleet file and the package describe
+/// different nodes (a stale fleet file, or a package from another
+/// `gateway.toml`) and the bundle checked against the fleet proves nothing
+/// for that package.
+fn check_package_node(fleet: &fleet::Fleet, path: &str) -> Result<(), String> {
+    let digest = read_hex_file(Path::new(path))?;
+    let digest: [u8; 32] = digest.try_into().map_err(|_| format!("{path}: not a 32-byte digest"))?;
+    let name = fleet::node_for_digest(fleet, &digest).ok_or_else(|| {
+        format!("verify: the package's node digest {} is no node's in the fleet file (a stale fleet file, or a package built from another gateway.toml)", hex(&digest))
+    })?;
+    println!("policy: the package's node is {name} in the fleet file");
+    Ok(())
+}
+
 fn cmd_fleet(args: &[String]) -> Result<(), String> {
     let out = PathBuf::from(arg(args, "--out")?);
     let fleet_id = util::hex_n::<16>(&arg(args, "--fleet-id")?, "--fleet-id")?;
@@ -216,27 +277,11 @@ fn cmd_fleet(args: &[String]) -> Result<(), String> {
     }
     let mut nodes = Vec::new();
     for path in &gateway_paths {
-        let path = Path::new(path);
-        let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let dir = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")).to_path_buf();
-        let load = |name: &str| -> Result<Vec<u8>, String> { fs::read(dir.join(name)).map_err(|e| format!("{}: {e}", dir.join(name).display())) };
-        let raw: validate::RawConfig = toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-        let inside_prefix = validate::parse_prefix(&raw.gateway.inside_prefix).map_err(|e| format!("{}: {e}", path.display()))?;
-        let checked = validate::check(&text, &load).map_err(|e| format!("{}: {e}", path.display()))?;
-        let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("node").to_string();
-        if nodes.iter().any(|n: &fleet::Node| n.name == name) {
-            return Err(format!("fleet: two gateway.toml files both name the node {name:?}"));
+        let (node, _) = load_node(Path::new(path), Some(fleet_id))?;
+        if nodes.iter().any(|n: &fleet::Node| n.name == node.name) {
+            return Err(format!("fleet: two gateway.toml files both name the node {:?}", node.name));
         }
-        nodes.push(fleet::Node {
-            name,
-            fleet_id,
-            inside_prefix,
-            inside_ip: checked.inside_ip,
-            outside_ip: checked.outside_ip,
-            neighbors: checked.neighbors.iter().map(|(ip, _)| *ip).collect(),
-            gateway_wg_public: checked.gateway_public,
-            gateway_rp_digest: checked.gateway_rp.hash,
-        });
+        nodes.push(node);
     }
     nodes.sort_by_key(|n| n.name.clone());
     let built = fleet::Fleet { fleet_id, nodes };
@@ -573,6 +618,11 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
             for node in &fleet.nodes {
                 policy_wire::parse(&slot, &node.as_node_config(), &rp_digest).map_err(|e| format!("verify: node {} rejects the slot: {e:?}", node.name))?;
             }
+            if let Some(path) = arg_opt(args, "--package-node") {
+                check_package_node(&fleet, &path)?;
+            }
+        } else if arg_opt(args, "--package-node").is_some() {
+            return Err("verify: --package-node needs --fleet".into());
         }
         println!("policy: both signatures verify; version={} min_release={} peer_count={}", header.version, header.min_release, header.peer_count);
         return Ok(());
@@ -588,7 +638,11 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
         }
         return Ok(());
     }
-    Err("verify: need --slot or --ledger".into())
+    if let (Some(fleet_path), Some(path)) = (arg_opt(args, "--fleet"), arg_opt(args, "--package-node")) {
+        let fleet = fleet::Fleet::parse(&fs::read_to_string(&fleet_path).map_err(|e| format!("{fleet_path}: {e}"))?)?;
+        return check_package_node(&fleet, &path);
+    }
+    Err("verify: need --slot, --ledger, or --fleet with --package-node".into())
 }
 
 // --- ledger init / restore -----------------------------------------------
@@ -747,6 +801,7 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("keygen") => cmd_keygen(&args[1..]),
         Some("approver-keygen") => cmd_approver_keygen(&args[1..]),
         Some("fleet") => cmd_fleet(&args[1..]),
+        Some("node-digest") => cmd_node_digest(&args[1..]),
         Some("render") => cmd_render(&args[1..]),
         Some("diff") => cmd_diff(&args[1..]),
         Some("approve") => cmd_approve(&args[1..]),
@@ -762,7 +817,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{}", hex(&Roster::parse(&text)?.digest()));
             Ok(())
         }
-        _ => Err("usage: policy keygen|approver-keygen|fleet|render|diff|approve|sign|verify|ledger|roster-digest ...".into()),
+        _ => Err("usage: policy keygen|approver-keygen|fleet|node-digest|render|diff|approve|sign|verify|ledger|roster-digest ...".into()),
     }
 }
 

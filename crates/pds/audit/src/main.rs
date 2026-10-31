@@ -93,6 +93,16 @@ impl fmt::Display for Hex<'_> {
     }
 }
 
+/// An IPv4 address carried big-endian in a record's `a`, as `a.b.c.d`.
+struct Ipv4(u32);
+
+impl fmt::Display for Ipv4 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let [a, b, c, d] = self.0.to_be_bytes();
+        write!(f, "{a}.{b}.{c}.{d}")
+    }
+}
+
 /// The console: the UART, the chain over every line printed, the running
 /// total of every source's `lost`, and the checkpoint schedule.
 struct Console {
@@ -380,6 +390,25 @@ impl Audit {
                     true
                 }
                 None => false,
+            },
+            // M8 plan C12: who connected, and from where. An endpoint
+            // change is two records, printed as two adjacent lines of the
+            // same source: the IP, then the port (a line is one record).
+            Decoded::PeerHandshake(peer) => {
+                println!(console, "audit: src={} PeerHandshake peer={} index={:#010x} lost={}", src, peer, r.a, r.b);
+                true
+            }
+            Decoded::PeerEndpointIp(peer) => {
+                println!(console, "audit: src={} PeerEndpoint peer={} ip={} lost={}", src, peer, Ipv4(r.a), r.b);
+                true
+            }
+            // A port above 65535 is no port: counted as an unknown code.
+            Decoded::PeerEndpointPort(peer) => match u16::try_from(r.a) {
+                Ok(port) => {
+                    println!(console, "audit: src={} PeerEndpoint peer={} port={} lost={}", src, peer, port, r.b);
+                    true
+                }
+                Err(_) => false,
             },
             Decoded::Unknown => false,
         };

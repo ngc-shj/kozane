@@ -78,6 +78,7 @@ AUDIT_BLOB = seal(AUDIT_BODY, 4096)
 BLOBS = {"secrets": BLOB, "pq_secrets": PQ_BLOB, "tls_secrets": TLS_BLOB, "audit_secrets": AUDIT_BLOB}
 # What the fake `mksecrets audit-public` writes.
 AUDIT_PUB = "5e" * 32 + "\n"
+NODE_DIGEST = "6d" * 32 + "\n"
 # An SRK TPM2B_PUBLIC as tpm2_readpublic -o writes it (framing only: the
 # template is mksecrets' check).
 SRK = (90).to_bytes(2, "big") + bytes(range(90))
@@ -266,7 +267,8 @@ def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BL
                         "--tls-secrets", str(d / "tls.bin"), "--audit-secrets", str(d / "audit.bin"),
                         "--srk-public", str(d / "srk.pub"), "--firmware", "x", "--out", str(d / "pkg"), "--system", str(d / "kozane.system"), "--policy", "x", "--image", "x",
                         "--gen-config", str(d / "gen_config.h"), "--search-path", str(search), "--board", "x",
-                        "--config", "x", "--microkit", "x", "--harness", str(harness_path)]
+                        "--config", "x", "--microkit", "x", "--harness", str(harness_path),
+                        "--gateway-config", "x", "--policy-bin", "x"]
             captured = io.StringIO()
             with contextlib.redirect_stdout(captured):
                 status = pkg.main()
@@ -401,7 +403,8 @@ def run_main(build_result):
                         "--tls-secrets", str(d / "tls.bin"), "--audit-secrets", str(d / "audit.bin"),
                         "--srk-public", str(d / "srk.pub"), "--firmware", "x", "--out", str(out), "--system", "x", "--policy", "x",
                         "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
-                        "--config", "x", "--microkit", "x", "--harness", "x"]
+                        "--config", "x", "--microkit", "x", "--harness", "x",
+                        "--gateway-config", "x", "--policy-bin", "x"]
             real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
             real_sigmask = signal.pthread_sigmask(signal.SIG_BLOCK, set())
             real_signal = signal.signal
@@ -558,7 +561,8 @@ def staging_in_forbidden_root():
                     "--tls-secrets", str(d / "tls.bin"), "--audit-secrets", str(d / "audit.bin"),
                     "--srk-public", str(d / "srk.pub"), "--firmware", "x", "--out", str(d / "pkg"), "--system", "x", "--policy", "x",
                     "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
-                    "--config", "x", "--microkit", "x", "--harness", "x"]
+                    "--config", "x", "--microkit", "x", "--harness", "x",
+                    "--gateway-config", "x", "--policy-bin", "x"]
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             status = pkg.main()
@@ -664,8 +668,9 @@ def build_case(variant=None):
     tls_secrets envelope each as the other's kind), "audit-swap" (the same
     for tls_secrets and audit_secrets), "assembly" (the envelope image is
     not the assembly), "audit-pub" (audit-public writes upper-case hex),
-    "no-audit-pub" (it writes nothing). Returns the errors, or build's own
-    output for a variant."""
+    "no-audit-pub" (it writes nothing), "node-digest" (`policy node-digest`
+    writes upper-case hex), "no-node-digest" (it writes nothing). Returns
+    the errors, or build's own output for a variant."""
     return lambda: _build_case(variant)
 
 
@@ -678,7 +683,7 @@ def envelope(mr: str) -> bytes:
 def _build_case(variant):
     d = tmp_tree()
     real_run = pkg.subprocess.run
-    microkit_saw, sealed, exported = [], {}, []
+    microkit_saw, sealed, exported, digested = [], {}, [], []
     try:
         (d / "slot.bin").write_bytes(bytes(SLOT))
         (d / "system.xml").write_text(SYSTEM.replace("slot-placeholder.bin", str(d / "slot.bin")))
@@ -711,6 +716,11 @@ def _build_case(variant):
                 return
             if cmd[0] == "cargo":
                 return
+            if cmd[:2] == ["policy", "node-digest"]:
+                digested.append(cmd[2:])
+                if variant != "no-node-digest":
+                    pathlib.Path(arg(cmd, "--out")).write_text(NODE_DIGEST.upper() if variant == "node-digest" else NODE_DIGEST)
+                return
             system = pathlib.Path(cmd[1])
             img = bytearray(BUILD_IMG)
             for mr, at in (("secrets", KEY_AT), ("pq_secrets", PQ_AT), ("tls_secrets", TLS_AT),
@@ -729,9 +739,9 @@ def _build_case(variant):
         pkg.subprocess.run = fake_run
 
         class A:
-            system, image, firmware, policy, search_path, board, config, microkit = (
+            system, image, firmware, policy, search_path, board, config, microkit, gateway_config, policy_bin = (
                 str(d / "system.xml"), str(d / "placeholder.img"), str(d / "flash.bin"), "p", "s", "b", "c",
-                "microkit")
+                "microkit", "gw/gateway.toml", "policy")
 
         captured = io.StringIO()
         with contextlib.redirect_stdout(captured):
@@ -749,6 +759,10 @@ def _build_case(variant):
             errors.append(f"audit.pub not exported once from the audit blob's private copy: {[p for p, _ in exported]}")
         if (staging / "audit.pub").exists() and (staging / "audit.pub").read_text() != AUDIT_PUB:
             errors.append("audit.pub is not what audit-public wrote")
+        if digested != [["--out", str(staging / "node.sha256"), "gw/gateway.toml"]]:
+            errors.append(f"node-digest not run once on --gateway-config into node.sha256: {digested}")
+        if (staging / "node.sha256").exists() and (staging / "node.sha256").read_text() != NODE_DIGEST:
+            errors.append("node.sha256 is not what node-digest wrote")
         desc = (staging / "boot.desc").read_bytes() if (staging / "boot.desc").exists() else b""
         if desc and pkg.measure.parse(desc)[1] != [(KEY_AT, len(BLOB)), (PQ_AT, len(PQ_BLOB)), (TLS_AT, len(TLS_BLOB)),
                                                    (AUDIT_AT, len(AUDIT_BLOB)), (SLOT_A_AT, SLOT), (SLOT_B_AT, SLOT)]:
@@ -1137,6 +1151,9 @@ CASES = [
     ("an audit.pub that is not lower-case hex is refused",
      ["package: audit.pub is not 64 lowercase hex digits and a newline"], build_case("audit-pub")),
     ("a missing audit.pub is refused", "package: cannot read audit.pub", build_case("no-audit-pub")),
+    ("a node.sha256 that is not lower-case hex is refused",
+     ["package: node.sha256 is not 64 lowercase hex digits and a newline"], build_case("node-digest")),
+    ("a missing node.sha256 is refused", "package: cannot read node.sha256", build_case("no-node-digest")),
     ("an envelope image that is not the boot-time assembly is refused",
      ["package: the boot-time assembly differs from the image microkit built with the envelopes"],
      build_case("assembly")),

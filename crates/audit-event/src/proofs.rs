@@ -1,5 +1,5 @@
-//! Kani harnesses for the `policy` and `InnerDenied` code ranges (M8 plan
-//! C9, F41, F43, F45):
+//! Kani harnesses for the `policy`, `InnerDenied` and per-peer code ranges
+//! (M8 plan C9, C12, F41, F43, F45):
 //! over every slot, reason and value, the encoding stays in its range and
 //! the decoding names exactly what was encoded, or `Unknown` for an
 //! out-of-range input; and the log never writes past its page.
@@ -94,6 +94,42 @@ fn inner_denied_encodes_and_decodes_exactly() {
     }
     kani::cover!(peer == INNER_PEERS - 1 && usize::from(reason) == INNER_REASON_NAMES.len() - 1);
     kani::cover!(peer < INNER_PEERS && usize::from(reason) == INNER_REASON_NAMES.len());
+}
+
+/// I9.6 (M8 plan C12, F45): each per-peer kind decodes as its own kind and
+/// peer when the peer is in range and as `Unknown` (its range's unknown)
+/// otherwise; no other code decodes as one; its counter slot is in bounds
+/// and it carries its value uncoalesced.
+#[kani::proof]
+fn peer_kinds_encode_and_decode_exactly() {
+    let (peer, value): (u16, u32) = (kani::any(), kani::any());
+    let port = value as u16;
+    let kinds = [
+        (Event::PeerHandshake { peer, index: value }, Decoded::PeerHandshake(peer), PEER_HANDSHAKE_BASE, value),
+        (Event::PeerEndpointIp { peer, ip: value }, Decoded::PeerEndpointIp(peer), PEER_ENDPOINT_IP_BASE, value),
+        (Event::PeerEndpointPort { peer, port }, Decoded::PeerEndpointPort(peer), PEER_ENDPOINT_PORT_BASE, u32::from(port)),
+    ];
+    for (ev, decoded, base, a) in kinds {
+        let code = ev.code();
+        assert!((base..=base + PEERS).contains(&code));
+        if peer < PEERS {
+            assert!(decode(code) == decoded);
+        } else {
+            assert!(code == base + PEERS);
+            assert!(decode(code) == Decoded::Unknown);
+        }
+        assert!(ev.slot() < SLOTS);
+        assert!(!ev.is_coalesced() && ev.value() == Some(a));
+    }
+    let other: u16 = kani::any();
+    match decode(other) {
+        Decoded::PeerHandshake(p) => assert!(Event::PeerHandshake { peer: p, index: 0 }.code() == other),
+        Decoded::PeerEndpointIp(p) => assert!(Event::PeerEndpointIp { peer: p, ip: 0 }.code() == other),
+        Decoded::PeerEndpointPort(p) => assert!(Event::PeerEndpointPort { peer: p, port: 0 }.code() == other),
+        _ => {}
+    }
+    kani::cover!(peer == PEERS - 1);
+    kani::cover!(peer == PEERS);
 }
 
 /// I9.4: the log writer writes only inside its page, and the reader's
