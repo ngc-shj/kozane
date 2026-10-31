@@ -13,7 +13,8 @@
 //! slots leave it answering `Unavailable{reason}` for the boot. Its callers
 //! (the barrier PDs, C6) reach it only through `Await`. Its audit lines go
 //! to a log page `audit` maps read-only (`audit_event::log`), so nothing
-//! of the tainted `audit` reaches it (L1).
+//! of the tainted `audit` reaches it (L1). One of them is its stack
+//! high-water mark after verification (C10), its stack's deepest use.
 
 #![no_std]
 #![no_main]
@@ -328,6 +329,9 @@ fn init() -> Policy {
 }
 
 fn start() -> Policy {
+    // SAFETY: first thing in init, with this PD's stack_size (layout checks
+    // POLICY_STACK_SIZE against the system file).
+    let stack = unsafe { cpu::StackProbe::paint(layout::POLICY_STACK_SIZE) };
     let page = memory_region_symbol!(audit_policy: *mut [u64; log::WORDS]);
     let mut log = AuditLog { page: page.cast(), writer: log::Writer::new(), coalescer: Coalescer::new(), pending: false };
     let verdict = decide();
@@ -339,6 +343,8 @@ fn start() -> Policy {
     };
     let _ = tpm_call(finish, &[], &mut []);
     report(&mut log, &verdict);
+    // Every verification has run: the mark is the deepest this PD goes.
+    log.record(Event::StackHighWater { bytes: u32::try_from(stack.high_water()).unwrap_or(u32::MAX) });
     // `policy: ready` whatever the outcome: readiness is that `Await` is
     // answered from here on; the barrier is about `Verified`.
     log.record(Event::Ready);

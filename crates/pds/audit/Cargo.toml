@@ -6,7 +6,9 @@ license.workspace = true
 
 [dependencies]
 boot-stage = { path = "../../boot-stage" }
+audit-core = { path = "../../audit-core" }
 audit-event = { path = "../../audit-event" }
+auditkey-core = { path = "../../auditkey-core" }
 layout = { path = "../../layout" }
 ring = { path = "../../ring" }
 sel4-microkit.workspace = true

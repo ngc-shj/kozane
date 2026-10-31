@@ -6,6 +6,12 @@
 //! transmit FIFO, polling the FIFO-full flag before each byte. It has no
 //! interrupt and no receive path; no PD prints through the kernel, and a
 //! release kernel has no debug printing at all.
+//!
+//! The export (M8 plan C10): every line ends in ` seq=<n>` and extends the
+//! hash chain (`audit_core::Chain`); `audit_core::Checkpoints` decides when
+//! a checkpoint line is due and when `auditkey` may be called. Its one PPC
+//! is `sign`, made only for that machine's `Action::Call`, which exists only
+//! after `auditkey`'s notification (`audit_core::ready_input`, F32).
 
 #![no_std]
 #![no_main]
@@ -13,14 +19,20 @@
 use core::fmt::{self, Write};
 use core::ptr::NonNull;
 
+use audit_core::{Action, Chain, Checkpoints, Line, Outcome};
 use audit_event::{
     Decoded, HTTP_REFUSED_NAMES, INNER_REASON_NAMES, POLICY_REASON_NAMES, POLICY_SLOT_NAMES, POLICY_STATE_REFUSED,
     Record, TCP_LIMIT_NAMES, TLS_CLOSED_NAMES, TLS_REFUSED_NAMES, TLS_TIMEOUT_NAMES, UnknownCodes, decode, log,
 };
+use auditkey_core::{CHAIN_LEN, Reply};
+use layout::auditkey::{SIGN, SIGN_REPLY_WORDS, SIGN_REQ_WORDS};
 use layout::{AUDIT_RING_SLOTS, audit as ch};
 use ring::shmem::ShmRing;
 use ring::{Consumer, RingError};
-use sel4_microkit::{Channel, ChannelSet, Handler, Infallible, memory_region_symbol, protection_domain, var};
+use sel4_microkit::{
+    Channel, ChannelSet, Handler, Infallible, MessageInfo, memory_region_symbol, protection_domain, var, with_msg_regs,
+    with_msg_regs_mut,
+};
 use wire::DropReason;
 
 type AuditRing = ShmRing<Record, AUDIT_RING_SLOTS>;
@@ -54,22 +66,127 @@ impl Uart {
     }
 }
 
-impl Write for Uart {
+/// One line on its way out: each byte to the UART and into the line's
+/// hash. No line holds a CR or LF (every field is a number or a name from a
+/// closed table); `Console::emit` ends it.
+struct LineWriter<'a> {
+    uart: &'a Uart,
+    line: Line,
+}
+
+impl Write for LineWriter<'_> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for b in s.bytes() {
-            if b == b'\n' {
-                self.put(b'\r');
-            }
-            self.put(b);
+            self.uart.put(b);
         }
+        self.line.update(s.as_bytes());
         Ok(())
     }
 }
 
-/// One line to the console; formatting into the UART cannot fail.
+/// Bytes as lowercase hex.
+struct Hex<'a>(&'a [u8]);
+
+impl fmt::Display for Hex<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.iter().try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
+/// The console: the UART, the chain over every line printed, the running
+/// total of every source's `lost`, and the checkpoint schedule.
+struct Console {
+    uart: Uart,
+    chain: Chain,
+    lost: u64,
+    checkpoints: Checkpoints,
+}
+
+/// `audit`'s one PPC (M8 plan C10, F32): `SIGN` to `auditkey` with the
+/// words of `audit_core`'s `Action::Call`, its only caller. Returns the
+/// reply label and how many reply words landed in `reply` (none if
+/// `auditkey` claims more than a reply holds). The registers are zeroed.
+fn sign(words: &[u64; SIGN_REQ_WORDS], reply: &mut [u64; SIGN_REPLY_WORDS]) -> (u64, usize) {
+    with_msg_regs_mut(|mrs| {
+        for (dst, src) in mrs.iter_mut().zip(words) {
+            *dst = *src;
+        }
+    });
+    let info = Channel::new(ch::CH_AUDITKEY).pp_call(MessageInfo::new(SIGN, SIGN_REQ_WORDS));
+    let count = info.count();
+    let n = if count <= SIGN_REPLY_WORDS { count } else { 0 };
+    with_msg_regs(|mrs| {
+        for (dst, src) in reply.iter_mut().zip(mrs.iter().take(n)) {
+            *dst = *src;
+        }
+    });
+    with_msg_regs_mut(|mrs| mrs.iter_mut().take(SIGN_REPLY_WORDS).for_each(|w| *w = 0));
+    (info.label(), n)
+}
+
+impl Console {
+    /// Prints one line with its ` seq=` trailer and CRLF, and extends the
+    /// chain over it (trailer included, CRLF not). Formatting cannot fail.
+    fn emit(&mut self, args: fmt::Arguments) {
+        let mut w = LineWriter { uart: &self.uart, line: self.chain.begin() };
+        let _ = w.write_fmt(args);
+        let LineWriter { uart, line } = w;
+        self.chain.end(line, |t| t.iter().for_each(|b| uart.put(*b)));
+        uart.put(b'\r');
+        uart.put(b'\n');
+    }
+
+    /// One line, then any checkpoint it made due.
+    fn line(&mut self, args: fmt::Arguments) {
+        self.emit(args);
+        self.checkpoint();
+    }
+
+    /// The checkpoint due before the next line, if any: signed through the
+    /// one `sign` call when `audit_core` says so, else unsigned. Its own
+    /// line carries the seq the request named, the chain before it and the
+    /// lost total.
+    fn checkpoint(&mut self) {
+        let chain = self.chain.head();
+        let lost = self.lost;
+        let outcome = match self.checkpoints.poll(self.chain.next_seq(), chain, lost) {
+            Action::Idle => return,
+            Action::Call(words) => {
+                let mut reply = [0u64; SIGN_REPLY_WORDS];
+                let (label, n) = sign(&words, &mut reply);
+                self.checkpoints.reply(label, reply.get(..n).unwrap_or(&[]))
+            }
+            Action::Unsigned(reason) => Outcome::Unsigned(reason),
+        };
+        self.checkpoint_line(outcome, &chain, lost);
+    }
+
+    fn checkpoint_line(&mut self, outcome: Outcome, chain: &[u8; CHAIN_LEN], lost: u64) {
+        match outcome {
+            Outcome::Signed(Reply { signature, identity: id }) => self.emit(format_args!(
+                "audit: checkpoint srk={} boot={} reset={} restart={} chain={} lost={} sig={}",
+                Hex(&id.srk_name),
+                Hex(&id.boot_id),
+                id.reset,
+                id.restart,
+                Hex(chain),
+                lost,
+                Hex(&signature)
+            )),
+            Outcome::Unsigned(reason) => self.emit(format_args!(
+                "audit: checkpoint boot=unavailable chain={} lost={} sig=unavailable reason={}",
+                Hex(chain),
+                lost,
+                reason
+            )),
+        }
+    }
+}
+
+/// One line to the console (`Console::line`).
 macro_rules! println {
-    ($uart:expr, $($arg:tt)*) => {
-        let _ = writeln!($uart, $($arg)*);
+    ($console:expr, $($arg:tt)*) => {
+        $console.line(format_args!($($arg)*))
     };
 }
 
@@ -87,11 +204,17 @@ struct PolicyLog {
     printed: usize,
 }
 
+/// The ring sources, then `policy`'s log page: the ready checkpoint waits
+/// for each one's `Ready`.
+const RING_SOURCES: usize = 8;
+const POLICY_SOURCE: usize = RING_SOURCES;
+const SOURCES: usize = RING_SOURCES + 1;
+
 struct Audit {
-    sources: [Source; 8],
+    sources: [Source; RING_SOURCES],
     policy: PolicyLog,
     unknown: UnknownCodes,
-    uart: Uart,
+    console: Console,
     /// The supervisor's record page (M7 plan C8), read-only here, and the
     /// last record printed.
     record: NonNull<[u64; supervisor_core::RECORD_WORDS]>,
@@ -113,7 +236,7 @@ fn start() -> Audit {
     let vaddr = *var!(uart_mmio_vaddr: usize = 0);
     // Without a console nothing could be reported; stop (fail-closed).
     let base = NonNull::new(vaddr as *mut u32).unwrap_or_else(|| panic!("audit: no uart mapping"));
-    let mut uart = Uart { base };
+    let uart = Uart { base };
     let sources = [
         source("ingress", ch::CH_INGRESS, memory_region_symbol!(audit_ingress: *mut u8)),
         source("eth_out", ch::CH_ETH_OUT, memory_region_symbol!(audit_eth_out: *mut u8)),
@@ -125,9 +248,10 @@ fn start() -> Audit {
         source("tls", ch::CH_TLS, memory_region_symbol!(audit_tls: *mut u8)),
     ];
     let policy = PolicyLog { page: memory_region_symbol!(audit_policy: *mut [u64; log::WORDS]).cast(), printed: 0 };
-    println!(uart, "audit: ready");
+    let mut console = Console { uart, chain: Chain::new(), lost: 0, checkpoints: Checkpoints::new(SOURCES) };
+    println!(console, "audit: ready");
     let record = memory_region_symbol!(supervisor_record: *mut [u64; supervisor_core::RECORD_WORDS]);
-    Audit { sources, policy, unknown: UnknownCodes::new(), uart, record, last_seq: 0 }
+    Audit { sources, policy, unknown: UnknownCodes::new(), console, record, last_seq: 0 }
 }
 
 fn drop_reason(r: u16) -> Option<DropReason> {
@@ -136,10 +260,10 @@ fn drop_reason(r: u16) -> Option<DropReason> {
 
 /// A coalesced kind whose value has a name in `names`: its line, or false
 /// (an unnamed value counts as an unknown code).
-fn named(uart: &mut Uart, src: &str, kind: &str, names: &[&str], v: u16, r: Record) -> bool {
+fn named(console: &mut Console, src: &str, kind: &str, names: &[&str], v: u16, r: Record) -> bool {
     match names.get(usize::from(v)) {
         Some(name) => {
-            println!(uart, "audit: src={} {}({}) total={} lost={}", src, kind, name, r.a, r.b);
+            println!(console, "audit: src={} {}({}) total={} lost={}", src, kind, name, r.a, r.b);
             true
         }
         None => false,
@@ -147,21 +271,26 @@ fn named(uart: &mut Uart, src: &str, kind: &str, names: &[&str], v: u16, r: Reco
 }
 
 impl Audit {
-    fn print(&mut self, src: &'static str, r: Record) {
-        let uart = &mut self.uart;
+    /// Prints source `index`'s record `r` (`index` < `SOURCES`).
+    fn print(&mut self, index: usize, src: &'static str, r: Record) {
+        let console = &mut self.console;
+        // Every source's lost count, whatever the record (M8 plan C10).
+        console.lost = console.lost.saturating_add(u64::from(r.b));
         let named = match decode(r.code) {
             // The readiness line keeps the form the PDs printed themselves
-            // before C6, which the integration waits read.
+            // before C6, which the integration waits read. The source counts
+            // as ready before its line, so the ready checkpoint follows it.
             Decoded::Fixed(audit_event::Event::Ready) => {
+                console.checkpoints.source_ready(index);
                 if r.b == 0 {
-                    println!(uart, "{}: ready", src);
+                    println!(console, "{}: ready", src);
                 } else {
-                    println!(uart, "{}: ready lost={}", src, r.b);
+                    println!(console, "{}: ready lost={}", src, r.b);
                 }
                 true
             }
             Decoded::Fixed(ev) => {
-                println!(uart, "audit: src={} {} total={} lost={}", src, ev.name(), r.a, r.b);
+                println!(console, "audit: src={} {} total={} lost={}", src, ev.name(), r.a, r.b);
                 // M7 plan C8's selftest variant: audit itself faults, once
                 // the line that triggers it is out.
                 #[cfg(feature = "fault-inject")]
@@ -172,65 +301,65 @@ impl Audit {
             }
             Decoded::FrameDropped(reason) => match drop_reason(reason) {
                 Some(d) => {
-                    println!(uart, "audit: src={} FrameDropped({:?}) total={} lost={}", src, d, r.a, r.b);
+                    println!(console, "audit: src={} FrameDropped({:?}) total={} lost={}", src, d, r.a, r.b);
                     true
                 }
                 None => false,
             },
-            Decoded::TcpLimited(kind) => named(uart, src, "TcpLimited", &TCP_LIMIT_NAMES, kind, r),
-            Decoded::TlsRefused(v) => named(uart, src, "TlsRefused", &TLS_REFUSED_NAMES, v, r),
-            Decoded::TlsClosed(v) => named(uart, src, "TlsClosed", &TLS_CLOSED_NAMES, v, r),
-            Decoded::HttpRefused(v) => named(uart, src, "HttpRefused", &HTTP_REFUSED_NAMES, v, r),
-            Decoded::TlsTimeout(v) => named(uart, src, "TlsTimeout", &TLS_TIMEOUT_NAMES, v, r),
+            Decoded::TcpLimited(kind) => named(console, src, "TcpLimited", &TCP_LIMIT_NAMES, kind, r),
+            Decoded::TlsRefused(v) => named(console, src, "TlsRefused", &TLS_REFUSED_NAMES, v, r),
+            Decoded::TlsClosed(v) => named(console, src, "TlsClosed", &TLS_CLOSED_NAMES, v, r),
+            Decoded::HttpRefused(v) => named(console, src, "HttpRefused", &HTTP_REFUSED_NAMES, v, r),
+            Decoded::TlsTimeout(v) => named(console, src, "TlsTimeout", &TLS_TIMEOUT_NAMES, v, r),
             Decoded::TlsSignHighWater => {
-                println!(uart, "audit: src={} TlsSignHighWater us={} lost={}", src, r.a, r.b);
+                println!(console, "audit: src={} TlsSignHighWater us={} lost={}", src, r.a, r.b);
                 true
             }
             Decoded::CostHighWater => {
-                println!(uart, "audit: src={} RpCostHighWater us={} lost={}", src, r.a, r.b);
+                println!(console, "audit: src={} RpCostHighWater us={} lost={}", src, r.a, r.b);
                 true
             }
             Decoded::StackHighWater => {
-                println!(uart, "audit: src={} StackHighWater bytes={} lost={}", src, r.a, r.b);
+                println!(console, "audit: src={} StackHighWater bytes={} lost={}", src, r.a, r.b);
                 true
             }
             Decoded::KeyStackHighWater => {
-                println!(uart, "audit: src={} KeyStackHighWater bytes={} lost={}", src, r.a, r.b);
+                println!(console, "audit: src={} KeyStackHighWater bytes={} lost={}", src, r.a, r.b);
                 true
             }
             Decoded::KeyWaitHighWater => {
-                println!(uart, "audit: src={} KeyWaitHighWater us={} lost={}", src, r.a, r.b);
+                println!(console, "audit: src={} KeyWaitHighWater us={} lost={}", src, r.a, r.b);
                 true
             }
             Decoded::Halted => {
-                println!(uart, "audit: src={} Halted reason={} lost={}", src, r.a, r.b);
+                println!(console, "audit: src={} Halted reason={} lost={}", src, r.a, r.b);
                 true
             }
             Decoded::KeyUnavailable => {
-                println!(uart, "audit: src={} KeyUnavailable code={} lost={}", src, r.a, r.b);
+                println!(console, "audit: src={} KeyUnavailable code={} lost={}", src, r.a, r.b);
                 true
             }
             // M8 plan C9: the version lines the runbook reads.
             Decoded::PolicyAccepted(slot) => match POLICY_SLOT_NAMES.get(usize::from(slot)) {
                 Some(slot) => {
-                    println!(uart, "{}: accepted version={} slot={} lost={}", src, r.a, slot, r.b);
+                    println!(console, "{}: accepted version={} slot={} lost={}", src, r.a, slot, r.b);
                     true
                 }
                 None => false,
             },
             Decoded::ReleaseSeq => {
-                println!(uart, "{}: release_seq={} lost={}", src, r.a, r.b);
+                println!(console, "{}: release_seq={} lost={}", src, r.a, r.b);
                 true
             }
             Decoded::PolicyUnavailable(reason) => match POLICY_REASON_NAMES.get(usize::from(reason)) {
                 // No current version is known when the state was refused,
                 // whatever `a` holds.
                 Some(name) if reason == POLICY_STATE_REFUSED => {
-                    println!(uart, "{}: unavailable reason={} current=unknown lost={}", src, name, r.b);
+                    println!(console, "{}: unavailable reason={} current=unknown lost={}", src, name, r.b);
                     true
                 }
                 Some(name) => {
-                    println!(uart, "{}: unavailable reason={} current={} lost={}", src, name, r.a, r.b);
+                    println!(console, "{}: unavailable reason={} current={} lost={}", src, name, r.a, r.b);
                     true
                 }
                 None => false,
@@ -238,7 +367,7 @@ impl Audit {
             Decoded::PolicyRejected { slot, reason } => {
                 match (POLICY_SLOT_NAMES.get(usize::from(slot)), POLICY_REASON_NAMES.get(usize::from(reason))) {
                     (Some(slot), Some(name)) => {
-                        println!(uart, "{}: rejected slot={} reason={} lost={}", src, slot, name, r.b);
+                        println!(console, "{}: rejected slot={} reason={} lost={}", src, slot, name, r.b);
                         true
                     }
                     _ => false,
@@ -247,7 +376,7 @@ impl Audit {
             // M8 plan C8: `inner`'s group-authorization drops, per peer.
             Decoded::InnerDenied { peer, reason } => match INNER_REASON_NAMES.get(usize::from(reason)) {
                 Some(name) => {
-                    println!(uart, "audit: src={} InnerDenied({}) peer={} total={} lost={}", src, name, peer, r.a, r.b);
+                    println!(console, "audit: src={} InnerDenied({}) peer={} total={} lost={}", src, name, peer, r.a, r.b);
                     true
                 }
                 None => false,
@@ -255,7 +384,7 @@ impl Audit {
             Decoded::Unknown => false,
         };
         if !named && let Some(total) = self.unknown.record() {
-            println!(uart, "audit: src={} unknown code={:#06x} unknown_total={}", src, r.code, total);
+            println!(console, "audit: src={} unknown code={:#06x} unknown_total={}", src, r.code, total);
         }
     }
 }
@@ -273,7 +402,7 @@ impl Audit {
         self.policy.printed = pending.end;
         for i in pending {
             let at = log::slot_word(i);
-            self.print("policy", log::decode([read(at), read(at.saturating_add(1))]));
+            self.print(POLICY_SOURCE, "policy", log::decode([read(at), read(at.saturating_add(1))]));
         }
     }
 }
@@ -282,6 +411,9 @@ impl Handler for Audit {
     type Error = Infallible;
 
     fn notified(&mut self, channels: ChannelSet) -> Result<(), Self::Error> {
+        if audit_core::ready_input(channels.iter().map(|c| c.index())) {
+            self.console.checkpoints.notified();
+        }
         if channels.contains(Channel::new(ch::CH_POLICY)) {
             self.drain_policy();
         }
@@ -292,12 +424,13 @@ impl Handler for Audit {
             let r = supervisor_core::Record::decode(unsafe { self.record.as_ptr().read_volatile() });
             if r.seq != 0 && r.seq != self.last_seq {
                 self.last_seq = r.seq;
+                self.console.lost = self.console.lost.saturating_add(r.lost);
                 match r.child_name() {
                     Some(pd) => {
-                        println!(self.uart, "supervisor: fault pd={} label={} lost={}", pd, r.label, r.lost);
+                        println!(self.console, "supervisor: fault pd={} label={} lost={}", pd, r.label, r.lost);
                     }
                     None => {
-                        println!(self.uart, "supervisor: fault child={} label={} lost={}", r.child, r.label, r.lost);
+                        println!(self.console, "supervisor: fault child={} label={} lost={}", r.child, r.label, r.lost);
                     }
                 }
             }
@@ -314,17 +447,19 @@ impl Handler for Audit {
             for _ in 0..AUDIT_RING_SLOTS {
                 let Some(src) = self.sources.get_mut(i) else { break };
                 match src.ring.pop() {
-                    Ok(Some(r)) => self.print(name, r),
+                    Ok(Some(r)) => self.print(i, name, r),
                     Ok(None) => break,
                     Err(RingError::Corrupt | RingError::Full) => {
                         if !core::mem::replace(&mut src.reported_corrupt, true) {
-                            println!(self.uart, "audit: src={} ring corrupt, ignoring producer", name);
+                            println!(self.console, "audit: src={} ring corrupt, ignoring producer", name);
                         }
                         break;
                     }
                 }
             }
         }
+        // The ready checkpoint can fall due on the notification alone.
+        self.console.checkpoint();
         Ok(())
     }
 }

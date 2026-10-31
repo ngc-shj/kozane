@@ -220,7 +220,7 @@ CASES_FOR_GATE = {
              "proxy-pd-backend-room", "proxy-pd-backend-rst", "https-syn-flood", "https-per-source-cap",
              "https-recycle-abort", "residue-wipe-state", "https-hello-lockstep", "cap-failure-ignored",
              "cap-barrier-skipped", "supervisor-resume", "c11-refuse-reason", "c11-no-shutdown",
-             "c11-fault-inject-serving", "c7-rndr-fault"},
+             "c11-fault-inject-serving", "c7-rndr-fault", "audit-trailer-raw"},
     "repro": {"repro-path-leak", "repro-firmware-timestamp"},
     "mir": {"mir-target-split", "mir-env-split", "mir-debug-split", "mir-feature-split"},
     "manifest": {"manifest"},
@@ -645,6 +645,15 @@ CASES = {
                           "a second supervisor record: the faulting child resumed"),
     # M7 plan C11: a REFUSE case declaring another SHUTDOWN reason, a QEMU
     # gone without one, and the fault-inject image under a serving case.
+    # M8 plan C10 [T41, S25]: the chain must cover each line's trailer.
+    # Hashed without it, tools/audit-verify refuses the integration capture
+    # at its ready checkpoint. The needle reads the raw text: the anchor
+    # line audit-verify prints ends in its checkpoint's ` seq=` trailer,
+    # which the derived view strips (RAW_NEEDLE).
+    "audit-trailer-raw": (["test", "it_boots=audit export"], lambda t: edit(
+        t, "crates/audit-core/src/lib.rs", "        out(t);\n        line.update(t);\n", "        out(t);\n"),
+                          re.compile(r"the chain does not match the lines before it \(a line edited\)\n(?:.*\n)*?"
+                                     r"anchor: audit: checkpoint srk=[0-9a-f]{68} .* sig=[0-9a-f]{128} seq=\d+\r?\n")),
     "c11-refuse-reason": (["test", "it_boots=measured boot"], lambda t: edit(
         t, "tools/uboot-config", 'HALT = "poweroff; while true; do true; done"\n',
         'HALT = "reset; while true; do true; done"\n'),
@@ -1636,6 +1645,20 @@ def warm_tree() -> pathlib.Path:
     return tree
 
 
+# M8 plan C10: every line `audit` prints ends in ` seq=<n>`. Needles are
+# matched against the gate output with that trailer stripped (anchored at
+# the line end, as run.py's view), except a RAW_NEEDLE case's, which reads
+# the raw text.
+SEQ_TRAILER = re.compile(r" seq=\d+(?=\r*$)", re.M)
+RAW_NEEDLE = {"audit-trailer-raw"}
+
+
+def strip_trailer(text: str) -> str:
+    """The derived view of console text: each line's ` seq=<n>` trailer
+    removed, nothing else changed."""
+    return SEQ_TRAILER.sub("", text)
+
+
 EXPECT_SUCCESS = {"kani-cache", "verus-cache"}
 ABSENT = {"kani-cache": "cached pass", "verus-cache": "cached pass"}
 
@@ -1744,6 +1767,8 @@ def run_case(name: str) -> bool:
     # Gates write their tool output to build/counts/*.log.
     for log in sorted((tree / "build/counts").glob("*.log")):
         text += log.read_text(errors="replace")
+    if name not in RAW_NEEDLE:
+        text = strip_trailer(text)
     # A needle is a string, a tuple of alternatives, or a compiled pattern
     # (for a report whose varying part, an address, sits mid-line).
     if isinstance(needle, re.Pattern):

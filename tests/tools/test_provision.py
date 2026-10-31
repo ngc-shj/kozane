@@ -14,10 +14,10 @@ M8 plan C3: every provisioning clears the TPM (the SRK changes); the `nv`
 step defines the two indices only from a ledger `tools/policy verify
 --ledger` accepts (a build pinned to this run's roster, as
 tests/tools/test_policy.py builds it) and a provisioning record two pinned
-record keys signed for this TPM's SRK. Its denies (each naming its cause,
-writing no slot and defining nothing) pair with the allow, which also
-checks the logical version, the Names against tools/measure.py's twin and
-reset_at_provision. Existing indices are refused without the two delete
+record keys signed for this TPM's SRK and resetCount. Its denies (each
+naming its cause, writing no slot and defining nothing) pair with the
+allow, which also checks the logical version, the Names against
+tools/measure.py's twin and reset_at_provision. Existing indices are refused without the two delete
 authorizations and replaced with them.
 
 Everything lives in one per-run directory, removed in `finally`; a
@@ -51,7 +51,7 @@ LAUNCH = ("import pathlib, sys; src = sys.argv[1]; g = {'__file__': src, '__name
           "exec(compile(open(src).read(), src, 'exec'), g); g['RECORD_KEYS'] = pathlib.Path(sys.argv[2]); "
           "sys.argv = [src] + sys.argv[3:]; sys.exit(g['main']())")
 RECORD_DOMAIN = b"kozane-reprovision-v1\0"
-FIXTURES = 24
+FIXTURES = 25
 
 
 def make_ca(run_dir: pathlib.Path, name: str) -> pathlib.Path:
@@ -156,7 +156,8 @@ def name_of(tcti: str, run_dir: pathlib.Path) -> str:
 
 
 def record(**fields) -> bytes:
-    return "".join(f"{k}={fields[k]}\n" for k in ("body_sha256", "fleet_id", "node", "srk_name", "v0")).encode()
+    return "".join(f"{k}={fields[k]}\n" for k in ("body_sha256", "fleet_id", "node", "reset_at_provision", "srk_name",
+                                                  "v0")).encode()
 
 
 def raw_sig(run_dir: pathlib.Path, name: str, body: bytes, key: pathlib.Path, domain: bytes = RECORD_DOMAIN,
@@ -309,6 +310,9 @@ def nv_fixtures(run_dir: pathlib.Path, ca: pathlib.Path, other: Swtpm, tpms: lis
             "the record's v0 0 is not the ledger head")
     nv_deny("deny: a record whose body is not the ledger head's", *signed("other-body", body_sha256="00" * 32),
             "the record's body_sha256")
+    nv_deny("deny: a record whose reset_at_provision is not this TPM's resetCount",
+            *signed("other-reset", reset_at_provision=str(int(fields["reset_at_provision"]) + 1)),
+            "the record's reset_at_provision")
 
     # Allow, then what it left in the TPM.
     slot = run_dir / "slot-a.bin"
@@ -318,7 +322,7 @@ def nv_fixtures(run_dir: pathlib.Path, ca: pathlib.Path, other: Swtpm, tpms: lis
     results.append(("allow: nv defines the indices and writes the ledger head into slot A",
                     rc == 0 and slot.read_bytes() == ledger.head and nv_defined() == {measure.NV_POLICY_CTR,
                                                                                          measure.NV_POLICY_BASE}
-                    and printed.get("reset_at_provision") == reset, text))
+                    and printed.get("reset_at_provision") == reset == fields["reset_at_provision"], text))
 
     def logical() -> int:
         out = run_dir / "nv.bin"

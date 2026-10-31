@@ -881,6 +881,15 @@ CASES = [
     ("allow release_seq values in the release tool's tests and in comments", set(),
      lambda t: (append(t / "tools/release/src/tests.rs", 'const X: &str = "release_seq=7";\n'),
                 append(t / "tools/release/src/main.rs", "// e.g. release_seq=7 in a manifest\n"))),
+    # P31 (M8 plan C10): audit's one call to auditkey.
+    ("P31 a second pp_call in audit", {"P31"},
+     lambda t: append(t / "crates/pds/audit/src/main.rs", "fn x() { let _ = Channel::new(0).pp_call(MessageInfo::new(0, 0)); }\n")),
+    ("P31 the auditkey channel decoded directly", {"P31"},
+     lambda t: append(t / "crates/pds/audit/src/main.rs", "fn y(c: usize) -> bool { c == ch::CH_AUDITKEY }\n")),
+    ("P31 ready_input removed", {"P31"},
+     lambda t: edit(t / "crates/pds/audit/src/main.rs", "audit_core::ready_input(", "audit_core::ready_input_unused(")),
+    ("allow the call and the channel named in a comment", set(),
+     lambda t: append(t / "crates/pds/audit/src/main.rs", "// .pp_call( on CH_AUDITKEY happens in sign only\n")),
 ]
 
 

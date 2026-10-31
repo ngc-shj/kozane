@@ -122,6 +122,36 @@ def main() -> int:
     timed("a timed-out case fails though its needle printed", g["TIMED_OUT"], False)
     timed("an ordinary failure with the needle passes", 2, True)
 
+    # M8 plan C10: needles see the console's ` seq=` trailers stripped at the
+    # line end (run.py's view), except a RAW_NEEDLE case's.
+    def viewed(name, case, needle, want):
+        nonlocal failures, ran
+        ran += 1
+        with tempfile.TemporaryDirectory() as d:
+            saved = (g["warm_tree"], g["run_make"])
+            g["warm_tree"] = lambda: pathlib.Path(d)
+            g["run_make"] = lambda tree, *targets: subprocess.CompletedProcess(
+                ["make"], 2, "audit: src=hs Halted reason=3 lost=0 seq=41\r\r\nanchor: x seq=7\n", "")
+            original = g["CASES"].get(case)
+            g["CASES"][case] = (["unit"], lambda t: None, needle)
+            try:
+                with contextlib.redirect_stdout(io.StringIO()):
+                    got = g["run_case"](case)
+            finally:
+                g["warm_tree"], g["run_make"] = saved
+                if original is None:
+                    del g["CASES"][case]
+                else:
+                    g["CASES"][case] = original
+        ok = got == want
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} run_case: {name}: got {got} want {want}")
+
+    viewed("a needle reads the line without its trailer", "selftest-fixture", "Halted reason=3 lost=0\r\r\n", True)
+    viewed("a needle never sees a trailer", "selftest-fixture", "anchor: x seq=7\n", False)
+    raw = next(iter(g["RAW_NEEDLE"]))
+    viewed("a RAW_NEEDLE case reads the trailer", raw, "anchor: x seq=7\n", True)
+
     # run_make itself: a make that never ends is killed with its group and
     # reported as TIMED_OUT; one that fails keeps its own code.
     def stub_make(name, body, timeout, want_code, want_err, child_dead=False):

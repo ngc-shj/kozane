@@ -37,6 +37,9 @@ pub const ETH_IN_IRQ: usize = 71;
 pub const DATA_STACK_SIZE: usize = 0x40_000;
 /// `tls`'s stack_size, which its stack probe paints.
 pub const TLS_STACK_SIZE: usize = 0x30_000;
+/// `policy`'s stack_size, which its stack probe paints (M8 plan C10: its
+/// high-water mark goes to its log page).
+pub const POLICY_STACK_SIZE: usize = 0x40_000;
 
 /// sp804 on QEMU virt (coliasgroup patch): 1 MHz input clock, SPI 11.
 pub const TIMER_IRQ: usize = 43;

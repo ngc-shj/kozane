@@ -9,6 +9,8 @@ audit-event = { path = "../../audit-event" }
 boot-stage = { path = "../../boot-stage" }
 # The node's facts, fleet ID and bundle signing keys (M8 plan C7).
 config = { path = "../../config" }
+# The stack probe (M8 plan C10: the high-water mark on the log page).
+cpu = { path = "../../cpu" }
 layout = { path = "../../layout" }
 # The bundle signature pair (M8 plan D1), at tools/release's and
 # tools/policy's pins; core only (probe P2). Only this PD links them (D10).

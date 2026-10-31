@@ -347,6 +347,11 @@ fn tls_stack_size_matches_layout() {
     assert_eq!(parse_num(&pd_attribute("tls", "stack_size").expect("stack_size")), TLS_STACK_SIZE);
 }
 
+#[test]
+fn policy_stack_size_matches_layout() {
+    assert_eq!(parse_num(&pd_attribute("policy", "stack_size").expect("stack_size")), POLICY_STACK_SIZE);
+}
+
 /// What one `<map>` of `pd` says: (vaddr, perms).
 fn map_of(pd: &str, mr: &str) -> Option<(usize, String)> {
     let text = system_text();

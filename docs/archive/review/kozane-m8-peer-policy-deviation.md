@@ -495,3 +495,41 @@ Run in a scratch worktree (`build/probes/p3/tree`, since removed).
     is 128 bytes with 15 pair lines.
   - Error codes start at 0x80, so they never collide with key's or
     tlskey's.
+
+### D-19 — the audit export's choices (batch B)
+
+- **The ready checkpoint.** It fires once all nine sources (eight rings
+  plus `policy`) report Ready and `auditkey` has notified. Every
+  checkpoint, signed or not, moves the next due point to its own seq + 64,
+  which satisfies D-18 after a refusal or a lost reply too.
+  `auditkey_never_refuses_the_schedule` drives the real `SeqRule` over a
+  grid of notify and ready points.
+- **No ready marker on the wire.** The line format has no marker for
+  "the ready checkpoint". So `--from-provisioning` requires the first
+  boot to start at seq 0 (the chain from `h0`) and its first checkpoint
+  line to be signed. Deny fixtures cover a mid-boot start and an
+  unsigned-first boot.
+- **The strip pattern** is ` seq=\d+(?=\r*$)`, not the plan's `\r?`,
+  because QEMU's pty ends lines with `\r\r\n`.
+- **run.py.** `Console.text` is the stripped view (append-only, so
+  offsets hold) and `Console.raw` the raw text. Every existing regex
+  works unchanged.
+- **Fail vs note.** `audit-verify` fails on holes, a chain mismatch, a bad
+  signature, another boot's checkpoint, a non-increasing checkpoint seq,
+  a boot with no signed checkpoint, and a continuity gap. `lost > 0`,
+  unsigned checkpoints and the unverified tail are notes, as C10's
+  "reports" reads.
+- **Unterminated last line.** `audit-verify` skips it: a capture killed
+  mid-line would otherwise read a half-printed ` seq=12` as `seq=1` and
+  report a false hole. It has its own fixture.
+- **The provisioning record** gains `reset_at_provision`, and `provision
+  nv` refuses a record whose value is not this TPM's resetCount.
+  `audit-verify` reads the record's fields but leaves its operator
+  signatures to `provision nv`.
+- **`policy`'s stack** is now observable: 68,832 B of its 262,144 B.
+  This closes slice 3's stack risk.
+- **No `Checkpoint` event in `audit-event`.** `audit` prints checkpoints
+  itself, so the event code C10 listed is not needed.
+- **check-pins P31**, added on review: `audit`'s single `.pp_call(` is in
+  `fn sign`, `CH_AUDITKEY` is named only there, and `ready_input` decodes
+  the notification. That is T47's PD-glue pin.

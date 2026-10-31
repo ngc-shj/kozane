@@ -1,0 +1,357 @@
+#!/usr/bin/env python3
+"""Verifies a captured audit stream (M8 plan C10): the SIEM's side of the
+export, run over the raw UART capture.
+
+Usage: audit-verify --pub AUDIT_PUB (--after LINE | --from-provisioning RECORD) CAPTURE
+
+AUDIT_PUB is the device's audit public key as tools/package exports it
+(audit.pub: 64 hex digits and a newline). CAPTURE is the raw console text,
+trailers included.
+
+Every line `audit` prints ends in ` seq=<n>`, counting a boot's lines from
+0; a line without one is someone else's (firmware, loader) and is skipped.
+A line with seq 0 starts a boot; an unterminated last line (a capture
+cut mid-line) is skipped. Per boot it recomputes the chain
+`h = SHA-256(h ‖ line)` (each line without its CRLF, trailer included)
+from `h0 = SHA-256("kozane-audit-v1\\0")`, and checks every checkpoint:
+
+  audit: checkpoint srk=<34 B> boot=<16 B> reset=<r> restart=<s> chain=<32 B> lost=<n> sig=<64 B> seq=<n>
+  audit: checkpoint boot=unavailable chain=<32 B> lost=<n> sig=unavailable reason=<code> seq=<n>
+
+Its printed chain must be the recomputed chain before its own line; a
+signed one must verify (Ed25519) over auditkey-core's fixed-width message
+`"kozane-audit-checkpoint-v1\\0" ‖ srk ‖ boot ‖ reset u32 ‖ restart u32 ‖
+seq u64 ‖ chain ‖ lost u64` (counts big-endian), where seq is the line's own
+trailer, and every signed checkpoint of one boot names the same TPM and
+boot. Fails: a sequence hole (a deleted, reordered or inserted line), a
+chain that does not match (an edited line), a signature that does not
+verify (a forged checkpoint, another device's key), a checkpoint from
+another boot, checkpoint seqs that do not strictly increase, a boot with
+no signed checkpoint, and a continuity gap. Reports without failing:
+`lost > 0`, unsigned checkpoints, and the lines after a boot's last
+signed checkpoint, which nothing has signed yet ("N unverified lines").
+
+Continuity (C10 [S31, S32, F46, F48]): every capture is anchored.
+  --after LINE: LINE is the last signed checkpoint of the previous capture
+    (its trailer included), itself verified under AUDIT_PUB. The capture's
+    first boot must be its successor, exactly one of: the same boot
+    resumed (same boot ID, reset and restart; the first line's seq is the
+    anchor's + 1 and the chain resumes from SHA-256(anchor chain ‖ anchor
+    line)); a TPM Reset (a new boot ID, reset + 1, restart 0); a TPM
+    Restart (a new boot ID, the same reset, restart + 1).
+  --from-provisioning RECORD: the first capture after provisioning, with
+    tools/provision's record. Its srk_name must be the capture's, and its
+    first boot must start at seq 0 with reset = reset_at_provision + 1,
+    restart 0, and its first checkpoint signed (the ready one).
+Each later boot in the capture is a TPM Reset or Restart successor of the
+one before it; anything else is a gap. The record's own signatures are
+tools/provision's to check (`provision nv`); this reads its fields.
+
+Prints `baseline srk=… reset=… restart=… seq=…` (what the capture is
+anchored to; `-` where provisioning fixes no value), one line per boot,
+the C9 version lines (`c9 boot=<i> seq=<n> verified=<yes|no>: <line>`),
+`note:` and `FAIL:` lines, then `anchor: <line>` (the --after for the next
+capture) and `audit-verify: ok` or `audit-verify: FAILED`. Exits 0 when
+nothing failed, 1 when something did, 2 on a usage error.
+"""
+
+import argparse
+import hashlib
+import pathlib
+import re
+import struct
+import sys
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+
+DOMAIN = b"kozane-audit-v1\0"
+SIG_DOMAIN = b"kozane-audit-checkpoint-v1\0"
+H0 = hashlib.sha256(DOMAIN).digest()
+
+TRAILER = re.compile(rb"^(?P<body>.*) seq=(?P<seq>0|[1-9][0-9]{0,19})$")
+SIGNED = re.compile(rb"^audit: checkpoint srk=(?P<srk>[0-9a-f]{68}) boot=(?P<boot>[0-9a-f]{32}) "
+                    rb"reset=(?P<reset>0|[1-9][0-9]{0,9}) restart=(?P<restart>0|[1-9][0-9]{0,9}) "
+                    rb"chain=(?P<chain>[0-9a-f]{64}) lost=(?P<lost>0|[1-9][0-9]{0,19}) sig=(?P<sig>[0-9a-f]{128})$")
+UNSIGNED = re.compile(rb"^audit: checkpoint boot=unavailable chain=(?P<chain>[0-9a-f]{64}) "
+                      rb"lost=(?P<lost>0|[1-9][0-9]{0,19}) sig=unavailable reason=(?P<reason>0|[1-9][0-9]{0,9})$")
+C9 = re.compile(rb"^policy: (accepted|release_seq|unavailable)[ =]")
+RECORD_FIELDS = ("body_sha256", "fleet_id", "node", "reset_at_provision", "srk_name", "v0")
+
+
+class Usage(Exception):
+    pass
+
+
+def link(h: bytes, line: bytes) -> bytes:
+    return hashlib.sha256(h + line).digest()
+
+
+class Checkpoint:
+    """A signed checkpoint line, parsed (fields in range) but unverified."""
+
+    def __init__(self, m: re.Match, seq: int, line: bytes):
+        self.srk, self.boot = bytes.fromhex(m["srk"].decode()), bytes.fromhex(m["boot"].decode())
+        self.reset, self.restart = int(m["reset"]), int(m["restart"])
+        self.chain, self.lost = bytes.fromhex(m["chain"].decode()), int(m["lost"])
+        self.sig, self.seq, self.line = bytes.fromhex(m["sig"].decode()), seq, line
+
+    def in_range(self) -> bool:
+        return self.reset < 2**32 and self.restart < 2**32 and self.lost < 2**64 and self.seq < 2**64
+
+    def message(self) -> bytes:
+        return SIG_DOMAIN + self.srk + self.boot + struct.pack(">IIQ", self.reset, self.restart, self.seq) + \
+            self.chain + struct.pack(">Q", self.lost)
+
+    def verifies(self, key: Ed25519PublicKey) -> bool:
+        if not self.in_range():
+            return False
+        try:
+            key.verify(self.sig, self.message())
+            return True
+        except InvalidSignature:
+            return False
+
+    def identity(self) -> tuple:
+        return self.srk, self.boot, self.reset, self.restart
+
+    def describe(self) -> str:
+        return f"boot={self.boot.hex()} reset={self.reset} restart={self.restart}"
+
+
+def parse_signed(line: bytes):
+    """A raw line (trailer included) as a signed checkpoint, or None."""
+    t = TRAILER.match(line)
+    m = SIGNED.match(t["body"]) if t else None
+    return Checkpoint(m, int(t["seq"]), line) if m else None
+
+
+def successor(prev: Checkpoint, cp: Checkpoint) -> str:
+    """Why `cp`'s boot is not a TPM Reset or Restart successor of `prev`'s
+    (empty when it is one)."""
+    if cp.srk != prev.srk:
+        return f"another TPM (srk {cp.srk.hex()} after {prev.srk.hex()})"
+    if cp.boot == prev.boot:
+        return f"the same boot ID {cp.boot.hex()} starts again"
+    if cp.reset == prev.reset + 1 and cp.restart == 0:
+        return ""
+    if cp.reset == prev.reset and cp.restart == prev.restart + 1:
+        return ""
+    return (f"reset={cp.reset} restart={cp.restart} after reset={prev.reset} restart={prev.restart}: "
+            "neither a TPM Reset (reset + 1, restart 0) nor a Restart (same reset, restart + 1); a boot is missing")
+
+
+class Boot:
+    def __init__(self, index: int, start_seq: int, chain: bytes):
+        self.index, self.start_seq, self.chain = index, start_seq, chain
+        self.next_seq = start_seq
+        self.signed = []          # verified signed checkpoints, in order
+        self.first_checkpoint = None  # ("signed"|"unsigned"|"bad", seq)
+        self.last_cp_seq = None
+        self.verified_cp = None   # seq of the last signed checkpoint whose chain matched
+        self.last_seq = None
+        self.lost = 0
+        self.c9 = []
+
+
+def load_pub(path: str) -> Ed25519PublicKey:
+    text = pathlib.Path(path).read_text()
+    if not re.fullmatch(r"[0-9a-f]{64}\n", text):
+        raise Usage(f"{path} is not 64 lowercase hex digits and a newline (tools/package's audit.pub)")
+    return Ed25519PublicKey.from_public_bytes(bytes.fromhex(text.strip()))
+
+
+def load_record(path: str) -> dict:
+    """tools/provision's record, canonical form only."""
+    try:
+        text = pathlib.Path(path).read_bytes().decode("ascii")
+    except (OSError, UnicodeDecodeError) as e:
+        raise Usage(f"cannot read the provisioning record {path}: {e}")
+    lines = text.split("\n")
+    pairs = [line.split("=", 1) for line in lines[:-1]]
+    if lines[-1] != "" or any(len(p) != 2 or not p[1] for p in pairs) or [k for k, _ in pairs] != list(RECORD_FIELDS):
+        raise Usage(f"{path} is not a provisioning record (keys {', '.join(RECORD_FIELDS)}, sorted)")
+    fields = dict(pairs)
+    if not re.fullmatch(r"[0-9a-f]{68}", fields["srk_name"]) or not re.fullmatch(r"0|[1-9][0-9]*",
+                                                                                 fields["reset_at_provision"]):
+        raise Usage(f"{path}: srk_name or reset_at_provision is malformed")
+    return fields
+
+
+def verify(capture: bytes, key: Ed25519PublicKey, after: Checkpoint = None, record: dict = None) -> tuple:
+    """(output lines, failure count)."""
+    out, fails = [], []
+
+    def fail(msg):
+        fails.append(msg)
+        out.append(f"FAIL: {msg}")
+
+    def note(msg):
+        out.append(f"note: {msg}")
+
+    if after is not None:
+        out.append(f"baseline srk={after.srk.hex()} reset={after.reset} restart={after.restart} seq={after.seq}")
+    else:
+        out.append(f"baseline srk={record['srk_name']} reset={record['reset_at_provision']} restart=- seq=-")
+
+    boots = []
+    # A capture cut mid-line (QEMU stopped while `audit` printed) ends in
+    # a line without its end: neither it nor its digits are a line yet.
+    *lines, unterminated = capture.split(b"\n")
+    if TRAILER.match(unterminated.rstrip(b"\r")):
+        note("the capture's unterminated last line was skipped")
+    for raw in lines:
+        line = raw.rstrip(b"\r")
+        t = TRAILER.match(line)
+        if not t:
+            continue
+        seq, body = int(t["seq"]), t["body"]
+        if seq == 0:
+            boots.append(Boot(len(boots), 0, H0))
+        elif not boots:
+            # The capture opens inside a boot: only an anchor in the same
+            # boot can say where its chain stands.
+            if after is None:
+                fail(f"the capture starts inside a boot (first seq={seq}) with no --after anchor in that boot")
+            # The chain is known only where the anchor's line was the last
+            # before this one; `continuity` judges any other start.
+            resumed = after is not None and seq == after.seq + 1
+            boots.append(Boot(0, seq, link(after.chain, after.line) if resumed else None))
+        b = boots[-1]
+        if seq != b.next_seq:
+            fail(f"boot {b.index}: sequence hole: seq={seq} where seq={b.next_seq} was due "
+                 "(a line deleted, reordered or inserted)")
+        b.next_seq = seq + 1
+        if body.startswith(b"audit: checkpoint"):
+            check_checkpoint(b, body, seq, line, key, fail, note)
+        if C9.match(body):
+            b.c9.append((seq, body))
+        b.last_seq = seq
+        if b.chain is not None:
+            b.chain = link(b.chain, line)
+
+    if not boots:
+        fail("no audit lines (no ` seq=` trailer) in the capture")
+
+    for b in boots:
+        out.append(f"boot {b.index}: " + (b.signed[0].describe() if b.signed else "no signed checkpoint")
+                   + f" seq={b.start_seq}..{b.last_seq} signed checkpoints={len(b.signed)}")
+        if not b.signed:
+            fail(f"boot {b.index}: no signed checkpoint")
+        if b.lost:
+            note(f"boot {b.index}: lost={b.lost}: the device dropped events before its last checkpoint")
+        tail = b.last_seq - (b.verified_cp if b.verified_cp is not None else b.start_seq - 1)
+        if tail > 0:
+            note(f"boot {b.index}: {tail} unverified lines after the last checkpoint")
+        for seq, body in b.c9:
+            ok = b.verified_cp is not None and seq < b.verified_cp
+            out.append(f"c9 boot={b.index} seq={seq} verified={'yes' if ok else 'no'}: {body.decode(errors='replace')}")
+
+    continuity(boots, after, record, fail)
+    last = next((b.signed[-1] for b in reversed(boots) if b.signed), None)
+    if last is not None:
+        out.append(f"anchor: {last.line.decode()}")
+    out.append("audit-verify: ok" if not fails else f"audit-verify: FAILED ({len(fails)})")
+    return out, len(fails)
+
+
+def check_checkpoint(b: Boot, body: bytes, seq: int, line: bytes, key, fail, note):
+    m, u = SIGNED.match(body), UNSIGNED.match(body)
+    if b.last_cp_seq is not None and seq <= b.last_cp_seq:
+        fail(f"boot {b.index}: checkpoint seq={seq} does not follow checkpoint seq={b.last_cp_seq}")
+    b.last_cp_seq = seq
+    if not m and not u:
+        fail(f"boot {b.index}: malformed checkpoint at seq={seq}")
+        b.first_checkpoint = b.first_checkpoint or ("bad", seq)
+        return
+    printed = bytes.fromhex((m or u)["chain"].decode())
+    chain_ok = b.chain is not None and printed == b.chain
+    if b.chain is not None and not chain_ok:
+        fail(f"boot {b.index}: checkpoint seq={seq}: the chain does not match the lines before it (a line edited)")
+    if u:
+        b.first_checkpoint = b.first_checkpoint or ("unsigned", seq)
+        note(f"boot {b.index}: unsigned checkpoint at seq={seq} reason={u['reason'].decode()}")
+        b.lost = max(b.lost, int(u["lost"]))
+        return
+    cp = Checkpoint(m, seq, line)
+    b.first_checkpoint = b.first_checkpoint or ("signed", seq)
+    if not cp.verifies(key):
+        fail(f"boot {b.index}: checkpoint seq={seq}: the signature does not verify under the device key")
+        return
+    if b.signed and cp.identity() != b.signed[0].identity():
+        fail(f"boot {b.index}: checkpoint seq={seq} is from another boot ({cp.describe()}, "
+             f"this boot is {b.signed[0].describe()})")
+        return
+    b.signed.append(cp)
+    b.lost = max(b.lost, cp.lost)
+    if chain_ok:
+        b.verified_cp = seq
+
+
+def continuity(boots: list, after: Checkpoint, record: dict, fail):
+    if not boots:
+        return
+    first = boots[0]
+    cp = first.signed[0] if first.signed else None
+    if after is not None:
+        if first.start_seq != 0:
+            if first.start_seq != after.seq + 1:
+                fail(f"the capture does not resume at the anchor: first seq={first.start_seq}, "
+                     f"want seq={after.seq + 1}")
+            elif cp is not None and cp.identity() != after.identity():
+                fail(f"the capture's first boot is not the anchor's ({cp.describe()}, anchor {after.describe()})")
+        elif cp is not None and (why := successor(after, cp)):
+            fail(f"gap after the anchor: {why}")
+    else:
+        if first.start_seq != 0:
+            fail(f"the first boot after provisioning starts inside a boot (first seq={first.start_seq})")
+        elif cp is not None:
+            reset = int(record["reset_at_provision"])
+            if cp.srk.hex() != record["srk_name"]:
+                fail(f"srk_name {cp.srk.hex()} does not match the provisioning record's {record['srk_name']}")
+            if cp.reset != reset + 1:
+                fail(f"the first boot after provisioning has reset={cp.reset}, want reset_at_provision + 1 = "
+                     f"{reset + 1} (a boot is missing)")
+            if cp.restart != 0:
+                fail(f"the first boot after provisioning has restart={cp.restart}, want 0 (a capture after a "
+                     "TPM Restart)")
+            if first.first_checkpoint != ("signed", cp.seq):
+                fail(f"the first boot's first checkpoint (seq={first.first_checkpoint[1]}) is not signed: its "
+                     "first signed checkpoint is not the ready one")
+    for prev, b in zip(boots, boots[1:]):
+        if prev.signed and b.signed and (why := successor(prev.signed[-1], b.signed[0])):
+            fail(f"boot {b.index}: gap after boot {prev.index}: {why}")
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(prog="audit-verify")
+    ap.add_argument("--pub", required=True)
+    anchor = ap.add_mutually_exclusive_group(required=True)
+    anchor.add_argument("--after")
+    anchor.add_argument("--from-provisioning")
+    ap.add_argument("capture")
+    a = ap.parse_args(argv)
+    try:
+        key = load_pub(a.pub)
+        record = load_record(a.from_provisioning) if a.from_provisioning else None
+        capture = pathlib.Path(a.capture).read_bytes()
+    except (Usage, OSError) as e:
+        print(f"audit-verify: {e}")
+        return 2
+    after = None
+    if a.after is not None:
+        after = parse_signed(a.after.encode().rstrip(b"\r\n"))
+        if after is None:
+            print("audit-verify: --after is not a signed checkpoint line with its seq trailer")
+            return 2
+        if not after.verifies(key):
+            print("FAIL: the --after anchor's signature does not verify under the device key")
+            print("audit-verify: FAILED (1)")
+            return 1
+    out, failed = verify(capture, key, after, record)
+    print("\n".join(out))
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

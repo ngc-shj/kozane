@@ -292,6 +292,22 @@ def check_reason_list_matches_rust():
 # ready whatever its outcome: readiness is that it answers `Await`.
 READY_LINE = re.compile(r"(eth_out|eth_in|ingress|inner|data|hs|audit|pq|tls|policy): ready\r*\n")
 
+# M8 plan C10: every line `audit` prints ends in ` seq=<n>` before its line
+# end ("\r\r\n" here, as above). The harness matches against a derived view
+# without it, so every pattern keeps its form; the raw text stays for
+# tools/audit-verify (Console.raw). Anchored at the line end: a ` seq=`
+# anywhere else is text.
+SEQ_TRAILER = re.compile(r" seq=\d+(?=\r*$)", re.M)
+# The end of an unfinished line that may still turn out to be a trailer.
+SEQ_TRAILER_START = re.compile(r" (?:s(?:e(?:q(?:=\d*\r*)?)?)?)?$")
+
+
+def strip_trailer(text: str) -> str:
+    """The derived view of console text: each line's ` seq=<n>` trailer
+    removed, nothing else changed. check-selftest strips its needles' text
+    with the same pattern."""
+    return SEQ_TRAILER.sub("", text)
+
 
 def start_without_stop_signals(thread: threading.Thread):
     """Starts a helper thread with the stop signals blocked; it inherits the
@@ -321,11 +337,17 @@ def guard_thread_starts():
 
 class Console:
     """QEMU serial output, drained by a thread so QEMU never blocks on a
-    full pty. Waits search the text after a cursor."""
+    full pty. Waits search the text after a cursor.
+
+    `text` is the derived view (strip_trailer) every wait, count and offset
+    uses; `raw` is what QEMU printed. The view only grows: a line's end that
+    may still become a trailer is held back until the line decides it."""
 
     def __init__(self, child: pexpect.spawn):
         self.child = child
         self.text = ""
+        self.raw = ""
+        self.held = ""
         # Arrival time of each chunk, by the text length after it.
         self.ends = []
         self.times = []
@@ -341,14 +363,27 @@ class Console:
             except pexpect.TIMEOUT:
                 continue
             except (pexpect.EOF, OSError, ValueError):
+                with self.lock:
+                    self._commit("", final=True)
                 self.alive = False
                 return
             sys.stdout.write(s)
             sys.stdout.flush()
             with self.lock:
-                self.text += s
+                self._commit(s)
                 self.ends.append(len(self.text))
                 self.times.append(time.monotonic())
+
+    def _commit(self, s: str, final: bool = False):
+        """Appends `s` to `raw` and what is decided of it to the view."""
+        self.raw += s
+        pending = self.held + s
+        cut = pending.rfind("\n") + 1
+        done, rest = pending[:cut], pending[cut:]
+        m = None if final else SEQ_TRAILER_START.search(rest)
+        hold = m.start() if m else len(rest)
+        self.text += strip_trailer(done) + (strip_trailer(rest) if final else rest[:hold])
+        self.held = rest[hold:]
 
     def mark(self) -> int:
         with self.lock:
@@ -3077,6 +3112,91 @@ def manifest_fields(release: str) -> dict:
     return dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
 
 
+# M8 plan C10: the two checkpoint forms `audit` prints, in the view.
+AUDIT_SIGNED = (r"audit: checkpoint srk=(?P<srk>[0-9a-f]{68}) boot=(?P<boot>[0-9a-f]{32}) reset=(?P<reset>\d+) "
+                r"restart=(?P<restart>\d+) chain=[0-9a-f]{64} lost=\d+ sig=[0-9a-f]{128}\r*\n")
+AUDIT_UNSIGNED = r"audit: checkpoint boot=unavailable chain=[0-9a-f]{64} lost=\d+ sig=unavailable reason=(?P<reason>\d+)\r*\n"
+
+
+def first_checkpoint(pkg: Package, media=None) -> tuple:
+    """Boots `pkg` to its first checkpoint line, then stops it: (that
+    line's match, the boot's raw console text). The ready checkpoint
+    follows every source's ready line, so `policy`'s are out by then."""
+    child, con = sealed_boot(pkg, media)
+    try:
+        m = con.wait_for(f"{AUDIT_SIGNED}|{AUDIT_UNSIGNED}", timeout=BOOT_TIMEOUT_S)
+        text = con.text
+    finally:
+        stop(child)
+    deadline = time.monotonic() + LINE_TIMEOUT_S
+    while con.alive and time.monotonic() < deadline:
+        time.sleep(0.05)
+    with con.lock:
+        return m, text, con.raw
+
+
+def policy_stack_headroom(text: str):
+    """M8 plan C10 (slice 3's risk note): `policy`'s stack mark, written to
+    its log page once both slots are verified, leaves STACK_HEADROOM_MIN of
+    its stack_size free."""
+    marks = [int(b) for b in re.findall(r"audit: src=policy StackHighWater bytes=(\d+) ", text)]
+    if len(marks) != 1:
+        raise Fail(f"policy: {len(marks)} stack high-water reports, want one")
+    size, hw = system_stack_size("policy"), marks[0]
+    print(f"\npolicy: stack high-water {hw} B of {size} B, {size - hw} B free", flush=True)
+    if hw < POLICY_STACK_FLOOR:
+        raise Fail(f"policy: stack high-water {hw} B is below {POLICY_STACK_FLOOR}; the probe is not measuring")
+    if size - hw < STACK_HEADROOM_MIN:
+        raise Fail(f"policy: {size - hw} B of stack free, want at least {STACK_HEADROOM_MIN}")
+
+
+def test_audit_export(good: Package, fi_net: Package, record: str, passed: list):
+    """M8 plan C10: a capture of one boot, from the provisioned v0 state,
+    verifies end to end with tools/audit-verify, the packaged audit.pub and
+    the run's provisioning record; a second boot has another boot ID; and an
+    audit envelope sealed to other PCRs (the fault-inject image's, whose
+    PCR 8 differs) leaves `auditkey` Unavailable, so the ready checkpoint is
+    printed unsigned with its boot error code."""
+    scratch = tempfile.mkdtemp(prefix="audit-export-", dir=os.path.dirname(good.dir))
+    try:
+        m, text, raw = first_checkpoint(good)
+        if m.group("boot") is None:
+            raise Fail(f"audit export: the first checkpoint is unsigned: {m.group(0).strip()}")
+        policy_stack_headroom(text)
+        passed.append("policy stack headroom")
+        capture = os.path.join(scratch, "boot1.txt")
+        with open(capture, "w") as f:
+            f.write(raw)
+        r = subprocess.run([sys.executable, os.path.join(ROOT, "tools/audit-verify"), "--pub", good.path("audit.pub"),
+                            "--from-provisioning", record, capture], capture_output=True, text=True)
+        fields = dict(line.split("=", 1) for line in open(record).read().splitlines())
+        want = f"baseline srk={fields['srk_name']} reset={fields['reset_at_provision']} restart=- seq=-"
+        if r.returncode != 0 or "audit-verify: ok" not in r.stdout or want not in r.stdout:
+            raise Fail(f"audit export: tools/audit-verify refused the capture (rc {r.returncode}):\n{r.stdout}{r.stderr}")
+        print(f"\naudit export: boot {m.group('boot')} reset={m.group('reset')} verified from provisioning", flush=True)
+        passed.append("audit export: one boot verifies end to end from provisioning")
+
+        again, _, _ = first_checkpoint(good)
+        if again.group("boot") is None or again.group("boot") == m.group("boot"):
+            raise Fail(f"audit export: a second boot's checkpoint names boot {again.group('boot')}, "
+                       f"the first {m.group('boot')}")
+        passed.append("audit export: two boots have distinct boot IDs")
+
+        media = good.media()
+        envelope = ENVELOPE_FILES.index("audit_secrets.env") + 2
+        if os.path.basename(media[envelope][0]) != "audit_secrets.env":
+            raise Fail(f"audit export: media slot {envelope} is {media[envelope][0]}, not the audit envelope")
+        media[envelope] = (fi_net.path("audit_secrets.env"), media[envelope][1])
+        unsigned, _, _ = first_checkpoint(good, media)
+        code = boot_code("auditkey-core", "UnsealRefused")
+        if unsigned.group("reason") is None or int(unsigned.group("reason")) != code:
+            raise Fail(f"audit export: other PCRs' audit envelope gave {unsigned.group(0).strip()}, "
+                       f"want the unsigned form with reason={code} (UnsealRefused)")
+        passed.append("audit export: an audit envelope sealed to other PCRs prints the unsigned checkpoint")
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
 def test_release_boot(pkg: Package, release: str, deploy: str, fi_net: Package, passed: list):
     """M7 plan C11: one boot of exactly the files a verified release names
     (build() made and verified it): every file QEMU loads hashes to the
@@ -4518,6 +4638,8 @@ def rp_global_drain_case(con, tap, sniffer, deploy, endpoint, hello, rps):
 # Free stack required below each McEliece PD's deepest use (M4 plan C8):
 # the scrub writes SCRUB_DEPTH below its root wherever the root is called.
 STACK_HEADROOM_MIN = 16 * 1024
+# Below this, `policy`'s mark cannot include a verification (M8 plan C10).
+POLICY_STACK_FLOOR = 4 * 1024
 
 
 def system_stack_size(pd: str) -> int:
@@ -7749,7 +7871,8 @@ def in_netns(tmp: str) -> int:
              ("https flood", lambda: test_https_flood(good, deploy, passed)),
              ("tls key failure", lambda: test_tls_key_failure(tls_mismatch, deploy, passed)),
              ("supervisor", lambda: test_supervisor(fi_net, fi_timer, passed)),
-             ("release boot", lambda: test_release_boot(good, release, deploy, fi_net, passed))]
+             ("release boot", lambda: test_release_boot(good, release, deploy, fi_net, passed)),
+             ("audit export", lambda: test_audit_export(good, fi_net, os.path.join(tmp, "policy/a/a.record"), passed))]
     # check-selftest's red-proofs need only the boot their injection breaks:
     # KOZANE_IT_BOOTS names those (comma-separated). A filtered run never
     # prints INTEGRATION-CASES, so it can never pass `make check`'s manifest.

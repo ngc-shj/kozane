@@ -201,6 +201,12 @@ the only guard for pqkey-core's wrappers. L8's adjudicating control is
      `"release_seq": "<n>"`) in tools/release.py, the Makefile or
      tools/release/src outside its tests.rs. A tripwire over source text:
      the adjudicating control is verify's refusal (test_release.py)
+  P31 audit's one call to auditkey (M8 plan C10, F32, T47): in
+     crates/pds/audit/src/main.rs, outside comments, `.pp_call(` occurs
+     once, inside `fn sign`; `CH_AUDITKEY` occurs once, at that call, so the
+     notification is never decoded except by `audit_core::ready_input`,
+     which must be called. A tripwire: audit-core's unit tests and Kani
+     harnesses are the control
 """
 
 import argparse
@@ -216,7 +222,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import waivers  # noqa: E402
 
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P18",
-         "P19", "P20", "P21", "P22", "P23", "P24", "P25", "P26", "P27", "P28", "P29", "P30"]
+         "P19", "P20", "P21", "P22", "P23", "P24", "P25", "P26", "P27", "P28", "P29", "P30", "P31"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
                "crates/tls-core", "crates/tlskey-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data",
@@ -1170,6 +1176,27 @@ def check_release_seq(root: pathlib.Path, out: list):
                 out.append(f"P30 {rel}:{n}: a release_seq value spelled out; it comes from {RELEASE_SEQ_SRC} (M8 plan C9)")
 
 
+# P31: audit calls auditkey from one place, after ready_input.
+AUDIT_MAIN = "crates/pds/audit/src/main.rs"
+
+
+def check_audit_call(root: pathlib.Path, out: list):
+    path = root / AUDIT_MAIN
+    if not path.is_file():
+        return
+    code = [l.split("//", 1)[0] for l in path.read_text().splitlines()]
+    calls = [n for n, l in enumerate(code, 1) if ".pp_call(" in l]
+    names = [n for n, l in enumerate(code, 1) if "CH_AUDITKEY" in l]
+    sign = next((n for n, l in enumerate(code, 1) if re.search(r"\bfn sign\(", l)), None)
+    end = next((n for n, l in enumerate(code, 1) if sign and n > sign and l.startswith("}")), None)
+    if len(calls) != 1 or not (sign and end and sign < calls[0] < end):
+        out.append(f"P31 {AUDIT_MAIN}: want exactly one .pp_call(, inside fn sign; found lines {calls} (M8 plan C10)")
+    if names != calls:
+        out.append(f"P31 {AUDIT_MAIN}: CH_AUDITKEY named at lines {names}; only at the one call (M8 plan C10)")
+    if not any("audit_core::ready_input(" in l for l in code):
+        out.append(f"P31 {AUDIT_MAIN}: the notification is not decoded by audit_core::ready_input (M8 plan C10)")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
@@ -1190,6 +1217,7 @@ def main() -> int:
     check_forbidden(root, out)
     check_policy(root, out)
     check_nv_writes(root, out)
+    check_audit_call(root, out)
     check_release_seq(root, out)
     check_secret_derives(root, out)
     check_secret_copies(root, out)

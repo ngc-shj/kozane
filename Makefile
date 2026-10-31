@@ -24,7 +24,7 @@ loader := $(BUILD)/loader.img
 counts := $(BUILD)/counts
 
 pds := supervisor eth-out eth-in ingress audit timer tpm rng key hs inner data pq pqkey tls tlskey policy auditkey
-host_crates := wire ring boot-stage rng-core supervisor-core audit-event drbg ingress-core inner-core layout laws supervisor-allowlist config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct limits tlskey-core secret policy-wire policy-client release-seq auditkey-core
+host_crates := wire ring boot-stage rng-core supervisor-core audit-event drbg ingress-core inner-core layout laws supervisor-allowlist config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct limits tlskey-core secret policy-wire policy-client release-seq auditkey-core audit-core
 empty :=
 space := $(empty) $(empty)
 # A crate shipped in more than one feature set is proved in each
@@ -34,7 +34,7 @@ kani_variants_boot-stage := --features boot-stop
 # The `policy` PD links policy-wire with `verifier` (M8 plan D-2), every
 # other PD without it.
 kani_variants_policy-wire := --features verifier
-kani_crates := wire ring boot-stage drbg rng-core supervisor-core ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire policy-wire audit-event auditkey-core
+kani_crates := wire ring boot-stage drbg rng-core supervisor-core ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire policy-wire audit-event auditkey-core audit-core
 
 .PHONY: clean-counts
 .PHONY: all image package run test check check-selftest repro mir audit lint lint-pds unit kani verus ct ct-harness ct-shape bolero fuzz-long laws pins manifest kernel-config clean
@@ -365,6 +365,7 @@ pins: release-tool policy-tool | $(counts)
 	python3 tests/tools/test_provision.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_mkcert.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_policy.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	python3 tests/tools/test_audit_verify.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	cargo clippy --locked --manifest-path tools/release/Cargo.toml --target-dir $(BUILD)/release/target --all-targets -- -D warnings \
 		> $(counts)/release-lint.log 2>&1 || { cat $(counts)/release-lint.log; exit 1; }
 	cargo test --locked --manifest-path tools/release/Cargo.toml --target-dir $(BUILD)/release/target \
@@ -376,7 +377,7 @@ pins: release-tool policy-tool | $(counts)
 		> $(counts)/policy-unit.log 2>&1 || { cat $(counts)/policy-unit.log; exit 1; }
 	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-POLICY-TOOL", n + 0 }' $(counts)/policy-unit.log >> $(counts)/pins.log
 	tools/verus-pairing >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES|UNIT-COUNTS-FIXTURES|PROOF-LOCK-FIXTURES|SELFTEST-SPLIT-FIXTURES|KANI-GUARD-FIXTURES|VERUS-PAIRING-FIXTURES|VERUS-PAIRED|MIR-GATE-FIXTURES|MEASURE-FIXTURES|RELEASE-FIXTURES|PROVISION-FIXTURES|MKCERT-FIXTURES|POLICY-FIXTURES|UNIT-RELEASE-TOOL|UNIT-POLICY-TOOL)' $(counts)/pins.log > $(counts)/pins
+	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES|UNIT-COUNTS-FIXTURES|PROOF-LOCK-FIXTURES|SELFTEST-SPLIT-FIXTURES|KANI-GUARD-FIXTURES|VERUS-PAIRING-FIXTURES|VERUS-PAIRED|MIR-GATE-FIXTURES|MEASURE-FIXTURES|RELEASE-FIXTURES|PROVISION-FIXTURES|MKCERT-FIXTURES|POLICY-FIXTURES|AUDIT-VERIFY-FIXTURES|UNIT-RELEASE-TOOL|UNIT-POLICY-TOOL)' $(counts)/pins.log > $(counts)/pins
 
 # Builds its own deployment (fresh keys, generated config, release package);
 # see run.py. Packaging a release kernel needs the C9 pass record, hence
