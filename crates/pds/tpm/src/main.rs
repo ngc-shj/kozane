@@ -1,8 +1,9 @@
 //! TPM driver PD (M5 plan C9, laws L1/L5): passive, untainted, the only PD
 //! that maps the TPM's TIS page (locality 0), and callee of the key PDs
-//! (`key`, `pqkey`, `tlskey`) alone. Each call carries one TPM command
-//! (`layout::tpm`); the `tpm2_wire` gate decides whether it reaches the
-//! device: the allowlist, per-client handle ownership (L2 between the key
+//! (`key`, `pqkey`, `tlskey`, `auditkey`) alone. Each call carries one TPM
+//! command (`layout::tpm`); the `tpm2_wire` gate decides whether it reaches
+//! the device: the allowlist (with `auditkey`'s ReadClock row, M8 plan
+//! C3), per-client handle ownership (L2 between the key
 //! domains), one flow per client and one flow at a time (Busy), and the
 //! cap of PCR 8 once every client sent Done or Failed, and the cap status
 //! each Done client asks for before it releases its key (post-M6 plan P3).
@@ -31,6 +32,9 @@ const _: () = assert!(MSG_BYTES == tpm2_wire::IPC_MSG_BYTES);
 const KEY: Channel = Channel::new(ipc::CH_KEY);
 const PQKEY: Channel = Channel::new(ipc::CH_PQKEY);
 const TLSKEY: Channel = Channel::new(ipc::CH_TLSKEY);
+/// M8 plan C10: the fourth raw client, the one whose ReadClock the gate
+/// forwards (`tpm2_wire::gate::AUDITKEY`).
+const AUDITKEY: Channel = Channel::new(ipc::CH_AUDITKEY);
 /// Not in the system until the `policy` PD is (M8 slice 3): no PPC arrives
 /// on it before then.
 const POLICY: Channel = Channel::new(ipc::CH_POLICY);
@@ -43,11 +47,13 @@ fn client(channel: Channel) -> Option<usize> {
         Some(1)
     } else if channel == TLSKEY {
         Some(2)
+    } else if channel == AUDITKEY {
+        Some(tpm2_wire::gate::AUDITKEY)
     } else {
         None
     }
 }
-const _: () = assert!(CLIENTS == 3);
+const _: () = assert!(CLIENTS == 4 && tpm2_wire::gate::AUDITKEY == 3);
 
 // TIS registers of locality 0 (TCG PC Client Platform TPM Profile, TIS).
 const ACCESS: usize = 0x00;

@@ -130,11 +130,11 @@ const MLKEM_CT_LEN: usize = 1088;
 
 /// Decapsulations (the four classes per entry), encapsulation attempts
 /// (every draw of each stream, the two crafted rejections), the generic
-/// shim once per entry, the envelope open for each blob kind (key, pq and,
-/// since M6 plan C12, tls), the hybrid exchange (its depth run, then its
-/// scan), the ClientHello's keys at their call site (a depth run) and the
-/// ClientHello through the handshake.
-const CASES: usize = ENTRIES * CLASSES.len() + (1 + 3 + 4) + 2 + ENTRIES + 3 + 2 + 1 + 1;
+/// shim once per entry, the envelope open for each blob kind (key, pq,
+/// since M6 plan C12 tls, and since M8 plan C10 audit), the hybrid exchange
+/// (its depth run, then its scan), the ClientHello's keys at their call site
+/// (a depth run) and the ClientHello through the handshake.
+const CASES: usize = ENTRIES * CLASSES.len() + (1 + 3 + 4) + 2 + ENTRIES + 4 + 2 + 1 + 1;
 
 /// 8-byte windows of the secret forms, at every byte offset.
 struct Needles {
@@ -689,7 +689,12 @@ pub fn run() -> ! {
 
     // The envelope-open closure (I10.3): after it returns, neither the KEK
     // nor the blob it opened is left on the stack, and the KEK is wiped.
-    for (kind, len) in [(Kind::Key, 1000), (Kind::Pq, secret_blob::pq::USED_LEN), (Kind::Tls, secret_blob::tls::USED_LEN)] {
+    for (kind, len) in [
+        (Kind::Key, 1000),
+        (Kind::Pq, secret_blob::pq::USED_LEN),
+        (Kind::Tls, secret_blob::tls::USED_LEN),
+        (Kind::Audit, secret_blob::audit::USED_LEN),
+    ] {
         let (env, mut kek, plain) = sealed_envelope(kind, len);
         let mut needles = Needles::new();
         needles.add(Form::Kek, kek.as_bytes());

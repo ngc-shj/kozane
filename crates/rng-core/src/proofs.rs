@@ -23,7 +23,16 @@ fn a_seed_is_a_full_nonzero_block_or_nothing() {
     let mut out = Secret::<SEED_LEN>::from_bytes(kani::any());
     let caller: u8 = kani::any();
     kani::assume(caller < CALLERS as u8);
-    let caller = [Caller::Hs, Caller::Pq, Caller::Ingress, Caller::Tls, Caller::Key, Caller::Pqkey, Caller::Tlskey]
+    let caller = [
+        Caller::Hs,
+        Caller::Pq,
+        Caller::Ingress,
+        Caller::Tls,
+        Caller::Key,
+        Caller::Pqkey,
+        Caller::Tlskey,
+        Caller::Auditkey,
+    ]
         [caller as usize];
     let r = s.seed(caller, kani::any(), &mut AnyDevice, &mut out);
     match r {

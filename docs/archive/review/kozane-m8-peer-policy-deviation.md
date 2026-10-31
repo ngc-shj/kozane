@@ -464,3 +464,34 @@ Run in a scratch worktree (`build/probes/p3/tree`, since removed).
   satisfied.
 - **Red-proof.** On a scratch copy, an `authorize_outbound` naming the
   wrong peer (`i / QUOTA ^ 1`) makes (a) fail.
+
+## Slice 5
+
+### D-18 — `auditkey`'s choices (batch A)
+
+- **ReadClock.** `tpm2::boot::unseal` takes an `Option<&mut Clock>` and
+  reads the clock after a successful flow and before Done. The read stays
+  inside the client's own flow, so it is never Busy, and P22's pin on
+  `unseal` keeps holding. A failed read fails the unseal.
+- **Gate.** `CLIENTS = 4`. `CLIENT_ONLY = [(ReadClock, auditkey)]`: once,
+  no parameters, refused after Done, off both `ALLOWED` and `REFUSED`.
+  I3.2 gains `read_clock_is_reachable_only_from_auditkey`.
+- **Timeouts.** `BUSY_TIMEOUT_NS` 360 s. `POLICY_MAX_NS` 60 s, about 8×
+  the measured 7.6 s, the margin `FLOW_MAX` keeps. So
+  `CAP_BARRIER_TIMEOUT_NS = 360 + 60 + 3 × 30 = 510 s`.
+- **Seq rule.**
+  - A boot starts as if seq 0 had been signed, and the state advances
+    only after a signature exists.
+  - The one exemption is taken by the first request that is not yet due
+    but is above the last signed seq. There is no "ready" flag on the
+    wire.
+  - `audit-core` (batch B) must therefore schedule the next checkpoint
+    at least `CHECKPOINT_EVERY` (64) after the last *signed* seq.
+- **Placement.**
+  - Priority 120: above `audit` and every tainted PD, below `policy`,
+    `tpm` and `rng`.
+  - The audit envelope loads at `0x6F000000`, the free MiB below slot
+    A. Descriptor order: four envelopes, then the slots. The descriptor
+    is 128 bytes with 15 pair lines.
+  - Error codes start at 0x80, so they never collide with key's or
+    tlskey's.

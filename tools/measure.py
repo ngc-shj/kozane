@@ -4,12 +4,12 @@ side is support/u-boot/boot.cmd; this module is its host twin, pinned by the
 C8 integration cases (a boot of the measure variant must print the PCR 8
 this module computes).
 
-Boot descriptor v3 (112 bytes, little-endian; M8 plan C4, deviation D-5):
-magic "SOSBOOT1", version u32 3, count u32 5, image_len u64, then (offset
-u64, len u64) for the secrets, pq_secrets and tls_secrets envelopes and the
-policy_a and policy_b bundle slots, then a reserved u64 0. Each range fits
-its kind's room (ENVELOPE_ROOM, BUNDLE_MAX), and every two are disjoint.
-Versions 1 and 2 are refused.
+Boot descriptor v3 (128 bytes, little-endian; M8 plan C4, deviation D-5):
+magic "SOSBOOT1", version u32 3, count u32 6, image_len u64, then (offset
+u64, len u64) for the four envelopes (secrets, pq_secrets, tls_secrets,
+audit_secrets) and the policy_a and policy_b bundle slots, then a reserved
+u64 0. Each range fits its kind's room (ENVELOPE_ROOM, BUNDLE_MAX), and
+every two are disjoint. Versions 1 and 2 are refused.
 
 PCR 8 starts at zero and is extended with sha256(descriptor), then with
 sha256(image[0, image_len)); TPM2_PCR_Extend sets pcr = sha256(pcr || digest).
@@ -47,7 +47,7 @@ def _limit(name: str) -> int:
 
 MAGIC = b"SOSBOOT1"
 VERSION = 3
-ENVELOPES = 3
+ENVELOPES = 4
 SLOTS = 2
 COUNT = ENVELOPES + SLOTS
 DESC_LEN = 8 + 4 + 4 + 8 + 16 * COUNT + 8
@@ -57,7 +57,8 @@ MAX_IMAGE = 0x10000000
 # Where QEMU loads each file and U-Boot reads it (boot.cmd's layout).
 LOAD_IMAGE = 0x70000000
 LOAD_DESC = 0x6FF00000
-LOAD_ENVELOPES = (0x6FC00000, 0x6FD00000, 0x6FE00000)
+# The audit envelope's slot sits below slot A (M8 plan C10).
+LOAD_ENVELOPES = (0x6FC00000, 0x6FD00000, 0x6FE00000, 0x6F000000)
 # Below boot.cmd's digest scratch at 0x6fb00000 (M8 plan P3).
 LOAD_SLOTS = (0x6F100000, 0x6F600000)
 ENVELOPE_ROOM = 0x100000

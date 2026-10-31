@@ -117,7 +117,7 @@ fn boot() -> Result<Oracle<'static>, BootError> {
     let buf = PLAINTEXT.0.get();
     // SAFETY: init runs once and is the only caller; no other reference to
     // the buffer exists while this one is used.
-    tpm2::boot::unseal(&mut Ppc, region(), Kind::Pq, unsafe { &mut *buf })?;
+    tpm2::boot::unseal(&mut Ppc, region(), Kind::Pq, unsafe { &mut *buf }, None)?;
     // SAFETY: as above. From here the buffer is only read, for the life of
     // the system (the oracle borrows it).
     let plain: &'static [u8] = unsafe { &*buf };

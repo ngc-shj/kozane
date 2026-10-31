@@ -244,7 +244,12 @@ fn open(env: &[u8], kind: Kind, kek: &[u8; 32]) -> (Result<(), EnvError>, Vec<u8
 
 #[test]
 fn sealed_envelope_parses_and_opens_to_the_region_every_kind() {
-    for (kind, len) in [(Kind::Key, 1000), (Kind::Pq, secret_blob::pq::USED_LEN), (Kind::Tls, secret_blob::tls::USED_LEN)] {
+    for (kind, len) in [
+        (Kind::Key, 1000),
+        (Kind::Pq, secret_blob::pq::USED_LEN),
+        (Kind::Tls, secret_blob::tls::USED_LEN),
+        (Kind::Audit, secret_blob::audit::USED_LEN),
+    ] {
         let plain = region(kind, len);
         let env = sealed(kind, &plain, 1);
         let e = Envelope::parse(&env, kind).unwrap();
@@ -276,6 +281,26 @@ fn a_key_envelope_is_refused_as_tls_and_a_tls_envelope_as_key() {
     assert!(r == Ok(()) && out == key);
     let (r, out) = open(&tls_env, Kind::Tls, &kek(2));
     assert!(r == Ok(()) && out == tls);
+}
+
+/// M8 plan C10: `audit_secrets` is 4096 bytes too, so the kind alone keeps
+/// an `auditkey` envelope from parsing as `key`'s or `tlskey`'s and the
+/// reverse; each still opens as its own kind.
+#[test]
+fn an_audit_envelope_is_refused_as_any_other_kind() {
+    let mut audit = [0u8; secret_blob::audit::REGION_SIZE];
+    secret_blob::audit::write(&mut audit, &[7; 32]).unwrap();
+    let mut tls = [0u8; secret_blob::tls::REGION_SIZE];
+    secret_blob::tls::write(&mut tls, &[4; 32], &[5; 32]).unwrap();
+    let audit_env = sealed(Kind::Audit, &audit, 3);
+    let tls_env = sealed(Kind::Tls, &tls, 2);
+    for other in [Kind::Key, Kind::Tls] {
+        assert_eq!(Envelope::parse(&audit_env, other).err(), Some(EnvError::BadKind), "{other:?}");
+    }
+    assert_eq!(Envelope::parse(&tls_env, Kind::Audit).err(), Some(EnvError::BadKind));
+    assert_eq!(Kind::Audit.code(), 4);
+    let (r, out) = open(&audit_env, Kind::Audit, &kek(3));
+    assert!(r == Ok(()) && out == audit);
 }
 
 /// The payload is the region without its trailing zeros: a blob whose last
@@ -460,7 +485,11 @@ impl FakeTpm {
             kek: kek(tag),
             session_key: [0; 32],
             nonce_tpm: [0x77; 32],
-            expected_name: Envelope::parse(env, Kind::Key).unwrap().object_name(),
+            expected_name: [Kind::Key, Kind::Audit]
+                .into_iter()
+                .find_map(|k| Envelope::parse(env, k).ok())
+                .unwrap()
+                .object_name(),
             load_name: None,
             unseal_attributes: UNSEAL_ATTRIBUTES,
             flip_unseal_hmac: false,
@@ -502,6 +531,13 @@ impl FakeTpm {
                 with_password(Some(OBJECT_HANDLE), &[&[0, 34][..], &name].concat())
             }
             CC_UNSEAL => self.unseal(cmd),
+            // M8 plan C10: resetCount 7, restartCount 2.
+            tpm2_wire::CC_READ_CLOCK => no_sessions(|w| {
+                w.bytes(&[0; 16]).unwrap();
+                w.u32(7).unwrap();
+                w.u32(2).unwrap();
+                w.u8(1).unwrap();
+            }),
             CC_FLUSH_CONTEXT => {
                 self.flushed.push(u32::from_be_bytes(cmd[10..14].try_into().unwrap()));
                 no_sessions(|_| {})
@@ -705,13 +741,15 @@ fn every_command_of_the_flow_fits_one_ipc_message() {
 use layout::tpm as ipc;
 use tpm2_wire::gate::{Gate, Refusal, State};
 
-use super::boot::{self, BUSY_PAUSE_NS, BUSY_TIMEOUT_NS, CAP_BARRIER_TIMEOUT_NS, Transport, UnsealError};
+use super::boot::{self, BUSY_PAUSE_NS, BUSY_TIMEOUT_NS, CAP_BARRIER_TIMEOUT_NS, Clock, Transport, UnsealError};
 
 /// `tpm` as the PD runs it: the gate in front of the fake TPM, with knobs
 /// for the transport's failures.
 struct FakePpc {
     tpm: FakeTpm,
     gate: Gate,
+    /// The gate's client index this PD is (`key`'s 0 unless a test sets it).
+    client: usize,
     /// (request kind, length) of every call.
     calls: Vec<(u64, usize)>,
     /// Busy replies before the gate sees a command.
@@ -737,6 +775,7 @@ impl FakePpc {
         FakePpc {
             tpm: FakeTpm::new(env, 3),
             gate: Gate::new(),
+            client: 0,
             calls: Vec::new(),
             busy: 0,
             clock: 0,
@@ -769,7 +808,7 @@ impl Transport for FakePpc {
                     self.busy -= 1;
                     return (ipc::label(ipc::RSP_BUSY, 0), 0);
                 }
-                let fwd = match self.gate.command(0, req) {
+                let fwd = match self.gate.command(self.client, req) {
                     Ok(fwd) => fwd,
                     // As the tpm PD answers it (M6 plan C12).
                     Err(Refusal::Busy) => return (ipc::label(ipc::RSP_BUSY, 0), 0),
@@ -794,7 +833,7 @@ impl Transport for FakePpc {
             }
             ipc::REQ_CAP_STATUS => {
                 assert!(req.is_empty() && ipc::arg(label) == 0);
-                assert_eq!(self.gate.state(0), Some(State::Done), "the cap status asked before Done");
+                assert_eq!(self.gate.state(self.client), Some(State::Done), "the cap status asked before Done");
                 if self.cap_busy > 0 {
                     self.cap_busy -= 1;
                     return (ipc::label(ipc::RSP_BUSY, 0), 0);
@@ -804,7 +843,7 @@ impl Transport for FakePpc {
             kind => {
                 assert!(kind == ipc::REQ_DONE || kind == ipc::REQ_FAILED, "unknown request {kind}");
                 assert!(req.is_empty());
-                let ok = self.gate.finish(0, kind == ipc::REQ_DONE).is_ok();
+                let ok = self.gate.finish(self.client, kind == ipc::REQ_DONE).is_ok();
                 let reply = if ok { ipc::label(ipc::RSP_OK, 0) } else { ipc::label(ipc::RSP_REFUSED, 1) };
                 (self.finish_reply.unwrap_or(reply), 0)
             }
@@ -824,8 +863,74 @@ impl Transport for FakePpc {
 
 fn boot_unseal(env: &[u8], ppc: &mut FakePpc) -> (Result<(), UnsealError>, Vec<u8>) {
     let mut out = vec![0xAAu8; Kind::Key.region_size()];
-    let r = boot::unseal(ppc, env, Kind::Key, &mut out);
+    let r = boot::unseal(ppc, env, Kind::Key, &mut out, None);
     (r, out)
+}
+
+/// `auditkey`'s unseal (M8 plan C10): its client index, its kind, the clock.
+fn audit_unseal(env: &[u8], ppc: &mut FakePpc) -> (Result<(), UnsealError>, Vec<u8>, Clock) {
+    ppc.client = tpm2_wire::gate::AUDITKEY;
+    let mut out = vec![0xAAu8; Kind::Audit.region_size()];
+    let mut clock = Clock { reset_count: 0xEE, restart_count: 0xEE };
+    let r = boot::unseal(ppc, env, Kind::Audit, &mut out, Some(&mut clock));
+    (r, out, clock)
+}
+
+#[test]
+fn auditkey_reads_the_clock_after_its_flow_and_before_its_done() {
+    let plain = region(Kind::Audit, secret_blob::audit::USED_LEN);
+    let env = sealed(Kind::Audit, &plain, 3);
+    let mut ppc = FakePpc::new(&env);
+    let (r, out, clock) = audit_unseal(&env, &mut ppc);
+    assert_eq!(r, Ok(()));
+    assert!(out == plain);
+    assert_eq!(clock, Clock { reset_count: 7, restart_count: 2 });
+    assert_eq!(ppc.commands(), FULL_FLOW.len() + 1, "the flow, then ReadClock");
+    let n = ppc.calls.len();
+    assert_eq!(
+        ppc.calls[n - 3..],
+        [(ipc::REQ_COMMAND, tpm2_wire::READ_CLOCK_CMD_LEN), (ipc::REQ_DONE, 0), (ipc::REQ_CAP_STATUS, 0)],
+        "ReadClock after the flushes, then Done and the cap barrier"
+    );
+    assert_eq!(ppc.tpm.flushed, [OBJECT_HANDLE, SESSION_HANDLE, SRK_HANDLE]);
+}
+
+#[test]
+fn a_refused_clock_read_fails_the_unseal_and_sends_failed() {
+    // The gate refuses ReadClock to any client but auditkey: key's index
+    // asking for the clock is refused, so its unseal fails.
+    let env = sealed(Kind::Audit, &region(Kind::Audit, secret_blob::audit::USED_LEN), 3);
+    let mut ppc = FakePpc::new(&env);
+    let mut out = vec![0xAAu8; Kind::Audit.region_size()];
+    let mut clock = Clock { reset_count: 0xEE, restart_count: 0xEE };
+    let r = boot::unseal(&mut ppc, &env, Kind::Audit, &mut out, Some(&mut clock));
+    assert_eq!(r, Err(UnsealError::TpmUnavailable));
+    assert!(out.iter().all(|b| *b == 0));
+    assert_eq!(clock, Clock::default());
+    assert_eq!(ppc.last(), ipc::REQ_FAILED);
+}
+
+#[test]
+fn a_failed_flow_reads_no_clock() {
+    let env = sealed(Kind::Audit, &region(Kind::Audit, secret_blob::audit::USED_LEN), 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.unseal_rc = Some(0x99D);
+    let (r, out, clock) = audit_unseal(&env, &mut ppc);
+    assert_eq!(r, Err(UnsealError::UnsealRefused));
+    assert!(out.iter().all(|b| *b == 0));
+    assert_eq!(clock, Clock::default());
+    assert_eq!(ppc.commands(), FULL_FLOW.len(), "no ReadClock after a failed flow");
+    assert_eq!(ppc.last(), ipc::REQ_FAILED);
+}
+
+#[test]
+fn a_cap_failure_after_the_clock_leaves_no_clock() {
+    let env = sealed(Kind::Audit, &region(Kind::Audit, secret_blob::audit::USED_LEN), 3);
+    let mut ppc = FakePpc::new(&env);
+    ppc.cap_reply = ipc::label(ipc::RSP_REFUSED, ipc::REFUSED_CAP_FAILED);
+    let (r, _, clock) = audit_unseal(&env, &mut ppc);
+    assert_eq!(r, Err(UnsealError::CapFailed));
+    assert_eq!(clock, Clock::default());
 }
 
 #[test]

@@ -38,6 +38,10 @@
          placeholder; `make package` swaps this prefill_path too
          (secret_blob::tls). -->
     <memory_region name="tls_secrets" size="0x1000" prefill_path="tls-secrets-placeholder.bin" />
+    <!-- auditkey's checkpoint key (law L2, owner auditkey; M8 plan C10, D7):
+         zero placeholder; `make package` swaps this prefill_path too
+         (secret_blob::audit). -->
+    <memory_region name="audit_secrets" size="0x1000" prefill_path="audit-secrets-placeholder.bin" />
     <!-- M8 plan C4, D3: the two peer-policy bundle slots, BUNDLE_MAX each,
          zero placeholders here. U-Boot measures both into PCR 9 and copies
          each over its range; mapped read-only into `policy` and the barrier
@@ -215,6 +219,17 @@
         <protection_domain name="tlskey" id="7" priority="135" budget="2_000" period="10_000" passive="true" stack_size="0x20_000">
             <program_image path="pd-tlskey.elf" />
             <map mr="tls_secrets" vaddr="0x2_000_000" perms="r" setvar_vaddr="tls_secrets" />
+        </protection_domain>
+
+        <!-- M8 plan C10, D7: the audit checkpoint signer. Passive: every
+             signature runs on audit's scheduling context, its one caller,
+             below it; this budget only covers init (the unseal, ReadClock,
+             the boot ID). Above audit, below tpm and rng, which it calls;
+             tlskey's stack (Ed25519 and its scrub). No audit ring: it
+             reports through its replies to audit. -->
+        <protection_domain name="auditkey" id="16" priority="120" budget="2_000" period="10_000" passive="true" stack_size="0x20_000">
+            <program_image path="pd-auditkey.elf" />
+            <map mr="audit_secrets" vaddr="0x2_000_000" perms="r" setvar_vaddr="audit_secrets" />
         </protection_domain>
 
         <!-- M8 plan C5: the peer-policy verifier. Passive: every Await runs on
@@ -553,6 +568,23 @@
     <channel>
         <end pd="policy" id="2" />
         <end pd="audit" id="10" notify="false" />
+    </channel>
+
+    <!-- M8 plan C10, C11: audit calls auditkey (the key exemption's shape:
+         audit pp, notify=false; auditkey pp=false), and auditkey notifies
+         audit on the same channel once, at the end of its init. Its unseal
+         and ReadClock go to tpm, its boot ID comes from rng. -->
+    <channel>
+        <end pd="audit" id="11" pp="true" notify="false" />
+        <end pd="auditkey" id="1" pp="false" />
+    </channel>
+    <channel>
+        <end pd="auditkey" id="3" pp="true" notify="false" />
+        <end pd="tpm" id="4" pp="false" notify="false" />
+    </channel>
+    <channel>
+        <end pd="auditkey" id="4" pp="true" notify="false" />
+        <end pd="rng" id="8" pp="false" />
     </channel>
 
     <!-- M8 plan C6, C11: the barrier PDs' Await on policy, once each in

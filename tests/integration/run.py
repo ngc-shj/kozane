@@ -78,6 +78,7 @@ import ctypes
 import errno
 import hashlib
 import hmac
+import itertools
 import json
 import math
 import os
@@ -1979,6 +1980,11 @@ def test_mismatched_blob(pkg: "Package"):
 
 # ---------------------------------------------------------------- measured boot (M5 plan C8)
 
+# The envelopes tools/package writes, in descriptor range order (one per key
+# PD; M8 plan C10 added `auditkey`'s).
+ENVELOPE_FILES = ("secrets.env", "pq_secrets.env", "tls_secrets.env", "audit_secrets.env")
+
+
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import measure  # noqa: E402  (the host model of support/u-boot/boot.cmd)
 
@@ -2052,7 +2058,7 @@ class Package:
             return f.read()
 
     def media(self) -> list:
-        names = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "tls_secrets.env")
+        names = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "tls_secrets.env", "audit_secrets.env")
         return list(zip(list(map(self.path, names)) + list(self.slots),
                         (measure.LOAD_IMAGE, measure.LOAD_DESC) + measure.LOADS,
                         strict=True))
@@ -2423,14 +2429,14 @@ def test_measured_boot(pkg: str, slots: tuple, passed: list):
     """C8: the PCR 8 U-Boot produces is the one tools/measure.py computes
     from the public release files; it moves with any byte of the image or
     the descriptor; and the descriptor checks U-Boot runs on-device refuse a
-    wrapping range, each overlapping pair of the five ranges (M8 plan C4),
+    wrapping range, each overlapping pair of the six ranges (M8 plan C4),
     range 2 past image_len and a version-2 descriptor, but allow a range
     ending exactly at image_len."""
     def read(name):
         with open(os.path.join(pkg, name), "rb") as f:
             return f.read()
     image, desc = read("published.img"), read("boot.desc")
-    envs = [read("secrets.env"), read("pq_secrets.env"), read("tls_secrets.env"), *slots]
+    envs = [read("secrets.env"), read("pq_secrets.env"), read("tls_secrets.env"), read("audit_secrets.env"), *slots]
     want = measure.expected_pcr8(desc, image)
     # M7 plan C4: the package's PCRs 0-8 are the twin's for its flash.bin.
     pcrs = [bytes.fromhex(l) for l in read("pcrs").decode().split()]
@@ -2504,7 +2510,7 @@ def test_measured_boot(pkg: str, slots: tuple, passed: list):
             passed.append(f"measured boot: {case}")
 
         # Its allow pair: a range ending exactly at image_len (the first of
-        # the five that can move there without overlapping the others).
+        # the six that can move there without overlapping the others).
         for i, (_, length) in enumerate(ranges):
             moved_ranges = ranges[:i] + [(image_len - length, length)] + ranges[i + 1:]
             if not measure.check_ranges(image_len, moved_ranges):
@@ -2546,17 +2552,18 @@ def boot_code(crate: str, variant: str) -> int:
 
 
 def check_key_code_tables_apart():
-    """M6 plan C12 (R1-S F6, R2-T N8): `key`'s and `tlskey`'s codes are
-    disjoint, so a `KeyUnavailable` code names the key PD that failed; each
-    table's codes are distinct too. The mirror keeps the crates apart (no
-    dependency edge between them)."""
-    key, tlskey = code_table("key-core"), code_table("tlskey-core")
-    for name, table in (("key-core", key), ("tlskey-core", tlskey)):
+    """M6 plan C12 (R1-S F6, R2-T N8): `key`'s, `tlskey`'s and, since M8
+    (plan C10), `auditkey`'s codes are pairwise disjoint, so a code names
+    the key PD that failed; each table's codes are distinct too. The mirror
+    keeps the crates apart (no dependency edge between them)."""
+    tables = {crate: code_table(crate) for crate in ("key-core", "tlskey-core", "auditkey-core")}
+    for name, table in tables.items():
         if len(set(table.values())) != len(table):
             raise Fail(f"key code tables: {name} uses a code twice: {table}")
-    shared = sorted(set(key.values()) & set(tlskey.values()))
-    if shared:
-        raise Fail(f"key code tables: key-core and tlskey-core share codes {shared}")
+    for a, b in itertools.combinations(tables, 2):
+        shared = sorted(set(tables[a].values()) & set(tables[b].values()))
+        if shared:
+            raise Fail(f"key code tables: {a} and {b} share codes {shared}")
 
 
 def cap_digest() -> bytes:
@@ -2852,8 +2859,10 @@ def test_tpm_proxy(good: Package, passed: list):
         except Fail as e:
             raise Fail(f"A7 proxy: the unmodified relay did not pass a sealed boot ({e}); "
                        f"relay error: {child.proxy.error!r}") from None
-        if child.proxy.unseals != 3:
-            raise Fail(f"A7 proxy: the relay saw {child.proxy.unseals} Unseal responses, want 3")
+        # Four raw clients (M8 plan C10): auditkey's flow ends before the
+        # cap, which tls's readiness waited for.
+        if child.proxy.unseals != 4:
+            raise Fail(f"A7 proxy: the relay saw {child.proxy.unseals} Unseal responses, want 4")
     finally:
         stop(child)
     passed.append("A7 proxy: the unmodified relay passes a sealed boot")
@@ -2862,7 +2871,12 @@ def test_tpm_proxy(good: Package, passed: list):
     child, con = sealed_boot(good, flip=True)
     try:
         key_outcomes(con, invalid, "A7 proxy")
-        if child.proxy.flipped != 3 or child.proxy.error is not None:
+        # auditkey (M8 plan C10) prints nothing yet; its flipped Unseal may
+        # still be on its way when the callers' outcomes are in.
+        deadline = time.monotonic() + LINE_TIMEOUT_S
+        while child.proxy.flipped < 4 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if child.proxy.flipped != 4 or child.proxy.error is not None:
             raise Fail(f"A7 proxy: {child.proxy.flipped} responses flipped, relay error {child.proxy.error!r}")
     finally:
         stop(child)
@@ -3075,7 +3089,7 @@ def test_release_boot(pkg: Package, release: str, deploy: str, fi_net: Package, 
     pcrs = [bytes.fromhex(p) for p in fields["pcrs"].split(",")]
     image, desc, firmware = (os.path.join(release, n) for n in ("published.img", "boot.desc", "flash.bin"))
     media = [(image, measure.LOAD_IMAGE), (desc, measure.LOAD_DESC)] + \
-        list(zip(map(pkg.path, ("secrets.env", "pq_secrets.env", "tls_secrets.env")), measure.LOAD_ENVELOPES)) + \
+        list(zip(map(pkg.path, ENVELOPE_FILES), measure.LOAD_ENVELOPES, strict=True)) + \
         list(zip(pkg.slots, measure.LOAD_SLOTS, strict=True))
     for path, key in ((firmware, "firmware_sha256"), (image, "loader_img_sha256"), (desc, "boot_desc_sha256")):
         if file_sha256(path) != fields[key]:
@@ -7576,39 +7590,39 @@ def build(tmp: str):
     env = {**os.environ, "KOZANE_CONFIG": os.path.join(tmp, "a/gateway.toml")}
     make("image", env=env)
     make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
-         f"TLS_SECRETS={tmp}/a/tls-secrets.bin", f"SRK_PUBLIC={srk_a}",
-         f"OUT={tmp}/a/pkg", env=env)
+         f"TLS_SECRETS={tmp}/a/tls-secrets.bin", f"AUDIT_SECRETS={tmp}/a/audit-secrets.bin",
+         f"SRK_PUBLIC={srk_a}", f"OUT={tmp}/a/pkg", env=env)
     # Only `key`'s blob mismatches: pqkey and tlskey keep A's, so only `key` is
     # Unavailable.
     make("package", f"SECRETS={tmp}/b/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
-         f"TLS_SECRETS={tmp}/a/tls-secrets.bin", f"SRK_PUBLIC={srk_a}",
-         f"OUT={tmp}/b/pkg", env=env)
+         f"TLS_SECRETS={tmp}/a/tls-secrets.bin", f"AUDIT_SECRETS={tmp}/a/audit-secrets.bin",
+         f"SRK_PUBLIC={srk_a}", f"OUT={tmp}/b/pkg", env=env)
     make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
-         f"TLS_SECRETS={tmp}/a/tls-secrets.bin",
+         f"TLS_SECRETS={tmp}/a/tls-secrets.bin", f"AUDIT_SECRETS={tmp}/a/audit-secrets.bin",
          f"SRK_PUBLIC={srk_foreign}", f"OUT={tmp}/a/pkg-foreign", env=env)
     # Only the TLS blob's scalar differs (M6 plan case 8, C12): `key` and
     # `pqkey` stay Ready, `tlskey` is Unavailable.
     make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
-         f"TLS_SECRETS={tmp}/a/tls-secrets-mismatch.bin",
+         f"TLS_SECRETS={tmp}/a/tls-secrets-mismatch.bin", f"AUDIT_SECRETS={tmp}/a/audit-secrets.bin",
          f"SRK_PUBLIC={srk_a}", f"OUT={tmp}/a/pkg-tls-mismatch", env=env)
     env_c = {**os.environ, "KOZANE_CONFIG": os.path.join(tmp, "c/gateway.toml")}
     make("package", f"SECRETS={tmp}/c/secrets.bin", f"PQ_SECRETS={tmp}/c/pqkey-secrets.bin",
-         f"TLS_SECRETS={tmp}/c/tls-secrets.bin", f"SRK_PUBLIC={srk_c}",
-         f"OUT={tmp}/c/pkg", env=env_c)
+         f"TLS_SECRETS={tmp}/c/tls-secrets.bin", f"AUDIT_SECRETS={tmp}/c/audit-secrets.bin",
+         f"SRK_PUBLIC={srk_c}", f"OUT={tmp}/c/pkg", env=env_c)
     # M7 plan C11: A's package released and verified as a deployer would,
     # each envelope's policy checked against the signed PCRs.
     make("release-tool")
     keys = os.path.join(tmp, "release-keys")
     release_tool("keygen", "--dir", keys, "--forbid", ROOT)
     release_py("make", "--keys", keys, "--pkg", f"{tmp}/a/pkg", "--out", f"{tmp}/a/release", "--allow-dirty")
-    for envelope, kind in (("secrets.env", "key"), ("pq_secrets.env", "pq"), ("tls_secrets.env", "tls")):
+    for envelope, kind in zip(ENVELOPE_FILES, ("key", "pq", "tls", "audit"), strict=True):
         release_py("verify", "--pub", keys, "--release", f"{tmp}/a/release", "--allow-dirty",
                    "--envelope", f"{tmp}/a/pkg/{envelope}", "--kind", kind)
     # M7 plan C8: the fault-inject selftest variants of A's package.
     for variant in FAULT_INJECT_VARIANTS:
         make(f"package-fault-inject-{variant}", f"SECRETS={tmp}/a/secrets.bin",
              f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin", f"TLS_SECRETS={tmp}/a/tls-secrets.bin",
-             f"SRK_PUBLIC={srk_a}", f"OUT={tmp}/a/pkg-fi-{variant}", env=env)
+             f"AUDIT_SECRETS={tmp}/a/audit-secrets.bin", f"SRK_PUBLIC={srk_a}", f"OUT={tmp}/a/pkg-fi-{variant}", env=env)
     for pkg in ("a/pkg", "b/pkg", "a/pkg-foreign", "a/pkg-tls-mismatch", "c/pkg",
                 *(f"a/pkg-fi-{v}" for v in FAULT_INJECT_VARIANTS)):
         if sorted(os.listdir(os.path.join(tmp, pkg))) != sorted(PACKAGE_OUTPUTS):
@@ -7633,9 +7647,9 @@ def release_py(*args):
         raise Fail(f"tools/release.py {args[0]} failed: {r.stdout}{r.stderr}")
 
 
-# What tools/package writes: no image with a secret in it (M5 plan C8 F2).
-PACKAGE_OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "tls_secrets.env", "flash.bin",
-                   "pcrs")
+# What tools/package writes: no image with a secret in it (M5 plan C8 F2),
+# and since M8 (plan C10) the audit key's public half.
+PACKAGE_OUTPUTS = ("published.img", "boot.desc", *ENVELOPE_FILES, "flash.bin", "pcrs", "audit.pub")
 
 
 def packages(tmp: str) -> dict:

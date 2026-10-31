@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Packages a deployment for one TPM (plan C16, M3 plan L6, M5 plan C8,
 C11): the published image (`make image`'s, with the zero placeholders), the
-boot descriptor naming where U-Boot copies each envelope, the three sealed
+boot descriptor naming where U-Boot copies each envelope, the four sealed
 envelopes (`key`'s blob for the `secrets` mr, `pqkey`'s for `pq_secrets`,
-`tlskey`'s for `tls_secrets`; M6 plan Re-plan R1), the firmware that boots
-them, and the PCRs 0-8 they are sealed to (M7 plan C4). No image with a
-secret in it is written.
+`tlskey`'s for `tls_secrets`, M6 plan Re-plan R1; `auditkey`'s for
+`audit_secrets`, M8 plan C10), the firmware that boots them, and the PCRs
+0-8 they are sealed to (M7 plan C4). No image with a secret in it is
+written. The audit key's public half is exported as audit.pub, so
+tools/audit-verify can check the checkpoints; the host keeps no copy of the
+private half beyond the blob the operator zeroizes.
 
 Usage: package --secrets FILE --pq-secrets FILE --tls-secrets FILE
-               --srk-public FILE --firmware FLASH --out DIR
+               --audit-secrets FILE --srk-public FILE --firmware FLASH --out DIR
                --system FILE --policy FILE --image LOADER
                --gen-config gen_config.h --search-path DIR --board BOARD
                --config CONFIG --microkit BIN --harness CT_HARNESS
@@ -17,33 +20,35 @@ Usage: package --secrets FILE --pq-secrets FILE --tls-secrets FILE
 writes (mksecrets seal checks it is the storage template). The flow:
 
   1. microkit builds the system with size-correct, random stand-ins as the
-     three secrets prefills and the two bundle slots' (`policy_a`,
-     `policy_b`; M8 plan C4): where they land are the descriptor's five
+     four secrets prefills and the two bundle slots' (`policy_a`,
+     `policy_b`; M8 plan C4): where they land are the descriptor's six
      ranges;
   2. the descriptor (v3) names those ranges, and PCRs 0-8 are computed from
      the firmware (PCR 0: what TF-A will extend), the descriptor and the
      published image (PCR 8: what U-Boot will extend; tools/measure.py);
   3. `mksecrets seal` seals each blob to that SRK and those PCRs, each
-     under a fresh KEK;
+     under a fresh KEK, and `mksecrets audit-public` exports audit.pub from
+     the same private copy of the audit blob;
   4. microkit builds the system again with the envelopes as prefills, and
      the assembly U-Boot performs (tools/measure.py) must give back that
      image byte for byte.
 
 Each build is accepted only if, against the placeholder build:
-  - the .system differs in nothing but the five stand-in mrs' prefill_path;
+  - the .system differs in nothing but the six stand-in mrs' prefill_path;
   - (stand-ins) the images have equal length, differ somewhere, and every
-    differing byte lies inside one of the five places the stand-ins appear,
+    differing byte lies inside one of the six places the stand-ins appear,
     where the placeholder image held zeros;
-and each blob must be a full region of its own kind (magic, version, the
-TLS blob's zero reserved word, checksum, zero padding), each envelope a
-sealed envelope of its kind. All three blobs and OUT must resolve outside
+and each blob must be a full region of its own kind (magic, version, a
+zero reserved word where it has one, checksum, zero padding), each envelope
+a sealed envelope of its kind. All four blobs and OUT must resolve outside
 the repository (and so `build/`) and the toolchain caches. OUT must not
 exist yet: everything is built in a
 fresh 0700 staging directory beside it under umask 077, renamed into place
 only after every check passed, and removed on every failure path. OUT holds
 published.img, boot.desc, secrets.env, pq_secrets.env, tls_secrets.env,
-flash.bin (the --firmware the PCRs were computed from) and pcrs (PCRs 0-8,
-one hex value a line).
+audit_secrets.env, audit.pub (64 hex digits and a newline), flash.bin (the
+--firmware the PCRs were computed from) and pcrs (PCRs 0-8, one hex value a
+line).
 Only `release` kernels are packaged (M5 plan C7, closing SC20 and
 architecture R4 on shipped images), judged from the kernel's own
 gen_config.h rather than a make variable: no CONFIG_DEBUG_BUILD, no
@@ -62,6 +67,7 @@ import argparse
 import hashlib
 import os
 import pathlib
+import re
 import shutil
 import signal
 import subprocess
@@ -110,8 +116,11 @@ PQ = BlobKind("pq_secrets", b"SOSPQKY1", 1, 16384, lambda _blob: 13904)
 # `tlskey` blob v1: header 16 B (reserved u32 0 at 12), TLS scalar, boot
 # seed: the checksum covers [..80] (secret_blob::tls).
 TLS = BlobKind("tls_secrets", b"SOSTLSK1", 1, 4096, lambda _blob: 80)
+# `auditkey` blob v1 (M8 plan C10): header 16 B (reserved u32 0 at 12),
+# Ed25519 seed: the checksum covers [..48] (secret_blob::audit).
+AUDIT = BlobKind("audit_secrets", b"SOSAUDK1", 1, 4096, lambda _blob: 48)
 # In descriptor range order (tools/measure.py).
-KINDS = (KEY, PQ, TLS)
+KINDS = (KEY, PQ, TLS, AUDIT)
 SECRETS_MRS = tuple(k.mr for k in KINDS)
 # The bundle slots (M8 plan C4), after the envelopes in descriptor order:
 # zero in every image tools/package builds; U-Boot copies a node's slots
@@ -121,11 +130,13 @@ SLOT_MRS = ("policy_a", "policy_b")
 STANDIN_MRS = SECRETS_MRS + SLOT_MRS
 STANDIN_SIZES = tuple(k.size for k in KINDS) + (measure.BUNDLE_MAX,) * len(SLOT_MRS)
 # `mksecrets seal --kind` and the envelope's kind code (tpm2::envelope).
-SEAL_KINDS = {"secrets": ("key", 1), "pq_secrets": ("pq", 2), "tls_secrets": ("tls", 3)}
+SEAL_KINDS = {"secrets": ("key", 1), "pq_secrets": ("pq", 2), "tls_secrets": ("tls", 3),
+              "audit_secrets": ("audit", 4)}
 ENVELOPE_MAGIC = b"SOSSEAL1"
 # tpm2_wire::SRK_PUBLIC_LEN: the SRK's TPMT_PUBLIC (a P-256 point).
 SRK_PUBLIC_LEN = 90
-OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "tls_secrets.env", "flash.bin", "pcrs")
+OUTPUTS = ("published.img", "boot.desc", "secrets.env", "pq_secrets.env", "tls_secrets.env", "audit_secrets.env",
+           "audit.pub", "flash.bin", "pcrs")
 
 
 def is_debug(gen_config: str) -> bool:
@@ -239,7 +250,7 @@ def check_blob(kind: BlobKind, blob: bytes) -> list:
     version = int.from_bytes(blob[8:12], "little")
     if version != kind.version:
         return [f"{name} is version {version}, expected {kind.version}"]
-    if kind in (KEY, TLS) and any(blob[12:16]):
+    if kind in (KEY, TLS, AUDIT) and any(blob[12:16]):
         return [f"{name} has a non-zero reserved word"]
     body = kind.body(blob)
     if hashlib.blake2s(blob[:body]).digest() != blob[body:body + 32]:
@@ -329,7 +340,7 @@ def _diff_elements(a: ET.Element, b: ET.Element, where: str, errors: list):
 
 def check_systems(placeholder: str, package: str) -> list:
     """The package .system must equal the placeholder one except for the
-    five stand-in mrs' prefill_paths, which must be set in both."""
+    six stand-in mrs' prefill_paths, which must be set in both."""
     a, b = ET.fromstring(placeholder), ET.fromstring(package)
     errors = []
     _diff_elements(a, b, a.tag, errors)
@@ -424,7 +435,7 @@ def main() -> int:
     for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
         signal.signal(s, exit_on_signal)
     ap = argparse.ArgumentParser()
-    for opt in ("secrets", "pq-secrets", "tls-secrets", "srk-public", "firmware", "out", "system", "policy", "image",
+    for opt in ("secrets", "pq-secrets", "tls-secrets", "audit-secrets", "srk-public", "firmware", "out", "system", "policy", "image",
                 "gen-config",
                 "search-path", "board", "config", "microkit", "harness"):
         ap.add_argument(f"--{opt}", required=True)
@@ -542,7 +553,7 @@ def publish(src: pathlib.Path, dst: pathlib.Path):
 
 def blob_args(a) -> dict:
     """The operator's blob path for each secrets mr."""
-    return {KEY.mr: a.secrets, PQ.mr: a.pq_secrets, TLS.mr: a.tls_secrets}
+    return {KEY.mr: a.secrets, PQ.mr: a.pq_secrets, TLS.mr: a.tls_secrets, AUDIT.mr: a.audit_secrets}
 
 
 def microkit(a, system: pathlib.Path, image: pathlib.Path, report: pathlib.Path):
@@ -561,12 +572,30 @@ def seal(blob: pathlib.Path, mr: str, srk: pathlib.Path, pcrs: list, out: pathli
                    check=True)
 
 
+def audit_public(blob: pathlib.Path, out: pathlib.Path):
+    """`mksecrets audit-public`: the audit key's public half, from the blob."""
+    subprocess.run(["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "audit-public", "--blob", str(blob),
+                    "--out", str(out)], check=True)
+
+
+def check_audit_public(path: pathlib.Path) -> list:
+    """audit.pub as `mksecrets audit-public` writes it: 64 lowercase hex
+    digits and a newline, nothing else."""
+    try:
+        text = path.read_bytes()
+    except OSError as e:
+        return [f"package: cannot read audit.pub: {e}"]
+    if not re.fullmatch(rb"[0-9a-f]{64}\n", text):
+        return ["package: audit.pub is not 64 lowercase hex digits and a newline"]
+    return []
+
+
 def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
     """Builds in the staging dir `out`. The envelopes are sealed from private
     copies of the blob bytes that were checked (`blobs`, by mr), never from
     the caller's paths again, so swapping a path after the check cannot
-    change what is sealed; the copies go as soon as all are sealed. No
-    microkit run ever sees a blob."""
+    change what is sealed; the copies go as soon as all are sealed and
+    audit.pub is exported. No microkit run ever sees a blob."""
     placeholder_system = pathlib.Path(a.system).read_text()
     published = pathlib.Path(a.image).read_bytes()
     firmware = pathlib.Path(a.firmware).read_bytes()
@@ -606,18 +635,21 @@ def build(a, blobs: dict, srk: bytes, out: pathlib.Path) -> int:
         print(f"package: {e}")
         return 1
 
-    # 3. Seal each blob from its private copy.
+    # 3. Seal each blob from its private copy; the audit key's public half
+    # comes from the same copy as its envelope.
     copies = {mr: out / f"{mr}.bin" for mr in SECRETS_MRS}
     try:
         for mr, copy in copies.items():
             copy.write_bytes(blobs[mr])
         for mr, copy in copies.items():
             seal(copy, mr, srk_copy, pcrs, out / f"{mr}.env")
+        audit_public(copies[AUDIT.mr], out / "audit.pub")
     finally:
         for copy in copies.values():
             copy.unlink(missing_ok=True)
     envelopes = {mr: (out / f"{mr}.env").read_bytes() for mr in SECRETS_MRS}
     errors = [e for kind in KINDS for e in check_envelope(kind, envelopes[kind.mr])]
+    errors += check_audit_public(out / "audit.pub")
     if errors:
         print("\n".join(errors))
         return 1

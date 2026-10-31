@@ -80,6 +80,18 @@ pub mod audit {
     /// M8 plan C10: `policy`'s log page (`audit_event::log`), which `audit`
     /// maps read-only; it never notifies `policy`.
     pub const CH_POLICY: usize = 10;
+    /// M8 plan C10, D7: `audit`'s PPC to `auditkey`, which notifies `audit`
+    /// on it once, at the end of its init (the call site is `audit`'s, in
+    /// the export's slice).
+    pub const CH_AUDITKEY: usize = 11;
+    /// A checkpoint every this many printed lines (M8 plan C10): the most
+    /// lines a capture holds past its last signed checkpoint, which the
+    /// verifier reports as unverified. 64 keeps that tail to a screenful
+    /// and a signature per 64 lines (one Ed25519 sign, well under 1 ms
+    /// natively) is noise beside the UART's own cost; it is half of
+    /// `AUDIT_RING_SLOTS`, so a full drain of one ring passes a checkpoint.
+    pub const CHECKPOINT_EVERY: u64 = 64;
+    const _: () = assert!(CHECKPOINT_EVERY > 0 && CHECKPOINT_EVERY <= super::AUDIT_RING_SLOTS as u64);
 }
 
 #[cfg(test)]
@@ -162,6 +174,34 @@ pub mod tlskey {
     pub const CH_RNG: usize = 4;
 }
 
+/// M8 plan C10, D7: the audit checkpoint signer, a passive key-role PD.
+/// `audit` is its one caller, on `CH_AUDIT`, which `auditkey` also
+/// notifies once at the end of its init (ready or Unavailable). One PPC
+/// label, `SIGN`: `SIGN_REQ_WORDS` words in (`seq`, the chain's 32 bytes
+/// as four little-endian words, `lost`), answered `OK` with
+/// `SIGN_REPLY_LEN` bytes packed into words (`tpm::pack`; the encoding is
+/// `auditkey_core`'s), `REFUSED` (the seq rule) or `BAD_REQUEST` with no
+/// data, or `UNAVAILABLE | code` with no data once its boot failed.
+pub mod auditkey {
+    pub const CH_AUDIT: usize = 1;
+    pub const CH_TPM: usize = 3;
+    pub const CH_RNG: usize = 4;
+    pub const SIGN: u64 = 1;
+    pub const OK: u64 = 0;
+    pub const BAD_REQUEST: u64 = 1;
+    /// The seq rule refused the request: nothing was signed.
+    pub const REFUSED: u64 = 2;
+    /// `UNAVAILABLE | code`: the boot failed with that code (low byte).
+    pub const UNAVAILABLE: u64 = 0x100;
+    /// seq u64, chain [32], lost u64.
+    pub const SIGN_REQ_WORDS: usize = 1 + 4 + 1;
+    /// signature [64] ‖ boot_id [16] ‖ reset u32 ‖ restart u32 ‖ srk_name
+    /// [34], little-endian counts.
+    pub const SIGN_REPLY_LEN: usize = 64 + 16 + 4 + 4 + 34;
+    pub const SIGN_REPLY_WORDS: usize = SIGN_REPLY_LEN.div_ceil(8);
+    const _: () = assert!(SIGN_REPLY_WORDS <= super::tpm::MSG_WORDS);
+}
+
 /// M3: the McEliece decapsulation oracle (plan C2), a passive key-role PD.
 pub mod pqkey {
     pub const CH_PQ: usize = 1;
@@ -215,6 +255,8 @@ pub mod rng {
     pub const CH_KEY: usize = 5;
     pub const CH_PQKEY: usize = 6;
     pub const CH_TLSKEY: usize = 7;
+    /// M8 plan C10: `auditkey`'s boot ID and its unseal's salt.
+    pub const CH_AUDITKEY: usize = 8;
     pub const SEED: u64 = 0;
     pub const UNAVAILABLE: u64 = 1;
 }
@@ -230,7 +272,10 @@ pub mod tpm {
     pub const CH_KEY: usize = 1;
     pub const CH_PQKEY: usize = 2;
     pub const CH_TLSKEY: usize = 3;
-    /// The `policy` PD (M8 plan C3, C5); 4 is left for `auditkey` (C10).
+    /// `auditkey` (M8 plan C3, C10), the fourth raw client: the only one
+    /// whose ReadClock the gate forwards.
+    pub const CH_AUDITKEY: usize = 4;
+    /// The `policy` PD (M8 plan C3, C5).
     pub const CH_POLICY: usize = 5;
     /// Whether the system has the `policy` PD (M8 deviation D-6): `tpm`'s
     /// cap waits for its Done or Failed only then. Set in the same change

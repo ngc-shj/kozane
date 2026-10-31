@@ -170,10 +170,12 @@
 #   tunnelled plaintext (L3: the `dn`/`nd` data regions). All of these and
 #   `audit` are tainted. `pq` (M3a) runs the Rosenpass responder on
 #   datagrams relayed by `ingress` and sends each fresh OSK to `hs`; it is
-#   tainted too. `key`, `pqkey` and `tlskey` are the taint-exempt secrets
-#   holders (passive; `key` takes PPC from `hs` only and maps only
-#   `secrets`, `pqkey` from `pq` only and maps only `pq_secrets`, `tlskey`
-#   from `tls` only and maps only `tls_secrets`; L2 as amended).
+#   tainted too. `key`, `pqkey`, `tlskey` and `auditkey` (M8) are the
+#   taint-exempt secrets holders (passive; `key` takes PPC from `hs` only
+#   and maps only `secrets`, `pqkey` from `pq` only and maps only
+#   `pq_secrets`, `tlskey` from `tls` only and maps only `tls_secrets`,
+#   `auditkey` from `audit` only and maps only `audit_secrets`; L2 as
+#   amended).
 #   `timer` is exempt as notify-only (L1): it notifies `data`, `hs`,
 #   `ingress`, `pq` and `tls`, none of which can notify it. `audit` (M5) owns the
 #   PL011 page as the only console and writes its lines there. `tpm` (M5)
@@ -236,6 +238,15 @@ role = "supervisor"
 role = "untrusted_input"
 
 [pds.tlskey]
+role = "key"
+
+# M8 plan C10, D7, C11: the audit checkpoint signer. A key pd like the
+# others: one pp caller (`audit`), its own secrets mr alone (no audit ring),
+# a pp channel to `tpm` and one to `rng`. Its end of the `audit` channel
+# keeps notify (the key pds' default), which is how it tells `audit` that
+# its init ended; the key exemption already confines a key pd's channels
+# to its caller, `tpm` and `rng`, so it can notify no one else.
+[pds.auditkey]
 role = "key"
 
 [pds.policy]
@@ -311,6 +322,10 @@ owner = "pqkey"
 [mrs.tls_secrets]
 kind = "secrets"
 owner = "tlskey"
+
+[mrs.audit_secrets]
+kind = "secrets"
+owner = "auditkey"
 
 # M8 plan C1, C4, C6, C11: the two peer-policy bundle slots, read by
 # `policy` and the barrier pds (which open only the slot `policy` verified).
@@ -807,6 +822,24 @@ notify = { policy = false, tpm = false }
 [[channels]]
 between = ["policy", "audit"]
 notify = { audit = false }
+
+# M8 plan C10, C11: `audit` calls `auditkey`, which notifies `audit` on
+# the same channel once, at the end of its init; `auditkey` unseals through
+# `tpm` and draws its boot ID from `rng`.
+[[channels]]
+between = ["audit", "auditkey"]
+pp = { audit = true, auditkey = false }
+notify = { audit = false, auditkey = true }
+
+[[channels]]
+between = ["auditkey", "tpm"]
+pp = { auditkey = true, tpm = false }
+notify = { auditkey = false, tpm = false }
+
+[[channels]]
+between = ["auditkey", "rng"]
+pp = { auditkey = true, rng = false }
+notify = { auditkey = false }
 
 # M8 plan C6, C11: each barrier pd's `Await` on `policy`.
 

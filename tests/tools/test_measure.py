@@ -1,7 +1,7 @@
 """tools/measure.py: the PCR 8 chain against known values, and the I8.2
 range checks on both sides of each boundary (M5 plan C8); the PCR 0 chain
 over the FIP's closed list and its refusals (M7 plan C3, C4); descriptor v3's
-five ranges and per-kind rooms, PCR 9 over the two bundle slots, and the NV
+six ranges and per-kind rooms, PCR 9 over the two bundle slots, and the NV
 index twins (M8 plan C3, C4).
 
 Usage: python3 tests/tools/test_measure.py
@@ -20,9 +20,10 @@ import measure  # noqa: E402
 import fip_fixture  # noqa: E402
 
 SLOT = measure.BUNDLE_MAX
-# Three envelopes in the first 0x10000 bytes, then the two slots.
+# Four envelopes in the first 0x10000 bytes, then the two slots.
 IMG = 0x10000 + 2 * SLOT
-GOOD = [(0x2000, 0x1000), (0x4000, 0x4000), (0x9000, 0x1000), (0x10000, SLOT), (0x10000 + SLOT, SLOT)]
+GOOD = [(0x2000, 0x1000), (0x4000, 0x4000), (0x9000, 0x1000), (0xb000, 0x1000), (0x10000, SLOT),
+        (0x10000 + SLOT, SLOT)]
 IMAGE = bytes(range(256)) * (IMG // 256)
 BOOT_CMD = (ROOT / "support/u-boot/boot.cmd").read_text()
 SLOT_A = bytes(range(256)) * (SLOT // 256)
@@ -66,16 +67,17 @@ def pcr_moves(i: int, rng: tuple) -> bool:
         != measure.expected_pcr8(measure.pack(IMG, GOOD), IMAGE)
 
 
-def wide_envelope(length: int) -> tuple:
-    """(image_len, ranges) with range 1 `length` long and room for it."""
-    return 0x200000 + 2 * SLOT, [(0, 0x10), (0xf0000, length), (0x10, 0x10), (0x200000, SLOT),
-                                 (0x200000 + SLOT, SLOT)]
+def wide_envelope(length: int, i: int = 1) -> tuple:
+    """(image_len, ranges) with envelope `i` `length` long and room for it."""
+    envelopes = [(0x10 * n, 0x10) for n in range(measure.ENVELOPES)]
+    envelopes[i] = (0xf0000, length)
+    return 0x200000 + 2 * SLOT, envelopes + [(0x200000, SLOT), (0x200000 + SLOT, SLOT)]
 
 
 def pair_overlap(i: int, j: int) -> bool:
-    """Pair (i, j), i < j, with j a slot: range i moved to overlap range j
-    alone (an envelope into the slot; slot A one byte into slot B) is
-    refused as that pair's overlap, and only so."""
+    """Pair (i, j), i < j, with j the audit envelope or a slot: range i
+    moved to overlap range j alone (an envelope onto range j's start; slot A
+    one byte into slot B) is refused as that pair's overlap, and only so."""
     oi, li = GOOD[i]
     oj, _ = GOOD[j]
     moved = (oj - 1, li) if i >= measure.ENVELOPES else (oj, li)
@@ -108,6 +110,28 @@ def boot_cmd_lines() -> list:
     return missing
 
 
+def boot_cmd_layout() -> list:
+    """boot.cmd reads the descriptor measure packs: its length hashed, its
+    count, its reserved word's offset, every field 32-bit checked, and each
+    range copied from its load address (measure.LOADS)."""
+    fields = " ".join(f"$o{i} $l{i}" for i in range(measure.COUNT))
+    lines = [f"hash sha256 {measure.LOAD_DESC:#x} {measure.DESC_LEN:#x} *0x6fb00000 || REFUSE\n",
+             f"setexpr.l cnt *0x6ff0000c; if test 0x$cnt -ne {measure.COUNT}; then REFUSE; fi\n",
+             f"setexpr.q rsv *{measure.LOAD_DESC + measure.DESC_LEN - 8:#x}; if test 0x$rsv -ne 0; then REFUSE; fi\n",
+             f"for v in {fields}; do setexpr hi 0x$v / 0x100000000; if test 0x$hi -ne 0; then REFUSE; fi; done\n"]
+    lines += [f"setexpr d{i} 0x70000000 + 0x$o{i}\ncp.b {load:#x} $d{i} $l{i} || REFUSE\n"
+              for i, load in enumerate(measure.LOADS)]
+    return [line for line in lines if BOOT_CMD.count(line) != 1]
+
+
+def load_slots_apart() -> bool:
+    """Every load slot at its room, the descriptor, the digest scratch and
+    the image: no two overlap."""
+    spans = list(zip(measure.LOADS, measure.ROOMS)) + [
+        (measure.LOAD_DESC, measure.DESC_LEN), (0x6FB00000, 0x100), (measure.LOAD_IMAGE, measure.MAX_IMAGE)]
+    return all(a + n <= b or b + m <= a for k, (a, n) in enumerate(spans) for b, m in spans[k + 1:])
+
+
 def pcr0_chain() -> bool:
     pcr = bytes(32)
     for _, data in fip_fixture.payloads():
@@ -122,7 +146,7 @@ CASES = [
      == "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b"),
     ("PCR 8 is descriptor then image", chain),
     ("a range ending exactly at image_len is allowed",
-     lambda: not measure.check_ranges(IMG, with_range(4, (IMG - SLOT, SLOT)))),
+     lambda: not measure.check_ranges(IMG, with_range(5, (IMG - SLOT, SLOT)))),
     ("a range past image_len is refused",
      lambda: "outside the image" in "".join(measure.check_ranges(IMG, with_range(1, (IMG - 0x3000, 0x4000))))),
     ("an offset past image_len is refused",
@@ -134,24 +158,29 @@ CASES = [
          measure.check_ranges(IMG, with_range(2, (IMG - 0x800, 0x1000))))),
     ("range 2 wrapping 64 bits is refused",
      lambda: "range 2" in "".join(measure.check_ranges(IMG, with_range(2, (2**64 - 0x10, 0x20))))),
-    # Each pair on its own: the third range stays clear of both.
+    # Each pair on its own: the other ranges stay clear of both.
     ("ranges 0 and 1 overlapping are refused", lambda: overlaps(0, 1, (0x2fff, 0x1000))),
     ("ranges 0 and 1 adjacent are allowed", lambda: not measure.check_ranges(IMG, with_range(1, (0x3000, 0x1000)))),
     ("ranges 0 and 2 overlapping are refused", lambda: overlaps(0, 2, (0x1001, 0x1000))),
     ("ranges 0 and 2 adjacent are allowed", lambda: not measure.check_ranges(IMG, with_range(2, (0x1000, 0x1000)))),
     ("ranges 1 and 2 overlapping are refused", lambda: overlaps(1, 2, (0x7fff, 0x1000))),
     ("ranges 1 and 2 adjacent are allowed", lambda: not measure.check_ranges(IMG, with_range(2, (0x8000, 0x1000)))),
+    # The twelve pairs since v2: each with the audit envelope (3) or a slot.
     *((f"ranges {i} and {j} overlapping are refused", lambda i=i, j=j: pair_overlap(i, j))
-      for i in range(measure.COUNT) for j in range(max(i + 1, measure.ENVELOPES), measure.COUNT)),
+      for i, j in measure.PAIRS if j >= 3),
     ("an envelope ending exactly where slot A starts is allowed",
      lambda: not measure.check_ranges(IMG, with_range(1, (0x10000 - 0x4000, 0x4000)))),
+    ("the audit envelope adjacent to range 2 is allowed",
+     lambda: not measure.check_ranges(IMG, with_range(3, (0xa000, 0x1000)))),
     ("slot B starting exactly where slot A ends is allowed",
-     lambda: GOOD[3][0] + GOOD[3][1] == GOOD[4][0] and not measure.check_ranges(IMG, GOOD)),
+     lambda: GOOD[4][0] + GOOD[4][1] == GOOD[5][0] and not measure.check_ranges(IMG, GOOD)),
     ("boot.cmd holds each pair's line, each room and the PCR 9 slot measurements",
      lambda: not boot_cmd_lines()),
+    ("boot.cmd hashes, counts, checks and copies all six ranges", lambda: not boot_cmd_layout()),
     ("the slot load addresses stay below boot.cmd's digest scratch (P3)",
      lambda: all(load + measure.BUNDLE_MAX <= 0x6FB00000 for load in measure.LOAD_SLOTS)
      and measure.LOAD_SLOTS[0] + measure.BUNDLE_MAX <= measure.LOAD_SLOTS[1]),
+    ("no two load slots overlap each other, the descriptor, the scratch or the image", load_slots_apart),
     ("ranges other than the prefill ranges are refused",
      lambda: "prefill" in "".join(measure.check_ranges(IMG, GOOD, expected=with_range(2, (0xa000, 0x1000))))),
     ("the prefill ranges themselves are allowed", lambda: not measure.check_ranges(IMG, GOOD, expected=GOOD)),
@@ -160,23 +189,29 @@ CASES = [
      == measure.check_ranges(*wide_envelope(0x100001))),
     ("an envelope range of exactly ENVELOPE_ROOM is allowed",
      lambda: not measure.check_ranges(*wide_envelope(0x100000))),
+    ("the audit envelope range longer than ENVELOPE_ROOM is refused",
+     lambda: ["measure: range 3 length 0x100001 exceeds its load slot (0x100000)"]
+     == measure.check_ranges(*wide_envelope(0x100001, 3))),
     ("a slot range longer than BUNDLE_MAX is refused",
-     lambda: [f"measure: range 3 length {SLOT + 1:#x} exceeds its load slot ({SLOT:#x})",
-              f"measure: slot range 3 length {SLOT + 1:#x} is not BUNDLE_MAX ({SLOT:#x})"]
-     == measure.check_ranges(IMG + 1, GOOD[:3] + [(0x10000, SLOT + 1), (0x10001 + SLOT, SLOT)])),
+     lambda: [f"measure: range 4 length {SLOT + 1:#x} exceeds its load slot ({SLOT:#x})",
+              f"measure: slot range 4 length {SLOT + 1:#x} is not BUNDLE_MAX ({SLOT:#x})"]
+     == measure.check_ranges(IMG + 1, GOOD[:4] + [(0x10000, SLOT + 1), (0x10001 + SLOT, SLOT)])),
     ("a slot range shorter than BUNDLE_MAX is refused",
-     lambda: [f"measure: slot range 3 length {SLOT - 1:#x} is not BUNDLE_MAX ({SLOT:#x})"]
-     == measure.check_ranges(IMG, GOOD[:3] + [(GOOD[3][0], SLOT - 1), GOOD[4]])),
-    ("four ranges are refused", lambda: "4 ranges, expected 5" in "".join(measure.check_ranges(IMG, GOOD[:4]))),
-    ("an empty image is refused", lambda: "image_len" in "".join(measure.check_ranges(0, [(0, 0)] * 5))),
-    ("a v3 descriptor with five ranges is allowed",
-     lambda: measure.parse(raw(3, 5, [IMG, *[v for r in GOOD for v in r], 0])) == (IMG, GOOD)),
+     lambda: [f"measure: slot range 4 length {SLOT - 1:#x} is not BUNDLE_MAX ({SLOT:#x})"]
+     == measure.check_ranges(IMG, GOOD[:4] + [(GOOD[4][0], SLOT - 1), GOOD[5]])),
+    ("five ranges are refused", lambda: "5 ranges, expected 6" in "".join(measure.check_ranges(IMG, GOOD[:5]))),
+    ("an empty image is refused", lambda: "image_len" in "".join(measure.check_ranges(0, [(0, 0)] * 6))),
+    ("a v3 descriptor with six ranges is allowed",
+     lambda: measure.parse(raw(3, 6, [IMG, *[v for r in GOOD for v in r], 0])) == (IMG, GOOD)),
     # Version 2 (M6's three-envelope form) is refused, at v3's length too.
-    ("a 112-byte version-2 descriptor is refused", lambda: "header" in raises(
-        lambda: measure.parse(raw(2, 5, [IMG, *[v for r in GOOD for v in r], 0])))),
-    ("a v3 descriptor with count 3 is refused", lambda: "header" in raises(
-        lambda: measure.parse(raw(3, 3, [IMG, *[v for r in GOOD for v in r], 0])))),
-    ("an 80-byte (v2) descriptor is refused", lambda: "80 bytes, expected 112" in raises(
+    ("a 128-byte version-2 descriptor is refused", lambda: "header" in raises(
+        lambda: measure.parse(raw(2, 6, [IMG, *[v for r in GOOD for v in r], 0])))),
+    ("a v3 descriptor with count 5 is refused", lambda: "header" in raises(
+        lambda: measure.parse(raw(3, 5, [IMG, *[v for r in GOOD for v in r], 0])))),
+    # Slice 2's five-range v3, without the audit envelope (deviation D-5).
+    ("a 112-byte (five-range) v3 descriptor is refused", lambda: "112 bytes, expected 128" in raises(
+        lambda: measure.parse(raw(3, 5, [IMG, *[v for r in GOOD[:3] + GOOD[4:] for v in r], 0])))),
+    ("an 80-byte (v2) descriptor is refused", lambda: "80 bytes, expected 128" in raises(
         lambda: measure.parse(raw(2, 3, [IMG, *[v for r in GOOD[:3] for v in r], 0])))),
     ("a bad magic is refused", lambda: "header" in raises(
         lambda: measure.parse(b"X" + measure.pack(IMG, GOOD)[1:]))),
@@ -184,7 +219,8 @@ CASES = [
         lambda: measure.parse(measure.pack(IMG, GOOD)[:-1] + b"\x01"))),
     ("an envelope longer than its range is refused", lambda: "envelope" in raises(
         lambda: measure.assemble(bytes(IMG), measure.pack(IMG, GOOD),
-                                 [bytes(0x1001), bytes(0x4000), bytes(0x1000), bytes(SLOT), bytes(SLOT)]))),
+                                 [bytes(0x1001), bytes(0x4000), bytes(0x1000), bytes(0x1000), bytes(SLOT),
+                                  bytes(SLOT)]))),
     ("ranges over the zero placeholder are allowed",
      lambda: not measure.check_placeholder(bytes(IMG), measure.pack(IMG, GOOD))),
     ("a range over non-zero image bytes (loader code) is refused", lambda: "zero placeholder" in "".join(
@@ -192,10 +228,14 @@ CASES = [
     ("range 2 over non-zero image bytes is refused",
      lambda: ["measure: range 2 (0x9000, 0x1000) is not the zero placeholder in the published image"]
      == measure.check_placeholder(bytes(0x9fff) + b"\x01" + bytes(IMG - 0xa000), measure.pack(IMG, GOOD))),
+    ("the audit range over non-zero image bytes is refused",
+     lambda: ["measure: range 3 (0xb000, 0x1000) is not the zero placeholder in the published image"]
+     == measure.check_placeholder(bytes(0xbfff) + b"\x01" + bytes(IMG - 0xc000), measure.pack(IMG, GOOD))),
     ("assembly writes each envelope and slot at its range only", lambda: measure.assemble(
-        bytes(IMG), measure.pack(IMG, GOOD), [b"\x01" * 0x1000, b"\x02" * 0x4000, b"\x03" * 0x1000, SLOT_A, SLOT_B])
+        bytes(IMG), measure.pack(IMG, GOOD),
+        [b"\x01" * 0x1000, b"\x02" * 0x4000, b"\x03" * 0x1000, b"\x04" * 0x1000, SLOT_A, SLOT_B])
      == bytes(0x2000) + b"\x01" * 0x1000 + bytes(0x1000) + b"\x02" * 0x4000 + bytes(0x1000) + b"\x03" * 0x1000
-     + bytes(0x10000 - 0xa000) + SLOT_A + SLOT_B),
+     + bytes(0x1000) + b"\x04" * 0x1000 + bytes(0x10000 - 0xc000) + SLOT_A + SLOT_B),
     ("moving range 2's offset changes PCR 8", lambda: pcr_moves(2, (0xa000, 0x1000))),
     ("changing range 2's length changes PCR 8", lambda: pcr_moves(2, (0x9000, 0x800))),
     # M8 plan C4, D3: PCR 9 is slot A then slot B, each over BUNDLE_MAX.

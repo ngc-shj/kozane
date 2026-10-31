@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<system>
+    <memory_region name="tis" size="0x1000" phys_addr="0xc000000" />
+    <memory_region name="audit_secrets" size="0x1000" prefill_path="audit-secrets.bin" />
+    <protection_domain name="audit" priority="1">
+        <program_image path="audit.elf" />
+    </protection_domain>
+    <protection_domain name="other" priority="1">
+        <program_image path="other.elf" />
+    </protection_domain>
+    <protection_domain name="auditkey" priority="2" passive="true">
+        <program_image path="auditkey.elf" />
+        <map mr="audit_secrets" vaddr="0x2000000" perms="r" />
+    </protection_domain>
+    <protection_domain name="tpm" priority="3" passive="true">
+        <program_image path="tpm.elf" />
+        <map mr="tis" vaddr="0x2000000" perms="rw" cached="false" />
+    </protection_domain>
+    <channel>
+        <end pd="audit" id="11" pp="true" notify="false" />
+        <end pd="auditkey" id="1" pp="false" notify="true" />
+    </channel>
+    <channel>
+        <end pd="auditkey" id="3" pp="true" notify="false" />
+        <end pd="tpm" id="4" pp="false" notify="false" />
+    </channel>
+    <channel>
+        <end pd="auditkey" id="2" pp="false" notify="true" />
+        <end pd="other" id="1" pp="false" notify="false" />
+    </channel>
+</system>

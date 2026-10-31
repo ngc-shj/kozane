@@ -1,8 +1,9 @@
 //! Generates a development deployment (plan C16, M3 plan C6, M6 plan C11):
 //! fresh gateway keys, a gateway config for the build (KOZANE_CONFIG) with
-//! the McEliece public key file it names, and the three secrets regions for
+//! the McEliece public key file it names, and the four secrets regions for
 //! `make package` (`secrets.bin` for `key`, `pqkey-secrets.bin` for
-//! `pqkey`, `tls-secrets.bin` for `tlskey`). None of them names a peer: the
+//! `pqkey`, `tls-secrets.bin` for `tlskey`, `audit-secrets.bin` for
+//! `auditkey`, M8 plan C10). None of them names a peer: the
 //! peers arrive in the signed bundle (M8 plan D4, C7), so the deployment
 //! does not change when they do.
 //!
@@ -19,6 +20,10 @@
 //! (`devca.pem`, its key never written) and the leaf (`tls.der`); the config
 //! names the leaf and `tls_public`, and is validated last.
 //!
+//! For the audit stream (M8 plan C10, D7): a fresh Ed25519 seed goes into
+//! the audit blob and its public key into `audit.pub` (64 hex digits and a
+//! newline), the key `tools/audit-verify` checks checkpoints with.
+//!
 //! Usage: mksecrets --template config/gateway.toml --out DIR [--clients N]
 //!                  [--endpoint HOST:PORT] [--rp-endpoint HOST:PORT]
 //!                  [--tls-name NAME] [--test-negative] [--tls-mismatch-blob]
@@ -33,7 +38,7 @@
 //! `mksecrets seal` seals one of those blobs offline into its envelope (M5
 //! plan C11) for one TPM and one expected set of PCRs 0-8 (M7 plan C4):
 //!
-//!   mksecrets seal --kind key|pq|tls --blob FILE --srk-public FILE --pcrs HEX,...,HEX --out FILE
+//!   mksecrets seal --kind key|pq|tls|audit --blob FILE --srk-public FILE --pcrs HEX,...,HEX --out FILE
 //!
 //! The SRK public is the TPM2B_PUBLIC `tpm2_readpublic -o` writes for the
 //! SRK (the storage template `tpm2::envelope` pins); the PCRs are the nine
@@ -41,6 +46,10 @@
 //! `pcrs`. Every envelope gets a fresh KEK,
 //! obfuscation seed and ECDH scalar from /dev/urandom (S13). The envelope
 //! is public; OUT must not exist yet.
+//!
+//! `mksecrets audit-public --blob FILE --out FILE` writes the public key of
+//! an audit blob as `audit.pub` does: what `tools/package` exports next to
+//! the envelopes, derived from the very blob it seals.
 //!
 //! DIR must not exist yet and, after resolving symlinks, must lie outside
 //! the repository and the toolchain caches, so secrets never land where a
@@ -319,6 +328,18 @@ struct Deployment {
     peers: Vec<PeerBundle>,
     /// The clients' `[[peers]]` entries for tools/policy's peers.toml.
     clients_toml: String,
+    audit_blob: Box<[u8; secret_blob::audit::REGION_SIZE]>,
+    /// `audit.pub`: the audit key's public half, hex.
+    audit_pub: String,
+}
+
+/// `audit.pub`'s contents for an Ed25519 seed: 64 lowercase hex digits and
+/// a newline.
+fn audit_public_hex(seed: &[u8; 32]) -> String {
+    let pk = auditkey_core::public_key(seed);
+    let mut s: String = pk.iter().map(|b| format!("{b:02x}")).collect();
+    s.push('\n');
+    s
 }
 
 const GATEWAY_RP_PUBLIC: &str = "gateway.rp.pk";
@@ -447,6 +468,14 @@ fn generate(
     };
     pq::write(&mut pq_blob, &fields).ok_or_else(|| "pqkey secrets do not fit the region".to_string())?;
 
+    // The audit checkpoint key (M8 plan C10): an Ed25519 seed is any 32
+    // bytes (RFC 8032 §5.1.5).
+    let audit_seed = Secret::<32>::from_bytes(random32()?);
+    let mut audit_blob = zeroed::<{ secret_blob::audit::REGION_SIZE }>()?;
+    secret_blob::audit::write(&mut audit_blob, audit_seed.as_bytes())
+        .ok_or_else(|| "audit secrets do not fit the region".to_string())?;
+    let audit_pub = audit_public_hex(audit_seed.as_bytes());
+
     // Clients route the gateway's inside network through the tunnel.
     let inside = &g.inside_prefix;
     let mut bundles = Vec::with_capacity(clients);
@@ -483,6 +512,8 @@ fn generate(
         gateway_rp_public: gateway_rp.public,
         peers: bundles,
         clients_toml,
+        audit_blob,
+        audit_pub,
     })
 }
 
@@ -642,6 +673,8 @@ fn run(args: &[String]) -> Result<(), String> {
             write_private(&stage.join("tls-secrets-mismatch.bin"), &b[..])?;
         }
         write_private(&stage.join("pqkey-secrets.bin"), &d.pq_blob[..])?;
+        write_private(&stage.join("audit-secrets.bin"), &d.audit_blob[..])?;
+        write_private(&stage.join("audit.pub"), d.audit_pub.as_bytes())?;
         write_private(&stage.join(TLS_PUB), d.tls_pub_pem.as_bytes())?;
         for (name, bytes) in &d.certs {
             write_private(&stage.join(name), bytes)?;
@@ -700,7 +733,8 @@ fn parse_kind(name: &str) -> Result<Kind, String> {
         "key" => Ok(Kind::Key),
         "pq" => Ok(Kind::Pq),
         "tls" => Ok(Kind::Tls),
-        other => Err(format!("--kind: {other} is not key, pq or tls")),
+        "audit" => Ok(Kind::Audit),
+        other => Err(format!("--kind: {other} is not key, pq, tls or audit")),
     }
 }
 
@@ -717,6 +751,7 @@ fn read_blob(path: &Path, kind: Kind, region: &mut [u8]) -> Result<(), String> {
         Kind::Key => secret_blob::Blob::parse(region).map(|_| ()),
         Kind::Pq => pq::Blob::parse(region).map(|_| ()),
         Kind::Tls => secret_blob::tls::Blob::parse(region).map(|_| ()),
+        Kind::Audit => secret_blob::audit::Blob::parse(region).map(|_| ()),
     };
     checked.map_err(|e| format!("{}: {}", path.display(), e.message()))
 }
@@ -752,7 +787,10 @@ fn run_seal(args: &[String]) -> Result<(), String> {
         }
     }
     let (Some(kind), Some(blob), Some(srk), Some(pcr), Some(out)) = (kind, blob, srk, pcr, out) else {
-        return Err("usage: mksecrets seal --kind key|pq|tls --blob FILE --srk-public FILE --pcrs HEX,...,HEX --out FILE".into());
+        return Err(
+            "usage: mksecrets seal --kind key|pq|tls|audit --blob FILE --srk-public FILE --pcrs HEX,...,HEX --out FILE"
+                .into(),
+        );
     };
     let srk_file = std::fs::read(&srk).map_err(|e| format!("{}: {e}", srk.display()))?;
     let envelope = seal_file(kind, &blob, srk_public(&srk_file)?, &pcr)?;
@@ -789,7 +827,7 @@ fn run_check_envelope(args: &[String]) -> Result<(), String> {
         }
     }
     let (Some(kind), Some(envelope), Some(pcr)) = (kind, envelope, pcr) else {
-        return Err("usage: mksecrets check-envelope --kind key|pq|tls --envelope FILE --pcrs HEX,...,HEX".into());
+        return Err("usage: mksecrets check-envelope --kind key|pq|tls|audit --envelope FILE --pcrs HEX,...,HEX".into());
     };
     let bytes = std::fs::read(&envelope).map_err(|e| format!("{}: {e}", envelope.display()))?;
     envelope_sealed_to(&bytes, kind, &pcr)?;
@@ -822,12 +860,40 @@ fn run_check_srk(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// `audit-public`: the public key of the audit blob at `blob`, as
+/// `audit.pub` holds it. The blob is read into a wiping buffer.
+fn audit_public_file(blob: &Path) -> Result<String, String> {
+    let mut region = Secret::<{ secret_blob::audit::REGION_SIZE }>::zero();
+    read_blob(blob, Kind::Audit, region.as_mut_bytes())?;
+    let parsed = secret_blob::audit::Blob::parse(region.as_bytes()).map_err(|e| e.message().to_string())?;
+    Ok(audit_public_hex(parsed.seed()))
+}
+
+fn run_audit_public(args: &[String]) -> Result<(), String> {
+    let usage = || "usage: mksecrets audit-public --blob FILE --out FILE".to_string();
+    let (mut blob, mut out) = (None, None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut value = || it.next().cloned().ok_or_else(|| format!("{a} needs a value"));
+        match a.as_str() {
+            "--blob" => blob = Some(PathBuf::from(value()?)),
+            "--out" => out = Some(PathBuf::from(value()?)),
+            other => return Err(format!("unknown argument {other}")),
+        }
+    }
+    let (Some(blob), Some(out)) = (blob, out) else { return Err(usage()) };
+    write_private(&out, audit_public_file(&blob)?.as_bytes())?;
+    println!("mksecrets: wrote the audit public key of {} to {}", blob.display(), out.display());
+    Ok(())
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.split_first() {
         Some((mode, rest)) if mode == "seal" => run_seal(rest),
         Some((mode, rest)) if mode == "check-envelope" => run_check_envelope(rest),
         Some((mode, rest)) if mode == "check-srk" => run_check_srk(rest),
+        Some((mode, rest)) if mode == "audit-public" => run_audit_public(rest),
         _ => run(&args),
     };
     match result {

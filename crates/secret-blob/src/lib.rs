@@ -1,8 +1,9 @@
 //! Formats of the secrets memory regions (law L6): the only place static
-//! secrets exist at run time. There are three blobs with distinct magics,
+//! secrets exist at run time. There are four blobs with distinct magics,
 //! each mapped into its own key PD alone (law L2): `key`'s WireGuard blob
-//! (this module), `pqkey`'s McEliece blob ([`pq`]) and `tlskey`'s TLS
-//! signing key ([`tls`], M6 plan C12). Shared by the key PDs (validation),
+//! (this module), `pqkey`'s McEliece blob ([`pq`]), `tlskey`'s TLS
+//! signing key ([`tls`], M6 plan C12) and `auditkey`'s checkpoint key
+//! ([`audit`], M8 plan C10). Shared by the key PDs (validation),
 //! `mksecrets` (writing) and the config checks, so each layout is defined
 //! once.
 //!
@@ -28,6 +29,7 @@
     clippy::arithmetic_side_effects
 )]
 
+pub mod audit;
 pub mod pq;
 pub mod tls;
 

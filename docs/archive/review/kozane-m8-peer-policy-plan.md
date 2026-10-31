@@ -1078,3 +1078,26 @@ Batch B, the barrier and the consumers (after A):
 - C9: `release_seq` in `tools/release`'s manifest (signed) and
   `tools/release.py`; a check-pins rule tying it to
   `crates/release-seq`; the `min_release` boundary triple in unit tests.
+
+### Slice 5 (C10, C4's sixth range)
+
+Batch A, `auditkey` and its envelope:
+- `crates/auditkey-core` (request parser, the seq rule, the signed tuple;
+  Kani) and `crates/pds/auditkey` (passive key PD, priority above
+  `audit`, `rng` client, notify to `audit` at the end of init);
+- the envelope kind `audit` in `mksecrets`, `tools/package`, `secret-blob`
+  and `tpm2` envelope sizes;
+- the `tpm` gate: `CLIENTS = 4`, `BUSY_TIMEOUT_NS` 360 s, the cap barrier
+  re-derived, and the per-client `ReadClock` row (I3.2);
+- descriptor v3 with six ranges: boot.cmd, measure.py, the 12 pair cases;
+- laws (key role with one caller and a notify to `audit`),
+  `supervisor-core`, layout, system, manifest.
+
+Batch B, the export:
+- `crates/audit-core` (the ready gate, `ready_input`, checkpoint
+  scheduling) and `crates/pds/audit` (` seq=` trailer, hash chain from
+  constant `h0`, signed and unsigned checkpoints);
+- `run.py` and check-selftest strip the trailer in one function;
+- `tools/audit-verify` with its fixtures and the end-to-end capture
+  case;
+- `policy`'s stack high-water record (slice 3's risk note).

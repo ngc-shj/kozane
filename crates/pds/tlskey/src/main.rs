@@ -112,7 +112,7 @@ fn boot() -> Result<Oracle<'static>, BootError> {
     // SAFETY: init runs once and is the only caller; no other reference to
     // the buffer exists while this one is used. On an unseal failure the
     // buffer is all zero (tpm2::boot).
-    tpm2::boot::unseal(&mut Ppc, region(), Kind::Tls, unsafe { &mut *buf })?;
+    tpm2::boot::unseal(&mut Ppc, region(), Kind::Tls, unsafe { &mut *buf }, None)?;
     // SAFETY: as above. `Oracle::boot` wipes the whole buffer on any of its
     // failures (M5 plan C6: an Unavailable key PD holds no secret); on
     // success it borrows it read-only for the life of the system.

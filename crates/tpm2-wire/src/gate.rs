@@ -1,19 +1,22 @@
 //! The `tpm` PD's core (M5 plan C9): which client command reaches the
-//! device. `key`, `pqkey` and `tlskey` (M6 plan C12) are separate L2
-//! domains that share `tpm` as a callee, so this is where L2 between them is
-//! enforced (S11).
+//! device. `key`, `pqkey`, `tlskey` (M6 plan C12) and `auditkey` (M8 plan
+//! C10) are separate L2 domains that share `tpm` as a callee, so this is
+//! where L2 between them is enforced (S11).
 //!
 //! - Allowlist by command code: CreatePrimary, StartAuthSession, PolicyPCR,
 //!   PolicyAuthValue, Import, Load, Unseal, FlushContext, PCR_Read.
 //!   Anything else, PCR_Extend included, is refused before any device write.
+//!   One per-client row (M8 plan C3, I3.2): ReadClock, for `auditkey`
+//!   alone, once, before its Done; for every other client it is off the
+//!   list like any other command.
 //! - Handle ownership: the handles CreatePrimary, StartAuthSession and Load
 //!   return belong to the client that asked. PolicyPCR and PolicyAuthValue
 //!   need an owned session, Unseal an owned object (and every session in
 //!   its auth area owned or the password session), Import and Load an owned
 //!   parent, FlushContext an owned handle; a successful flush drops the
 //!   entry, so a reused handle number belongs to its new owner (S16, S19).
-//! - One flow per client per boot: CreatePrimary, StartAuthSession, Load and
-//!   Unseal at most once each. A client that sent Done or Failed is
+//! - One flow per client per boot: CreatePrimary, StartAuthSession, Load,
+//!   Unseal and ReadClock at most once each. A client that sent Done or Failed is
 //!   refused everything.
 //! - One flow at a time (swtpm, like small TPMs, holds three transient
 //!   objects; two flows need four): a Fresh client is told Busy while any
@@ -53,14 +56,19 @@
 use crate::{
     CC_CLEAR, CC_CREATE_PRIMARY, CC_FLUSH_CONTEXT, CC_HIERARCHY_CHANGE_AUTH, CC_IMPORT, CC_LOAD, CC_NV_DEFINE_SPACE,
     CC_NV_INCREMENT, CC_NV_READ, CC_NV_READ_PUBLIC, CC_NV_UNDEFINE_SPACE, CC_NV_UNDEFINE_SPACE_SPECIAL, CC_NV_WRITE,
-    CC_NV_WRITE_LOCK, CC_PCR_EXTEND, CC_PCR_READ, CC_POLICY_AUTH_VALUE, CC_POLICY_PCR, CC_START_AUTH_SESSION, CC_UNSEAL,
+    CC_NV_WRITE_LOCK, CC_PCR_EXTEND, CC_PCR_READ, CC_POLICY_AUTH_VALUE, CC_POLICY_PCR, CC_READ_CLOCK, CC_START_AUTH_SESSION,
+    CC_UNSEAL,
     DIGEST_LEN, IPC_MSG_BYTES, NAME_LEN, NV_INCREMENT_CMD_LEN, NV_POLICY_BASE, NV_POLICY_CTR, NV_READ_CMD_LEN,
     NV_READ_PUBLIC_CMD_LEN, PCR_EXTEND_CMD_LEN, PCR_READ_CMD_LEN, RH_NULL, RH_OWNER, RS_PW, Reader, ST_NO_SESSIONS,
     ST_SESSIONS, nv_increment, nv_read, nv_read_public, parse_nv_increment, parse_nv_read, parse_nv_read_public,
     parse_pcr_extend, parse_slot_pcr_read, slot_pcr_read,
 };
 
-pub const CLIENTS: usize = 3;
+/// `key`, `pqkey`, `tlskey` and `auditkey`, in the `tpm` PD's client order.
+pub const CLIENTS: usize = 4;
+/// `auditkey`'s client index (M8 plan C3, C10): the fourth raw client.
+pub const AUDITKEY: usize = 3;
+const _: () = assert!(AUDITKEY < CLIENTS);
 /// Each client owns at most a primary, a session and an object.
 const SLOTS: usize = CLIENTS * 3;
 /// The most sessions one auth area may carry (TPM 2.0 Part 1).
@@ -140,6 +148,17 @@ pub const REFUSED: [u32; 10] = [
     CC_PCR_EXTEND,
 ];
 
+/// The per-client rows (M8 plan C3, I3.2): a command off `ALLOWED` that
+/// one client alone may send, once, before its Done. ReadClock gives
+/// `auditkey` the resetCount and restartCount its checkpoints bind (C10).
+pub const CLIENT_ONLY: [(u32, usize); 1] = [(CC_READ_CLOCK, AUDITKEY)];
+
+/// Whether `client` may send command code `cc` at all: `ALLOWED`, or a
+/// `CLIENT_ONLY` row naming it.
+pub fn allowed_for(client: usize, cc: u32) -> bool {
+    ALLOWED.contains(&cc) || CLIENT_ONLY.iter().any(|(c, owner)| *c == cc && *owner == client)
+}
+
 /// Every command the policy operations send, all on the two policy indices
 /// or PCR 9; NV_Increment on the counter only.
 pub const POLICY_COMMANDS: [u32; 4] = [CC_NV_READ_PUBLIC, CC_NV_READ, CC_NV_INCREMENT, CC_PCR_READ];
@@ -159,6 +178,9 @@ const fn disjoint(refused: &[u32], allowed: &[u32]) -> bool {
 }
 
 const _: () = assert!(disjoint(&REFUSED, &ALLOWED));
+// The per-client row widens nothing the refused set names, and is not on
+// the shared list (or it would be every client's).
+const _: () = assert!(!listed(&REFUSED, CC_READ_CLOCK) && !listed(&ALLOWED, CC_READ_CLOCK));
 // `read_version` builds NV_ReadPublic and NV_Read in one buffer.
 const _: () = assert!(NV_READ_PUBLIC_CMD_LEN <= NV_READ_CMD_LEN);
 
@@ -180,9 +202,10 @@ pub enum Refusal {
     /// Not a well-formed command of the flow (length, tag, handle area or
     /// auth area).
     Malformed,
-    /// The command code is not on the allowlist.
+    /// The command code is not on the allowlist, nor on a per-client row
+    /// naming this client.
     NotAllowed,
-    /// A second CreatePrimary, StartAuthSession, Load or Unseal.
+    /// A second CreatePrimary, StartAuthSession, Load, Unseal or ReadClock.
     Repeated,
     /// A handle the client does not own, or not of the kind the command needs.
     NotOwned,
@@ -299,6 +322,7 @@ const ONCE_PRIMARY: u8 = 1;
 const ONCE_SESSION: u8 = 2;
 const ONCE_LOAD: u8 = 4;
 const ONCE_UNSEAL: u8 = 8;
+const ONCE_CLOCK: u8 = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Gate {
@@ -426,7 +450,7 @@ impl Gate {
         let tag = r.u16().map_err(|_| Refusal::Malformed)?;
         let size = r.u32().map_err(|_| Refusal::Malformed)?;
         let cc = r.u32().map_err(|_| Refusal::Malformed)?;
-        if !ALLOWED.contains(&cc) {
+        if !allowed_for(client, cc) {
             return Err(Refusal::NotAllowed);
         }
         if usize::try_from(size).ok() != Some(cmd.len()) {
@@ -475,6 +499,13 @@ impl Gate {
                     return Err(Refusal::Malformed);
                 }
                 None
+            }
+            // `auditkey`'s row: no handles, no parameters.
+            CC_READ_CLOCK => {
+                if r.remaining() != 0 {
+                    return Err(Refusal::Malformed);
+                }
+                Some(ONCE_CLOCK)
             }
             _ => None, // PCR_Read: no handles
         };

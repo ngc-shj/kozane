@@ -34,6 +34,16 @@ name = "audit-event"
 version = "0.1.0"
 
 [[package]]
+name = "auditkey-core"
+version = "0.1.0"
+dependencies = [
+ "layout",
+ "libcrux-ed25519",
+ "secret-blob",
+ "zeroize",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1053,6 +1063,7 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 name = "mksecrets"
 version = "0.1.0"
 dependencies = [
+ "auditkey-core",
  "libc",
  "libcrux-curve25519",
  "limits",
@@ -1161,6 +1172,22 @@ dependencies = [
  "sel4-microkit",
  "supervisor-core",
  "wire",
+]
+
+[[package]]
+name = "pd-auditkey"
+version = "0.1.0"
+dependencies = [
+ "auditkey-core",
+ "boot-stage",
+ "cpu",
+ "layout",
+ "rng-client",
+ "secret-blob",
+ "sel4-microkit",
+ "tpm2",
+ "tpm2-wire",
+ "zeroize",
 ]
 
 [[package]]

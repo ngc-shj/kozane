@@ -380,6 +380,25 @@ fn sealed_envelope_unseals_to_the_original_blob_through_the_gate_and_the_cap_fol
     assert_eq!(r, Ok(()));
     assert!(out == tls_blob, "the tls envelope did not open to its blob");
     gate.finish(2, true).unwrap();
+    assert_eq!(gate.cap(&mut buf), None, "capped before the fourth client finished");
+
+    // M8 plan C10: `auditkey`'s envelope, the fourth client, and its
+    // ReadClock (its alone) before its Done; swtpm answers it.
+    let audit_blob = blob(Kind::Audit, "audit");
+    let audit_env = seal(Kind::Audit, &audit_blob, &srk_public, &expected_pcrs(), "seal-audit");
+    let (r, out) =
+        drive(&mut tpm, client(&audit_env, Kind::Audit, "c-audit"), Kind::Audit, Some((&mut gate, 3)), pass);
+    assert_eq!(r, Ok(()));
+    assert!(out == audit_blob, "the audit envelope did not open to its blob");
+    let n = tpm2_wire::read_clock(&mut buf).unwrap();
+    let clock_cmd = buf[..n].to_vec();
+    assert_eq!(gate.command(2, &clock_cmd), Err(Refusal::Finished), "tlskey after its Done");
+    let fwd = gate.command(3, &clock_cmd).unwrap();
+    let rsp = tpm.transact(&clock_cmd);
+    gate.response(fwd, &rsp);
+    let clock = tpm2_wire::parse_read_clock(&rsp).unwrap();
+    assert_eq!(clock.restart_count, 0, "no TPM Restart since this swtpm's Startup(CLEAR)");
+    gate.finish(3, true).unwrap();
 
     let n = gate.cap(&mut buf).expect("cap after every client is done");
     tpm2_wire::parse_pcr_extend(&tpm.transact(&buf[..n])).unwrap();
@@ -815,21 +834,29 @@ fn every_key_pd_unseals_concurrently_through_the_pd_model_and_pcr8_is_capped() {
     let pq_env = seal(Kind::Pq, &pq_blob, &srk_public, &expected_pcrs(), "boot-seal-pq");
     let tls_blob = blob(Kind::Tls, "tls");
     let tls_env = seal(Kind::Tls, &tls_blob, &srk_public, &expected_pcrs(), "boot-seal-tls");
+    let audit_blob = blob(Kind::Audit, "audit");
+    let audit_env = seal(Kind::Audit, &audit_blob, &srk_public, &expected_pcrs(), "boot-seal-audit");
     let pd = std::sync::Mutex::new(PdModel { tpm, gate: Gate::new(), busy: 0 });
     let start = Instant::now();
     // Two flows at once would need four transient objects (swtpm has
-    // three): the Busy rule serialises the three, whichever starts first.
+    // three): the Busy rule serialises the four, whichever starts first.
+    // `auditkey` (client 3) also reads the clock inside its flow.
     let run = |client: usize, env: &[u8], kind: Kind| {
         let mut out = vec![0xAAu8; kind.region_size()];
-        let r = tpm2::boot::unseal(&mut PdCall { pd: &pd, client, start }, env, kind, &mut out);
+        let mut clock = tpm2::boot::Clock::default();
+        let wants = (client == tpm2_wire::gate::AUDITKEY).then_some(&mut clock);
+        let r = tpm2::boot::unseal(&mut PdCall { pd: &pd, client, start }, env, kind, &mut out, wants);
         (r, out)
     };
-    let (key, pq, tls) = std::thread::scope(|s| {
+    let (key, pq, tls, audit) = std::thread::scope(|s| {
         let a = s.spawn(|| run(0, &key_env, Kind::Key));
         let b = s.spawn(|| run(1, &pq_env, Kind::Pq));
         let c = s.spawn(|| run(2, &tls_env, Kind::Tls));
-        (a.join().unwrap(), b.join().unwrap(), c.join().unwrap())
+        let d = s.spawn(|| run(3, &audit_env, Kind::Audit));
+        (a.join().unwrap(), b.join().unwrap(), c.join().unwrap(), d.join().unwrap())
     });
+    assert_eq!(audit.0, Ok(()));
+    assert!(audit.1 == audit_blob, "auditkey's region");
     assert_eq!(key.0, Ok(()));
     assert!(key.1 == key_blob, "key's region");
     assert_eq!(pq.0, Ok(()));

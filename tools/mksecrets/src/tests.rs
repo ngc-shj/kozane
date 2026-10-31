@@ -327,6 +327,8 @@ fn run_writes_the_three_blobs_the_key_files_and_one_bundle_per_client() {
         std::fs::read_dir(&out).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
     names.sort();
     let want = [
+        "audit-secrets.bin",
+        "audit.pub",
         "clients.toml",
         "devca.pem",
         "gateway.rp.pk",
@@ -350,6 +352,8 @@ fn run_writes_the_three_blobs_the_key_files_and_one_bundle_per_client() {
     assert_eq!(size("secrets.bin"), secret_blob::REGION_SIZE);
     assert_eq!(size("tls-secrets.bin"), secret_blob::tls::REGION_SIZE);
     assert_eq!(size("tls-secrets-mismatch.bin"), secret_blob::tls::REGION_SIZE);
+    assert_eq!(size("audit-secrets.bin"), secret_blob::audit::REGION_SIZE);
+    assert_eq!(size("audit.pub"), 65);
     assert_eq!(size("peer-0.rp.pk"), pq::PK_LEN);
     assert_eq!(size("peer-0.rp.sk"), pq::LIBOQS_SK_LEN);
     // The written config builds against the written key files.
@@ -459,6 +463,14 @@ const PCRS_HEX: &str = "3d4b8c2a9e1f0067a5c3b2d1e0f9a8b7c6d5e4f30112233445566778
 0000000000000000000000000000000000000000000000000000000000000000,\
 f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b\n";
 
+/// The audit blob of the shared deployment (`auditkey`'s), written where
+/// `seal` and `audit-public` read it.
+fn audit_blob_file(s: &Scratch) -> PathBuf {
+    let path = s.dir("in-audit").join("audit-secrets.bin");
+    std::fs::write(&path, &deployment().0.audit_blob[..]).unwrap();
+    path
+}
+
 /// The blobs of the shared deployment (`key`'s, `pqkey`'s, `tlskey`'s),
 /// written where `seal` reads them, and the SRK file.
 fn blob_files(s: &Scratch) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
@@ -477,7 +489,13 @@ fn blob_files(s: &Scratch) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
 fn seal_writes_envelopes_that_parse_for_their_kind() {
     let s = Scratch::new("seal");
     let (key, pqb, tls, srk) = blob_files(&s);
-    for (kind, name, blob) in [("key", "secrets.env", &key), ("pq", "pq_secrets.env", &pqb), ("tls", "tls_secrets.env", &tls)] {
+    let audit = audit_blob_file(&s);
+    for (kind, name, blob) in [
+        ("key", "secrets.env", &key),
+        ("pq", "pq_secrets.env", &pqb),
+        ("tls", "tls_secrets.env", &tls),
+        ("audit", "audit_secrets.env", &audit),
+    ] {
         let out = s.0.join(name);
         let args: Vec<String> = [
             "--kind", kind, "--blob", blob.to_str().unwrap(), "--srk-public", srk.to_str().unwrap(),
@@ -528,6 +546,12 @@ fn seal_refuses_a_blob_of_the_other_kind_bad_pcrs_and_a_bad_srk_file() {
     let e = seal_file(Kind::Key, &tls, srk_public(&srk).unwrap(), &pcr).unwrap_err();
     assert!(e.contains("bad magic"), "{e}");
     let e = seal_file(Kind::Tls, &key, srk_public(&srk).unwrap(), &pcr).unwrap_err();
+    assert!(e.contains("bad magic"), "{e}");
+    // So are the audit blob and the TLS blob (M8 plan C10).
+    let audit = audit_blob_file(&s);
+    let e = seal_file(Kind::Audit, &tls, srk_public(&srk).unwrap(), &pcr).unwrap_err();
+    assert!(e.contains("bad magic"), "{e}");
+    let e = seal_file(Kind::Tls, &audit, srk_public(&srk).unwrap(), &pcr).unwrap_err();
     assert!(e.contains("bad magic"), "{e}");
     let mut corrupt = deployment().0.blob.to_vec();
     corrupt[100] ^= 1;
@@ -700,3 +724,29 @@ fn check_srk_names_the_template_and_refuses_fixed_tpm_clear() {
     assert!(srk_name_hex(&loose).unwrap_err().contains("not the SRK storage template"));
     assert!(srk_name_hex(&srk[..40]).is_err());
 }
+
+/// M8 plan C10: the audit blob's seed is the key of `audit.pub`, and
+/// `audit-public` writes that same key from the blob file alone, the
+/// export `tools/package` makes; the hex is 64 lowercase digits and a
+/// newline. A blob of another kind is refused.
+#[test]
+fn audit_public_is_the_audit_blob_s_key() {
+    let d = &deployment().0;
+    let blob = secret_blob::audit::Blob::parse(&d.audit_blob[..]).unwrap_or_else(|e| panic!("{}", e.message()));
+    let pk = auditkey_core::public_key(blob.seed());
+    let hex: String = pk.iter().map(|b| format!("{b:02x}")).collect();
+    assert_eq!(d.audit_pub, format!("{hex}\n"));
+    let s = Scratch::new("audit-public");
+    let path = audit_blob_file(&s);
+    let out = s.0.join("audit.pub");
+    let args: Vec<String> =
+        ["--blob", path.to_str().unwrap(), "--out", out.to_str().unwrap()].iter().map(|a| a.to_string()).collect();
+    run_audit_public(&args).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), d.audit_pub);
+    assert!(run_audit_public(&args).is_err(), "the output is never replaced");
+    let (_, _, tls, _) = blob_files(&s);
+    let e = audit_public_file(&tls).unwrap_err();
+    assert!(e.contains("bad magic"), "{e}");
+    assert!(run_audit_public(&args[..2]).is_err(), "no --out");
+}
+

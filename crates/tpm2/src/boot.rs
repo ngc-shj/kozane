@@ -13,8 +13,12 @@
 //!   and small TPMs hold too few objects for two at once). A Busy client
 //!   waits `BUSY_PAUSE_NS` and asks again, for at most `BUSY_TIMEOUT_NS`.
 //! - Done (or Failed) is sent whatever happened, so `tpm` can cap PCR 8
-//!   once every client (`key`, `pqkey`, `tlskey`) has finished. A Done
-//!   `tpm` does not acknowledge leaves the PD without its secrets.
+//!   once every client (`key`, `pqkey`, `tlskey`, `auditkey`) has
+//!   finished. A Done `tpm` does not acknowledge leaves the PD without its
+//!   secrets.
+//! - `auditkey` alone (M8 plan C3, C10) also reads the TPM clock: after a
+//!   successful flow and before its Done, still inside its flow, so no
+//!   other client's interleaves. A failed read fails the unseal.
 //! - The cap barrier (post-M6 plan P3): after its Done, the client asks
 //!   `tpm` for the cap status until the cap is confirmed, and keeps its
 //!   secrets only then. A failed cap is `CapFailed`, so every key domain
@@ -30,22 +34,33 @@ use crate::envelope::Kind;
 /// Between two calls of a client `tpm` answered Busy.
 pub const BUSY_PAUSE_NS: u64 = 10_000_000;
 /// The longest one flow holds `tpm`: its TPM commands plus its P-256 work
-/// under TCG at the smallest key PD init budget (`pqkey`'s 0.1; `key`'s and
-/// `tlskey`'s are 0.2), with a wide margin (M5's bound for one flow).
+/// under TCG at the smallest key PD init budget (`pqkey`'s 0.1; `key`'s,
+/// `tlskey`'s and `auditkey`'s are 0.2), with a wide margin (M5's bound
+/// for one flow). `auditkey`'s ReadClock is one more command inside it.
 const FLOW_MAX_NS: u64 = 120_000_000_000;
 /// How long a client waits for the others' flows before giving up: every
-/// other client may be served first (M6 plan C12: two flows of the three).
+/// other client may be served first (M8 plan C3: three flows of the four).
 pub const BUSY_TIMEOUT_NS: u64 = FLOW_MAX_NS * (tpm2_wire::gate::CLIENTS as u64 - 1);
-const _: () = assert!(BUSY_TIMEOUT_NS == 240_000_000_000);
+const _: () = assert!(BUSY_TIMEOUT_NS == 360_000_000_000);
+/// The longest `policy`'s operations hold the cap back (M8 plan C3, F33):
+/// its whole init, both slots hashed and both signatures verified between
+/// its State and its Done. Slice 3 measured it at 7.6 s at most under TCG
+/// (deviation log, "P2 and the stack risk, observed"); this is about eight
+/// times that, the margin FLOW_MAX_NS keeps over one flow.
+const POLICY_MAX_NS: u64 = 60_000_000_000;
 /// How long a Done client waits for the cap: the other clients' flows (as
-/// `BUSY_TIMEOUT_NS`), then every attempt of the cap within its deadline
-/// (round 3 R3-3), so a slow TCG boot does not halt every domain.
+/// `BUSY_TIMEOUT_NS`), `policy`'s operations, then every attempt of the cap
+/// within its deadline (round 3 R3-3), so a slow TCG boot does not halt
+/// every domain.
 pub const CAP_BARRIER_TIMEOUT_NS: u64 =
-    BUSY_TIMEOUT_NS + tpm2_wire::gate::CAP_ATTEMPTS as u64 * tpm2_wire::gate::CAP_ATTEMPT_DEADLINE_NS;
+    BUSY_TIMEOUT_NS + POLICY_MAX_NS + tpm2_wire::gate::CAP_ATTEMPTS as u64 * tpm2_wire::gate::CAP_ATTEMPT_DEADLINE_NS;
 const _: () = assert!(
     CAP_BARRIER_TIMEOUT_NS
-        >= BUSY_TIMEOUT_NS + tpm2_wire::gate::CAP_ATTEMPTS as u64 * tpm2_wire::gate::CAP_ATTEMPT_DEADLINE_NS
+        >= BUSY_TIMEOUT_NS
+            + POLICY_MAX_NS
+            + tpm2_wire::gate::CAP_ATTEMPTS as u64 * tpm2_wire::gate::CAP_ATTEMPT_DEADLINE_NS
 );
+const _: () = assert!(CAP_BARRIER_TIMEOUT_NS == 510_000_000_000);
 /// Fresh draws of the client entropy when the ECDH scalar is unusable
 /// (zero or not below the group order: about 2^-32 per draw).
 const ENTROPY_DRAWS: usize = 4;
@@ -176,16 +191,50 @@ pub fn cap_barrier(tpm: &mut impl Transport, rsp: &mut [u8; ipc::MSG_BYTES]) -> 
     }
 }
 
+/// ReadClock through `tpm` (M8 plan C10): resetCount and restartCount.
+/// Anything but a well-formed response is `TpmUnavailable`, or
+/// `ResponseInvalid` for a malformed one.
+fn read_clock(tpm: &mut impl Transport, rsp: &mut [u8; ipc::MSG_BYTES]) -> Result<Clock, UnsealError> {
+    let mut cmd = [0u8; tpm2_wire::READ_CLOCK_CMD_LEN];
+    let n = tpm2_wire::read_clock(&mut cmd).ok_or(UnsealError::TpmUnavailable)?;
+    let m = exchange(tpm, cmd.get(..n).unwrap_or(&[]), rsp).ok_or(UnsealError::TpmUnavailable)?;
+    match tpm2_wire::parse_read_clock(rsp.get(..m).unwrap_or(&[])) {
+        Ok(c) => Ok(Clock { reset_count: c.reset_count, restart_count: c.restart_count }),
+        Err(tpm2_wire::RspError::Tpm(_)) => Err(UnsealError::TpmUnavailable),
+        Err(_) => Err(UnsealError::ResponseInvalid),
+    }
+}
+
+/// The TPM's boot counts (M8 plan C10): what `auditkey` binds into its
+/// checkpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Clock {
+    pub reset_count: u32,
+    pub restart_count: u32,
+}
+
 /// Runs the whole unseal of `envelope` (`kind`'s, read in place) into
 /// `out` (the region's size), then tells `tpm` Done or Failed and, after a
-/// Done, waits at the cap barrier.
-pub fn unseal(tpm: &mut impl Transport, envelope: &[u8], kind: Kind, out: &mut [u8]) -> Result<(), UnsealError> {
+/// Done, waits at the cap barrier. With `clock` (`auditkey` alone), a
+/// successful flow also reads the TPM clock into it before the Done; a
+/// failed read fails the unseal, and `clock` is left zero on every failure.
+pub fn unseal(
+    tpm: &mut impl Transport,
+    envelope: &[u8],
+    kind: Kind,
+    out: &mut [u8],
+    clock: Option<&mut Clock>,
+) -> Result<(), UnsealError> {
     out.fill(0);
     let mut rsp = [0u8; ipc::MSG_BYTES];
-    let result = match start(tpm, envelope, kind) {
+    let mut result = match start(tpm, envelope, kind) {
         Ok(client) => run(tpm, client, out, &mut rsp),
         Err(e) => Err(e),
     };
+    let mut read = Clock::default();
+    if result.is_ok() && clock.is_some() {
+        result = read_clock(tpm, &mut rsp).map(|c| read = c);
+    }
     // The session's secrets passed through frames below this one that do not
     // wipe their own state (crypto.rs): libcrux's P-256 ECDH in start (the
     // ephemeral scalar and shared point) and its HMAC and KDF frames in run.
@@ -204,6 +253,10 @@ pub fn unseal(tpm: &mut impl Transport, envelope: &[u8], kind: Kind, out: &mut [
     rsp.fill(0);
     if result.is_err() {
         out.fill(0);
+        read = Clock::default();
+    }
+    if let Some(c) = clock {
+        *c = read;
     }
     result
 }

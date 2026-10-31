@@ -34,9 +34,11 @@ pub enum Caller {
     Key,
     Pqkey,
     Tlskey,
+    /// M8 plan C10: `auditkey`'s boot ID and its unseal's salt.
+    Auditkey,
 }
 
-pub const CALLERS: usize = 7;
+pub const CALLERS: usize = 8;
 
 impl Caller {
     fn index(self) -> usize {

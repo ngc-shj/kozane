@@ -22,8 +22,8 @@ RELEASE = [sys.executable, str(ROOT / "tools/release.py")]
 SEQ = re.search(r"^pub const RELEASE_SEQ: u32 = (\d+);$", (ROOT / "crates/release-seq/src/lib.rs").read_text(), re.M)[1]
 BIN = str(ROOT / "build/release/target/release/release")
 SLOT = measure.BUNDLE_MAX
-# The three envelopes, then the two bundle slots (descriptor v3).
-RANGES = [(0x1000, 0x400), (0x2000, 0x800), (0x3000, 0x400), (0x4000, SLOT), (0x4000 + SLOT, SLOT)]
+# The four envelopes, then the two bundle slots (descriptor v3).
+RANGES = [(0x1000, 0x400), (0x2000, 0x800), (0x3000, 0x400), (0x3800, 0x400), (0x4000, SLOT), (0x4000 + SLOT, SLOT)]
 
 
 def run(*args) -> tuple:
@@ -38,7 +38,7 @@ def setup(d: pathlib.Path) -> None:
             raise SystemExit(f"keygen failed: {out}")
     pkg = d / "pkg"
     pkg.mkdir()
-    # Code-like bytes everywhere except the five ranges, which hold the zero
+    # Code-like bytes everywhere except the six ranges, which hold the zero
     # placeholder as a published image does.
     image = bytearray(bytes(range(1, 256)) * 65)[:0x4000] + bytes(2 * SLOT) + bytes(range(1, 256))
     for at, length in RANGES:
@@ -229,10 +229,16 @@ def case_range2_over_code(d):
     return ok and "range 2" in out, out
 
 
+def case_audit_over_code(d):
+    """The audit envelope's range, the fourth envelope (M8 plan C10)."""
+    ok, out = case_range_over_code(d, at=0x3bff)
+    return ok and "range 3" in out, out
+
+
 def case_slot_over_code(d):
     """A bundle slot's range is checked like an envelope's (M8 plan C4)."""
     ok, out = case_range_over_code(d, at=0x4000 + 2 * SLOT - 1)
-    return ok and "range 4" in out, out
+    return ok and "range 5" in out, out
 
 
 def case_v2_descriptor(d):
@@ -241,7 +247,7 @@ def case_v2_descriptor(d):
     desc = struct.pack("<8sIIQQQQQQQQ", measure.MAGIC, 2, 3, len(image), *RANGES[0], *RANGES[1], *RANGES[2], 0)
     (d / "pkg/boot.desc").write_bytes(desc)
     rc, out = make(d)
-    return rc == 1 and "descriptor is 80 bytes, expected 112" in out and not (d / "rel").exists(), out
+    return rc == 1 and "descriptor is 80 bytes, expected 128" in out and not (d / "rel").exists(), out
 
 
 def fault_inject_image(d) -> bytes:
@@ -281,12 +287,15 @@ def case_release_seq_missing(d):
     return rc == 1 and "manifest key release_seq is missing" in out, out
 
 
-def case_kind_tls(d):
-    """`--kind tls` is a choice: only the --envelope pairing refuses it."""
+def case_kind_tls_audit(d):
+    """`--kind tls` and `--kind audit` are choices: only the --envelope
+    pairing refuses them."""
     rc, out = verify(d, "keys", "rel", "--kind", "tls")
+    rc_audit, out_audit = verify(d, "keys", "rel", "--kind", "audit")
     rc2, out2 = verify(d, "keys", "rel", "--kind", "bogus")
-    return rc == 2 and "--envelope and --kind go together" in out and rc2 == 2 and "invalid choice" in out2, \
-        out + out2
+    return rc == 2 and "--envelope and --kind go together" in out and rc_audit == 2 \
+        and "--envelope and --kind go together" in out_audit and rc2 == 2 and "invalid choice" in out2, \
+        out + out_audit + out2
 
 
 CASES = [
@@ -311,9 +320,10 @@ CASES = [
     ("verify refuses a signed image holding a fault-inject PD", case_verify_fault_inject),
     ("a descriptor range over non-zero image bytes is refused", case_range_over_code),
     ("a descriptor range 2 over non-zero image bytes is refused", case_range2_over_code),
+    ("the audit envelope range over non-zero image bytes is refused", case_audit_over_code),
     ("a bundle slot range over non-zero image bytes is refused", case_slot_over_code),
     ("a version-2 descriptor is refused", case_v2_descriptor),
-    ("verify takes --kind tls", case_kind_tls),
+    ("verify takes --kind tls and --kind audit", case_kind_tls_audit),
 ]
 
 

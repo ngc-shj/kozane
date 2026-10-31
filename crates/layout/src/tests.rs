@@ -88,7 +88,7 @@ fn every_region_is_a_link_an_audit_ring_or_a_named_singleton() {
         .flat_map(|l| ["used", "free", "data"].map(|s| std::format!("{l}_{s}")))
         .chain(AUDITS.iter().map(|a| String::from(*a)))
         .chain(
-            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "tpm_mmio", "rng_mmio", "rng_dma", "supervisor_record", "secrets", "pq_secrets", "tls_secrets", "policy_a", "policy_b", "audit_policy"]
+            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "tpm_mmio", "rng_mmio", "rng_dma", "supervisor_record", "secrets", "pq_secrets", "tls_secrets", "audit_secrets", "policy_a", "policy_b", "audit_policy"]
                 .map(String::from),
         )
         .collect();
@@ -168,7 +168,7 @@ fn tpm_policy_requests_are_distinct_kinds() {
             assert_ne!(a, b);
         }
     }
-    for ch in [tpm::CH_KEY, tpm::CH_PQKEY, tpm::CH_TLSKEY] {
+    for ch in [tpm::CH_KEY, tpm::CH_PQKEY, tpm::CH_TLSKEY, tpm::CH_AUDITKEY] {
         assert_ne!(tpm::CH_POLICY, ch);
     }
 }
@@ -214,6 +214,12 @@ fn pq_secrets_region_holds_one_blob() {
 fn tls_secrets_region_holds_one_blob() {
     // Mirrors secret_blob::tls::REGION_SIZE (tlskey maps it whole).
     assert_eq!(mr_sizes()["tls_secrets"], 4096);
+}
+
+#[test]
+fn audit_secrets_region_holds_one_blob() {
+    // Mirrors secret_blob::audit::REGION_SIZE (auditkey maps it whole).
+    assert_eq!(mr_sizes()["audit_secrets"], 4096);
 }
 
 // NET_RING_SLOTS >= NET_BUFFERS is a compile-time assert in ring::link.
@@ -289,6 +295,9 @@ fn channel_ids_match_layout() {
         (("ingress", ingress::CH_POLICY), ("policy", policy::CH_INGRESS)),
         (("data", data::CH_POLICY), ("policy", policy::CH_DATA)),
         (("inner", inner::CH_POLICY), ("policy", policy::CH_INNER)),
+        (("audit", audit::CH_AUDITKEY), ("auditkey", auditkey::CH_AUDIT)),
+        (("auditkey", auditkey::CH_TPM), ("tpm", tpm::CH_AUDITKEY)),
+        (("auditkey", auditkey::CH_RNG), ("rng", rng::CH_AUDITKEY)),
     ];
     for (a, b) in expected {
         assert!(has_channel(a, b), "{a:?} <-> {b:?}");
@@ -417,6 +426,69 @@ fn tlskey_is_a_passive_key_pd_on_the_planned_schedule() {
     for pd in ["key", "pqkey", "tls", "tpm", "hs"] {
         assert!(map_of(pd, "tls_secrets").is_none(), "{pd} maps tls_secrets");
     }
+}
+
+/// M8 plan C10, D7, C11: `auditkey` is passive, above its caller `audit`
+/// and below its callees `tpm` and `rng`, maps its own secrets region alone
+/// (no audit ring), and its channel to `audit` has the key shape (`audit`
+/// pp, notify=false; `auditkey` pp=false and free to notify, which is how
+/// it reports the end of its init); its `tpm` channel is `key`'s.
+#[test]
+fn auditkey_is_a_passive_key_pd_called_and_notified_by_audit_alone() {
+    let attr = |a| pd_attribute("auditkey", a).expect(a);
+    assert_eq!(attr("passive"), "true");
+    let prio = parse_num(&attr("priority"));
+    assert!(parse_num(&pd_attribute("audit", "priority").expect("audit")) < prio);
+    for callee in ["tpm", "rng"] {
+        assert!(parse_num(&pd_attribute(callee, "priority").expect(callee)) > prio, "{callee}");
+    }
+    let text = system_text();
+    let doc = roxmltree::Document::parse(&text).expect("parse .system");
+    let pd = doc
+        .descendants()
+        .find(|n| n.has_tag_name("protection_domain") && n.attribute("name") == Some("auditkey"))
+        .expect("auditkey");
+    let maps: std::vec::Vec<&str> = pd.children().filter(|m| m.has_tag_name("map")).map(|m| m.attribute("mr").unwrap()).collect();
+    assert_eq!(maps, ["audit_secrets"]);
+    assert_eq!(map_of("auditkey", "audit_secrets").map(|m| m.1).as_deref(), Some("r"));
+    for other in doc.descendants().filter(|n| n.has_tag_name("protection_domain")) {
+        let name = other.attribute("name").unwrap();
+        if name != "auditkey" {
+            assert!(map_of(name, "audit_secrets").is_none(), "{name} maps audit_secrets");
+        }
+    }
+    let mut peers = std::vec::Vec::new();
+    for c in doc.descendants().filter(|n| n.has_tag_name("channel")) {
+        let ends: std::vec::Vec<roxmltree::Node> = c.children().filter(|e| e.has_tag_name("end")).collect();
+        let Some(i) = ends.iter().position(|e| e.attribute("pd") == Some("auditkey")) else { continue };
+        let (own, peer) = (ends[i], ends[1 - i]);
+        let name = peer.attribute("pd").expect("pd");
+        let shape = (own.attribute("pp"), own.attribute("notify"), peer.attribute("pp"), peer.attribute("notify"));
+        match name {
+            "audit" => assert_eq!(shape, (Some("false"), None, Some("true"), Some("false")), "audit"),
+            "tpm" => assert_eq!(shape, (Some("true"), Some("false"), Some("false"), Some("false")), "tpm"),
+            "rng" => assert_eq!(shape, (Some("true"), Some("false"), Some("false"), None), "rng"),
+            other => panic!("auditkey has a channel to {other}"),
+        }
+        peers.push(name);
+    }
+    peers.sort_unstable();
+    assert_eq!(peers, ["audit", "rng", "tpm"]);
+}
+
+/// The PPC encodings `audit` and `auditkey` share (M8 plan C10).
+#[test]
+fn auditkey_labels_and_sizes_are_pinned() {
+    assert_eq!(auditkey::SIGN_REQ_WORDS, 6);
+    assert_eq!((auditkey::SIGN_REPLY_LEN, auditkey::SIGN_REPLY_WORDS), (122, 16));
+    let labels = [auditkey::OK, auditkey::BAD_REQUEST, auditkey::REFUSED];
+    for (i, a) in labels.iter().enumerate() {
+        assert_eq!(a & auditkey::UNAVAILABLE, 0);
+        for b in &labels[i + 1..] {
+            assert_ne!(a, b);
+        }
+    }
+    assert_eq!(audit::CHECKPOINT_EVERY, 64);
 }
 
 /// M7 plan C8: every pd but the supervisor is its child, with the id that

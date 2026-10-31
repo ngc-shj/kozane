@@ -38,6 +38,7 @@ fn caller(channel: Channel) -> Option<Caller> {
         (ipc::CH_KEY, Caller::Key),
         (ipc::CH_PQKEY, Caller::Pqkey),
         (ipc::CH_TLSKEY, Caller::Tlskey),
+        (ipc::CH_AUDITKEY, Caller::Auditkey),
     ]
     .into_iter()
     .find(|(ch, _)| channel == Channel::new(*ch))

@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+# The audit key's public half (M8 plan C10), as `auditkey` derives it.
+auditkey-core = { path = "../../crates/auditkey-core" }
 # `validate.rs` (M8 plan C1 R2), shared with `config`'s build.rs.
 limits = { path = "../../crates/limits" }
 policy-wire = { path = "../../crates/policy-wire" }

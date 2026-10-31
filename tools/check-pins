@@ -29,11 +29,12 @@ Rules:
      secrets in plain arrays (L12, M3 plan S12, M4 plan C11; pqkey-core
      holds its secrets in `Zeroizing`), in tpm2 (M5 plan I10.3), in
      tls-core, pds/tls and key-core (M6 plan S9), in tlskey-core and
-     pds/tlskey (M6 plan C12), and in `secret`, which defines the shared
-     `Secret` itself (M6 Phase 2 self-check)
+     pds/tlskey (M6 plan C12), in auditkey-core and pds/auditkey (M8 plan
+     C10), and in `secret`, which defines the shared `Secret` itself (M6
+     Phase 2 self-check)
   P10 no `from_bytes(*` in the secret crates or in hs-core, key-core,
-     data-core, wg-core, tpm2, tls-core, tlskey-core and the key, hs, data,
-     tls and tlskey PDs: a dereferenced array is a by-value temporary of
+     data-core, wg-core, tpm2, tls-core, tlskey-core, auditkey-core and the
+     key, hs, data, tls, tlskey and auditkey PDs: a dereferenced array is a by-value temporary of
      the secret left on the stack; `copy_from(&..)` copies in place (L12)
   P11 no cookie (COOKIE_FILES, M3b plan S3) and no tag of a TAG_SETS crate
      (any source in it: tpm2's HMAC tags, its Unseal response check, M5
@@ -98,9 +99,9 @@ Rules:
      unrelated wakeup
   P22 the cap barrier (post-M6 plan P3): crates/tpm2/src/boot.rs's `fn
      unseal` calls `cap_barrier(` after its Done, `fn cap_barrier` asks
-     `REQ_CAP_STATUS`, and each key PD (key, pqkey, tlskey) unseals through
-     `tpm2::boot::unseal(`, so none releases its key before the cap of PCR
-     8 is confirmed
+     `REQ_CAP_STATUS`, and each key PD (key, pqkey, tlskey, auditkey)
+     unseals through `tpm2::boot::unseal(`, so none releases its key before
+     the cap of PCR 8 is confirmed
   P23 the old name (post-M6 plan P7): outside docs/archive and
      third_party, a line naming `secureos` (or secure_os, secure-os, any
      case) either cites an archive document by its file name or sits in a
@@ -219,12 +220,12 @@ RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P1
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
                "crates/tls-core", "crates/tlskey-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data",
-               "crates/pds/tls", "crates/pds/tlskey"]
+               "crates/pds/tls", "crates/pds/tlskey", "crates/auditkey-core", "crates/pds/auditkey"]
 PENDING: set[str] = set()
 # Crates whose secret-holding types must not be Clone/Copy/Debug (P9).
 SECRET_CRATES = ["crates/rosenpass-core", "crates/pqkey-core", "crates/pds/pq", "crates/pds/pqkey", "crates/pds/ingress",
                  "crates/mce460896", "crates/tpm2", "crates/tls-core", "crates/pds/tls", "crates/key-core",
-                 "crates/tlskey-core", "crates/pds/tlskey", "crates/secret"]
+                 "crates/tlskey-core", "crates/pds/tlskey", "crates/auditkey-core", "crates/pds/auditkey", "crates/secret"]
 # mce460896's types that hold no secret (P9): every other type there does.
 MCE_PUBLIC_TYPES = {"RngError"}
 # Types that hold a secret under a name of their own, not as Secret<..> (P9,
@@ -265,7 +266,7 @@ PASS_IMPL = r"\bimpl\s+ring\s*::\s*pass\s*::\s*Pass\s+for\s+Pass\b"
 # P22: the file holding the barrier, and the key PDs that must unseal
 # through it.
 BARRIER_FILE = "crates/tpm2/src/boot.rs"
-KEY_PDS = ("key", "pqkey", "tlskey")
+KEY_PDS = ("key", "pqkey", "tlskey", "auditkey")
 
 
 def run_blocks(dockerfile: str):

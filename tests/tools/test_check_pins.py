@@ -660,6 +660,11 @@ CASES = [
                       "\nfn bad(expected: &[u8; 32], finished: &[u8; 32]) -> bool {\n    finished == expected\n}\n")),
     # P21 anchors in the same file and fails closed without it.
     ("P11 pds/tls's main removed", {"P11", "P21"}, lambda t: (t / "crates/pds/tls/src/main.rs").unlink()),
+    # P9/P10 (M8 plan C10): auditkey-core and pds/auditkey join.
+    ("P9 derive(Debug) on a Secret wrapper in auditkey-core", {"P9"},
+     lambda t: append(t / "crates/auditkey-core/src/lib.rs", "\n#[derive(Debug)]\nstruct Leak(Secret<32>);\n")),
+    ("P10 from_bytes(*..) in pds/auditkey", {"P10"},
+     lambda t: append(t / "crates/pds/auditkey/src/main.rs", "\nfn f(k: &[u8; 32]) -> K { K::from_bytes(*k) }\n")),
     # P9/P10 (M6 Phase 2 self-check): the shared `secret` crate joins.
     ("P9 derive(Clone) on Secret in crates/secret", {"P9"},
      lambda t: edit(t / "crates/secret/src/lib.rs", "pub struct Secret<const N: usize>([u8; N]);",
@@ -768,6 +773,9 @@ CASES = [
      lambda t: edit(t / "crates/tpm2/src/boot.rs", "ipc::label(ipc::REQ_CAP_STATUS, 0)", "ipc::label(ipc::REQ_DONE, 0)")),
     ("P22 a key PD unseals around tpm2::boot::unseal", {"P22"},
      lambda t: edit(t / "crates/pds/pqkey/src/main.rs", "tpm2::boot::unseal(", "tpm2::boot::unseal_unbarred(")),
+    # M8 plan C10: auditkey, the fourth key PD, waits at the barrier too.
+    ("P22 auditkey unseals around tpm2::boot::unseal", {"P22"},
+     lambda t: edit(t / "crates/pds/auditkey/src/main.rs", "tpm2::boot::unseal(", "tpm2::boot::unseal_unbarred(")),
     ("allow the barrier call split over lines", set(),
      lambda t: edit(t / "crates/tpm2/src/boot.rs", "=> cap_barrier(tpm, &mut rsp),",
                     "=> cap_barrier(\n            tpm,\n            &mut rsp,\n        ),")),

@@ -5,7 +5,8 @@
 //! with symbolic NV values and faults.
 
 use super::gate::{
-    ALLOWED, CAP_ATTEMPTS, CapStatus, CapTransport, Gate, POLICY_COMMANDS, PolicyRefusal, PolicyTransport, REFUSED, Refusal,
+    AUDITKEY, CAP_ATTEMPTS, CapStatus, CapTransport, Gate, POLICY_COMMANDS, PolicyRefusal, PolicyTransport, REFUSED, Refusal,
+    allowed_for,
 };
 use super::*;
 
@@ -49,6 +50,7 @@ fn response_parsers_are_total_and_in_bounds() {
     let _ = parse_slot_pcr_read(bytes);
     let _ = parse_nv_read(bytes);
     let _ = parse_nv_increment(bytes);
+    let _ = parse_read_clock(bytes);
 }
 
 const UNSEAL_MAX: usize = 120;
@@ -73,8 +75,9 @@ fn unseal_parse_is_total_and_in_bounds() {
 
 const CMD_MAX: usize = 32;
 
-/// Deny: a command code off the allowlist (any u32, PCR_Extend included)
-/// is refused, whatever else the command holds, so no device write follows.
+/// Deny: a command code off the allowlist for this client (any u32,
+/// PCR_Extend included, ReadClock for every client but `auditkey`) is
+/// refused, whatever else the command holds, so no device write follows.
 #[kani::proof]
 #[kani::unwind(12)]
 fn unlisted_command_codes_never_reach_the_device() {
@@ -82,16 +85,49 @@ fn unlisted_command_codes_never_reach_the_device() {
     let len: usize = kani::any();
     kani::assume(len >= HEADER_LEN && len <= CMD_MAX);
     let cc: u32 = kani::any();
-    kani::assume(!ALLOWED.contains(&cc));
+    let client: usize = kani::any();
+    kani::assume(client < gate::CLIENTS);
+    kani::assume(!allowed_for(client, cc));
     if let Some(field) = buf.get_mut(6..10) {
         field.copy_from_slice(&cc.to_be_bytes());
     }
-    let client: usize = kani::any();
-    kani::assume(client < gate::CLIENTS);
     let mut g = Gate::new();
     let r = g.command(client, buf.get(..len).unwrap_or(&[]));
     assert!(r == Err(Refusal::NotAllowed));
     assert!(g.state(client) == Some(gate::State::Fresh));
+    kani::cover!(cc == CC_READ_CLOCK, "ReadClock from a client that is not auditkey");
+}
+
+/// I3.2 (M8 plan C3): ReadClock reaches the device only from `auditkey`,
+/// with or without a `policy` PD, whatever else the command holds: every
+/// other client is refused and nothing changes. `auditkey`'s well-formed
+/// ReadClock is forwarded, once.
+#[kani::proof]
+#[kani::unwind(36)]
+fn read_clock_is_reachable_only_from_auditkey() {
+    let mut buf: [u8; CMD_MAX] = kani::any();
+    let len: usize = kani::any();
+    kani::assume(len >= HEADER_LEN && len <= CMD_MAX);
+    if let Some(field) = buf.get_mut(6..10) {
+        field.copy_from_slice(&CC_READ_CLOCK.to_be_bytes());
+    }
+    let client: usize = kani::any();
+    kani::assume(client < gate::CLIENTS);
+    let mut g = Gate::with_policy(kani::any(), N_CTR, N_BASE);
+    let before = g.clone();
+    let r = g.command(client, buf.get(..len).unwrap_or(&[]));
+    if client != AUDITKEY {
+        assert!(r == Err(Refusal::NotAllowed));
+        assert!(g == before);
+    }
+    if let Ok(fwd) = r {
+        assert!(client == AUDITKEY && fwd.client() == AUDITKEY && fwd.command_code() == CC_READ_CLOCK);
+        assert!(g.command(client, buf.get(..len).unwrap_or(&[])) == Err(Refusal::Repeated));
+    }
+    let mut cmd = [0u8; READ_CLOCK_CMD_LEN];
+    let n = read_clock(&mut cmd).unwrap_or(0);
+    let well_formed = buf.get(..len) == cmd.get(..n);
+    kani::cover!(r.is_ok() && well_formed, "auditkey's ReadClock is forwarded");
 }
 
 fn handle_rsp(handle: u32) -> [u8; 14] {

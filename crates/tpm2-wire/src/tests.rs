@@ -6,8 +6,8 @@ use std::vec;
 use std::vec::Vec;
 
 use super::gate::{
-    ALLOWED, CAP_ATTEMPT_DEADLINE_NS, CAP_ATTEMPTS, CAP_DIGEST, CLIENTS, CapStatus, CapTransport, CapVerdict, Gate,
-    POLICY_COMMANDS, PolicyPhase, PolicyRefusal, PolicyState, PolicyTransport, REFUSED, Refusal, State,
+    ALLOWED, AUDITKEY, CAP_ATTEMPT_DEADLINE_NS, CAP_ATTEMPTS, CAP_DIGEST, CLIENT_ONLY, CLIENTS, CapStatus, CapTransport,
+    CapVerdict, Gate, POLICY_COMMANDS, PolicyPhase, PolicyRefusal, PolicyState, PolicyTransport, REFUSED, Refusal, State,
 };
 use super::*;
 
@@ -45,7 +45,7 @@ fn create_primary_is_the_command_swtpm_accepted() {
 #[test]
 fn every_builder_writes_its_documented_length_into_the_header() {
     let mut buf = [0u8; IPC_MSG_BYTES];
-    let cases: [(Option<usize>, usize); 14] = [
+    let cases: [(Option<usize>, usize); 15] = [
         (create_primary(&mut buf), CREATE_PRIMARY_CMD_LEN),
         (start_auth_session(&mut buf, 0x8000_0000, &[1; 32], &[2; POINT_LEN]), START_AUTH_SESSION_CMD_LEN),
         (policy_pcr(&mut buf, 0x0300_0000), POLICY_PCR_CMD_LEN),
@@ -60,6 +60,7 @@ fn every_builder_writes_its_documented_length_into_the_header() {
         (nv_read_public(&mut buf, NV_POLICY_CTR), NV_READ_PUBLIC_CMD_LEN),
         (nv_read(&mut buf, NV_POLICY_CTR), NV_READ_CMD_LEN),
         (nv_increment(&mut buf, NV_POLICY_CTR), NV_INCREMENT_CMD_LEN),
+        (read_clock(&mut buf), READ_CLOCK_CMD_LEN),
     ];
     for (i, (got, want)) in cases.iter().enumerate() {
         assert_eq!(*got, Some(*want), "builder {i}");
@@ -456,7 +457,7 @@ fn a_finished_client_is_refused_everything_and_cannot_finish_twice() {
     assert_eq!(g.command(OWNER, &cmd(pcr_read)), Err(Refusal::Finished));
     assert_eq!(g.finish(OWNER, true), Err(Refusal::Finished));
     assert_eq!(g.command(CLIENTS, &cmd(pcr_read)), Err(Refusal::UnknownClient));
-    assert_eq!(CLIENTS, 3);
+    assert_eq!(CLIENTS, 4);
 }
 
 #[test]
@@ -469,6 +470,8 @@ fn the_cap_comes_once_after_every_client_finishes_and_then_everything_is_refused
     g.finish(OTHER, false).unwrap();
     assert_eq!(g.cap(&mut buf), None, "the third client has not finished");
     g.finish(THIRD, true).unwrap();
+    assert_eq!(g.cap(&mut buf), None, "the fourth client (auditkey) has not finished");
+    g.finish(AUDITKEY, true).unwrap();
     let n = g.cap(&mut buf).unwrap();
     assert_eq!(buf[..n], cmd(|b| pcr_extend(b, &CAP_DIGEST))[..]);
     assert!(g.is_capped());
@@ -522,7 +525,64 @@ fn a_fresh_client_is_busy_while_any_other_is_unsealing_for_every_ordered_pair() 
             assert_eq!(g.state(b), Some(State::Unsealing), "{a} -> {b}");
         }
     }
-    assert_eq!(pairs, 6);
+    assert_eq!(pairs, 12);
+}
+
+/// M8 plan C3, I3.2: ReadClock is `auditkey`'s alone. Every other client
+/// is refused it as off the list, and nothing changes; `auditkey` gets it
+/// once, as part of its flow (so it waits like any first command while
+/// another flow is under way), and not after its Done.
+#[test]
+fn read_clock_is_auditkey_s_alone_once_and_before_its_done() {
+    let clock = cmd(read_clock);
+    assert_eq!(clock.len(), READ_CLOCK_CMD_LEN);
+    assert_eq!(CLIENT_ONLY, [(CC_READ_CLOCK, AUDITKEY)]);
+    for c in (0..CLIENTS).filter(|c| *c != AUDITKEY) {
+        let mut g = Gate::with_policy(true, [1; NAME_LEN], [2; NAME_LEN]);
+        let before = g.clone();
+        assert_eq!(g.command(c, &clock), Err(Refusal::NotAllowed), "client {c}");
+        assert!(g == before, "client {c}: a refused ReadClock changed the gate");
+    }
+    // Allow: auditkey's, after its unseal and before its Done.
+    let mut g = Gate::new();
+    setup(&mut g, AUDITKEY, 0x8000_0000, 0x0300_0000, 0x8000_0001);
+    forward(&mut g, AUDITKEY, &clock, &OK);
+    assert_eq!(g.command(AUDITKEY, &clock), Err(Refusal::Repeated));
+    let mut extra = clock.clone();
+    extra.extend_from_slice(&[0; 4]);
+    let len = extra.len() as u32;
+    extra[2..6].copy_from_slice(&len.to_be_bytes());
+    let mut g2 = Gate::new();
+    assert_eq!(g2.command(AUDITKEY, &extra), Err(Refusal::Malformed), "parameters on ReadClock");
+    let mut tagged = clock.clone();
+    tagged[1] = 0x02; // ST_SESSIONS
+    assert_eq!(g2.command(AUDITKEY, &tagged), Err(Refusal::Malformed), "a session tag on ReadClock");
+    g.finish(AUDITKEY, true).unwrap();
+    let mut g3 = Gate::new();
+    g3.finish(AUDITKEY, true).unwrap();
+    assert_eq!(g3.command(AUDITKEY, &clock), Err(Refusal::Finished), "after its Done");
+    // A Fresh auditkey's ReadClock waits for another client's flow.
+    let mut g = Gate::new();
+    forward(&mut g, OWNER, &cmd(create_primary), &handle_rsp(0x8000_0000));
+    assert_eq!(g.command(AUDITKEY, &clock), Err(Refusal::Busy));
+}
+
+#[test]
+fn read_clock_round_trips_its_time_info() {
+    let rsp = hex("8001 00000023 00000000 0000000000001000 0000000000002000 00000007 00000002 01");
+    assert_eq!(
+        parse_read_clock(&rsp),
+        Ok(ClockRsp { time: 0x1000, clock: 0x2000, reset_count: 7, restart_count: 2, safe: 1 })
+    );
+    assert_eq!(parse_read_clock(&rsp[..rsp.len() - 1]), Err(RspError::Size));
+    let mut short = rsp[..rsp.len() - 1].to_vec();
+    short[5] -= 1;
+    assert_eq!(parse_read_clock(&short), Err(RspError::Short));
+    let mut long = rsp.clone();
+    long.push(0);
+    long[5] += 1;
+    assert_eq!(parse_read_clock(&long), Err(RspError::Malformed));
+    assert_eq!(parse_read_clock(&hex("8001 0000000a 00000101")), Err(RspError::Tpm(0x101)));
 }
 
 #[test]
@@ -1015,10 +1075,14 @@ fn fuzz_one(bytes: &[u8]) {
     let _ = parse_pcr_read(bytes);
     let _ = parse_empty(bytes);
     let _ = parse_pcr_extend(bytes);
+    let _ = parse_read_clock(bytes);
     for client in 0..CLIENTS {
         let mut g = Gate::new();
         if let Ok(fwd) = g.command(client, bytes) {
-            assert!(ALLOWED.contains(&fwd.command_code()));
+            // The shared list, or the one per-client row: ReadClock for
+            // auditkey alone (M8 plan C3, I3.2).
+            let cc = fwd.command_code();
+            assert!(ALLOWED.contains(&cc) || (cc == CC_READ_CLOCK && client == AUDITKEY));
             g.response(fwd, bytes);
         }
     }

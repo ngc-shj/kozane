@@ -23,8 +23,8 @@ policy := policy/laws.toml
 loader := $(BUILD)/loader.img
 counts := $(BUILD)/counts
 
-pds := supervisor eth-out eth-in ingress audit timer tpm rng key hs inner data pq pqkey tls tlskey policy
-host_crates := wire ring boot-stage rng-core supervisor-core audit-event drbg ingress-core inner-core layout laws supervisor-allowlist config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct limits tlskey-core secret policy-wire policy-client release-seq
+pds := supervisor eth-out eth-in ingress audit timer tpm rng key hs inner data pq pqkey tls tlskey policy auditkey
+host_crates := wire ring boot-stage rng-core supervisor-core audit-event drbg ingress-core inner-core layout laws supervisor-allowlist config secret-blob mksecrets wg-wire wg-core key-core msgs hs-core data-core cpu rosenpass-wire rosenpass-core pqkey-core mce460896 tpm2-wire tpm2 tls-wire tls-core http-wire ct limits tlskey-core secret policy-wire policy-client release-seq auditkey-core
 empty :=
 space := $(empty) $(empty)
 # A crate shipped in more than one feature set is proved in each
@@ -34,7 +34,7 @@ kani_variants_boot-stage := --features boot-stop
 # The `policy` PD links policy-wire with `verifier` (M8 plan D-2), every
 # other PD without it.
 kani_variants_policy-wire := --features verifier
-kani_crates := wire ring boot-stage drbg rng-core supervisor-core ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire policy-wire audit-event
+kani_crates := wire ring boot-stage drbg rng-core supervisor-core ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire policy-wire audit-event auditkey-core
 
 .PHONY: clean-counts
 .PHONY: all image package run test check check-selftest repro mir audit lint lint-pds unit kani verus ct ct-harness ct-shape bolero fuzz-long laws pins manifest kernel-config clean
@@ -98,6 +98,12 @@ $(BUILD)/tls-secrets-placeholder.bin:
 	mkdir -p $(BUILD)
 	head -c 4096 /dev/zero > $@
 
+# Same for the auditkey secrets region (`auditkey` is Unavailable on it;
+# M8 plan C10).
+$(BUILD)/audit-secrets-placeholder.bin:
+	mkdir -p $(BUILD)
+	head -c 4096 /dev/zero > $@
+
 # Zero bundle slots (M8 plan C4), BUNDLE_MAX each, as tools/measure.py reads
 # it from crates/limits.
 $(BUILD)/policy-slot-placeholder.bin: crates/limits/src/lib.rs tools/measure.py
@@ -105,7 +111,7 @@ $(BUILD)/policy-slot-placeholder.bin: crates/limits/src/lib.rs tools/measure.py
 	python3 -c 'import sys; sys.path.insert(0, "tools"); import measure; sys.stdout.buffer.write(bytes(measure.BUNDLE_MAX))' > $@
 
 # The laws checker runs on the exact file handed to the Microkit tool.
-image: pds kernel-config $(BUILD)/secrets-placeholder.bin $(BUILD)/pq-secrets-placeholder.bin $(BUILD)/tls-secrets-placeholder.bin $(BUILD)/policy-slot-placeholder.bin
+image: pds kernel-config $(BUILD)/secrets-placeholder.bin $(BUILD)/pq-secrets-placeholder.bin $(BUILD)/tls-secrets-placeholder.bin $(BUILD)/audit-secrets-placeholder.bin $(BUILD)/policy-slot-placeholder.bin
 	cargo run --locked -q -p laws -- check --system $(system) --policy $(policy) --search-path $(BUILD)
 	$(MICROKIT_SDK)/bin/microkit $(system) \
 		--search-path $(BUILD) \
@@ -114,15 +120,16 @@ image: pds kernel-config $(BUILD)/secrets-placeholder.bin $(BUILD)/pq-secrets-pl
 		-r $(BUILD)/report.txt \
 		-o $(loader)
 
-# The published image, its boot descriptor and the three blobs sealed to
-# one TPM's SRK and the image's PCR 8 (M5 plan C8, C11, M6 plan C12);
+# The published image, its boot descriptor and the four blobs sealed to
+# one TPM's SRK and the image's PCR 8 (M5 plan C8, C11, M6 plan C12, M8
+# plan C10);
 # tools/package builds the same system with only the secrets prefill_paths
 # changed and refuses anything else, and any kernel but a release one (M5
 # plan C7):
 # `make package MICROKIT_CONFIG=release ...`.
 ifneq ($(filter package,$(MAKECMDGOALS)),)
-ifeq ($(and $(SECRETS),$(PQ_SECRETS),$(TLS_SECRETS),$(SRK_PUBLIC),$(OUT)),)
-$(error package: set SECRETS=<blob> PQ_SECRETS=<blob> TLS_SECRETS=<blob> SRK_PUBLIC=<tpm2b_public> OUT=<dir>)
+ifeq ($(and $(SECRETS),$(PQ_SECRETS),$(TLS_SECRETS),$(AUDIT_SECRETS),$(SRK_PUBLIC),$(OUT)),)
+$(error package: set SECRETS=<blob> PQ_SECRETS=<blob> TLS_SECRETS=<blob> AUDIT_SECRETS=<blob> SRK_PUBLIC=<tpm2b_public> OUT=<dir>)
 endif
 endif
 # tools/package also runs tools/ct-shape (identity, forbidden, shape,
@@ -131,7 +138,7 @@ endif
 # have passed.
 package: image ct-harness $(firmware)
 	tools/package --secrets $(SECRETS) --pq-secrets $(PQ_SECRETS) --tls-secrets $(TLS_SECRETS) \
-		--srk-public $(SRK_PUBLIC) --firmware $(firmware) --out $(OUT) \
+		--audit-secrets $(AUDIT_SECRETS) --srk-public $(SRK_PUBLIC) --firmware $(firmware) --out $(OUT) \
 		--system $(system) --policy $(policy) \
 		--image $(loader) --gen-config $(sdk_config_dir)/include/kernel/gen_config.h \
 		--search-path $(BUILD) --board $(MICROKIT_BOARD) --config $(MICROKIT_CONFIG) \

@@ -166,8 +166,8 @@ def tree(d: pathlib.Path, pd_bm=None, pd_extra=(), harness_bm=None, harness_extr
          harness_encapsulate=None, tls_exchange_extra=(), harness_anon_file="src/hybrid.rs", harness_anon_line=12,
          harness_cmp="bcmp", boot_stop=None, run_init_crates=None):
     """A search path with pd-pq.elf and pd-pqkey.elf, each with its own
-    McEliece root only, pqkey, pd-key.elf and pd-tlskey.elf with the envelope
-    open (key and tlskey without McEliece), pd-tls.elf with the TLS roots
+    McEliece root only, pqkey, pd-key.elf, pd-tlskey.elf and pd-auditkey.elf
+    with the envelope open (without McEliece), pd-tls.elf with the TLS roots
     alone, and a harness
     (with every root) built at other addresses with other crate hashes,
     other anonymous-constant numbers and bcmp for memcmp.
@@ -176,7 +176,7 @@ def tree(d: pathlib.Path, pd_bm=None, pd_extra=(), harness_bm=None, harness_extr
     `run_init_crates` maps a PD ELF to the crate its init wrapper names
     (default: its own; None: no wrapper). Returns (search path, harness)."""
     own = {"pd-pq.elf": "pd_pq", "pd-pqkey.elf": "pd_pqkey", "pd-key.elf": "pd_key", "pd-tlskey.elf": "pd_tlskey",
-           "pd-tls.elf": "pd_tls"}
+           "pd-auditkey.elf": "pd_auditkey", "pd-tls.elf": "pd_tls"}
     wrap = {**own, **(run_init_crates or {})}
     search = d / "search"
     search.mkdir()
@@ -192,6 +192,9 @@ def tree(d: pathlib.Path, pd_bm=None, pd_extra=(), harness_bm=None, harness_extr
     build(search, "pd-tlskey.elf", program("a1", "pd_tlskey", vstd=vstd,
                                            debug_put_char=debug_put_char == "pd-tlskey.elf", mce=False,
                                            run_init_crate=wrap["pd-tlskey.elf"]), 0x200000)
+    build(search, "pd-auditkey.elf", program("a1", "pd_auditkey", vstd=vstd,
+                                             debug_put_char=debug_put_char == "pd-auditkey.elf", mce=False,
+                                             run_init_crate=wrap["pd-auditkey.elf"]), 0x200000)
     build(search, "pd-tls.elf", program("a1", "pd_tls", mce=False, open_root=False, tls=True,
                                         exchange_extra=tls_exchange_extra, run_init_crate=wrap["pd-tls.elf"]),
           0x200000)

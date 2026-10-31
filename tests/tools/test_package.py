@@ -45,6 +45,11 @@ SYSTEM = """<system>
         <program_image path="pd-tlskey.elf" />
         <map mr="tls_secrets" vaddr="0x8_000_000" perms="r" />
     </protection_domain>
+    <memory_region name="audit_secrets" size="0x1000" prefill_path="audit-placeholder.bin" />
+    <protection_domain name="auditkey" priority="134" passive="true">
+        <program_image path="pd-auditkey.elf" />
+        <map mr="audit_secrets" vaddr="0x8_000_000" perms="r" />
+    </protection_domain>
     <memory_region name="policy_a" size="0x480000" prefill_path="slot-placeholder.bin" />
     <memory_region name="policy_b" size="0x480000" prefill_path="slot-placeholder.bin" />
 </system>"""
@@ -60,15 +65,19 @@ def le32(n: int) -> bytes:
     return n.to_bytes(4, "little")
 
 
-# `key` blob v4 (no peers, M8 plan C7); `pqkey` blob v1; `tlskey` blob v1
-# (crates/secret-blob).
+# `key` blob v4 (no peers, M8 plan C7); `pqkey` blob v1; `tlskey` blob v1;
+# `auditkey` blob v1 (M8 plan C10) (crates/secret-blob).
 KEY_BODY = b"SOSSECR1" + le32(4) + le32(0) + bytes(range(1, 65))
 BLOB = seal(KEY_BODY, 4096)
 PQ_BODY = b"SOSPQKY1" + le32(1) + bytes((i * 7 + 3) % 256 for i in range(13904 - 12))
 PQ_BLOB = seal(PQ_BODY, 16384)
 TLS_BODY = b"SOSTLSK1" + le32(1) + le32(0) + bytes(range(101, 165))
 TLS_BLOB = seal(TLS_BODY, 4096)
-BLOBS = {"secrets": BLOB, "pq_secrets": PQ_BLOB, "tls_secrets": TLS_BLOB}
+AUDIT_BODY = b"SOSAUDK1" + le32(1) + le32(0) + bytes(range(201, 233))
+AUDIT_BLOB = seal(AUDIT_BODY, 4096)
+BLOBS = {"secrets": BLOB, "pq_secrets": PQ_BLOB, "tls_secrets": TLS_BLOB, "audit_secrets": AUDIT_BLOB}
+# What the fake `mksecrets audit-public` writes.
+AUDIT_PUB = "5e" * 32 + "\n"
 # An SRK TPM2B_PUBLIC as tpm2_readpublic -o writes it (framing only: the
 # template is mksecrets' check).
 SRK = (90).to_bytes(2, "big") + bytes(range(90))
@@ -78,13 +87,16 @@ PQ_AT = KEY_AT + len(BLOB) + len(PAD)
 PQ_END = PQ_AT + len(PQ_BLOB)
 TLS_AT = PQ_END + len(PAD)
 TLS_END = TLS_AT + len(TLS_BLOB)
-PLACEHOLDER_IMG = b"\x7fELF" + PAD + bytes(4096) + PAD + bytes(16384) + PAD + bytes(4096) + PAD
+AUDIT_AT = TLS_END + len(PAD)
+AUDIT_END = AUDIT_AT + len(AUDIT_BLOB)
+PLACEHOLDER_IMG = b"\x7fELF" + PAD + bytes(4096) + PAD + bytes(16384) + PAD + bytes(4096) + PAD + bytes(4096) + PAD
 # The firmware the PCRs are computed from (M7 plan C4): a minimal FIP.
 sys.path.insert(0, str(ROOT / "tests/tools"))
 import fip_fixture  # noqa: E402
 FLASH = fip_fixture.flash()
-PACKAGE_IMG = b"\x7fELF" + PAD + BLOB + PAD + PQ_BLOB + PAD + TLS_BLOB + PAD
-SPANS = f"{KEY_AT:#x}..{KEY_AT + len(BLOB):#x}, {PQ_AT:#x}..{PQ_END:#x}, {TLS_AT:#x}..{TLS_END:#x}"
+PACKAGE_IMG = b"\x7fELF" + PAD + BLOB + PAD + PQ_BLOB + PAD + TLS_BLOB + PAD + AUDIT_BLOB + PAD
+SPANS = f"{KEY_AT:#x}..{KEY_AT + len(BLOB):#x}, {PQ_AT:#x}..{PQ_END:#x}, {TLS_AT:#x}..{TLS_END:#x}, " \
+    f"{AUDIT_AT:#x}..{AUDIT_END:#x}"
 # The placeholder image `build` sees: the two bundle slots' zeros after the
 # envelopes' (M8 plan C4).
 SLOT = pkg.measure.BUNDLE_MAX
@@ -171,8 +183,10 @@ class ct_stubs:
         pkg.CT_SHAPE, pkg.CT_POLICY, pkg.CT_ROOT, pkg.valgrind_version = self.saved
 
 
-def package_system(path="/elsewhere/secrets.bin", pq_path="/elsewhere/pq.bin", tls_path="/elsewhere/tls.bin"):
-    return pkg.with_prefill(SYSTEM, {"secrets": path, "pq_secrets": pq_path, "tls_secrets": tls_path})
+def package_system(path="/elsewhere/secrets.bin", pq_path="/elsewhere/pq.bin", tls_path="/elsewhere/tls.bin",
+                   audit_path="/elsewhere/audit.bin"):
+    return pkg.with_prefill(SYSTEM, {"secrets": path, "pq_secrets": pq_path, "tls_secrets": tls_path,
+                                     "audit_secrets": audit_path})
 
 
 def flip(img: bytes, at: int) -> bytes:
@@ -198,8 +212,8 @@ def waivers_file(text):
     return run
 
 
-def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BLOB, tls=TLS_BLOB, lock_text=LOCK_NO_CMR,
-                harness=True, ct_green=True, record=True, real_ct=None, srk=SRK):
+def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BLOB, tls=TLS_BLOB, audit=AUDIT_BLOB,
+                lock_text=LOCK_NO_CMR, harness=True, ct_green=True, record=True, real_ct=None, srk=SRK):
     """Runs `main()` with `build` replaced and the waiver file and Cargo.lock
     pointed at scratch ones (None: absent). Returns what it printed (the success line
     dropped, the scratch dir shown as <d>), plus a note when the outcome disagrees with that output, so
@@ -229,12 +243,13 @@ def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BL
             (d / "secrets.bin").write_bytes(key)
             (d / "pq.bin").write_bytes(pq)
             (d / "tls.bin").write_bytes(tls)
+            (d / "audit.bin").write_bytes(audit)
             (d / "srk.pub").write_bytes(srk)
             (d / "gen_config.h").write_text(gen)
             (d / "kozane.system").write_text(
                 '<system>\n<program_image path="pd-pqkey.elf" />\n<program_image path="pd-pq.elf" />\n'
                 '<program_image path="pd-key.elf" />\n<program_image path="pd-tls.elf" />\n'
-                '<program_image path="pd-tlskey.elf" />\n</system>\n')
+                '<program_image path="pd-tlskey.elf" />\n<program_image path="pd-auditkey.elf" />\n</system>\n')
             if waivers_text is not None:
                 (d / "waivers.toml").write_text(waivers_text)
             pkg.WAIVERS = d / "waivers.toml"
@@ -248,7 +263,8 @@ def main_checks(gen=GEN_RELEASE, waivers_text=WAIVERS_CLOSED, key=BLOB, pq=PQ_BL
                 return 0
             pkg.build = fake_build
             sys.argv = ["package", "--secrets", str(d / "secrets.bin"), "--pq-secrets", str(d / "pq.bin"),
-                        "--tls-secrets", str(d / "tls.bin"), "--srk-public", str(d / "srk.pub"), "--firmware", "x", "--out", str(d / "pkg"), "--system", str(d / "kozane.system"), "--policy", "x", "--image", "x",
+                        "--tls-secrets", str(d / "tls.bin"), "--audit-secrets", str(d / "audit.bin"),
+                        "--srk-public", str(d / "srk.pub"), "--firmware", "x", "--out", str(d / "pkg"), "--system", str(d / "kozane.system"), "--policy", "x", "--image", "x",
                         "--gen-config", str(d / "gen_config.h"), "--search-path", str(search), "--board", "x",
                         "--config", "x", "--microkit", "x", "--harness", str(harness_path)]
             captured = io.StringIO()
@@ -334,6 +350,7 @@ def run_main(build_result):
             blob.write_bytes(BLOB)
             (d / "pq.bin").write_bytes(PQ_BLOB)
             (d / "tls.bin").write_bytes(TLS_BLOB)
+            (d / "audit.bin").write_bytes(AUDIT_BLOB)
             (d / "srk.pub").write_bytes(SRK)
             gen = d / "gen_config.h"
             gen.write_text(GEN_RELEASE)
@@ -381,7 +398,8 @@ def run_main(build_result):
 
             pkg.build = fake_build
             sys.argv = ["package", "--secrets", str(blob), "--pq-secrets", str(d / "pq.bin"),
-                        "--tls-secrets", str(d / "tls.bin"), "--srk-public", str(d / "srk.pub"), "--firmware", "x", "--out", str(out), "--system", "x", "--policy", "x",
+                        "--tls-secrets", str(d / "tls.bin"), "--audit-secrets", str(d / "audit.bin"),
+                        "--srk-public", str(d / "srk.pub"), "--firmware", "x", "--out", str(out), "--system", "x", "--policy", "x",
                         "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
                         "--config", "x", "--microkit", "x", "--harness", "x"]
             real_handlers = {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT)}
@@ -522,6 +540,7 @@ def staging_in_forbidden_root():
         blob.write_bytes(BLOB)
         (d / "pq.bin").write_bytes(PQ_BLOB)
         (d / "tls.bin").write_bytes(TLS_BLOB)
+        (d / "audit.bin").write_bytes(AUDIT_BLOB)
         (d / "srk.pub").write_bytes(SRK)
         gen = d / "gen_config.h"
         gen.write_text(GEN_RELEASE)
@@ -529,14 +548,15 @@ def staging_in_forbidden_root():
 
         def roots(repo):
             calls.append(1)
-            # The first four calls are the three blob and the OUT checks; the
-            # fifth is the staging re-check, which now sees `d` as forbidden.
-            return real_roots(repo) + ([d.resolve()] if len(calls) > 4 else [])
+            # The first five calls are the four blob and the OUT checks; the
+            # sixth is the staging re-check, which now sees `d` as forbidden.
+            return real_roots(repo) + ([d.resolve()] if len(calls) > 5 else [])
 
         pkg.forbidden_roots = roots
         pkg.build = lambda *a: built.append(1) or 0
         sys.argv = ["package", "--secrets", str(blob), "--pq-secrets", str(d / "pq.bin"),
-                    "--tls-secrets", str(d / "tls.bin"), "--srk-public", str(d / "srk.pub"), "--firmware", "x", "--out", str(d / "pkg"), "--system", "x", "--policy", "x",
+                    "--tls-secrets", str(d / "tls.bin"), "--audit-secrets", str(d / "audit.bin"),
+                    "--srk-public", str(d / "srk.pub"), "--firmware", "x", "--out", str(d / "pkg"), "--system", "x", "--policy", "x",
                     "--image", "x", "--gen-config", str(gen), "--search-path", "x", "--board", "x",
                     "--config", "x", "--microkit", "x", "--harness", "x"]
         out = io.StringIO()
@@ -546,7 +566,7 @@ def staging_in_forbidden_root():
         if status != 1 or built or (d / "pkg").exists() or [p for p in d.iterdir() if p.name.startswith(".pkg.")]:
             errors.append(f"staging in a forbidden root was not refused cleanly (status {status}, built {built})")
         # Refused by the staging re-check itself, not by an earlier check.
-        if "staging directory" not in out.getvalue() or len(calls) != 5:
+        if "staging directory" not in out.getvalue() or len(calls) != 6:
             errors.append(f"refused by another check: {out.getvalue().strip()!r}, {len(calls)} root lookups")
         return errors
     finally:
@@ -630,23 +650,27 @@ def handler_ignores_further_signals():
 
 
 def build_case(variant=None):
-    """`build` (M5 plan C8, C11) with microkit and `mksecrets seal` stood in
-    for: microkit puts each prefill where the placeholder image holds its
-    zeros, seal writes a fake envelope. The blobs must reach seal only as
-    private copies of the checked bytes and never reach microkit, the
-    descriptor must name where the stand-ins landed (the three envelopes and
-    the two bundle slots), PCR 8 must be the one measure computes, and OUT
-    must hold the outputs alone. `variant`
+    """`build` (M5 plan C8, C11) with microkit, `mksecrets seal` and
+    `mksecrets audit-public` stood in for: microkit puts each prefill where
+    the placeholder image holds its zeros, seal writes a fake envelope,
+    audit-public a fixed key. The blobs must reach seal (and the audit blob
+    audit-public) only as private copies of the checked bytes and never
+    reach microkit, the descriptor must name where the stand-ins landed (the
+    four envelopes and the two bundle slots), PCR 8 must be the one measure
+    computes, and OUT must hold the outputs alone. `variant`
     breaks one step: "tamper" (the .system microkit consumed changes),
     "standin" (the stand-in image differs outside the ranges), "envelope"
     (seal writes the plaintext), "swap" (seal writes the secrets and the
-    tls_secrets envelope each as the other's kind), "assembly" (the envelope
-    image is not the assembly). Returns the errors, or build's own output for a variant."""
+    tls_secrets envelope each as the other's kind), "audit-swap" (the same
+    for tls_secrets and audit_secrets), "assembly" (the envelope image is
+    not the assembly), "audit-pub" (audit-public writes upper-case hex),
+    "no-audit-pub" (it writes nothing). Returns the errors, or build's own
+    output for a variant."""
     return lambda: _build_case(variant)
 
 
 def envelope(mr: str) -> bytes:
-    kind = {"secrets": pkg.KEY, "pq_secrets": pkg.PQ, "tls_secrets": pkg.TLS}[mr]
+    kind = {"secrets": pkg.KEY, "pq_secrets": pkg.PQ, "tls_secrets": pkg.TLS, "audit_secrets": pkg.AUDIT}[mr]
     return pkg.ENVELOPE_MAGIC + le32(1) + le32(pkg.SEAL_KINDS[mr][1]) + bytes(range(1, 101)) \
         + bytes(kind.size - 116)
 
@@ -654,7 +678,7 @@ def envelope(mr: str) -> bytes:
 def _build_case(variant):
     d = tmp_tree()
     real_run = pkg.subprocess.run
-    microkit_saw, sealed = [], {}
+    microkit_saw, sealed, exported = [], {}, []
     try:
         (d / "slot.bin").write_bytes(bytes(SLOT))
         (d / "system.xml").write_text(SYSTEM.replace("slot-placeholder.bin", str(d / "slot.bin")))
@@ -667,13 +691,22 @@ def _build_case(variant):
             return cmd[cmd.index(flag) + 1]
 
         def fake_run(cmd, check=False, **_):
+            if cmd[:2] == ["cargo", "run"] and "mksecrets" in cmd and "audit-public" in cmd:
+                blob = pathlib.Path(arg(cmd, "--blob"))
+                exported.append((str(blob), blob.read_bytes()))
+                if variant != "no-audit-pub":
+                    pathlib.Path(arg(cmd, "--out")).write_text(AUDIT_PUB.upper() if variant == "audit-pub" else AUDIT_PUB)
+                return
             if cmd[:2] == ["cargo", "run"] and "mksecrets" in cmd:
-                mr = {"key": "secrets", "pq": "pq_secrets", "tls": "tls_secrets"}[arg(cmd, "--kind")]
+                mr = {"key": "secrets", "pq": "pq_secrets", "tls": "tls_secrets", "audit": "audit_secrets"}[
+                    arg(cmd, "--kind")]
                 blob = pathlib.Path(arg(cmd, "--blob"))
                 sealed[mr] = (str(blob), blob.read_bytes(), pathlib.Path(arg(cmd, "--srk-public")).read_bytes(),
                               arg(cmd, "--pcrs"))
-                swapped = {"secrets": "tls_secrets", "tls_secrets": "secrets"}.get(mr, mr)
-                out = BLOBS[mr] if variant == "envelope" else envelope(swapped if variant == "swap" else mr)
+                swaps = {"swap": ("secrets", "tls_secrets"), "audit-swap": ("tls_secrets", "audit_secrets")}
+                a, b = swaps.get(variant, (None, None))
+                swapped = {a: b, b: a}.get(mr, mr)
+                out = BLOBS[mr] if variant == "envelope" else envelope(swapped)
                 pathlib.Path(arg(cmd, "--out")).write_bytes(out)
                 return
             if cmd[0] == "cargo":
@@ -681,7 +714,7 @@ def _build_case(variant):
             system = pathlib.Path(cmd[1])
             img = bytearray(BUILD_IMG)
             for mr, at in (("secrets", KEY_AT), ("pq_secrets", PQ_AT), ("tls_secrets", TLS_AT),
-                           ("policy_a", SLOT_A_AT), ("policy_b", SLOT_B_AT)):
+                           ("audit_secrets", AUDIT_AT), ("policy_a", SLOT_A_AT), ("policy_b", SLOT_B_AT)):
                 prefill = [m.get("prefill_path") for m in pkg.ET.fromstring(system.read_text())
                            .iter("memory_region") if m.get("name") == mr][0]
                 data = pathlib.Path(prefill).read_bytes()
@@ -706,15 +739,19 @@ def _build_case(variant):
         if variant is not None:
             return captured.getvalue().splitlines() if status == 1 else [f"accepted (status {status})"]
         errors = [] if status == 0 else [f"build failed ({status}): {captured.getvalue()}"]
-        if any(data in (BLOB, PQ_BLOB, TLS_BLOB) for data in microkit_saw):
+        if any(data in BLOBS.values() for data in microkit_saw):
             errors.append("a blob reached microkit")
-        if len(microkit_saw) != 10:
-            errors.append(f"microkit saw {len(microkit_saw)} prefills, want two builds of five")
-        if microkit_saw[8:] != [bytes(SLOT)] * 2:
+        if len(microkit_saw) != 12:
+            errors.append(f"microkit saw {len(microkit_saw)} prefills, want two builds of six")
+        if microkit_saw[10:] != [bytes(SLOT)] * 2:
             errors.append("the envelope build's slots are not the placeholder's zeros")
+        if len(exported) != 1 or not exported[0][0].startswith(str(staging)) or exported[0][1] != AUDIT_BLOB:
+            errors.append(f"audit.pub not exported once from the audit blob's private copy: {[p for p, _ in exported]}")
+        if (staging / "audit.pub").exists() and (staging / "audit.pub").read_text() != AUDIT_PUB:
+            errors.append("audit.pub is not what audit-public wrote")
         desc = (staging / "boot.desc").read_bytes() if (staging / "boot.desc").exists() else b""
         if desc and pkg.measure.parse(desc)[1] != [(KEY_AT, len(BLOB)), (PQ_AT, len(PQ_BLOB)), (TLS_AT, len(TLS_BLOB)),
-                                                   (SLOT_A_AT, SLOT), (SLOT_B_AT, SLOT)]:
+                                                   (AUDIT_AT, len(AUDIT_BLOB)), (SLOT_A_AT, SLOT), (SLOT_B_AT, SLOT)]:
             errors.append(f"descriptor ranges {pkg.measure.parse(desc)[1]}")
         want_pcrs = pkg.measure.expected_pcrs(FLASH, desc, BUILD_IMG) if desc else []
         for mr in pkg.SECRETS_MRS:
@@ -780,7 +817,7 @@ def outside(at: int) -> list:
     return [f"package: image differs outside the blobs ({at:#x}..{at:#x} vs {SPANS})"]
 
 
-IMAGE_BLOBS = [BLOB, PQ_BLOB, TLS_BLOB]
+IMAGE_BLOBS = [BLOB, PQ_BLOB, TLS_BLOB, AUDIT_BLOB]
 
 # (name, expected: an error substring, a list of the exact errors, or None
 # for accept; check)
@@ -789,17 +826,18 @@ def assembly(tamper=False):
     with the envelopes is the published one with each at its range, the
     slots' zeros left as they were."""
     def run():
-        key, pq, tls = b"K" * 0x100, b"Q" * 0x200, b"T" * 0x100
+        key, pq, tls, audit = b"K" * 0x100, b"Q" * 0x200, b"T" * 0x100, b"A" * 0x100
         published = bytes(0x1000 + 2 * SLOT)
         built = bytearray(published)
         built[0x400:0x500] = key
         built[0x800:0xa00] = pq
         built[0xc00:0xd00] = tls
+        built[0xe00:0xf00] = audit
         if tamper:
             built[0x10] = 1
-        desc = pkg.measure.pack(len(published), [(0x400, 0x100), (0x800, 0x200), (0xc00, 0x100),
+        desc = pkg.measure.pack(len(published), [(0x400, 0x100), (0x800, 0x200), (0xc00, 0x100), (0xe00, 0x100),
                                                  (0x1000, SLOT), (0x1000 + SLOT, SLOT)])
-        return pkg.check_assembly(published, desc, [key, pq, tls, bytes(SLOT), bytes(SLOT)], bytes(built))
+        return pkg.check_assembly(published, desc, [key, pq, tls, audit, bytes(SLOT), bytes(SLOT)], bytes(built))
     return run
 
 
@@ -808,9 +846,9 @@ CASES = [
      lambda: pkg.check_systems(SYSTEM, package_system())
      + pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG, IMAGE_BLOBS)
      + pkg.check_blob(pkg.KEY, BLOB) + pkg.check_blob(pkg.PQ, PQ_BLOB) + pkg.check_blob(pkg.TLS, TLS_BLOB)
-     + pkg.require_release(GEN_RELEASE)),
-    ("all three blobs swapped in, in any order", None,
-     lambda: pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG, [TLS_BLOB, PQ_BLOB, BLOB])),
+     + pkg.check_blob(pkg.AUDIT, AUDIT_BLOB) + pkg.require_release(GEN_RELEASE)),
+    ("all four blobs swapped in, in any order", None,
+     lambda: pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG, [TLS_BLOB, AUDIT_BLOB, PQ_BLOB, BLOB])),
     ("empty image diff", "identical to the placeholder",
      lambda: pkg.check_images(PLACEHOLDER_IMG, PLACEHOLDER_IMG, IMAGE_BLOBS)),
     ("image diff outside the blob", "differs outside the blob",
@@ -829,6 +867,10 @@ CASES = [
      lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, TLS_AT - 1), IMAGE_BLOBS)),
     ("image diff just past the tls blob", outside(TLS_END),
      lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, TLS_END), IMAGE_BLOBS)),
+    ("image diff just before the audit blob", outside(AUDIT_AT - 1),
+     lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, AUDIT_AT - 1), IMAGE_BLOBS)),
+    ("image diff just past the audit blob", outside(AUDIT_END),
+     lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, AUDIT_END), IMAGE_BLOBS)),
     ("image diff in the last byte", outside(len(PACKAGE_IMG) - 1),
      lambda: pkg.check_images(PLACEHOLDER_IMG, flip(PACKAGE_IMG, len(PACKAGE_IMG) - 1), IMAGE_BLOBS)),
     ("pq blob missing from the image", ["package: 'SOSPQKY1' blob does not appear exactly once in the image"],
@@ -837,6 +879,9 @@ CASES = [
     ("tls blob missing from the image", ["package: 'SOSTLSK1' blob does not appear exactly once in the image"],
      lambda: pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG[:TLS_AT] + bytes(len(TLS_BLOB)) + PACKAGE_IMG[TLS_END:],
                               IMAGE_BLOBS)),
+    ("audit blob missing from the image", ["package: 'SOSAUDK1' blob does not appear exactly once in the image"],
+     lambda: pkg.check_images(PLACEHOLDER_IMG,
+                              PACKAGE_IMG[:AUDIT_AT] + bytes(len(AUDIT_BLOB)) + PACKAGE_IMG[AUDIT_END:], IMAGE_BLOBS)),
     ("image length changed", "length changed",
      lambda: pkg.check_images(PLACEHOLDER_IMG, PACKAGE_IMG + b"\0", IMAGE_BLOBS)),
     ("placeholder not zero under the blob", "not zero where a blob lands",
@@ -847,6 +892,9 @@ CASES = [
     ("placeholder not zero under the tls blob",
      [f"package: placeholder image is not zero where a blob lands ({TLS_AT:#x}..{TLS_END:#x})"],
      lambda: pkg.check_images(flip(PLACEHOLDER_IMG, TLS_AT + 200), PACKAGE_IMG, IMAGE_BLOBS)),
+    ("placeholder not zero under the audit blob",
+     [f"package: placeholder image is not zero where a blob lands ({AUDIT_AT:#x}..{AUDIT_END:#x})"],
+     lambda: pkg.check_images(flip(PLACEHOLDER_IMG, AUDIT_AT + 200), PACKAGE_IMG, IMAGE_BLOBS)),
     # A second copy present at the same offset in both images: no extra
     # diff, so only the uniqueness clause can reject it.
     ("blob appears twice", "exactly once",
@@ -910,7 +958,28 @@ CASES = [
      lambda: pkg.check_blob(pkg.KEY, TLS_BLOB)),
     ("key blob in the tls mr", ["package: 'tls_secrets' blob holds a 'secrets' blob (SOSSECR1)"],
      lambda: pkg.check_blob(pkg.TLS, BLOB)),
-    ("main() packages all three blobs", None, main_checks()),
+    # The `auditkey` blob (M8 plan C10): the size of the key and tls blobs,
+    # told apart by its magic; its checksum covers the 48-byte body.
+    ("audit blob accepted", None, lambda: pkg.check_blob(pkg.AUDIT, AUDIT_BLOB)),
+    ("audit blob bad magic", ["package: 'audit_secrets' blob has no SOSAUDK1 magic"],
+     lambda: pkg.check_blob(pkg.AUDIT, b"X" + AUDIT_BLOB[1:])),
+    ("audit blob version 2", ["package: 'audit_secrets' blob is version 2, expected 1"],
+     lambda: pkg.check_blob(pkg.AUDIT, resealed(AUDIT_BLOB, 8, le32(2), len(AUDIT_BODY)))),
+    ("audit blob non-zero reserved word", ["package: 'audit_secrets' blob has a non-zero reserved word"],
+     lambda: pkg.check_blob(pkg.AUDIT, resealed(AUDIT_BLOB, 12, le32(1), len(AUDIT_BODY)))),
+    ("audit blob checksum mismatch", ["package: 'audit_secrets' blob checksum mismatch"],
+     lambda: pkg.check_blob(pkg.AUDIT, flip(AUDIT_BLOB, 47))),
+    ("audit blob checksum field changed", ["package: 'audit_secrets' blob checksum mismatch"],
+     lambda: pkg.check_blob(pkg.AUDIT, flip(AUDIT_BLOB, 48))),
+    ("audit blob non-zero padding", ["package: 'audit_secrets' blob has non-zero padding"],
+     lambda: pkg.check_blob(pkg.AUDIT, flip(AUDIT_BLOB, 80))),
+    ("short audit blob", ["package: 'audit_secrets' blob is 4095 bytes, expected 4096"],
+     lambda: pkg.check_blob(pkg.AUDIT, AUDIT_BLOB[:-1])),
+    ("audit blob in the tls mr", ["package: 'tls_secrets' blob holds a 'audit_secrets' blob (SOSAUDK1)"],
+     lambda: pkg.check_blob(pkg.TLS, AUDIT_BLOB)),
+    ("tls blob in the audit mr", ["package: 'audit_secrets' blob holds a 'tls_secrets' blob (SOSTLSK1)"],
+     lambda: pkg.check_blob(pkg.AUDIT, TLS_BLOB)),
+    ("main() packages all four blobs", None, main_checks()),
     ("main() refuses the pq blob given as --secrets",
      ["package: 'secrets' blob holds a 'pq_secrets' blob (SOSPQKY1)",
       "package: 'pq_secrets' blob holds a 'secrets' blob (SOSSECR1)"],
@@ -921,6 +990,12 @@ CASES = [
      main_checks(key=TLS_BLOB, tls=BLOB)),
     ("main() refuses a bad tls blob", ["package: 'tls_secrets' blob has a non-zero reserved word"],
      main_checks(tls=resealed(TLS_BLOB, 12, le32(1), len(TLS_BODY)))),
+    ("main() refuses the tls and audit blobs swapped",
+     ["package: 'tls_secrets' blob holds a 'audit_secrets' blob (SOSAUDK1)",
+      "package: 'audit_secrets' blob holds a 'tls_secrets' blob (SOSTLSK1)"],
+     main_checks(tls=AUDIT_BLOB, audit=TLS_BLOB)),
+    ("main() refuses a bad audit blob", ["package: 'audit_secrets' blob checksum mismatch"],
+     main_checks(audit=flip(AUDIT_BLOB, 20))),
     ("main() refuses a bad pq blob", ["package: 'pq_secrets' blob checksum mismatch"],
      main_checks(pq=flip(PQ_BLOB, 100))),
     ("other attribute changed", "attributes of <protection_domain>",
@@ -935,6 +1010,9 @@ CASES = [
     ("package system without the tls mr's prefill_path",
      ["package: package system needs one 'tls_secrets' mr with a prefill_path"],
      lambda: pkg.check_systems(SYSTEM, package_system().replace('prefill_path="/elsewhere/tls.bin"', 'prefill_path=""'))),
+    ("package system without the audit mr's prefill_path",
+     ["package: package system needs one 'audit_secrets' mr with a prefill_path"],
+     lambda: pkg.check_systems(SYSTEM, package_system().replace('prefill_path="/elsewhere/audit.bin"', 'prefill_path=""'))),
     ("package system without a bundle slot's prefill_path",
      ["package: package system needs one 'policy_b' mr with a prefill_path"],
      lambda: pkg.check_systems(SYSTEM, package_system().replace(
@@ -1047,11 +1125,18 @@ CASES = [
      [f"package: image differs outside the blobs (0x2..0x2 vs {BUILD_SPANS})"], build_case("standin")),
     ("an envelope that is not sealed is refused",
      ["package: 'secrets' envelope has no SOSSEAL1 magic", "package: 'pq_secrets' envelope has no SOSSEAL1 magic",
-      "package: 'tls_secrets' envelope has no SOSSEAL1 magic"],
+      "package: 'tls_secrets' envelope has no SOSSEAL1 magic", "package: 'audit_secrets' envelope has no SOSSEAL1 magic"],
      build_case("envelope")),
     ("secrets and tls_secrets envelopes sealed as each other's kind are refused",
      ["package: 'secrets' envelope is not of its mr's kind", "package: 'tls_secrets' envelope is not of its mr's kind"],
      build_case("swap")),
+    ("tls_secrets and audit_secrets envelopes sealed as each other's kind are refused",
+     ["package: 'tls_secrets' envelope is not of its mr's kind",
+      "package: 'audit_secrets' envelope is not of its mr's kind"],
+     build_case("audit-swap")),
+    ("an audit.pub that is not lower-case hex is refused",
+     ["package: audit.pub is not 64 lowercase hex digits and a newline"], build_case("audit-pub")),
+    ("a missing audit.pub is refused", "package: cannot read audit.pub", build_case("no-audit-pub")),
     ("an envelope image that is not the boot-time assembly is refused",
      ["package: the boot-time assembly differs from the image microkit built with the envelopes"],
      build_case("assembly")),
@@ -1078,9 +1163,11 @@ CASES = [
      lambda: pkg.check_envelope(pkg.KEY, envelope("tls_secrets"))),
     ("a secrets envelope in the tls mr is refused", ["package: 'tls_secrets' envelope is not of its mr's kind"],
      lambda: pkg.check_envelope(pkg.TLS, envelope("secrets"))),
+    ("a tls envelope in the audit mr is refused", ["package: 'audit_secrets' envelope is not of its mr's kind"],
+     lambda: pkg.check_envelope(pkg.AUDIT, envelope("tls_secrets"))),
     ("sealed envelopes of their kinds are accepted", None,
      lambda: pkg.check_envelope(pkg.KEY, envelope("secrets")) + pkg.check_envelope(pkg.PQ, envelope("pq_secrets"))
-     + pkg.check_envelope(pkg.TLS, envelope("tls_secrets"))),
+     + pkg.check_envelope(pkg.TLS, envelope("tls_secrets")) + pkg.check_envelope(pkg.AUDIT, envelope("audit_secrets"))),
     ("main() refuses an SRK public that is not a TPM2B_PUBLIC",
      ["package: --srk-public is 91 bytes, not an SRK TPM2B_PUBLIC (2 + 90, as tpm2_readpublic -o writes it)"],
      main_checks(srk=SRK[:-1])),

@@ -157,7 +157,7 @@ def listed_image_missing():
 
 SYSTEM_TWO = ('<program_image path="pd-pqkey.elf" />\n<program_image path="pd-pq.elf" />\n'
               '<program_image path="pd-key.elf" />\n<program_image path="pd-tls.elf" />\n'
-              '<program_image path="pd-tlskey.elf" />\n')
+              '<program_image path="pd-tlskey.elf" />\n<program_image path="pd-auditkey.elf" />\n')
 
 
 def bm_with(old: str, new: str) -> list:
@@ -347,7 +347,7 @@ def cli(**kw):
                 want_third = "ct-shape: pd-ingress.elf: identity: mce460896::decaps is McEliece code in a PD outside"
                 return [] if r.returncode == 1 and any(l.startswith(want_third) for l in lines) \
                     else [f"exit {r.returncode}: {lines}"]
-            return [] if (r.returncode, lines) == ((1, lines) if mutated else (0, ["CT-SHAPE-SYMBOLS 15"])) \
+            return [] if (r.returncode, lines) == ((1, lines) if mutated else (0, ["CT-SHAPE-SYMBOLS 17"])) \
                 and (not mutated or len(lines) == 2) else [f"exit {r.returncode}: {lines}"]
         finally:
             shutil.rmtree(d)
@@ -526,7 +526,7 @@ CASES = [
      cli(system_text="<program_image />\n", want="a program_image without a path")),
     ("a system file without a root's image fails", None,
      cli(system_text='<program_image path="pd-pqkey.elf" />\n',
-         want="no program_image pd-key.elf, pd-pq.elf, pd-tls.elf, pd-tlskey.elf")),
+         want="no program_image pd-auditkey.elf, pd-key.elf, pd-pq.elf, pd-tls.elf, pd-tlskey.elf")),
     ("a PD the system file lists but the search path lacks fails",
      ["pd-gone.elf: identity: cannot read <search>/pd-gone.elf: No such file or directory"],
      lambda: [e.replace(e[e.index("read ") + 5:e.index("/pd-gone")], "<search>") for e in listed_image_missing()()]),

@@ -266,9 +266,75 @@ mod tls_blob {
     }
 }
 
+mod audit_blob {
+    extern crate std;
+
+    use super::super::audit::*;
+    use super::super::{BlobError, blake2s};
+
+    fn sample() -> [u8; REGION_SIZE] {
+        let mut out = [0u8; REGION_SIZE];
+        assert_eq!(write(&mut out, &[0x71; 32]), Some(USED_LEN));
+        out
+    }
+
+    #[test]
+    fn round_trip_exposes_the_seed() {
+        let r = sample();
+        assert_eq!(Blob::parse(&r).unwrap().seed(), &[0x71; 32]);
+    }
+
+    #[test]
+    fn offsets_are_the_documented_layout() {
+        // Pinned numerically: tools/package checks the checksum at
+        // CHECKSUM_AT.
+        assert_eq!([SEED_AT, CHECKSUM_AT, USED_LEN], [16, 48, 80]);
+        let r = sample();
+        assert_eq!(&r[..8], b"SOSAUDK1");
+        assert_eq!(&r[8..12], &1u32.to_le_bytes());
+        assert_eq!(&r[12..16], &[0; 4]);
+        assert_eq!(&r[SEED_AT..CHECKSUM_AT], &[0x71; 32]);
+        assert_eq!(&r[CHECKSUM_AT..USED_LEN], &blake2s(&[&r[..CHECKSUM_AT]]));
+        assert!(r[USED_LEN..].iter().all(|b| *b == 0));
+    }
+
+    #[test]
+    fn each_validation_failure_has_its_own_error() {
+        let mut r = sample();
+        r[0] ^= 1;
+        assert_eq!(Blob::parse(&r).err(), Some(BlobError::BadMagic));
+        for version in [0u32, 2] {
+            let mut r = sample();
+            r[8..12].copy_from_slice(&version.to_le_bytes());
+            assert_eq!(Blob::parse(&r).err(), Some(BlobError::BadVersion), "version {version}");
+        }
+        let mut r = sample();
+        r[12] = 1;
+        assert_eq!(Blob::parse(&r).err(), Some(BlobError::BadVersion), "reserved");
+        let mut r = sample();
+        r[SEED_AT + 5] ^= 1;
+        assert_eq!(Blob::parse(&r).err(), Some(BlobError::BadChecksum));
+        let mut r = sample();
+        r[REGION_SIZE - 1] = 1;
+        assert_eq!(Blob::parse(&r).err(), Some(BlobError::NonZeroPadding));
+        assert_eq!(Blob::parse(&r[..REGION_SIZE - 1]).err(), Some(BlobError::TooSmall));
+        assert_eq!(Blob::parse(&[0u8; REGION_SIZE]).err(), Some(BlobError::BadMagic));
+    }
+
+    #[test]
+    fn magics_keep_the_audit_and_other_4k_blobs_apart() {
+        // The key, TLS and audit regions are all 4096 bytes: only the magic
+        // tells them apart.
+        let audit = sample();
+        assert_eq!(super::super::Blob::parse(&audit).err(), Some(BlobError::BadMagic));
+        assert_eq!(super::super::tls::Blob::parse(&audit).err(), Some(BlobError::BadMagic));
+        assert_eq!(Blob::parse(&super::sample()).err(), Some(BlobError::BadMagic));
+    }
+}
+
 extern crate std;
 
-/// tools/package re-implements the three layouts in Python; it is checked
+/// tools/package re-implements the four layouts in Python; it is checked
 /// here so either side drifting fails `unit`, not only a packaged boot.
 #[test]
 fn tools_package_mirrors_the_blob_layouts() {
@@ -297,7 +363,15 @@ fn tools_package_mirrors_the_blob_layouts() {
         crate::tls::REGION_SIZE,
         crate::tls::CHECKSUM_AT
     );
+    let audit = std::format!(
+        "AUDIT = BlobKind(\"audit_secrets\", b\"{}\", {}, {}, lambda _blob: {})",
+        ascii(&crate::audit::MAGIC),
+        crate::audit::VERSION,
+        crate::audit::REGION_SIZE,
+        crate::audit::CHECKSUM_AT
+    );
     assert!(package.contains(&key), "tools/package does not declare: {key}");
+    assert!(package.contains(&audit), "tools/package does not declare: {audit}");
     assert!(package.contains(&pq), "tools/package does not declare: {pq}");
     assert!(package.contains(&tls), "tools/package does not declare: {tls}");
 }

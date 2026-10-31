@@ -41,6 +41,9 @@ pub const CC_PCR_EXTEND: u32 = 0x182;
 pub const CC_NV_INCREMENT: u32 = 0x134;
 pub const CC_NV_READ: u32 = 0x14E;
 pub const CC_NV_READ_PUBLIC: u32 = 0x169;
+/// `auditkey`'s alone, before its Done (M8 plan C3, C10): resetCount and
+/// restartCount for its checkpoints.
+pub const CC_READ_CLOCK: u32 = 0x181;
 /// Commands the device never issues (M8 plan C3, I3.2): named so the gate's
 /// refused set can list them.
 pub const CC_NV_UNDEFINE_SPACE_SPECIAL: u32 = 0x11F;
@@ -193,6 +196,10 @@ pub const PCR_EXTEND_CMD_LEN: usize = HEADER_LEN + 4 + PW_AUTH_LEN + 4 + 2 + DIG
 pub const NV_READ_PUBLIC_CMD_LEN: usize = HEADER_LEN + 4;
 pub const NV_READ_CMD_LEN: usize = HEADER_LEN + 8 + PW_AUTH_LEN + 2 + 2;
 pub const NV_INCREMENT_CMD_LEN: usize = HEADER_LEN + 8 + PW_AUTH_LEN;
+pub const READ_CLOCK_CMD_LEN: usize = HEADER_LEN;
+/// TPMS_TIME_INFO: time u64, then TPMS_CLOCK_INFO (clock u64, resetCount
+/// u32, restartCount u32, safe u8).
+pub const TIME_INFO_LEN: usize = 8 + 8 + 4 + 4 + 1;
 /// TPMS_NV_PUBLIC with a SHA-256 authPolicy: nvIndex, nameAlg, attributes,
 /// authPolicy (32), dataSize.
 pub const NV_PUBLIC_LEN: usize = 4 + 2 + 4 + 2 + DIGEST_LEN + 2;
@@ -211,7 +218,7 @@ pub const MAX_COMMAND: usize = max(
         max(max(IMPORT_CMD_LEN, MAX_LOAD_CMD_LEN), max(UNSEAL_CMD_LEN, FLUSH_CONTEXT_CMD_LEN)),
         max(
             max(PCR_READ_CMD_LEN, PCR_EXTEND_CMD_LEN),
-            max(NV_READ_PUBLIC_CMD_LEN, max(NV_READ_CMD_LEN, NV_INCREMENT_CMD_LEN)),
+            max(max(NV_READ_PUBLIC_CMD_LEN, READ_CLOCK_CMD_LEN), max(NV_READ_CMD_LEN, NV_INCREMENT_CMD_LEN)),
         ),
     ),
 );
@@ -548,6 +555,13 @@ pub fn nv_increment(out: &mut [u8], index: u32) -> Option<usize> {
     w.finish()
 }
 
+/// TPM2_ReadClock: no handles, no sessions, no parameters.
+pub fn read_clock(out: &mut [u8]) -> Option<usize> {
+    let mut w = Writer::new(out);
+    header(&mut w, ST_NO_SESSIONS, CC_READ_CLOCK)?;
+    w.finish()
+}
+
 /// Checks the header against the bytes received and returns the reader
 /// past it. A nonzero response code is returned as `Tpm`, with nothing
 /// after the header (TPM 2.0 Part 1: an error response is the header alone).
@@ -768,6 +782,32 @@ pub fn parse_nv_read(bytes: &[u8]) -> Result<u64, RspError> {
 pub fn parse_nv_increment(bytes: &[u8]) -> Result<(), RspError> {
     let s = password_response(bytes, false)?;
     if s.params.is_empty() { Ok(()) } else { Err(RspError::Malformed) }
+}
+
+/// ReadClock's TPMS_TIME_INFO. `time` and `clock` are informational; a
+/// checkpoint binds the two counts (M8 plan C10).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockRsp {
+    pub time: u64,
+    pub clock: u64,
+    /// TPM Resets (cold boots) since the last TPM2_Clear.
+    pub reset_count: u32,
+    /// TPM Restarts since the last Reset.
+    pub restart_count: u32,
+    pub safe: u8,
+}
+
+/// ReadClock's response: exactly one TPMS_TIME_INFO.
+pub fn parse_read_clock(bytes: &[u8]) -> Result<ClockRsp, RspError> {
+    let mut r = response_header(bytes, ST_NO_SESSIONS)?;
+    let mut u64_be = || r.array::<8>().map(|b| u64::from_be_bytes(*b));
+    let time = u64_be()?;
+    let clock = u64_be()?;
+    let reset_count = r.u32()?;
+    let restart_count = r.u32()?;
+    let safe = r.u8()?;
+    r.end()?;
+    Ok(ClockRsp { time, clock, reset_count, restart_count, safe })
 }
 
 /// Writes TPMS_NV_PUBLIC of a SHA-256 index: what its Name hashes (the

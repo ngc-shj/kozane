@@ -6,7 +6,8 @@
 //! |--------|--------------------------------------------------------------|
 //! | 0      | magic "SOSSEAL1"                                             |
 //! | 8      | version u32 = 1 (little-endian, as the other blobs)          |
-//! | 12     | kind u32: 1 = `key`'s blob, 2 = `pqkey`'s, 3 = `tlskey`'s    |
+//! | 12     | kind u32: 1 = `key`'s blob, 2 = `pqkey`'s, 3 = `tlskey`'s,   |
+//! |        | 4 = `auditkey`'s (M8 plan C10)                               |
 //! | 16     | payload_len u32: plaintext bytes                             |
 //! | 20     | pinned SRK Name (34)                                         |
 //! | 54     | pinned SRK public, TPM2B_PUBLIC (2 + 90)                     |
@@ -70,6 +71,9 @@ pub enum Kind {
     /// The same size as `Key`'s: the kind in the AAD and the blobs' magics
     /// keep the two apart.
     Tls,
+    /// `auditkey`'s checkpoint key, the `audit_secrets` region (M8 plan
+    /// C10). The same size as `Key`'s and `Tls`'s, kept apart as they are.
+    Audit,
 }
 
 impl Kind {
@@ -78,6 +82,7 @@ impl Kind {
             Kind::Key => 1,
             Kind::Pq => 2,
             Kind::Tls => 3,
+            Kind::Audit => 4,
         }
     }
 
@@ -87,6 +92,7 @@ impl Kind {
             Kind::Key => secret_blob::REGION_SIZE,
             Kind::Pq => pq::REGION_SIZE,
             Kind::Tls => secret_blob::tls::REGION_SIZE,
+            Kind::Audit => secret_blob::audit::REGION_SIZE,
         }
     }
 
@@ -100,6 +106,7 @@ impl Kind {
 const _: () = assert!(secret_blob::USED_LEN <= Kind::Key.capacity());
 const _: () = assert!(pq::USED_LEN <= Kind::Pq.capacity());
 const _: () = assert!(secret_blob::tls::USED_LEN <= Kind::Tls.capacity());
+const _: () = assert!(secret_blob::audit::USED_LEN <= Kind::Audit.capacity());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EnvError {

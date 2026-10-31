@@ -2,7 +2,7 @@
 """Signed releases and their verification (M5 plan C13, C12).
 
   release.py make --keys DIR --pkg DIR --out DIR [--version V] [--allow-dirty]
-  release.py verify --pub DIR --release DIR [--envelope FILE --kind key|pq|tls] [--allow-dirty]
+  release.py verify --pub DIR --release DIR [--envelope FILE --kind key|pq|tls|audit] [--allow-dirty]
 
 `make` writes OUT/{manifest, manifest.sig, published.img, boot.desc,
 flash.bin}. The manifest's image, descriptor and firmware digests and its
@@ -19,7 +19,7 @@ and PCRs 0-8 from the shipped files and compares them with the signed
 fields, and refuses a release_seq other than crates/release-seq's: the
 release is checked against the source it claims to be; with --envelope it
 also checks that the envelope (of --kind: `key`'s,
-`pqkey`'s or `tlskey`'s) has a sealed object that enforces the signed PCRs
+`pqkey`'s, `tlskey`'s or `auditkey`'s) has a sealed object that enforces the signed PCRs
 (`mksecrets check-envelope`, the PDs' own parser).
 
 Control class: fail-closed verification gate; a missing file, a failing tool
@@ -182,7 +182,7 @@ def main() -> int:
     v.add_argument("--pub", required=True)
     v.add_argument("--release", required=True)
     v.add_argument("--envelope")
-    v.add_argument("--kind", choices=("key", "pq", "tls"))
+    v.add_argument("--kind", choices=("key", "pq", "tls", "audit"))
     v.add_argument("--allow-dirty", action="store_true")
     a = ap.parse_args()
     if a.cmd == "verify" and bool(a.envelope) != bool(a.kind):

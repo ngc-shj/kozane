@@ -1,0 +1,51 @@
+# M8 plan C10, C11: `auditkey`, a key pd with one pp caller (`audit`),
+# its own secrets mr alone, and a notify to `audit` on that caller's
+# channel at the end of its init.
+# Deny: a second pd calls it (L2).
+[pds.audit]
+role = "service"
+
+[pds.auditkey]
+role = "key"
+
+[pds.tpm]
+role = "tpm"
+
+[pds.other]
+role = "service"
+
+[mrs.tis]
+kind = "device"
+owner = "tpm"
+phys_addr = 0xc000000
+size = 0x1000
+tpm = true
+
+[mrs.audit_secrets]
+kind = "secrets"
+owner = "auditkey"
+
+[[channels]]
+between = ["audit", "auditkey"]
+pp = { audit = true, auditkey = false }
+notify = { audit = false, auditkey = true }
+
+[[channels]]
+between = ["auditkey", "tpm"]
+pp = { auditkey = true, tpm = false }
+notify = { auditkey = false, tpm = false }
+
+[[channels]]
+between = ["other", "auditkey"]
+pp = { other = true, auditkey = false }
+notify = { other = false, auditkey = true }
+
+[priority]
+below = [["service", "key"], ["key", "tpm"]]
+
+[budgets]
+ratio_cap = 0.5
+ratio_sum_cap = 0.9
+
+[board]
+ram = [{ start = 0x4000_0000, size = 0x8000_0000 }]

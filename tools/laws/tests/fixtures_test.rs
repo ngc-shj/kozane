@@ -1124,3 +1124,42 @@ fn callers_on_a_pd_that_is_not_a_policy_pd_is_a_policy_error() {
 fn a_policy_caller_naming_an_undeclared_pd_is_a_policy_error() {
     assert_parse_error_naming("policy_caller_undeclared_deny", "policy references undeclared pd 'tls'");
 }
+
+// M8 plan C10, C11: `auditkey` is a key pd with one pp caller (`audit`),
+// its own secrets mr alone, and a notify to `audit` at the end of its init
+// on that caller's channel; the key rules are otherwise unchanged.
+
+#[test]
+fn auditkey_called_and_notified_by_audit_alone_is_allowed() {
+    assert_allow("auditkey_audit_caller_allow");
+}
+
+#[test]
+fn a_second_caller_of_auditkey_is_l2() {
+    assert_deny_exactly(
+        "auditkey_second_caller_deny",
+        &["L2: key pd 'auditkey' has 2 pp callers, at most one: audit, other"],
+    );
+}
+
+#[test]
+fn auditkey_notifying_a_pd_other_than_its_caller_is_l1() {
+    assert_deny_exactly(
+        "auditkey_notify_other_deny",
+        &["L1: channel between key pd 'auditkey' and 'other' does not meet the key exemption (peer pp=true, key \
+           pp=false, peer notify=false, key maps only the secrets mr)"],
+    );
+}
+
+#[test]
+fn auditkey_mapping_an_audit_ring_is_l1_l2() {
+    assert_deny_exactly(
+        "auditkey_maps_audit_ring_deny",
+        &[
+            "L1: channel between key pd 'auditkey' and 'audit' does not meet the key exemption (peer pp=true, key \
+             pp=false, peer notify=false, key maps only the secrets mr)",
+            "L1: key pd 'auditkey' maps mr 'audit_auditkey', not just the secrets mr",
+            "L2: key pd 'auditkey' maps mr 'audit_auditkey', which is not its own secrets mr",
+        ],
+    );
+}

@@ -18,9 +18,9 @@
 /// each its index here as `id`; `layout`'s tests check the two agree).
 /// New children take the next id, so a record's id keeps naming the same
 /// PD across releases.
-pub const CHILDREN: [&str; 16] = [
+pub const CHILDREN: [&str; 17] = [
     "eth_out", "eth_in", "timer", "tpm", "rng", "key", "pqkey", "tlskey", "hs", "pq", "ingress", "data", "inner",
-    "tls", "audit", "policy",
+    "tls", "audit", "policy", "auditkey",
 ];
 
 /// What the supervisor does with a fault: always a reset. The child and
