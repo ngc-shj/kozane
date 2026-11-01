@@ -1,6 +1,6 @@
 # Code Review: kozane-m8-peer-policy
 Date: 2026-11-01
-Review round: 6
+Review round: 7
 
 ## Changes from Previous Round
 Initial review, at 751e95b, after Phase 2 Step 2-5's self-check (D-23).
@@ -651,3 +651,51 @@ confirmed resolved, except T-F3 (the Kani counts, still open) and T-F6
   approval case.
 - **T6-5:** `restore_with_heads` uses `{who}-restore.head`.
 - **T6-A1:** the comment is fixed.
+
+## Round 7 (661bb66..ac791c3)
+
+### Findings
+- **Functionality:**
+  - F7-1 Minor: "every copy shares v0" holds per ledger, not per pin.
+  - F7-2 Minor: the runbook omitted the 300 s future-skew refusal.
+- **Security:**
+  - S7-1 Minor: freshness runs on the restore host's clock. Within 24 h,
+    or with the clock set back, stored approvals still replay, so D-24
+    overstated it.
+  - S7-2 Minor: P31 missed an aliased `include` (`use core::include as
+    x;`).
+- **Testing:**
+  - T7-1 Major: every P31 `mod` fixture also carried a `path` attribute
+    and vice versa, so neither arm was pinned.
+  - T7-2 Major: the genesis-supersede fixture ran on a ledger at v0, so
+    "v0" and "the copy's head" were indistinguishable.
+  - T7-3 Minor: a temp dir leaked if setup panicked.
+
+### Round 7 Resolution Status
+- **F7-1:** D-24, the comment and the runbook say "every copy of this
+  ledger" and give the recovery: remove the head file, and the next
+  `approve` starts it again.
+- **F7-2:** the runbook names the 5-minute skew and asks for synced
+  clocks.
+- **S7-1 — Accepted, with the docs made honest:**
+  - D-24 and the runbook now say what the window does and does not stop.
+    `restore` is no stronger than copying the files. What holds is each
+    approver's head at their next `approve`, and every node's counter.
+  - The residual's "roster of four or more" now applies only to fresh
+    approvals.
+  - Anti-Deferral check: a code control would still rest on files the
+    operator supplies.
+- **S7-2:** P31 refuses any `include` token. Fixture: include through an
+  alias.
+- **T7-1:**
+  - The mod fixtures (split raw-identifier, macro-made) no longer carry a
+    `path` attribute.
+  - New fixture: a `path` attribute with no `mod`.
+  - Red-proved arm by arm with a direct `check_audit_call` run on the
+    real audit source plus each fixture text. Without the mod arm,
+    split raw and macro go silent. Without the include arm, alias and
+    newline go silent. Without the path arm, path-only goes silent.
+- **T7-2:** the fixture signs v1 before the supersede and asserts that
+  the head records `version=0` and `approved_version=-`. Red-proved with
+  the copy-head mutant.
+- **T7-3:** the test's temp dir is removed by a drop guard.

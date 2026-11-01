@@ -709,12 +709,22 @@ changes go beyond the plan's text:
   Round 6 changed three more things:
   - Suppose an approver approved v0 while the ledger was empty, and then
     hands that approval back in an `approve-restore`. Their head then
-    keeps the copy's v0 as its ledger half. Every copy of the fleet shares
-    v0, so this cannot wedge them, and the head still records something
-    (S6-3, F6-1).
-  - A restore approval is good for 24 hours (300 s of skew), so approvals
-    kept from one restore cannot be replayed later onto a copy cut back to
-    that height (S6-1).
+    keeps the copy's v0 as its ledger half, and still records something
+    (S6-3, F6-1). Every copy of the same ledger shares that v0. A copy of
+    another ledger made under the same pin and keys (a re-genesis that
+    kept the pin) does not, so superseding against it records the wrong
+    v0 (round 7, F7-1). Recovery is to remove the head file: the next
+    `approve` starts it again.
+  - A restore approval is good for 24 hours (300 s of skew), measured
+    against the restore host's clock (S6-1). That narrows replay; it does
+    not stop it. Within the window, or on a host whose clock is set back,
+    the approvals kept from one restore still restore a copy cut back to
+    that height, with no approver and on any roster size (round 7, S7-1).
+    `restore` is no stronger than a copy of the files. The controls that
+    hold are elsewhere:
+    - each approver's head refuses the cut-back ledger at their next
+      `approve` (truncation of an approved version);
+    - every node refuses a version below its counter.
   - The bundle keys an approver passes to `approve-restore` are their own
     trusted copy.
 
@@ -726,7 +736,9 @@ changes go beyond the plan's text:
   - The restore operator chooses which approvers' heads reach `restore`.
     A copy missing the newest signed version restores when neither of that
     version's approvers is a restore approver and their heads are not
-    passed. That needs a roster of four or more and the operator's intent.
+    passed. With fresh approvals this needs a roster of four or more. With
+    replayed ones (above) any roster works. Either way the approvers' heads
+    catch it at their next `approve`.
   - `--supersede` verifies under the ledger's current roster, so an
     approver whose key was rotated after a fork cannot hand back the older
     approval. They are refused, not let through. Picking a roster from the

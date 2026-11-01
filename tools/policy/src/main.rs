@@ -906,7 +906,8 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
             // recorded (the next `approve` on the restored ledger does that).
             // A handed-back genesis approval would leave nothing recorded
             // (S6-3): the copy's v0 then becomes the ledger half, which every
-            // copy of this fleet shares, so it wedges nothing.
+            // copy of this ledger shares (D-24: not a copy of another ledger
+            // under the same pin).
             let ledger_half = match (head.ledger, superseded) {
                 (None, true) => Some((0, crate::head_body_sha256(&copy.read_entry(0)?)?)),
                 (l, _) => l,

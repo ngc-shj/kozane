@@ -243,14 +243,20 @@ fn restore_approvals_at(dir: &std::path::Path, ts: u64) -> (Roster, Vec<String>)
 
 #[test]
 fn restore_refuses_approvals_older_than_a_day() {
-    let dir = std::env::temp_dir().join(format!("policy-restore-age-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    /// Removes the directory however the test ends.
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = TempDir(std::env::temp_dir().join(format!("policy-restore-age-{}", std::process::id())));
+    std::fs::create_dir_all(&dir.0).unwrap();
     let now = 2_000_000;
-    let (roster, fresh) = restore_approvals_at(&dir, now - 60);
-    let (old_roster, stale) = restore_approvals_at(&dir, now - approval::RESTORE_APPROVAL_MAX_AGE_S - 1);
+    let (roster, fresh) = restore_approvals_at(&dir.0, now - 60);
+    let (old_roster, stale) = restore_approvals_at(&dir.0, now - approval::RESTORE_APPROVAL_MAX_AGE_S - 1);
     let fresh_ok = crate::check_restore_approvals(&fresh, &roster, 7, &[4; 32], &[3; 16], now);
     let stale_err = crate::check_restore_approvals(&stale, &old_roster, 7, &[4; 32], &[3; 16], now);
-    std::fs::remove_dir_all(&dir).unwrap();
     assert_eq!(fresh_ok.map(|v| v.len()), Ok(2));
     assert!(stale_err.is_err_and(|e| e.contains("ago: approvals are for one recovery")));
 }

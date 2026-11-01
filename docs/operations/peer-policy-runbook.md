@@ -310,8 +310,14 @@ slot comes from the ledger (`entries/`) and is checked with
   handed-back approval is then cleared from their head. It verifies the
   copy with the bundle public keys (`--keys-pub`, the approver's own
   trusted copy), as `restore` does. A restore approval is good for 24
-  hours: `restore` refuses older ones, so approve right before the
-  restore. An
+  hours: `restore` refuses older ones, and ones dated more than 5 minutes
+  ahead of the restore host's clock, so approve right before the restore
+  and keep the clocks in sync. That clock is the restore host's, so the
+  window limits replay but does not prevent it. What catches a cut-back
+  ledger is each approver's own head at their next `approve`. Superseding a genesis approval records the
+  copy's v0 in the head; if that was a copy of the wrong ledger, the
+  approver removes their head file and starts it again at their next
+  `approve`. An
   approver without a head file (a wiped device) cannot approve a restore,
   so a restore needs two approvers whose head files survived: on a
   two-member roster that has lost one, the fleet starts a new ledger at a

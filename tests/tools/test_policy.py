@@ -975,10 +975,16 @@ def case_superseding_a_genesis_approval_leaves_a_usable_head(d):
                     "--approver-key", ctx.approver_key["carol"], "--approver-id", "carol", "--head", head,
                     "--out", d / "cg.approval")
     assert rc2 == 0, out2
+    # The copy's head is v1, so v0 in carol's head is the v0 rule and not
+    # the copy's head (T7-2).
+    rcs, outs = ctx.sign(ctx.draft1, [ctx.a1, ctx.b1], d / "slot1.bin")
+    assert rcs == 0, outs
     rc3, out3 = carol_approves_restore(ctx, d, ctx.ledger, head, "--supersede", d / "cg.approval")
+    text = head.read_text()
+    head_ok = "version=0\n" in text and "approved_version=-" in text
     rc4, out4 = run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--from", ctx.ledger, "--approver-key",
                     ctx.approver_key["carol"], "--approver-id", "carol", "--head", head, "--out", d / "rc2.approval")
-    return rc3 == 0 and rc4 == 0, out3 + out4
+    return rc3 == 0 and head_ok and rc4 == 0, out3 + text + out4
 
 
 def case_approve_restore_with_a_blank_head(d):

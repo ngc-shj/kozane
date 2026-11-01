@@ -1270,9 +1270,10 @@ def check_audit_call(root: pathlib.Path, out: list):
     # One source file: a module beside main.rs, or code pulled in from
     # elsewhere, could call `sign` unseen.
     # Over the whole text, not by line. audit is one file with no modules,
-    # so any `mod` token (split, raw, macro-generated), any `include` `!`,
-    # and any attribute with a `path` key is refused outright.
-    for m in re.finditer(r"\bmod\b|\binclude\s*!|#\s*!?\s*\[[^\]]*\bpath\b", stripped):
+    # so any `mod` token (split, raw, macro-generated), any `include` token
+    # (an alias, `use core::include as x;`, is one too) and any attribute
+    # with a `path` key is refused outright.
+    for m in re.finditer(r"\bmod\b|\binclude\b|#\s*!?\s*\[[^\]]*\bpath\b", stripped):
         n = stripped.count("\n", 0, m.start()) + 1
         out.append(f"P31 {AUDIT_MAIN}:{n}: an out-of-line module or include! pulls in code the one-call-site check does not read (M8 plan C10)")
     others = sorted(str(f.relative_to(root)) for f in path.parent.rglob("*.rs") if f != path)
