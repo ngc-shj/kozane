@@ -348,7 +348,7 @@ fn unseal_after_the_cap_is_refused() {
 /// and leaves the gate, its once-bits and every state, exactly as it was;
 /// once the owner has finished, the same client's whole setup is forwarded.
 #[kani::proof]
-#[kani::unwind(14)]
+#[kani::unwind(36)]
 fn a_fresh_client_is_busy_without_effect_and_runs_after_the_owner_finishes() {
     let (owner, other) = any_two_clients();
     let owner_primary = any_transient();
@@ -428,7 +428,7 @@ impl CapTransport for ScriptedDevice {
 /// and the device confirmed the extend; whichever subset finished and
 /// however, whether the cap ran or not, whatever the device answered.
 #[kani::proof]
-#[kani::unwind(14)]
+#[kani::unwind(36)]
 fn cap_status_is_pure_and_never_confirmed_before_a_confirmed_extend() {
     let mut g = Gate::new();
     let finished: [bool; gate::CLIENTS] = kani::any();
