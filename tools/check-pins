@@ -832,6 +832,32 @@ REGISTRY = "registry+https://github.com/rust-lang/crates.io-index"
 VERUS_VENDORED = re.compile(r"^(vstd|verus_[a-z_]+)$")
 
 
+DEP_KINDS = ("dependencies", "dev-dependencies", "build-dependencies", "dev_dependencies", "build_dependencies")
+
+
+def dependency_entries(doc: dict, ws_deps: dict) -> list:
+    """Every dependency a parsed Cargo.toml declares, as (table, key, spec,
+    package): `[workspace.dependencies]`, the top-level and `target.*`
+    tables of every kind (both spellings), with an inherited entry
+    (`workspace = true`) resolved to the package its workspace declaration
+    names. Shared by P16 and P27, so the two read manifests alike (R48)."""
+    tables = [("workspace.dependencies", doc.get("workspace", {}).get("dependencies", {}))]
+    scopes = [("", doc)] + [(f"target.{t}.", v) for t, v in doc.get("target", {}).items() if isinstance(v, dict)]
+    for prefix, scope in scopes:
+        for kind in DEP_KINDS:
+            tables.append((f"{prefix}{kind}", scope.get(kind) or {}))
+    entries = []
+    for table, deps in tables:
+        for key, spec in (deps.items() if isinstance(deps, dict) else []):
+            spec = spec if isinstance(spec, dict) else {"version": spec}
+            package = spec.get("package", key)
+            if spec.get("workspace") is True:
+                declared = ws_deps.get(key, {})
+                package = declared.get("package", key) if isinstance(declared, dict) else key
+            entries.append((table, key, spec, package))
+    return entries
+
+
 def check_mce_deps(root: pathlib.Path, out: list):
     path = root / "crates/mce460896/Cargo.toml"
     if not path.is_file():
@@ -873,34 +899,22 @@ def check_mce_deps(root: pathlib.Path, out: list):
             doc = tomllib.loads(member.read_text())
         except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
             continue  # P3/P6 report unreadable manifests
-        tables = [doc.get("workspace", {}).get("dependencies", {})]
-        for scope in [doc] + list(doc.get("target", {}).values()):
-            for kind in ("dependencies", "dev-dependencies", "build-dependencies"):
-                tables.append(scope.get(kind, {}))
         # Dependency keys that name sha3 or zeroize, by key or by `package`.
         guarded = set()
         ws_deps = ws_doc.get("workspace", {}).get("dependencies", {})
-        for deps in tables:
-            for key, spec in deps.items():
-                spec = spec if isinstance(spec, dict) else {"version": spec}
-                package = spec.get("package", key)
-                if spec.get("workspace") is True:
-                    # An inherited entry names its package in the workspace
-                    # declaration, under the same key.
-                    declared = ws_deps.get(key, {})
-                    package = declared.get("package", key) if isinstance(declared, dict) else key
-                if package not in ("sha3", "zeroize"):
-                    continue
-                guarded.add(key)
-                if spec.get("workspace") is True:
-                    # Inherited: its declaration is judged in
-                    # [workspace.dependencies], but cargo adds the member's
-                    # own features on top.
-                    if spec.get("features") or spec.get("default-features", False) is not False:
-                        out.append(f"P16 {rel}: {key} inherits from the workspace but adds features")
-                    continue
-                if spec.get("features") or spec.get("default-features", True) is not False:
-                    out.append(f"P16 {rel}: {key} with features or default features unifies them into mce460896")
+        for _, key, spec, package in dependency_entries(doc, ws_deps):
+            if package not in ("sha3", "zeroize"):
+                continue
+            guarded.add(key)
+            if spec.get("workspace") is True:
+                # Inherited: its declaration is judged in
+                # [workspace.dependencies], but cargo adds the member's
+                # own features on top.
+                if spec.get("features") or spec.get("default-features", False) is not False:
+                    out.append(f"P16 {rel}: {key} inherits from the workspace but adds features")
+                continue
+            if spec.get("features") or spec.get("default-features", True) is not False:
+                out.append(f"P16 {rel}: {key} with features or default features unifies them into mce460896")
         for feature, enables in doc.get("features", {}).items():
             for e in enables:
                 m = re.match(r"(?:dep:)?([A-Za-z0-9_-]+)\??/", str(e))
@@ -1122,28 +1136,38 @@ TOKEN_FROM_REPLY = re.compile(r"\bfrom_reply\s*\(")
 BYPASS_FLAG = re.compile(r"[\"']--(force|single|roster)[\"']|\bskip_approval\b")
 
 
-def verifier_users_in(manifest: dict) -> list:
-    """Where a parsed Cargo.toml turns on policy-wire's `verifier`."""
-    tables = [("", manifest)] + [(f"target.{t}.", v) for t, v in manifest.get("target", {}).items() if isinstance(v, dict)]
-    names, found = set(), []
-    for prefix, table in tables:
-        for kind in ("dependencies", "dev-dependencies", "build-dependencies"):
-            for key, dep in (table.get(kind) or {}).items():
-                package = dep.get("package", key) if isinstance(dep, dict) else key
-                if package != "policy-wire":
-                    continue
-                names.add(key)
-                if isinstance(dep, dict) and "verifier" in (dep.get("features") or []):
-                    found.append(f"[{prefix}{kind}.{key}] features")
+def verifier_users_in(manifest: dict, ws_deps: dict) -> list:
+    """Where a parsed Cargo.toml turns on policy-wire's `verifier`: a
+    dependency entry with it (inherited ones too), a `[features]` entry
+    naming it through any key that is policy-wire, and, in policy-wire's own
+    manifest, any feature but `verifier` itself that includes it."""
+    names, found = {"policy-wire"}, []
+    for table, key, spec, package in dependency_entries(manifest, ws_deps):
+        if package != "policy-wire":
+            continue
+        names.add(key)
+        if "verifier" in (spec.get("features") or []):
+            found.append(f"[{table}.{key}] features")
+    own = manifest.get("package", {}).get("name") == "policy-wire"
     for feature, enables in (manifest.get("features") or {}).items():
         for e in enables if isinstance(enables, list) else []:
-            dep, _, feat = str(e).partition("/")
-            if feat == "verifier" and dep.rstrip("?") in names | {"policy-wire"}:
+            dep, _, feat = str(e).removeprefix("dep:").partition("/")
+            if (feat == "verifier" and dep.rstrip("?") in names) or (own and e == "verifier" and feature != "verifier"):
                 found.append(f"[features] {feature}")
     return found
 
 
 def check_policy(root: pathlib.Path, out: list):
+    try:
+        ws_deps = tomllib.loads((root / "Cargo.toml").read_text()).get("workspace", {}).get("dependencies", {})
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        ws_deps = {}
+    # A PD's per-build features (Makefile `features_<pd>`) reach policy-wire
+    # through cargo's `dep/feature` syntax too.
+    makefile = root / "Makefile"
+    for n, line in enumerate(makefile.read_text().splitlines() if makefile.is_file() else [], 1):
+        if re.search(r"\bfeatures_[A-Za-z0-9_-]+\s*[:+?]?=\s*[^\s#]*\bverifier\b", line.split("#", 1)[0]):
+            out.append(f"P27 Makefile:{n}: a PD build's features name verifier (M8 plan C1)")
     for p in sorted(root.glob("**/Cargo.toml")):
         rel = str(p.relative_to(root))
         if any(part in ("target", "build", "third_party") for part in p.relative_to(root).parts) or rel in VERIFIER_USERS:
@@ -1156,7 +1180,7 @@ def check_policy(root: pathlib.Path, out: list):
         except tomllib.TOMLDecodeError as e:
             out.append(f"P27 {rel}: not valid TOML ({e})")
             continue
-        for where in verifier_users_in(manifest):
+        for where in verifier_users_in(manifest, ws_deps):
             out.append(f"P27 {rel}: {where} enables policy-wire's verifier feature outside the policy PD and tools/policy (M8 plan C1)")
     for rel, text in crate_sources(root, "crates"):
         if rel.startswith(SLOT_READERS):
@@ -1238,7 +1262,11 @@ def check_audit_call(root: pathlib.Path, out: list):
     stripped = strip_rust_comments(path.read_text())
     unterminated("P31", AUDIT_MAIN, stripped, out)
     code = stripped.splitlines()
-    # One source file: a module beside main.rs could call `sign` unseen.
+    # One source file: a module beside main.rs, or code pulled in from
+    # elsewhere, could call `sign` unseen.
+    for n, l in enumerate(code, 1):
+        if re.search(r"#\s*\[\s*path\b|\binclude!\s*\(", l):
+            out.append(f"P31 {AUDIT_MAIN}:{n}: #[path] or include! pulls in code the one-call-site check does not read (M8 plan C10)")
     others = sorted(str(f.relative_to(root)) for f in path.parent.rglob("*.rs") if f != path)
     if others:
         out.append(f"P31 {AUDIT_MAIN}: audit has other source files {others}; its one call site is only checked in main.rs (M8 plan C10)")

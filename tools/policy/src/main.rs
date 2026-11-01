@@ -551,6 +551,22 @@ fn check_head_needs(what: &str, ledger: &ledger::Ledger, state: &ledger::ChainSt
     )))
 }
 
+/// `out` is created first (refused if it exists), then `before` moves the
+/// approver's head, then the record lands in the file already reserved: a
+/// head never records an approval whose file could not be created, and a
+/// failed head write leaves no approval behind.
+fn write_reserved(out: &Path, record: &[u8], before: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    use std::io::Write;
+    let err = |e: std::io::Error| format!("{}: {e}", out.display());
+    let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o644).open(out).map_err(err)?;
+    if let Err(e) = before() {
+        drop(f);
+        let _ = fs::remove_file(out);
+        return Err(e);
+    }
+    f.write_all(record).and_then(|()| f.sync_all()).map_err(err)
+}
+
 /// Written to a temporary file, synced and renamed into place, so a crash
 /// leaves the old head or the new one, never a torn file.
 fn write_head_file(path: &Path, head: &HeadFile) -> Result<(), String> {
@@ -633,12 +649,8 @@ fn cmd_approve(args: &[String]) -> Result<(), String> {
     // later ledger at the height it was drafted against. The approval is
     // recorded beside it before the approval exists, so no approval ever
     // goes out unrecorded.
-    if out.exists() {
-        return Err(format!("{}: already exists", out.display()));
-    }
     let ledger_head = state.height.zip(state.head_body.as_ref().map(|b| Sha256::digest(b).into()));
-    write_head_file(&head_path, &HeadFile { ledger: ledger_head, approved: Some((header.version, body_sha256)) })?;
-    write_new(&out, &record, 0o644)?;
+    write_reserved(&out, &record, || write_head_file(&head_path, &HeadFile { ledger: ledger_head, approved: Some((header.version, body_sha256)) }))?;
     println!("policy: {approver_id} approved version {} ({})", header.version, out.display());
     Ok(())
 }
@@ -823,10 +835,19 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
             };
             // The approver's own head, on their own device (D11): the copy
             // holds their head and their last approval, or they hand that
-            // approval back. The restore operator holds no say in it.
-            let head = read_head_file(Path::new(&arg(args, "--head")?))?;
-            check_head("ledger approve-restore", &copy, &state, head.as_ref(), &approver_id, None, arg_opt(args, "--supersede").as_deref())?;
+            // approval back. The restore operator holds no say in it. An
+            // approver without a head file has nothing to check the copy
+            // against, so cannot vouch for it.
+            let head_path = PathBuf::from(arg(args, "--head")?);
+            let head = read_head_file(&head_path)?.ok_or_else(|| {
+                format!("ledger approve-restore: no head file at {}: an approver without one cannot vouch for a restore", head_path.display())
+            })?;
+            check_head("ledger approve-restore", &copy, &state, Some(&head), &approver_id, None, arg_opt(args, "--supersede").as_deref())?;
             let head_body_sha256: [u8; 32] = Sha256::digest(state.head_body.as_ref().ok_or("ledger approve-restore: internal")?).into();
+            // The head now names the copy's head, its approval held or handed
+            // back: `restore`, checking the heads it is given, sees this one
+            // as checked.
+            let new_head = HeadFile { ledger: Some((version, head_body_sha256)), approved: None };
             let fleet_id = state.head_header.as_ref().ok_or("ledger approve-restore: internal")?.fleet_id;
 
             let sk = load_approver_signing(Path::new(&approver_key_path))?;
@@ -838,7 +859,7 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
                 ts: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
             };
             let record = approval::sign_restore(&sk, &fields, &mut sig::urandom)?;
-            write_new(&out, &record, 0o644)?;
+            write_reserved(&out, &record, || write_head_file(&head_path, &new_head))?;
             println!("policy: {approver_id} approved restoring head version {version} ({})", out.display());
             Ok(())
         }
@@ -859,18 +880,32 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
             let restored_body_sha256: [u8; 32] = Sha256::digest(state.head_body.as_ref().ok_or("ledger restore: internal")?).into();
             let fleet_id = state.head_header.as_ref().ok_or("ledger restore: internal")?.fleet_id;
 
-            // The heads of approvers not among the restore approvers, as an
-            // extra check; each restore approver checked their own head and
-            // last approval in `approve-restore`.
+            // Every head it is given, ledger head and last approval both,
+            // fail-closed (D11): an approver whose approval the copy lacks
+            // either restores through `approve-restore --supersede` on their
+            // own device (which rewrites their head) or is refused here.
+            // Which heads are passed is the operator's choice (D-24 residual).
             for head_path in &head_paths {
-                let Some((recorded_version, recorded_digest)) = read_head_file(Path::new(head_path))?.and_then(|h| h.ledger) else { continue };
-                if restored_version < recorded_version {
-                    return Err(format!("ledger restore: the copy (version {restored_version}) is behind the head in {head_path} (version {recorded_version})"));
+                let head = read_head_file(Path::new(head_path))?.ok_or_else(|| format!("ledger restore: no head file at {head_path}"))?;
+                if let Some((recorded_version, recorded_digest)) = head.ledger {
+                    if restored_version < recorded_version {
+                        return Err(format!("ledger restore: the copy (version {restored_version}) is behind the head in {head_path} (version {recorded_version})"));
+                    }
+                    if head_body_sha256(&copy.read_entry(recorded_version)?)? != recorded_digest {
+                        return Err(format!("ledger restore: the copy's version {recorded_version} does not match the head in {head_path} (contains or extends, never diverges)"));
+                    }
                 }
-                let at = copy.read_entry(recorded_version)?;
-                let got = head_body_sha256(&at)?;
-                if got != recorded_digest {
-                    return Err(format!("ledger restore: the copy's version {recorded_version} does not match the head in {head_path} (contains or extends, never diverges)"));
+                if let Some((approved_version, approved_body)) = head.approved {
+                    if restored_version < approved_version {
+                        return Err(format!(
+                            "ledger restore: {head_path} records an approval of version {approved_version}, which the copy (version {restored_version}) does not hold: if it was signed, the copy is truncated"
+                        ));
+                    }
+                    if head_body_sha256(&copy.read_entry(approved_version)?)? != approved_body {
+                        return Err(format!(
+                            "ledger restore: {head_path} records an approval of version {approved_version} with another body than the copy's: if it was signed, the copy is forked"
+                        ));
+                    }
                 }
             }
 

@@ -167,10 +167,15 @@ is "a bundle without that peer", nothing faster.
    The head file is the approver's own record of the newest ledger head
    they have verified and of the last version and body they approved.
    `approve` refuses a ledger that is behind that head or disagrees with
-   it, and a ledger that does not hold the version they last approved:
-   that version was either signed and cut off this ledger (truncation),
-   or abandoned. Only the approver can say it was abandoned, by passing
-   that approval back with `--supersede <file>`.
+   it, and a ledger that does not hold the version they last approved, or
+   holds another body at it: that version was either signed and cut off
+   this ledger (truncation), signed in a fork, or abandoned (another draft
+   was signed instead). Only the approver can say it was abandoned, by
+   passing that approval back with `--supersede <file>`, so each approver
+   keeps every approval file they make. Approving the same draft again
+   (a lost approval file) needs nothing. `--supersede` verifies under the
+   ledger's current roster: an approver whose key was rotated since
+   cannot hand back an older approval (D-24).
 5. The signing operator:
    `policy sign --ledger <ledger> --draft draft.bin --approvals A B --keys <keys> --out v<n>.bin`,
    then `policy verify --keys-pub <keys> --slot v<n>.bin --fleet fleet.toml`,
@@ -301,13 +306,17 @@ slot comes from the ledger (`entries/`) and is checked with
   lacks, or holds another body at, the version they last approved: if that
   version was signed, the copy is truncated or forked. If they abandoned
   it, they say so by passing their own approval of it with
-  `--supersede <file>`; nobody else's approval stands in for it. Then
+  `--supersede <file>`; nobody else's approval stands in for it. Either
+  way their head then names the copy's head. An approver without a head
+  file cannot approve a restore. Then
   `policy ledger restore --from <copy> --dir <new dir> --approvals R1 R2 --keys-pub <keys> --head <file>...`,
-  with the head file of every approver that can be reached. It refuses a
-  copy whose chain does not verify, one behind or diverging from any given
-  head, and fewer than two distinct approvers under the roster in force at
-  the restored head. An approver whose device was wiped starts a new head
-  file at their next `approve`.
+  with the head file of every approver that can be reached, the newest
+  version's approvers above all. It refuses a copy whose chain does not
+  verify, one behind or diverging from any given head, one that lacks or
+  forks the last approval a given head records, and fewer than two
+  distinct approvers under the roster in force at the restored head.
+  Which heads reach it is the operator's choice (D-24). An approver whose
+  device was wiped starts a new head file at their next `approve`.
 - **Roster change.** A roster change is a bundle:
   `policy render --input peers.toml --fleet fleet.toml --ledger <ledger> --out draft.bin --set-roster new-roster.toml`
   (it saves the new roster next to the draft), two approvals under the

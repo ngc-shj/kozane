@@ -1,6 +1,6 @@
 # Code Review: kozane-m8-peer-policy
 Date: 2026-11-01
-Review round: 3
+Review round: 4
 
 ## Changes from Previous Round
 Initial review, at 751e95b, after Phase 2 Step 2-5's self-check (D-23).
@@ -410,3 +410,90 @@ confirmed resolved, except T-F3 (the Kani counts, still open) and T-F6
     tables, renamed packages (`package =`) and `[features]` entries.
   - Fixture: a target dependency table renamed `pw`, enabling
     `verifier`.
+
+## Round 4 (f5937f1..4c8a59c)
+
+### Findings
+- **Security:**
+  - S4-1 Major: `restore` had lost the approved-version check of the heads
+    given to it (an R43 narrowing). Restore approvers who had not
+    approved the newest version could restore a copy missing it.
+  - S4-2 Minor = F4-3: a missing head file silently disabled
+    `approve-restore`'s checks.
+  - S4-3 Minor = F4-1 Major: P27 missed `[workspace.dependencies]`,
+    inherited and renamed dependencies, policy-wire's own features and the
+    Makefile's `features_<pd>` (R1/R48: P16 already resolved inheritance).
+  - S4-4 = A-1 Minor: P31 could be evaded with `#[path]` or `include!`.
+- **Functionality:**
+  - F4-2 Minor: `--supersede` verifies under the current roster, so it is
+    refused after a key rotation.
+  - F4-4 Minor: a superseded restore approval left the head as it was.
+  - F4-5 Minor: the head moved before the approval file existed.
+  - F4-6 Minor: the runbook's approve step was stale.
+- **Testing:**
+  - T4-1 Major: the forked-at-approved-version branch was untested.
+  - T4-2 Major: approve-restore was never tested with a satisfied head.
+  - T4-3 Major: no fixture pinned that an existing `--out` is refused
+    before the head moves.
+  - T4-4 Minor: `case_unneeded_supersede` did not use `approve_refused`.
+    The round-3 count of "seven" cases was right, but the claim that
+    "all" new refused cases used it was not: six cases use it.
+  - T4-5 Minor: P27's parse paths were untested.
+  - T4-6 Minor: the flake note misread the 12 bytes; the harness dropped
+    the body.
+
+### Round 4 Resolution Status
+- **S4-1:**
+  - `restore` checks both halves of every given head, fail-closed with no
+    `--supersede`.
+  - A satisfied or superseding `approve-restore` rewrites the approver's
+    own head to the copy's head (F4-4).
+  - Fixtures:
+    - restore refuses bob's head (approved v1) under carol and alice's
+      blank-head restore approvals;
+    - the superseded allow case now goes on to restore with carol's
+      rewritten head.
+  - Red-proved.
+  - Residual recorded in D-24: the operator picks which heads reach
+    `restore`.
+- **S4-2 / F4-3:** `approve-restore` refuses a missing head file. The
+  fixtures use explicit blank heads. Fixture: approve-restore needs a head
+  file. Red-proved.
+- **S4-3 / F4-1:**
+  - `dependency_entries` (check-pins) is now the one dependency walker for
+    P16 and P27: workspace dependencies, target tables, both spellings,
+    and inherited keys resolved to their package.
+  - P27 also refuses policy-wire's own features that include `verifier`,
+    and `features_<pd>` assignments naming it.
+  - Fixtures:
+    - deny: a workspace dependency; an inherited renamed key through
+      `[features]` `pw?/verifier`; policy-wire's own `default`; Makefile
+      `features_hs`; an invalid manifest;
+    - allow: a renamed policy-wire without `verifier`.
+- **S4-4 / A-1:** P31 refuses `#[path]` and `include!` in audit's
+  main.rs, with a fixture.
+- **F4-2 — Accepted:** recorded as a D-24 residual.
+  - Anti-Deferral check: picking a roster from the copy would trust
+    files that no chain link vouches for.
+  - Worst case: an approver who rotated their key after a fork is refused
+    and needs a fresh approval round. This is fail-closed.
+  - Likelihood: low.
+- **F4-5:** `write_reserved` creates `--out` (O_EXCL), then moves the
+  head, then writes the record. A failed head write removes the
+  reservation.
+- **F4-6:** the runbook's approve and lost-ledger text matches
+  `check_head`.
+- **T4-1:** fixtures for the forked ledger through `approve-restore` and
+  through `approve`, each denied and then allowed with `--supersede`.
+  Red-proved with `held.is_some()`.
+- **T4-2:** fixture: approve-restore with a satisfied head. It also
+  checks that the head is rewritten.
+- **T4-3:** fixture: approve to an existing `--out`, with the head
+  unchanged. It was first red-proof-vacuous (the same draft wrote an
+  identical head), so it now starts from a v0 head. Red-proved with a
+  head-before-reservation mutant.
+- **T4-4:** `case_unneeded_supersede` now uses `approve_refused`.
+- **T4-5:** see S4-3.
+- **T4-6:** the note names the legs (a 502 from tls-core on the backend
+  leg; a client connect timeout). On a mismatch, release boot now
+  reports the body prefix and tls's backend audit lines.

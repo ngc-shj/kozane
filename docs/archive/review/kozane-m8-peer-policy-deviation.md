@@ -696,8 +696,22 @@ changes go beyond the plan's text:
   holds another body there, unless the approver hands their own approval
   back with `--supersede` (round 3). Both run on the approver's own
   device, so `restore`'s operator cannot answer for them. Re-approving
-  the identical draft needs nothing. `restore` keeps only the
-  ledger-head check for heads passed to it.
+  the identical draft needs nothing. Round 4 made three changes:
+  - `restore` again checks both halves of every head given to it,
+    fail-closed and without `--supersede`;
+  - a superseding or satisfied `approve-restore` rewrites that approver's
+    own head to the copy's head;
+  - `approve-restore` refuses an approver without a head file.
+
+  Two residuals remain:
+  - The restore operator chooses which approvers' heads reach `restore`.
+    A copy missing the newest signed version restores when neither of that
+    version's approvers is a restore approver and their heads are not
+    passed. That needs a roster of four or more and the operator's intent.
+  - `--supersede` verifies under the ledger's current roster, so an
+    approver whose key was rotated after a fork cannot hand back the older
+    approval. They are refused, not let through. Picking a roster from the
+    copy would trust files the chain does not vouch for.
 - **Clear evidence (D5).** On swtpm, `TPM2_Clear` sets resetCount and
   restartCount to 0, and the next power cycle sets resetCount to 1. On
   swtpm in the dev image, after two power cycles and a TPM Restart the
@@ -729,7 +743,9 @@ changes go beyond the plan's text:
   passed.
 - **`release boot`.** It failed in both of round 3's full `make test`
   runs on gx10. The first returned "HTTPS returned 12 bytes, not the
-  backend's body", the second a curl connect timeout (10 s). Each time
+  backend's body": 12 bytes is tls-core's `Bad Gateway` body, so it failed
+  on the gateway-to-backend leg. The second was a curl connect timeout
+  (10 s) on the client-to-gateway leg. Each time
   the HTTPS request came right after the WireGuard handshake. Two reruns
   of the case alone passed. Nothing on that path changed since the last
   full pass (f5937f1); round 3 touched only tools/policy, tools/check-pins

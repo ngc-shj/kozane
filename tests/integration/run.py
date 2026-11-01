@@ -3434,7 +3434,11 @@ def test_release_boot(pkg: Package, release: str, deploy: str, fault_inject: dic
         con.wait_for(r"audit: src=hs HandshakeOk total=1 ")
         body, _ = curl_get(os.path.join(deploy, "devca.pem"))
         if body != backend_body():
-            raise Fail(f"release boot: HTTPS returned {len(body)} bytes, not the backend's body")
+            # What came back, and whether `tls` audited a backend failure, so
+            # a recurrence names its leg (D-24's flake note).
+            backend_audit = con.count(r"audit: src=tls Backend\w+ ")
+            raise Fail(f"release boot: HTTPS returned {len(body)} bytes, not the backend's body: {body[:64]!r}; "
+                       f"tls backend audit lines: {backend_audit or 'none'}")
         no_supervisor_record(con, "release boot")
         kill_qemu(child)
         got = read_pcrs(child.tpm)
