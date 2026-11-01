@@ -557,7 +557,7 @@ fn check_head_needs(what: &str, ledger: &ledger::Ledger, state: &ledger::ChainSt
 /// head never records an approval whose file could not be created, and a
 /// failed head write leaves no approval behind; a failed record write
 /// removes the partial file.
-fn write_reserved(out: &Path, record: &[u8], before: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+fn write_reserved(out: &Path, record: &[u8], retry: &str, before: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     use std::io::Write;
     let err = |e: std::io::Error| format!("{}: {e}", out.display());
     let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o644).open(out).map_err(err)?;
@@ -569,7 +569,7 @@ fn write_reserved(out: &Path, record: &[u8], before: impl FnOnce() -> Result<(),
     f.write_all(record).and_then(|()| f.sync_all()).map_err(|e| {
         drop(f);
         let _ = fs::remove_file(out);
-        format!("{}: {e} (the head already records this approval: approve the same draft again to write it)", out.display())
+        format!("{}: {e} ({retry})", out.display())
     })
 }
 
@@ -656,7 +656,7 @@ fn cmd_approve(args: &[String]) -> Result<(), String> {
     // recorded beside it before the approval exists, so no approval ever
     // goes out unrecorded.
     let ledger_head = state.height.zip(state.head_body.as_ref().map(|b| Sha256::digest(b).into()));
-    write_reserved(&out, &record, || write_head_file(&head_path, &HeadFile { ledger: ledger_head, approved: Some((header.version, body_sha256)) }))?;
+    write_reserved(&out, &record, "the head already records this approval: approve the same draft again to write it", || write_head_file(&head_path, &HeadFile { ledger: ledger_head, approved: Some((header.version, body_sha256)) }))?;
     println!("policy: {approver_id} approved version {} ({})", header.version, out.display());
     Ok(())
 }
@@ -810,6 +810,46 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
 
 // --- ledger init / restore -----------------------------------------------
 
+/// `restore`'s approvals (D11, S6-1): at least two distinct roster
+/// entries, each bound to this head and fleet and signed within
+/// `RESTORE_APPROVAL_MAX_AGE_S` of `now`. Returns the records to keep.
+fn check_restore_approvals(
+    approval_paths: &[String],
+    roster: &Roster,
+    restored_version: u32,
+    restored_body_sha256: &[u8; 32],
+    fleet_id: &[u8; 16],
+    now: u64,
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut approver_ids = Vec::new();
+    let mut approval_bytes = Vec::new();
+    for path in approval_paths {
+        let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+        let fields = approval::parse_and_verify_restore(&bytes, roster).map_err(|e| format!("ledger restore: {path}: {e}"))?;
+        if fields.head_version != restored_version {
+            return Err(format!("ledger restore: {path}: bound to head version {}, not {restored_version}", fields.head_version));
+        }
+        // The fleet first: another fleet's head differs in its body
+        // too, and this order keeps the fleet binding observable.
+        if fields.fleet_id != *fleet_id {
+            return Err(format!("ledger restore: {path}: bound to another fleet_id"));
+        }
+        if fields.head_body_sha256 != *restored_body_sha256 {
+            return Err(format!("ledger restore: {path}: bound to another head digest"));
+        }
+        approval::restore_approval_fresh(fields.ts, now).map_err(|e| format!("ledger restore: {path}: {e}"))?;
+        if approver_ids.contains(&fields.approver_id) {
+            return Err(format!("ledger restore: approver {} approved twice", fields.approver_id));
+        }
+        approver_ids.push(fields.approver_id);
+        approval_bytes.push(bytes);
+    }
+    if approver_ids.len() < 2 {
+        return Err("ledger restore: at least two distinct roster entries must approve the restore".into());
+    }
+    Ok(approval_bytes)
+}
+
 fn cmd_ledger(args: &[String]) -> Result<(), String> {
     match args.first().map(String::as_str) {
         Some("init") => {
@@ -834,8 +874,8 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
             let out = PathBuf::from(arg(args, "--out")?);
             let pinned = read_pin()?;
 
-            // With the bundle signatures (S5-1): this moves the approver's
-            // head, so the copy must be one `restore` itself would accept.
+            // With the bundle signatures (S5-1): a supersede here changes the
+            // approver's head, so the copy must be one `restore` would accept.
             let keys_pub = load_bundle_verifying(Path::new(&arg(args, "--keys-pub")?))?;
             let copy = ledger::Ledger::open(&from);
             let state = copy
@@ -864,7 +904,14 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
             // The head moves only for a handed-back approval, and only that
             // half: the copy may never be restored, so its ledger head is not
             // recorded (the next `approve` on the restored ledger does that).
-            let new_head = HeadFile { ledger: head.ledger, approved: if superseded { None } else { head.approved } };
+            // A handed-back genesis approval would leave nothing recorded
+            // (S6-3): the copy's v0 then becomes the ledger half, which every
+            // copy of this fleet shares, so it wedges nothing.
+            let ledger_half = match (head.ledger, superseded) {
+                (None, true) => Some((0, crate::head_body_sha256(&copy.read_entry(0)?)?)),
+                (l, _) => l,
+            };
+            let new_head = HeadFile { ledger: ledger_half, approved: if superseded { None } else { head.approved } };
             let fleet_id = state.head_header.as_ref().ok_or("ledger approve-restore: internal")?.fleet_id;
 
             let sk = load_approver_signing(Path::new(&approver_key_path))?;
@@ -876,7 +923,12 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
                 ts: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0),
             };
             let record = approval::sign_restore(&sk, &fields, &mut sig::urandom)?;
-            write_reserved(&out, &record, || write_head_file(&head_path, &new_head))?;
+            let retry = if superseded {
+                "the handed-back approval is already cleared from the head: run approve-restore again without --supersede"
+            } else {
+                "the head is unchanged: run approve-restore again"
+            };
+            write_reserved(&out, &record, retry, || write_head_file(&head_path, &new_head))?;
             println!("policy: {approver_id} approved restoring head version {version} ({})", out.display());
             Ok(())
         }
@@ -929,31 +981,8 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
             if approval_paths.len() < 2 {
                 return Err("ledger restore: at least two --approvals are required".into());
             }
-            let mut approver_ids = Vec::new();
-            let mut approval_bytes = Vec::new();
-            for path in &approval_paths {
-                let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-                let fields = approval::parse_and_verify_restore(&bytes, &state.roster).map_err(|e| format!("ledger restore: {path}: {e}"))?;
-                if fields.head_version != restored_version {
-                    return Err(format!("ledger restore: {path}: bound to head version {}, not {restored_version}", fields.head_version));
-                }
-                // The fleet first: another fleet's head differs in its body
-                // too, and this order keeps the fleet binding observable.
-                if fields.fleet_id != fleet_id {
-                    return Err(format!("ledger restore: {path}: bound to another fleet_id"));
-                }
-                if fields.head_body_sha256 != restored_body_sha256 {
-                    return Err(format!("ledger restore: {path}: bound to another head digest"));
-                }
-                if approver_ids.contains(&fields.approver_id) {
-                    return Err(format!("ledger restore: approver {} approved twice", fields.approver_id));
-                }
-                approver_ids.push(fields.approver_id);
-                approval_bytes.push(bytes);
-            }
-            if approver_ids.len() < 2 {
-                return Err("ledger restore: at least two distinct roster entries must approve the restore".into());
-            }
+            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+            let approval_bytes = check_restore_approvals(&approval_paths, &state.roster, restored_version, &restored_body_sha256, &fleet_id, now)?;
 
             if dir.exists() {
                 return Err(format!("ledger restore: {} already exists", dir.display()));

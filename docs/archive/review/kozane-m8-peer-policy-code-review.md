@@ -1,6 +1,6 @@
 # Code Review: kozane-m8-peer-policy
 Date: 2026-11-01
-Review round: 5
+Review round: 6
 
 ## Changes from Previous Round
 Initial review, at 751e95b, after Phase 2 Step 2-5's self-check (D-23).
@@ -585,3 +585,69 @@ confirmed resolved, except T-F3 (the Kani counts, still open) and T-F6
   - No crate under Kani changed after f5937f1; round 4 and round 5 touched
     tools/ and tests/ only.
   - The cache was copied to gx10 for the final `make check`.
+
+## Round 6 (81a91d8..661bb66)
+
+### Findings
+- **Security:**
+  - S6-1 Major: restore approvals never expired, so approvals stored with
+    one restore were a permanent token. Replayed onto a copy cut back to
+    that height, with no `--head`, they restored it with no approver
+    involved.
+  - S6-2 Minor = F6-3 = T6-2 (Major, testing): P31's `mod` rule ran per
+    line, so split or raw-identifier declarations and macro-made modules
+    slipped through, and the old `#[path]` arm was dropped.
+  - S6-3 Minor = F6-1: superseding a genesis approval wrote a blank head,
+    which approve-restore then refused.
+  - S6-A1 Minor: the provenance of `--keys-pub` was not documented.
+- **Functionality:** F6-2 Minor: the record-write retry hint was wrong for
+  approve-restore.
+- **Testing:**
+  - T6-1 Major: a head-move mutant on the `--supersede` path survived.
+  - T6-3 Minor: the inherited-undeclared branches had no fixtures.
+  - T6-4 Minor: some head-unchanged assertions could not fail.
+  - T6-5 Minor: a head file name collided.
+  - T6-A1 Minor: a stale comment.
+
+### Round 6 Resolution Status
+- **S6-1:**
+  - A restore approval is good for `RESTORE_APPROVAL_MAX_AGE_S` (24 h),
+    with `RESTORE_APPROVAL_SKEW_S` (300 s) of clock skew
+    (`approval::restore_approval_fresh`).
+  - `restore`'s approval checks moved into `check_restore_approvals`,
+    which takes `now`.
+  - Unit tests: freshness boundaries; stale approvals refused by
+    `check_restore_approvals` while fresh ones pass.
+  - Red-proved: with the call removed, the stale test failed.
+  - The runbook and D-24 are updated.
+- **S6-2 / F6-3 / T6-2:**
+  - P31 runs over the whole stripped text and refuses any `mod` token,
+    `include` followed by `!` (newlines allowed), and any attribute with a
+    `path` key.
+  - Fixtures: a split raw-identifier `mod` with `#[path]`; a
+    macro-generated module; `include` and `!` on separate lines. The two
+    earlier forms are kept.
+  - No inline-`mod` allow case: audit has no modules, and the rule is
+    deliberately "none".
+- **S6-3 / F6-1:**
+  - Superseding a genesis approval keeps the copy's v0 as the ledger
+    half. Every copy of the fleet shares v0.
+  - Fixture: superseding a genesis approval leaves a usable head (a second
+    approve-restore succeeds). Red-proved.
+- **S6-A1:** the runbook says `--keys-pub` is the approver's own trusted
+  copy.
+- **F6-2:** each caller passes its own retry hint to `write_reserved`.
+- **T6-1:**
+  - The forked case asserts that after `--supersede` the ledger half is
+    unchanged and `approved_version=-`.
+  - Red-proved: the reviewer's mutant (the head moved to the copy on
+    supersede) made the case fail.
+- **T6-3:** fixtures: a P27 inherited `policy-wire` the workspace does
+  not declare, with `verifier`; a P16 inherited `sha3` it does not
+  declare, with features.
+- **T6-4 — Accepted:** the head-unchanged checks in refused cases without
+  `--supersede` are regression guards against a future head move before
+  the refusal. The one that can fail today is the supersede-with-another's
+  approval case.
+- **T6-5:** `restore_with_heads` uses `{who}-restore.head`.
+- **T6-A1:** the comment is fixed.

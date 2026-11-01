@@ -139,6 +139,25 @@ impl RestoreFields {
     }
 }
 
+/// How long a restore approval stays usable (S6-1): long enough for one
+/// recovery, short enough that one restore's approvals, kept with the
+/// restored ledger, are no token for rolling it back later.
+pub const RESTORE_APPROVAL_MAX_AGE_S: u64 = 24 * 3600;
+/// Clock skew tolerated between an approver's device and the restore host.
+pub const RESTORE_APPROVAL_SKEW_S: u64 = 300;
+
+pub fn restore_approval_fresh(ts: u64, now: u64) -> Result<(), String> {
+    if ts > now.saturating_add(RESTORE_APPROVAL_SKEW_S) {
+        return Err(format!("restore approval: signed at {ts}, in the future of this host's clock ({now})"));
+    }
+    if now.saturating_sub(ts) > RESTORE_APPROVAL_MAX_AGE_S {
+        return Err(format!(
+            "restore approval: signed at {ts}, more than {RESTORE_APPROVAL_MAX_AGE_S} s ago: approvals are for one recovery, ask again"
+        ));
+    }
+    Ok(())
+}
+
 pub fn sign_restore(sk: &sig::ApproverSigningKey, fields: &RestoreFields, random: &mut dyn FnMut(&mut [u8]) -> bool) -> Result<Vec<u8>, String> {
     let block = fields.render_fields();
     let signature = sig::approver_sign(sk, sig::RESTORE_DOMAIN, &block, random).map_err(|e| e.to_string())?;

@@ -212,6 +212,49 @@ fn diff_of_an_unchanged_body_marks_every_item_unchanged() {
     assert!(d.lines().filter(|l| l.starts_with("  ")).count() == 2 && !d.lines().any(|l| l.starts_with(['+', '-'])), "{d}");
 }
 
+// --- restore approvals are fresh (S6-1) -------------------------------------
+
+#[test]
+fn restore_approval_freshness_boundaries() {
+    let now = 1_000_000;
+    let max = approval::RESTORE_APPROVAL_MAX_AGE_S;
+    let skew = approval::RESTORE_APPROVAL_SKEW_S;
+    assert!(approval::restore_approval_fresh(now - max, now).is_ok());
+    assert!(approval::restore_approval_fresh(now - max - 1, now).is_err());
+    assert!(approval::restore_approval_fresh(now + skew, now).is_ok());
+    assert!(approval::restore_approval_fresh(now + skew + 1, now).is_err());
+}
+
+/// Two approvals of this head and fleet, signed at `ts`, as files.
+fn restore_approvals_at(dir: &std::path::Path, ts: u64) -> (Roster, Vec<String>) {
+    let mut rng = counter_rng();
+    let mut approvers = Vec::new();
+    let mut paths = Vec::new();
+    for id in ["alice", "bob"] {
+        let (sk, pk) = sig::approver_keygen(&mut rng).unwrap();
+        approvers.push(Approver { id: id.into(), ed25519_pub: pk });
+        let fields = RestoreFields { approver_id: id.into(), fleet_id: [3; 16], head_body_sha256: [4; 32], head_version: 7, ts };
+        let path = dir.join(format!("{id}-{ts}.approval"));
+        std::fs::write(&path, approval::sign_restore(&sk, &fields, &mut rng).unwrap()).unwrap();
+        paths.push(path.to_string_lossy().into_owned());
+    }
+    (Roster { approvers }, paths)
+}
+
+#[test]
+fn restore_refuses_approvals_older_than_a_day() {
+    let dir = std::env::temp_dir().join(format!("policy-restore-age-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let now = 2_000_000;
+    let (roster, fresh) = restore_approvals_at(&dir, now - 60);
+    let (old_roster, stale) = restore_approvals_at(&dir, now - approval::RESTORE_APPROVAL_MAX_AGE_S - 1);
+    let fresh_ok = crate::check_restore_approvals(&fresh, &roster, 7, &[4; 32], &[3; 16], now);
+    let stale_err = crate::check_restore_approvals(&stale, &old_roster, 7, &[4; 32], &[3; 16], now);
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(fresh_ok.map(|v| v.len()), Ok(2));
+    assert!(stale_err.is_err_and(|e| e.contains("ago: approvals are for one recovery")));
+}
+
 // --- record ---------------------------------------------------------------
 
 #[test]

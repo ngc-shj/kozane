@@ -891,7 +891,7 @@ def restore_with_heads(ctx, d, ledger, *heads):
     for who in ("alice", "bob"):
         out = d / f"r-{who}.approval"
         rc, o = run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--from", ledger, "--approver-key",
-                    ctx.approver_key[who], "--approver-id", who, "--head", approver_head(ctx, d, who, ledger, f"{who}-r.head"),
+                    ctx.approver_key[who], "--approver-id", who, "--head", approver_head(ctx, d, who, ledger, f"{who}-restore.head"),
                     "--out", out)
         assert rc == 0, o
         approvals.append(out)
@@ -954,6 +954,31 @@ def case_approve_restore_of_an_unsigned_copy(d):
     rc, out = carol_approves_restore(ctx, d, copy, head)
     return rc != 0 and "does not verify" in out and head.read_text() == head_was \
         and not (d / "rc.approval").exists(), out
+
+
+def case_superseding_a_genesis_approval_leaves_a_usable_head(d):
+    """S6-3: carol approved a genesis draft on an empty ledger; the fleet's
+    v0 is another body. Her supersede in approve-restore keeps v0 as her
+    ledger head, so approving the restore again still works."""
+    ctx = Ctx(d)
+    fresh = d / "fresh-ledger"
+    rc0, out0 = run(BIN, "ledger", "init", "--dir", fresh, "--genesis-roster", ctx.roster_path)
+    assert rc0 == 0, out0
+    gdir = d / "genesis-peers"
+    gdir.mkdir()
+    draft_g = d / "draft_genesis.bin"
+    rc1, out1 = run(BIN, "render", "--input", default_peers_toml(gdir, min_release=9), "--fleet", ctx.fleet,
+                     "--ledger", fresh, "--out", draft_g)
+    assert rc1 == 0, out1
+    head = d / "carol.head"
+    rc2, out2 = run(BIN, "approve", "--ledger", fresh, "--draft", draft_g, "--diff-sha256", reviewed(fresh, draft_g),
+                    "--approver-key", ctx.approver_key["carol"], "--approver-id", "carol", "--head", head,
+                    "--out", d / "cg.approval")
+    assert rc2 == 0, out2
+    rc3, out3 = carol_approves_restore(ctx, d, ctx.ledger, head, "--supersede", d / "cg.approval")
+    rc4, out4 = run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--from", ctx.ledger, "--approver-key",
+                    ctx.approver_key["carol"], "--approver-id", "carol", "--head", head, "--out", d / "rc2.approval")
+    return rc3 == 0 and rc4 == 0, out3 + out4
 
 
 def case_approve_restore_with_a_blank_head(d):
@@ -1040,7 +1065,13 @@ def case_approve_restore_of_a_forked_ledger(d):
     rc, out = carol_approves_restore(ctx, d, ctx.ledger, head)
     unmoved = head.read_text() == head_was
     rc2, out2 = carol_approves_restore(ctx, d, ctx.ledger, head, "--supersede", d / "c1.approval")
-    ok = rc != 0 and "this ledger is forked" in out and unmoved and rc2 == 0 and (d / "rc.approval").exists()
+    # T6-1: the supersede clears only the approval; the ledger half stays
+    # carol's (v0), not the forked copy's head (v1').
+    kept = [l for l in head.read_text().splitlines() if l.startswith(("version=", "body_sha256="))] == \
+        [l for l in head_was.splitlines() if l.startswith(("version=", "body_sha256="))]
+    cleared = "approved_version=-" in head.read_text()
+    ok = rc != 0 and "this ledger is forked" in out and unmoved and rc2 == 0 and (d / "rc.approval").exists() \
+        and kept and cleared
     return ok, out + out2
 
 
@@ -1174,6 +1205,7 @@ CASES = [
     ("restore refuses a given head with a newer approval", case_restore_refuses_a_given_head_with_a_newer_approval),
     ("approve-restore needs a head file", case_approve_restore_without_a_head_file),
     ("approve-restore refuses a blank head", case_approve_restore_with_a_blank_head),
+    ("superseding a genesis approval leaves a usable head", case_superseding_a_genesis_approval_leaves_a_usable_head),
     ("restore refuses a given head forked at its approval", case_restore_refuses_a_given_head_forked_at_its_approval),
     ("restore refuses a missing head file", case_restore_refuses_a_missing_head_file),
     ("restore with a satisfied given head", case_restore_with_a_satisfied_given_head),

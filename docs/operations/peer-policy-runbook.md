@@ -308,7 +308,10 @@ slot comes from the ledger (`entries/`) and is checked with
   it, they say so by passing their own approval of it with
   `--supersede <file>`; nobody else's approval stands in for it, and the
   handed-back approval is then cleared from their head. It verifies the
-  copy with the bundle public keys (`--keys-pub`), as `restore` does. An
+  copy with the bundle public keys (`--keys-pub`, the approver's own
+  trusted copy), as `restore` does. A restore approval is good for 24
+  hours: `restore` refuses older ones, so approve right before the
+  restore. An
   approver without a head file (a wiped device) cannot approve a restore,
   so a restore needs two approvers whose head files survived: on a
   two-member roster that has lost one, the fleet starts a new ledger at a

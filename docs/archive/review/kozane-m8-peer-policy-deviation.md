@@ -706,6 +706,18 @@ changes go beyond the plan's text:
     round 5 also refuses a head that records nothing. It checks the copy
     with the bundle signatures, as `restore` does.
 
+  Round 6 changed three more things:
+  - Suppose an approver approved v0 while the ledger was empty, and then
+    hands that approval back in an `approve-restore`. Their head then
+    keeps the copy's v0 as its ledger half. Every copy of the fleet shares
+    v0, so this cannot wedge them, and the head still records something
+    (S6-3, F6-1).
+  - A restore approval is good for 24 hours (300 s of skew), so approvals
+    kept from one restore cannot be replayed later onto a copy cut back to
+    that height (S6-1).
+  - The bundle keys an approver passes to `approve-restore` are their own
+    trusted copy.
+
   A further consequence: a restore needs two approvers whose head files
   survived. On a two-member roster that has lost one, the way out is a
   new ledger at a new genesis, not a restore.
