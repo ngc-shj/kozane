@@ -904,10 +904,11 @@ CASES = [
     ("P31 a second sign( call in audit", {"P31"},
      lambda t: append(t / "crates/pds/audit/src/main.rs",
                       "fn z(w: &[u64; SIGN_REQ_WORDS], r: &mut [u64; SIGN_REPLY_WORDS]) { let _ = sign(w, r); }\n")),
+    ("P31 sign used as a value in audit", {"P31"},
+     lambda t: append(t / "crates/pds/audit/src/main.rs", "fn z() { let _f = sign; }\n")),
     ("P31 the sign( call moved out of the Action::Call arm", {"P31"},
      lambda t: edit(t / "crates/pds/audit/src/main.rs", "            Action::Call(words) => {\n",
-                    "            Action::Call(words) => {\n                let _moved = ();\n                let _moved = ();\n"
-                    "                let _moved = ();\n")),
+                    "            Action::Call(words) => {\n                let _moved = ();\n                let _moved = ();\n")),
     ("allow the call and the channel named in a comment", set(),
      lambda t: append(t / "crates/pds/audit/src/main.rs", "// .pp_call( on CH_AUDITKEY happens in sign only; sign( is called once\n")),
     # P32 (M8 plan C12): the audit map cites only tests the tree has.

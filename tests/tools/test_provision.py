@@ -51,7 +51,7 @@ LAUNCH = ("import pathlib, sys; src = sys.argv[1]; g = {'__file__': src, '__name
           "exec(compile(open(src).read(), src, 'exec'), g); g['RECORD_KEYS'] = pathlib.Path(sys.argv[2]); "
           "sys.argv = [src] + sys.argv[3:]; sys.exit(g['main']())")
 RECORD_DOMAIN = b"kozane-reprovision-v1\0"
-FIXTURES = 27
+FIXTURES = 28
 
 
 def make_ca(run_dir: pathlib.Path, name: str) -> pathlib.Path:
@@ -379,6 +379,17 @@ def nv_fixtures(run_dir: pathlib.Path, ca: pathlib.Path, other: Swtpm, tpms: lis
     # D5, S18: a Clear zeroes resetCount and restartCount, so a TPM reset
     # since the SRK flow's Clear is one that was not cleared in this
     # session; record and nv refuse it (their allows are the ones above).
+    # restartCount alone first: a TPM Restart (Shutdown(STATE), then
+    # Startup(STATE)) leaves resetCount at 0.
+    tool_out(tpm.tcti, "tpm2_shutdown")
+    subprocess.run(["swtpm_ioctl", "--unix", f"{tpm.sock}.ctrl", "-i"], check=True, capture_output=True)
+    tool_out(tpm.tcti, "tpm2_startup")
+    restarted = run_dir / "restarted.record"
+    rc, text = tool(pinned, "record", "--tcti", tpm.tcti, "--ledger", ledger.dir, "--keys-pub", ledger.keys,
+                    "--node", "n1", "--out", restarted, "--policy-bin", ledger.bin)
+    results.append(("deny: record on a TPM restarted since its Clear",
+                    rc != 0 and "record: the TPM shows reset_count=0 restart_count=1" in text and not restarted.exists(),
+                    text))
     subprocess.run(["swtpm_ioctl", "--unix", f"{tpm.sock}.ctrl", "-i"], check=True, capture_output=True)
     tool_out(tpm.tcti, "tpm2_startup", "-c")
     late = run_dir / "late.record"
@@ -388,10 +399,16 @@ def nv_fixtures(run_dir: pathlib.Path, ca: pathlib.Path, other: Swtpm, tpms: lis
                     rc != 0 and "record: the TPM shows reset_count=1 restart_count=0" in text and not late.exists(),
                     text))
     late_slot = run_dir / "slot-late.bin"
+    # Even with both delete keys in hand, the existing indices stay as they
+    # were: the refusal comes before any delete.
+    publics = [tool_out(tpm.tcti, "tpm2_nvreadpublic", f"{i:#x}") for i in (measure.NV_POLICY_CTR, measure.NV_POLICY_BASE)]
+    version = logical()
     rc, text = nv(good, [s1, s2], late_slot, delete_keys=(keys["op1"], keys["op2"]))
     results.append(("deny: nv on a TPM reset since its Clear, with a record read right after it",
-                    rc != 0 and "nv: the TPM shows reset_count=1 restart_count=0" in text and not late_slot.exists(),
-                    text))
+                    rc != 0 and "nv: the TPM shows reset_count=1 restart_count=0" in text and not late_slot.exists()
+                    and publics == [tool_out(tpm.tcti, "tpm2_nvreadpublic", f"{i:#x}")
+                                    for i in (measure.NV_POLICY_CTR, measure.NV_POLICY_BASE)]
+                    and logical() == version, text))
 
 
 def main() -> int:

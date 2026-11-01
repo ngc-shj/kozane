@@ -672,8 +672,13 @@ mod proofs {
                     assert!(Some(a.tuple) == t);
                 }
             }
+            // An eviction, not a refresh: the share was full and an entry now
+            // holds this tuple where another tuple was.
             let share_full = (start..start + QUOTA).all(|i| before.flows.get(i).is_some_and(|f| f.alive(now)));
-            kani::cover!(share_full && before.flows != table.flows, "an own-share eviction");
+            let replaced = (start..start + QUOTA).any(|i| {
+                before.flows.get(i).is_some_and(|b| Some(b.tuple) != t) && table.flows.get(i).is_some_and(|a| Some(a.tuple) == t)
+            });
+            kani::cover!(share_full && replaced, "an own-share eviction");
         }
     }
 

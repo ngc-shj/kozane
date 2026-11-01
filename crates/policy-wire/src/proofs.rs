@@ -79,10 +79,6 @@ fn is_valid_candidate(current: u32, release_seq: u32, view: SlotView) -> bool {
     }
 }
 
-/// I5.3 deny: `Refuse` only when neither slot is a candidate (Empty,
-/// Malformed, BadSignature, RolledBack, Skipped, BelowFloor all forbid a
-/// `Use`/`Advance`), and `Equivocation`/`PrevMismatch` only when the
-/// slots disagree about a shared version or a `prev` link.
 fn view_version(view: SlotView) -> Option<u32> {
     match view {
         SlotView::Valid { version, .. } => Some(version),
@@ -227,6 +223,7 @@ fn verified_next_version_needs_a_matching_advance_reply() {
                 StateReply::Refused => unreachable!(),
             };
             let view = if slot == Slot::A { a } else { b };
+            kani::cover!(true, "a slot used without an advance");
             assert!(version == current && view_version(view) == Some(current));
         }
         Step::Done(Outcome::Unavailable { reason: Reject::StateRefused }) => assert!(state_refused),

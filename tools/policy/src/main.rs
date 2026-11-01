@@ -8,14 +8,15 @@
 //!   policy node-digest --out <file> <gateway.toml>      (the node's NodeConfig digest, as tools/package records it)
 //!   policy render --input peers.toml --fleet <file> --ledger <dir> --out draft.bin [--set-roster <file>]
 //!   policy diff --ledger <dir> --draft draft.bin
-//!   policy approve --ledger <dir> --draft draft.bin --approver-key <file> --approver-id <id> --head <file> --out A.approval
+//!   policy rp-digest <rp public key file>                (the digest `diff` prints per peer)
+//!   policy approve --ledger <dir> --draft draft.bin --diff-sha256 <hex> --approver-key <file> --approver-id <id> --head <file> [--supersede <earlier approval>] --out A.approval
 //!   policy sign --ledger <dir> --draft draft.bin --approvals A B ... --keys <dir> --out slot.bin [--new-roster <file>]
 //!   policy verify --keys-pub <dir> --slot slot.bin [--fleet <file> [--package-node <file>]]
 //!   policy verify --fleet <file> --package-node <file>
 //!   policy verify --ledger <dir> --keys-pub <dir>
 //!   policy ledger init --dir <dir> --genesis-roster <roster.toml>
 //!   policy ledger approve-restore --from <copy> --approver-key <file> --approver-id <id> --out R.approval
-//!   policy ledger restore --from <copy> --dir <dir> --approvals R1 R2 --keys-pub <dir> --head <file>...
+//!   policy ledger restore --from <copy> --dir <dir> --approvals R1 R2 --keys-pub <dir> --head <file>... [--supersede <approval>...]
 //!   policy roster-digest <roster.toml>                    (prints the hex digest to pin, for operators and fixtures)
 //!
 //! Keys are dev keys (owner decision, residual RM8-1, as tools/release's
@@ -444,20 +445,52 @@ fn cmd_diff(args: &[String]) -> Result<(), String> {
 
 // --- approve ------------------------------------------------------------
 
-fn read_head_file(path: &Path) -> Result<Option<(u32, [u8; 32])>, String> {
+/// An approver's head file (D11): the newest ledger head they verified
+/// (absent before the ledger has one), and the last version and body they
+/// approved, which a truncated ledger can drop.
+struct HeadFile {
+    ledger: Option<(u32, [u8; 32])>,
+    approved: Option<(u32, [u8; 32])>,
+}
+
+const HEAD_KEYS: [&str; 4] = ["approved_body_sha256", "approved_version", "body_sha256", "version"];
+
+/// `-` for both fields is "none yet" (every key is always written).
+fn head_pair(fields: &[(String, String)], version: &str, digest: &str) -> Result<Option<(u32, [u8; 32])>, String> {
+    match (record::get(fields, version), record::get(fields, digest)) {
+        (Some("-"), Some("-")) => Ok(None),
+        (Some(v), Some(d)) if v != "-" && d != "-" => Ok(Some((
+            v.parse().map_err(|_| format!("head file: bad {version}"))?,
+            util::hex_n::<32>(d, &format!("head file: {digest}"))?,
+        ))),
+        _ => Err(format!("head file: {version} and {digest} are both set or both -")),
+    }
+}
+
+fn read_head_file(path: &Path) -> Result<Option<HeadFile>, String> {
     if !path.exists() {
         return Ok(None);
     }
     let bytes = fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let fields = record::parse(&bytes, &["body_sha256", "version"]).map_err(|e| format!("{}: {e}", path.display()))?;
-    let version: u32 = record::get(&fields, "version").ok_or("head file: missing version")?.parse().map_err(|_| "head file: bad version")?;
-    let digest = util::hex_n::<32>(record::get(&fields, "body_sha256").ok_or("head file: missing body_sha256")?, "head file: body_sha256")?;
-    Ok(Some((version, digest)))
+    let fields = record::parse(&bytes, &HEAD_KEYS).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(Some(HeadFile {
+        ledger: head_pair(&fields, "version", "body_sha256")?,
+        approved: head_pair(&fields, "approved_version", "approved_body_sha256")?,
+    }))
 }
 
-fn write_head_file(path: &Path, version: u32, digest: [u8; 32]) -> Result<(), String> {
-    let bytes = record::render(&[("body_sha256", &hex(&digest)), ("version", &version.to_string())], &["body_sha256", "version"]);
-    fs::write(path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+fn write_head_file(path: &Path, head: &HeadFile) -> Result<(), String> {
+    let pair = |p: Option<(u32, [u8; 32])>| p.map_or(("-".to_string(), "-".to_string()), |(v, d)| (v.to_string(), hex(&d)));
+    let (version, body) = pair(head.ledger);
+    let (approved_version, approved_body) = pair(head.approved);
+    let pairs = [
+        ("version", version),
+        ("body_sha256", body),
+        ("approved_version", approved_version),
+        ("approved_body_sha256", approved_body),
+    ];
+    let refs: Vec<(&str, &str)> = pairs.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    fs::write(path, record::render(&refs, &HEAD_KEYS)).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 fn cmd_approve(args: &[String]) -> Result<(), String> {
@@ -469,14 +502,13 @@ fn cmd_approve(args: &[String]) -> Result<(), String> {
     // Required (D11): an approver without a head file checks nothing
     // against truncation or forks. A missing *file* is a first approval or
     // a wiped device starting over (runbook).
-    let head_path = Some(PathBuf::from(arg(args, "--head")?));
+    let head_path = PathBuf::from(arg(args, "--head")?);
 
     let pinned = read_pin()?;
     let state = ledger.verify_chain_unsigned(pinned)?;
 
-    if let Some(head_path) = &head_path
-        && let Some((recorded_version, recorded_digest)) = read_head_file(head_path)?
-    {
+    let recorded = read_head_file(&head_path)?;
+    if let Some((recorded_version, recorded_digest)) = recorded.as_ref().and_then(|h| h.ledger) {
         match state.height {
             None => return Err(format!("approve: the ledger is empty, behind this approver's recorded head (version {recorded_version})")),
             Some(h) if h < recorded_version => {
@@ -511,6 +543,35 @@ fn cmd_approve(args: &[String]) -> Result<(), String> {
         ));
     }
 
+    // A version this approver approved that the ledger does not hold was
+    // either signed and then cut off this ledger (truncation, D11) or
+    // abandoned; only the approver can say which, by handing back that
+    // approval (`--supersede`), never by default.
+    if let Some((approved_version, approved_body)) = recorded.as_ref().and_then(|h| h.approved) {
+        if state.height.is_some_and(|h| h >= approved_version) {
+            let at = ledger.read_entry(approved_version)?;
+            if head_body_sha256(&at)? != approved_body {
+                println!(
+                    "policy: note: the ledger's version {approved_version} is not the body you approved ({}); another draft was signed",
+                    hex(&approved_body)
+                );
+            }
+        } else {
+            let path = arg_opt(args, "--supersede").ok_or_else(|| {
+                format!(
+                    "approve: you approved version {approved_version} (body {}), which this ledger does not hold: if it was signed, this ledger is truncated; if it was abandoned, pass that approval with --supersede <file>",
+                    hex(&approved_body)
+                )
+            })?;
+            let bytes = fs::read(&path).map_err(|e| format!("{path}: {e}"))?;
+            let earlier = approval::parse_and_verify(&bytes, &state.roster).map_err(|e| format!("approve: --supersede {path}: {e}"))?;
+            if earlier.approver_id != approver_id || earlier.version != approved_version || earlier.body_sha256 != approved_body {
+                return Err(format!("approve: --supersede {path} is not your approval of version {approved_version} recorded in the head file"));
+            }
+            println!("policy: superseding your approval of version {approved_version} ({})", hex(&approved_body));
+        }
+    }
+
     let sk = load_approver_signing(Path::new(&approver_key_path))?;
     let fields = approval::ApprovalFields {
         approver_id: approver_id.clone(),
@@ -526,10 +587,10 @@ fn cmd_approve(args: &[String]) -> Result<(), String> {
     write_new(&out, &record, 0o644)?;
     // The head is the verified ledger's, never the draft's: a draft that is
     // never signed must not move it, or this approver is refused every
-    // later ledger at the height it was drafted against.
-    if let (Some(head_path), Some(height), Some(head_body)) = (&head_path, state.height, &state.head_body) {
-        write_head_file(head_path, height, Sha256::digest(head_body).into())?;
-    }
+    // later ledger at the height it was drafted against. The approval is
+    // kept beside it, for the truncation check above.
+    let ledger_head = state.height.zip(state.head_body.as_ref().map(|b| Sha256::digest(b).into()));
+    write_head_file(&head_path, &HeadFile { ledger: ledger_head, approved: Some((header.version, body_sha256)) })?;
     println!("policy: {approver_id} approved version {} ({})", header.version, out.display());
     Ok(())
 }
@@ -745,15 +806,35 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
             let restored_body_sha256: [u8; 32] = Sha256::digest(state.head_body.as_ref().ok_or("ledger restore: internal")?).into();
             let fleet_id = state.head_header.as_ref().ok_or("ledger restore: internal")?.fleet_id;
 
+            // Each head's approval as well (D11): a copy that lacks a version
+            // an approver approved may be cut below it; an abandoned approval
+            // is handed back with --supersede, as for `approve`.
+            let supersede = arg_list(args, "--supersede");
             for head_path in &head_paths {
-                let Some((recorded_version, recorded_digest)) = read_head_file(Path::new(head_path))? else { continue };
-                if restored_version < recorded_version {
-                    return Err(format!("ledger restore: the copy (version {restored_version}) is behind the head in {head_path} (version {recorded_version})"));
+                let Some(head) = read_head_file(Path::new(head_path))? else { continue };
+                if let Some((recorded_version, recorded_digest)) = head.ledger {
+                    if restored_version < recorded_version {
+                        return Err(format!("ledger restore: the copy (version {restored_version}) is behind the head in {head_path} (version {recorded_version})"));
+                    }
+                    let at = copy.read_entry(recorded_version)?;
+                    let got = head_body_sha256(&at)?;
+                    if got != recorded_digest {
+                        return Err(format!("ledger restore: the copy's version {recorded_version} does not match the head in {head_path} (contains or extends, never diverges)"));
+                    }
                 }
-                let at = copy.read_entry(recorded_version)?;
-                let got = head_body_sha256(&at)?;
-                if got != recorded_digest {
-                    return Err(format!("ledger restore: the copy's version {recorded_version} does not match the head in {head_path} (contains or extends, never diverges)"));
+                if let Some((approved_version, approved_body)) = head.approved
+                    && restored_version < approved_version
+                {
+                    let handed_back = supersede.iter().any(|path| {
+                        fs::read(path).ok().and_then(|b| approval::parse_and_verify(&b, &state.roster).ok()).is_some_and(|f| {
+                            f.version == approved_version && f.body_sha256 == approved_body
+                        })
+                    });
+                    if !handed_back {
+                        return Err(format!(
+                            "ledger restore: {head_path} records an approval of version {approved_version}, which the copy (version {restored_version}) does not hold: if it was signed, the copy is truncated; if it was abandoned, pass that approval with --supersede"
+                        ));
+                    }
                 }
             }
 

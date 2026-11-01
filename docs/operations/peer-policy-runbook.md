@@ -153,6 +153,10 @@ is "a bundle without that peer", nothing faster.
      added), `min_release`, and `roster_sha256`. Group indices are the
      order of `[[groups]]` in `peers.toml`. Check each new `rp=` against
      the peer's own key file with `policy rp-digest <file>`;
+   - when `roster_sha256` changes: get the new `roster.toml` from the
+     drafter, check that `policy roster-digest <roster.toml>` prints the
+     new `roster_sha256`, and check every entry (id and key) against the
+     IdP. The diff shows only the digest;
    - that each change matches a request they can trace to the IdP and MDM
      (a peer's device and owner), not just to the person who drafted it;
    - that the version is the ledger head + 1.
@@ -161,9 +165,12 @@ is "a bundle without that peer", nothing faster.
    `approve` prints the diff again and refuses unless it is the one
    reviewed.
    The head file is the approver's own record of the newest ledger head
-   they have verified (never the draft, so a draft that is not signed
-   leaves it unchanged); `approve` refuses a ledger that is behind it or
-   disagrees with it, which catches truncation and forks.
+   they have verified and of the last version and body they approved.
+   `approve` refuses a ledger that is behind that head or disagrees with
+   it, and a ledger that does not hold the version they last approved:
+   that version was either signed and cut off this ledger (truncation),
+   or abandoned. Only the approver can say it was abandoned, by passing
+   that approval back with `--supersede <file>`.
 5. The signing operator:
    `policy sign --ledger <ledger> --draft draft.bin --approvals A B --keys <keys> --out v<n>.bin`,
    then `policy verify --keys-pub <keys> --slot v<n>.bin --fleet fleet.toml`,

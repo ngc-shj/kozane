@@ -681,12 +681,21 @@ changes go beyond the plan's text:
   view is host-only (`render` feature), runs the structural walk, and
   authorizes nothing. `approve` requires `--diff-sha256` and `--head`.
   `policy rp-digest` prints the per-peer key digest that `diff` shows.
-- **The approver head is the verified ledger head, not the draft.** Plan
-  D11 said "last-seen head". The code had recorded the draft, so an
-  abandoned draft locked its approver out.
+  `contents` reads a slot without a token, so in round 2 it moved behind
+  `verifier`, which P27 already confines.
+- **The approver head is the verified ledger head, plus the last
+  approval.** Plan D11 said "last-seen head". The code had recorded the
+  draft, so an abandoned draft locked its approver out. Round 1 recorded
+  the ledger head alone, which left the newest signed version unprotected
+  against truncation (round 2, S2-1/F2-1). The head file now holds both
+  the ledger head and the last approval. `approve` and `ledger restore`
+  refuse a ledger that lacks the approved version, unless the approver
+  hands that approval back with `--supersede`.
 - **Clear evidence (D5).** On swtpm, `TPM2_Clear` sets resetCount and
-  restartCount to 0, and the next power cycle sets resetCount to 1
-  (build/probes/clear-counts.sh). `provision record` and `nv` now refuse
+  restartCount to 0, and the next power cycle sets resetCount to 1. On
+  swtpm in the dev image, after two power cycles and a TPM Restart the
+  counts were `reset_count: 3 restart_count: 1`. After `tpm2_clear -c p`
+  they were `0 0`, and after one more power cycle `1 0`. `provision record` and `nv` now refuse
   unless both counts are 0, and `nv` refuses a record whose
   `reset_at_provision` is not 0. Steps 1–4 of provisioning therefore run
   in one TPM session.

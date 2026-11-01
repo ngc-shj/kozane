@@ -3164,15 +3164,19 @@ def no_supervisor_record(con: Console, what: str):
         raise Fail(f"{what}: a boot stop reached the supervisor ({m.group(0).strip()})")
 
 
-def fault_boot(pkg: Package, resets: tuple = None):
+def fault_boot(pkg: Package, resets: tuple = None, after_checkpoint: bool = True):
     """A variant boot on a dgram wire, ready: (child, con, wire). Under
-    -no-reboot a reset is QEMU's SHUTDOWN guest-reset."""
+    -no-reboot a reset is QEMU's SHUTDOWN guest-reset. `after_checkpoint`
+    waits for the ready checkpoint too; without it the caller's frame lands
+    while `audit` may still be signing it, the case D-23's drain covers."""
     w = Wire()
     child, con = boot(pkg, w.netdev("n0"), dgram("n1", free_udp_port(), free_udp_port()),
                       shutdown=None if resets is not None else "guest-reset", resets=resets)
     try:
         wait_arp_ready(w, con)
         con.wait_for(r"hs: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        if not after_checkpoint:
+            return child, con, w
         ready_at = time.monotonic()
         # The ready checkpoint's signature (D-20, D-23): the injection comes
         # after it, and how long it took after the boot was ready is what
@@ -3210,7 +3214,9 @@ def test_supervisor(fi_net: Package, fi_timer: Package, passed: list):
     record_a = None
     for frame, halted in ((FAULT_FRAME_A, False), (FAULT_FRAME_B, True)):
         name = "A" if frame == FAULT_FRAME_A else "B"
-        child, con, w = fault_boot(fi_net)
+        # B is sent as soon as the boot is ready, while the ready checkpoint
+        # may still be signing: its lines must survive that too (D-23).
+        child, con, w = fault_boot(fi_net, after_checkpoint=not halted)
         try:
             mark = con.mark()
             w.send(ipv4_udp(PEER_IP, GW_IP, 40000, WG_PORT, frame))
@@ -3222,6 +3228,11 @@ def test_supervisor(fi_net: Package, fi_timer: Package, passed: list):
             if r.group(1) != "ingress" or r.group(3) != "0":
                 raise Fail(f"inject {name}: the record is {r.group(0).strip()}, want pd=ingress lost=0")
             reset_after_one_record(child, con, mark, f"inject {name}")
+            if halted:
+                cp = re.search(AUDIT_SIGNED, con.text)
+                during = cp is None or cp.start() > mark + r.start()
+                print(f"supervisor: inject B's record came {'before' if during else 'after'} the ready checkpoint",
+                      flush=True)
             if con.count(r"WgBadMessage", since=mark):
                 raise Fail(f"inject {name}: ingress audited the frame instead of stopping")
             record_a = record_a or r.group(0).strip()
@@ -3239,7 +3250,7 @@ def test_supervisor(fi_net: Package, fi_timer: Package, passed: list):
         if r.group(1) != "ingress":
             raise Fail(f"reboot: the record is {r.group(0).strip()}")
         # D-20's margin, measured: from the faulting frame to audit's
-        # record, an upper bound on what the supervisor's 1 s drain covers.
+        # record, an upper bound on what FAULT_DRAIN_NS must cover.
         print(f"supervisor: the record was printed {con.time_at(r.end() + mark) - sent:.3f} s after the fault", flush=True)
         again = con.wait_for(r"U-Boot \d{4}\.\d{2} ", since=r.end() + mark, timeout=BOOT_TIMEOUT_S)
         second = again.end() + r.end() + mark
@@ -3762,6 +3773,11 @@ def policy_cases(good: Package, fi_policy: Package, deploy: str, tmp: str, passe
             frames = lan_frames(pb)
             if frames:
                 raise Fail(f"{what}: the gateway's inside NIC sent {len(frames)} frames to the LAN host's probe")
+            # F-F5: a verified slot's rejection names its version (v0 in A,
+            # v1 in B, both behind the counter).
+            for slot, version in (("A", 0), ("B", 1)):
+                if not pb.con.count(rf"policy: rejected slot={slot} reason=RolledBack version={version} lost=\d+"):
+                    raise Fail(f"{what}: no rejected line for slot {slot} naming version={version}")
             # The halts count as the barrier PDs' last word, so the boot
             # still signs the checkpoint that verifies its `policy:` lines.
             try:
@@ -8188,11 +8204,7 @@ class PolicyFixtures:
         os.mkdir(to, 0o700)
         shutil.copytree(fleet.ledger, os.path.join(to, "ledger"))
         for a in POLICY_APPROVERS:
-            # A head exists once its approver has approved against a
-            # non-empty ledger (`approve` records the verified ledger head).
-            head = os.path.join(fleet.dir, f"{a}.head")
-            if os.path.exists(head):
-                shutil.copy2(head, to)
+            shutil.copy2(os.path.join(fleet.dir, f"{a}.head"), to)
         return to
 
     def c13_bundles(self, fleet: Fleet, deploy: str) -> str:

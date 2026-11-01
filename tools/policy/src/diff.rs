@@ -13,6 +13,11 @@
 //! `policy_wire::contents`, the device's own structural walk, not a second
 //! parser. The last line compares `body_sha256`, so a change no item line
 //! shows still changes the diff.
+//!
+//! The text is part of every approval (`diff_sha256`), and `ledger verify`
+//! re-renders it for every entry: changing the format makes every approval
+//! in an existing ledger "bound to another diff". `tests.rs` pins it byte
+//! for byte.
 
 use sha2::{Digest, Sha256};
 
@@ -89,14 +94,10 @@ fn items(body: &[u8]) -> Result<Items, String> {
     }
     let mut rules = BTreeSet::new();
     for g in 0..c.group_count() {
+        // The walk refuses a group without rules, so every group has a line.
         let group = c.group(g).ok_or("diff: internal: a walked group is missing")?;
-        let mut any = false;
         for r in group.rules() {
-            any = true;
             rules.insert(format!("rule group={g} {} {} {}-{}", prefix(&r.dst), proto(r.proto), r.port_lo, r.port_hi));
-        }
-        if !any {
-            rules.insert(format!("rule group={g} none"));
         }
     }
     Ok(Items { peers, rules })

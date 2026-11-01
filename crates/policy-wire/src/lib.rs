@@ -412,20 +412,21 @@ pub fn header(slot: &[u8]) -> Result<Header, Reject> {
 
 /// A slot's peers and groups after the structural walk alone (no node
 /// check, no signatures), for a person to read: `tools/policy diff` shows
-/// approvers every peer and rule through it (M8 plan C2, S8). Host side
-/// only (`render`), and it authorizes nothing.
-#[cfg(feature = "render")]
+/// approvers every peer and rule through it (M8 plan C2, S8). It reads a
+/// slot without a token, so it is `verifier`'s, which check-pins P27 keeps
+/// to the policy PD and tools/policy; it authorizes nothing.
+#[cfg(feature = "verifier")]
 pub struct Contents<'a> {
     slot: &'a [u8],
     layout: Layout,
 }
 
-#[cfg(feature = "render")]
+#[cfg(feature = "verifier")]
 pub fn contents(slot: &[u8]) -> Result<Contents<'_>, Reject> {
     Ok(Contents { slot, layout: walk(slot)? })
 }
 
-#[cfg(feature = "render")]
+#[cfg(feature = "verifier")]
 impl<'a> Contents<'a> {
     pub fn peer_count(&self) -> u8 {
         self.layout.peer_count

@@ -265,7 +265,7 @@ def cases(run: Run) -> list:
     case("allow: --after, a TPM Reset successor", run.verify(capture(reset), after=anchor), 0, "audit-verify: ok")
     case("allow: --after, a TPM Restart successor", run.verify(capture(restart), after=anchor), 0, "audit-verify: ok")
     case("report: --after, a new boot leaves the anchor's tail unverifiable", run.verify(capture(reset), after=anchor), 0,
-         "note: the anchor's boot may have continued past seq=")
+         "note: the anchor's boot may have continued past seq=12; its lines after the anchor are not verifiable")
     case("deny: --after, a reset jump", run.verify(capture(jump), after=anchor), 1,
          "gap after the anchor: reset=7 restart=0 after reset=5 restart=0")
     # A capture split inside one boot: the rest of `first`'s boot.
@@ -278,6 +278,9 @@ def cases(run: Run) -> list:
          "audit-verify: ok")
     case("deny: --after, a line deleted just after the anchor", run.verify(capture(rest.lines[1:]), after=anchor), 1,
          "the capture does not resume at the anchor: first seq=14, want seq=13")
+    rc_resumed, out_resumed = run.verify(capture(rest.lines), after=anchor)
+    case("allow: --after, the same boot resumed has no unverifiable-tail note",
+         (rc_resumed, "no note" if "may have continued past" not in out_resumed else out_resumed), 0, "no note")
     case("allow: the next capture's anchor is printed", run.verify(capture(rest.lines), after=anchor), 0,
          f"anchor: {rest.lines[-1].decode()}")
     return out

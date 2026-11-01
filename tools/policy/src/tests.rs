@@ -175,6 +175,36 @@ fn diff_shows_a_widened_rule_as_its_rule_lines() {
     assert!(d.contains("+ rule group=0 10.2.0.0/24 tcp 443-65535\n"), "{d}");
 }
 
+/// The diff text byte for byte (diff.rs: approvals bind it, so a format
+/// change breaks every existing ledger).
+#[test]
+fn diff_text_is_pinned() {
+    let old = bundle_with(0xAB, 443);
+    let new = bundle_with(0xCD, 65535);
+    let text = crate::diff::render(
+        Some((&wire_header::read(&old).unwrap(), policy_wire::split(&old).unwrap().body())),
+        &wire_header::read(&new).unwrap(),
+        policy_wire::split(&new).unwrap().body(),
+    )
+    .unwrap();
+    assert_eq!(text, GOLDEN_DIFF);
+}
+
+const GOLDEN_DIFF: &str = concat!(
+    "fleet_id: 09090909090909090909090909090909 -> 09090909090909090909090909090909\n",
+    "version: 1 -> 1\n",
+    "min_release: 0 -> 0\n",
+    "prev_sha256: 0000000000000000000000000000000000000000000000000000000000000000 -> 0000000000000000000000000000000000000000000000000000000000000000\n",
+    "roster_sha256: 0000000000000000000000000000000000000000000000000000000000000000 -> 0000000000000000000000000000000000000000000000000000000000000000\n",
+    "peer_count: 1 -> 1\n",
+    "group_count: 1 -> 1\n",
+    "- peer BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc= rp=d43e5319f6a607b66d21ace48af21821ac176ca19a4e26c94b4d7dff51e56a53 groups=0 allowed=10.1.0.0/24\n",
+    "+ peer BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc= rp=27b15da9990dadfddbe3b62b314d9e63204ec4cc30e870a1557be78b77c0056d groups=0 allowed=10.1.0.0/24\n",
+    "- rule group=0 10.2.0.0/24 tcp 443-443\n",
+    "+ rule group=0 10.2.0.0/24 tcp 443-65535\n",
+    "body_sha256: 3f1193844b865d0c356c215390fb3dd095dab952a82251a20cd3cff31b1a8ba5 -> 93bedf4819dbabe298170984a6f82d895212ef8c2c0d080849510cd3cf0f38c3\n",
+);
+
 #[test]
 fn diff_of_an_unchanged_body_marks_every_item_unchanged() {
     let old = bundle_with(0xAB, 443);

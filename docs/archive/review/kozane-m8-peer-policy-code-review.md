@@ -1,6 +1,6 @@
 # Code Review: kozane-m8-peer-policy
 Date: 2026-11-01
-Review round: 1
+Review round: 2
 
 ## Changes from Previous Round
 Initial review, at 751e95b, after Phase 2 Step 2-5's self-check (D-23).
@@ -245,3 +245,98 @@ verified-local by the `make test` at this round's commit (below).
   - Cost to fix: one swtpm interop test per fact. It would re-test swtpm,
     not Kozane.
 - **T-F10:** the comment is corrected.
+
+## Round 2 (751e95b..6aeafc7)
+
+Round 2 reviewed only the round-1 fixes. All round-1 findings were
+confirmed resolved, except T-F3 (the Kani counts, still open) and T-F6
+(partial, continued below as T2-9).
+
+### Findings
+- **Functionality:**
+  - F2-1 Major = S2-1 Minor: the approver head lagged one version, so the
+    newest signed version had no truncation protection (R43, a narrowing
+    the round-1 fix introduced).
+  - F2-2 Minor: usage header. F2-3 Minor: a stale "1 s drain" comment.
+    F2-4 Minor: `head_path` was an `Option` that is always `Some`.
+  - F2-5 Minor: the diff format was neither versioned nor pinned; there
+    was an unreachable branch.
+  - F2-6 Minor: a probe cited from the git-ignored build/.
+- **Security:**
+  - S2-2 Minor: `contents` behind `render` was a token-less slot reader
+    that P27 did not pin.
+  - S2-3 Minor: a roster change was shown only as a digest.
+  - S2-A1 Minor (Adjacent): P31 could be evaded by using `sign` as a
+    value.
+- **Testing:**
+  - T2-1 Major: no injection during a checkpoint signature.
+  - T2-2 Major: `rp-digest` and the diff `approve` prints were untested.
+  - T2-4 Major: the nv deny after a power cycle did not check that the NV
+    indices were unchanged.
+  - Minors:
+    - T2-3: lemma (d)'s cover could be met by a refresh.
+    - T2-5: no restart-only deny.
+    - T2-6: P31's window edge was not pinned.
+    - T2-7: the note was never asserted absent.
+    - T2-8: the rejected `version=` was unasserted.
+    - T2-9: the bolero header was constant.
+    - T2-10: a misplaced doc and a missing cover.
+    - T2-11: the fork tolerated a missing head.
+    - T2-12: the "stale" digest case was not stale; the snapshot had no
+      red-proof.
+
+### Round 2 Resolution Status
+- **F2-1 / S2-1 (approver head and truncation):**
+  - The head file holds the verified ledger head and the last approval.
+  - `approve` and `ledger restore` refuse a ledger that lacks the
+    approved version, unless the approver hands back that approval with
+    `--supersede`.
+  - Fixtures: an abandoned draft is superseded explicitly; without
+    `--supersede` it is refused; a truncated replica is refused;
+    supersede with someone else's approval is refused; restore below an
+    approved version is refused; restore with the approval superseded
+    succeeds.
+  - Red-proved: with both checks disabled, 5 cases failed.
+  - Runbook and D-24 are updated.
+- **S2-2:** `Contents`/`contents` are behind `verifier` (P27).
+- **S2-3:** a runbook step: check `policy roster-digest` of the new
+  roster and read every entry.
+- **S2-A1:** P31 counts every `sign` token but the definition. New
+  fixture: `sign` used as a value.
+- **F2-2, F2-3, F2-4:** fixed.
+- **F2-5:** the unreachable branch is removed. A golden-text unit test
+  (`diff_text_is_pinned`) pins the format, and diff.rs documents why.
+- **F2-6:** D-24 quotes the probe's output.
+- **T2-1:**
+  - Inject B now goes in right after `hs: ready`, before the ready
+    checkpoint, and logs whether its record came before or after the
+    checkpoint.
+  - Inject A still goes in after the checkpoint.
+  - The interval still uses poll time. That is within the 5× margin, so
+    no change.
+- **T2-2:** new case "rp-digest prints the rp= that diff and approve
+  show": the digest equals diff's `rp=`, a short file is refused, and
+  `approve`'s stdout carries the peer line.
+- **T2-4:** the nv deny snapshots both indices' public areas and the
+  logical version, and requires them unchanged.
+- **T2-5:** new case "record on a TPM restarted since its Clear".
+  Red-proved with a reset-only mutant.
+- **T2-6:** the fixture now sits at arm+4, just past the edge, and the
+  comment says "within three lines".
+- **T2-7:** the needle pins `seq=12;`, and a resumed-boot case asserts
+  the note is absent.
+- **T2-8:** the rolled-back case requires `rejected slot=A … version=0`
+  and `slot=B … version=1`.
+- **T2-9:** version, min_release, prev, roster and both signatures now
+  vary with the input.
+- **T2-10:** the stale doc is removed, and the Done(Verified) arm has a
+  cover.
+- **T2-11:** strict head copy, now that `approve` always writes a head.
+- **T2-12:**
+  - The stale case uses the same draft's diff against an older copy of
+    the ledger.
+  - `entries()` is renamed `ledger_snapshot()`.
+  - Red-proved: a mutant `sign` leaving a stray file in the ledger made
+    17 refusal cases fail.
+- **T2-3:** the cover is tightened to a replaced tuple. It is proved
+  with the inner-core gate run.

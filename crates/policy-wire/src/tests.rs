@@ -784,7 +784,17 @@ fn fuzz_one(bytes: &[u8]) {
     let (port_lo, port_hi) = if proto == PROTO_ICMP { (0, 0) } else { (u16::from(b1), u16::from(b1).saturating_add(1)) };
     let rules = [Rule { dst: Prefix { addr: [10, 60, 0, 0], len: 24 }, proto, port_lo, port_hi }];
     let groups = [PlainGroup { rules: &rules }];
-    let plain = base_bundle(core::slice::from_ref(&peer), &groups);
+    // The header and the signature bytes vary with the input too, so the
+    // byte-identity check below sees every accessor (`parse` does not look
+    // at signatures).
+    let mut plain = base_bundle(core::slice::from_ref(&peer), &groups);
+    let word = |at: usize| u32::from_be_bytes(core::array::from_fn(|i| bytes.get(at + i).copied().unwrap_or(0)));
+    plain.version = word(2);
+    plain.min_release = word(6);
+    plain.prev_sha256 = [bytes.get(10).copied().unwrap_or(0); 32];
+    plain.roster_sha256 = [bytes.get(11).copied().unwrap_or(0); 32];
+    plain.sig_ed25519 = [bytes.get(12).copied().unwrap_or(0); 64];
+    plain.sig_mldsa65 = [bytes.get(13).copied().unwrap_or(0); 3309];
     let slot = render(&plain);
     let parsed = parse(&slot, &node(), &fake_digest).unwrap();
     assert_eq!(parsed.version(), plain.version);

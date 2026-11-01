@@ -1216,12 +1216,14 @@ def check_audit_call(root: pathlib.Path, out: list):
         out.append(f"P31 {AUDIT_MAIN}: want exactly one .pp_call(, inside fn sign; found lines {calls} (M8 plan C10)")
     if names != calls:
         out.append(f"P31 {AUDIT_MAIN}: CH_AUDITKEY named at lines {names}; only at the one call (M8 plan C10)")
-    # `sign` takes any words, so its one caller must be the machine's
-    # `Action::Call(words) =>` arm, on the line right after it.
-    sign_calls = [n for n, l in enumerate(code, 1) if re.search(r"(?<!fn )\bsign\(", l)]
+    # `sign` takes any words, so its one use must be the machine's
+    # `Action::Call(words) =>` arm, within three lines after it: every
+    # `sign` token but the definition counts, so `let f = sign;` or
+    # `.map(sign)` is a second use too.
+    sign_calls = [n for n, l in enumerate(code, 1) if re.search(r"\bsign\b", re.sub(r"\bfn sign\(", "", l))]
     arm = [n for n, l in enumerate(code, 1) if re.search(r"\bAction::Call\(words\)\s*=>", l)]
     if len(sign_calls) != 1 or len(arm) != 1 or not (arm[0] < sign_calls[0] <= arm[0] + 3):
-        out.append(f"P31 {AUDIT_MAIN}: want exactly one sign( call, in the Action::Call(words) arm; "
+        out.append(f"P31 {AUDIT_MAIN}: want exactly one use of sign, a call in the Action::Call(words) arm; "
                    f"found calls {sign_calls}, arms {arm} (M8 plan C10)")
     if not any("audit_core::ready_input(" in l for l in code):
         out.append(f"P31 {AUDIT_MAIN}: the notification is not decoded by audit_core::ready_input (M8 plan C10)")
