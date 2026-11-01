@@ -107,8 +107,8 @@ pub fn node_digest(n: &Node) -> [u8; 32] {
     h.update([n.inside_prefix.len]);
     h.update(n.inside_ip);
     h.update(n.outside_ip);
-    #[allow(clippy::cast_possible_truncation)]
-    h.update([neighbors.len() as u8]);
+    // Four bytes, never truncated (at most MAX_NEIGHBORS today).
+    h.update(u32::try_from(neighbors.len()).unwrap_or(u32::MAX).to_be_bytes());
     for ip in &neighbors {
         h.update(ip);
     }

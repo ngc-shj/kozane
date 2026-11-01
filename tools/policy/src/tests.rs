@@ -386,3 +386,22 @@ fn a_package_node_digest_matches_only_its_own_fleet_node() {
     other_fleet.fleet_id = [8; 16];
     assert_eq!(node_for_digest(&fleet, &node_digest(&other_fleet)), None);
 }
+
+/// The roster digest's lengths are four big-endian bytes: an id of 256
+/// bytes is prefixed `00 00 01 00`, where a one-byte length would have
+/// written `00` and let another roster share the encoding.
+#[test]
+fn roster_digest_lengths_are_not_truncated() {
+    use sha2::{Digest, Sha256};
+    let key = [7u8; 32];
+    let id = "x".repeat(256);
+    let roster = Roster { approvers: vec![Approver { id: id.clone(), ed25519_pub: key }] };
+    let mut h = Sha256::new();
+    h.update(b"kozane-policy-roster-v1\0");
+    h.update([0, 0, 0, 1]);
+    h.update([0, 0, 1, 0]);
+    h.update(id.as_bytes());
+    h.update(key);
+    let expected: [u8; 32] = h.finalize().into();
+    assert_eq!(roster.digest(), expected);
+}

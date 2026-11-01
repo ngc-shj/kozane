@@ -41,7 +41,7 @@ ROOT = pathlib.Path(__file__).resolve().parents[2]
 TOOL = ROOT / "tools/provision"
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT / "tests/tools"))
-import measure  # noqa: E402
+import measure  # noqa: E402  (after the sys.path insert above, by design)
 import test_policy  # noqa: E402  (its pinned tools/policy build and ledger fixture)
 
 # Runs tools/provision with its pinned record keys pointed at a run's file:

@@ -38,6 +38,8 @@ mod wire_header;
 // Shared with `config`'s build.rs and `tools/mksecrets`: the `fleet`
 // command renders each node's `NodeConfig` through the exact checks the
 // image build runs, never a second parser.
+// validate.rs is shared with the image build and mksecrets; this tool uses
+// only its loader and checks, so the rest is unused here by design.
 #[allow(dead_code)]
 mod validate {
     include!("../../../crates/config/src/validate.rs");

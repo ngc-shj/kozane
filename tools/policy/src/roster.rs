@@ -77,7 +77,9 @@ impl Roster {
         toml::to_string(&raw).unwrap_or_default()
     }
 
-    /// `sha256(ROSTER_DOMAIN ‖ count u8 ‖ (id_len u8 ‖ id ‖ ed25519_pub[32])*)`,
+    /// `sha256(ROSTER_DOMAIN ‖ count u32 ‖ (id_len u32 ‖ id ‖ ed25519_pub[32])*)`,
+    /// lengths big-endian and never truncated, so no two rosters share an
+    /// encoding,
     /// over the approvers in their canonical (sorted-by-id) order. Sorts a
     /// local copy rather than trusting `self.approvers` to already be
     /// sorted, so a `Roster` built directly (not through [`Roster::parse`])
@@ -88,11 +90,9 @@ impl Roster {
         sorted.sort_by_key(|a| a.id.clone());
         let mut h = Sha256::new();
         h.update(ROSTER_DOMAIN);
-        #[allow(clippy::cast_possible_truncation)]
-        h.update([sorted.len() as u8]);
+        h.update(len32(sorted.len()));
         for a in sorted {
-            #[allow(clippy::cast_possible_truncation)]
-            h.update([a.id.len() as u8]);
+            h.update(len32(a.id.len()));
             h.update(a.id.as_bytes());
             h.update(a.ed25519_pub);
         }
@@ -102,4 +102,10 @@ impl Roster {
     pub fn find(&self, id: &str) -> Option<&Approver> {
         self.approvers.iter().find(|a| a.id == id)
     }
+}
+
+/// A length as four big-endian bytes; saturates rather than wraps, and no
+/// roster or id comes near 2^32.
+fn len32(n: usize) -> [u8; 4] {
+    u32::try_from(n).unwrap_or(u32::MAX).to_be_bytes()
 }
