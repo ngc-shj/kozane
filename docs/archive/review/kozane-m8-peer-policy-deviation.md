@@ -699,9 +699,16 @@ changes go beyond the plan's text:
   the identical draft needs nothing. Round 4 made three changes:
   - `restore` again checks both halves of every head given to it,
     fail-closed and without `--supersede`;
-  - a superseding or satisfied `approve-restore` rewrites that approver's
-    own head to the copy's head;
-  - `approve-restore` refuses an approver without a head file.
+  - a superseding `approve-restore` clears that approval from the
+    approver's own head. In round 5 it no longer moves the ledger half, so
+    a copy that is never restored cannot wedge the approver;
+  - `approve-restore` refuses an approver without a head file, and in
+    round 5 also refuses a head that records nothing. It checks the copy
+    with the bundle signatures, as `restore` does.
+
+  A further consequence: a restore needs two approvers whose head files
+  survived. On a two-member roster that has lost one, the way out is a
+  new ledger at a new genesis, not a restore.
 
   Two residuals remain:
   - The restore operator chooses which approvers' heads reach `restore`.

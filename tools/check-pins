@@ -852,8 +852,10 @@ def dependency_entries(doc: dict, ws_deps: dict) -> list:
             spec = spec if isinstance(spec, dict) else {"version": spec}
             package = spec.get("package", key)
             if spec.get("workspace") is True:
-                declared = ws_deps.get(key, {})
-                package = declared.get("package", key) if isinstance(declared, dict) else key
+                # None: inherited, but the root declares no such key (cargo
+                # refuses it; callers report it rather than guess).
+                declared = ws_deps.get(key)
+                package = None if declared is None else declared.get("package", key) if isinstance(declared, dict) else key
             entries.append((table, key, spec, package))
     return entries
 
@@ -903,7 +905,7 @@ def check_mce_deps(root: pathlib.Path, out: list):
         guarded = set()
         ws_deps = ws_doc.get("workspace", {}).get("dependencies", {})
         for _, key, spec, package in dependency_entries(doc, ws_deps):
-            if package not in ("sha3", "zeroize"):
+            if (package or key) not in ("sha3", "zeroize"):
                 continue
             guarded.add(key)
             if spec.get("workspace") is True:
@@ -1143,6 +1145,9 @@ def verifier_users_in(manifest: dict, ws_deps: dict) -> list:
     manifest, any feature but `verifier` itself that includes it."""
     names, found = {"policy-wire"}, []
     for table, key, spec, package in dependency_entries(manifest, ws_deps):
+        if package is None and "verifier" in (spec.get("features") or []):
+            found.append(f"[{table}.{key}] features (inherited, but the workspace declares no {key})")
+            continue
         if package != "policy-wire":
             continue
         names.add(key)
@@ -1264,9 +1269,12 @@ def check_audit_call(root: pathlib.Path, out: list):
     code = stripped.splitlines()
     # One source file: a module beside main.rs, or code pulled in from
     # elsewhere, could call `sign` unseen.
+    # Any out-of-line `mod x;` (whatever attribute names its file: `path`,
+    # `cfg_attr(.., path = ..)`, split over lines) and `include!` with any
+    # delimiter or spacing: audit is one file.
     for n, l in enumerate(code, 1):
-        if re.search(r"#\s*\[\s*path\b|\binclude!\s*\(", l):
-            out.append(f"P31 {AUDIT_MAIN}:{n}: #[path] or include! pulls in code the one-call-site check does not read (M8 plan C10)")
+        if re.search(r"\bmod\s+[A-Za-z_][A-Za-z0-9_]*\s*;|\binclude\s*!", l):
+            out.append(f"P31 {AUDIT_MAIN}:{n}: an out-of-line module or include! pulls in code the one-call-site check does not read (M8 plan C10)")
     others = sorted(str(f.relative_to(root)) for f in path.parent.rglob("*.rs") if f != path)
     if others:
         out.append(f"P31 {AUDIT_MAIN}: audit has other source files {others}; its one call site is only checked in main.rs (M8 plan C10)")

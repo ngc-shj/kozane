@@ -1,6 +1,6 @@
 # Code Review: kozane-m8-peer-policy
 Date: 2026-11-01
-Review round: 4
+Review round: 5
 
 ## Changes from Previous Round
 Initial review, at 751e95b, after Phase 2 Step 2-5's self-check (D-23).
@@ -497,3 +497,91 @@ confirmed resolved, except T-F3 (the Kani counts, still open) and T-F6
 - **T4-6:** the note names the legs (a 502 from tls-core on the backend
   leg; a client connect timeout). On a mismatch, release boot now
   reports the body prefix and tls's backend audit lines.
+
+## Round 5 (4c8a59c..81a91d8)
+
+### Findings
+- **Security:**
+  - S5-1 Minor = F5-1 Major: approve-restore moved the approver's head to
+    an operator-supplied copy that was checked without bundle signatures
+    and might never be restored. An approver could be wedged with no reset
+    (R38, R48).
+  - S5-2 Minor: a head recording nothing was accepted as a head.
+  - S5-3 Minor = A5-1: P31 missed `include![..]`, `include !`, and
+    `cfg_attr(.., path)` / split `#[path]` modules.
+  - S5-4 Minor: P27's Makefile regex missed indirection; inherited keys
+    without a declaration fell back to their own name.
+- **Functionality:**
+  - F5-2 Minor: a failed record write left a partial approval file.
+  - F5-3 Minor: the runbook did not say a wiped approver cannot approve a
+    restore.
+  - F5-4 Minor: the release-boot diagnostic regex matched only
+    `BackendUnavailable`.
+- **Testing:**
+  - T5-1 Major: restore's forked, missing-head and satisfied-head branches
+    had no fixtures.
+  - T5-2 Major: write_reserved's cleanup was unproven.
+  - T5-3 Minor: P31's `include!` had no fixture.
+  - T5-4 Minor: the underscore dependency spellings were untested.
+  - T5-5 Minor: a wrong docstring.
+  - T5-6 Minor: refused approve-restore cases did not check the head.
+  - T5-7 Minor: nothing recorded the run behind the new KANI-* lines.
+
+### Round 5 Resolution Status
+- **S5-1 / F5-1:**
+  - `approve-restore` takes `--keys-pub` and checks the copy with
+    `verify_chain`, as `restore` does.
+  - It no longer moves the ledger half of the head; it clears only a
+    handed-back approval.
+  - Fixtures: approve-restore verifies the copy's signatures (a flipped
+    ML-DSA byte, head unchanged); with a satisfied head, the head is
+    unchanged.
+  - Red-proved (verify unsigned; head moved to the copy).
+- **S5-2:**
+  - A head recording nothing is refused ("no head recorded").
+  - The fixtures' restore heads are real (`approver_head`: an `approve`
+    of v0's draft against that ledger).
+  - Fixture: approve-restore refuses a blank head. Red-proved.
+- **S5-3 / A5-1:**
+  - P31 refuses every out-of-line `mod x;`, whatever attribute names its
+    file, and `include` followed by `!` with any spacing or delimiter.
+  - Fixtures: `include ! [..]`; a `cfg_attr` path module.
+- **S5-4:**
+  - An inherited key with no workspace declaration is reported, not
+    guessed. P16 keeps its fallback to the key.
+  - Accepted, Minor: other workspaces' inheritance and Makefile
+    indirection.
+    - Every PD builds in the root workspace, where resolution is right.
+      `features_<pd>` assignments are literal today.
+    - P27 is a declared tripwire. The adjudicating controls are the laws'
+      read-only slot MR and `open`'s token (P27 text).
+    - Worst case: a host tool in another workspace enables `verifier`,
+      which affects no device build.
+- **F5-2:** a failed record write removes the partial file and says to
+  approve the same draft again.
+- **F5-3:** the runbook and D-24 say a restore needs two approvers whose
+  head files survived, and what a two-member roster does otherwise.
+- **F5-4:** the regex also matches `TlsClosed(Backend*)` and
+  `TlsTimeout(BackendConnect)`, after a short settle.
+- **T5-1:** fixtures:
+  - restore refuses a given head forked at its approval;
+  - restore refuses a missing head file;
+  - restore with a satisfied given head (allow).
+
+  Red-proved with the reviewer's combined mutant.
+- **T5-2:** fixture: approve whose head cannot be written (no such
+  directory) leaves no approval. Red-proved with the cleanup removed.
+- **T5-3:** see S5-3.
+- **T5-4:** fixture: an underscore `dev_dependencies` table.
+- **T5-5:** the docstring is fixed, and it says the heads are checked
+  before the approvals.
+- **T5-6:** the refused approve-restore cases check the head is
+  unchanged.
+- **T5-7, and T-F3 from round 1, closed:**
+  - The KANI-* lines come from the full `make kani` on z1mn: at 751e95b
+    (17299 s, rc 0), then at f5937f1 (1356 s, rc 0). The second run
+    re-proved inner-core in full and took the rest from the cache. It
+    reported 164 harnesses, and every crate verified.
+  - No crate under Kani changed after f5937f1; round 4 and round 5 touched
+    tools/ and tests/ only.
+  - The cache was copied to gx10 for the final `make check`.

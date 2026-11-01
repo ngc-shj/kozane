@@ -15,7 +15,7 @@
 //!   policy verify --fleet <file> --package-node <file>
 //!   policy verify --ledger <dir> --keys-pub <dir>
 //!   policy ledger init --dir <dir> --genesis-roster <roster.toml>
-//!   policy ledger approve-restore --from <copy> --approver-key <file> --approver-id <id> --head <file> [--supersede <earlier approval>] --out R.approval
+//!   policy ledger approve-restore --from <copy> --keys-pub <dir> --approver-key <file> --approver-id <id> --head <file> [--supersede <earlier approval>] --out R.approval
 //!   policy ledger restore --from <copy> --dir <dir> --approvals R1 R2 --keys-pub <dir> --head <file>...
 //!   policy roster-digest <roster.toml>                    (prints the hex digest to pin, for operators and fixtures)
 //!
@@ -485,6 +485,7 @@ fn read_head_file(path: &Path) -> Result<Option<HeadFile>, String> {
 /// or holds with another body, was either cut off this ledger or abandoned
 /// (or superseded by another draft); only the approver can say which, by
 /// handing back their own approval of it (`--supersede`).
+/// `Ok(true)` when the last approval was handed back (`--supersede`).
 /// `draft` is the version and body being approved now (`approve`): the same
 /// one approved again (a lost approval file) needs nothing handed back.
 fn check_head(
@@ -495,10 +496,10 @@ fn check_head(
     approver_id: &str,
     draft: Option<(u32, [u8; 32])>,
     supersede: Option<&str>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let needed = check_head_needs(what, ledger, state, head, draft)?;
     match (needed, supersede) {
-        (None, None) => Ok(()),
+        (None, None) => Ok(false),
         (None, Some(path)) => Err(format!("{what}: --supersede {path} given, but nothing recorded needs superseding")),
         (Some(why), None) => Err(why),
         (Some(_), Some(path)) => {
@@ -511,7 +512,7 @@ fn check_head(
                 return Err(format!("{what}: --supersede {path} is not your approval of version {approved_version} recorded in the head file"));
             }
             println!("policy: superseding your approval of version {approved_version} ({})", hex(&approved_body));
-            Ok(())
+            Ok(true)
         }
     }
 }
@@ -554,7 +555,8 @@ fn check_head_needs(what: &str, ledger: &ledger::Ledger, state: &ledger::ChainSt
 /// `out` is created first (refused if it exists), then `before` moves the
 /// approver's head, then the record lands in the file already reserved: a
 /// head never records an approval whose file could not be created, and a
-/// failed head write leaves no approval behind.
+/// failed head write leaves no approval behind; a failed record write
+/// removes the partial file.
 fn write_reserved(out: &Path, record: &[u8], before: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
     use std::io::Write;
     let err = |e: std::io::Error| format!("{}: {e}", out.display());
@@ -564,7 +566,11 @@ fn write_reserved(out: &Path, record: &[u8], before: impl FnOnce() -> Result<(),
         let _ = fs::remove_file(out);
         return Err(e);
     }
-    f.write_all(record).and_then(|()| f.sync_all()).map_err(err)
+    f.write_all(record).and_then(|()| f.sync_all()).map_err(|e| {
+        drop(f);
+        let _ = fs::remove_file(out);
+        format!("{}: {e} (the head already records this approval: approve the same draft again to write it)", out.display())
+    })
 }
 
 /// Written to a temporary file, synced and renamed into place, so a crash
@@ -828,8 +834,13 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
             let out = PathBuf::from(arg(args, "--out")?);
             let pinned = read_pin()?;
 
+            // With the bundle signatures (S5-1): this moves the approver's
+            // head, so the copy must be one `restore` itself would accept.
+            let keys_pub = load_bundle_verifying(Path::new(&arg(args, "--keys-pub")?))?;
             let copy = ledger::Ledger::open(&from);
-            let state = copy.verify_chain_unsigned(pinned)?;
+            let state = copy
+                .verify_chain(&keys_pub, pinned)
+                .map_err(|e| format!("ledger approve-restore: the copy's chain does not verify: {e}"))?;
             let Some(version) = state.height else {
                 return Err("ledger approve-restore: the copy is empty; nothing to restore".into());
             };
@@ -839,15 +850,21 @@ fn cmd_ledger(args: &[String]) -> Result<(), String> {
             // approver without a head file has nothing to check the copy
             // against, so cannot vouch for it.
             let head_path = PathBuf::from(arg(args, "--head")?);
-            let head = read_head_file(&head_path)?.ok_or_else(|| {
-                format!("ledger approve-restore: no head file at {}: an approver without one cannot vouch for a restore", head_path.display())
-            })?;
-            check_head("ledger approve-restore", &copy, &state, Some(&head), &approver_id, None, arg_opt(args, "--supersede").as_deref())?;
+            let head = read_head_file(&head_path)?
+                .filter(|h| h.ledger.is_some() || h.approved.is_some())
+                .ok_or_else(|| {
+                    format!(
+                        "ledger approve-restore: no head recorded at {}: an approver without one cannot vouch for a restore",
+                        head_path.display()
+                    )
+                })?;
+            let superseded =
+                check_head("ledger approve-restore", &copy, &state, Some(&head), &approver_id, None, arg_opt(args, "--supersede").as_deref())?;
             let head_body_sha256: [u8; 32] = Sha256::digest(state.head_body.as_ref().ok_or("ledger approve-restore: internal")?).into();
-            // The head now names the copy's head, its approval held or handed
-            // back: `restore`, checking the heads it is given, sees this one
-            // as checked.
-            let new_head = HeadFile { ledger: Some((version, head_body_sha256)), approved: None };
+            // The head moves only for a handed-back approval, and only that
+            // half: the copy may never be restored, so its ledger head is not
+            // recorded (the next `approve` on the restored ledger does that).
+            let new_head = HeadFile { ledger: head.ledger, approved: if superseded { None } else { head.approved } };
             let fleet_id = state.head_header.as_ref().ok_or("ledger approve-restore: internal")?.fleet_id;
 
             let sk = load_approver_signing(Path::new(&approver_key_path))?;

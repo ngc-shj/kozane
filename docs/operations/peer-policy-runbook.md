@@ -301,14 +301,18 @@ slot comes from the ledger (`entries/`) and is checked with
   ledger and every approval record, and escalate to incident response.
   Recovery needs a new signing key, which is compiled into every image.
 - **Lost ledger.** Each restore approver, on their own device, runs
-  `policy ledger approve-restore --from <copy> --approver-key <key> --approver-id <id> --head <own head file> --out R<N>.approval`.
+  `policy ledger approve-restore --from <copy> --keys-pub <keys> --approver-key <key> --approver-id <id> --head <own head file> --out R<N>.approval`.
   It refuses a copy behind or diverging from their head, and a copy that
   lacks, or holds another body at, the version they last approved: if that
   version was signed, the copy is truncated or forked. If they abandoned
   it, they say so by passing their own approval of it with
-  `--supersede <file>`; nobody else's approval stands in for it. Either
-  way their head then names the copy's head. An approver without a head
-  file cannot approve a restore. Then
+  `--supersede <file>`; nobody else's approval stands in for it, and the
+  handed-back approval is then cleared from their head. It verifies the
+  copy with the bundle public keys (`--keys-pub`), as `restore` does. An
+  approver without a head file (a wiped device) cannot approve a restore,
+  so a restore needs two approvers whose head files survived: on a
+  two-member roster that has lost one, the fleet starts a new ledger at a
+  new genesis (D-24). Then
   `policy ledger restore --from <copy> --dir <new dir> --approvals R1 R2 --keys-pub <keys> --head <file>...`,
   with the head file of every approver that can be reached, the newest
   version's approvers above all. It refuses a copy whose chain does not

@@ -155,6 +155,18 @@ def blank_head(path: pathlib.Path) -> pathlib.Path:
     return path
 
 
+def approver_head(ctx, d, who: str, ledger: pathlib.Path, name: str) -> pathlib.Path:
+    """A real approver head for `ledger`: `who` approves v0's draft against
+    it, as an approver whose last act was that approval (its ledger head is
+    `ledger`'s, its approval v0, which `ledger` holds)."""
+    head = d / name
+    rc, out = run(BIN, "approve", "--ledger", ledger, "--draft", ctx.draft0, "--diff-sha256", reviewed(ledger, ctx.draft0),
+                  "--approver-key", ctx.approver_key[who], "--approver-id", who, "--head", head,
+                  "--out", d / f"{name}.v0.approval")
+    assert rc == 0, out
+    return head
+
+
 class Ctx:
     """A fresh fixture: dev keys, a 3-approver roster, an initialised
     ledger, a 2-node fleet, and version 0 already signed."""
@@ -293,7 +305,7 @@ def case_wrong_approval_domain(d):
     wrong domain to hand it one."""
     ctx = Ctx(d)
     restore = d / "restore.approval"
-    rc0, out0 = run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-1.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"],
+    rc0, out0 = run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "alice", ctx.ledger, "restore-1.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"],
                      "--approver-id", "alice", "--out", restore)
     assert rc0 == 0, out0
     return ctx.sign_refused(ctx.draft1, [restore, ctx.b1], "record key head_body_sha256 is unknown")
@@ -755,9 +767,9 @@ def case_restore_allow(d):
     assert rc0 == 0, out0
     r1 = d / "r1.approval"
     r2 = d / "r2.approval"
-    rc1, out1 = run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-2.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"],
+    rc1, out1 = run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "alice", ctx.ledger, "restore-2.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"],
                      "--approver-id", "alice", "--out", r1)
-    rc2, out2 = run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-3.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["bob"],
+    rc2, out2 = run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "bob", ctx.ledger, "restore-3.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["bob"],
                      "--approver-id", "bob", "--out", r2)
     assert rc1 == 0 and rc2 == 0, out1 + out2
     restored = d / "restored"
@@ -779,8 +791,8 @@ def case_restore_missing_approver_head(d):
     ahead_head.write_text("approved_body_sha256=-\napproved_version=-\nbody_sha256=" + "ab" * 32 + "\nversion=1\n")
     r1 = d / "r1.approval"
     r2 = d / "r2.approval"
-    run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-4.head"), "--from", stale_copy, "--approver-key", ctx.approver_key["alice"], "--approver-id", "alice", "--out", r1)
-    run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-5.head"), "--from", stale_copy, "--approver-key", ctx.approver_key["bob"], "--approver-id", "bob", "--out", r2)
+    run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "alice", stale_copy, "restore-4.head"), "--from", stale_copy, "--approver-key", ctx.approver_key["alice"], "--approver-id", "alice", "--out", r1)
+    run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "bob", stale_copy, "restore-5.head"), "--from", stale_copy, "--approver-key", ctx.approver_key["bob"], "--approver-id", "bob", "--out", r2)
     rc, out = run(BIN, "ledger", "restore", "--from", stale_copy, "--dir", d / "restored", "--approvals", r1, r2,
                   "--keys-pub", ctx.keys, "--head", ahead_head)
     return rc != 0 and "behind the head" in out, out
@@ -801,8 +813,8 @@ def case_restore_below_recorded_head(d):
     ahead_head.write_text("approved_body_sha256=-\napproved_version=-\nbody_sha256=" + "ab" * 32 + "\nversion=5\n")
     r1 = d / "r1.approval"
     r2 = d / "r2.approval"
-    run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-6.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"], "--approver-id", "alice", "--out", r1)
-    run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-7.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["bob"], "--approver-id", "bob", "--out", r2)
+    run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "alice", ctx.ledger, "restore-6.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"], "--approver-id", "alice", "--out", r1)
+    run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "bob", ctx.ledger, "restore-7.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["bob"], "--approver-id", "bob", "--out", r2)
     rc, out = run(BIN, "ledger", "restore", "--from", ctx.ledger, "--dir", d / "restored", "--approvals", r1, r2,
                   "--keys-pub", ctx.keys, "--head", ahead_head)
     return rc != 0 and "behind the head" in out, out
@@ -823,7 +835,7 @@ def v0_copy_after_v1(ctx, d):
 
 
 def carol_approves_restore(ctx, d, copy, head, *extra):
-    return run(BIN, "ledger", "approve-restore", "--from", copy, "--approver-key", ctx.approver_key["carol"],
+    return run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--from", copy, "--approver-key", ctx.approver_key["carol"],
                "--approver-id", "carol", "--head", head, "--out", d / "rc.approval", *extra)
 
 
@@ -832,8 +844,9 @@ def case_restore_below_an_approved_version(d):
     that lacks v1, which she approved and which was signed."""
     ctx = Ctx(d)
     copy, head = v0_copy_after_v1(ctx, d)
+    head_was = head.read_text()
     rc, out = carol_approves_restore(ctx, d, copy, head)
-    return rc != 0 and "does not hold: if it was signed, this ledger is truncated" in out \
+    return rc != 0 and "does not hold: if it was signed, this ledger is truncated" in out and head.read_text() == head_was \
         and not (d / "rc.approval").exists(), out
 
 
@@ -844,9 +857,9 @@ def case_restore_with_the_approval_superseded(d):
     copy, head = v0_copy_after_v1(ctx, d)
     rc, out = carol_approves_restore(ctx, d, copy, head, "--supersede", d / "c1.approval")
     ra = d / "ra.approval"
-    rc1, out1 = run(BIN, "ledger", "approve-restore", "--from", copy, "--approver-key", ctx.approver_key["alice"],
-                    "--approver-id", "alice", "--head", blank_head(d / "alice-r.head"), "--out", ra)
-    # carol's head now names the copy's head, so restore takes it.
+    rc1, out1 = run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--from", copy, "--approver-key", ctx.approver_key["alice"],
+                    "--approver-id", "alice", "--head", approver_head(ctx, d, "alice", copy, "alice-r.head"), "--out", ra)
+    # carol's handed-back approval is cleared from her head, so restore takes it.
     rc2, out2 = run(BIN, "ledger", "restore", "--from", copy, "--dir", d / "restored", "--approvals", d / "rc.approval", ra,
                     "--keys-pub", ctx.keys, "--head", head)
     return rc == 0 and rc1 == 0 and rc2 == 0, out + out1 + out2
@@ -854,15 +867,17 @@ def case_restore_with_the_approval_superseded(d):
 
 def case_restore_refuses_a_given_head_with_a_newer_approval(d):
     """S4-1: v1 is approved by alice and bob and signed; the copy is cut back
-    to v0; carol and dave (heads that predate v1) approve the restore. bob's
-    head, passed to restore, records his approval of v1: refused."""
+    to v0; carol and alice (with heads made against the copy) approve the
+    restore. bob's head, passed to restore, records his approval of v1:
+    refused. restore checks the heads before it reads the approvals, so the
+    approvals only make the case otherwise complete."""
     ctx = Ctx(d)
     copy, _ = v0_copy_after_v1(ctx, d)
     approvals = []
     for who in ("carol", "alice"):
         out = d / f"r-{who}.approval"
-        rc, o = run(BIN, "ledger", "approve-restore", "--from", copy, "--approver-key", ctx.approver_key[who],
-                    "--approver-id", who, "--head", blank_head(d / f"{who}-blank.head"), "--out", out)
+        rc, o = run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--from", copy, "--approver-key", ctx.approver_key[who],
+                    "--approver-id", who, "--head", approver_head(ctx, d, who, copy, f"{who}-v0.head"), "--out", out)
         assert rc == 0, o
         approvals.append(out)
     rc, out = run(BIN, "ledger", "restore", "--from", copy, "--dir", d / "restored", "--approvals", *approvals,
@@ -871,13 +886,92 @@ def case_restore_refuses_a_given_head_with_a_newer_approval(d):
         and not (d / "restored").exists(), out
 
 
+def restore_with_heads(ctx, d, ledger, *heads):
+    approvals = []
+    for who in ("alice", "bob"):
+        out = d / f"r-{who}.approval"
+        rc, o = run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--from", ledger, "--approver-key",
+                    ctx.approver_key[who], "--approver-id", who, "--head", approver_head(ctx, d, who, ledger, f"{who}-r.head"),
+                    "--out", out)
+        assert rc == 0, o
+        approvals.append(out)
+    extra = [a for h in heads for a in ("--head", h)]
+    return run(BIN, "ledger", "restore", "--from", ledger, "--dir", d / "restored", "--approvals", *approvals,
+               "--keys-pub", ctx.keys, *extra)
+
+
+def case_restore_refuses_a_given_head_forked_at_its_approval(d):
+    """T5-1: carol's head records v1 = draft1, the ledger holds another v1."""
+    ctx = Ctx(d)
+    head = fork_v1(ctx, d)
+    rc, out = restore_with_heads(ctx, d, ctx.ledger, head)
+    return rc != 0 and "with another body than the copy's" in out and not (d / "restored").exists(), out
+
+
+def case_restore_refuses_a_missing_head_file(d):
+    ctx = Ctx(d)
+    rc, out = restore_with_heads(ctx, d, ctx.ledger, d / "no-such.head")
+    return rc != 0 and "ledger restore: no head file at" in out and not (d / "restored").exists(), out
+
+
+def case_restore_with_a_satisfied_given_head(d):
+    """T5-1 allow: alice's head (v1 approved and signed) is held by the copy."""
+    ctx = Ctx(d)
+    rc0, out0 = ctx.sign(ctx.draft1, [ctx.a1, ctx.b1], d / "slot1.bin")
+    assert rc0 == 0, out0
+    rc, out = restore_with_heads(ctx, d, ctx.ledger, d / "alice1.head")
+    return rc == 0 and (d / "restored").exists(), out
+
+
+def case_approve_whose_head_cannot_be_written(d):
+    """T5-2: the head write fails (its directory does not exist): the
+    reserved approval file is removed again."""
+    ctx = Ctx(d)
+    rc, out = approve_carol(ctx, d, ctx.draft1, "c1.approval", d / "no-such-dir" / "carol.head")
+    return rc != 0 and not (d / "c1.approval").exists(), out
+
+
+def case_approve_restore_of_an_unsigned_copy(d):
+    """S5-1: a copy whose v1 carries a bad bundle signature (its approvals
+    genuine) is refused by approve-restore itself, and the head is left as
+    it was."""
+    ctx = Ctx(d)
+    head = d / "carol.head"
+    ctx.approve("carol", ctx.draft0, head, out=d / "c0.approval")
+    rc0, out0 = ctx.sign(ctx.draft1, [ctx.a1, ctx.b1], d / "slot1.bin")
+    assert rc0 == 0, out0
+    copy = d / "copy"
+    shutil.copytree(ctx.ledger, copy)
+    entry = copy / "entries/0000000001.bin"
+    slot = bytearray(entry.read_bytes())
+    rc1, out1 = run(BIN, "verify", "--keys-pub", ctx.keys, "--slot", entry, "--fleet", ctx.fleet)
+    assert rc1 == 0, out1
+    # The ML-DSA-65 signature ends the slot's non-zero bytes (the tail is
+    # zero): flip its last byte, so the structure still walks.
+    slot[len(slot.rstrip(b"\0")) - 1] ^= 1
+    entry.write_bytes(bytes(slot))
+    head_was = head.read_text()
+    rc, out = carol_approves_restore(ctx, d, copy, head)
+    return rc != 0 and "does not verify" in out and head.read_text() == head_was \
+        and not (d / "rc.approval").exists(), out
+
+
+def case_approve_restore_with_a_blank_head(d):
+    """S5-2: a head that records nothing (no command writes one) is no head."""
+    ctx = Ctx(d)
+    rc, out = run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--from", ctx.ledger, "--approver-key",
+                  ctx.approver_key["alice"], "--approver-id", "alice", "--head", blank_head(d / "blank.head"),
+                  "--out", d / "r.approval")
+    return rc != 0 and "no head recorded at" in out and not (d / "r.approval").exists(), out
+
+
 def case_approve_restore_without_a_head_file(d):
     """S4-2: an approver without a head file has nothing to check the copy
     against, so cannot vouch for a restore."""
     ctx = Ctx(d)
-    rc, out = run(BIN, "ledger", "approve-restore", "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"],
+    rc, out = run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"],
                   "--approver-id", "alice", "--head", d / "no-such.head", "--out", d / "r.approval")
-    return rc != 0 and "no head file at" in out and not (d / "r.approval").exists(), out
+    return rc != 0 and "no head recorded at" in out and not (d / "r.approval").exists(), out
 
 
 def case_restore_supersede_with_someone_elses_approval(d):
@@ -885,8 +979,10 @@ def case_restore_supersede_with_someone_elses_approval(d):
     stand in for carol's own."""
     ctx = Ctx(d)
     copy, head = v0_copy_after_v1(ctx, d)
+    head_was = head.read_text()
     rc, out = carol_approves_restore(ctx, d, copy, head, "--supersede", ctx.a1)
-    return rc != 0 and "is not your approval of version 1" in out and not (d / "rc.approval").exists(), out
+    return rc != 0 and "is not your approval of version 1" in out and not (d / "rc.approval").exists() \
+        and head.read_text() == head_was, out
 
 
 def case_reapproving_the_same_draft(d):
@@ -940,9 +1036,11 @@ def case_approve_restore_of_a_forked_ledger(d):
     refused as forked, until she supersedes her approval."""
     ctx = Ctx(d)
     head = fork_v1(ctx, d)
+    head_was = head.read_text()
     rc, out = carol_approves_restore(ctx, d, ctx.ledger, head)
+    unmoved = head.read_text() == head_was
     rc2, out2 = carol_approves_restore(ctx, d, ctx.ledger, head, "--supersede", d / "c1.approval")
-    ok = rc != 0 and "this ledger is forked" in out and rc2 == 0 and (d / "rc.approval").exists()
+    ok = rc != 0 and "this ledger is forked" in out and unmoved and rc2 == 0 and (d / "rc.approval").exists()
     return ok, out + out2
 
 
@@ -967,21 +1065,23 @@ def case_approve_after_a_fork_at_the_approved_version(d):
 def case_approve_restore_with_a_satisfied_head(d):
     """T4-2: the common recovery: carol's head (v1 approved and signed) is
     held by the copy, so she approves the restore with nothing to hand back,
-    and her head then names the copy's head."""
+    and her head stays as it was."""
     ctx = Ctx(d)
     head = d / "carol.head"
     ctx.approve("carol", ctx.draft1, head, out=d / "c1.approval")
     rc0, out0 = ctx.sign(ctx.draft1, [ctx.a1, ctx.b1], d / "slot1.bin")
     assert rc0 == 0, out0
+    head_was = head.read_text()
     rc, out = carol_approves_restore(ctx, d, ctx.ledger, head)
-    rewritten = "approved_version=-" in head.read_text() and "version=1" in head.read_text()
-    return rc == 0 and (d / "rc.approval").exists() and rewritten, out + head.read_text()
+    # F5-1: a held approval leaves the head as it was (the copy may never
+    # be restored).
+    return rc == 0 and (d / "rc.approval").exists() and head.read_text() == head_was, out + head.read_text()
 
 
 def case_single_restore_approval(d):
     ctx = Ctx(d)
     r1 = d / "r1.approval"
-    run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-8.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"], "--approver-id", "alice", "--out", r1)
+    run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "alice", ctx.ledger, "restore-8.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"], "--approver-id", "alice", "--out", r1)
     rc, out = run(BIN, "ledger", "restore", "--from", ctx.ledger, "--dir", d / "restored", "--approvals", r1,
                   "--keys-pub", ctx.keys)
     return rc != 0 and "at least two" in out, out
@@ -990,7 +1090,7 @@ def case_single_restore_approval(d):
 def case_same_restore_approver_twice(d):
     ctx = Ctx(d)
     r1 = d / "r1.approval"
-    run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-9.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"], "--approver-id", "alice", "--out", r1)
+    run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "alice", ctx.ledger, "restore-9.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"], "--approver-id", "alice", "--out", r1)
     rc, out = run(BIN, "ledger", "restore", "--from", ctx.ledger, "--dir", d / "restored", "--approvals", r1, r1,
                   "--keys-pub", ctx.keys)
     return rc != 0 and "approved twice" in out, out
@@ -1000,8 +1100,8 @@ def case_restore_approver_not_in_roster(d):
     ctx = Ctx(d)
     r1 = d / "r1.approval"
     r2 = d / "r2.approval"
-    run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-10.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"], "--approver-id", "alice", "--out", r1)
-    run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-11.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["dave"], "--approver-id", "dave", "--out", r2)
+    run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "alice", ctx.ledger, "restore-10.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"], "--approver-id", "alice", "--out", r1)
+    run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "dave", ctx.ledger, "restore-11.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["dave"], "--approver-id", "dave", "--out", r2)
     rc, out = run(BIN, "ledger", "restore", "--from", ctx.ledger, "--dir", d / "restored", "--approvals", r1, r2,
                   "--keys-pub", ctx.keys)
     return rc != 0 and "is not in the roster" in out, out
@@ -1023,11 +1123,11 @@ def case_removed_by_roster_change_approver(d):
                      "--keys", ctx.keys, "--out", d / "slot1_rc.bin", "--new-roster", new_roster)
     assert rc1 == 0, out1
     carol_restore = d / "carol.approval"
-    rc2, out2 = run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-12.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["carol"],
+    rc2, out2 = run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "carol", ctx.ledger, "restore-12.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["carol"],
                      "--approver-id", "carol", "--out", carol_restore)
     assert rc2 == 0, out2
     alice_restore = d / "alice.approval"
-    run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-13.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"], "--approver-id", "alice", "--out", alice_restore)
+    run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "alice", ctx.ledger, "restore-13.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"], "--approver-id", "alice", "--out", alice_restore)
     rc, out = run(BIN, "ledger", "restore", "--from", ctx.ledger, "--dir", d / "restored", "--approvals", carol_restore, alice_restore,
                   "--keys-pub", ctx.keys)
     return rc != 0 and "is not in the roster" in out, out
@@ -1038,11 +1138,11 @@ def case_restore_approval_bound_to_another_head(d):
     # A restore approval signed against the ledger while it was still at
     # version 0 (an earlier, legitimately-reached head).
     stale_restore = d / "stale.approval"
-    run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-14.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"], "--approver-id", "alice", "--out", stale_restore)
+    run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "alice", ctx.ledger, "restore-14.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"], "--approver-id", "alice", "--out", stale_restore)
     rc0, out0 = ctx.sign(ctx.draft1, [ctx.a1, ctx.b1], d / "slot1.bin")
     assert rc0 == 0, out0
     fresh_restore = d / "fresh.approval"
-    run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-15.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["bob"], "--approver-id", "bob", "--out", fresh_restore)
+    run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "bob", ctx.ledger, "restore-15.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["bob"], "--approver-id", "bob", "--out", fresh_restore)
     rc, out = run(BIN, "ledger", "restore", "--from", ctx.ledger, "--dir", d / "restored", "--approvals", stale_restore, fresh_restore,
                   "--keys-pub", ctx.keys)
     return rc != 0 and "bound to head version" in out, out
@@ -1055,9 +1155,9 @@ def case_restore_approval_bound_to_another_fleet(d):
     # Same roster and version, so only the fleet binding differs.
     other_ctx = Ctx(other, fleet_id="cd" * 16)
     other_restore = other / "r.approval"
-    run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-16.head"), "--from", other_ctx.ledger, "--approver-key", other_ctx.approver_key["alice"], "--approver-id", "alice", "--out", other_restore)
+    run(BIN, "ledger", "approve-restore", "--keys-pub", other_ctx.keys, "--head", approver_head(other_ctx, d, "alice", other_ctx.ledger, "restore-16.head"), "--from", other_ctx.ledger, "--approver-key", other_ctx.approver_key["alice"], "--approver-id", "alice", "--out", other_restore)
     alice_restore = d / "alice.approval"
-    run(BIN, "ledger", "approve-restore", "--head", blank_head(d / "restore-17.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["bob"], "--approver-id", "bob", "--out", alice_restore)
+    run(BIN, "ledger", "approve-restore", "--keys-pub", ctx.keys, "--head", approver_head(ctx, d, "bob", ctx.ledger, "restore-17.head"), "--from", ctx.ledger, "--approver-key", ctx.approver_key["bob"], "--approver-id", "bob", "--out", alice_restore)
     rc, out = run(BIN, "ledger", "restore", "--from", ctx.ledger, "--dir", d / "restored", "--approvals", other_restore, alice_restore,
                   "--keys-pub", ctx.keys)
     return rc != 0 and "another fleet_id" in out, out
@@ -1073,6 +1173,12 @@ CASES = [
     ("restore with that approval superseded", case_restore_with_the_approval_superseded),
     ("restore refuses a given head with a newer approval", case_restore_refuses_a_given_head_with_a_newer_approval),
     ("approve-restore needs a head file", case_approve_restore_without_a_head_file),
+    ("approve-restore refuses a blank head", case_approve_restore_with_a_blank_head),
+    ("restore refuses a given head forked at its approval", case_restore_refuses_a_given_head_forked_at_its_approval),
+    ("restore refuses a missing head file", case_restore_refuses_a_missing_head_file),
+    ("restore with a satisfied given head", case_restore_with_a_satisfied_given_head),
+    ("approve whose head cannot be written leaves no approval", case_approve_whose_head_cannot_be_written),
+    ("approve-restore verifies the copy's signatures", case_approve_restore_of_an_unsigned_copy),
     ("restore supersede with someone else's approval is refused", case_restore_supersede_with_someone_elses_approval),
     ("re-approving the same draft needs no supersede", case_reapproving_the_same_draft),
     ("an unneeded supersede is refused", case_unneeded_supersede),

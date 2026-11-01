@@ -3436,7 +3436,8 @@ def test_release_boot(pkg: Package, release: str, deploy: str, fault_inject: dic
         if body != backend_body():
             # What came back, and whether `tls` audited a backend failure, so
             # a recurrence names its leg (D-24's flake note).
-            backend_audit = con.count(r"audit: src=tls Backend\w+ ")
+            time.sleep(PROBE_SETTLE_S)
+            backend_audit = con.count(r"audit: src=tls (?:\w+\()?Backend\w+\)? ")
             raise Fail(f"release boot: HTTPS returned {len(body)} bytes, not the backend's body: {body[:64]!r}; "
                        f"tls backend audit lines: {backend_audit or 'none'}")
         no_supervisor_record(con, "release boot")
