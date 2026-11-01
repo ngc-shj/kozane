@@ -151,12 +151,12 @@ def cases(run: Run) -> list:
     case("allow: the unverified tail is reported", run.verify(clean), 0, "boot 0: 3 unverified lines after the last checkpoint")
     rejected = Device(k, boot_id(1), RESET_AT_PROVISION + 1)
     rejected.line("audit: ready")
-    rejected.line("policy: rejected slot=B reason=Version lost=0")
+    rejected.line("policy: rejected slot=B reason=RolledBack version=3 lost=0")
     rejected.line("policy: accepted version=0 slot=A lost=0")
     rejected.checkpoint()
     rejected.events(1)
     case("allow: --events prints a policy rejection, verified", run.verify(capture(rejected), events=True), 0,
-         "event boot=0 seq=1 verified=yes: policy: rejected slot=B reason=Version lost=0")
+         "event boot=0 seq=1 verified=yes: policy: rejected slot=B reason=RolledBack version=3 lost=0")
     case("allow: --events marks the lines after the last checkpoint unverified", run.verify(capture(rejected), events=True), 0,
          "event boot=0 seq=4 verified=no: audit: src=ingress ArpReplied total=1 lost=0")
 
@@ -264,6 +264,8 @@ def cases(run: Run) -> list:
          "the --after anchor's signature does not verify under the device key")
     case("allow: --after, a TPM Reset successor", run.verify(capture(reset), after=anchor), 0, "audit-verify: ok")
     case("allow: --after, a TPM Restart successor", run.verify(capture(restart), after=anchor), 0, "audit-verify: ok")
+    case("report: --after, a new boot leaves the anchor's tail unverifiable", run.verify(capture(reset), after=anchor), 0,
+         "note: the anchor's boot may have continued past seq=")
     case("deny: --after, a reset jump", run.verify(capture(jump), after=anchor), 1,
          "gap after the anchor: reset=7 restart=0 after reset=5 restart=0")
     # A capture split inside one boot: the rest of `first`'s boot.

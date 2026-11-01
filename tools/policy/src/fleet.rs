@@ -5,11 +5,11 @@
 //! `tools/package` also records for the node so `verify --fleet` can catch
 //! the two falling out of step.
 //!
-//! `gateway.toml` has no `fleet_id` field yet (M8 plan C7, which moves
-//! `[[peers]]` out and adds a `[policy]` section, is a later slice; this
-//! tool does not touch `crates/config`). `tools/policy fleet` therefore
-//! takes `--fleet-id` once on the command line and stamps every node built
-//! in that call with it — one fleet file is always one fleet.
+//! `tools/policy fleet` takes `--fleet-id` once on the command line and
+//! stamps every node built in that call with it — one fleet file is always
+//! one fleet. A `gateway.toml` with a `[policy]` section (a provisioned
+//! node) must already name that fleet_id; one without (not provisioned
+//! yet) takes it.
 //!
 //! On-disk format (TOML; only the digest below is byte-canonical, not the
 //! file):
@@ -89,7 +89,7 @@ fn hex16(s: &str, what: &str) -> Result<[u8; 16], String> {
 }
 
 /// `sha256(DOMAIN ‖ fleet_id[16] ‖ inside_prefix.addr[4] ‖
-/// inside_prefix.len[1] ‖ inside_ip[4] ‖ outside_ip[4] ‖ neighbor_count(u8)
+/// inside_prefix.len[1] ‖ inside_ip[4] ‖ outside_ip[4] ‖ neighbor_count(u32 BE)
 /// ‖ neighbors, ascending, each [4] ‖ gateway_wg_public[32] ‖
 /// gateway_rp_digest[32])`. A canonical byte encoding, not the wire
 /// format: it exists only to let two independently-built records

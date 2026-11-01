@@ -30,8 +30,11 @@ The SRK flow, failing at the first step that fails:
   4. only then write those same bytes to --out (a new file, renamed into
      place).
 
-`record` prints (and writes to --out) the provisioning record two operators
-sign after that Clear: canonical `key=value` lines (keys sorted, LF ends)
+`record` refuses unless the TPM's resetCount and restartCount are both 0,
+which only a Clear sets and nothing but a Clear lowers (the SRK flow's,
+in this TPM session; `nv` checks the same and that the record's
+reset_at_provision is 0). It prints (and writes to --out) the provisioning
+record two operators sign after that Clear: canonical `key=value` lines (keys sorted, LF ends)
 `body_sha256`, `fleet_id`, `node`, `reset_at_provision`, `srk_name`, `v0`,
 where `srk_name` and `reset_at_provision` (the resetCount) are read from the
 TPM itself and `v0`, `body_sha256` and `fleet_id` are the head of a ledger
@@ -126,13 +129,33 @@ def srk_name(env: dict, scratch: pathlib.Path) -> bytes:
     return name.read_bytes()
 
 
-def reset_count(env: dict) -> str:
-    """The TPM's resetCount (TPM2_ReadClock)."""
+def clock_counts(env: dict) -> tuple:
+    """The TPM's resetCount and restartCount (TPM2_ReadClock), as decimal
+    strings."""
     clock = run("ReadClock", ["tpm2_readclock"], env).decode()
-    m = re.search(r"^\s*reset_count:\s*(\d+)$", clock, re.M)
-    if not m:
-        raise Refused(f"provision: tpm2_readclock printed no reset_count: {clock.strip()}")
-    return m.group(1)
+    counts = []
+    for name in ("reset_count", "restart_count"):
+        m = re.search(rf"^\s*{name}:\s*(\d+)$", clock, re.M)
+        if not m:
+            raise Refused(f"provision: tpm2_readclock printed no {name}: {clock.strip()}")
+        counts.append(m.group(1))
+    return tuple(counts)
+
+
+def reset_count(env: dict) -> str:
+    return clock_counts(env)[0]
+
+
+def require_cleared(env: dict, what: str):
+    """TPM2_Clear sets resetCount and restartCount to 0 (probed on swtpm),
+    and nothing else lowers them: both 0 is the evidence that the SRK flow's
+    Clear ran in this TPM session (M8 plan D5, S18), so the record cannot
+    bind an SRK that pre-M8 envelopes still unseal under."""
+    reset, restart = clock_counts(env)
+    if (reset, restart) != ("0", "0"):
+        raise Refused(f"provision: {what}: the TPM shows reset_count={reset} restart_count={restart}, not 0 and 0; "
+                      "it was not cleared in this session (run the SRK flow, which clears it, then this step "
+                      "without a reboot)")
 
 
 def provision(a, scratch: pathlib.Path) -> bytes:
@@ -419,6 +442,7 @@ def cmd_record(a, scratch: pathlib.Path) -> str:
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", a.node):
         raise Refused(f"provision: node name {a.node!r} is not [a-z0-9_-]+")
     env = tpm_env(a.tcti)
+    require_cleared(env, "record")
     record = render_record({"body_sha256": head.body_sha256, "fleet_id": head.fleet_id, "node": a.node,
                             "reset_at_provision": reset_count(env), "srk_name": srk_name(env, scratch).hex(),
                             "v0": str(head.version)})
@@ -452,6 +476,10 @@ def cmd_nv(a, scratch: pathlib.Path) -> str:
         raise Refused("provision: the two delete keys are one key")
     pinned = pinned_record_keys(head.fleet_id)
     fields = verify_record(pathlib.Path(a.record).read_bytes(), a.record_sigs, pinned, delete_pub, scratch)
+    if fields["reset_at_provision"] != "0":
+        raise Refused(f"provision: the record's reset_at_provision {fields['reset_at_provision']} is not 0: "
+                      "it was not read right after a Clear")
+    require_cleared(env, "nv")
     srk = srk_name(env, scratch).hex()
     for key, want, what in (("fleet_id", head.fleet_id, "the ledger's fleet"), ("node", a.node, "--node"),
                             ("srk_name", srk, "this TPM's SRK"),

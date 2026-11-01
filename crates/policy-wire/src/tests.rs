@@ -672,6 +672,18 @@ fn precedence_picks_the_worse_reason_when_neither_slot_is_a_candidate() {
     assert_eq!(select(5, 0, SlotView::Malformed, SlotView::Empty), Decision::Refuse { reason: Reject::Malformed });
 }
 
+/// I5.1: a lone `current+1` slot is never used without its anchor,
+/// whatever the other slot is (the allow side: an anchor present advances,
+/// above).
+#[test]
+fn a_next_version_candidate_without_an_anchor_is_prev_mismatch() {
+    let next = valid(6, 0, [9; 32], [1; 32]);
+    for other in [SlotView::Empty, SlotView::Malformed, SlotView::BadSignature, valid(4, 0, [0; 32], [9; 32])] {
+        assert_eq!(select(5, 0, next, other), Decision::Refuse { reason: Reject::PrevMismatch }, "{other:?}");
+        assert_eq!(select(5, 0, other, next), Decision::Refuse { reason: Reject::PrevMismatch }, "{other:?}");
+    }
+}
+
 #[test]
 fn current_plus_one_overflow_never_makes_u32_max_plus_one_a_candidate() {
     let a = valid(u32::MAX, 0, [0; 32], [1; 32]);
@@ -781,13 +793,41 @@ fn fuzz_one(bytes: &[u8]) {
     let rules_again: Vec<Rule> = parsed.group(0).unwrap().rules().collect();
     assert_eq!(rules_again, rules);
 
+    // I1.3 byte for byte: the slot re-rendered from what `parse` returned
+    // (and `split`'s signatures) is the slot.
+    let u = split(&slot).unwrap();
+    let views: Vec<_> = (0..parsed.peer_count()).map(|i| parsed.peer(i).unwrap()).collect();
+    let allowed_again: Vec<Vec<Prefix>> = views.iter().map(|p| p.allowed().collect()).collect();
+    let peers_again: Vec<PlainPeer> = views
+        .iter()
+        .zip(&allowed_again)
+        .map(|(p, a)| PlainPeer { wg_pub: *p.wg_pub(), rp_pub: p.rp_pub(), groups: p.groups(), allowed: a })
+        .collect();
+    let group_rules: Vec<Vec<Rule>> = (0..parsed.group_count()).map(|g| parsed.group(g).unwrap().rules().collect()).collect();
+    let groups_again: Vec<PlainGroup> = group_rules.iter().map(|r| PlainGroup { rules: r }).collect();
+    let again = render(&PlainBundle {
+        fleet_id: FLEET,
+        version: parsed.version(),
+        min_release: parsed.min_release(),
+        prev_sha256: *parsed.prev_sha256(),
+        roster_sha256: *parsed.roster_sha256(),
+        peers: &peers_again,
+        groups: &groups_again,
+        sig_ed25519: *u.sig_ed25519(),
+        sig_mldsa65: *u.sig_mldsa65(),
+    });
+    assert!(again == slot, "the re-rendered slot differs");
+
     // Parse and split never panic on a valid slot with a window of it
     // overwritten by the input, at an offset the input picks among the
     // header, the peer entry, the group and the signatures: every
     // structural branch sees arbitrary bytes at full slot length.
     let mut mutated = slot.clone();
     let rest = bytes.get(2..).unwrap_or(&[]);
-    let anchors = [0usize, 96, 96 + 32 + limits::SPK_LEN, slot.len() - 3373 - 64 - 16];
+    // The last window starts 16 bytes before the signatures (the body's
+    // end), so it reaches into them.
+    let sig_at = split(&slot).unwrap().body().len();
+    let anchors = [0usize, 96, 96 + 32 + limits::SPK_LEN, sig_at - 16];
     let at = anchors[usize::from(b1) % anchors.len()] + usize::from(b0 % 16);
     for (i, &b) in rest.iter().take(64).enumerate() {
         if let Some(m) = mutated.get_mut(at + i) {

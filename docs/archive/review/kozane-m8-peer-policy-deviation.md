@@ -659,4 +659,49 @@ Left open:
   fault`). That is an upper bound on what the drain must cover. The final
   `make check` and the split self-test report it. The worst case is to be
   recorded here, and the constant raised if it exceeds 0.2 s (a margin
-  under 5×).
+  under 5×). Measured in Phase 3's `make test` on gx10: 0.292 s. But a
+  fault that lands while `audit` waits on a checkpoint signature waits
+  for that signature too, and 2 s lost inject B's lines once: the frame
+  came during the ready checkpoint. The supervisor case now prints how
+  long the ready checkpoint came after the boot was ready (worst seen
+  1.508 s over three runs) and injects only after it, so the case no
+  longer depends on that race. `FAULT_DRAIN_NS` is 8 s, more than five
+  times the longer of the two. A fault now resets the node at least 8 s
+  later; under TCG that is the price of never losing its line.
+
+## Phase 3 code review
+
+### D-24 — round 1: what changed, and what was narrowed
+
+Round 1's findings and their resolutions are in the code review log. These
+changes go beyond the plan's text:
+
+- **`approve` binds the reviewed diff (S8).** `diff` now prints one line
+  per peer and per rule, read through a new `policy_wire::contents`. That
+  view is host-only (`render` feature), runs the structural walk, and
+  authorizes nothing. `approve` requires `--diff-sha256` and `--head`.
+  `policy rp-digest` prints the per-peer key digest that `diff` shows.
+- **The approver head is the verified ledger head, not the draft.** Plan
+  D11 said "last-seen head". The code had recorded the draft, so an
+  abandoned draft locked its approver out.
+- **Clear evidence (D5).** On swtpm, `TPM2_Clear` sets resetCount and
+  restartCount to 0, and the next power cycle sets resetCount to 1
+  (build/probes/clear-counts.sh). `provision record` and `nv` now refuse
+  unless both counts are 0, and `nv` refuses a record whose
+  `reset_at_provision` is not 0. Steps 1–4 of provisioning therefore run
+  in one TPM session.
+- **A halted source counts as ready for the ready checkpoint.** A boot
+  whose barrier PDs halt (`policy` Unavailable) now signs the checkpoint
+  that verifies its `policy:` lines. The C13 `rolled-back` case asserts
+  it.
+- **`policy: rejected` prints `version=`.** It shows the slot's version
+  for RolledBack, Skipped and BelowFloor, and `version=-` otherwise,
+  because the event's 0 is also v0.
+- **P1's TPM-side refusals are pinned only by the probe, not in-tree.**
+  The probe refused NV_UndefineSpaceSpecial with one signature, with a
+  cpHash for the other index, and with a replayed signature
+  (build/probes, slice 0). The tool's empty-nonce refusal is a fixture.
+  The remaining TPM facts are the reference TPM's own behaviour, which
+  the nv allow/deny fixtures (the delete with both keys, and the refusal
+  without them) exercise end to end. A per-fact interop test would
+  re-test swtpm, not Kozane.

@@ -76,23 +76,23 @@ fn diff_is_total_and_sensitive_to_every_field() {
     let base = sample_bundle(1, 0, [0; 32], [0; 32]);
     let base_header = wire_header::read(&base).unwrap();
     let base_body = policy_wire::split(&base).unwrap().body().to_vec();
-    let base_diff = crate::diff::render(None, &base_header, &base_body);
+    let base_diff = crate::diff::render(None, &base_header, &base_body).unwrap();
 
     // version
     let v = sample_bundle(2, 0, [0; 32], [0; 32]);
-    assert_ne!(crate::diff::render(None, &wire_header::read(&v).unwrap(), policy_wire::split(&v).unwrap().body()), base_diff);
+    assert_ne!(crate::diff::render(None, &wire_header::read(&v).unwrap(), policy_wire::split(&v).unwrap().body()).unwrap(), base_diff);
     // min_release
     let m = sample_bundle(1, 9, [0; 32], [0; 32]);
-    assert_ne!(crate::diff::render(None, &wire_header::read(&m).unwrap(), policy_wire::split(&m).unwrap().body()), base_diff);
+    assert_ne!(crate::diff::render(None, &wire_header::read(&m).unwrap(), policy_wire::split(&m).unwrap().body()).unwrap(), base_diff);
     // prev_sha256
     let p = sample_bundle(1, 0, [7; 32], [0; 32]);
-    assert_ne!(crate::diff::render(None, &wire_header::read(&p).unwrap(), policy_wire::split(&p).unwrap().body()), base_diff);
+    assert_ne!(crate::diff::render(None, &wire_header::read(&p).unwrap(), policy_wire::split(&p).unwrap().body()).unwrap(), base_diff);
     // roster_sha256
     let r = sample_bundle(1, 0, [0; 32], [7; 32]);
-    assert_ne!(crate::diff::render(None, &wire_header::read(&r).unwrap(), policy_wire::split(&r).unwrap().body()), base_diff);
+    assert_ne!(crate::diff::render(None, &wire_header::read(&r).unwrap(), policy_wire::split(&r).unwrap().body()).unwrap(), base_diff);
 
     // same inputs twice give the same diff (it is a pure function)
-    assert_eq!(crate::diff::render(None, &base_header, &base_body), base_diff);
+    assert_eq!(crate::diff::render(None, &base_header, &base_body).unwrap(), base_diff);
 }
 
 #[test]
@@ -119,9 +119,67 @@ fn diff_changes_when_a_rule_changes() {
     };
     let a = render_with(&rule_a);
     let b = render_with(&rule_b);
-    let da = crate::diff::render(None, &wire_header::read(&a).unwrap(), policy_wire::split(&a).unwrap().body());
-    let db = crate::diff::render(None, &wire_header::read(&b).unwrap(), policy_wire::split(&b).unwrap().body());
+    let da = crate::diff::render(None, &wire_header::read(&a).unwrap(), policy_wire::split(&a).unwrap().body()).unwrap();
+    let db = crate::diff::render(None, &wire_header::read(&b).unwrap(), policy_wire::split(&b).unwrap().body()).unwrap();
     assert_ne!(da, db, "a single rule byte changed but the diff did not");
+}
+
+/// One peer and one rule, the knobs S8's diff must show an approver.
+fn bundle_with(rp_byte: u8, port_hi: u16) -> Vec<u8> {
+    let rp = vec![rp_byte; limits::SPK_LEN];
+    let rp: &[u8; limits::SPK_LEN] = rp.as_slice().try_into().unwrap();
+    let peers = [PlainPeer { wg_pub: [7; 32], rp_pub: rp, groups: 1, allowed: &[Prefix { addr: [10, 1, 0, 0], len: 24 }] }];
+    let rules = [Rule { dst: Prefix { addr: [10, 2, 0, 0], len: 24 }, proto: policy_wire::PROTO_TCP, port_lo: 443, port_hi }];
+    let groups = [PlainGroup { rules: &rules }];
+    policy_wire::render::render(&PlainBundle {
+        fleet_id: [9; 16],
+        version: 1,
+        min_release: 0,
+        prev_sha256: [0; 32],
+        roster_sha256: [0; 32],
+        peers: &peers,
+        groups: &groups,
+        sig_ed25519: [0; 64],
+        sig_mldsa65: [0; 3309],
+    })
+}
+
+/// The diff of `new` against `old`, without its `body_sha256` line: what
+/// the item lines alone tell an approver.
+fn items_diff(old: &[u8], new: &[u8]) -> String {
+    let old_header = wire_header::read(old).unwrap();
+    let text = crate::diff::render(
+        Some((&old_header, policy_wire::split(old).unwrap().body())),
+        &wire_header::read(new).unwrap(),
+        policy_wire::split(new).unwrap().body(),
+    )
+    .unwrap();
+    text.lines().filter(|l| !l.starts_with("body_sha256:")).map(|l| format!("{l}\n")).collect()
+}
+
+#[test]
+fn diff_shows_a_swapped_rp_key_as_its_peer_line() {
+    let old = bundle_with(0xAB, 443);
+    let d = items_diff(&old, &bundle_with(0xCD, 443));
+    let removed = d.lines().filter(|l| l.starts_with("- peer BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=")).count();
+    let added = d.lines().filter(|l| l.starts_with("+ peer BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=")).count();
+    assert_eq!((removed, added), (1, 1), "{d}");
+    assert!(d.contains(" allowed=10.1.0.0/24"), "{d}");
+}
+
+#[test]
+fn diff_shows_a_widened_rule_as_its_rule_lines() {
+    let old = bundle_with(0xAB, 443);
+    let d = items_diff(&old, &bundle_with(0xAB, 65535));
+    assert!(d.contains("- rule group=0 10.2.0.0/24 tcp 443-443\n"), "{d}");
+    assert!(d.contains("+ rule group=0 10.2.0.0/24 tcp 443-65535\n"), "{d}");
+}
+
+#[test]
+fn diff_of_an_unchanged_body_marks_every_item_unchanged() {
+    let old = bundle_with(0xAB, 443);
+    let d = items_diff(&old, &old);
+    assert!(d.lines().filter(|l| l.starts_with("  ")).count() == 2 && !d.lines().any(|l| l.starts_with(['+', '-'])), "{d}");
 }
 
 // --- record ---------------------------------------------------------------

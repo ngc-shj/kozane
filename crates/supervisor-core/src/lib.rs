@@ -51,8 +51,10 @@ pub const RECORD_WORDS: usize = 3;
 /// (M8 deviation D-20). `audit` outranks the supervisor but runs on 500 µs
 /// per 10 ms: a fault that lands while it prints a checkpoint line or waits
 /// on `auditkey`'s signature would otherwise reset before the fault line is
-/// printed. One second is about 50 ms of `audit`'s CPU.
-pub const FAULT_DRAIN_NS: u64 = 1_000_000_000;
+/// printed. Under TCG the fault line came at most 0.292 s after the
+/// faulting frame, and a checkpoint signature took up to 1.508 s (D-23);
+/// eight seconds keeps more than five times the longer.
+pub const FAULT_DRAIN_NS: u64 = 8_000_000_000;
 
 impl Record {
     pub fn encode(&self) -> [u64; RECORD_WORDS] {

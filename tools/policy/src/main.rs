@@ -288,6 +288,14 @@ fn cmd_fleet(args: &[String]) -> Result<(), String> {
     }
     let mut nodes = Vec::new();
     for path in &gateway_paths {
+        // A node already provisioned compiles its own `[policy]` fleet_id:
+        // stamping another one here would describe an image that refuses
+        // every bundle as WrongFleet. A node without `[policy]` (not yet
+        // provisioned) takes `--fleet-id`.
+        let (own, has_policy) = load_node(Path::new(path), None)?;
+        if has_policy && own.fleet_id != fleet_id {
+            return Err(format!("fleet: {path}'s [policy] fleet_id {} is not --fleet-id {}", hex(&own.fleet_id), hex(&fleet_id)));
+        }
         let (node, _) = load_node(Path::new(path), Some(fleet_id))?;
         if nodes.iter().any(|n: &fleet::Node| n.name == node.name) {
             return Err(format!("fleet: two gateway.toml files both name the node {:?}", node.name));
@@ -420,7 +428,7 @@ fn compute_diff(ledger: &ledger::Ledger, draft: &[u8]) -> Result<(String, [u8; 3
     let header = wire_header::read(draft)?;
     let body = policy_wire::split(draft).map_err(|e| format!("{e:?}"))?.body();
     let old = head_for_diff(ledger)?;
-    let text = diff::render(old.as_ref().map(|(h, b)| (h, b.as_slice())), &header, body);
+    let text = diff::render(old.as_ref().map(|(h, b)| (h, b.as_slice())), &header, body)?;
     let digest = diff::sha256(&text);
     Ok((text, digest))
 }
@@ -458,7 +466,10 @@ fn cmd_approve(args: &[String]) -> Result<(), String> {
     let approver_key_path = arg(args, "--approver-key")?;
     let approver_id = arg(args, "--approver-id")?;
     let out = PathBuf::from(arg(args, "--out")?);
-    let head_path = arg_opt(args, "--head").map(PathBuf::from);
+    // Required (D11): an approver without a head file checks nothing
+    // against truncation or forks. A missing *file* is a first approval or
+    // a wiped device starting over (runbook).
+    let head_path = Some(PathBuf::from(arg(args, "--head")?));
 
     let pinned = read_pin()?;
     let state = ledger.verify_chain_unsigned(pinned)?;
@@ -486,8 +497,19 @@ fn cmd_approve(args: &[String]) -> Result<(), String> {
     let body = policy_wire::split(&draft).map_err(|e| format!("{e:?}"))?.body();
     let body_sha256: [u8; 32] = Sha256::digest(body).into();
     let old = head_for_diff(&ledger)?;
-    let diff_text = diff::render(old.as_ref().map(|(h, b)| (h, b.as_slice())), &header, body);
+    let diff_text = diff::render(old.as_ref().map(|(h, b)| (h, b.as_slice())), &header, body)?;
     let diff_sha256 = diff::sha256(&diff_text);
+    // The approver names the diff they reviewed (`policy diff`'s last
+    // line), so what they read and the draft they approve are one (S8).
+    print!("{diff_text}");
+    let reviewed = util::hex_n::<32>(&arg(args, "--diff-sha256")?, "approve: --diff-sha256")?;
+    if reviewed != diff_sha256 {
+        return Err(format!(
+            "approve: --diff-sha256 {} is not this draft's diff against this ledger ({}): review `policy diff` again",
+            hex(&reviewed),
+            hex(&diff_sha256)
+        ));
+    }
 
     let sk = load_approver_signing(Path::new(&approver_key_path))?;
     let fields = approval::ApprovalFields {
@@ -502,8 +524,11 @@ fn cmd_approve(args: &[String]) -> Result<(), String> {
     };
     let record = approval::sign(&sk, &fields, &mut sig::urandom)?;
     write_new(&out, &record, 0o644)?;
-    if let Some(head_path) = &head_path {
-        write_head_file(head_path, header.version, body_sha256)?;
+    // The head is the verified ledger's, never the draft's: a draft that is
+    // never signed must not move it, or this approver is refused every
+    // later ledger at the height it was drafted against.
+    if let (Some(head_path), Some(height), Some(head_body)) = (&head_path, state.height, &state.head_body) {
+        write_head_file(head_path, height, Sha256::digest(head_body).into())?;
     }
     println!("policy: {approver_id} approved version {} ({})", header.version, out.display());
     Ok(())
@@ -563,7 +588,7 @@ fn cmd_sign(args: &[String]) -> Result<(), String> {
     let body = policy_wire::split(&draft).map_err(|e| format!("{e:?}"))?.body();
     let body_sha256: [u8; 32] = Sha256::digest(body).into();
     let old = state.head_header.as_ref().zip(state.head_body.as_ref());
-    let diff_text = diff::render(old.map(|(h, b)| (h, b.as_slice())), &header, body);
+    let diff_text = diff::render(old.map(|(h, b)| (h, b.as_slice())), &header, body)?;
     let diff_sha256 = diff::sha256(&diff_text);
 
     let mut approval_bytes = Vec::new();
@@ -815,6 +840,16 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("node-digest") => cmd_node_digest(&args[1..]),
         Some("render") => cmd_render(&args[1..]),
         Some("diff") => cmd_diff(&args[1..]),
+        // The rp key digest `diff` prints per peer, for checking it against
+        // the peer's own key file.
+        Some("rp-digest") => {
+            let path = args.get(1).ok_or("usage: policy rp-digest <rp public key file>")?;
+            let bytes = fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+            let key: &[u8; limits::SPK_LEN] =
+                bytes.as_slice().try_into().map_err(|_| format!("{path}: not {} bytes", limits::SPK_LEN))?;
+            println!("{}", hex(&rp_digest(key)));
+            Ok(())
+        }
         Some("approve") => cmd_approve(&args[1..]),
         Some("sign") => cmd_sign(&args[1..]),
         Some("verify") => cmd_verify(&args[1..]),
@@ -828,7 +863,7 @@ fn run(args: &[String]) -> Result<(), String> {
             println!("{}", hex(&Roster::parse(&text)?.digest()));
             Ok(())
         }
-        _ => Err("usage: policy keygen|approver-keygen|fleet|node-digest|render|diff|approve|sign|verify|ledger|roster-digest ...".into()),
+        _ => Err("usage: policy keygen|approver-keygen|fleet|node-digest|render|diff|rp-digest|approve|sign|verify|ledger|roster-digest ...".into()),
     }
 }
 

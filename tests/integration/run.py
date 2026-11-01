@@ -3173,6 +3173,13 @@ def fault_boot(pkg: Package, resets: tuple = None):
     try:
         wait_arp_ready(w, con)
         con.wait_for(r"hs: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        ready_at = time.monotonic()
+        # The ready checkpoint's signature (D-20, D-23): the injection comes
+        # after it, and how long it took after the boot was ready is what
+        # the supervisor's drain must outlast for a fault that lands during it.
+        con.wait_for(AUDIT_SIGNED, timeout=BOOT_TIMEOUT_S)
+        print(f"supervisor: the ready checkpoint came {time.monotonic() - ready_at:.3f} s after the boot was ready",
+              flush=True)
     except BaseException:
         stop(child)
         raise
@@ -3451,7 +3458,7 @@ def file_sha256(path: str) -> str:
 # Verified, and halts with POLICY_UNAVAILABLE on Unavailable.
 BARRIER_PDS = ("hs", "pq", "ingress", "data", "inner")
 POLICY_OUTCOME = r"policy: (?P<outcome>accepted version=\d+ slot=[AB]|unavailable reason=\w+ current=\w+) lost=\d+\r*\n"
-POLICY_REJECTED = r"policy: rejected slot=([AB]) reason=(\w+) lost=\d+\r*\n"
+POLICY_REJECTED = r"policy: rejected slot=([AB]) reason=(\w+) version=(?:\d+|-) lost=\d+\r*\n"
 # Deployment A's clients the cases play (D-16: client i is peer i of v0):
 # P, revoked from v1 on, and R, in every bundle.
 CLIENT_P, CLIENT_R = 0, 1
@@ -3755,6 +3762,12 @@ def policy_cases(good: Package, fi_policy: Package, deploy: str, tmp: str, passe
             frames = lan_frames(pb)
             if frames:
                 raise Fail(f"{what}: the gateway's inside NIC sent {len(frames)} frames to the LAN host's probe")
+            # The halts count as the barrier PDs' last word, so the boot
+            # still signs the checkpoint that verifies its `policy:` lines.
+            try:
+                pb.con.wait_for(AUDIT_SIGNED, timeout=BOOT_TIMEOUT_S)
+            except Fail:
+                raise Fail(f"{what}: no signed checkpoint on a boot whose barrier PDs halted") from None
         boot_once(c, what, bundle("v0"), bundle("v1"), "unavailable reason=RolledBack current=2",
                   {("A", "RolledBack"), ("B", "RolledBack")}, 2, then=denied)
         passed.append("policy rolled-back: both slots behind the counter, every barrier PD halts")
@@ -8157,9 +8170,12 @@ class PolicyFixtures:
         policy_tool(self.bin, "render", "--input", peers, "--fleet", fleet.fleet_file, "--ledger", ledger,
                     "--out", draft)
         approvals = []
+        # What each approver read: `diff`'s digest goes back into `approve`.
+        reviewed = re.search(r"^diff_sha256=([0-9a-f]{64})$",
+                             policy_tool(self.bin, "diff", "--ledger", ledger, "--draft", draft), re.M).group(1)
         for a in POLICY_APPROVERS:
             approvals.append(f"{out}.{a}.approval")
-            policy_tool(self.bin, "approve", "--ledger", ledger, "--draft", draft, "--approver-key",
+            policy_tool(self.bin, "approve", "--ledger", ledger, "--draft", draft, "--diff-sha256", reviewed, "--approver-key",
                         os.path.join(self.root, a, "ed25519.key"), "--approver-id", a, "--head",
                         os.path.join(ledger_dir, f"{a}.head"), "--out", approvals[-1])
         policy_tool(self.bin, "sign", "--ledger", ledger, "--draft", draft, "--approvals", *approvals,
@@ -8172,7 +8188,11 @@ class PolicyFixtures:
         os.mkdir(to, 0o700)
         shutil.copytree(fleet.ledger, os.path.join(to, "ledger"))
         for a in POLICY_APPROVERS:
-            shutil.copy2(os.path.join(fleet.dir, f"{a}.head"), to)
+            # A head exists once its approver has approved against a
+            # non-empty ledger (`approve` records the verified ledger head).
+            head = os.path.join(fleet.dir, f"{a}.head")
+            if os.path.exists(head):
+                shutil.copy2(head, to)
         return to
 
     def c13_bundles(self, fleet: Fleet, deploy: str) -> str:

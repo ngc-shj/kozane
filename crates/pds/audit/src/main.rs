@@ -341,7 +341,11 @@ impl Audit {
                 println!(console, "audit: src={} KeyWaitHighWater us={} lost={}", src, r.a, r.b);
                 true
             }
+            // A boot stop is a source's last word: it counts as ready, or a
+            // boot whose barrier PDs halt (policy Unavailable) would never
+            // sign the checkpoint that verifies its `policy:` lines.
             Decoded::Halted => {
+                console.checkpoints.source_ready(index);
                 println!(console, "audit: src={} Halted reason={} lost={}", src, r.a, r.b);
                 true
             }
@@ -376,8 +380,14 @@ impl Audit {
             },
             Decoded::PolicyRejected { slot, reason } => {
                 match (POLICY_SLOT_NAMES.get(usize::from(slot)), POLICY_REASON_NAMES.get(usize::from(reason))) {
+                    // The version only where the slot held a verified
+                    // bundle; `policy` sends 0 otherwise, which is also v0.
+                    (Some(slot), Some(name)) if matches!(*name, "RolledBack" | "Skipped" | "BelowFloor") => {
+                        println!(console, "{}: rejected slot={} reason={} version={} lost={}", src, slot, name, r.a, r.b);
+                        true
+                    }
                     (Some(slot), Some(name)) => {
-                        println!(console, "{}: rejected slot={} reason={} lost={}", src, slot, name, r.b);
+                        println!(console, "{}: rejected slot={} reason={} version=- lost={}", src, slot, name, r.b);
                         true
                     }
                     _ => false,

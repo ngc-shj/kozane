@@ -240,7 +240,8 @@ impl Ledger {
                 }
             }
 
-            let diff_text = diff::render(prev.as_ref().map(|(h, b)| (h, b.as_slice())), &header, split.body());
+            let diff_text = diff::render(prev.as_ref().map(|(h, b)| (h, b.as_slice())), &header, split.body())
+                .map_err(|e| format!("ledger: version {v}: {e}"))?;
             let diff_digest = diff::sha256(&diff_text);
 
             let approvals = self.read_approvals(v).map_err(|e| format!("ledger: version {v}: {e}"))?;

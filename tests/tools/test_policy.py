@@ -140,6 +140,14 @@ def pubkey(d: pathlib.Path, name: str) -> str:
     return (d / name / "ed25519.pub").read_text().strip()
 
 
+def reviewed(ledger, draft) -> str:
+    """The diff_sha256 `policy diff` prints for `draft` against `ledger`:
+    what an approver passes to `approve` after reading that diff."""
+    rc, out = run(BIN, "diff", "--ledger", ledger, "--draft", draft)
+    assert rc == 0, out
+    return re.search(r"^diff_sha256=([0-9a-f]{64})$", out, re.M).group(1)
+
+
 class Ctx:
     """A fresh fixture: dev keys, a 3-approver roster, an initialised
     ledger, a 2-node fleet, and version 0 already signed."""
@@ -192,7 +200,7 @@ class Ctx:
         self.b1 = self.approve("bob", self.draft1, d / "bob1.head", out=d / "b1.approval")
 
     def approve(self, approver: str, draft: pathlib.Path, head: pathlib.Path, out: pathlib.Path) -> pathlib.Path:
-        rc, o = run(BIN, "approve", "--ledger", self.ledger, "--draft", draft, "--approver-key", self.approver_key[approver],
+        rc, o = run(BIN, "approve", "--ledger", self.ledger, "--draft", draft, "--diff-sha256", reviewed(self.ledger, draft), "--approver-key", self.approver_key[approver],
                     "--approver-id", approver, "--head", head, "--out", out)
         assert rc == 0, o
         return out
@@ -201,11 +209,14 @@ class Ctx:
         return run(BIN, "sign", "--ledger", self.ledger, "--draft", draft, "--approvals", *approvals, "--keys", self.keys, "--out", out)
 
     def entries(self) -> list:
-        return sorted(p.name for p in (self.ledger / "entries").iterdir())
+        """The whole ledger tree, contents included: `append` writes the
+        roster and the approvals before the entry."""
+        return sorted((str(p.relative_to(self.ledger)), p.read_bytes() if p.is_file() else b"")
+                      for p in self.ledger.rglob("*"))
 
     def sign_refused(self, draft: pathlib.Path, approvals: list, needle: str) -> tuple:
         """A refused `sign`: non-zero for `needle`'s reason, and nothing
-        written, neither a slot nor a ledger entry (the reason alone would
+        written, neither a slot nor anything in the ledger (the reason alone would
         stay green if the entry were committed before the check)."""
         before = self.entries()
         out_slot = self.d / "refused-slot.bin"
@@ -319,8 +330,8 @@ def case_record_for_another_diff(d):
     other_ledger = d / "other-ledger"
     rc0, out0 = run(BIN, "ledger", "init", "--dir", other_ledger, "--genesis-roster", ctx.roster_path)
     assert rc0 == 0, out0
-    rc1, out1 = run(BIN, "approve", "--ledger", other_ledger, "--draft", ctx.draft1, "--approver-key", ctx.approver_key["alice"],
-                     "--approver-id", "alice", "--out", d / "a_diff.approval")
+    rc1, out1 = run(BIN, "approve", "--ledger", other_ledger, "--draft", ctx.draft1, "--diff-sha256", reviewed(other_ledger, ctx.draft1), "--approver-key", ctx.approver_key["alice"],
+                     "--approver-id", "alice", "--head", d / "alice-other.head", "--out", d / "a_diff.approval")
     assert rc1 == 0, out1
     return ctx.sign_refused(ctx.draft1, [d / "a_diff.approval", ctx.b1], "another diff")
 
@@ -443,7 +454,7 @@ def case_approver_head_ahead_of_ledger(d):
     ctx = Ctx(d)
     ahead = d / "ahead.head"
     ahead.write_text("body_sha256=" + "ab" * 32 + "\nversion=5\n")
-    rc, out = run(BIN, "approve", "--ledger", ctx.ledger, "--draft", ctx.draft1, "--approver-key", ctx.approver_key["carol"],
+    rc, out = run(BIN, "approve", "--ledger", ctx.ledger, "--draft", ctx.draft1, "--diff-sha256", reviewed(ctx.ledger, ctx.draft1), "--approver-key", ctx.approver_key["carol"],
                   "--approver-id", "carol", "--head", ahead, "--out", d / "c1.approval")
     return approve_refused(rc, out, ahead, "body_sha256=" + "ab" * 32 + "\nversion=5\n", d / "c1.approval", "behind this approver's recorded head")
 
@@ -452,9 +463,88 @@ def case_approver_head_same_version_different_digest(d):
     ctx = Ctx(d)
     wrong = d / "wrong.head"
     wrong.write_text("body_sha256=" + "cd" * 32 + "\nversion=0\n")
-    rc, out = run(BIN, "approve", "--ledger", ctx.ledger, "--draft", ctx.draft1, "--approver-key", ctx.approver_key["carol"],
+    rc, out = run(BIN, "approve", "--ledger", ctx.ledger, "--draft", ctx.draft1, "--diff-sha256", reviewed(ctx.ledger, ctx.draft1), "--approver-key", ctx.approver_key["carol"],
                   "--approver-id", "carol", "--head", wrong, "--out", d / "c1.approval")
     return approve_refused(rc, out, wrong, "body_sha256=" + "cd" * 32 + "\nversion=0\n", d / "c1.approval", "tampered or forked ledger")
+
+
+def case_head_file_follows_the_ledger_across_versions(d):
+    """One head file kept across versions (as the runbook has it): it
+    records the verified ledger head, so after v1 is signed the same file
+    lets the approver approve v2."""
+    ctx = Ctx(d)
+    head = d / "carol.head"
+    ctx.approve("carol", ctx.draft1, head, out=d / "c1.approval")
+    rc0, out0 = ctx.sign(ctx.draft1, [ctx.a1, ctx.b1], d / "slot1.bin")
+    assert rc0 == 0, out0
+    peers_dir = d / "v2"
+    peers_dir.mkdir()
+    draft2 = d / "draft2.bin"
+    rc1, out1 = run(BIN, "render", "--input", default_peers_toml(peers_dir, min_release=2), "--fleet", ctx.fleet,
+                     "--ledger", ctx.ledger, "--out", draft2)
+    assert rc1 == 0, out1
+    rc, out = run(BIN, "approve", "--ledger", ctx.ledger, "--draft", draft2, "--diff-sha256", reviewed(ctx.ledger, draft2), "--approver-key", ctx.approver_key["carol"],
+                  "--approver-id", "carol", "--head", head, "--out", d / "c2.approval")
+    return rc == 0, out
+
+
+def case_an_abandoned_draft_leaves_the_head(d):
+    """A draft approved and then abandoned (never signed) does not move the
+    approver's head: a revised draft for the same version is approved with
+    the same head file."""
+    ctx = Ctx(d)
+    head = d / "carol.head"
+    ctx.approve("carol", ctx.draft1, head, out=d / "c1.approval")
+    peers_dir = d / "v1-revised"
+    peers_dir.mkdir()
+    revised = d / "draft1-revised.bin"
+    rc1, out1 = run(BIN, "render", "--input", default_peers_toml(peers_dir, min_release=5), "--fleet", ctx.fleet,
+                     "--ledger", ctx.ledger, "--out", revised)
+    assert rc1 == 0, out1
+    rc, out = run(BIN, "approve", "--ledger", ctx.ledger, "--draft", revised, "--diff-sha256", reviewed(ctx.ledger, revised), "--approver-key", ctx.approver_key["carol"],
+                  "--approver-id", "carol", "--head", head, "--out", d / "c1r.approval")
+    return rc == 0, out
+
+
+def case_approve_with_a_stale_diff_digest(d):
+    """S8: the digest an approver reviewed is the draft's diff against this
+    ledger, or nothing is approved (no record, no head moved)."""
+    ctx = Ctx(d)
+    stale = reviewed(ctx.ledger, ctx.draft0)
+    head = d / "carol.head"
+    rc, out = run(BIN, "approve", "--ledger", ctx.ledger, "--draft", ctx.draft1, "--diff-sha256", stale,
+                  "--approver-key", ctx.approver_key["carol"], "--approver-id", "carol", "--head", head,
+                  "--out", d / "c1.approval")
+    return rc != 0 and "is not this draft's diff against this ledger" in out and not (d / "c1.approval").exists() \
+        and not head.exists(), out
+
+
+def case_approve_without_a_head_file_argument(d):
+    ctx = Ctx(d)
+    rc, out = run(BIN, "approve", "--ledger", ctx.ledger, "--draft", ctx.draft1, "--diff-sha256",
+                  reviewed(ctx.ledger, ctx.draft1), "--approver-key", ctx.approver_key["carol"],
+                  "--approver-id", "carol", "--out", d / "c1.approval")
+    return rc != 0 and "missing --head" in out and not (d / "c1.approval").exists(), out
+
+
+def case_diff_shows_the_changed_peer(d):
+    """S8: v1's diff names v1's changed item, not only body_sha256: the
+    second peer's rp key changes, so its old line goes and its new one
+    comes, while the first peer stays unchanged."""
+    ctx = Ctx(d)
+    peers_dir = d / "v1-rekey"
+    peers_dir.mkdir()
+    path = default_peers_toml(peers_dir)
+    write_rp_key(peers_dir / "p2.pk", 9)
+    draft = d / "rekey.bin"
+    rc0, out0 = run(BIN, "render", "--input", path, "--fleet", ctx.fleet, "--ledger", ctx.ledger, "--out", draft)
+    assert rc0 == 0, out0
+    rc, out = run(BIN, "diff", "--ledger", ctx.ledger, "--draft", draft)
+    p1, p2 = f"peer {wg_pub(1)} ", f"peer {wg_pub(2)} "
+    lines = out.splitlines()
+    ok = rc == 0 and sum(l.startswith("  " + p1) for l in lines) == 1 \
+        and sum(l.startswith("- " + p2) for l in lines) == 1 and sum(l.startswith("+ " + p2) for l in lines) == 1
+    return ok, out
 
 
 def case_overlap_with_one_node_of_fleet(d):
@@ -531,6 +621,22 @@ def case_package_node_differs(d):
     rc2, out2 = run(BIN, "verify", "--keys-pub", ctx.keys, "--slot", ctx.slot0, "--fleet", ctx.fleet, "--package-node", digest)
     msg = "is no node's in the fleet file"
     return rc1 != 0 and msg in out1 and rc2 != 0 and msg in out2, out1 + out2
+
+
+def case_fleet_refuses_a_node_of_another_fleet(d):
+    """A provisioned node's gateway.toml names its own fleet_id; `fleet`
+    refuses to stamp it with another (its image would refuse every bundle)."""
+    ctx = Ctx(d)
+    with_policy(ctx.gw1, fleet_id="cd" * 16)
+    rc, out = run(BIN, "fleet", "--out", d / "fleet2.toml", "--fleet-id", FLEET_ID, ctx.gw1, ctx.gw2)
+    return rc != 0 and "[policy] fleet_id" in out and not (d / "fleet2.toml").exists(), out
+
+
+def case_fleet_takes_a_node_of_this_fleet(d):
+    ctx = Ctx(d)
+    with_policy(ctx.gw1)
+    rc, out = run(BIN, "fleet", "--out", d / "fleet2.toml", "--fleet-id", FLEET_ID, ctx.gw1, ctx.gw2)
+    return rc == 0, out
 
 
 def case_node_digest_without_policy(d):
@@ -692,6 +798,13 @@ CASES = [
     ("a payload swapped after approval is refused", case_payload_swapped_after_approval),
     ("the same approver twice is refused", case_same_approver_twice),
     ("one approval only is refused", case_one_approval_only),
+    ("fleet refuses a provisioned node of another fleet", case_fleet_refuses_a_node_of_another_fleet),
+    ("fleet takes a provisioned node of this fleet", case_fleet_takes_a_node_of_this_fleet),
+    ("approve refuses a stale reviewed diff digest", case_approve_with_a_stale_diff_digest),
+    ("approve needs --head", case_approve_without_a_head_file_argument),
+    ("diff shows the changed peer, not only body_sha256", case_diff_shows_the_changed_peer),
+    ("a head file follows the ledger across versions", case_head_file_follows_the_ledger_across_versions),
+    ("an abandoned draft leaves the approver head", case_an_abandoned_draft_leaves_the_head),
     ("an approver not in the roster is refused", case_approver_not_in_roster),
     ("a forged approval signature is refused", case_forged_approval_signature),
     ("a restore record used as a bundle approval is refused (wrong domain)", case_wrong_approval_domain),

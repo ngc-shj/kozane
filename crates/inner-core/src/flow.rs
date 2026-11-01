@@ -25,8 +25,8 @@ use limits::{FLOW_IDLE_NS, FLOW_LINGER_NS, MAX_PEERS};
 use policy_wire::{PROTO_ICMP, PROTO_TCP, PROTO_UDP, Rule};
 use wire::{DropReason, IPPROTO_TCP, IPPROTO_UDP, IPV4_HDR, Ipv4, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN, UDP_HDR};
 
-/// Entries in the table. Kani proves the logic over a small table, two
-/// entries a peer, with the same code (M8 plan C8).
+/// Entries in the table. Kani proves the logic over a small table, one
+/// entry a peer (below), with the same code (M8 plan C8).
 #[cfg(not(kani))]
 pub const MAX_FLOWS: usize = limits::MAX_FLOWS;
 #[cfg(kani)]
@@ -609,10 +609,12 @@ mod proofs {
 
     // I8.3, by induction over any operation sequence (D-17): (a) an outbound
     // Allow names a live entry of that peer's share for the reversed tuple,
-    // (b) an outbound packet makes no entry alive, (c) an inbound Deny
-    // changes nothing; only an inbound Allow makes an entry alive, and I8.1
-    // says that needs a matching rule. A sequence harness ran out of memory
-    // at the 40 GB cap; these are one step from an arbitrary table.
+    // (b) an outbound packet makes no entry alive and rewrites no tuple,
+    // (c) an inbound Deny changes nothing, (d) an inbound Allow writes only
+    // its own peer's share and only its packet's tuple; so only an inbound
+    // Allow from a peer makes an entry of that peer's alive, and I8.1 says
+    // that needs a matching rule. A sequence harness ran out of memory at
+    // the 40 GB cap; these are one step from an arbitrary table.
 
     #[kani::proof]
     #[kani::unwind(18)]
@@ -637,8 +639,41 @@ mod proofs {
         let mut table = before;
         let now: u64 = kani::any();
         let _ = table.authorize_outbound(&small_packet(), now);
+        let mut changed = 0;
         for (b, a) in before.flows.iter().zip(table.flows.iter()) {
             assert!(b.alive(now) || !a.alive(now));
+            assert!(b.tuple == a.tuple);
+            if b != a {
+                changed += 1;
+            }
+        }
+        assert!(changed <= 1);
+    }
+
+    #[kani::proof]
+    #[kani::unwind(18)]
+    fn i8_3_inbound_allow_writes_only_its_share_and_its_tuple() {
+        let r = [any_rule()];
+        let groups: [&[Rule]; 1] = [&r];
+        let peers: [u8; 2] = [kani::any(), kani::any()];
+        let rules = ModelRules { peers: &peers, groups: &groups };
+        let before = any_table();
+        let mut table = before;
+        let now: u64 = kani::any();
+        let peer: u8 = one_of(0, 1);
+        let p = small_packet();
+        if table.authorize_inbound(&rules, peer, &p, now) == Inbound::Allow {
+            let start = usize::from(peer) * QUOTA;
+            let t = Tuple::inbound(&p);
+            for (i, (b, a)) in before.flows.iter().zip(table.flows.iter()).enumerate() {
+                if i < start || i >= start + QUOTA {
+                    assert!(b == a);
+                } else if b != a {
+                    assert!(Some(a.tuple) == t);
+                }
+            }
+            let share_full = (start..start + QUOTA).all(|i| before.flows.get(i).is_some_and(|f| f.alive(now)));
+            kani::cover!(share_full && before.flows != table.flows, "an own-share eviction");
         }
     }
 

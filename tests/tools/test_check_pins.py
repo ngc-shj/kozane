@@ -901,8 +901,15 @@ CASES = [
      lambda t: append(t / "crates/pds/audit/src/main.rs", "fn y(c: usize) -> bool { c == ch::CH_AUDITKEY }\n")),
     ("P31 ready_input removed", {"P31"},
      lambda t: edit(t / "crates/pds/audit/src/main.rs", "audit_core::ready_input(", "audit_core::ready_input_unused(")),
+    ("P31 a second sign( call in audit", {"P31"},
+     lambda t: append(t / "crates/pds/audit/src/main.rs",
+                      "fn z(w: &[u64; SIGN_REQ_WORDS], r: &mut [u64; SIGN_REPLY_WORDS]) { let _ = sign(w, r); }\n")),
+    ("P31 the sign( call moved out of the Action::Call arm", {"P31"},
+     lambda t: edit(t / "crates/pds/audit/src/main.rs", "            Action::Call(words) => {\n",
+                    "            Action::Call(words) => {\n                let _moved = ();\n                let _moved = ();\n"
+                    "                let _moved = ();\n")),
     ("allow the call and the channel named in a comment", set(),
-     lambda t: append(t / "crates/pds/audit/src/main.rs", "// .pp_call( on CH_AUDITKEY happens in sign only\n")),
+     lambda t: append(t / "crates/pds/audit/src/main.rs", "// .pp_call( on CH_AUDITKEY happens in sign only; sign( is called once\n")),
     # P32 (M8 plan C12): the audit map cites only tests the tree has.
     ("P32 a made-up unit test cited", {"P32"},
      lambda t: append(t / AUDIT_MAP, AUDIT_ROW.format("`rust:the_audit_map_cites_a_test_nobody_wrote`"))),

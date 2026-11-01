@@ -23,12 +23,14 @@
 //! [`Bundle`] has no public fields and no public constructor besides
 //! [`parse`] and [`open`]; [`Verified`] has none besides [`Verified::from_reply`]:
 //!
-//! ```compile_fail
-//! let _ = policy_wire::Bundle { slot: &[] };
+//! Every field is named, so privacy is the only error:
+//!
+//! ```compile_fail,E0451
+//! let _ = policy_wire::Bundle { slot: &[], version: 0, min_release: 0, prev_sha256: [0; 32], roster_sha256: [0; 32], layout: todo!() };
 //! ```
 //!
-//! ```compile_fail
-//! let _ = policy_wire::Verified { version: 0 };
+//! ```compile_fail,E0451
+//! let _ = policy_wire::Verified { slot: policy_wire::Slot::A, version: 0, body_sha256: [0; 32] };
 //! ```
 //!
 //! Without the `verifier` feature a consumer reaches a `Bundle` only through
@@ -406,6 +408,46 @@ pub fn header(slot: &[u8]) -> Result<Header, Reject> {
         peer_count: layout.peer_count,
         group_count: layout.group_count,
     })
+}
+
+/// A slot's peers and groups after the structural walk alone (no node
+/// check, no signatures), for a person to read: `tools/policy diff` shows
+/// approvers every peer and rule through it (M8 plan C2, S8). Host side
+/// only (`render`), and it authorizes nothing.
+#[cfg(feature = "render")]
+pub struct Contents<'a> {
+    slot: &'a [u8],
+    layout: Layout,
+}
+
+#[cfg(feature = "render")]
+pub fn contents(slot: &[u8]) -> Result<Contents<'_>, Reject> {
+    Ok(Contents { slot, layout: walk(slot)? })
+}
+
+#[cfg(feature = "render")]
+impl<'a> Contents<'a> {
+    pub fn peer_count(&self) -> u8 {
+        self.layout.peer_count
+    }
+
+    pub fn group_count(&self) -> u8 {
+        self.layout.group_count
+    }
+
+    pub fn peer(&self, i: u8) -> Option<PeerView<'a>> {
+        if i >= self.layout.peer_count {
+            return None;
+        }
+        peer_at(self.slot, &self.layout, usize::from(i))
+    }
+
+    pub fn group(&self, i: u8) -> Option<GroupView<'a>> {
+        if i >= self.layout.group_count {
+            return None;
+        }
+        group_at(self.slot, &self.layout, usize::from(i))
+    }
 }
 
 /// The shipped instantiation of [`walk_structure`] (I1.1): the real `K =

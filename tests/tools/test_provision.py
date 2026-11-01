@@ -51,7 +51,7 @@ LAUNCH = ("import pathlib, sys; src = sys.argv[1]; g = {'__file__': src, '__name
           "exec(compile(open(src).read(), src, 'exec'), g); g['RECORD_KEYS'] = pathlib.Path(sys.argv[2]); "
           "sys.argv = [src] + sys.argv[3:]; sys.exit(g['main']())")
 RECORD_DOMAIN = b"kozane-reprovision-v1\0"
-FIXTURES = 25
+FIXTURES = 27
 
 
 def make_ca(run_dir: pathlib.Path, name: str) -> pathlib.Path:
@@ -310,9 +310,9 @@ def nv_fixtures(run_dir: pathlib.Path, ca: pathlib.Path, other: Swtpm, tpms: lis
             "the record's v0 0 is not the ledger head")
     nv_deny("deny: a record whose body is not the ledger head's", *signed("other-body", body_sha256="00" * 32),
             "the record's body_sha256")
-    nv_deny("deny: a record whose reset_at_provision is not this TPM's resetCount",
+    nv_deny("deny: a record not read right after a Clear (reset_at_provision 1)",
             *signed("other-reset", reset_at_provision=str(int(fields["reset_at_provision"]) + 1)),
-            "the record's reset_at_provision")
+            "the record's reset_at_provision 1 is not 0")
 
     # Allow, then what it left in the TPM.
     slot = run_dir / "slot-a.bin"
@@ -375,6 +375,23 @@ def nv_fixtures(run_dir: pathlib.Path, ca: pathlib.Path, other: Swtpm, tpms: lis
         why = str(e)
     results.append(("deny: the delete signer refuses an empty session nonce",
                     why == "provision: delete signing refused: the session nonce is empty", why))
+
+    # D5, S18: a Clear zeroes resetCount and restartCount, so a TPM reset
+    # since the SRK flow's Clear is one that was not cleared in this
+    # session; record and nv refuse it (their allows are the ones above).
+    subprocess.run(["swtpm_ioctl", "--unix", f"{tpm.sock}.ctrl", "-i"], check=True, capture_output=True)
+    tool_out(tpm.tcti, "tpm2_startup", "-c")
+    late = run_dir / "late.record"
+    rc, text = tool(pinned, "record", "--tcti", tpm.tcti, "--ledger", ledger.dir, "--keys-pub", ledger.keys,
+                    "--node", "n1", "--out", late, "--policy-bin", ledger.bin)
+    results.append(("deny: record on a TPM reset since its Clear",
+                    rc != 0 and "record: the TPM shows reset_count=1 restart_count=0" in text and not late.exists(),
+                    text))
+    late_slot = run_dir / "slot-late.bin"
+    rc, text = nv(good, [s1, s2], late_slot, delete_keys=(keys["op1"], keys["op2"]))
+    results.append(("deny: nv on a TPM reset since its Clear, with a record read right after it",
+                    rc != 0 and "nv: the TPM shows reset_count=1 restart_count=0" in text and not late_slot.exists(),
+                    text))
 
 
 def main() -> int:

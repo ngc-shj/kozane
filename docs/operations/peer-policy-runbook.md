@@ -80,8 +80,10 @@ on distinct devices: every collusion of a pair is residual RM8-7.
 Provisioning always starts with `TPM2_Clear`: the SRK changes, so no
 envelope sealed before it unseals afterwards. That is what keeps every
 pre-M8 release closed (SC33, D5), and it is not a step that can be
-skipped. It also means the node's package must be re-made after every
-provisioning.
+skipped: steps 2 and 4 refuse a TPM whose resetCount or restartCount is
+not 0, which only that Clear leaves, so steps 1 to 4 run in one TPM
+session with no reboot in between. It also means the node's package must
+be re-made after every provisioning.
 
 1. Clear, EK certificate check, SRK:
    `tools/provision --tcti TCTI --ek-root CERT --ek-intermediates CERTS --out srk.pub`.
@@ -144,17 +146,24 @@ is "a bundle without that peer", nothing faster.
    because an approver need not hold the public keys; `verify --ledger`
    does.)
 3. Each approver checks, independently:
-   - the diff line by line: every peer added or removed, each key, each
-     allowed IP, each group membership and rule, `min_release`, and
-     `roster_sha256`;
+   - the diff line by line: every peer line (`peer <wg_pub> rp=<digest>
+     groups=<indices> allowed=<prefixes>`) and rule line (`rule
+     group=<index> <dst> <proto> <ports>`) marked `+` (added) or `-`
+     (removed; a changed peer is its old line removed and its new one
+     added), `min_release`, and `roster_sha256`. Group indices are the
+     order of `[[groups]]` in `peers.toml`. Check each new `rp=` against
+     the peer's own key file with `policy rp-digest <file>`;
    - that each change matches a request they can trace to the IdP and MDM
      (a peer's device and owner), not just to the person who drafted it;
    - that the version is the ledger head + 1.
 4. Each approver approves:
-   `policy approve --ledger <replica> --draft draft.bin --approver-key <key> --approver-id <id> --head <own head file> --out <id>.approval`.
-   The head file is the approver's own record of the last version they
-   approved; `approve` refuses a ledger that is behind it or disagrees with
-   it, which catches truncation and forks.
+   `policy approve --ledger <replica> --draft draft.bin --diff-sha256 <the diff_sha256 line they reviewed> --approver-key <key> --approver-id <id> --head <own head file> --out <id>.approval`.
+   `approve` prints the diff again and refuses unless it is the one
+   reviewed.
+   The head file is the approver's own record of the newest ledger head
+   they have verified (never the draft, so a draft that is not signed
+   leaves it unchanged); `approve` refuses a ledger that is behind it or
+   disagrees with it, which catches truncation and forks.
 5. The signing operator:
    `policy sign --ledger <ledger> --draft draft.bin --approvals A B --keys <keys> --out v<n>.bin`,
    then `policy verify --keys-pub <keys> --slot v<n>.bin --fleet fleet.toml`,
@@ -310,8 +319,14 @@ anchored:
 - Every later capture:
   `tools/audit-verify --pub audit.pub --after '<anchor line>' <capture>`,
   where the anchor line is the `anchor:` line of the previous capture's
-  output. Capture without gaps: a reboot (TPM Reset) or a TPM Restart is a
-  successor, anything else is a gap.
+  output. Each capture starts at the line right after that anchor, so it
+  repeats the previous capture's unverified tail: a capture that starts
+  where the previous one ended fails "does not resume at the anchor"
+  whenever the previous one ended after its last signed checkpoint.
+  Capture without gaps: a reboot (TPM Reset) or a TPM Restart is a
+  successor, anything else is a gap. When the next capture starts with a
+  new boot, the previous boot's lines after the anchor are not verifiable
+  (`audit-verify` notes it): keep that tail from the previous capture.
 - After a re-provisioning, the next capture starts again with
   `--from-provisioning` and the new record.
 

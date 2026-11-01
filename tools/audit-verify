@@ -33,7 +33,9 @@ signed checkpoint, which nothing has signed yet ("N unverified lines").
 
 Continuity (C10 [S31, S32, F46, F48]): every capture is anchored.
   --after LINE: LINE is the last signed checkpoint of the previous capture
-    (its trailer included), itself verified under AUDIT_PUB. The capture's
+    (its trailer included), itself verified under AUDIT_PUB. A capture
+    starts with the line right after LINE, repeating the previous capture's
+    unverified tail. The capture's
     first boot must be its successor, exactly one of: the same boot
     resumed (same boot ID, reset and restart; the first line's seq is the
     anchor's + 1 and the chain resumes from SHA-256(anchor chain ‖ anchor
@@ -258,7 +260,7 @@ def verify(capture: bytes, key: Ed25519PublicKey, after: Checkpoint = None, reco
             ok = b.verified_cp is not None and seq < b.verified_cp
             out.append(f"event boot={b.index} seq={seq} verified={'yes' if ok else 'no'}: {body.decode(errors='replace')}")
 
-    continuity(boots, after, record, fail)
+    continuity(boots, after, record, fail, note)
     last = next((b.signed[-1] for b in reversed(boots) if b.signed), None)
     if last is not None:
         out.append(f"anchor: {last.line.decode()}")
@@ -299,7 +301,7 @@ def check_checkpoint(b: Boot, body: bytes, seq: int, line: bytes, key, fail, not
         b.verified_cp = seq
 
 
-def continuity(boots: list, after: Checkpoint, record: dict, fail):
+def continuity(boots: list, after: Checkpoint, record: dict, fail, note):
     if not boots:
         return
     first = boots[0]
@@ -313,6 +315,11 @@ def continuity(boots: list, after: Checkpoint, record: dict, fail):
                 fail(f"the capture's first boot is not the anchor's ({cp.describe()}, anchor {after.describe()})")
         elif cp is not None and (why := successor(after, cp)):
             fail(f"gap after the anchor: {why}")
+        else:
+            # Nothing binds where the anchor's boot ended: its lines after
+            # the anchor, later checkpoints included, are unverifiable here.
+            note(f"the anchor's boot may have continued past seq={after.seq}; its lines after the anchor "
+                      "are not verifiable from this capture")
     else:
         if first.start_seq != 0:
             fail(f"the first boot after provisioning starts inside a boot (first seq={first.start_seq})")

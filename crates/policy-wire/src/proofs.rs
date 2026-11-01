@@ -1,6 +1,5 @@
 //! Kani harnesses (M8 plan C1/C5). Run with `cargo kani -p policy-wire`,
 //! one job at a time (the M8 deviation log: no two Kani jobs on one host).
-//! Not run by this change; written for the orchestrator's re-proof.
 
 use super::*;
 
@@ -84,6 +83,26 @@ fn is_valid_candidate(current: u32, release_seq: u32, view: SlotView) -> bool {
 /// Malformed, BadSignature, RolledBack, Skipped, BelowFloor all forbid a
 /// `Use`/`Advance`), and `Equivocation`/`PrevMismatch` only when the
 /// slots disagree about a shared version or a `prev` link.
+fn view_version(view: SlotView) -> Option<u32> {
+    match view {
+        SlotView::Valid { version, .. } => Some(version),
+        _ => None,
+    }
+}
+
+/// `anchor` verifies `next`'s `prev` link: valid at exactly `current`, its
+/// body what `next` names as its predecessor.
+fn anchors(current: u32, anchor: SlotView, next: SlotView) -> bool {
+    match (anchor, next) {
+        (SlotView::Valid { version, body_sha256, .. }, SlotView::Valid { prev_sha256, .. }) => version == current && body_sha256 == prev_sha256,
+        _ => false,
+    }
+}
+
+/// I5.3 deny, with I5.1's version binding: a used slot is a candidate at
+/// exactly `current`; an advanced one is a candidate at `current+1` whose
+/// `prev` the other slot anchors; two candidates at one version with
+/// different bodies are always `Equivocation`.
 #[kani::proof]
 #[kani::unwind(33)]
 fn select_never_uses_or_advances_a_non_candidate_slot() {
@@ -91,14 +110,31 @@ fn select_never_uses_or_advances_a_non_candidate_slot() {
     let release_seq: u32 = kani::any();
     let a = any_slot_view();
     let b = any_slot_view();
-    match select(current, release_seq, a, b) {
-        Decision::Use { slot: Slot::A } | Decision::Advance { slot: Slot::A } => {
-            assert!(is_valid_candidate(current, release_seq, a));
+    let d = select(current, release_seq, a, b);
+    match d {
+        Decision::Use { slot: Slot::A } => {
+            assert!(is_valid_candidate(current, release_seq, a) && view_version(a) == Some(current));
         }
-        Decision::Use { slot: Slot::B } | Decision::Advance { slot: Slot::B } => {
-            assert!(is_valid_candidate(current, release_seq, b));
+        Decision::Use { slot: Slot::B } => {
+            assert!(is_valid_candidate(current, release_seq, b) && view_version(b) == Some(current));
+        }
+        Decision::Advance { slot: Slot::A } => {
+            assert!(is_valid_candidate(current, release_seq, a) && view_version(a) == current.checked_add(1));
+            assert!(anchors(current, b, a));
+        }
+        Decision::Advance { slot: Slot::B } => {
+            assert!(is_valid_candidate(current, release_seq, b) && view_version(b) == current.checked_add(1));
+            assert!(anchors(current, a, b));
         }
         Decision::Refuse { .. } => {}
+    }
+    if let (SlotView::Valid { version: va, body_sha256: ba, .. }, SlotView::Valid { version: vb, body_sha256: bb, .. }) = (a, b)
+        && is_valid_candidate(current, release_seq, a)
+        && is_valid_candidate(current, release_seq, b)
+        && va == vb
+        && ba != bb
+    {
+        assert!(d == Decision::Refuse { reason: Reject::Equivocation });
     }
 }
 
@@ -182,9 +218,16 @@ fn verified_next_version_needs_a_matching_advance_reply() {
     let pcr9_matches = matches!(reply, StateReply::Ok { pcr9, .. } if pcr9 == expected_pcr9);
 
     match after_state(reply, &expected_pcr9, release_seq, a, b) {
-        Step::Done(Outcome::Verified { .. }) => {
+        Step::Done(Outcome::Verified { slot, version, .. }) => {
             assert!(!state_refused);
             assert!(pcr9_matches);
+            // Without an ADVANCE, only a slot already at `current` is used.
+            let current = match reply {
+                StateReply::Ok { current, .. } => current,
+                StateReply::Refused => unreachable!(),
+            };
+            let view = if slot == Slot::A { a } else { b };
+            assert!(version == current && view_version(view) == Some(current));
         }
         Step::Done(Outcome::Unavailable { reason: Reject::StateRefused }) => assert!(state_refused),
         Step::Done(Outcome::Unavailable { reason: Reject::MeasureMismatch }) => assert!(!state_refused && !pcr9_matches),
