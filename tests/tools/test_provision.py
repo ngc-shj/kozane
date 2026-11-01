@@ -379,8 +379,8 @@ def nv_fixtures(run_dir: pathlib.Path, ca: pathlib.Path, other: Swtpm, tpms: lis
     # D5, S18: a Clear zeroes resetCount and restartCount, so a TPM reset
     # since the SRK flow's Clear is one that was not cleared in this
     # session; record and nv refuse it (their allows are the ones above).
-    # restartCount alone first: a TPM Restart (Shutdown(STATE), then
-    # Startup(STATE)) leaves resetCount at 0.
+    # restartCount alone first: a TPM Resume (Shutdown(STATE), then
+    # Startup(STATE)) leaves resetCount at 0, as a Restart would.
     tool_out(tpm.tcti, "tpm2_shutdown")
     subprocess.run(["swtpm_ioctl", "--unix", f"{tpm.sock}.ctrl", "-i"], check=True, capture_output=True)
     tool_out(tpm.tcti, "tpm2_startup")

@@ -295,9 +295,13 @@ slot comes from the ledger (`entries/`) and is checked with
   (RM8-1, RM8-7). Stop: keep the node closed, preserve both slots, the
   ledger and every approval record, and escalate to incident response.
   Recovery needs a new signing key, which is compiled into every image.
-- **Lost ledger.** Each approver whose replica survives runs
-  `policy ledger approve-restore --from <copy> --approver-key <key> --approver-id <id> --out R<N>.approval`
-  only after checking that the copy contains their own head. Then
+- **Lost ledger.** Each restore approver, on their own device, runs
+  `policy ledger approve-restore --from <copy> --approver-key <key> --approver-id <id> --head <own head file> --out R<N>.approval`.
+  It refuses a copy behind or diverging from their head, and a copy that
+  lacks, or holds another body at, the version they last approved: if that
+  version was signed, the copy is truncated or forked. If they abandoned
+  it, they say so by passing their own approval of it with
+  `--supersede <file>`; nobody else's approval stands in for it. Then
   `policy ledger restore --from <copy> --dir <new dir> --approvals R1 R2 --keys-pub <keys> --head <file>...`,
   with the head file of every approver that can be reached. It refuses a
   copy whose chain does not verify, one behind or diverging from any given

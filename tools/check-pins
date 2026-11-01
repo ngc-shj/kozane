@@ -1122,15 +1122,42 @@ TOKEN_FROM_REPLY = re.compile(r"\bfrom_reply\s*\(")
 BYPASS_FLAG = re.compile(r"[\"']--(force|single|roster)[\"']|\bskip_approval\b")
 
 
+def verifier_users_in(manifest: dict) -> list:
+    """Where a parsed Cargo.toml turns on policy-wire's `verifier`."""
+    tables = [("", manifest)] + [(f"target.{t}.", v) for t, v in manifest.get("target", {}).items() if isinstance(v, dict)]
+    names, found = set(), []
+    for prefix, table in tables:
+        for kind in ("dependencies", "dev-dependencies", "build-dependencies"):
+            for key, dep in (table.get(kind) or {}).items():
+                package = dep.get("package", key) if isinstance(dep, dict) else key
+                if package != "policy-wire":
+                    continue
+                names.add(key)
+                if isinstance(dep, dict) and "verifier" in (dep.get("features") or []):
+                    found.append(f"[{prefix}{kind}.{key}] features")
+    for feature, enables in (manifest.get("features") or {}).items():
+        for e in enables if isinstance(enables, list) else []:
+            dep, _, feat = str(e).partition("/")
+            if feat == "verifier" and dep.rstrip("?") in names | {"policy-wire"}:
+                found.append(f"[features] {feature}")
+    return found
+
+
 def check_policy(root: pathlib.Path, out: list):
     for p in sorted(root.glob("**/Cargo.toml")):
         rel = str(p.relative_to(root))
         if any(part in ("target", "build", "third_party") for part in p.relative_to(root).parts) or rel in VERIFIER_USERS:
             continue
-        for n, line in enumerate(p.read_text().splitlines(), 1):
-            code = line.split("#", 1)[0]
-            if "policy-wire" in code and "verifier" in code or re.search(r"policy-wire/verifier", code):
-                out.append(f"P27 {rel}:{n}: policy-wire's verifier feature outside the policy PD and tools/policy (M8 plan C1)")
+        # Parsed, not read by line: a `[dependencies.policy-wire]` table, a
+        # renamed dependency (`package = "policy-wire"`) or a target table
+        # all enable the feature too.
+        try:
+            manifest = tomllib.loads(p.read_text())
+        except tomllib.TOMLDecodeError as e:
+            out.append(f"P27 {rel}: not valid TOML ({e})")
+            continue
+        for where in verifier_users_in(manifest):
+            out.append(f"P27 {rel}: {where} enables policy-wire's verifier feature outside the policy PD and tools/policy (M8 plan C1)")
     for rel, text in crate_sources(root, "crates"):
         if rel.startswith(SLOT_READERS):
             continue
@@ -1207,7 +1234,14 @@ def check_audit_call(root: pathlib.Path, out: list):
     path = root / AUDIT_MAIN
     if not path.is_file():
         return
-    code = [l.split("//", 1)[0] for l in path.read_text().splitlines()]
+    # The shared lexer, so a `//` inside a string hides nothing (R48).
+    stripped = strip_rust_comments(path.read_text())
+    unterminated("P31", AUDIT_MAIN, stripped, out)
+    code = stripped.splitlines()
+    # One source file: a module beside main.rs could call `sign` unseen.
+    others = sorted(str(f.relative_to(root)) for f in path.parent.rglob("*.rs") if f != path)
+    if others:
+        out.append(f"P31 {AUDIT_MAIN}: audit has other source files {others}; its one call site is only checked in main.rs (M8 plan C10)")
     calls = [n for n, l in enumerate(code, 1) if ".pp_call(" in l]
     names = [n for n, l in enumerate(code, 1) if "CH_AUDITKEY" in l]
     sign = next((n for n, l in enumerate(code, 1) if re.search(r"\bfn sign\(", l)), None)

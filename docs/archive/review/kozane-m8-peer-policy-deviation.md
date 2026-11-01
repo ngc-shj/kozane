@@ -664,8 +664,11 @@ Left open:
   for that signature too, and 2 s lost inject B's lines once: the frame
   came during the ready checkpoint. The supervisor case now prints how
   long the ready checkpoint came after the boot was ready (worst seen
-  1.508 s over three runs) and injects only after it, so the case no
-  longer depends on that race. `FAULT_DRAIN_NS` is 8 s, more than five
+  1.508 s over three runs). Inject A goes in after it. Inject B goes in as
+  soon as the boot is ready, so it can land while the checkpoint is
+  pending, and the case logs whether its record came before or after the
+  checkpoint line. "Before" shows only that much, not that the signature
+  was in flight. The case passes either way with the 8 s drain. `FAULT_DRAIN_NS` is 8 s, more than five
   times the longer of the two. A fault now resets the node at least 8 s
   later; under TCG that is the price of never losing its line.
 
@@ -688,9 +691,13 @@ changes go beyond the plan's text:
   draft, so an abandoned draft locked its approver out. Round 1 recorded
   the ledger head alone, which left the newest signed version unprotected
   against truncation (round 2, S2-1/F2-1). The head file now holds both
-  the ledger head and the last approval. `approve` and `ledger restore`
-  refuse a ledger that lacks the approved version, unless the approver
-  hands that approval back with `--supersede`.
+  the ledger head and the last approval. `approve` and `ledger
+  approve-restore` refuse a ledger that lacks the approved version, or
+  holds another body there, unless the approver hands their own approval
+  back with `--supersede` (round 3). Both run on the approver's own
+  device, so `restore`'s operator cannot answer for them. Re-approving
+  the identical draft needs nothing. `restore` keeps only the
+  ledger-head check for heads passed to it.
 - **Clear evidence (D5).** On swtpm, `TPM2_Clear` sets resetCount and
   restartCount to 0, and the next power cycle sets resetCount to 1. On
   swtpm in the dev image, after two power cycles and a TPM Restart the
@@ -714,3 +721,21 @@ changes go beyond the plan's text:
   the nv allow/deny fixtures (the delete with both keys, and the refusal
   without them) exercise end to end. A per-fact interop test would
   re-test swtpm, not Kozane.
+
+### Note — harness flakes seen in Phase 3
+
+- **wireguard `TimeoutError`.** It came back once, in round 1's first
+  full `make test`, with the same helper-thread signature. The rerun
+  passed.
+- **`release boot`.** It failed in both of round 3's full `make test`
+  runs on gx10. The first returned "HTTPS returned 12 bytes, not the
+  backend's body", the second a curl connect timeout (10 s). Each time
+  the HTTPS request came right after the WireGuard handshake. Two reruns
+  of the case alone passed. Nothing on that path changed since the last
+  full pass (f5937f1); round 3 touched only tools/policy, tools/check-pins
+  and test wording. At the time gx10's swap was full (15 of 15 GB) and
+  84 GB of its 121 GB was in use, mostly unified-memory allocations of
+  local model servers outside this project. The same tree's full
+  `make test` on z1mn passed (134 cases, rc 0).
+- Both stay recorded flakes. If either recurs in the final `make check`
+  or the self-test, it gets investigated rather than retried.

@@ -1,6 +1,6 @@
 # Code Review: kozane-m8-peer-policy
 Date: 2026-11-01
-Review round: 2
+Review round: 3
 
 ## Changes from Previous Round
 Initial review, at 751e95b, after Phase 2 Step 2-5's self-check (D-23).
@@ -340,3 +340,73 @@ confirmed resolved, except T-F3 (the Kani counts, still open) and T-F6
     17 refusal cases fail.
 - **T2-3:** the cover is tightened to a replaced tuple. It is proved
   with the inner-core gate run.
+
+## Round 3 (6aeafc7..f5937f1)
+
+### Findings
+- **Security:**
+  - S3-1 Major = F3-1 Major = T3-2a: in `ledger restore`, `--head` and
+    `--supersede` were in the restore operator's hands. Any approval of
+    the signed version (all of them are public in a replica) stood in for
+    the head's owner, so a truncated copy restored (R49, R48).
+  - S3-2 Minor: a fork at the approved version passed with only a note.
+  - S3-3 Minor: the approval was written before the head, and the head
+    write was not atomic.
+  - S3-A1 Minor (Adjacent): P31 could be evaded with a `//` inside a
+    string or a second source file.
+  - S3-A2 Minor (Adjacent): P27's Cargo.toml check was line-based.
+- **Functionality:**
+  - F3-2 Minor: re-approving the identical draft needed `--supersede`.
+  - F3-3 Minor: the runbook's lost-ledger text was stale.
+  - F3-4 Minor: an unneeded or invalid `--supersede` was accepted
+    silently.
+  - F3-5 Minor: an inverted error message.
+- **Testing:**
+  - T3-1 Major: the new refused-`approve` cases did not check for no
+    record and an unchanged head.
+  - T3-2 Major: the restore supersede was untested on the deny side.
+  - T3-3 Minor: the regime print overclaimed, and a D-23 sentence was
+    stale.
+  - T3-4 Minor: supersede was denied only on approver_id.
+  - T3-5 Minor: "Restart" should have read "Resume".
+
+### Round 3 Resolution Status
+- **S3-1 / F3-1 / T3-2a / T3-2 (head checks on the approver's own
+  device):**
+  - `check_head` is shared by `approve` and `ledger approve-restore`.
+    `approve-restore` now requires `--head` and takes `--supersede`,
+    bound to the approver's own id, version and body.
+  - `restore` keeps only the ledger-head check for heads passed to it,
+    and no longer takes `--supersede`.
+  - Fixtures (on approve-restore):
+    - a copy below an approved version is refused;
+    - with her own approval superseded, the copy is approved;
+    - with someone else's approval, it is refused.
+  - Red-proved with the approve-restore check disabled.
+- **S3-2:** a different body at the approved version also requires
+  `--supersede` ("this ledger is forked").
+- **S3-3:** the head is written via a temporary file, sync and rename,
+  before the approval exists. An existing `--out` is refused first.
+- **F3-2:** the identical draft approved again needs nothing. There is a
+  fixture, red-proved.
+- **F3-4:** an unneeded `--supersede` is refused, with a fixture,
+  red-proved. An unreadable or invalid file fails with its own error.
+- **F3-3, F3-5:** fixed.
+- **T3-1:**
+  - All new refused-`approve` cases use `approve_refused`: no record, head
+    byte-identical.
+  - Red-proved: a mutant writing the head before the check made seven
+    cases fail.
+- **T3-4:** new case: carol's own approval of another body is refused.
+- **T3-3:** the print says "before/after the ready checkpoint line", and
+  D-23 is reworded.
+- **T3-5:** the comment is fixed.
+- **S3-A1:**
+  - P31 uses `strip_rust_comments` and `unterminated`, and refuses any
+    other source file under crates/pds/audit/src.
+  - Fixtures: `sign` after a `//` inside a string; a second source file.
+- **S3-A2:**
+  - P27 parses each Cargo.toml (`tomllib`): dependency tables, target
+    tables, renamed packages (`package =`) and `[features]` entries.
+  - Fixture: a target dependency table renamed `pw`, enabling
+    `verifier`.

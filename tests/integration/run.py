@@ -3231,7 +3231,7 @@ def test_supervisor(fi_net: Package, fi_timer: Package, passed: list):
             if halted:
                 cp = re.search(AUDIT_SIGNED, con.text)
                 during = cp is None or cp.start() > mark + r.start()
-                print(f"supervisor: inject B's record came {'before' if during else 'after'} the ready checkpoint",
+                print(f"supervisor: inject B's record came {'before' if during else 'after'} the ready checkpoint line",
                       flush=True)
             if con.count(r"WgBadMessage", since=mark):
                 raise Fail(f"inject {name}: ingress audited the frame instead of stopping")
