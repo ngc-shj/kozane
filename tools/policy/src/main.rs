@@ -54,6 +54,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use roster::Roster;
 
@@ -131,9 +132,13 @@ fn forbid_roots(args: &[String]) -> Vec<PathBuf> {
     args.windows(2).filter(|w| w[0] == "--forbid").map(|w| PathBuf::from(&w[1])).collect()
 }
 
-fn read_hex_file(path: &Path) -> Result<Vec<u8>, String> {
-    let text = fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    sig::unhex(text.trim_end_matches('\n')).ok_or(format!("{}: not lowercase hex", path.display()))
+/// The decoded file. Both the text and the bytes are wiped on drop: the
+/// signing keys pass through here (L12), as in tools/release.
+fn read_hex_file(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
+    let text = Zeroizing::new(fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?);
+    sig::unhex(text.trim_end_matches('\n'))
+        .map(Zeroizing::new)
+        .ok_or(format!("{}: not lowercase hex", path.display()))
 }
 
 // --- keygen / approver-keygen -------------------------------------------
@@ -143,8 +148,11 @@ fn cmd_keygen(args: &[String]) -> Result<(), String> {
     check_location(&dir, &forbid_roots(args))?;
     fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let (sk, pk) = sig::bundle_keygen(&mut sig::urandom).map_err(|e| e.to_string())?;
-    write_new(&dir.join("ed25519.key"), format!("{}\n", hex(&sk.ed25519)).as_bytes(), 0o600)?;
-    write_new(&dir.join("ml-dsa-65.key"), format!("{}\n", hex(sk.ml_dsa.as_ref())).as_bytes(), 0o600)?;
+    // The hex text of a private key is wiped once written (L12).
+    let ed_hex = Zeroizing::new(format!("{}\n", hex(&sk.ed25519)));
+    write_new(&dir.join("ed25519.key"), ed_hex.as_bytes(), 0o600)?;
+    let ml_hex = Zeroizing::new(format!("{}\n", hex(sk.ml_dsa.as_ref())));
+    write_new(&dir.join("ml-dsa-65.key"), ml_hex.as_bytes(), 0o600)?;
     write_new(&dir.join("ed25519.pub"), format!("{}\n", hex(&pk.ed25519)).as_bytes(), 0o644)?;
     write_new(&dir.join("ml-dsa-65.pub"), format!("{}\n", hex(pk.ml_dsa.as_ref())).as_bytes(), 0o644)?;
     println!("policy: dev bundle-signing keys in {}", dir.display());
@@ -156,7 +164,8 @@ fn cmd_approver_keygen(args: &[String]) -> Result<(), String> {
     check_location(&dir, &forbid_roots(args))?;
     fs::DirBuilder::new().mode(0o700).create(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let (sk, pk) = sig::approver_keygen(&mut sig::urandom).map_err(|e| e.to_string())?;
-    write_new(&dir.join("ed25519.key"), format!("{}\n", hex(&sk)).as_bytes(), 0o600)?;
+    let sk_hex = Zeroizing::new(format!("{}\n", hex(&sk.0)));
+    write_new(&dir.join("ed25519.key"), sk_hex.as_bytes(), 0o600)?;
     write_new(&dir.join("ed25519.pub"), format!("{}\n", hex(&pk)).as_bytes(), 0o644)?;
     println!("policy: dev approver key in {}", dir.display());
     Ok(())
@@ -200,9 +209,9 @@ fn load_approver_signing(path: &Path) -> Result<sig::ApproverSigningKey, String>
     if b.len() != 32 {
         return Err(format!("{}: wrong length", path.display()));
     }
-    let mut sk = [0u8; 32];
-    sk.copy_from_slice(&b);
-    Ok(sig::ApproverSigningKey(sk))
+    let mut sk = sig::ApproverSigningKey([0u8; 32]);
+    sk.0.copy_from_slice(&b);
+    Ok(sk)
 }
 
 // --- fleet ---------------------------------------------------------------
@@ -262,7 +271,7 @@ fn cmd_node_digest(args: &[String]) -> Result<(), String> {
 /// for that package.
 fn check_package_node(fleet: &fleet::Fleet, path: &str) -> Result<(), String> {
     let digest = read_hex_file(Path::new(path))?;
-    let digest: [u8; 32] = digest.try_into().map_err(|_| format!("{path}: not a 32-byte digest"))?;
+    let digest: [u8; 32] = digest.as_slice().try_into().map_err(|_| format!("{path}: not a 32-byte digest"))?;
     let name = fleet::node_for_digest(fleet, &digest).ok_or_else(|| {
         format!("verify: the package's node digest {} is no node's in the fleet file (a stale fleet file, or a package built from another gateway.toml)", hex(&digest))
     })?;

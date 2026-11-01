@@ -128,14 +128,13 @@ impl Drop for ApproverSigningKey {
     }
 }
 
-pub fn approver_keygen(random: &mut dyn FnMut(&mut [u8]) -> bool) -> Result<([u8; 32], [u8; 32]), SigError> {
-    let mut sk = [0u8; 32];
-    if !random(&mut sk) || sk.iter().all(|&b| b == 0) {
-        sk.zeroize();
+pub fn approver_keygen(random: &mut dyn FnMut(&mut [u8]) -> bool) -> Result<(ApproverSigningKey, [u8; 32]), SigError> {
+    let mut sk = ApproverSigningKey([0u8; 32]);
+    if !random(&mut sk.0) || sk.0.iter().all(|&b| b == 0) {
         return Err(SigError::Randomness);
     }
     let mut pk = [0u8; 32];
-    libcrux_ed25519::secret_to_public(&mut pk, &sk);
+    libcrux_ed25519::secret_to_public(&mut pk, &sk.0);
     Ok((sk, pk))
 }
 

@@ -3226,10 +3226,14 @@ def test_supervisor(fi_net: Package, fi_timer: Package, passed: list):
     child, con, w = fault_boot(fi_net, resets=("guest-reset",))
     try:
         mark = con.mark()
+        sent = time.monotonic()
         w.send(ipv4_udp(PEER_IP, GW_IP, 40000, WG_PORT, FAULT_FRAME_A))
         r = con.wait_for(SUPERVISOR_RECORD, since=mark)
         if r.group(1) != "ingress":
             raise Fail(f"reboot: the record is {r.group(0).strip()}")
+        # D-20's margin, measured: from the faulting frame to audit's
+        # record, an upper bound on what the supervisor's 1 s drain covers.
+        print(f"supervisor: the record was printed {con.time_at(r.end() + mark) - sent:.3f} s after the fault", flush=True)
         again = con.wait_for(r"U-Boot \d{4}\.\d{2} ", since=r.end() + mark, timeout=BOOT_TIMEOUT_S)
         second = again.end() + r.end() + mark
         for pd in ("hs", "pq", "tls"):

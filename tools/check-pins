@@ -178,7 +178,9 @@ the only guard for pqkey-core's wrappers. L8's adjudicating control is
   P27 the peer-policy slots (M8 plan C1, C6): `policy-wire`'s `verifier`
      feature (parse without a token) is enabled only by crates/pds/policy and
      tools/policy, and `memory_region_symbol!(policy_a|policy_b ...)` appears
-     only in crates/pds/policy and crates/policy-client. A tripwire over
+     only in crates/pds/policy and crates/policy-client, and
+     `Verified::from_reply` (a token from any bytes) is called under crates/
+     only in policy-wire and policy-client. A tripwire over
      source text; the boundary is the laws' read-only slot MR (C11) and
      `open` needing a `Verified` token
   P28 no single-person signing (M8 plan C2): tools/policy/src names no
@@ -1111,6 +1113,10 @@ def check_boot_stage(root: pathlib.Path, out: list):
 VERIFIER_USERS = ("crates/pds/policy/Cargo.toml", "tools/policy/Cargo.toml")
 SLOT_READERS = ("crates/pds/policy/", "crates/policy-client/")
 SLOT_SYMBOL = re.compile(r"memory_region_symbol!\(\s*policy_[ab]\b")
+# `Verified::from_reply` builds a token from any bytes, so only the client
+# that decodes the `policy` PD's reply calls it (and policy-wire's tests).
+TOKEN_MAKERS = ("crates/policy-wire/", "crates/policy-client/")
+TOKEN_FROM_REPLY = re.compile(r"\bfrom_reply\s*\(")
 # A flag the signer would parse is a string literal; skip_approval is an
 # identifier. Comment lines may name them (the tool's own docs do).
 BYPASS_FLAG = re.compile(r"[\"']--(force|single|roster)[\"']|\bskip_approval\b")
@@ -1131,6 +1137,12 @@ def check_policy(root: pathlib.Path, out: list):
         for n, line in enumerate(text.splitlines(), 1):
             if SLOT_SYMBOL.search(line):
                 out.append(f"P27 {rel}:{n}: a policy slot read outside policy and policy-client (M8 plan C6)")
+    for rel, text in crate_sources(root, "crates"):
+        if rel.startswith(TOKEN_MAKERS):
+            continue
+        for n, line in enumerate(text.splitlines(), 1):
+            if TOKEN_FROM_REPLY.search(line.split("//", 1)[0]):
+                out.append(f"P27 {rel}:{n}: a Verified token built outside policy-client (M8 plan C6)")
     for rel, text in crate_sources(root, "tools/policy/src"):
         for n, line in enumerate(text.splitlines(), 1):
             if not line.lstrip().startswith("//") and BYPASS_FLAG.search(line):

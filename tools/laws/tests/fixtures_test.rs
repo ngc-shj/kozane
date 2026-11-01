@@ -962,6 +962,14 @@ fn bundle_slot_mapped_by_a_non_reader_is_l4() {
 }
 
 #[test]
+fn bundle_slot_read_by_a_pd_that_is_no_caller_of_policy_is_l4() {
+    assert_deny_exactly(
+        "bundle_slot_reader_not_caller_deny",
+        &["L4: pd 'data' reads bundle_slot mr 'policy_a' but is not a named caller of a policy pd"],
+    );
+}
+
+#[test]
 fn bundle_slot_mapped_read_only_by_a_listed_reader_is_allowed() {
     assert_allow("bundle_slot_reader_allow");
 }

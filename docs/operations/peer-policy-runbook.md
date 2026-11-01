@@ -189,8 +189,10 @@ Then, node by node or in HA-sized batches:
 2. Write the slot, then reboot. The counter advances only at boot, after
    the new slot verified (C5); until then the node enforces the old
    bundle, revoked peers included (A12).
-3. Version check from the SIEM, on `tools/audit-verify` output with
-   `verified=yes`: `policy: accepted version=<new> slot=<the slot written>`
+3. Version check from the SIEM, on `tools/audit-verify --events` output
+   with `verified=yes` (an absence counts only over verified lines; wait
+   for the next signed checkpoint if the boot's lines are still
+   `verified=no`): `policy: accepted version=<new> slot=<the slot written>`
    and `policy: release_seq=<expected>`, no `policy: rejected` line for
    the written slot, and no `Halted reason=16` from a barrier PD. For a
    revocation, also check that no `PeerHandshake` line follows for the

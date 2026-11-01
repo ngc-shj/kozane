@@ -1,5 +1,5 @@
 [pds.policy]
-role = "service"
+role = "policy"
 
 [mrs.policy_a]
 kind = "bundle_slot"

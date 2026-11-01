@@ -200,6 +200,19 @@ class Ctx:
     def sign(self, draft: pathlib.Path, approvals: list, out: pathlib.Path) -> tuple:
         return run(BIN, "sign", "--ledger", self.ledger, "--draft", draft, "--approvals", *approvals, "--keys", self.keys, "--out", out)
 
+    def entries(self) -> list:
+        return sorted(p.name for p in (self.ledger / "entries").iterdir())
+
+    def sign_refused(self, draft: pathlib.Path, approvals: list, needle: str) -> tuple:
+        """A refused `sign`: non-zero for `needle`'s reason, and nothing
+        written, neither a slot nor a ledger entry (the reason alone would
+        stay green if the entry were committed before the check)."""
+        before = self.entries()
+        out_slot = self.d / "refused-slot.bin"
+        rc, out = self.sign(draft, approvals, out_slot)
+        wrote = out_slot.exists() or self.entries() != before
+        return rc != 0 and needle in out and not wrote, out + ("\nrefused sign wrote a slot or ledger entry" if wrote else "")
+
     def tampered_copy(self, src: pathlib.Path, dst_name: str, at: int, nbytes: int, value: bytes) -> pathlib.Path:
         b = bytearray(src.read_bytes())
         b[at:at + nbytes] = value
@@ -224,28 +237,23 @@ def case_payload_swapped_after_approval(d):
     """A14: the draft's peer section is edited after both approvals."""
     ctx = Ctx(d)
     swapped = ctx.tampered_copy(ctx.draft1, "swapped.bin", 200, 1, bytes([ctx.draft1.read_bytes()[200] ^ 1]))
-    out_slot = d / "slot_swapped.bin"
-    rc, out = ctx.sign(swapped, [ctx.a1, ctx.b1], out_slot)
-    return rc != 0 and "another body" in out, out
+    return ctx.sign_refused(swapped, [ctx.a1, ctx.b1], "another body")
 
 
 def case_same_approver_twice(d):
     ctx = Ctx(d)
-    rc, out = ctx.sign(ctx.draft1, [ctx.a1, ctx.a1], d / "slot.bin")
-    return rc != 0 and "approved twice" in out, out
+    return ctx.sign_refused(ctx.draft1, [ctx.a1, ctx.a1], "approved twice")
 
 
 def case_one_approval_only(d):
     ctx = Ctx(d)
-    rc, out = ctx.sign(ctx.draft1, [ctx.a1], d / "slot.bin")
-    return rc != 0 and "at least two" in out, out
+    return ctx.sign_refused(ctx.draft1, [ctx.a1], "at least two")
 
 
 def case_approver_not_in_roster(d):
     ctx = Ctx(d)
     mallory = ctx.approve("dave", ctx.draft1, d / "dave.head", out=d / "dave.approval")
-    rc, out = ctx.sign(ctx.draft1, [ctx.a1, mallory], d / "slot.bin")
-    return rc != 0 and "is not in the roster" in out, out
+    return ctx.sign_refused(ctx.draft1, [ctx.a1, mallory], "is not in the roster")
 
 
 def case_forged_approval_signature(d):
@@ -256,8 +264,7 @@ def case_forged_approval_signature(d):
     # the record still parses and only the signature is wrong.
     b[-5] = ord("1") if b[-5] != ord("1") else ord("2")
     forged.write_bytes(bytes(b))
-    rc, out = ctx.sign(ctx.draft1, [forged, ctx.b1], d / "slot.bin")
-    return rc != 0 and "signature does not verify" in out, out
+    return ctx.sign_refused(ctx.draft1, [forged, ctx.b1], "signature does not verify")
 
 
 def case_wrong_approval_domain(d):
@@ -271,16 +278,14 @@ def case_wrong_approval_domain(d):
     rc0, out0 = run(BIN, "ledger", "approve-restore", "--from", ctx.ledger, "--approver-key", ctx.approver_key["alice"],
                      "--approver-id", "alice", "--out", restore)
     assert rc0 == 0, out0
-    rc, out = ctx.sign(ctx.draft1, [restore, ctx.b1], d / "slot.bin")
-    return rc != 0 and "record key head_body_sha256 is unknown" in out, out
+    return ctx.sign_refused(ctx.draft1, [restore, ctx.b1], "record key head_body_sha256 is unknown")
 
 
 def case_record_for_another_version(d):
     ctx = Ctx(d)
     bumped = ctx.tampered_copy(ctx.draft1, "bumped.bin", VERSION_AT, 4, (2).to_bytes(4, "big"))
     a_bumped = ctx.approve("alice", bumped, d / "alice_b.head", out=d / "a_bumped.approval")
-    rc, out = ctx.sign(ctx.draft1, [a_bumped, ctx.b1], d / "slot.bin")
-    return rc != 0 and "bound to version" in out, out
+    return ctx.sign_refused(ctx.draft1, [a_bumped, ctx.b1], "bound to version")
 
 
 def case_record_for_another_fleet(d):
@@ -288,24 +293,21 @@ def case_record_for_another_fleet(d):
     other_fleet = bytes.fromhex("cd" * 16)
     bumped = ctx.tampered_copy(ctx.draft1, "otherfleet.bin", FLEET_ID_AT, FLEET_ID_LEN, other_fleet)
     a_bumped = ctx.approve("alice", bumped, d / "alice_f.head", out=d / "a_fleet.approval")
-    rc, out = ctx.sign(ctx.draft1, [a_bumped, ctx.b1], d / "slot.bin")
-    return rc != 0 and "another fleet_id" in out, out
+    return ctx.sign_refused(ctx.draft1, [a_bumped, ctx.b1], "another fleet_id")
 
 
 def case_record_for_another_prev(d):
     ctx = Ctx(d)
     bumped = ctx.tampered_copy(ctx.draft1, "otherprev.bin", PREV_SHA256_AT, PREV_SHA256_LEN, bytes([0x55] * PREV_SHA256_LEN))
     a_bumped = ctx.approve("alice", bumped, d / "alice_p.head", out=d / "a_prev.approval")
-    rc, out = ctx.sign(ctx.draft1, [a_bumped, ctx.b1], d / "slot.bin")
-    return rc != 0 and "another prev_sha256" in out, out
+    return ctx.sign_refused(ctx.draft1, [a_bumped, ctx.b1], "another prev_sha256")
 
 
 def case_record_for_another_roster(d):
     ctx = Ctx(d)
     bumped = ctx.tampered_copy(ctx.draft1, "otherroster.bin", ROSTER_SHA256_AT, ROSTER_SHA256_LEN, bytes([0x66] * ROSTER_SHA256_LEN))
     a_bumped = ctx.approve("alice", bumped, d / "alice_r.head", out=d / "a_roster.approval")
-    rc, out = ctx.sign(ctx.draft1, [a_bumped, ctx.b1], d / "slot.bin")
-    return rc != 0 and "another roster_sha256" in out, out
+    return ctx.sign_refused(ctx.draft1, [a_bumped, ctx.b1], "another roster_sha256")
 
 
 def case_record_for_another_diff(d):
@@ -320,8 +322,7 @@ def case_record_for_another_diff(d):
     rc1, out1 = run(BIN, "approve", "--ledger", other_ledger, "--draft", ctx.draft1, "--approver-key", ctx.approver_key["alice"],
                      "--approver-id", "alice", "--out", d / "a_diff.approval")
     assert rc1 == 0, out1
-    rc, out = ctx.sign(ctx.draft1, [d / "a_diff.approval", ctx.b1], d / "slot.bin")
-    return rc != 0 and "another diff" in out, out
+    return ctx.sign_refused(ctx.draft1, [d / "a_diff.approval", ctx.b1], "another diff")
 
 
 def case_version_equal_to_head(d):
@@ -329,8 +330,7 @@ def case_version_equal_to_head(d):
     bumped = ctx.tampered_copy(ctx.draft1, "v0again.bin", VERSION_AT, 4, (0).to_bytes(4, "big"))
     a = ctx.approve("alice", bumped, d / "a.head", out=d / "a_eq.approval")
     b = ctx.approve("bob", bumped, d / "b.head", out=d / "b_eq.approval")
-    rc, out = ctx.sign(bumped, [a, b], d / "slot.bin")
-    return rc != 0 and "does not match the ledger head+1" in out, out
+    return ctx.sign_refused(bumped, [a, b], "does not match the ledger head+1")
 
 
 def case_version_below_head(d):
@@ -340,8 +340,7 @@ def case_version_below_head(d):
     bumped = ctx.tampered_copy(ctx.draft1, "vhigh.bin", VERSION_AT, 4, (0xFFFFFFFF).to_bytes(4, "big"))
     a = ctx.approve("alice", bumped, d / "a.head", out=d / "a_lo.approval")
     b = ctx.approve("bob", bumped, d / "b.head", out=d / "b_lo.approval")
-    rc, out = ctx.sign(bumped, [a, b], d / "slot.bin")
-    return rc != 0 and "does not match the ledger head+1" in out, out
+    return ctx.sign_refused(bumped, [a, b], "does not match the ledger head+1")
 
 
 def case_version_skips(d):
@@ -349,8 +348,7 @@ def case_version_skips(d):
     bumped = ctx.tampered_copy(ctx.draft1, "v2.bin", VERSION_AT, 4, (2).to_bytes(4, "big"))
     a = ctx.approve("alice", bumped, d / "a.head", out=d / "a_sk.approval")
     b = ctx.approve("bob", bumped, d / "b.head", out=d / "b_sk.approval")
-    rc, out = ctx.sign(bumped, [a, b], d / "slot.bin")
-    return rc != 0 and "does not match the ledger head+1" in out, out
+    return ctx.sign_refused(bumped, [a, b], "does not match the ledger head+1")
 
 
 def case_genesis_with_nonempty_ledger(d):
@@ -368,8 +366,7 @@ def case_genesis_with_nonempty_ledger(d):
     assert rc1 == 0, out1
     a = ctx.approve("alice", draft_g, d / "a.head", out=d / "a_g.approval")
     b = ctx.approve("bob", draft_g, d / "b.head", out=d / "b_g.approval")
-    rc, out = ctx.sign(draft_g, [a, b], d / "slot.bin")
-    return rc != 0 and "does not match the ledger head+1" in out, out
+    return ctx.sign_refused(draft_g, [a, b], "does not match the ledger head+1")
 
 
 def case_prev_not_ledger_head(d):
@@ -377,8 +374,7 @@ def case_prev_not_ledger_head(d):
     bumped = ctx.tampered_copy(ctx.draft1, "badprev.bin", PREV_SHA256_AT, PREV_SHA256_LEN, bytes([0x77] * PREV_SHA256_LEN))
     a = ctx.approve("alice", bumped, d / "a.head", out=d / "a_pv.approval")
     b = ctx.approve("bob", bumped, d / "b.head", out=d / "b_pv.approval")
-    rc, out = ctx.sign(bumped, [a, b], d / "slot.bin")
-    return rc != 0 and "prev_sha256 is not the ledger head" in out, out
+    return ctx.sign_refused(bumped, [a, b], "prev_sha256 is not the ledger head")
 
 
 def case_second_body_for_signed_version(d):
@@ -397,8 +393,7 @@ def case_second_body_for_signed_version(d):
     b = ctx.approve("bob", other_draft, d / "b2.head", out=d / "b_2nd.approval")
     rc1, out1 = ctx.sign(ctx.draft1, [ctx.a1, ctx.b1], d / "slot1.bin")
     assert rc1 == 0, out1
-    rc, out = ctx.sign(other_draft, [a, b], d / "slot1b.bin")
-    return rc != 0 and "does not match the ledger head+1" in out, out
+    return ctx.sign_refused(other_draft, [a, b], "does not match the ledger head+1")
 
 
 def case_tampered_roster(d):
@@ -437,13 +432,20 @@ def case_broken_chain_link(d):
     return rc != 0 and ("broken chain link" in out or "signature does not verify" in out), out
 
 
+def approve_refused(rc: int, out: str, head: pathlib.Path, head_was: str, record: pathlib.Path, needle: str) -> tuple:
+    """A refused `approve`: non-zero for `needle`'s reason, no approval
+    record written and the approver's head left as it was."""
+    wrote = record.exists() or head.read_text() != head_was
+    return rc != 0 and needle in out and not wrote, out + ("\nrefused approve wrote a record or moved the head" if wrote else "")
+
+
 def case_approver_head_ahead_of_ledger(d):
     ctx = Ctx(d)
     ahead = d / "ahead.head"
     ahead.write_text("body_sha256=" + "ab" * 32 + "\nversion=5\n")
     rc, out = run(BIN, "approve", "--ledger", ctx.ledger, "--draft", ctx.draft1, "--approver-key", ctx.approver_key["carol"],
                   "--approver-id", "carol", "--head", ahead, "--out", d / "c1.approval")
-    return rc != 0 and "behind this approver's recorded head" in out, out
+    return approve_refused(rc, out, ahead, "body_sha256=" + "ab" * 32 + "\nversion=5\n", d / "c1.approval", "behind this approver's recorded head")
 
 
 def case_approver_head_same_version_different_digest(d):
@@ -452,7 +454,7 @@ def case_approver_head_same_version_different_digest(d):
     wrong.write_text("body_sha256=" + "cd" * 32 + "\nversion=0\n")
     rc, out = run(BIN, "approve", "--ledger", ctx.ledger, "--draft", ctx.draft1, "--approver-key", ctx.approver_key["carol"],
                   "--approver-id", "carol", "--head", wrong, "--out", d / "c1.approval")
-    return rc != 0 and "tampered or forked ledger" in out, out
+    return approve_refused(rc, out, wrong, "body_sha256=" + "cd" * 32 + "\nversion=0\n", d / "c1.approval", "tampered or forked ledger")
 
 
 def case_overlap_with_one_node_of_fleet(d):

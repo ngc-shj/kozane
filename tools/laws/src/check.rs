@@ -1114,7 +1114,9 @@ fn check_data_confinement(system: &System, policy: &Policy, findings: &mut Vec<F
 /// allowlist shape `plain`'s share table gets in `check_default_deny`
 /// (L4, default deny), fixed to read-only: no pd may map it with `w` or
 /// `x`, and every pd that maps it must be one of its policy `readers`
-/// (which may be empty, an unmapped slot). It never seeds taint (L1): it
+/// (which may be empty, an unmapped slot), and every reader but the
+/// `policy` pd is one of its named callers (C6's barrier set). It never
+/// seeds taint (L1): it
 /// is not a `Device` mr, so `compute_taint`'s seed filter already excludes
 /// it; verifying the bytes inside is `policy`'s job (C6), not the laws'.
 fn check_bundle_slot(system: &System, policy: &Policy, findings: &mut Vec<Finding>) {
@@ -1130,6 +1132,18 @@ fn check_bundle_slot(system: &System, policy: &Policy, findings: &mut Vec<Findin
                 findings.push(Finding::new(
                     LawId::L4,
                     format!("pd '{}' maps bundle_slot mr '{}' but is not listed in its policy readers", pd.name, m.mr),
+                ));
+            } else if policy.role(&pd.name) != Some(Role::Policy)
+                && !system
+                    .pds
+                    .iter()
+                    .any(|p| policy.role(&p.name) == Some(Role::Policy) && policy.is_named_caller(&p.name, &pd.name))
+            {
+                // C6: a reader that is no named caller of `policy` could
+                // map the slots without ever awaiting `Verified`.
+                findings.push(Finding::new(
+                    LawId::L4,
+                    format!("pd '{}' reads bundle_slot mr '{}' but is not a named caller of a policy pd", pd.name, m.mr),
                 ));
             }
         }

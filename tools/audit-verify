@@ -2,7 +2,7 @@
 """Verifies a captured audit stream (M8 plan C10): the SIEM's side of the
 export, run over the raw UART capture.
 
-Usage: audit-verify --pub AUDIT_PUB (--after LINE | --from-provisioning RECORD) CAPTURE
+Usage: audit-verify --pub AUDIT_PUB (--after LINE | --from-provisioning RECORD) [--events] CAPTURE
 
 AUDIT_PUB is the device's audit public key as tools/package exports it
 (audit.pub: 64 hex digits and a newline). CAPTURE is the raw console text,
@@ -50,6 +50,10 @@ tools/provision's to check (`provision nv`); this reads its fields.
 Prints `baseline srk=… reset=… restart=… seq=…` (what the capture is
 anchored to; `-` where provisioning fixes no value), one line per boot,
 the C9 version lines (`c9 boot=<i> seq=<n> verified=<yes|no>: <line>`),
+with --events every audit line the same way (`event boot=<i> seq=<n>
+verified=<yes|no>: <line>`, for checks such as "no `policy: rejected` and
+no `PeerHandshake` for a revoked peer" that need the absence of a line
+proved over the signed part of the stream),
 `note:` and `FAIL:` lines, then `anchor: <line>` (the --after for the next
 capture) and `audit-verify: ok` or `audit-verify: FAILED`. Exits 0 when
 nothing failed, 1 when something did, 2 on a usage error.
@@ -152,6 +156,7 @@ class Boot:
         self.last_seq = None
         self.lost = 0
         self.c9 = []
+        self.events = []
 
 
 def load_pub(path: str) -> Ed25519PublicKey:
@@ -178,7 +183,8 @@ def load_record(path: str) -> dict:
     return fields
 
 
-def verify(capture: bytes, key: Ed25519PublicKey, after: Checkpoint = None, record: dict = None) -> tuple:
+def verify(capture: bytes, key: Ed25519PublicKey, after: Checkpoint = None, record: dict = None,
+           events: bool = False) -> tuple:
     """(output lines, failure count)."""
     out, fails = [], []
 
@@ -226,6 +232,8 @@ def verify(capture: bytes, key: Ed25519PublicKey, after: Checkpoint = None, reco
             check_checkpoint(b, body, seq, line, key, fail, note)
         if C9.match(body):
             b.c9.append((seq, body))
+        if events:
+            b.events.append((seq, body))
         b.last_seq = seq
         if b.chain is not None:
             b.chain = link(b.chain, line)
@@ -246,6 +254,9 @@ def verify(capture: bytes, key: Ed25519PublicKey, after: Checkpoint = None, reco
         for seq, body in b.c9:
             ok = b.verified_cp is not None and seq < b.verified_cp
             out.append(f"c9 boot={b.index} seq={seq} verified={'yes' if ok else 'no'}: {body.decode(errors='replace')}")
+        for seq, body in b.events:
+            ok = b.verified_cp is not None and seq < b.verified_cp
+            out.append(f"event boot={b.index} seq={seq} verified={'yes' if ok else 'no'}: {body.decode(errors='replace')}")
 
     continuity(boots, after, record, fail)
     last = next((b.signed[-1] for b in reversed(boots) if b.signed), None)
@@ -329,6 +340,7 @@ def main(argv=None) -> int:
     anchor = ap.add_mutually_exclusive_group(required=True)
     anchor.add_argument("--after")
     anchor.add_argument("--from-provisioning")
+    ap.add_argument("--events", action="store_true")
     ap.add_argument("capture")
     a = ap.parse_args(argv)
     try:
@@ -348,7 +360,7 @@ def main(argv=None) -> int:
             print("FAIL: the --after anchor's signature does not verify under the device key")
             print("audit-verify: FAILED (1)")
             return 1
-    out, failed = verify(capture, key, after, record)
+    out, failed = verify(capture, key, after, record, a.events)
     print("\n".join(out))
     return 1 if failed else 0
 

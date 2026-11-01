@@ -616,3 +616,47 @@ differences from the plan:
 
   Each of these has failed on its own mutant. A check-selftest case per
   item would re-run the same evidence through a slower path.
+
+## Phase 2 self-check (Step 2-5)
+
+### D-23 — what the recurring-checklist self-check found
+
+Three reviewers checked `main...HEAD` against R1–R57, RS and RT. These
+findings were fixed:
+
+- **Key copies left in memory (R39, Major).** `tools/policy` decoded its
+  signing keys into plain `Vec`s and `String`s, and `approver_keygen`
+  returned a bare array, although its manifest claims L12 as
+  tools/release does. It now follows tools/release: `read_hex_file` returns
+  `Zeroizing`, the key hex is wiped once written, and approver keys are
+  `ApproverSigningKey` from generation on. tools/release has no check-pins
+  rule for this either, so none was added.
+- **A `Verified` token from any bytes (R49, Major).** `Verified::from_reply`
+  is public, and `policy_client::open` maps the slot itself, so a barrier
+  PD could have made its own token without tripping P27. P27 now also
+  allows `from_reply` under crates/ only in policy-wire and policy-client,
+  and the rustdoc calls `Verified` a witness, not a capability. A Cargo
+  feature gate was considered, but it would only be the same kind of
+  tripwire with more churn (D-21's injection, the doctest).
+- **The slot readers and the policy callers were separate lists (R42,
+  Minor).** Laws L4 now requires every bundle_slot reader other than the
+  `policy` pd to be one of its named callers.
+- **Refused `sign` and `approve` were checked only by their reason (RT8,
+  Major).** The fixtures now also check that no slot, ledger entry,
+  approval record or head change was written. Red-proved on a mutant that
+  checks distinct approvers only after appending.
+- **The runbook's absence checks ran on output that never contains those
+  lines (R12/R29, Major).** `audit-verify` printed only the C9 lines, so
+  "no `policy: rejected`" and "no `PeerHandshake` for a revoked peer"
+  always held. `--events` prints every line with its verified flag, and
+  the runbook and the audit map now use it.
+
+Left open:
+
+- **`FAULT_DRAIN_NS` (D-20) was not set from a measurement (R53, Minor).**
+  The supervisor case now prints the time from the faulting frame to
+  audit's record (`supervisor: the record was printed <s> s after the
+  fault`). That is an upper bound on what the drain must cover. The final
+  `make check` and the split self-test report it. The worst case is to be
+  recorded here, and the constant raised if it exceeds 0.2 s (a margin
+  under 5×).

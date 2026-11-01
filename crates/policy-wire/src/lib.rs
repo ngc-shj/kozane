@@ -712,11 +712,14 @@ impl Slot {
     }
 }
 
-/// Proof that `policy` has already verified and selected a slot's bundle
-/// (M8 plan C5/C6): no public fields and no public constructor besides
+/// The typed form of `policy`'s `Verified` reply (M8 plan C5/C6): no
+/// public fields and no public constructor besides
 /// [`Verified::from_reply`] (I1.2), so [`open`] is reachable only through
-/// one. `version` and `body_sha256` are carried for audit only (M8 plan
-/// "Consumer-flow walkthroughs"); `open` does not re-hash the slot.
+/// one. A witness, not a capability: `from_reply` accepts any well-formed
+/// bytes, so only crates/policy-client, decoding the `policy` PD's reply,
+/// calls it (check-pins P27). `version` and `body_sha256` are carried for
+/// audit only (M8 plan "Consumer-flow walkthroughs"); `open` does not
+/// re-hash the slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Verified {
     slot: Slot,

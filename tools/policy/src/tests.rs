@@ -229,7 +229,7 @@ fn an_approval_verifies_under_its_own_roster_entry() {
         ts: 123,
         version: 7,
     };
-    let record = approval::sign(&sig::ApproverSigningKey(sk), &fields, &mut rng).unwrap();
+    let record = approval::sign(&sk, &fields, &mut rng).unwrap();
     let got = approval::parse_and_verify(&record, &roster).unwrap();
     assert_eq!(got, fields);
 }
@@ -249,7 +249,7 @@ fn a_forged_approval_signature_is_refused() {
         ts: 123,
         version: 7,
     };
-    let mut record = approval::sign(&sig::ApproverSigningKey(sk), &fields, &mut rng).unwrap();
+    let mut record = approval::sign(&sk, &fields, &mut rng).unwrap();
     let at = record.len() - 5;
     record[at] ^= 1;
     assert!(approval::parse_and_verify(&record, &roster).is_err());
@@ -270,7 +270,7 @@ fn an_approver_not_in_the_roster_is_refused() {
         ts: 123,
         version: 7,
     };
-    let record = approval::sign(&sig::ApproverSigningKey(sk), &fields, &mut rng).unwrap();
+    let record = approval::sign(&sk, &fields, &mut rng).unwrap();
     let err = approval::parse_and_verify(&record, &roster).unwrap_err();
     assert!(err.contains("is not in the roster"), "{err}");
 }
@@ -284,7 +284,7 @@ fn an_approval_record_is_not_a_restore_record_and_vice_versa() {
     let (sk, pk) = sig::approver_keygen(&mut rng).unwrap();
     let roster = Roster { approvers: vec![Approver { id: "alice".into(), ed25519_pub: pk }] };
     let restore_fields = RestoreFields { approver_id: "alice".into(), fleet_id: [3; 16], head_body_sha256: [4; 32], head_version: 7, ts: 1 };
-    let record = approval::sign_restore(&sig::ApproverSigningKey(sk), &restore_fields, &mut rng).unwrap();
+    let record = approval::sign_restore(&sk, &restore_fields, &mut rng).unwrap();
     // Not parseable as a bundle approval: the required key set differs.
     assert!(approval::parse_and_verify(&record, &roster).is_err());
 }
@@ -295,7 +295,7 @@ fn a_restore_approval_verifies_and_a_forged_one_does_not() {
     let (sk, pk) = sig::approver_keygen(&mut rng).unwrap();
     let roster = Roster { approvers: vec![Approver { id: "alice".into(), ed25519_pub: pk }] };
     let fields = RestoreFields { approver_id: "alice".into(), fleet_id: [3; 16], head_body_sha256: [4; 32], head_version: 7, ts: 1 };
-    let record = approval::sign_restore(&sig::ApproverSigningKey(sk), &fields, &mut rng).unwrap();
+    let record = approval::sign_restore(&sk, &fields, &mut rng).unwrap();
     assert_eq!(approval::parse_and_verify_restore(&record, &roster).unwrap(), fields);
 
     let mut forged = record.clone();

@@ -110,7 +110,8 @@ class Run:
         self.dir, self.n = d, 0
         self.key, self.other = Key(), Key()
 
-    def verify(self, data: bytes, pub: str = None, rec: str = None, after: bytes = None, flag: bool = True) -> tuple:
+    def verify(self, data: bytes, pub: str = None, rec: str = None, after: bytes = None, flag: bool = True,
+               events: bool = False) -> tuple:
         self.n += 1
         cap, pubf, recf = (self.dir / f"{self.n}.{x}" for x in ("cap", "pub", "rec"))
         cap.write_bytes(data)
@@ -121,6 +122,8 @@ class Run:
         elif flag:
             recf.write_text(rec or record())
             args += ["--from-provisioning", str(recf)]
+        if events:
+            args.append("--events")
         args.append(str(cap))
         r = subprocess.run(args, capture_output=True, text=True)
         return r.returncode, r.stdout + r.stderr
@@ -146,6 +149,16 @@ def cases(run: Run) -> list:
     case("allow: the C9 lines are extracted, verified", run.verify(clean), 0,
          "c9 boot=0 seq=9 verified=yes: policy: accepted version=0 slot=A lost=0")
     case("allow: the unverified tail is reported", run.verify(clean), 0, "boot 0: 3 unverified lines after the last checkpoint")
+    rejected = Device(k, boot_id(1), RESET_AT_PROVISION + 1)
+    rejected.line("audit: ready")
+    rejected.line("policy: rejected slot=B reason=Version lost=0")
+    rejected.line("policy: accepted version=0 slot=A lost=0")
+    rejected.checkpoint()
+    rejected.events(1)
+    case("allow: --events prints a policy rejection, verified", run.verify(capture(rejected), events=True), 0,
+         "event boot=0 seq=1 verified=yes: policy: rejected slot=B reason=Version lost=0")
+    case("allow: --events marks the lines after the last checkpoint unverified", run.verify(capture(rejected), events=True), 0,
+         "event boot=0 seq=4 verified=no: audit: src=ingress ArpReplied total=1 lost=0")
 
     case("allow: a capture cut mid-line skips its unterminated last line",
          run.verify(clean + b"audit: src=ingress ArpReplied total=4 lost=0 seq=1"), 0,
