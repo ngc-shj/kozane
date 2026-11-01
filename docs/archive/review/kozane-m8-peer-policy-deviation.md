@@ -713,8 +713,9 @@ changes go beyond the plan's text:
     (S6-3, F6-1). Every copy of the same ledger shares that v0. A copy of
     another ledger made under the same pin and keys (a re-genesis that
     kept the pin) does not, so superseding against it records the wrong
-    v0 (round 7, F7-1). Recovery is to remove the head file: the next
-    `approve` starts it again.
+    v0 (round 7, F7-1). The runbook has the approver save the head file
+    before such a supersede and put it back. Removing the head instead
+    leaves that approver out of the pending restore (round 8, F8-1).
   - A restore approval is good for 24 hours (300 s of skew), measured
     against the restore host's clock (S6-1). That narrows replay; it does
     not stop it. Within the window, or on a host whose clock is set back,
@@ -722,8 +723,11 @@ changes go beyond the plan's text:
     that height, with no approver and on any roster size (round 7, S7-1).
     `restore` is no stronger than a copy of the files. The controls that
     hold are elsewhere:
-    - each approver's head refuses the cut-back ledger at their next
-      `approve` (truncation of an approved version);
+    - the head of each approver of a dropped version, and any head
+      recording a later ledger head, refuses the cut-back ledger at
+      their next `approve`, unless that approver hands their approval
+      back. Approvers of none of the dropped versions see nothing (round
+      8, F8-2);
     - every node refuses a version below its counter.
   - The bundle keys an approver passes to `approve-restore` are their own
     trusted copy.

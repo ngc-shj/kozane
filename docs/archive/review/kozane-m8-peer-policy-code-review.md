@@ -1,6 +1,6 @@
 # Code Review: kozane-m8-peer-policy
 Date: 2026-11-01
-Review round: 7
+Review round: 8
 
 ## Changes from Previous Round
 Initial review, at 751e95b, after Phase 2 Step 2-5's self-check (D-23).
@@ -699,3 +699,38 @@ confirmed resolved, except T-F3 (the Kani counts, still open) and T-F6
   the head records `version=0` and `approved_version=-`. Red-proved with
   the copy-head mutant.
 - **T7-3:** the test's temp dir is removed by a drop guard.
+
+## Round 8 (ac791c3..1cf00ad)
+
+### Findings
+- **Functionality:**
+  - F8-1 Minor: the "remove the head file" recovery shut that approver out
+    of the pending restore, and the runbook did not say so.
+  - F8-2 Minor: the docs said each approver's head catches a cut-back
+    ledger; only the heads of the dropped versions' approvers do (and any
+    later ledger head).
+- **Security:**
+  - S8-1 Minor: a nightly `${concat(..)}` builds `include` or `sign` from
+    parts no token rule sees (rustc-confirmed).
+  - S8-2 Minor: the recovery had no check to tell the F7-1 mix-up from a
+    real fork.
+- **Testing:** no findings. All round-7 red-proofs reproduced
+  independently, and the counts and the `make test` skip are sound.
+
+### Round 8 Resolution Status
+- **F8-1 / S8-2:**
+  - The runbook has the approver save the head file before a genesis
+    supersede and put it back.
+  - The head file is removed only after two checks: the head's v0 is the
+    wrong copy's, and the ledger's v0 is the fleet's known genesis.
+    Otherwise the refusal is treated as a fork and escalated.
+  - It states that an approver without a head cannot approve the pending
+    restore.
+- **F8-2:** D-24 and the runbook name the heads that catch it: the
+  dropped versions' approvers and later ledger heads, unless the approval
+  is handed back.
+- **S8-1:**
+  - P31 refuses the mechanism: any metavariable expression (`${`) and any
+    `#![feature]` in audit (audit uses neither).
+  - Fixtures: a metavariable concat; a crate feature gate.
+  - Red-proved arm by arm.
