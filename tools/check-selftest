@@ -832,11 +832,14 @@ CASES = {
         f"if test 0x$e{i} -gt 0x$o{j} && test 0x$e{j} -gt 0x$o{i}; then REFUSE; fi\n", ""),
         f"the {i}-{j} overlap was not refused")
        for i, j in ((0, 3), (0, 4), (0, 5), (1, 3), (1, 4), (1, 5), (2, 3), (2, 4), (2, 5), (3, 4), (3, 5), (4, 5))},
-    # M8 plan C4, D3: U-Boot stops extending PCR 9 with slot A, so PCR 9
-    # after a shipped boot no longer matches the host twin.
-    "measure-pcr9-twin": (["test", "it_boots=sealed boot"], lambda t: edit(
+    # M8 plan C4, D3: U-Boot stops extending PCR 9 with slot A. `policy`
+    # recomputes PCR 9 from both slots, so a boot that should accept v0 is
+    # MeasureMismatch instead. (Sealed boot's host twin never gets there:
+    # every barrier PD halts first.)
+    "measure-pcr9-twin": (["test", "it_boots=policy advance-revoke"], lambda t: edit(
         t, "support/u-boot/boot.cmd", "tpm2 pcr_extend 9 0x6fb00060 || REFUSE\n", ""),
-        "FAIL [sealed boot]: Fail: PCR 9 after the shipped boot is"),
+        "FAIL [policy advance-revoke]: Fail: advance-revoke (start 0), v0: policy unavailable "
+        "reason=MeasureMismatch current=0, want accepted version=0 slot=A"),
     # Range 2's no-wrap form (len <= image_len - offset): without it, a range
     # 2 running past image_len within 32 bits is copied.
     "measure-range2-wrap": (["test", "it_boots=measured boot"], lambda t: edit(
