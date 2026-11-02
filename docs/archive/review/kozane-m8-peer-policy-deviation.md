@@ -723,11 +723,11 @@ changes go beyond the plan's text:
     that height, with no approver and on any roster size (round 7, S7-1).
     `restore` is no stronger than a copy of the files. The controls that
     hold are elsewhere:
-    - the head of each approver of a dropped version, and any head
-      recording a later ledger head, refuses the cut-back ledger at
-      their next `approve`, unless that approver hands their approval
-      back. Approvers of none of the dropped versions see nothing (round
-      8, F8-2);
+    - at the next `approve`, a head recording a ledger head above the
+      cut refuses the cut-back ledger outright. A head recording an
+      approval of a dropped version refuses it unless the approver hands
+      that approval back. A head recording neither sees nothing (rounds 8
+      and 9, F8-2 and F9-1);
     - every node refuses a version below its counter.
   - The bundle keys an approver passes to `approve-restore` are their own
     trusted copy.

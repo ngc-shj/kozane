@@ -1,6 +1,6 @@
 # Code Review: kozane-m8-peer-policy
 Date: 2026-11-01
-Review round: 8
+Review round: 9
 
 ## Changes from Previous Round
 Initial review, at 751e95b, after Phase 2 Step 2-5's self-check (D-23).
@@ -734,3 +734,51 @@ confirmed resolved, except T-F3 (the Kani counts, still open) and T-F6
     `#![feature]` in audit (audit uses neither).
   - Fixtures: a metavariable concat; a crate feature gate.
   - Red-proved arm by arm.
+
+## Round 9 (1cf00ad..c673cb7)
+
+### Findings
+- **Functionality:**
+  - F9-1 Minor: the hand-back escape was overstated for ledger-half
+    refusals, and D-24 contradicted itself.
+  - F9-2 Minor: "supersede again against the right copy" is refused when
+    the right copy holds the approval.
+  - F9-3 Minor: the feature arm missed `#![cfg_attr(.., feature(..))]`,
+    and the new arms printed the module message.
+- **Security:**
+  - S9-1 Minor: P31 matched the spelling `.pp_call(`, not the call. A
+    space, the `Channel::pp_call(&c, ..)` form, `endpoint().call` or
+    `Channel::new(11)` made an uncounted call to auditkey or read its
+    notification.
+  - S9-2 Minor: the recovery check's first condition always held, and the
+    second had no trusted value.
+- **Testing:**
+  - T9-1 Minor: the whitespace tolerance of the new arms was unproven.
+  - T9-2 Minor (Adjacent): one message for every arm.
+
+### Round 9 Resolution Status
+- **F9-1:** the runbook and D-24 say that a head recording a ledger head
+  above the cut always refuses. A head recording an approval of a
+  dropped version refuses unless that approval is handed back. A head
+  recording neither sees nothing.
+- **F9-2:** the runbook says "run approve-restore again … with
+  `--supersede` only if it still asks for it".
+- **F9-3 / T9-2:**
+  - The feature arm matches any inner attribute naming `feature`.
+  - The `${` and feature hits have their own message.
+  - Fixture: a feature gate through `cfg_attr`.
+- **T9-1:** the metavariable and feature fixtures use the spaced
+  spellings (`$ {`, `# ! [ feature`). Proved: the tight-regex mutants
+  leave them silent, and so does the no-`cfg_attr` mutant for its
+  fixture.
+- **S9-1:**
+  - P31 counts every `pp_call` token over the whole text and requires
+    exactly one, inside `fn sign`.
+  - It refuses `endpoint`, `sel4`, and `Channel::new` given a literal
+    number.
+  - Fixtures: a spaced call; the method-path form; an endpoint; a
+    literal channel.
+  - All new fixtures are red against the round-8 check-pins.
+- **S9-2:** the runbook anchors the check on the `body_sha256` of the
+  genesis approval the approver handed back. The ledger's v0 must equal
+  it and the head's v0 must differ from it; otherwise, escalate.

@@ -314,17 +314,19 @@ slot comes from the ledger (`entries/`) and is checked with
   ahead of the restore host's clock, so approve right before the restore
   and keep the clocks in sync. That clock is the restore host's, so the
   window limits replay but does not prevent it. What catches a cut-back
-  ledger is the head of each approver of a dropped version (and any head
-  recording a later ledger head), at their next `approve`, unless that
-  approver hands their approval back. Superseding a genesis approval records the
+  ledger, at the next `approve`, is a head recording a ledger head above
+  the cut (always refused), or an approval of a dropped version (refused
+  unless the approver hands it back). Superseding a genesis approval records the
   copy's v0 in the head. Copy the head file aside before such a
   supersede: if the copy turns out to be of the wrong ledger, put the
-  saved file back and supersede again against the right copy. Without
+  saved file back and run approve-restore again against the right copy,
+  with `--supersede` only if it still asks for it. Without
   the saved file, the only way out is to remove the head file. Do that
-  only after confirming the mix-up: the head's `body_sha256` at
-  `version=0` is the v0 of the copy they superseded against, and the
-  current ledger's v0 is the fleet's known genesis body. Otherwise the
-  "tampered or forked ledger" refusal may be a real fork: escalate it.
+  only after confirming the mix-up against a value the approver holds:
+  the `body_sha256` in the genesis approval they handed back. The
+  current ledger's v0 must equal it, and the head's `body_sha256` at
+  `version=0` must differ from it. Otherwise the "tampered or forked
+  ledger" refusal may be a real fork: escalate it.
   An approver who removed their head cannot approve this restore; the
   other approvers must, or a two-member roster starts a new genesis. An
   approver without a head file (a wiped device) cannot approve a restore,

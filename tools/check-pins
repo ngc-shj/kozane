@@ -1276,18 +1276,28 @@ def check_audit_call(root: pathlib.Path, out: list):
     # Also refused: metavariable expressions (`${concat(..)}` builds an
     # `include` or `sign` from parts no token rule sees) and any
     # `#![feature]` that would enable them; audit uses neither.
-    for m in re.finditer(r"\bmod\b|\binclude\b|#\s*!?\s*\[[^\]]*\bpath\b|\$\s*\{|#\s*!\s*\[\s*feature\b", stripped):
+    for m in re.finditer(r"\bmod\b|\binclude\b|#\s*!?\s*\[[^\]]*\bpath\b", stripped):
         n = stripped.count("\n", 0, m.start()) + 1
         out.append(f"P31 {AUDIT_MAIN}:{n}: an out-of-line module or include! pulls in code the one-call-site check does not read (M8 plan C10)")
+    # Any inner attribute naming `feature` (`cfg_attr` included).
+    for m in re.finditer(r"\$\s*\{|#\s*!\s*\[[^\]]*\bfeature\b", stripped):
+        n = stripped.count("\n", 0, m.start()) + 1
+        out.append(f"P31 {AUDIT_MAIN}:{n}: a metavariable expression or feature gate can build a name no P31 token rule sees (M8 plan C10)")
     others = sorted(str(f.relative_to(root)) for f in path.parent.rglob("*.rs") if f != path)
     if others:
         out.append(f"P31 {AUDIT_MAIN}: audit has other source files {others}; its one call site is only checked in main.rs (M8 plan C10)")
-    calls = [n for n, l in enumerate(code, 1) if ".pp_call(" in l]
+    # Every `pp_call` token over the whole text (spacing, `Channel::pp_call`
+    # and a split call are one too), and no other way to make or read a
+    # call: no endpoint, no sel4, no channel number written as a literal.
+    calls = [stripped.count("\n", 0, m.start()) + 1 for m in re.finditer(r"\bpp_call\b", stripped)]
+    for m in re.finditer(r"\bendpoint\b|\bsel4\b|\bChannel\s*::\s*new\s*\(\s*\d", stripped):
+        n = stripped.count("\n", 0, m.start()) + 1
+        out.append(f"P31 {AUDIT_MAIN}:{n}: an endpoint, sel4 or a literal channel number reaches auditkey past the one call (M8 plan C10)")
     names = [n for n, l in enumerate(code, 1) if "CH_AUDITKEY" in l]
     sign = next((n for n, l in enumerate(code, 1) if re.search(r"\bfn sign\(", l)), None)
     end = next((n for n, l in enumerate(code, 1) if sign and n > sign and l.startswith("}")), None)
     if len(calls) != 1 or not (sign and end and sign < calls[0] < end):
-        out.append(f"P31 {AUDIT_MAIN}: want exactly one .pp_call(, inside fn sign; found lines {calls} (M8 plan C10)")
+        out.append(f"P31 {AUDIT_MAIN}: want exactly one pp_call, inside fn sign; found lines {calls} (M8 plan C10)")
     if names != calls:
         out.append(f"P31 {AUDIT_MAIN}: CH_AUDITKEY named at lines {names}; only at the one call (M8 plan C10)")
     # `sign` takes any words, so its one use must be the machine's
