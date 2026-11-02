@@ -13,6 +13,14 @@ authority its role needs. Static keys live in passive PDs that have no
 device and no network path. The image is reproducible, its boot is measured
 into a TPM, and its secrets are sealed to that measurement.
 
+Which peers may connect, and what each may reach behind the gateway, comes
+from a signed peer-policy bundle rather than from the image. A bundle is
+approved by two people and signed with Ed25519 + ML-DSA-65. It is
+installed without a rebuild, and a TPM NV counter refuses any rollback to
+an older one. The audit stream on the console is hash-chained, with
+checkpoints signed inside the gateway, so a log collector can check that it
+is complete and unaltered.
+
 > **Research project.** It has run only under QEMU (with swtpm), never on
 > hardware. It has had no independent audit, and the keys in this
 > repository are development keys. Do not deploy it to protect anything
@@ -31,12 +39,15 @@ into a TPM, and its secrets are sealed to that measurement.
 |---|---|---|
 | Wire parsers and emitters for WireGuard, Rosenpass, Ethernet/IP/UDP, the inter-PD messages, and the PD rings: memory safety and parse/emit round trips | PROVEN | Verus (`make verus`); required functions in `policy/verus-required.toml`, trusted constructs in `policy/verus-trusted.toml` |
 | TLS record and handshake parsers, HTTP/1.1 head parser (smuggling forms refused), TPM 2.0 wire format, ingress and inner gates | BOUNDED | Kani (`make kani`). The HTTP parser is proved step by step and composed by induction; the induction itself is argued |
+| Peer-policy bundle parser and slot selection, NV counter advanced only after a verified newer slot, inner's group authorization and flow table, the audit checkpoint signer's sequence rule | BOUNDED | Kani (`make kani`: `policy-wire`, `tpm2-wire`, `inner-core`, `auditkey-core`, `audit-core`) |
 | Driver PDs only copy frames, never interpret them, within proved bounds (L7) | BOUNDED | Kani (`crates/ring`: every copy stays in its region) |
 | Capability layout: taint, secrets only in the key PDs, default deny, device ownership, budgets and priorities (L1–L5, L11, L13) | CHECKED | `tools/laws` against `policy/laws.toml` and the exact `.system` given to Microkit |
 | Constant-time code paths in the key PDs | CHECKED | `make ct` and `make ct-shape` (Valgrind memcheck with secrets marked undefined, and a shape gate) |
 | Post-quantum is mandatory: no WireGuard session without a Rosenpass PSK (L8), no TLS traffic secret without X25519MLKEM768 (L14) | CHECKED | Contracts in the code and end-to-end tests against wireguard-go, Rosenpass and OpenSSL |
 | Reproducible image: two builds from different paths are bit-identical; the shipped code matches the verified code at the MIR level | CHECKED | `make repro`, `make mir` |
 | Measured boot into PCR 8, secrets sealed to it, signed releases (Ed25519 + ML-DSA-65) | CHECKED (QEMU + swtpm) | `make test` boots the packaged image through U-Boot |
+| Peer-policy bundles: two-person approval, an append-only approval ledger, slots measured into PCR 9 (not sealed), anti-rollback through a TPM NV counter | CHECKED (QEMU + swtpm) | `tools/policy` fixtures, `make test` (the policy cases), the self-test's injected faults |
+| Audit export: every line numbered and hash-chained, checkpoints signed by a separate `auditkey` PD | CHECKED | `tools/audit-verify` and its fixtures, `make test` |
 | seL4 enforces isolation for this configuration | ASSUMED | Microkit uses the MCS kernel, whose AArch64 proofs are not yet published, and QEMU `virt` is not a verified platform |
 | libcrux primitives, rust-sel4, smoltcp, the Rust toolchain | ASSUMED | Pinned by version and hash, not verified here |
 
@@ -57,9 +68,14 @@ These are known and accepted, not oversights:
   QEMU, U-Boot itself is not measured, so an attacker who can replace it
   on the boot media defeats measured boot. The quality of entropy and the
   NIC's line-rate behaviour on real hardware are unknown.
-- **Keys and rollback.** Release signing keys are development keys kept
-  on the build host. There is no anti-rollback counter yet, so an older
-  signed image still boots.
+- **Keys and rollback.** Release and bundle signing keys are development
+  keys kept on the build host. A bundle older than the TPM counter is
+  refused, and an older release refuses a bundle whose `min_release` is
+  above it, so it stops serving. But an older signed release still boots
+  until a bundle raises that floor.
+- **Human procedures.** Two-person approval, provisioning and ledger
+  restore depend on the operators following the runbook. What each step
+  catches, and what it does not, is listed in the M8 deviation log (D-24).
 - **Clients without post-quantum TLS** cannot connect to the HTTPS proxy.
   This is intended (L14). Some older client stacks offer only classical
   groups.
@@ -103,7 +119,7 @@ proofs should not run concurrently.
 | `crates/mce460896` | Classic McEliece 460896 (Rosenpass's static KEM) |
 | `system/kozane.system` | The Microkit system description |
 | `policy/` | The security laws and gate inputs (`laws.toml`, Verus lists, constant-time rules) |
-| `tools/` | Laws checker, packaging, release signing and verification, gates |
+| `tools/` | Laws checker, packaging, release signing and verification, peer-policy signing and approval (`policy`), TPM provisioning, audit-stream verification, gates |
 | `tests/` | Integration tests (QEMU, wireguard-go, Rosenpass, OpenSSL) |
 | `docker/` | The pinned development environment |
 | `docs/` | Roadmap, scope research, plans, reviews and deviation logs |
@@ -129,6 +145,11 @@ it must hold all of the following:
 ## Documentation
 
 - [docs/PLAN.md](docs/PLAN.md): milestones and status
+- [docs/operations/peer-policy-runbook.md](docs/operations/peer-policy-runbook.md):
+  key custody, provisioning, issuing and rolling out a policy change,
+  recovery
+- [docs/operations/audit-map.md](docs/operations/audit-map.md): who, from
+  where, when and under which policy, mapped to the mechanism and the test
 - [docs/research/2026-10-scope.md](docs/research/2026-10-scope.md): why this scope
 - [The architecture plan](docs/archive/review/secureos-pq-vpn-architecture-plan.md):
   security laws, threat model, residual risks
