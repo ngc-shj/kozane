@@ -668,7 +668,10 @@ Left open:
   soon as the boot is ready, so it can land while the checkpoint is
   pending, and the case logs whether its record came before or after the
   checkpoint line. "Before" shows only that much, not that the signature
-  was in flight. The case passes either way with the 8 s drain. `FAULT_DRAIN_NS` is 8 s, more than five
+  was in flight. The case passes either way with the 8 s drain. The final
+  `make check` ran on z1mn. There the ready checkpoint came up to 2.428 s
+  after the boot was ready, and the record 0.416 s after the fault. 8 s
+  was then under five times the longer, so `FAULT_DRAIN_NS` is 15 s. `FAULT_DRAIN_NS` is 8 s, more than five
   times the longer of the two. A fault now resets the node at least 8 s
   later; under TCG that is the price of never losing its line.
 
@@ -789,8 +792,14 @@ changes go beyond the plan's text:
   84 GB of its 121 GB was in use, mostly unified-memory allocations of
   local model servers outside this project. The same tree's full
   `make test` on z1mn passed (134 cases, rc 0).
-- Both stay recorded flakes. If either recurs in the final `make check`
-  or the self-test, it gets investigated rather than retried.
+- **`https residue`.** Once, in the second final `make check` on z1mn:
+  connection B was refused with `TlsClosed(PerSource)`, because the
+  per-source cap still counted an earlier connection, so its `s_client`
+  printed no verify line. Two runs of the boot alone passed (7 of 7
+  each). The diff since the passing run changed only `FAULT_DRAIN_NS`,
+  which this boot never reaches.
+- All three stay recorded flakes. If one recurs in the self-test, it gets
+  investigated rather than retried.
 
 ### Note — check-pins P31 is a tripwire (round 10)
 
