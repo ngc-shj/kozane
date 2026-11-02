@@ -316,7 +316,7 @@ slot comes from the ledger (`entries/`) and is checked with
   window limits replay but does not prevent it. What catches a cut-back
   ledger, at the next `approve`, is a head recording a ledger head above
   the cut (always refused), or an approval of a dropped version (refused
-  unless the approver hands it back). Superseding a genesis approval records the
+  unless the approver hands it back or approves that same draft again). Superseding a genesis approval records the
   copy's v0 in the head. Copy the head file aside before such a
   supersede: if the copy turns out to be of the wrong ledger, put the
   saved file back and run approve-restore again against the right copy,

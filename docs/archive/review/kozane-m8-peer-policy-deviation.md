@@ -532,7 +532,7 @@ Run in a scratch worktree (`build/probes/p3/tree`, since removed).
   itself, so the event code C10 listed is not needed.
 - **check-pins P31**, added on review: `audit`'s single `.pp_call(` is in
   `fn sign`, `CH_AUDITKEY` is named only there, and `ready_input` decodes
-  the notification. That is T47's PD-glue pin.
+  the notification. That is T47's PD-glue pin, as a tripwire (D-24).
 
 ## Slice 6
 
@@ -726,8 +726,9 @@ changes go beyond the plan's text:
     - at the next `approve`, a head recording a ledger head above the
       cut refuses the cut-back ledger outright. A head recording an
       approval of a dropped version refuses it unless the approver hands
-      that approval back. A head recording neither sees nothing (rounds 8
-      and 9, F8-2 and F9-1);
+      that approval back, or approves that same draft again (which
+      re-proposes the dropped version unchanged). A head recording neither
+      sees nothing (rounds 8 to 10, F8-2, F9-1, F10-2);
     - every node refuses a version below its counter.
   - The bundle keys an approver passes to `approve-restore` are their own
     trusted copy.
@@ -790,3 +791,23 @@ changes go beyond the plan's text:
   `make test` on z1mn passed (134 cases, rc 0).
 - Both stay recorded flakes. If either recurs in the final `make check`
   or the self-test, it gets investigated rather than retried.
+
+### Note — check-pins P31 is a tripwire (round 10)
+
+Ten rounds narrowed P31 one spelling at a time: `.pp_call(`, `mod`,
+`include`, `#[path]`, `${`, `#![feature]`, endpoint/sel4/literal
+channels, and finally the `notified()` gate. Plain Rust still passes it:
+- a channel number computed (`ch::CH_TLS + 1`) or passed through a
+  helper;
+- a loop around the one `pp_call` in `sign`;
+- `core::arch::asm!`, `transmute`, `#[link_name]`.
+
+Token rules cannot close that class. P31 catches drift in a reviewed
+change; it is not the boundary. The controls that decide are:
+- `auditkey`'s fixed tuple and its seq rule (`auditkey-core`'s Kani), so
+  an extra call gets no signature the one call site could not;
+- `audit-core`'s Kani `no_call_without_the_ready_input`;
+- the kernel capability: only `audit` holds a PPC channel to `auditkey`.
+
+No further P31 rules are planned. The audit map's "(P31)" means this
+tripwire.

@@ -1,6 +1,6 @@
 # Code Review: kozane-m8-peer-policy
 Date: 2026-11-01
-Review round: 9
+Review round: 10
 
 ## Changes from Previous Round
 Initial review, at 751e95b, after Phase 2 Step 2-5's self-check (D-23).
@@ -782,3 +782,67 @@ confirmed resolved, except T-F3 (the Kani counts, still open) and T-F6
 - **S9-2:** the runbook anchors the check on the `body_sha256` of the
   genesis approval the approver handed back. The ledger's v0 must equal
   it and the head's v0 must differ from it; otherwise, escalate.
+
+## Round 10 (c673cb7..d321a2b) — the last round the loop allows
+
+### Findings
+All of them are Minor.
+- **Functionality:**
+  - F10-1: P31's literal-channel arm is narrower than its claim (a
+    `const`, `source(..)`, arithmetic, `index() == 11` or `asm!` pass).
+  - F10-2: "refused unless handed back" omitted the same-draft
+    re-approval.
+- **Security:** S10-1: P31 is a token tripwire presented as the PD-glue
+  pin. An unconditional `notified()`, a numeric channel, a loop in `sign`
+  or `asm!` pass it. The reviewer advised declaring it a tripwire and at
+  most pinning `notified()`.
+- **Testing:**
+  - T10-1: the `sel4` alternative had no fixture.
+  - T10-2: the literal-channel whitespace tolerance was unproven.
+  - T10-3: the "exactly one `pp_call`" condition was never the only thing
+    that failed a fixture.
+  - T10-A1 (Adjacent): the P31 header text was stale.
+
+### Round 10 Resolution Status
+- **S10-1 / F10-1 — P31 declared a tripwire; no further token rules:**
+  - The P31 description, the code comment, D-24 (new note "check-pins P31
+    is a tripwire"), the slice-5 deviation line and the audit map name
+    what P31 is and what it is not.
+  - They also name the deciding controls: auditkey-core's fixed tuple
+    and seq rule (Kani), audit-core's Kani
+    `no_call_without_the_ready_input`, and the kernel capability.
+  - Anti-Deferral check:
+    - Worst case: audit asks auditkey for an extra signature. That buys
+      nothing beyond the one call site, because auditkey-core's seq rule
+      bounds it. Or audit blocks on an auditkey still in init, which is
+      an availability cost.
+    - Likelihood: needs a reviewed in-repo change.
+    - Cost to fix: unbounded. Token rules cannot close Rust's computed
+      values, `asm!` and transmute; ten rounds show it.
+  - One cheap rule, as the reviewer suggested: the checkpoint machine's
+    `notified()` must sit right under the `ready_input` test. Fixture: an
+    ungated `notified()`.
+- **F10-2:** the runbook and D-24 add "or approves that same draft
+  again".
+- **T10-1:** fixture: a `sel4` path in audit.
+- **T10-2:** the literal-channel fixture is written `Channel :: new ( 11 )`.
+- **T10-3:** fixture: a second `pp_call` naming `CH_AUDITKEY`.
+- **Proved by mutation** with a direct `check_audit_call` run on the real
+  audit source plus each fixture:
+  - the tight literal mutant silences only the spaced literal fixture;
+  - removing `sel4` silences only the sel4 fixture;
+  - removing the count silences only the second-call fixture;
+  - removing the `notified()` rule silences only the ungated fixture;
+  - the clean source stays silent.
+- **T10-A1:** the header is rewritten (see S10-1).
+
+## Review Loop Limit Reached (10 rounds)
+Every finding from all ten rounds is resolved or recorded as Accepted
+with an Anti-Deferral entry. No finding is open:
+- the Accepted findings: T-F9, F4-2, S5-4 (part), T6-4, S7-1 and S10-1;
+- the D-24 residuals: the operator chooses which heads reach `restore`;
+  `--supersede` verifies only under the current roster; restore
+  approvals are fresh only against the restore host's clock.
+
+Round 10's fixes are proved by the mutations above and the gates below.
+They were not reviewed by an eleventh round.

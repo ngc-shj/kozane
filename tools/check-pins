@@ -204,11 +204,17 @@ the only guard for pqkey-core's wrappers. L8's adjudicating control is
      tools/release/src outside its tests.rs. A tripwire over source text:
      the adjudicating control is verify's refusal (test_release.py)
   P31 audit's one call to auditkey (M8 plan C10, F32, T47): in
-     crates/pds/audit/src/main.rs, outside comments, `.pp_call(` occurs
-     once, inside `fn sign`; `CH_AUDITKEY` occurs once, at that call, so the
-     notification is never decoded except by `audit_core::ready_input`,
-     which must be called. A tripwire: audit-core's unit tests and Kani
-     harnesses are the control
+     crates/pds/audit/src/main.rs, outside comments and literals, one
+     `pp_call` token, inside `fn sign`; `CH_AUDITKEY` only at that call;
+     `sign` used once, in the `Action::Call(words)` arm; the checkpoint
+     machine's `notified()` only right under the `ready_input` test; and
+     none of `mod`, `include`, a `path` attribute, `${`, an inner
+     `feature` attribute, `endpoint`, `sel4` or a literal channel number.
+     A token tripwire against drift, not a boundary: a computed channel,
+     a loop in `sign`, `asm!` or a transmute pass it (D-24). The controls
+     are auditkey-core's fixed tuple and seq rule (Kani), audit-core's
+     Kani `no_call_without_the_ready_input`, and the kernel capability
+     (only audit holds a PPC to auditkey)
   P32 the audit map cites only tests that exist (M8 plan C12): while
      crates/pds/policy exists, docs/operations/audit-map.md exists, and every
      backticked `<kind>:<name>` in it names something in the tree (`it:` an
@@ -1287,8 +1293,9 @@ def check_audit_call(root: pathlib.Path, out: list):
     if others:
         out.append(f"P31 {AUDIT_MAIN}: audit has other source files {others}; its one call site is only checked in main.rs (M8 plan C10)")
     # Every `pp_call` token over the whole text (spacing, `Channel::pp_call`
-    # and a split call are one too), and no other way to make or read a
-    # call: no endpoint, no sel4, no channel number written as a literal.
+    # and a split call are one too), and the plain spellings of another
+    # way in: an endpoint, sel4, a channel number written as a literal. A
+    # computed number or `asm!` passes (a tripwire, D-24).
     calls = [stripped.count("\n", 0, m.start()) + 1 for m in re.finditer(r"\bpp_call\b", stripped)]
     for m in re.finditer(r"\bendpoint\b|\bsel4\b|\bChannel\s*::\s*new\s*\(\s*\d", stripped):
         n = stripped.count("\n", 0, m.start()) + 1
@@ -1309,6 +1316,13 @@ def check_audit_call(root: pathlib.Path, out: list):
     if len(sign_calls) != 1 or len(arm) != 1 or not (arm[0] < sign_calls[0] <= arm[0] + 3):
         out.append(f"P31 {AUDIT_MAIN}: want exactly one use of sign, a call in the Action::Call(words) arm; "
                    f"found calls {sign_calls}, arms {arm} (M8 plan C10)")
+    # F32's ready gate in the glue: the one argument-less `notified()` (the
+    # checkpoint machine's) sits on the line after the `ready_input` test.
+    gate = [n for n, l in enumerate(code, 1) if re.search(r"\bif\s+audit_core::ready_input\(", l)]
+    marks = [stripped.count("\n", 0, m.start()) + 1 for m in re.finditer(r"\bnotified\s*\(\s*\)", stripped)]
+    if len(gate) != 1 or marks != [gate[0] + 1]:
+        out.append(f"P31 {AUDIT_MAIN}: want the checkpoint machine's notified() only right under the ready_input test; "
+                   f"found tests {gate}, calls {marks} (M8 plan C10, F32)")
     if not any("audit_core::ready_input(" in l for l in code):
         out.append(f"P31 {AUDIT_MAIN}: the notification is not decoded by audit_core::ready_input (M8 plan C10)")
 
