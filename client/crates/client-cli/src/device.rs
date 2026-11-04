@@ -161,15 +161,14 @@ impl<T: Transport> Device<T> {
         step("install psk", self.genl.call(&mut m)).map(drop)
     }
 
-    /// Removes the peer and re-adds it with a fresh random PSK; the draw
-    /// comes first, so a failed one changes nothing.
+    /// Replaces the peer with one holding a fresh random PSK, in one
+    /// request; the draw comes first, so a failed one changes nothing.
     pub fn scrub(&mut self) -> Result<(), String> {
         self.draw()?;
-        step("scrub: remove peer", self.genl.call(&mut wg::remove_peer(self.family, self.index, &self.gw_wg_pub)))?;
         let peer = wg::Peer { public: &self.gw_wg_pub, endpoint: &self.endpoint, allowed_ips: &self.allowed_ips };
-        let mut m = wg::add_peer(self.family, self.index, &peer, self.psk.expose());
+        let mut m = wg::replace_peer(self.family, self.index, &peer, self.psk.expose());
         self.psk.wipe();
-        step("scrub: re-add peer", self.genl.call(&mut m)).map(drop)
+        step("scrub: replace peer", self.genl.call(&mut m)).map(drop)
     }
 
     /// Deletes the interface.

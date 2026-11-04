@@ -96,16 +96,31 @@ fn key(b: u8) -> [u8; 32] {
 }
 
 #[test]
-fn remove_peer_layout() {
-    let mut want = hdr(80, 30, 0x5); // the wireguard family id, 30 here
+fn replace_peer_layout() {
+    let ep = "192.0.2.1:51820".parse().unwrap();
+    let ips = [Cidr { addr: "10.2.0.0".parse().unwrap(), len: 24 }];
+    let peer = wg::Peer { public: &key(0xaa), endpoint: &ep, allowed_ips: &ips };
+    let mut want = hdr(208, 30, 0x5); // the wireguard family id, 30 here
     want.extend_from_slice(&[1, 1, 0, 0]); // WG_CMD_SET_DEVICE, version 1
     want.extend_from_slice(&[8, 0, 1, 0, 5, 0, 0, 0]); // WGDEVICE_A_IFINDEX
-    want.extend_from_slice(&[52, 0, 8, 0x80]); // WGDEVICE_A_PEERS | NESTED
-    want.extend_from_slice(&[48, 0, 0, 0x80]); // peer 0 | NESTED
+    want.extend_from_slice(&[180, 0, 8, 0x80]); // WGDEVICE_A_PEERS | NESTED
+    // Entry 1: the peer removed, its keypairs with it.
+    want.extend_from_slice(&[48, 0, 0, 0x80]); // peer | NESTED
     want.extend_from_slice(&[36, 0, 1, 0]); // WGPEER_A_PUBLIC_KEY
     want.extend_from_slice(&key(0xaa));
     want.extend_from_slice(&[8, 0, 3, 0, 1, 0, 0, 0]); // WGPEER_A_FLAGS: REMOVE_ME
-    assert_eq!(bytes(wg::remove_peer(30, 5, &key(0xaa))), want);
+    // Entry 2, in the same request: the same key created again.
+    want.extend_from_slice(&[128, 0, 0, 0x80]);
+    want.extend_from_slice(&[36, 0, 1, 0]);
+    want.extend_from_slice(&key(0xaa));
+    want.extend_from_slice(&[36, 0, 2, 0]); // WGPEER_A_PRESHARED_KEY
+    want.extend_from_slice(&key(0x55));
+    want.extend_from_slice(&[20, 0, 4, 0, 2, 0, 0xca, 0x6c, 192, 0, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+    want.extend_from_slice(&[32, 0, 9, 0x80, 28, 0, 0, 0x80]);
+    want.extend_from_slice(&[6, 0, 1, 0, 2, 0, 0, 0]);
+    want.extend_from_slice(&[8, 0, 2, 0, 10, 2, 0, 0]);
+    want.extend_from_slice(&[5, 0, 3, 0, 24, 0, 0, 0]);
+    assert_eq!(bytes(wg::replace_peer(30, 5, &peer, &key(0x55))), want);
 }
 
 #[test]
@@ -164,8 +179,7 @@ fn no_request_carries_device_flags() {
     for m in [
         wg::configure(30, 5, &key(2), 1, &peer, &key(3)),
         wg::set_psk(30, 5, &key(1), &key(3)),
-        wg::remove_peer(30, 5, &key(1)),
-        wg::add_peer(30, 5, &peer, &key(3)),
+        wg::replace_peer(30, 5, &peer, &key(3)),
     ] {
         let b = bytes(m);
         assert!(attrs(&b[20..]).all(|(t, _)| t != 5));

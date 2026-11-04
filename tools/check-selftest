@@ -740,7 +740,10 @@ CASES = {
                                                                           "            Action::Reset => reset::system_reset(),\n"
                                                                           "        }\n",
                                                                           "        let _ = (decide, Action::Reset, reset::system_reset);\n"
-                                                                          "        Ok(Some(msg_info))\n"),
+                                                                          # Label 0 and no words: seL4 restarts a
+                                                                          # UserException's thread (the EL1 board's
+                                                                          # panic, D-25) only on such a reply.
+                                                                          "        Ok(Some(MessageInfo::new(0, 0)))\n"),
                           "a second supervisor record: the faulting child resumed"),
     # M7 plan C11: a REFUSE case declaring another SHUTDOWN reason, a QEMU
     # gone without one, and the fault-inject image under a serving case.
@@ -1968,13 +1971,10 @@ CASES = {
         "            eprintln!(\"kzc-psk: connection closed; peer scrubbed\");\n"),
                           "kzc: psk survived exit"),
     # I10.3 a: the scrub's netlink acks ignored; b: a failed draw ignored.
-    "kzc-psk-ack": (["client"], lambda t: (
-        edit(t, "client/crates/client-cli/src/device.rs",
-             '        step("scrub: remove peer", self.genl.call(&mut wg::remove_peer(self.family, self.index, &self.gw_wg_pub)))?;\n',
-             '        let _ = step("scrub: remove peer", self.genl.call(&mut wg::remove_peer(self.family, self.index, &self.gw_wg_pub)));\n'),
-        edit(t, "client/crates/client-cli/src/device.rs",
-             '        step("scrub: re-add peer", self.genl.call(&mut m)).map(drop)\n',
-             '        let _ = step("scrub: re-add peer", self.genl.call(&mut m));\n        Ok(())\n')),
+    "kzc-psk-ack": (["client"], lambda t: edit(
+        t, "client/crates/client-cli/src/device.rs",
+        '        step("scrub: replace peer", self.genl.call(&mut m)).map(drop)\n',
+        '        let _ = step("scrub: replace peer", self.genl.call(&mut m));\n        Ok(())\n'),
                     "kzc-psk: scrub unconfirmed"),
     "kzc-psk-zero": (["client"], lambda t: edit(
         t, "client/crates/client-cli/src/device.rs",
@@ -1995,9 +1995,8 @@ CASES = {
     # D6: a scrub that only replaces the PSK (live keypairs survive it).
     "kzc-psk-only-scrub": (["client"], lambda t: edit(
         t, "client/crates/client-cli/src/device.rs",
-        '        step("scrub: remove peer", self.genl.call(&mut wg::remove_peer(self.family, self.index, &self.gw_wg_pub)))?;\n'
         "        let peer = wg::Peer { public: &self.gw_wg_pub, endpoint: &self.endpoint, allowed_ips: &self.allowed_ips };\n"
-        "        let mut m = wg::add_peer(self.family, self.index, &peer, self.psk.expose());\n",
+        "        let mut m = wg::replace_peer(self.family, self.index, &peer, self.psk.expose());\n",
         "        let mut m = wg::set_psk(self.family, self.index, &self.gw_wg_pub, self.psk.expose());\n"),
                            "kzc: session survived scrub"),
     # D6 lifecycle: no delete on drop; a marked leftover refused.

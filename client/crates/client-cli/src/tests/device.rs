@@ -95,15 +95,18 @@ fn device(genl: Vec<Result<Vec<Vec<u8>>, NlError>>, fill: crate::device::Fill) -
 }
 
 #[test]
-fn scrub_removes_then_re_adds_the_peer_with_a_random_psk() {
-    let (mut dev, _, glog) = device(acks(2), ok_fill);
+fn scrub_replaces_the_peer_in_one_request_with_a_random_psk() {
+    let (mut dev, _, glog) = device(acks(1), ok_fill);
     dev.scrub().unwrap();
     let sent = glog.borrow();
-    assert_eq!(sent.len(), 2, "kzc: session survived scrub");
-    let remove = &peers(&sent[0])[0];
+    assert_eq!(sent.len(), 1, "kzc-psk: scrub split across requests");
+    let entries = peers(&sent[0]);
+    assert_eq!(entries.len(), 2, "kzc: session survived scrub");
+    let remove = &entries[0];
     assert_eq!(get(remove, wg::WGPEER_A_PUBLIC_KEY), Some(&[0xaa; 32][..]));
     assert_eq!(get(remove, wg::WGPEER_A_FLAGS), Some(&wg::WGPEER_F_REMOVE_ME.to_ne_bytes()[..]), "kzc: session survived scrub");
-    let add = &peers(&sent[1])[0];
+    let add = &entries[1];
+    assert_eq!(get(add, wg::WGPEER_A_PUBLIC_KEY), Some(&[0xaa; 32][..]));
     assert_eq!(get(add, wg::WGPEER_A_FLAGS), None);
     assert_eq!(get(add, wg::WGPEER_A_PRESHARED_KEY), Some(&[0x5c; 32][..]));
     assert_eq!(get(add, wg::WGPEER_A_ENDPOINT), Some(&wg::sockaddr(&"192.0.2.1:51820".parse().unwrap())[..]));
@@ -114,24 +117,17 @@ fn scrub_removes_then_re_adds_the_peer_with_a_random_psk() {
 fn a_failed_draw_is_fatal_and_sends_nothing() {
     for fill in [failing_fill as crate::device::Fill, zero_fill] {
         // Acks for a scrub that wrongly goes on, so the assertion judges it.
-        let (mut dev, _, glog) = device(acks(2), fill);
+        let (mut dev, _, glog) = device(acks(1), fill);
         assert!(dev.scrub().is_err(), "kzc-psk: zero psk installed");
         assert!(glog.borrow().is_empty(), "kzc-psk: zero psk installed");
     }
 }
 
 #[test]
-fn a_refused_remove_is_fatal() {
-    let (mut dev, _, glog) = device(vec![Err(NlError::Errno(libc::ENODEV)), Ok(Vec::new())], ok_fill);
+fn a_refused_replace_is_fatal() {
+    let (mut dev, _, _) = device(vec![Err(NlError::Errno(libc::ENODEV))], ok_fill);
     let e = dev.scrub().expect_err("kzc-psk: scrub unconfirmed");
-    assert!(e.contains("remove peer"), "{e}");
-    assert_eq!(glog.borrow().len(), 1, "no re-add after a refused remove");
-}
-
-#[test]
-fn a_refused_re_add_is_fatal() {
-    let (mut dev, _, _) = device(vec![Ok(Vec::new()), Err(NlError::Errno(libc::EINVAL))], ok_fill);
-    dev.scrub().expect_err("kzc-psk: scrub unconfirmed");
+    assert!(e.contains("replace peer"), "{e}");
 }
 
 #[test]

@@ -1044,3 +1044,58 @@ test that fails on the old code, red-proved on a scratch copy.
   space. It is a unified-diff blank context line, and removing it changes
   the patch and the SDK build input. Three files lost a blank line at
   their end.
+
+### D-25 — split self-test at e417fce: a racy scrub and a stale mutation
+
+The split self-test at e417fce failed three cases. None of them was a
+fault in the gateway.
+
+- **`kzc-cookie` and `kzc-oracle-count`: kzc-psk's scrub left a gap.**
+  - The failure: both runs stopped in the cookie prelude with
+    `kzc-psk: kz0 has other than one peer: ''`.
+  - The cause: `Device::scrub` removed the peer in one netlink request and
+    re-added it in a second.
+    - Between the two, the interface had no peer. The harness's
+      `wg show` landed in that window under the partition's parallel load.
+    - A failed re-add would also have left the interface without a peer
+      until a restart. That fails closed, but the state is not one the
+      design names.
+  - The fix: `wg::replace_peer` sends one `WG_CMD_SET_DEVICE` with two
+    peer entries.
+    - The first is the key with `WGPEER_F_REMOVE_ME`; the removal takes
+      every live keypair with it (S1.11).
+    - The second is the same key with the fresh PSK, endpoint and allowed
+      IPs, so the peer is created again.
+    - The kernel applies a request's peers in order under the device's
+      update lock, and `wg show` reads under the same lock. So no reader
+      sees the interface without its peer, and the scrub succeeds or fails
+      as a whole.
+  - The tests:
+    - Layout: `replace_peer_layout`.
+    - Device: one request with the remove entry, then the add entry.
+      A refused replace is fatal (UNIT-CLIENT 88).
+    - The real-kernel netns test still sees the session gone
+      (`latest-handshake` 0) and the PSK replaced after a scrub.
+    - The selftest mutations `kzc-psk-ack` and `kzc-psk-only-scrub` were
+      re-aimed at the new lines, and both still go red with their needles.
+  - The docs: `docs/operations/client.md` says the peer is replaced in
+    one kernel request.
+- **`supervisor-resume`: the mutation no longer resumed anything on the
+  EL1 board.**
+  - The failure: the mutated supervisor answered the fault with the
+    `MessageInfo` it received. One record printed, and then nothing more
+    within the boot timeout.
+  - The cause is in the kernel:
+    - seL4's `handleFaultReply` restarts a thread after a UserException
+      only when the reply's label is 0. A VMFault is restarted whatever
+      the label.
+    - Under M8's hyp-mode kernel, the panic that the fault-inject frame
+      causes arrived as label 8, which restarts on any reply.
+    - On `kozane_virt_aarch64_el1` it arrives as UserException (label 3),
+      so the label-3 reply left the child suspended.
+    - The supervisor itself is unchanged: it never answers a fault. Only
+      the mutation, which is meant to prove a resumed child would be
+      caught, had stopped resuming.
+  - The fix: the mutation replies `MessageInfo::new(0, 0)`. That is label
+    0 and no message words, so the registers are unchanged and the thread
+    restarts at the faulting instruction on either kernel.
