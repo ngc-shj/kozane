@@ -85,9 +85,13 @@ pub struct VmConf {
 
 pub const CONF_KEYS: [&str; 4] = ["inside_bridge", "outside_bridge", "qemu", "swtpm"];
 
-/// A Linux interface name: 1 to 15 bytes of `[A-Za-z0-9_.-]`.
+/// A Linux interface name: 1 to 15 bytes of `[A-Za-z0-9_.-]`, other than
+/// `.` and `..` (the kernel's `dev_valid_name`; the client's `interface`).
 pub fn is_ifname(v: &str) -> bool {
-    (1..16).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+    (1..16).contains(&v.len())
+        && v != "."
+        && v != ".."
+        && v.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
 }
 
 impl VmConf {

@@ -2,12 +2,15 @@
 """An argv-recording QEMU stand-in (M9 plan C4, I4.1): records its argv and
 its fds into qemu.json next to itself, makes one round trip with the swtpm
 stand-in over the TPM chardev's fd, prints a console line and an `audit`
-heartbeat line on its stdout (the serial pipe), and exits 0."""
+heartbeat line on its stdout (the serial pipe), and exits 0. With a
+`console-first` file beside it, it closes the console 0.5 s before it
+exits, with the status that file holds."""
 
 import json
 import os
 import re
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(sys.argv[0]))
 sys.path.insert(0, HERE)
@@ -23,3 +26,8 @@ with open(os.path.join(HERE, "qemu.json"), "w") as f:
     json.dump(rec, f)
 sys.stdout.write("U-Boot stand-in\r\naudit: src=timer Heartbeat ticks=1 lost=0 seq=1\r\n")
 sys.stdout.flush()
+first = os.path.join(HERE, "console-first")
+if os.path.exists(first):
+    os.close(1)
+    time.sleep(0.5)
+    sys.exit(int(open(first).read()))

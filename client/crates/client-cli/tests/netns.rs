@@ -564,4 +564,3 @@ fn inner() {
 
     eprintln!("netns: all cases passed");
 }
-

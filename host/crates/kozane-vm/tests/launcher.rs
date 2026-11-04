@@ -122,6 +122,23 @@ fn i4_1_the_children_get_vm_py_argv_and_exactly_their_checked_fds() {
 }
 
 #[test]
+fn a_console_closed_before_qemu_exits_still_ends_cleanly() {
+    let root = node("console-first");
+    write(&root.join("stubs/console-first"), b"0", 0o644);
+    let out = boot(&root);
+    assert!(out.status.success(), "vm-launcher: the reader's EOF before QEMU's exit failed the boot\n{}", text(&out));
+}
+
+#[test]
+fn a_qemu_failing_after_its_console_closed_fails_the_boot() {
+    let root = node("console-first-fail");
+    write(&root.join("stubs/console-first"), b"3", 0o644);
+    let out = boot(&root);
+    assert!(!out.status.success(), "{}", text(&out));
+    assert!(text(&out).contains("qemu exited (exit status: 3)"), "{}", text(&out));
+}
+
+#[test]
 fn i4_2_a_firmware_other_than_the_pinned_one_is_refused() {
     let root = node("deny-hash");
     write(&root.join("etc/kozane/firmware.pin"), pin_text(&sha256_hex(b"another u-boot"), 1).as_bytes(), 0o600);

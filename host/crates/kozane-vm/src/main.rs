@@ -56,6 +56,8 @@ pub const RELEASE_KEYS: &str = "/etc/kozane/release-keys";
 const NODE: &str = "/var/lib/kozane/node";
 const LOG_DIR: &str = "/var/log/kozane";
 const LOG: &str = "/var/log/kozane/console.log";
+/// The serial reader child's name.
+const READER: &str = "serial reader";
 
 const OUTSIDE_TAP: &str = "kozane-out";
 const INSIDE_TAP: &str = "kozane-in";
@@ -247,7 +249,7 @@ fn boot(res: &Resolver) -> Result<bool, String> {
             memlock: false,
             first_free,
         })?;
-        children.push(Running::start("serial reader", reader)?);
+        children.push(Running::start(READER, reader)?);
 
         let q = &args.qemu_fds;
         let mut fds = vec![
@@ -334,15 +336,50 @@ fn supervise(mut children: Vec<Running>, mut beat: File, signals: &OwnedFd) -> b
     };
     let clean = match first {
         Some(mut c) => {
-            let status = c.child.wait();
-            eprintln!("kozane-vm: {} exited ({})", c.name, status.as_ref().map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()));
-            clean_exit(c.name, stopping, status.is_ok_and(|s| s.success()))
+            let success = reap(&mut c);
+            if c.name == READER && success && !stopping {
+                // The reader ends at EOF, and QEMU closing the console on
+                // its way out is what causes that, so the reader can be
+                // seen first: QEMU's own exit decides, if it follows.
+                qemu_after_reader(&mut children)
+            } else {
+                clean_exit(c.name, stopping, success)
+            }
         }
         None => false,
     };
     stop_all(children);
     eprintln!("kozane-vm: {beats} heartbeats");
     clean
+}
+
+/// How long QEMU may take to exit after its console closed.
+const QEMU_AFTER_READER_MS: libc::c_int = 5000;
+
+/// Waits for an exited child; whether it succeeded.
+fn reap(c: &mut Running) -> bool {
+    let status = c.child.wait();
+    eprintln!("kozane-vm: {} exited ({})", c.name, status.as_ref().map(|s| s.to_string()).unwrap_or_else(|e| e.to_string()));
+    status.is_ok_and(|s| s.success())
+}
+
+/// After the reader's clean EOF: whether QEMU exits, successfully, within
+/// `QEMU_AFTER_READER_MS`. A QEMU still running is stopped by `stop_all`.
+fn qemu_after_reader(children: &mut Vec<Running>) -> bool {
+    let Some(i) = children.iter().position(|c| c.name == "qemu") else {
+        return false;
+    };
+    let Some(q) = children.get(i) else {
+        return false;
+    };
+    let mut poll = libc::pollfd { fd: q.pidfd.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+    // SAFETY: one valid pollfd.
+    if unsafe { libc::poll(&mut poll, 1, QEMU_AFTER_READER_MS) } != 1 {
+        eprintln!("kozane-vm: the console closed and QEMU did not exit");
+        return false;
+    }
+    let mut q = children.remove(i);
+    clean_exit(q.name, false, reap(&mut q))
 }
 
 /// Whether the first child to exit ends the boot cleanly. After a requested

@@ -202,5 +202,21 @@ per `audit` heartbeat line, and the journal shows
 liveness root sees, and root never parses guest output. QEMU's own errors
 go to the journal.
 
+**The console log is capped at 1 GiB**, since the guest decides how much it
+prints:
+- At the cap, the reader writes `kozane-vm: console log full; dropping
+  console output until it is rotated` and drops console bytes. It keeps
+  counting heartbeats, so the VM keeps running.
+- When the file is smaller again, the reader first writes
+  `kozane-vm: <n> console bytes dropped while the log was full`, then
+  resumes.
+- `audit`'s seq and chain numbers in the log show which records the gap
+  took. `tools/audit-verify` reports the gap; it does not pass over it.
+- Rotate with `copytruncate` (logrotate), since the reader keeps its file
+  open. A rename-based rotation leaves it writing to the old file.
+- Keep `/var/log/kozane` on a filesystem, or under a quota, that a full
+  log cannot exhaust for the rest of the host. A failed write stops the
+  reader, and with it the VM.
+
 Refusals print `kozane-vm: …` on stderr (the journal) and exit non-zero;
 the message names the file and the check that failed.

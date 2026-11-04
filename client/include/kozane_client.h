@@ -145,7 +145,7 @@ int kz_client_new(const struct kz_config *config,
 // # Safety
 //
 // `h` is a live handle; a non-null `buf` is valid for reads of `len`
-// bytes.
+// bytes and does not point into the handle (`KZ_ERR_INVALID` if it does).
 int kz_client_on_datagram(struct kz_client *h, uint64_t now, const uint8_t *buf, size_t len);
 
 // Runs the client's timers at `now` (ns on a clock that counts suspend,
@@ -161,7 +161,8 @@ int kz_client_on_timer(struct kz_client *h, uint64_t now);
 //
 // # Safety
 //
-// `h` is a live handle and `out` is valid for a write.
+// `h` is a live handle and `out` is valid for a write and outside the
+// handle (`KZ_ERR_INVALID` if not).
 int kz_client_next_deadline(struct kz_client *h, uint64_t *out);
 
 // Takes the oldest queued action: its kind into `*kind`, its payload
@@ -174,7 +175,8 @@ int kz_client_next_deadline(struct kz_client *h, uint64_t *out);
 //
 // `h` is a live handle, `kind` and `len` are valid for writes, and a
 // non-null `buf` is valid for writes of `cap` bytes (`buf` may be null
-// only with `cap` 0).
+// only with `cap` 0). `kind`, `len`, the `cap` bytes at `buf` and the
+// handle do not overlap (`KZ_ERR_INVALID` if any two do).
 int kz_client_take_action(struct kz_client *h, uint8_t *buf, size_t cap, int *kind, size_t *len);
 
 // Frees the handle, wiping the client's keys, its handshake secrets and

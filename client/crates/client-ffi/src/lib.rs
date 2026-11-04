@@ -210,6 +210,19 @@ unsafe fn bytes<'a>(ptr: *const u8, len: usize) -> Option<&'a [u8]> {
     (!ptr.is_null()).then(|| unsafe { core::slice::from_raw_parts(ptr, len) })
 }
 
+/// Whether `alen` bytes at `a` and `blen` bytes at `b` share a byte. The
+/// C contract does not keep the caller's pointers apart, and Rust's does:
+/// an overlap is refused instead of becoming two aliasing writes.
+fn overlaps(a: *const u8, alen: usize, b: *const u8, blen: usize) -> bool {
+    let (a, b) = (a.addr(), b.addr());
+    alen != 0 && blen != 0 && a < b.saturating_add(blen) && b < a.saturating_add(alen)
+}
+
+/// Whether `len` bytes at `p` reach into the handle's own memory.
+fn in_handle(h: *const kz_client, p: *const u8, len: usize) -> bool {
+    overlaps(h.cast(), size_of::<kz_client>(), p, len)
+}
+
 fn socket_addr(a: &kz_sockaddr) -> Option<SocketAddr> {
     let ip = match a.family {
         KZ_FAMILY_IPV4 => {
@@ -241,10 +254,12 @@ fn socket_addr(a: &kz_sockaddr) -> Option<SocketAddr> {
 pub unsafe extern "C" fn kz_client_new(config: *const kz_config, keys: *const kz_keys, out: *mut *mut kz_client) -> c_int {
     catch_unwind(AssertUnwindSafe(|| {
         // SAFETY: the caller's contract.
-        let (Some(config), Some(keys), Some(out)) = (unsafe { config.as_ref() }, unsafe { keys.as_ref() }, unsafe { out.as_mut() })
-        else {
+        let (Some(config), Some(keys)) = (unsafe { config.as_ref() }, unsafe { keys.as_ref() }) else {
             return KZ_ERR_INVALID;
         };
+        if out.is_null() {
+            return KZ_ERR_INVALID;
+        }
         // SAFETY: the caller's contract.
         let (Some(gw_rp_pub), Some(rp_pub), Some(rp_sk)) = (unsafe {
             (
@@ -260,7 +275,9 @@ pub unsafe extern "C" fn kz_client_new(config: *const kz_config, keys: *const kz
         };
         match new(rp_endpoint, gw_rp_pub, config.gw_wg_pub, rp_pub, rp_sk) {
             Ok(handle) => {
-                *out = Box::into_raw(handle);
+                // SAFETY: `out` is valid for a write (the caller's
+                // contract); the input borrows are no longer used.
+                unsafe { out.write(Box::into_raw(handle)) };
                 KZ_OK
             }
             Err(code) => code,
@@ -293,9 +310,12 @@ fn new(
 /// # Safety
 ///
 /// `h` is a live handle; a non-null `buf` is valid for reads of `len`
-/// bytes.
+/// bytes and does not point into the handle (`KZ_ERR_INVALID` if it does).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kz_client_on_datagram(h: *mut kz_client, now: u64, buf: *const u8, len: usize) -> c_int {
+    if in_handle(h, buf, len) {
+        return KZ_ERR_INVALID;
+    }
     // SAFETY: the caller's contract.
     let Some(msg) = (unsafe { bytes(buf, len) }) else {
         return KZ_ERR_INVALID;
@@ -330,18 +350,18 @@ pub unsafe extern "C" fn kz_client_on_timer(h: *mut kz_client, now: u64) -> c_in
 ///
 /// # Safety
 ///
-/// `h` is a live handle and `out` is valid for a write.
+/// `h` is a live handle and `out` is valid for a write and outside the
+/// handle (`KZ_ERR_INVALID` if not).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kz_client_next_deadline(h: *mut kz_client, out: *mut u64) -> c_int {
-    // SAFETY: the caller's contract.
-    let Some(out) = (unsafe { out.as_mut() }) else {
+    if out.is_null() || in_handle(h, out.cast(), size_of::<u64>()) {
         return KZ_ERR_INVALID;
-    };
-    // SAFETY: the caller's contract.
+    }
+    // SAFETY: the caller's contract; `out` is outside the handle.
     unsafe {
         with_handle(h, |c| match c.client.next_deadline() {
             Some(t) => {
-                *out = t;
+                out.write(t);
                 KZ_OK
             }
             None => KZ_NONE,
@@ -359,7 +379,8 @@ pub unsafe extern "C" fn kz_client_next_deadline(h: *mut kz_client, out: *mut u6
 ///
 /// `h` is a live handle, `kind` and `len` are valid for writes, and a
 /// non-null `buf` is valid for writes of `cap` bytes (`buf` may be null
-/// only with `cap` 0).
+/// only with `cap` 0). `kind`, `len`, the `cap` bytes at `buf` and the
+/// handle do not overlap (`KZ_ERR_INVALID` if any two do).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kz_client_take_action(
     h: *mut kz_client,
@@ -368,28 +389,43 @@ pub unsafe extern "C" fn kz_client_take_action(
     kind: *mut c_int,
     len: *mut usize,
 ) -> c_int {
-    // SAFETY: the caller's contract.
-    let (Some(kind), Some(len)) = (unsafe { kind.as_mut() }, unsafe { len.as_mut() }) else {
-        return KZ_ERR_INVALID;
-    };
-    if buf.is_null() && cap != 0 {
+    if kind.is_null() || len.is_null() || (buf.is_null() && cap != 0) {
         return KZ_ERR_INVALID;
     }
-    // SAFETY: the caller's contract.
-    unsafe { with_handle(h, |c| take(c, buf, cap, kind, len)) }
+    let ranges = [
+        (kind.cast_const().cast::<u8>(), size_of::<c_int>()),
+        (len.cast_const().cast::<u8>(), size_of::<usize>()),
+        (buf.cast_const(), cap),
+        (h.cast_const().cast::<u8>(), size_of::<kz_client>()),
+    ];
+    for (i, &(a, alen)) in ranges.iter().enumerate() {
+        if ranges.iter().skip(i.saturating_add(1)).any(|&(b, blen)| overlaps(a, alen, b, blen)) {
+            return KZ_ERR_INVALID;
+        }
+    }
+    // SAFETY: the caller's contract; `kind` and `len` are outside the
+    // handle and each other, so their writes alias nothing.
+    unsafe {
+        with_handle(h, |c| {
+            let (code, k, l) = take(c, buf, cap);
+            kind.write(k);
+            len.write(l);
+            code
+        })
+    }
 }
 
-fn take(c: &mut kz_client, buf: *mut u8, cap: usize, kind: &mut c_int, len: &mut usize) -> c_int {
+/// The oldest action into `buf`: (status, kind, payload length).
+fn take(c: &mut kz_client, buf: *mut u8, cap: usize) -> (c_int, c_int, usize) {
     if c.queued == 0 {
-        (*kind, *len) = (0, 0);
-        return KZ_NONE;
+        return (KZ_NONE, 0, 0);
     }
     let Some(slot) = c.slots.get_mut(c.head) else {
-        return KZ_ERR_INTERNAL;
+        return (KZ_ERR_INTERNAL, 0, 0);
     };
-    (*kind, *len) = (slot.kind, slot.len);
-    if cap < slot.len {
-        return KZ_ERR_BUFFER;
+    let (kind, len) = (slot.kind, slot.len);
+    if cap < len {
+        return (KZ_ERR_BUFFER, kind, len);
     }
     let payload: &[u8] = match slot.kind {
         KZ_ACTION_SEND => slot.datagram.get(..slot.len).unwrap_or(&[]),
@@ -398,14 +434,15 @@ fn take(c: &mut kz_client, buf: *mut u8, cap: usize, kind: &mut c_int, len: &mut
     };
     if !payload.is_empty() {
         // SAFETY: `buf` is valid for `cap >= payload.len()` bytes (the
-        // caller's contract) and cannot overlap the handle's own slot.
+        // caller's contract), and the slot is inside the handle, which
+        // `kz_client_take_action` checked `buf` is not.
         unsafe { core::ptr::copy_nonoverlapping(payload.as_ptr(), buf, payload.len()) };
     }
     slot.psk.wipe();
     (slot.kind, slot.len) = (0, 0);
     c.head = c.head.saturating_add(1);
     c.queued = c.queued.saturating_sub(1);
-    KZ_OK
+    (KZ_OK, kind, len)
 }
 
 /// Frees the handle, wiping the client's keys, its handshake secrets and

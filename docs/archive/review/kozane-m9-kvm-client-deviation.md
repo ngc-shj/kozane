@@ -961,3 +961,86 @@ PDs stay as they are.
   either way.
 - **If it recurs** with no reply at all, it is a liveness bug. It blocks
   the milestone until it is understood.
+
+### D-24 — external security review: three fixes before merge
+
+A security review of fa90c9b, outside the triangulate rounds, found three
+issues. All three were confirmed in the code and fixed. Each fix has a
+test that fails on the old code, red-proved on a scratch copy.
+
+- **High — `release.py` verified a launcher by path, then ran the path.**
+  - The fault: `verify` hashed `kozane-vm` and then opened the same path
+    again to run `--build-info`. Whoever can write the release directory
+    could swap the file in between, and their binary would then run with
+    the verifier's privilege.
+  - The fix: `checked_launcher` replaces `require_no_seams` in `make` and
+    `verify`.
+    - It reads the file once, with `O_NOFOLLOW`, and hashes those bytes.
+    - In `verify` it refuses a digest other than the signed one before
+      anything runs.
+    - It runs the same bytes from a sealed memfd, as
+      `/proc/self/fd/<n>`.
+    - C4's rule stands: `SEAMS=0` comes from the exact file whose hash is
+      signed.
+  - Two release fixtures (RELEASE-FIXTURES 30):
+    - a stand-in that reports `SEAMS=0` only when run from its read copy;
+    - a symlinked `kozane-vm` whose target holds the signed bytes. The old
+      code printed `release: verified` for it.
+- **Medium — the guest could fill the host's disk through the console
+  log.**
+  - The fault: the reader appended every console byte to
+    `/var/log/kozane/console.log` with no bound. A guest that printed
+    without end filled `/var/log`. The failed write then stopped the VM,
+    and `Restart=always` turned that into a restart loop.
+  - The fix: `serial::Cap` keeps the log within `LOG_MAX` (1 GiB).
+    - Past the cap it writes one marker and drops console bytes, never
+      heartbeats.
+    - Once the file is smaller again (a `copytruncate` rotation), it
+      writes the count of dropped bytes first.
+    - The length comes from `fstat` on each chunk, so a rotation is seen.
+    - `audit`'s seq numbers make the gap a failure in `tools/audit-verify`.
+      It is not silent.
+  - The tests: four unit tests (below the cap; the marker, then nothing;
+    the count after a rotation; no marker past the cap).
+  - The docs: `docs/operations/host.md` gives the cap, the markers,
+    `copytruncate`, and a separate filesystem or quota for
+    `/var/log/kozane`.
+- **Medium — the C ABI let callers alias what Rust treats as unique.**
+  - The fault, in `kz_client_take_action`:
+    - it made `&mut` references from `kind` and `len` while a `&mut`
+      handle was also live;
+    - it copied into `buf` with `copy_nonoverlapping`.
+    - The header did not forbid overlaps, so a call that was valid C could
+      be undefined behaviour in Rust.
+  - `kz_client_next_deadline`'s `out` and `kz_client_on_datagram`'s input
+    could likewise point into the handle.
+  - The fix:
+    - The outputs are now raw pointers, written once.
+    - An overlap is refused with `KZ_ERR_INVALID`. In `take_action` that
+      covers any two of `kind`, `len`, `buf[..cap]` and the handle. In
+      `next_deadline` it covers `out` against the handle, and in
+      `on_datagram` the input against the handle.
+    - `kz_client_new` writes `*out` only after its input borrows end.
+    - The header says all this (regenerated).
+    - The PSK still goes straight from its slot to `buf`, with no local
+      copy left on the stack.
+  - Six FFI unit tests, five of them refusals, which fail with the overlap
+    check removed (UNIT-CLIENT 89).
+- **Found while fixing the console log: the reader could win the exit
+  race.**
+  - The fault: QEMU closing its console on the way out gives the reader
+    EOF, and `supervise` could see the reader exit before QEMU did. A
+    clean poweroff then failed the boot. This was seen once in six runs of
+    `i4_1_…`.
+  - The fix: after a clean EOF from the reader, QEMU's own exit decides,
+    if it comes within 5 s. Otherwise the boot failed.
+  - The tests: the QEMU stub's `console-first` mode closes the console
+    0.5 s before it exits. One test expects a clean boot; the old code
+    failed it. A second expects QEMU's failure to be reported.
+    UNIT-HOST 56.
+- **From `/simplify`:** `kv::is_ifname` now refuses `.` and `..`, like
+  the client's `interface` and the kernel's `dev_valid_name`.
+- **Left as is:** `docker/sdk/kozane-board.patch:43` keeps its trailing
+  space. It is a unified-diff blank context line, and removing it changes
+  the patch and the SDK build input. Three files lost a blank line at
+  their end.

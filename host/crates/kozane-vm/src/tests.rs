@@ -63,6 +63,8 @@ fn vm_conf_takes_exactly_its_four_keys_in_order() {
     for bad in [
         good.replace("br-in", "a-bridge-name-too-long"),
         good.replace("br-in", "br in"),
+        good.replace("br-in", "."),
+        good.replace("br-in", ".."),
         good.replace("=/usr/bin/swtpm", "=swtpm"),
         good.replace("inside_bridge=br-in\noutside_bridge=br-out\n", "outside_bridge=br-out\ninside_bridge=br-in\n"),
         format!("{good}qemu=/x\n"),

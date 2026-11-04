@@ -361,4 +361,3 @@ pub fn netlink_recv(fd: BorrowedFd<'_>, buf: &mut [u8]) -> io::Result<(usize, u3
         }
     }
 }
-

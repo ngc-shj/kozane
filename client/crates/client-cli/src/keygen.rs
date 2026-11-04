@@ -204,4 +204,3 @@ fn split_dir(path: &'static str) -> Result<(&'static str, &'static str), String>
         .filter(|(parent, name)| !parent.is_empty() && !name.is_empty())
         .ok_or_else(|| format!("keygen: {path} is not an absolute directory"))
 }
-

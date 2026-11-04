@@ -29,6 +29,8 @@ FIRMWARE = b"u-boot stand-in " * 64
 # build and a test-seams build.
 LAUNCHER = b"#!/bin/sh\necho SEAMS=0\n"
 LAUNCHER_SEAMS = b"#!/bin/sh\necho SEAMS=1\n"
+# Reports SEAMS=0 only when run from the read copy, not from its path.
+LAUNCHER_FD = b'#!/bin/sh\ncase "$0" in /proc/self/fd/*) echo SEAMS=0 ;; *) echo SEAMS=1 ;; esac\n'
 RANGES = [(0x1000, 0x400), (0x2000, 0x800), (0x3000, 0x400), (0x3800, 0x400), (0x4000, SLOT), (0x4000 + SLOT, SLOT)]
 
 
@@ -55,7 +57,7 @@ def setup(d: pathlib.Path) -> None:
     (pkg / "boot.desc").write_bytes(desc)
     (pkg / "u-boot.bin").write_bytes(FIRMWARE)
     write_pcrs(pkg)
-    for name, data in (("kozane-vm", LAUNCHER), ("kozane-vm-seams", LAUNCHER_SEAMS)):
+    for name, data in (("kozane-vm", LAUNCHER), ("kozane-vm-seams", LAUNCHER_SEAMS), ("kozane-vm-fd", LAUNCHER_FD)):
         (d / name).write_bytes(data)
         (d / name).chmod(0o755)
 
@@ -174,6 +176,26 @@ def case_verify_launcher_seams(d):
     made = signed_release(d, "0" * 40, launcher=LAUNCHER_SEAMS)
     rc, out = verify_default(d)
     return made and rc == 1 and "built with test seams" in out, out
+
+
+def case_launcher_run_from_its_read(d):
+    """make and verify run the launcher bytes they hashed, from the one read
+    of the file, not the path: a swap after the read is never run."""
+    rc, out = make(d, launcher="kozane-vm-fd")
+    rc2, out2 = verify(d) if rc == 0 else (rc, "")
+    return rc == 0 and rc2 == 0, out + out2
+
+
+def case_launcher_symlink(d):
+    """A shipped kozane-vm that is a symlink is refused, though its target
+    holds the signed bytes: the path can be repointed after the check."""
+    make(d)
+    (d / "elsewhere").write_bytes((d / "rel/kozane-vm").read_bytes())
+    (d / "elsewhere").chmod(0o755)
+    (d / "rel/kozane-vm").unlink()
+    (d / "rel/kozane-vm").symlink_to(d / "elsewhere")
+    rc, out = verify(d)
+    return rc == 1 and "kozane-vm" in out and "Too many levels of symbolic links" in out, out
 
 
 def case_existing_out(d):
@@ -349,6 +371,8 @@ CASES = [
     ("make refuses a kozane-vm built with test seams", case_make_launcher_seams),
     ("a kozane-vm changed after signing is refused", case_launcher_changed),
     ("verify refuses a signed kozane-vm built with test seams", case_verify_launcher_seams),
+    ("make and verify run the kozane-vm bytes they hashed", case_launcher_run_from_its_read),
+    ("verify refuses a kozane-vm that is a symlink", case_launcher_symlink),
     ("an existing OUT is refused", case_existing_out),
     ("release keys inside the repo are refused", case_keys_in_repo),
     ("a failed signing leaves no OUT and no staging, and the retry succeeds", case_sign_fails_leaves_nothing),

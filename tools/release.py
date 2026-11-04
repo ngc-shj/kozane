@@ -20,7 +20,9 @@ must be the tree it was built from.
 and PCRs 0-8 from the shipped files and compares them with the signed
 fields, and refuses a release_seq other than crates/release-seq's: the
 release is checked against the source it claims to be. The shipped
-kozane-vm must match kozane_vm_sha256 and then report `SEAMS=0`. With --envelope it
+kozane-vm must match kozane_vm_sha256 and then report `SEAMS=0`: it is read
+once, and the bytes hashed are the bytes run, from a sealed memfd, so a file
+swapped after the read is neither hashed nor run. With --envelope it
 also checks that the envelope (of --kind: `key`'s,
 `pqkey`'s, `tlskey`'s or `auditkey`'s) has a sealed object that enforces the signed PCRs
 (`mksecrets check-envelope`, the PDs' own parser).
@@ -30,6 +32,7 @@ or any disagreement is a refusal.
 """
 
 import argparse
+import fcntl
 import hashlib
 import os
 import pathlib
@@ -78,16 +81,42 @@ def release_seq() -> str:
     return found[0]
 
 
-def require_no_seams(binary: pathlib.Path) -> None:
-    """The launcher at `binary` was built without the test seams: its
-    `--build-info` reports `SEAMS=0` and nothing else for SEAMS (M9 plan C4)."""
+def checked_launcher(path: pathlib.Path, want: str | None = None) -> str:
+    """The digest of the launcher at `path`, built without the test seams:
+    its `--build-info` reports `SEAMS=0` and nothing else for SEAMS (M9 plan
+    C4). With `want`, a digest other than `want` is refused before anything
+    runs. The file is read once (not through a symlink), and the bytes
+    hashed are the ones run, from a sealed memfd: a path swapped after the
+    read changes neither."""
     try:
-        r = subprocess.run([str(binary), "--build-info"], capture_output=True, text=True, timeout=60)
-    except (OSError, subprocess.TimeoutExpired) as e:
-        raise Refused(f"kozane-vm --build-info: {e}")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as e:
+        raise Refused(f"{path}: {e}")
+    with os.fdopen(fd, "rb") as f:
+        data = f.read()
+    digest = hashlib.sha256(data).hexdigest()
+    if want is not None and digest != want:
+        raise Refused(f"kozane_vm_sha256: the shipped kozane-vm gives {digest}, the signed manifest says {want}")
+    # Not close-on-exec: the child runs it as /proc/self/fd/<n>, and a
+    # script launcher (the fixtures') is read by its interpreter from there.
+    mfd = os.memfd_create("kozane-vm", os.MFD_ALLOW_SEALING)
+    try:
+        with os.fdopen(os.dup(mfd), "wb") as m:
+            m.write(data)
+        os.fchmod(mfd, 0o500)
+        fcntl.fcntl(mfd, fcntl.F_ADD_SEALS,
+                    fcntl.F_SEAL_WRITE | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_SEAL)
+        try:
+            r = subprocess.run([f"/proc/self/fd/{mfd}", "--build-info"], pass_fds=(mfd,),
+                               capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            raise Refused(f"kozane-vm --build-info: {e}")
+    finally:
+        os.close(mfd)
     seams = [line for line in r.stdout.splitlines() if line.startswith("SEAMS=")]
     if r.returncode != 0 or seams != ["SEAMS=0"]:
         raise Refused(f"kozane-vm: built with test seams, or no build info ({seams or r.returncode})")
+    return digest
 
 
 def versions() -> dict:
@@ -140,8 +169,7 @@ def make(a) -> None:
         # The digest and the build-info check are both of the copy shipped.
         shutil.copyfile(a.kozane_vm, staging / "kozane-vm")
         (staging / "kozane-vm").chmod(0o755)
-        require_no_seams(staging / "kozane-vm")
-        fields["kozane_vm_sha256"] = sha256(staging / "kozane-vm")
+        fields["kozane_vm_sha256"] = checked_launcher(staging / "kozane-vm")
         manifest = tool("render", *(f"{k}={v}" for k, v in fields.items()))
         (staging / "manifest").write_text(manifest)
         tool("sign", "--keys", a.keys, "--manifest", str(staging / "manifest"), "--out", str(staging / "manifest.sig"))
@@ -184,11 +212,7 @@ def verify(a) -> None:
     if fields.get("release_seq") != seq:
         raise Refused(f"release_seq: crates/release-seq says {seq}, the signed manifest says {fields.get('release_seq')}")
     # Hash first: only the signed launcher is run for its build info.
-    launcher = rel / "kozane-vm"
-    if fields.get("kozane_vm_sha256") != sha256(launcher):
-        raise Refused(f"kozane_vm_sha256: the shipped kozane-vm gives {sha256(launcher)}, "
-                      f"the signed manifest says {fields.get('kozane_vm_sha256')}")
-    require_no_seams(launcher)
+    checked_launcher(rel / "kozane-vm", want=fields.get("kozane_vm_sha256", ""))
     if a.envelope:
         r = subprocess.run(["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "check-envelope",
                             "--kind", a.kind, "--envelope", a.envelope, "--pcrs", fields["pcrs"]],
