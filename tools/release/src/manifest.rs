@@ -4,16 +4,19 @@
 //! the fields read from them cannot disagree.
 
 /// Every key a manifest carries, in its required (sorted) order.
-/// `firmware_sha256` is flash.bin's, and `pcrs` the PCRs 0-8 the envelopes
-/// are sealed to, comma-separated (M7 plan C4). `release_seq` is the
-/// release's `RELEASE_SEQ` (M8 plan C9, D5), a canonical decimal `u32`.
-pub const KEYS: [&str; 11] = [
+/// `firmware_sha256` is u-boot.bin's (M9 plan C2), and `pcrs` the PCRs 0-8
+/// the envelopes are sealed to, comma-separated (M7 plan C4). `release_seq`
+/// is the release's `RELEASE_SEQ` (M8 plan C9, D5), a canonical decimal `u32`.
+/// `kozane_vm_sha256` is the host launcher's, the release build without test
+/// seams (M9 plan C4).
+pub const KEYS: [&str; 12] = [
     "boot_desc_sha256",
     "cargo_lock_sha256",
     "commit",
     "dev_image",
     "firmware_sha256",
     "kani",
+    "kozane_vm_sha256",
     "loader_img_sha256",
     "pcrs",
     "release_seq",

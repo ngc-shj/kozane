@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Positive pin rules for the dev environment and gates (plan C1, C2).
 
-Usage: check-pins [--root DIR] [--enforce-pending]
+Usage: check-pins [--root DIR] [--enforce-pending] [--sdk DIR]
 Exit 0 when every rule holds; 1 with one line per violation; prints
 "CHECK-PINS-RULES <n>" (enforced rules) for the count manifest.
 
@@ -107,19 +107,20 @@ Rules:
      case) either cites an archive document by its file name or sits in a
      file policy/old-name-allowlist lists with a reason; a listed file that
      still exists but no longer names it is a stale entry
-  P24 the measured firmware (M7 plan C2, C3): support/tf-a/build-flags
-     exists and fixes BUILD_STRING=kozane and BUILD_MESSAGE_TIMESTAMP=
-     "kozane" (TF-A otherwise embeds the build time and `git describe`);
-     support/u-boot/boot.cmd starts no TPM (`tpm2 startup`: BL1 does), and
-     support/u-boot/kozane.config turns on neither CONFIG_MEASURED_BOOT nor
-     CONFIG_EFI_TCG2_PROTOCOL (no event-log replay); tests/integration/run.py
-     spells "-bios" once, in qemu_machine, the one builder of the QEMU
-     command line, which refuses any firmware but `make firmware`'s
+  P24 the firmware's boot path (M9 plan C2, C12): nothing runs before
+     U-Boot, so support/u-boot/boot.cmd starts the TPM itself, with one
+     uncommented `tpm2 startup TPM2_SU_CLEAR || REFUSE` after `tpm2 init`
+     and before the first `tpm2 pcr_extend`; support/u-boot/kozane.config
+     turns on neither CONFIG_MEASURED_BOOT nor CONFIG_EFI_TCG2_PROTOCOL (no
+     event-log replay); tools/vm.py spells "-bios" once, in `def machine`,
+     the one source of the QEMU command line, and tests/integration/run.py
+     never does
   P25 no RNDR (M7 plan C7, D3): in crates/ (*.rs, Cargo.toml) no RNDR
      encoding (`s3_3_c2_c4_0`) and none of the removed API (`cpu::rndr`,
-     `cpu::fill_random`, `fn rndr`); and outside docs/ no `neoverse-n2`,
-     the RNDR core the platform left (the CPU is cortex-a72, which faults
-     on RNDR). A best-effort tripwire over source text: the CPU faulting is
+     `cpu::fill_random`, `fn rndr`); outside docs/ no `neoverse-n2`, the
+     RNDR core the platform left; and tools/vm.py's `CPU` is exactly tcg
+     cortex-a72 (which faults on RNDR) and kvm host (M9 plan D2; a FEAT_RNG
+     host is RM9-2), the one `-cpu` its machine renders. A best-effort tripwire over source text: the CPU faulting is
      the enforcement
   P26 the boot stop (M7 plan C9): `boot-stop` appears in no Cargo.toml but
      boot-stage's and pdkit's (which define it) and the leaf PDs' (crates/
@@ -225,10 +226,73 @@ the only guard for pqkey-core's wrappers. L8's adjudicating control is
      tests/tools/<file>); and every backticked span in a table's Test
      column has one of those kinds. A check of names: whether a test proves
      what its row claims is the review's
+  P33 the Rosenpass golden vectors are fixed (M9 plan C7, T2.18): the
+     files in crates/rosenpass-core/tests/vectors and the rosenpass-wire
+     parser corpus's seed-* files are exactly RP_VECTORS, by sha256.
+     tools/rp-vectors regenerates them with fresh keys, so a mode that
+     rewrites a file it should not is caught here; a deliberate
+     regeneration updates RP_VECTORS with it
+  P34 the initiator's constants are upstream's (M9 plan C7): the excerpt
+     crates/rosenpass-core/tests/vectors/upstream-constants.txt names
+     docker/Dockerfile's RP_MASTER_COMMIT and RP_MASTER_SHA256 and holds
+     each RP_CONSTANTS line as `<path>:<line> pub const <NAME>: Timing =
+     <value>;`; each mapped constant in initiator_state.rs evaluates to
+     that value (seconds as ns, the jitter as NUM / DEN) and its doc
+     comment cites `constants.rs:<line>`. The excerpt was copied from the
+     oracle stage's sha256-checked archive (the dev image has only the
+     binaries); P33 pins the excerpt itself
+  P35 the PD stack top follows the board (M9 deviation D-9): STACK_TOP in
+     crates/cpu/src/lib.rs (the stack probe) equals STACK_TOP in
+     tools/laws/src/check.rs (the guard-page law), and both equal the
+     Makefile board's `vspace_user_top` rounded down to its page, less the
+     IPC buffer's page, from the SDK's release address_space_constants.json
+     (--sdk, default $MICROKIT_SDK; a missing SDK fails)
+  P36 I14.1 (M9 plan C14): every `phys_addr` of system/*.system lies in a
+     device node of the SDK's kozane-virt.dtb (stock QEMU's `dumpdtb` of D2's
+     machine): in a node's `reg`, or in a `simple-bus` window (the platform
+     bus, where QEMU places the TPM). Precondition: the dtb has no
+     `arm,sp804` node, so it is not the patched QEMU's
+  P37 C1's forbidden patterns (M9 plan C1): `"-bios"`, `secure=on` and
+     `mon:stdio` appear in no file outside docs/archive, build, target,
+     .git, .claude and third_party but tools/vm.py (the one adjudicator),
+     tests/tools/test_vm.py (its fixtures) and this rule's own two files.
+     A tripwire over text; vm.violations is the adjudicator
+  P38 C10's forbidden patterns (M9 plan D6, deviation D-13): no
+     `Command::new` in client/**/src (the tests drive real tools), and no
+     `REPLACE_PEERS` anywhere under client/: kzc-psk never shells out and
+     never replaces the peer set
+  P39 D12's lock pin (M9 plan D12, deviation D-12): every package that
+     client/Cargo.lock shares with the root Cargo.lock resolves, in each
+     version client/ locks, to one the root locks with the same source and
+     checksum (`pins: client lock drift`); host/Cargo.lock against
+     tools/release/Cargo.lock likewise (`pins: host lock drift`), and
+     tools/rp-residue/Cargo.lock against the root lock (`pins: rp-residue
+     lock drift`, deviation D-16)
+  P40 the test seams stay in two modules (M9 plan C4, C10): `feature =
+     "test-seams"` appears in crate sources (*.rs under a src/ of client/,
+     host/, crates/ or tools/) only in host/crates/kozane-vm/src/resolve.rs
+     and client/crates/client-cli/src/seams.rs; integration tests (a
+     crate's tests/) may gate themselves on it
+  P41 the host unit is canonical (M9 plan D6's subset): each fenced block
+     of docs/operations/*.md that starts with `[Unit]` has one `Key=Value`
+     per line, no `~`, no directive repeated in a section and no section
+     repeated. client/dist's units are client-cli's test's (units.rs), so
+     they are not read here
+  P42 the client scrubs after every initiator call (M9 plan C7, I7.2,
+     deviation D-16): in client/crates/client/src/lib.rs each of the six
+     `ini.<method>(` calls (start, handle_resp_hello, handle_empty_data,
+     handle_cookie_reply, tick) is `let <x> = ...;` with `scrub_stack();`
+     as the next line, before the result is acted on; no other client
+     source names `Initiator`. A tripwire over text; tools/rp-residue is
+     the adjudicator of what the scrub clears
 """
 
 import argparse
+import ast
 import collections
+import fractions
+import hashlib
+import json
 import os
 import pathlib
 import re
@@ -241,7 +305,7 @@ import waivers  # noqa: E402
 
 RULES = ["P1", "P2", "P3", "P4", "P5", "P6", "P7", "P8", "P9", "P10", "P11", "P12", "P13", "P14", "P15", "P16", "P18",
          "P19", "P20", "P21", "P22", "P23", "P24", "P25", "P26", "P27", "P28", "P29", "P30", "P31",
-         "P32"]
+         "P32", "P33", "P34", "P35", "P36", "P37", "P38", "P39", "P40", "P41", "P42"]
 # Crates whose secrets must not be copied by value (P10).
 COPY_CRATES = ["crates/hs-core", "crates/key-core", "crates/data-core", "crates/wg-core", "crates/tpm2",
                "crates/tls-core", "crates/tlskey-core", "crates/pds/key", "crates/pds/hs", "crates/pds/data",
@@ -1043,35 +1107,47 @@ def check_old_name(root: pathlib.Path, out: list):
         out.append(f"P23 {OLD_NAME_ALLOWLIST}: {rel} no longer names the old name; drop the stale entry")
 
 
-# P24: the firmware build's fixed strings and the boot path's shape.
-TFA_FLAGS = "support/tf-a/build-flags"
-TFA_FIXED = ("BUILD_STRING=kozane", 'BUILD_MESSAGE_TIMESTAMP="kozane"')
+# P24: the boot path's shape, U-Boot first and alone (M9 plan C2).
+TPM_STARTUP = re.compile(r"\s*tpm2\s+startup\s+TPM2_SU_CLEAR\s*\|\|\s*REFUSE\s*")
+VM_PY = "tools/vm.py"
+
+
+def python_def(text: str, name: str) -> tuple:
+    """[start, end) of the top-level `def name(` in `text`, or (-1, -1)."""
+    start = text.find(f"\ndef {name}(")
+    if start < 0:
+        return -1, -1
+    end = min((i for i in (text.find("\ndef ", start + 1), text.find("\nclass ", start + 1)) if i > 0),
+              default=len(text))
+    return start, end
 
 
 def check_firmware(root: pathlib.Path, out: list):
-    flags = root / TFA_FLAGS
-    if not flags.is_file():
-        out.append(f"P24 {TFA_FLAGS}: missing; the firmware build has no fixed flags")
-    else:
-        lines = {l.strip() for l in flags.read_text().splitlines() if not l.startswith("#")}
-        for fixed in TFA_FIXED:
-            if fixed not in lines:
-                out.append(f"P24 {TFA_FLAGS}: no `{fixed}` line; TF-A embeds the build time or `git describe`")
     boot = root / "support/u-boot/boot.cmd"
-    for n, line in enumerate(boot.read_text().splitlines(), 1):
-        if not line.lstrip().startswith("#") and re.search(r"\btpm2\s+startup\b", line):
-            out.append(f"P24 support/u-boot/boot.cmd:{n}: U-Boot starts the TPM; BL1 does (M7 plan C3)")
+    lines = [(n, l) for n, l in enumerate(boot.read_text().splitlines(), 1) if not l.lstrip().startswith("#")]
+    init = [n for n, l in lines if re.match(r"\s*tpm2\s+init\b", l)]
+    startup = [n for n, l in lines if re.match(r"\s*tpm2\s+startup\b", l)]
+    extend = [n for n, l in lines if re.match(r"\s*tpm2\s+pcr_extend\b", l)]
+    good = [n for n, l in lines if TPM_STARTUP.fullmatch(l)]
+    if len(startup) != 1 or good != startup:
+        out.append(f"P24 support/u-boot/boot.cmd: {len(good)} `tpm2 startup TPM2_SU_CLEAR || REFUSE` line(s) of "
+                   f"{len(startup)} `tpm2 startup`; U-Boot must start the TPM once, refusing on failure (M9 plan C2)")
+    elif not init or not extend or not init[0] < startup[0] < extend[0]:
+        out.append(f"P24 support/u-boot/boot.cmd:{startup[0]}: `tpm2 startup` is not after `tpm2 init` and before "
+                   "the first `tpm2 pcr_extend`")
     config = root / "support/u-boot/kozane.config"
     for n, line in enumerate(config.read_text().splitlines(), 1):
         if re.fullmatch(r"CONFIG_(MEASURED_BOOT|EFI_TCG2_PROTOCOL)=y\s*", line):
             out.append(f"P24 support/u-boot/kozane.config:{n}: {line.split('=')[0]} replays the event log (M7 plan D1)")
+    vm = (root / VM_PY).read_text()
+    bios = [m.start() for m in re.finditer(r'"-bios"', vm)]
+    start, end = python_def(vm, "machine")
+    if len(bios) != 1 or not start <= bios[0] < end:
+        out.append(f'P24 {VM_PY}: "-bios" appears {len(bios)} time(s); only `def machine` may name the firmware, '
+                   "once (M9 plan C1)")
     run = (root / "tests/integration/run.py").read_text()
-    bios = [m.start() for m in re.finditer(r'"-bios"', run)]
-    start = run.find("\ndef qemu_machine(")
-    end = min((i for i in (run.find("\ndef ", start + 1), run.find("\nclass ", start + 1)) if i > 0), default=len(run))
-    if len(bios) != 1 or start < 0 or not start <= bios[0] < end:
-        out.append(f'P24 tests/integration/run.py: "-bios" appears {len(bios)} time(s); only qemu_machine may name '
-                   "the firmware")
+    if re.search(r'"-bios"', run):
+        out.append('P24 tests/integration/run.py: names "-bios"; the QEMU command line is vm.machine\'s (M9 plan C1)')
 
 
 # P25: RNDR gone from the source and the platform.
@@ -1098,6 +1174,29 @@ def check_no_rndr(root: pathlib.Path, out: list):
             for n, line in enumerate(text.splitlines(), 1):
                 if "neoverse-n2" in line:
                     out.append(f"P25 {rel}:{n}: neoverse-n2 (an RNDR core); the platform CPU is cortex-a72 (M7 plan D3)")
+    check_vm_cpu(root, out)
+
+
+VM_CPU = {"tcg": "cortex-a72", "kvm": "host"}
+
+
+def check_vm_cpu(root: pathlib.Path, out: list):
+    """P25's platform clause: vm.machine's CPU arguments, read from the
+    source without running it."""
+    vm = (root / VM_PY).read_text()
+    cpu = None
+    for node in ast.parse(vm).body:
+        if isinstance(node, ast.Assign) and [getattr(t, "id", None) for t in node.targets] == ["CPU"]:
+            try:
+                cpu = ast.literal_eval(node.value)
+            except ValueError:
+                cpu = "not a literal"
+    if cpu != VM_CPU:
+        out.append(f"P25 {VM_PY}: CPU is {cpu!r}, not {VM_CPU!r}; TCG's CPU must fault on RNDR (M7 plan D3, M9 plan D2)")
+    start, end = python_def(vm, "machine")
+    renders = [m.start() for m in re.finditer(r'"-cpu"', vm)]
+    if len(renders) != 1 or not start <= renders[0] < end or not vm.startswith('"-cpu", CPU[accel]', renders[0]):
+        out.append(f'P25 {VM_PY}: the -cpu argument is not `"-cpu", CPU[accel]` once in `def machine`')
 
 
 # P26: the boot stop's feature and the one-shot init entry.
@@ -1412,10 +1511,426 @@ def check_audit_map(root: pathlib.Path, out: list):
                 out.append(f"P32 {AUDIT_MAP}:{n}: `{kind}:{name}` is no test in the tree (M8 plan C12)")
 
 
+# P33: sha256 of every Rosenpass vector file and rosenpass-wire seed.
+RP_VECTOR_DIR = "crates/rosenpass-core/tests/vectors"
+RP_SEED_DIR = "crates/rosenpass-wire/src/__fuzz__/tests__parsers_never_panic_and_round_trip/corpus"
+RP_VECTORS = {
+    f"{RP_VECTOR_DIR}/cookie.txt": "109a6a725d5d516085fbf61faab188c15b77966f4a855204ba1fdd829f6aa885",
+    f"{RP_VECTOR_DIR}/skt-initiator.bin": "e3b8f4921d622f83031da1cf72eb8071e7e1882d6ae3b29ad33f080bd76adac2",
+    f"{RP_VECTOR_DIR}/spkm-initiator.bin": "fb4af37ffd8ffa731c6b61df22cb4752e14464f27f61fb0b3a8e2a45d16bd461",
+    f"{RP_VECTOR_DIR}/spkm.bin": "10ff86babb399fd36a441803bfb096673ca80007b871926f73e91c8940983dab",
+    f"{RP_VECTOR_DIR}/spkt-initiator.bin": "ad946b9cae53569fc9c394f9cf4a65bd86b18ba596f2969efe39c8da45524182",
+    f"{RP_VECTOR_DIR}/spkt.bin": "f586c3d042ca6c8438ece42b6bfa248b232ca5f40468ac4b729bdfa164515aeb",
+    f"{RP_VECTOR_DIR}/upstream-constants.txt": "174699686d68df53a17279fc0e4720fa84e586a07fcd3e7dc85023ec2004a8b2",
+    f"{RP_VECTOR_DIR}/v02-initiator.txt": "1f6aa19323d9702d651c5093b5d24d1186e150e2ccf8634258bb53733e7544b7",
+    f"{RP_VECTOR_DIR}/v02.txt": "b6be43fe935efb9b10ac54c8870597bf8e8a652799664379a1042b588c459424",
+    f"{RP_SEED_DIR}/seed-empty-data": "9d4d2ac7cb4125aea3e816f65ac5b2edf5e94b64b9b61dde096441bf60e53131",
+    f"{RP_SEED_DIR}/seed-init-conf": "bf26763152c9e995213f596097cc337f84256c8ff9befcf82262c3754045233d",
+    f"{RP_SEED_DIR}/seed-init-hello": "1df7e0e87deaf9f78de8c04e12943fca3429c1be21a0b9c33dc08fc2326030de",
+    f"{RP_SEED_DIR}/seed-resp-hello": "3c86755f9c594f78ab73e0063580c0108b3adfbede8a369ae54c03843a99a0bc",
+}
+
+
+def check_rp_vectors(root: pathlib.Path, out: list):
+    # The synthetic P7 trees have no rosenpass-core.
+    if not (root / "crates/rosenpass-core").is_dir():
+        return
+    present = {str(p.relative_to(root)) for p in (root / RP_VECTOR_DIR).glob("*") if p.is_file()}
+    present |= {str(p.relative_to(root)) for p in (root / RP_SEED_DIR).glob("seed-*") if p.is_file()}
+    for rel in sorted(present | set(RP_VECTORS)):
+        path = root / rel
+        if rel not in RP_VECTORS:
+            out.append(f"P33 pins: rp vectors changed: {rel} is not pinned")
+        elif not path.is_file():
+            out.append(f"P33 pins: rp vectors changed: {rel} is missing")
+        elif (got := hashlib.sha256(path.read_bytes()).hexdigest()) != RP_VECTORS[rel]:
+            out.append(f"P33 pins: rp vectors changed: {rel} sha256 {got}, pinned {RP_VECTORS[rel]}")
+
+
+# P34: upstream's name -> (initiator_state.rs's constants, the scale from
+# upstream's seconds). A pair is a fraction NUM / DEN.
+RP_CONSTANTS_EXCERPT = f"{RP_VECTOR_DIR}/upstream-constants.txt"
+RP_CONSTANTS_SRC = "crates/rosenpass-core/src/initiator_state.rs"
+RP_CONSTANTS = {
+    "RETRANSMIT_DELAY_BEGIN": (("RETRANSMIT_DELAY_BEGIN_NS",), 10**9),
+    "RETRANSMIT_DELAY_GROWTH": (("RETRANSMIT_DELAY_GROWTH",), 1),
+    "RETRANSMIT_DELAY_END": (("RETRANSMIT_DELAY_END_NS",), 10**9),
+    "RETRANSMIT_DELAY_JITTER": (("RETRANSMIT_DELAY_JITTER_NUM", "RETRANSMIT_DELAY_JITTER_DEN"), 1),
+    "REJECT_AFTER_TIME": (("REJECT_AFTER_TIME_NS",), 10**9),
+    "REKEY_AFTER_TIME_INITIATOR": (("REKEY_AFTER_TIME_INITIATOR_NS",), 10**9),
+}
+UPSTREAM_LINE = re.compile(r"^(\S+):(\d+) pub const ([A-Z_]+): Timing = ([0-9]+(?:\.[0-9]+)?);$")
+RUST_CONST = re.compile(r"^((?:[ \t]*///.*\n)*)[ \t]*(?:pub )?const ([A-Z_0-9]+): u64 = ([^;]+);", re.M)
+
+
+def check_rp_constants(root: pathlib.Path, out: list):
+    if not (root / "crates/rosenpass-core").is_dir():
+        return
+    Fraction = fractions.Fraction
+    drift = "P34 rp-constants: drift:"
+    excerpt, src = root / RP_CONSTANTS_EXCERPT, root / RP_CONSTANTS_SRC
+    if not excerpt.is_file() or not src.is_file():
+        out.append(f"{drift} {RP_CONSTANTS_EXCERPT} or {RP_CONSTANTS_SRC} missing")
+        return
+    text = excerpt.read_text()
+    docker = (root / "docker/Dockerfile").read_text()
+    for arg in ("RP_MASTER_COMMIT", "RP_MASTER_SHA256"):
+        m = re.search(rf"^ARG {arg}=([0-9a-f]+)$", docker, re.M)
+        if not m or m.group(1) not in text:
+            out.append(f"{drift} {RP_CONSTANTS_EXCERPT} does not name docker/Dockerfile's {arg}")
+    upstream = {}
+    for line in text.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        m = UPSTREAM_LINE.match(line)
+        if not m or m.group(3) not in RP_CONSTANTS or m.group(3) in upstream:
+            out.append(f"{drift} {RP_CONSTANTS_EXCERPT}: unexpected line `{line}`")
+            continue
+        upstream[m.group(3)] = (m.group(2), Fraction(m.group(4)))
+    rust = {m.group(2): (m.group(1), m.group(3)) for m in RUST_CONST.finditer(src.read_text())}
+
+    def value(name: str, seen=()):
+        if name not in rust or name in seen:
+            return None
+        product = 1
+        for factor in (f.strip() for f in rust[name][1].split("*")):
+            if re.fullmatch(r"[0-9_]+", factor):
+                product *= int(factor.replace("_", ""))
+            elif (v := value(factor, (*seen, name))) is not None:
+                product *= v
+            else:
+                return None
+        return product
+
+    for name, (ours, scale) in RP_CONSTANTS.items():
+        if name not in upstream:
+            out.append(f"{drift} {RP_CONSTANTS_EXCERPT} has no line for upstream {name}")
+            continue
+        line, want = upstream[name]
+        vals = [value(c) for c in ours]
+        if None in vals:
+            out.append(f"{drift} {RP_CONSTANTS_SRC}: {' / '.join(ours)} not a product of literals and constants")
+            continue
+        got = Fraction(vals[0], vals[1]) if len(vals) == 2 else Fraction(vals[0])
+        if got != want * scale:
+            out.append(f"{drift} {RP_CONSTANTS_SRC}: {' / '.join(ours)} = {got}, upstream {name} = {want} "
+                       f"(constants.rs:{line}) x {scale}")
+        if not re.search(rf"constants\.rs:{line}\b", rust[ours[0]][0]):
+            out.append(f"{drift} {RP_CONSTANTS_SRC}: {ours[0]}'s doc does not cite constants.rs:{line}")
+
+
+# P35: the stack top (M9 deviation D-9).
+STACK_TOP_PINS = {"crates/cpu/src/lib.rs": r"const STACK_TOP: usize = (0x[0-9a-f_]+);",
+                  "tools/laws/src/check.rs": r"const STACK_TOP: u64 = (0x[0-9a-f_]+);"}
+
+
+def board(root: pathlib.Path) -> str:
+    m = re.search(r"^MICROKIT_BOARD := (\S+)$", (root / "Makefile").read_text(), re.M)
+    return m.group(1) if m else ""
+
+
+def check_stack_top(root: pathlib.Path, sdk, out: list):
+    # The synthetic P7 trees have no cpu crate.
+    if not (root / "crates/cpu").is_dir():
+        return
+    tops = {}
+    for rel, pattern in STACK_TOP_PINS.items():
+        found = re.findall(pattern, (root / rel).read_text()) if (root / rel).is_file() else []
+        if len(found) != 1:
+            out.append(f"P35 {rel}: {len(found)} STACK_TOP definitions, want one")
+            return
+        tops[rel] = int(found[0].replace("_", ""), 16)
+    constants = pathlib.Path(sdk or "") / "board" / board(root) / "release/address_space_constants.json"
+    try:
+        top = json.loads(constants.read_text())["vspace_user_top"]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        out.append(f"P35 pins: stack top unverifiable: cannot read vspace_user_top from {constants} ({e})")
+        return
+    want = (top & ~0xFFF) - 0x1000
+    for rel, got in tops.items():
+        if got != want:
+            out.append(f"P35 pins: stack top drift: {rel} STACK_TOP {got:#x}, the board's is {want:#x} "
+                       f"(vspace_user_top {top:#x} less the IPC buffer page)")
+
+
+# P36: I14.1, against the stock machine's device tree.
+DTB = "kozane-virt.dtb"
+
+
+def fdt_nodes(data: bytes) -> list:
+    """(path, properties, parent's properties) of every node of a
+    flattened device tree, parents before children."""
+    import struct
+    magic, _, off_struct, off_strings = struct.unpack_from(">4I", data)
+    if magic != 0xD00DFEED:
+        raise ValueError("not a flattened device tree")
+
+    def string(off: int) -> str:
+        start = off_strings + off
+        return data[start:data.index(b"\0", start)].decode()
+
+    nodes, stack, p = [], [], off_struct
+    while True:
+        tok, = struct.unpack_from(">I", data, p)
+        p += 4
+        if tok == 1:
+            end = data.index(b"\0", p)
+            name = data[p:end].decode()
+            p = (end + 4) & ~3
+            props = {}
+            stack.append((name, props))
+            nodes.append(("/".join(n for n, _ in stack) or "/", props, stack[-2][1] if len(stack) > 1 else None))
+        elif tok == 3:
+            length, nameoff = struct.unpack_from(">II", data, p)
+            p += 8
+            stack[-1][1][string(nameoff)] = data[p:p + length]
+            p = (p + length + 3) & ~3
+        elif tok == 2:
+            stack.pop()
+        elif tok == 4:
+            continue
+        elif tok == 9:
+            return nodes
+        else:
+            raise ValueError(f"bad token {tok:#x} at {p - 4}")
+
+
+def cells(raw: bytes, *widths) -> list:
+    """`raw` split into tuples of big-endian numbers of `widths` cells."""
+    step = sum(widths) * 4
+    if not step or len(raw) % step:
+        return []
+    out = []
+    for at in range(0, len(raw), step):
+        row, off = [], at
+        for w in widths:
+            row.append(int.from_bytes(raw[off:off + 4 * w], "big"))
+            off += 4 * w
+        out.append(tuple(row))
+    return out
+
+
+def dtb_windows(nodes: list) -> list:
+    """(start, end, node) of every root-level device region: a `reg` of a
+    child of the root, or a root-level simple-bus's `ranges` window. Memory
+    is not a device."""
+    root = nodes[0][1]
+    acells = int.from_bytes(root.get("#address-cells", b"\0\0\0\2"), "big")
+    scells = int.from_bytes(root.get("#size-cells", b"\0\0\0\1"), "big")
+    out = []
+    for path, props, parent in nodes[1:]:
+        if parent is not root or props.get("device_type") == b"memory\0":
+            continue
+        for base, size in cells(props.get("reg", b""), acells, scells):
+            out.append((base, base + size, path))
+        if b"simple-bus" in props.get("compatible", b"").split(b"\0"):
+            child = int.from_bytes(props.get("#address-cells", b"\0\0\0\1"), "big")
+            csize = int.from_bytes(props.get("#size-cells", b"\0\0\0\1"), "big")
+            for _, base, size in cells(props.get("ranges", b""), child, acells, csize):
+                out.append((base, base + size, path))
+    return out
+
+
+def number(text: str) -> int:
+    return int(text.replace("_", ""), 0)
+
+
+def check_dtb_devices(root: pathlib.Path, sdk, out: list):
+    dtb = pathlib.Path(sdk or "") / DTB
+    try:
+        nodes = fdt_nodes(dtb.read_bytes())
+    except (OSError, ValueError, IndexError) as e:
+        out.append(f"P36 pins: device not in virt-9.0: cannot read {dtb} ({e})")
+        return
+    patched = [path for path, props, _ in nodes if b"arm,sp804" in props.get("compatible", b"").split(b"\0")]
+    if patched:
+        out.append(f"P36 pins: dtb is not stock virt-9.0: {dtb} has arm,sp804 at {', '.join(patched)}")
+        return
+    windows = dtb_windows(nodes)
+    for system in sorted((root / "system").glob("*.system")):
+        rel = system.relative_to(root)
+        for m in re.finditer(r'<memory_region\b[^>]*>', system.read_text()):
+            name = re.search(r'\bname="([^"]*)"', m.group(0))
+            addr = re.search(r'\bphys_addr="([^"]*)"', m.group(0))
+            if not addr:
+                continue
+            try:
+                at = number(addr.group(1))
+            except ValueError:
+                out.append(f"P36 pins: device not in virt-9.0: {rel}: phys_addr {addr.group(1)!r} is no number")
+                continue
+            if not any(start <= at < end for start, end, _ in windows):
+                out.append(f"P36 pins: device not in virt-9.0: {rel} mr '{name.group(1) if name else '?'}' "
+                           f"phys_addr {at:#x} lies in no device node of {DTB}")
+
+
+# P37: C1's forbidden patterns, outside the adjudicator.
+C1_PATTERNS = re.compile(r'"-bios"|secure=on|mon:stdio')
+C1_ALLOWED = {"tools/vm.py", "tests/tools/test_vm.py", "tools/check-pins", "tests/tools/test_check_pins.py"}
+C1_SKIP = ("docs/archive", "build", "target", ".git", ".claude", "third_party")
+
+
+def tree_files(root: pathlib.Path, skip: tuple):
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = pathlib.Path(dirpath).relative_to(root).as_posix()
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("target")
+                             and (f"{rel_dir}/{d}" if rel_dir != "." else d) not in skip and d not in skip)
+        for name in sorted(filenames):
+            yield pathlib.Path(dirpath) / name
+
+
+def check_c1_patterns(root: pathlib.Path, out: list):
+    for p in tree_files(root, C1_SKIP):
+        rel = p.relative_to(root).as_posix()
+        if rel in C1_ALLOWED:
+            continue
+        try:
+            text = p.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        for n, line in enumerate(text.splitlines(), 1):
+            if (m := C1_PATTERNS.search(line)):
+                out.append(f"P37 {rel}:{n}: {m.group(0)} outside tools/vm.py; the QEMU command line is "
+                           "vm.machine's alone (M9 plan C1)")
+
+
+# P38: C10's forbidden patterns.
+def check_c10_patterns(root: pathlib.Path, out: list):
+    for p in tree_files(root / "client", ("build", ".git")) if (root / "client").is_dir() else ():
+        rel = p.relative_to(root).as_posix()
+        try:
+            text = p.read_text()
+        except (UnicodeDecodeError, OSError):
+            continue
+        for n, line in enumerate(text.splitlines(), 1):
+            if "REPLACE_PEERS" in line:
+                out.append(f"P38 {rel}:{n}: REPLACE_PEERS; kzc-psk updates its one peer only (M9 plan D6)")
+            if "Command::new" in line and p.suffix == ".rs" and "src" in p.relative_to(root / "client").parts:
+                out.append(f"P38 {rel}:{n}: Command::new in client source; kzc and kzc-psk never shell out (M9 plan D6)")
+
+
+# P39: D12's lock pin. (lock, reference, the failure's name)
+LOCK_PINS = (("client/Cargo.lock", "Cargo.lock", "client"), ("host/Cargo.lock", "tools/release/Cargo.lock", "host"),
+             ("tools/rp-residue/Cargo.lock", "Cargo.lock", "rp-residue"))
+
+
+def lock_packages(path: pathlib.Path) -> dict:
+    out = collections.defaultdict(set)
+    # A package without a name or version is P6's to report.
+    for pkg in tomllib.loads(path.read_text()).get("package", []):
+        if isinstance(pkg, dict) and "name" in pkg and "version" in pkg:
+            out[pkg["name"]].add((pkg["version"], pkg.get("source"), pkg.get("checksum")))
+    return out
+
+
+def check_lock_pins(root: pathlib.Path, out: list):
+    for lock, reference, what in LOCK_PINS:
+        try:
+            ours, theirs = lock_packages(root / lock), lock_packages(root / reference)
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+            out.append(f"P39 pins: {what} lock drift: cannot read {lock} or {reference} ({e})")
+            continue
+        for name in sorted(set(ours) & set(theirs)):
+            for version, source, checksum in sorted(ours[name] - theirs[name], key=str):
+                out.append(f"P39 pins: {what} lock drift: {lock} locks {name} {version} ({checksum}), {reference} "
+                           f"has {', '.join(sorted(v for v, _, _ in theirs[name]))} (M9 plan D12)")
+
+
+# P40: the test seams' two modules.
+SEAMS = re.compile(r'feature\s*=\s*"test-seams"')
+SEAM_FILES = {"host/crates/kozane-vm/src/resolve.rs", "client/crates/client-cli/src/seams.rs"}
+
+
+def check_seams(root: pathlib.Path, out: list):
+    for top in ("client", "host", "crates", "tools"):
+        if not (root / top).is_dir():
+            continue
+        for p in tree_files(root / top, ("build", ".git")):
+            rel = p.relative_to(root).as_posix()
+            if p.suffix != ".rs" or rel in SEAM_FILES or "src" not in p.relative_to(root).parts:
+                continue
+            for n, line in enumerate(p.read_text().splitlines(), 1):
+                if SEAMS.search(line):
+                    out.append(f"P40 {rel}:{n}: a test-seams cfg outside resolve.rs and seams.rs (M9 plan C4, C10)")
+
+
+# P41: D6's canonical unit subset, on the units the operations docs carry.
+def unit_problem(lines: list) -> str:
+    """Why `lines` (a unit file) is outside the subset, or ''."""
+    sections, current = {}, None
+    for n, line in enumerate(lines, 1):
+        if not line or line.startswith("#"):
+            continue
+        if line != line.strip() or line.endswith("\\"):
+            return f"line {n}: not canonical"
+        if line.startswith("[") and line.endswith("]"):
+            if line[1:-1] in sections:
+                return f"line {n}: section {line} repeated"
+            current = sections.setdefault(line[1:-1], set())
+            continue
+        key, eq, value = line.partition("=")
+        if not eq or not key.isalnum() or not key.isascii() or value != value.strip():
+            return f"line {n}: want Key=Value"
+        if "~" in value:
+            return f"line {n}: a `~` (inverted list)"
+        if current is None:
+            return f"line {n}: outside a section"
+        if key in current:
+            return f"line {n}: {key} repeated"
+        current.add(key)
+    return ""
+
+
+def check_units(root: pathlib.Path, out: list):
+    for doc in sorted((root / "docs/operations").glob("*.md")):
+        rel = doc.relative_to(root).as_posix()
+        lines = doc.read_text().splitlines()
+        fences = [i for i, line in enumerate(lines) if line.startswith("```")]
+        for start, end in zip(fences[::2], fences[1::2]):
+            block = lines[start + 1:end]
+            if next((line for line in block if line.strip()), "") != "[Unit]":
+                continue
+            if (why := unit_problem(block)):
+                out.append(f"P41 units: non-canonical unit file: {rel}:{start + 2}: {why}")
+
+
+# P42: the client's scrub after each initiator call.
+CLIENT_LIB = "client/crates/client/src/lib.rs"
+CLIENT_INITIATOR_CALLS = 6
+INITIATOR_CALL = re.compile(r"\bini\.(start|handle_resp_hello|handle_empty_data|handle_cookie_reply|tick)\(")
+
+
+def check_client_scrub(root: pathlib.Path, out: list):
+    try:
+        lines = (root / CLIENT_LIB).read_text().splitlines()
+    except (OSError, UnicodeDecodeError) as e:
+        out.append(f"P42 {CLIENT_LIB}: cannot read ({e})")
+        return
+    calls = 0
+    for n, line in enumerate(lines, 1):
+        if not INITIATOR_CALL.search(line):
+            continue
+        calls += 1
+        rest = [l.strip() for l in lines[n:] if l.strip()]
+        if not re.match(r"\s*let \w+ = ini\.\w+\(.*\);$", line) or rest[:1] != ["scrub_stack();"]:
+            out.append(f"P42 {CLIENT_LIB}:{n}: initiator call not followed by scrub_stack() (deviation D-16)")
+    if calls != CLIENT_INITIATOR_CALLS:
+        out.append(f"P42 {CLIENT_LIB}: {calls} initiator calls, want {CLIENT_INITIATOR_CALLS}; "
+                   "each must be followed by scrub_stack()")
+    for p in tree_files(root / "client", ("build", ".git", "target")) if (root / "client").is_dir() else []:
+        rel = p.relative_to(root).as_posix()
+        if p.suffix != ".rs" or rel == CLIENT_LIB or "src" not in p.relative_to(root).parts:
+            continue
+        for n, line in enumerate(p.read_text().splitlines(), 1):
+            if re.search(r"\bInitiator\b", line):
+                out.append(f"P42 {rel}:{n}: names Initiator; only {CLIENT_LIB} calls it, with its scrub")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default=".")
     ap.add_argument("--enforce-pending", action="store_true")
+    ap.add_argument("--sdk", default=os.environ.get("MICROKIT_SDK"))
     args = ap.parse_args()
     root = pathlib.Path(args.root)
     pending = set() if args.enforce_pending else PENDING
@@ -1452,6 +1967,16 @@ def main() -> int:
     check_firmware(root, out)
     check_no_rndr(root, out)
     check_boot_stage(root, out)
+    check_rp_vectors(root, out)
+    check_rp_constants(root, out)
+    check_stack_top(root, args.sdk, out)
+    check_dtb_devices(root, args.sdk, out)
+    check_c1_patterns(root, out)
+    check_c10_patterns(root, out)
+    check_lock_pins(root, out)
+    check_seams(root, out)
+    check_units(root, out)
+    check_client_scrub(root, out)
     failing = [l for l in out if l.split()[0] not in pending]
     for line in out:
         print(line if line in failing else f"pending {line}")

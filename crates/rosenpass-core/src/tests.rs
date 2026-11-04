@@ -419,7 +419,7 @@ fn hedged_output_depends_on_the_counter() {
 
 const COOKIE: &str = include_str!("../tests/vectors/cookie.txt");
 
-fn cv(name: &str) -> Vec<u8> {
+pub(crate) fn cv(name: &str) -> Vec<u8> {
     for line in COOKIE.lines().filter(|l| !l.starts_with('#') && !l.is_empty()) {
         let (k, hex) = line.split_once(' ').unwrap();
         if k == name {
@@ -429,11 +429,11 @@ fn cv(name: &str) -> Vec<u8> {
     panic!("no cookie vector {name}")
 }
 
-fn cookie_secret() -> Secret<16> {
+pub(crate) fn cookie_secret() -> Secret<16> {
     Secret::from_bytes(cv("cookie.secret").try_into().unwrap())
 }
 
-fn cookie_host() -> [u8; 18] {
+pub(crate) fn cookie_host() -> [u8; 18] {
     cv("cookie.host").try_into().unwrap()
 }
 

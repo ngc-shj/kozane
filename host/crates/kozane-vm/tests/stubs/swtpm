@@ -1,0 +1,24 @@
+#!/usr/bin/python3
+"""An argv-recording swtpm stand-in (M9 plan C4, I4.1): records its argv
+and its fds into swtpm.json next to itself, answers the QEMU stand-in's one
+round trip on the ctrl fd, then runs until QEMU's end closes, as swtpm's
+`clientfd=` channel does."""
+
+import json
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(sys.argv[0]))
+sys.path.insert(0, HERE)
+import inventory  # noqa: E402
+
+rec = inventory.inventory(sys.argv[1:])
+with open(os.path.join(HERE, "swtpm.json"), "w") as f:
+    json.dump(rec, f)
+ctrl = [int(m[1]) for a in sys.argv for m in [re.fullmatch(r"type=unixio,clientfd=(\d+)", a)] if m]
+if len(ctrl) == 1:
+    if os.read(ctrl[0], 4) == b"ping":
+        os.write(ctrl[0], b"pong")
+    while os.read(ctrl[0], 4096):
+        pass

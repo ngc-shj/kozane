@@ -2,6 +2,7 @@
 
 use crate::manifest::{self, ManifestError};
 use crate::sig::{self, SigError};
+use crate::verify_release;
 
 fn counter_rng() -> impl FnMut(&mut [u8]) -> bool {
     let mut n = 1u8;
@@ -27,6 +28,7 @@ fn good_manifest() -> Vec<u8> {
         ("release_seq", "1"),
         ("verus", "0.2026.10.04.426d8b0"),
         ("kani", "0.68.0"),
+        ("kozane_vm_sha256", "ff"),
     ])
     .unwrap()
 }
@@ -187,4 +189,32 @@ fn release_seq_is_a_signed_canonical_key() {
     }
     let missing: Vec<u8> = m.split_inclusive(|&b| b == b'\n').filter(|l| !l.starts_with(b"release_seq=")).flatten().copied().collect();
     assert_eq!(manifest::parse(&missing), Err(ManifestError::Missing("release_seq".into())));
+}
+
+/// M9 plan C4: the launcher's digest is signed with the rest, and a manifest
+/// without it is not a release.
+#[test]
+fn kozane_vm_sha256_is_a_signed_key() {
+    let m = good_manifest();
+    let text = String::from_utf8(m.clone()).unwrap();
+    assert!(text.contains("\nkani=0.68.0\nkozane_vm_sha256=ff\nloader_img_sha256="));
+    let (pk, _, s) = signed();
+    let swapped = text.replace("kozane_vm_sha256=ff\n", "kozane_vm_sha256=fe\n");
+    assert_eq!(sig::verify(&pk, swapped.as_bytes(), &s), Err(SigError::Ed25519Invalid));
+    let missing: Vec<u8> = m.split_inclusive(|&b| b == b'\n').filter(|l| !l.starts_with(b"kozane_vm_sha256=")).flatten().copied().collect();
+    assert_eq!(manifest::parse(&missing), Err(ManifestError::Missing("kozane_vm_sha256".into())));
+}
+
+/// The library entry point the launcher links: the fields of a verified
+/// manifest, and a refusal for a manifest that fails either check.
+#[test]
+fn verify_release_returns_the_fields_only_when_both_hold() {
+    let (pk, m, s) = signed();
+    let fields = verify_release(&pk, &m, &s).unwrap();
+    assert!(fields.iter().any(|(k, v)| k == "release_seq" && v == "1"));
+    let mut forged = m.clone();
+    forged[3] ^= 1;
+    assert!(verify_release(&pk, &forged, &s).is_err());
+    let unparsable = [m.as_slice(), b"zzz=1\n"].concat();
+    assert_eq!(verify_release(&pk, &unparsable, &s), Err("manifest key zzz is unknown".into()));
 }

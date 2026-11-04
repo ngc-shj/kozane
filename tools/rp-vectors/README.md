@@ -54,6 +54,26 @@ of whatever the buffer held before (the previous RespHello in a long-running
 responder). The driver hands the responder a zeroed buffer for that message, so
 the captured EmptyData has the all-zero cookie the kozane responder sends.
 
+The initiator's vectors (M9 plan C7) are a separate mode with its own fresh
+keys, so it touches none of the files above:
+
+    docker run --rm -v "$PWD":/work -w /work/tools/rp-vectors kozane-rp-oracle \
+        sh -c 'cargo +1.93.1 run --locked --release -- /work --initiator'
+
+It writes `v02-initiator.txt`, `spkt-initiator.bin`, `skt-initiator.bin` (the
+initiator's McEliece secret key in liboqs's layout, a test key) and
+`spkm-initiator.bin` (the responder's public key). Upstream's initiator is the
+subject here. Its draws are recorded in upstream's order:
+- the cookie value and sidi, from `rand::rng()`, through `TestVectorActive` in
+  init mode;
+- the Kyber keygen's d ‖ z, then each McEliece encapsulation attempt, from
+  liboqs `randombytes` on a SplitMix64 stream, recorded call by call.
+
+rosenpass-core replays them through its seams and must emit the same InitHello
+and InitConf. `tools/check-pins` P33 pins every file in the vectors directory
+and the rosenpass-wire seeds by sha256, so a regeneration updates
+`RP_VECTORS` there too.
+
 The McEliece vectors for `crates/mce460896` (M4 plan C8) are one more mode.
 It does not touch the files above.
 

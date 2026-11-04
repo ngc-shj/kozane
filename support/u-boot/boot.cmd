@@ -15,9 +15,10 @@
 # measure slot A, then slot B, into PCR 9; copy each envelope and each slot
 # into the image at its range; run. Every failure powers off and then
 # spins, so no failure falls through to a later command or a prompt.
-# TF-A's BL1 has started the TPM and extended PCR 0 (M7 plan C3); a TPM
-# nothing started fails the first extend below, which refuses.
+# M9 plan C2: nothing runs before U-Boot (no TF-A, D1), so U-Boot starts
+# the TPM itself. PCRs 0-7 stay zero; the seal policy names them at zero.
 tpm2 init || REFUSE
+tpm2 startup TPM2_SU_CLEAR || REFUSE
 hash sha256 0x6ff00000 0x80 *0x6fb00000 || REFUSE
 tpm2 pcr_extend 8 0x6fb00000 || REFUSE
 setexpr.q img *0x6ff00010

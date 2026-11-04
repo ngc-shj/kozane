@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """Signed releases and their verification (M5 plan C13, C12).
 
-  release.py make --keys DIR --pkg DIR --out DIR [--version V] [--allow-dirty]
+  release.py make --keys DIR --pkg DIR --out DIR [--version V] [--kozane-vm FILE] [--allow-dirty]
   release.py verify --pub DIR --release DIR [--envelope FILE --kind key|pq|tls|audit] [--allow-dirty]
 
 `make` writes OUT/{manifest, manifest.sig, published.img, boot.desc,
-flash.bin}. The manifest's image, descriptor and firmware digests and its
+u-boot.bin, kozane-vm}. The manifest's image, descriptor and firmware digests and its
 PCRs 0-8 come from the files it ships, the PCRs through tools/measure.py (the
-one host model of TF-A's and the boot command's measurements, M7 plan C4),
-and must agree with the package's own pcrs. Its release_seq is read from
+one host model of the boot command's measurements, M9 plan C2), and must
+agree with the package's own pcrs. Its release_seq is read from
 crates/release-seq, the constant the `policy` PD compiles in (M8 plan C9,
-D5), never given on the command line. A tree with
+D5), never given on the command line. Its kozane_vm_sha256 is the host
+launcher's (M9 plan C4), taken from the copy the release ships, which must
+report `SEAMS=0` (a build without the test seams). A tree with
 uncommitted changes to tracked files is refused: the commit a release names
 must be the tree it was built from.
 
 `verify` checks both signatures (tools/release), then recomputes every digest
 and PCRs 0-8 from the shipped files and compares them with the signed
 fields, and refuses a release_seq other than crates/release-seq's: the
-release is checked against the source it claims to be; with --envelope it
+release is checked against the source it claims to be. The shipped
+kozane-vm must match kozane_vm_sha256 and then report `SEAMS=0`. With --envelope it
 also checks that the envelope (of --kind: `key`'s,
 `pqkey`'s, `tlskey`'s or `auditkey`'s) has a sealed object that enforces the signed PCRs
 (`mksecrets check-envelope`, the PDs' own parser).
@@ -42,6 +45,9 @@ import measure  # noqa: E402
 
 RELEASE_BIN = ROOT / "build/release/target/release/release"
 RELEASE_SEQ_SRC = ROOT / "crates/release-seq/src/lib.rs"
+# The launcher's release build: `cargo build --release -p kozane-vm --locked`
+# in host/, no --features (M9 plan C4).
+KOZANE_VM_BIN = ROOT / "build/host/target/release/kozane-vm"
 
 
 class Refused(Exception):
@@ -72,6 +78,18 @@ def release_seq() -> str:
     return found[0]
 
 
+def require_no_seams(binary: pathlib.Path) -> None:
+    """The launcher at `binary` was built without the test seams: its
+    `--build-info` reports `SEAMS=0` and nothing else for SEAMS (M9 plan C4)."""
+    try:
+        r = subprocess.run([str(binary), "--build-info"], capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise Refused(f"kozane-vm --build-info: {e}")
+    seams = [line for line in r.stdout.splitlines() if line.startswith("SEAMS=")]
+    if r.returncode != 0 or seams != ["SEAMS=0"]:
+        raise Refused(f"kozane-vm: built with test seams, or no build info ({seams or r.returncode})")
+
+
 def versions() -> dict:
     verus = (pathlib.Path("/opt/verus/SOURCE").read_text().strip() if pathlib.Path("/opt/verus/SOURCE").exists()
              else "absent")
@@ -83,9 +101,9 @@ def make(a) -> None:
     pkg, out = pathlib.Path(a.pkg), pathlib.Path(a.out)
     if out.exists():
         raise Refused(f"{out} already exists")
-    image, desc, firmware = pkg / "published.img", pkg / "boot.desc", pkg / "flash.bin"
+    image, desc, firmware = pkg / "published.img", pkg / "boot.desc", pkg / "u-boot.bin"
     try:
-        pcrs = [p.hex() for p in measure.expected_pcrs(firmware.read_bytes(), desc.read_bytes(), image.read_bytes())]
+        pcrs = [p.hex() for p in measure.expected_pcrs(desc.read_bytes(), image.read_bytes())]
     except measure.DescriptorError as e:
         raise Refused(str(e))
     if (pkg / "pcrs").read_text().split() != pcrs:
@@ -113,18 +131,23 @@ def make(a) -> None:
         "release_seq": release_seq(),
         **versions(),
     }
-    manifest = tool("render", *(f"{k}={v}" for k, v in fields.items()))
     # Built in a staging directory beside OUT and renamed into place only
     # once signed and complete (F1): a failure leaves no OUT to block the
     # retry, and no reader ever sees a half-written release. The commit
     # point is the rename, after the signature is written.
     staging = pathlib.Path(tempfile.mkdtemp(prefix=f".{out.name}.release-", dir=out.parent))
     try:
+        # The digest and the build-info check are both of the copy shipped.
+        shutil.copyfile(a.kozane_vm, staging / "kozane-vm")
+        (staging / "kozane-vm").chmod(0o755)
+        require_no_seams(staging / "kozane-vm")
+        fields["kozane_vm_sha256"] = sha256(staging / "kozane-vm")
+        manifest = tool("render", *(f"{k}={v}" for k, v in fields.items()))
         (staging / "manifest").write_text(manifest)
         tool("sign", "--keys", a.keys, "--manifest", str(staging / "manifest"), "--out", str(staging / "manifest.sig"))
         shutil.copyfile(image, staging / "published.img")
         shutil.copyfile(desc, staging / "boot.desc")
-        shutil.copyfile(firmware, staging / "flash.bin")
+        shutil.copyfile(firmware, staging / "u-boot.bin")
         staging.chmod(0o755)
         os.rename(staging, out)
     except BaseException:
@@ -137,7 +160,7 @@ def verify(a) -> None:
     rel = pathlib.Path(a.release)
     printed = tool("verify", "--pub", a.pub, "--manifest", str(rel / "manifest"), "--sig", str(rel / "manifest.sig"))
     fields = dict(line.split("=", 1) for line in printed.splitlines() if "=" in line)
-    image, desc, firmware = rel / "published.img", rel / "boot.desc", rel / "flash.bin"
+    image, desc, firmware = rel / "published.img", rel / "boot.desc", rel / "u-boot.bin"
     if fields.get("commit", "").endswith("-dirty") and not a.allow_dirty:
         raise Refused(f"the release was built from a dirty tree ({fields['commit']})")
     placeholder = measure.check_placeholder(image.read_bytes(), desc.read_bytes()) \
@@ -145,7 +168,7 @@ def verify(a) -> None:
     if placeholder:
         raise Refused("; ".join(placeholder))
     try:
-        pcrs = measure.expected_pcrs(firmware.read_bytes(), desc.read_bytes(), image.read_bytes())
+        pcrs = measure.expected_pcrs(desc.read_bytes(), image.read_bytes())
     except measure.DescriptorError as e:
         raise Refused(str(e))
     want = {
@@ -160,6 +183,12 @@ def verify(a) -> None:
     seq = release_seq()
     if fields.get("release_seq") != seq:
         raise Refused(f"release_seq: crates/release-seq says {seq}, the signed manifest says {fields.get('release_seq')}")
+    # Hash first: only the signed launcher is run for its build info.
+    launcher = rel / "kozane-vm"
+    if fields.get("kozane_vm_sha256") != sha256(launcher):
+        raise Refused(f"kozane_vm_sha256: the shipped kozane-vm gives {sha256(launcher)}, "
+                      f"the signed manifest says {fields.get('kozane_vm_sha256')}")
+    require_no_seams(launcher)
     if a.envelope:
         r = subprocess.run(["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "check-envelope",
                             "--kind", a.kind, "--envelope", a.envelope, "--pcrs", fields["pcrs"]],
@@ -177,6 +206,7 @@ def main() -> int:
     m.add_argument("--pkg", required=True)
     m.add_argument("--out", required=True)
     m.add_argument("--version", default="m5-dev")
+    m.add_argument("--kozane-vm", default=str(KOZANE_VM_BIN))
     m.add_argument("--allow-dirty", action="store_true")
     v = sub.add_parser("verify")
     v.add_argument("--pub", required=True)

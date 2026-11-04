@@ -9,10 +9,12 @@ Usage: python3 tests/tools/test_selftest_split.py
 Prints "SELFTEST-SPLIT-FIXTURES <n>" and exits non-zero on any mismatch.
 """
 
+import fcntl
 import importlib.machinery
 import importlib.util
 import pathlib
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SRC = ROOT / "tools/selftest-split"
@@ -29,8 +31,13 @@ COMMIT = "c0ffee"
 CASES = {"a", "b", "c"}
 
 
-def log(part, i, n, results, commit=COMMIT, exited=True, layers=True):
+IMAGE = "ca72 934a"
+
+
+def log(part, i, n, results, commit=COMMIT, exited=True, layers=True, image=IMAGE):
     text = f"SELFTEST-SPLIT-INSTANCE {part} {i}/{n} commit={commit}\n"
+    if image:
+        text += f"SELFTEST-SPLIT-IMAGE {image}\n"
     text += f"SELFTEST-SPLIT-ASSIGNED {' '.join(results)}\n"
     for case, ok in results.items():
         text += f"{'ok  ' if ok else 'FAIL'} {case}: exit=2\nSELFTEST-CASE {case} {'ok' if ok else 'FAIL'}\n"
@@ -76,6 +83,13 @@ def main() -> int:
     other = valid()
     other["rest-2.log"] = log("rest", 2, 2, {"c": True}, commit="deadbeef")
     merged("a commit mismatch", other, "instances ran different commits")
+    # M9 plan C6 (image identity): one IMAGE and QEMU value across the logs.
+    mixed = valid()
+    mixed["rest-2.log"] = log("rest", 2, 2, {"c": True}, image="ffff 934a")
+    merged("two images in one merge", mixed, "mixed images")
+    unnamed = valid()
+    unnamed["rest-2.log"] = log("rest", 2, 2, {"c": True}, image=None)
+    merged("an instance with no image record", unnamed, "rest-2.log: no image record")
 
     # A failed case is no structural problem, but it fails the merge.
     ran += 1
@@ -99,12 +113,54 @@ def main() -> int:
     failures += not ok
     print(f"{'ok  ' if ok else 'FAIL'} classify: multi-line rule head and $(MAKE) call: {parts}")
 
-    # The real Makefile and cases: integration-count runs the full suite.
+    # The real Makefile and cases: integration-count runs the full suite;
+    # the KVM and kzc gates' cases get their own partitions (M9 plan C6).
     ran += 1
     _, real, _ = split.selftest_parts(4)
     ok = "integration-count" in real["qemu"]
     failures += not ok
     print(f"{'ok  ' if ok else 'FAIL'} classify: integration-count is a qemu case")
+    ran += 1
+    ok = "kvm-proof" in real["kvm"] and "kzc-cookie" in real["kzc"] \
+        and not set(real["kvm"]) & set(real["qemu"]) and not set(real["kzc"]) & set(real["qemu"])
+    failures += not ok
+    print(f"{'ok  ' if ok else 'FAIL'} classify: test-kvm and test-kzc cases are kvm and kzc cases: "
+          f"kvm {real['kvm']}, kzc {real['kzc']}")
+
+    # The partition locks: kvm never beside solver (or a proof run), kzc
+    # never beside qemu; each refusal names the holder. The allow side: with
+    # nothing held, both take their locks.
+    def locked(name, part, holder, held_lock, needle):
+        nonlocal failures, ran
+        ran += 1
+        with tempfile.TemporaryDirectory() as d:
+            paths = {k: pathlib.Path(d) / f"{k}.lock" for k in ("host", "solver", "proof")}
+            other = None
+            if holder:
+                other = open(paths[held_lock], "w")
+                fcntl.flock(other, fcntl.LOCK_EX)
+                other.write(f"{holder}\n")
+                other.flush()
+            try:
+                got = split.take_locks(part, paths)
+                for f in got:
+                    f.close()
+                result = "taken"
+            except SystemExit as e:
+                result = str(e)
+            finally:
+                if other:
+                    other.close()
+        ok = (needle in result) if needle else result == "taken"
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} locks: {name}: {result}")
+
+    locked("kvm with nothing held", "kvm", None, None, None)
+    locked("kzc with nothing held", "kzc", None, None, None)
+    locked("kvm beside solver", "kvm", "solver", "solver", "selftest-split: kvm beside solver")
+    locked("kvm beside a proof run", "kvm", "kani-gate", "proof", "selftest-split: kvm beside kani-gate")
+    locked("kvm beside qemu", "kvm", "qemu", "host", "selftest-split: kvm beside qemu")
+    locked("kzc beside qemu", "kzc", "qemu", "host", "selftest-split: kzc beside qemu")
 
     # ... and every case lands in exactly one instance at any N.
     ran += 1

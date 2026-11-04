@@ -1,0 +1,44 @@
+# kzc up: the Rosenpass initiator, which parses the network, with no
+# capabilities and only rp.sk and the pinned gateway key (M9 plan D6).
+# Canonical subset: one line per directive, no "~", no repeats.
+[Unit]
+Description=Kozane client Rosenpass initiator
+BindsTo=kozane-psk.service
+After=kozane-psk.service
+PartOf=kozane-psk.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/kzc up
+User=kozane-net
+Group=kozane-net
+CapabilityBoundingSet=
+NoNewPrivileges=yes
+LimitCORE=0
+LimitMEMLOCK=8M
+StateDirectory=kozane-net
+StateDirectoryMode=0700
+UMask=0077
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

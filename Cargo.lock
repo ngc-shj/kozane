@@ -1793,6 +1793,7 @@ dependencies = [
 name = "rosenpass-core"
 version = "0.1.0"
 dependencies = [
+ "bolero",
  "ct",
  "ingress-core",
  "libcrux-blake2",

@@ -1267,6 +1267,13 @@ impl UnknownCodes {
     }
 }
 
+/// `audit`'s own heartbeat line (M9 plan C3), `audit: Heartbeat ticks=<n>`:
+/// no producer raises it, so it has no code. Its name is reserved: no
+/// event a ring can carry is named so, and every `audit:` line a ring
+/// record prints starts `audit: src=`, so a producer cannot print a
+/// heartbeat for a node whose timer has stopped.
+pub const HEARTBEAT: &str = "Heartbeat";
+
 pub mod log;
 
 #[cfg(test)]

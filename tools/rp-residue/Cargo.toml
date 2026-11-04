@@ -1,0 +1,42 @@
+[package]
+name = "rp-residue"
+version = "0.1.0"
+edition = "2024"
+license = "BSD-2-Clause"
+publish = false
+
+# The residue cases for the Rosenpass initiator's exits (M9 plan C7, I7.2;
+# deviation D-16). Not a member of the kozane workspace and not part of
+# tools/ct-harness: rosenpass-core turns on libcrux-ml-kem's `kyber`
+# feature, which would unify into the ct-harness build and change the code
+# ct-shape compares with the PDs'. Its own lock, every shared package at the
+# root lock's version (check-pins P39).
+[workspace]
+
+[dependencies]
+rosenpass-core = { path = "../../crates/rosenpass-core" }
+rosenpass-wire = { path = "../../crates/rosenpass-wire" }
+# The client's stack scrub, called after each case as the client calls it
+# after each initiator call.
+kozane-client = { path = "../../client/crates/client" }
+# The real McEliece, for the depth the client's calls reach.
+mce460896 = { path = "../../crates/mce460896" }
+# The owned scan stack (mmap, pthread), at the root lock's version.
+libc = "=0.2.191"
+
+# The client's release profile (client/Cargo.toml): the initiator's
+# codegen as kzc ships it.
+[profile.release]
+panic = "unwind"
+overflow-checks = true
+debug = "line-tables-only"
+
+# rosenpass-wire depends on vstd: built from the vendored sources the root
+# workspace patches in, never from the registry.
+[patch.crates-io]
+vstd = { path = "../../third_party/verus/vstd" }
+verus_builtin = { path = "../../third_party/verus/verus_builtin" }
+verus_builtin_macros = { path = "../../third_party/verus/verus_builtin_macros" }
+verus_state_machines_macros = { path = "../../third_party/verus/verus_state_machines_macros" }
+verus_syn = { path = "../../third_party/verus/verus_syn" }
+verus_prettyplease = { path = "../../third_party/verus/verus_prettyplease" }

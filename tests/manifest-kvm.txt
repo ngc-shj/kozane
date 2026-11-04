@@ -1,0 +1,4 @@
+# `make test-kvm` (M9 plan C6): the boot-path cases under KVM on gx10
+# (VE21), with their own counts (build/counts-kvm); `make check` reads
+# neither.
+KVM-CASES 8

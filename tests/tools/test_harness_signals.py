@@ -230,7 +230,15 @@ done = []
 env = dict(vars(run), kill=lambda child: done.append("kill"), child=None, host=types.SimpleNamespace(stop=False),
            wg=types.SimpleNamespace(close=lambda: done.append("wg")),
            tap=types.SimpleNamespace(close=lambda: done.append("tap")), py=None, py2=None, sniffer=None, opened=[],
-           out=None, rp=None, rps=[], sock=None, threads=[], backend=None, inside=None)
+           out=None, rp=None, rps=[], sock=None, threads=[], backend=None, inside=None,
+           # M9 plan C6/C11: the tap and launcher teardowns.
+           others=(),
+           # A launcher still running: its kill is the recorded one. No process
+           # has this pid as its parent, so children_of finds none.
+           launcher=types.SimpleNamespace(poll=lambda: None, kill=lambda: done.append("kill"), wait=lambda: None,
+                                          pid=2**31 - 1),
+           bridges=[], root="/nonexistent/kozane-harness-signals",
+           con=types.SimpleNamespace(close=lambda: done.append("con")))
 
 def trace(frame, event, arg):
     # The pending handler runs on the way into the context manager, before

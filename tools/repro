@@ -5,8 +5,8 @@
 # Copies the work tree (without build/, target dirs, .git and crashes/) to a
 # directory at another absolute path, builds the published image there from
 # a cold PD target directory, and compares loader.img, report.txt, every
-# PD ELF, and both firmware images with their U-Boot (M7 plan C2) with the
-# primary build, which the caller has just made.
+# PD ELF, and both U-Boot firmware images (M9 plan C2) with the primary
+# build, which the caller has just made.
 #
 # The PD target directory is fixed by the Makefile (pd_target), outside any
 # tree: LLVM's local ThinLTO names promoted symbols with a hash of the
@@ -33,10 +33,9 @@ artifacts=(loader.img report.txt)
 for pd in "$@"; do
     artifacts+=("pd-$pd.elf")
 done
-# The firmware: its bytes decide PCR 0 (M7 plan C2, C4).
+# The firmware the release ships, and its measure variant (M9 plan C2).
 for variant in shipped measure; do
-    artifacts+=("firmware-$variant/flash.bin" "firmware-$variant/bl1.bin" "firmware-$variant/fip.bin"
-                "u-boot-$variant/u-boot.bin")
+    artifacts+=("u-boot-$variant/u-boot.bin")
 done
 
 scratch=$(mktemp -d "${TMPDIR:-/tmp}/kozane-repro.XXXXXX")

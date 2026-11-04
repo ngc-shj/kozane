@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""Timer ownership as a code property (M9 plan D13, C14 I14.2).
+
+Usage: timer-scan --system FILE --search-path DIR --out FILE
+
+seL4 exports the EL1 physical timer to EL0 for every thread at once, so no
+capability confines it. The build does: for every PD ELF the system file
+names (its `program_image`s under --search-path), every aligned 4-byte word
+of every executable PT_LOAD segment is decoded, and a register-form MRS or
+MSR in the timer class is refused outside the timer PD:
+
+    MRS/MSR (register): 1101 0101 00 L 1 o0 op1 CRn CRm op2 Rt, op0 = 2 + o0
+    rejected class:     op0 = 3, op1 = 3, CRn = 14 (CNT*_EL0: every write,
+                        and every read but ALLOWED's)
+
+The class is matched by encoding, not by name: CNTVCT, the self-synchronised
+`SS` reads and the CNTV_* timer are in it. It is the whole EL0 timer space;
+CNTKCTL_EL1 and the EL2 timer controls (op1 0 and 4) trap at EL0 and so are
+outside D13's class, but the scan rejects them too (OTHER_CNT): no PD has a
+reason to name them, and a word that does is refused, not explained.
+
+`pd-timer.elf` is exempt, and is the positive control: it must hold at
+least one rejected-class instruction (its CNTP_CVAL/CNTP_CTL writes), or the
+scan is not looking at the code it claims to.
+
+On success it writes --out (one line per PD, with the ELF's sha256, which
+`laws check`'s ELF check compares with the ELFs it reads, and
+`TIMER-SCAN-PDS <n>`, the PDs scanned: every PD but the timer) and prints
+the count line. --out is removed first, so a failed scan leaves no result.
+
+The scan's soundness needs W^X: a PD that could write its own code could
+make the instruction at run time. laws' ELF check (after the scan, in `make
+package`) refuses a writable executable segment or page.
+
+Control class: fail-closed over the shipped ELFs' executable segments, the
+code the loader maps executable (Microkit maps the other segments
+execute-never, P12). Data words inside an executable segment are decoded
+too: a false positive fails the build rather than passing it.
+"""
+
+import argparse
+import hashlib
+import os
+import pathlib
+import struct
+import sys
+import xml.etree.ElementTree as ET
+
+TIMER_ELF = "pd-timer.elf"
+PT_LOAD = 1
+PF_X = 1
+# (L, CRm, op2) of the class's reads every PD may make: the counter, through
+# cpu::now_ns, and its frequency.
+ALLOWED = {
+    (1, 0, 1): "MRS CNTPCT_EL0",
+    (1, 0, 0): "MRS CNTFRQ_EL0",
+}
+# op1 values outside D13's class whose CRn=14 registers the scan rejects too:
+# CNTKCTL_EL1 (op1 0) and the EL2 timer controls (op1 4).
+OTHER_CNT = (0, 4)
+
+
+class Fail(Exception):
+    pass
+
+
+def decode(word: int):
+    """(L, op0, op1, CRn, CRm, op2) of a register-form MRS/MSR, else None."""
+    if word & 0xFFD00000 != 0xD5100000:
+        return None
+    return ((word >> 21) & 1, 2 + ((word >> 19) & 1), (word >> 16) & 7, (word >> 12) & 0xF,
+            (word >> 8) & 0xF, (word >> 5) & 7)
+
+
+def classify(word: int) -> str:
+    """'rejected', 'allowed' or '' (not in the timer class at all)."""
+    d = decode(word)
+    if d is None:
+        return ""
+    l, op0, op1, crn, crm, op2 = d
+    if op0 != 3 or crn != 14 or (op1 != 3 and op1 not in OTHER_CNT):
+        return ""
+    if op1 == 3 and (l, crm, op2) in ALLOWED:
+        return "allowed"
+    return "rejected"
+
+
+def mnemonic(word: int) -> str:
+    l, op0, op1, crn, crm, op2 = decode(word)
+    reg = f"s{op0}_{op1}_c{crn}_c{crm}_{op2}"
+    return f"mrs x{word & 31}, {reg}" if l else f"msr {reg}, x{word & 31}"
+
+
+def executable_words(data: bytes, name: str):
+    """(file offset, word) for every 4-byte-aligned word (by virtual
+    address) of every executable PT_LOAD segment."""
+    if data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+        raise Fail(f"timer-scan: {name}: not a little-endian ELF64")
+    phoff, = struct.unpack_from("<Q", data, 0x20)
+    phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+    if phnum == 0 or phentsize < 56 or phoff + phnum * phentsize > len(data):
+        raise Fail(f"timer-scan: {name}: bad program header table")
+    segments = 0
+    for i in range(phnum):
+        p_type, p_flags, p_offset, p_vaddr, _, p_filesz = struct.unpack_from("<IIQQQQ", data, phoff + i * phentsize)
+        if p_type != PT_LOAD or not p_flags & PF_X:
+            continue
+        if p_offset + p_filesz > len(data):
+            raise Fail(f"timer-scan: {name}: executable segment {i} runs past the file")
+        segments += 1
+        for at in range((-p_vaddr) % 4, p_filesz - 3, 4):
+            yield p_offset + at, struct.unpack_from("<I", data, p_offset + at)[0]
+    if not segments:
+        raise Fail(f"timer-scan: {name}: no executable segment")
+
+
+def scan(data: bytes, name: str) -> tuple:
+    """(rejected [(offset, word)], allowed count) over the executable words."""
+    rejected, allowed = [], 0
+    for offset, word in executable_words(data, name):
+        kind = classify(word)
+        if kind == "rejected":
+            rejected.append((offset, word))
+        elif kind == "allowed":
+            allowed += 1
+    return rejected, allowed
+
+
+def system_images(system: pathlib.Path) -> list:
+    try:
+        root = ET.parse(system).getroot()
+    except (OSError, ET.ParseError) as e:
+        raise Fail(f"timer-scan: system file {system}: {e}")
+    names = [e.get("path") for e in root.iter("program_image")]
+    if not names or None in names:
+        raise Fail(f"timer-scan: system file {system}: no program_image, or one without a path")
+    return names
+
+
+def run(system: pathlib.Path, search_path: pathlib.Path) -> tuple:
+    """(errors, result lines) for every PD the system names."""
+    names = system_images(system)
+    if TIMER_ELF not in names:
+        return [f"timer-scan: no timer access in timer: {TIMER_ELF} is not in {system}"], []
+    errors, lines, scanned = [], [], 0
+    for name in sorted(set(names)):
+        try:
+            data = (search_path / name).read_bytes()
+        except OSError as e:
+            raise Fail(f"timer-scan: {name}: {e.strerror}")
+        rejected, _ = scan(data, name)
+        digest = hashlib.sha256(data).hexdigest()
+        if name == TIMER_ELF:
+            if not rejected:
+                errors.append(f"timer-scan: no timer access in timer: {name} holds no rejected-class instruction")
+            lines.append(f"pd {name} sha256={digest} control={len(rejected)}")
+            continue
+        scanned += 1
+        for offset, word in rejected:
+            errors.append(f"timer-scan: rejected instruction outside timer: pd={name} offset={offset:#x} "
+                          f"encoding={word:#010x} ({mnemonic(word)})")
+        lines.append(f"pd {name} sha256={digest} clean")
+    lines.append(f"TIMER-SCAN-PDS {scanned}")
+    return errors, lines
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--system", type=pathlib.Path, required=True)
+    ap.add_argument("--search-path", type=pathlib.Path, required=True)
+    ap.add_argument("--out", type=pathlib.Path, required=True)
+    a = ap.parse_args()
+    try:
+        a.out.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        errors, lines = run(a.system, a.search_path)
+    except Fail as e:
+        print(e)
+        return 1
+    if errors:
+        print("\n".join(errors))
+        return 1
+    tmp = a.out.with_name(a.out.name + ".tmp")
+    tmp.write_text("".join(f"{line}\n" for line in lines))
+    os.replace(tmp, a.out)
+    print(lines[-1])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

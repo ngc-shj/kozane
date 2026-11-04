@@ -74,7 +74,8 @@ pub const SESSION_ENCRYPT: u8 = 0x40;
 
 /// The PCR the cap extends (M5 plan C8): U-Boot's measurements.
 pub const PCR_INDEX: u32 = 8;
-/// The PCRs the seal policy names (M7 plan C4): 0-7, TF-A's, and 8.
+/// The PCRs the seal policy names (M7 plan C4): 0-7, zero since nothing runs
+/// before U-Boot (M9 plan C2), and 8.
 pub const POLICY_PCR_COUNT: usize = 9;
 /// TPML_PCR_SELECTION {sha256: {0..8}}: PolicyPCR and the envelope.
 pub const POLICY_PCR_SELECTION: [u8; 10] = [0, 0, 0, 1, 0x00, 0x0B, 3, 0xFF, 0x01, 0x00];

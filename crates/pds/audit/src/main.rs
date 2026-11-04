@@ -12,6 +12,10 @@
 //! a checkpoint line is due and when `auditkey` may be called. Its one PPC
 //! is `sign`, made only for that machine's `Action::Call`, which exists only
 //! after `auditkey`'s notification (`audit_core::ready_input`, F32).
+//!
+//! The heartbeat (M9 plan C3): `timer` notifies it once a second, and every
+//! `layout::audit::HEARTBEAT_S` ticks it prints `audit: Heartbeat ticks=<n>`,
+//! chained like every other line.
 
 #![no_std]
 #![no_main]
@@ -19,10 +23,11 @@
 use core::fmt::{self, Write};
 use core::ptr::NonNull;
 
-use audit_core::{Action, Chain, Checkpoints, Line, Outcome};
+use audit_core::{Action, Chain, Checkpoints, Heartbeat, Line, Outcome};
 use audit_event::{
-    Decoded, HTTP_REFUSED_NAMES, INNER_REASON_NAMES, POLICY_REASON_NAMES, POLICY_SLOT_NAMES, POLICY_STATE_REFUSED,
-    Record, TCP_LIMIT_NAMES, TLS_CLOSED_NAMES, TLS_REFUSED_NAMES, TLS_TIMEOUT_NAMES, UnknownCodes, decode, log,
+    Decoded, HEARTBEAT, HTTP_REFUSED_NAMES, INNER_REASON_NAMES, POLICY_REASON_NAMES, POLICY_SLOT_NAMES,
+    POLICY_STATE_REFUSED, Record, TCP_LIMIT_NAMES, TLS_CLOSED_NAMES, TLS_REFUSED_NAMES, TLS_TIMEOUT_NAMES, UnknownCodes,
+    decode, log,
 };
 use auditkey_core::{CHAIN_LEN, Reply};
 use layout::auditkey::{SIGN, SIGN_REPLY_WORDS, SIGN_REQ_WORDS};
@@ -229,6 +234,7 @@ struct Audit {
     /// last record printed.
     record: NonNull<[u64; supervisor_core::RECORD_WORDS]>,
     last_seq: u64,
+    heartbeat: Heartbeat,
 }
 
 fn source(name: &'static str, channel: usize, region: NonNull<u8>) -> Source {
@@ -261,7 +267,7 @@ fn start() -> Audit {
     let mut console = Console { uart, chain: Chain::new(), lost: 0, checkpoints: Checkpoints::new(SOURCES) };
     println!(console, "audit: ready");
     let record = memory_region_symbol!(supervisor_record: *mut [u64; supervisor_core::RECORD_WORDS]);
-    Audit { sources, policy, unknown: UnknownCodes::new(), console, record, last_seq: 0 }
+    Audit { sources, policy, unknown: UnknownCodes::new(), console, record, last_seq: 0, heartbeat: Heartbeat::new() }
 }
 
 fn drop_reason(r: u16) -> Option<DropReason> {
@@ -496,6 +502,9 @@ impl Handler for Audit {
                     }
                 }
             }
+        }
+        if channels.contains(Channel::new(ch::CH_TIMER)) && let Some(ticks) = self.heartbeat.tick() {
+            println!(self.console, "audit: {} ticks={}", HEARTBEAT, ticks);
         }
         // The ready checkpoint can fall due on the notification alone.
         self.console.checkpoint();

@@ -111,6 +111,45 @@ impl Encaps<EPK_LEN, ECT_LEN> for Kyber512 {
     }
 }
 
+/// Kyber-512 (round 3) secret key.
+pub const ESK_LEN: usize = 1632;
+
+/// The initiator's side of the ephemeral KEM: a fresh key pair per
+/// handshake (IHI3) and decapsulation of the responder's `ecti` (RHI4).
+pub trait Ephemeral {
+    fn keygen<R: Rng>(&mut self, rng: &mut R) -> Result<([u8; EPK_LEN], Secret<ESK_LEN>), RngError>;
+    /// Kyber rejects implicitly: a wrong ciphertext yields a pseudorandom
+    /// key that fails the next AEAD, never an error here.
+    fn decaps(&mut self, sk: &Secret<ESK_LEN>, ct: &[u8; ECT_LEN]) -> Secret<SHK_LEN>;
+}
+
+impl Ephemeral for Kyber512 {
+    fn keygen<R: Rng>(&mut self, rng: &mut R) -> Result<([u8; EPK_LEN], Secret<ESK_LEN>), RngError> {
+        use libcrux_ml_kem::kyber512;
+        let mut seed = Secret::<64>::zero();
+        rng.fill(seed.expose_mut())?;
+        // As in `encaps`, libcrux takes the seed and returns the key pair by
+        // value; those copies are inside its call (the dependency residue).
+        let (sk, pk) = kyber512::generate_key_pair(*seed.expose()).into_parts();
+        let mut sk: [u8; ESK_LEN] = sk.into();
+        let esk = Secret::copy_from(&sk);
+        zeroize::Zeroize::zeroize(&mut sk);
+        Ok((pk.into(), esk))
+    }
+
+    fn decaps(&mut self, sk: &Secret<ESK_LEN>, ct: &[u8; ECT_LEN]) -> Secret<SHK_LEN> {
+        use libcrux_ml_kem::kyber512;
+        use libcrux_ml_kem::mlkem512::{MlKem512Ciphertext, MlKem512PrivateKey};
+        let key = MlKem512PrivateKey::from(sk.expose());
+        let mut ss = kyber512::decapsulate(&key, &MlKem512Ciphertext::from(ct));
+        let mut key: [u8; ESK_LEN] = key.into();
+        zeroize::Zeroize::zeroize(&mut key);
+        let shk = Secret::copy_from(&ss);
+        zeroize::Zeroize::zeroize(&mut ss);
+        shk
+    }
+}
+
 /// Classic McEliece 460896 round 3 (`mce460896`), the static KEM for RHR5.
 /// The shim draws its randomness through a closure over `Rng`, so a failed
 /// draw surfaces directly as `EncapsError::Rng`, with no filler bytes

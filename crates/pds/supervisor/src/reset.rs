@@ -42,9 +42,9 @@ fn drain() {
     }
 }
 
-/// Resets the machine, after the drain. TF-A's PSCI does not return; if it
-/// ever did, the supervisor spins, so no fault is ever answered and no
-/// child resumes.
+/// Resets the machine, after the drain. The hypervisor's PSCI (KVM's, or
+/// QEMU's under TCG) does not return; if it ever did, the supervisor spins,
+/// so no fault is ever answered and no child resumes.
 pub fn system_reset() -> ! {
     drain();
     let args = sel4::sys::seL4_ARM_SMCContext { x0: PSCI_SYSTEM_RESET, ..Default::default() };

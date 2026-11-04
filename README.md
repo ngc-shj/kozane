@@ -1,7 +1,7 @@
 # Kozane
 
 A single-purpose network appliance OS on seL4 (Microkit), written in no_std
-Rust. One base, two images:
+Rust, run as a virtual appliance under QEMU/KVM. One base, two images:
 
 - **VPN gateway**: a WireGuard responder with Rosenpass. A session exists
   only with a fresh post-quantum PSK; WireGuard alone is refused.
@@ -21,10 +21,15 @@ an older one. The audit stream on the console is hash-chained, with
 checkpoints signed inside the gateway, so a log collector can check that it
 is complete and unaltered.
 
-> **Research project.** It has run only under QEMU (with swtpm), never on
-> hardware. It has had no independent audit, and the keys in this
-> repository are development keys. Do not deploy it to protect anything
-> real. What is and is not established is listed below.
+A client of its own, `kzc`, keeps a kernel WireGuard peer's PSK fresh
+through Rosenpass, and falls back to a random PSK when no exchange
+succeeds. Its core is a portable Rust library with a C ABI, the base for
+clients on other platforms.
+
+> **Research project.** It runs under QEMU/KVM (and TCG), with swtpm. It has
+> had no independent audit, and the keys in this repository are
+> development keys. Do not deploy it to protect anything real. What is and
+> is not established is listed below.
 
 ## What is established, and how
 
@@ -45,10 +50,15 @@ is complete and unaltered.
 | Constant-time code paths in the key PDs | CHECKED | `make ct` and `make ct-shape` (Valgrind memcheck with secrets marked undefined, and a shape gate) |
 | Post-quantum is mandatory: no WireGuard session without a Rosenpass PSK (L8), no TLS traffic secret without X25519MLKEM768 (L14) | CHECKED | Contracts in the code and end-to-end tests against wireguard-go, Rosenpass and OpenSSL |
 | Reproducible image: two builds from different paths are bit-identical; the shipped code matches the verified code at the MIR level | CHECKED | `make repro`, `make mir` |
-| Measured boot into PCR 8, secrets sealed to it, signed releases (Ed25519 + ML-DSA-65) | CHECKED (QEMU + swtpm) | `make test` boots the packaged image through U-Boot |
+| Measured boot into PCR 8, secrets sealed to it, signed releases (Ed25519 + ML-DSA-65) | CHECKED (QEMU + swtpm) | `make test` boots the packaged image through U-Boot. The firmware (U-Boot) is not measured: the launcher pins its hash, and PCRs 0–7 stay at zero |
+| The supported launch path: pinned firmware, fd-passed devices, no QMP or monitor, guest RAM locked, swtpm state encrypted | CHECKED | `make host` (the launcher against argv-recording stubs), `make test-kvm` (a release boot through `kozane-vm` under KVM) |
+| Timer writes only in the timer PD; no PD has writable executable memory | CHECKED | `tools/timer-scan` over the shipped ELFs, `tools/laws` |
+| The client: PQ-mandatory on its side (a random PSK at start and at the L8 bound), the privilege split, key file checks | CHECKED | `make client`, `make test-kzc` (kernel WireGuard against the gateway), interop with upstream Rosenpass |
 | Peer-policy bundles: two-person approval, an append-only approval ledger, slots measured into PCR 9 (not sealed), anti-rollback through a TPM NV counter | CHECKED (QEMU + swtpm) | `tools/policy` fixtures, `make test` (the policy cases), the self-test's injected faults |
 | Audit export: every line numbered and hash-chained, checkpoints signed by a separate `auditkey` PD | CHECKED | `tools/audit-verify` and its fixtures, `make test` |
-| seL4 enforces isolation for this configuration | ASSUMED | Microkit uses the MCS kernel, whose AArch64 proofs are not yet published, and QEMU `virt` is not a verified platform |
+| seL4 enforces isolation for this configuration | ASSUMED | The kernel runs at EL1 with MCS on QEMU `virt`. seL4's verified AArch64 configurations run it in EL2, MCS proofs are in progress, and QEMU `virt` is not a verified platform |
+| The host: hypervisor, QEMU, swtpm and its state, the launcher, the host admin | ASSUMED | A host admin can read guest memory and unseal. See [docs/operations/host.md](docs/operations/host.md) |
+| The launcher's first install | ASSUMED | The operator builds `tools/release` from the signed tag and checks `kozane_vm_sha256` |
 | libcrux primitives, rust-sel4, smoltcp, the Rust toolchain | ASSUMED | Pinned by version and hash, not verified here |
 
 `make check` runs every gate above. `tests/manifest.txt` lists how many
@@ -61,13 +71,25 @@ These are known and accepted, not oversights:
 - **No DMA isolation on aarch64.** Microkit supports IO address spaces only
   on x86. A compromised NIC driver PD can reach everything. The only
   defence is that the drivers copy and never parse (L7).
-- **Kernel proofs.** The MCS kernel configuration is not yet covered by
-  seL4's AArch64 proofs. Timing channels between PDs are not addressed.
-- **No hardware.** No board combines a verified kernel configuration, a TPM
-  with firmware measured boot, and a CPU random-number instruction. Under
-  QEMU, U-Boot itself is not measured, so an attacker who can replace it
-  on the boot media defeats measured boot. The quality of entropy and the
-  NIC's line-rate behaviour on real hardware are unknown.
+- **Kernel proofs.** The kernel configuration (EL1, MCS, QEMU `virt`) is not
+  covered by seL4's AArch64 proofs. Timing channels between PDs are not
+  addressed.
+- **A trusted host.** The appliance runs under QEMU/KVM. The host
+  (hypervisor, QEMU, swtpm, the launcher, its admin) is trusted: it can
+  read guest memory and unseal. The seal protects against other media
+  booted through the pinned firmware, and against a copy of the media run
+  on another TPM state. Stolen VM files stay protected only while swtpm's
+  key is off the VM's storage and guest RAM never reaches host storage. A
+  co-resident guest is not defended against: use a dedicated host.
+- **The firmware is not measured.** U-Boot is a host file. The launcher
+  refuses a U-Boot whose hash differs from the pin. Outside the launcher,
+  any first-stage code can extend PCR 8 with the genuine digests.
+- **The timer is confined by a code property, not a capability.** seL4
+  exports the generic timer to every PD. A build gate checks that only the
+  timer PD's code writes it, and that no PD can create executable memory.
+- **Client keys** are not encrypted at rest on Linux yet. A `SIGKILL`ed
+  client leaves its last PSK until the next start or the gateway's L8
+  window. Clients for Windows, macOS, iOS and Android are future work.
 - **Keys and rollback.** Release and bundle signing keys are development
   keys kept on the build host. A bundle older than the TPM counter is
   refused, and an older release refuses a bundle whose `min_release` is
@@ -89,9 +111,10 @@ milestone's deviations are in [docs/](docs/).
 ## Building and running
 
 Everything runs in a pinned development container. The base image is
-pinned by digest, packages by snapshot date, and every download by SHA-256;
-the Microkit SDK is also checked against its GPG signature. Development
-happens on an arm64 Linux host.
+pinned by digest, packages by snapshot date, and every download by SHA-256.
+The Microkit SDK is built in the image from pinned sources, for a GICv3
+EL1 board, and is bit-reproducible. Development happens on an arm64 Linux
+host. KVM is used where the host has it.
 
 ```sh
 make -C docker build    # build the dev image
@@ -100,8 +123,10 @@ make -C docker exec     # shell inside it
 
 make image              # build the PD ELFs and the loader image
 make package ...        # seal secrets to a provisioned TPM (tools/provision)
-make run PKG=<out> TPM_STATE=<swtpm state> SLOT_A=<its slot A>   # boot the package as shipped
-make test               # integration tests: VPN, HTTPS proxy, measured boot
+make run PKG=<out> TPM_STATE=<swtpm state> TPM_KEY=<its key> SLOT_A=<its slot A>   # boot the package as shipped
+make test               # integration tests under TCG: VPN, HTTPS proxy, measured boot
+make test-kvm           # the same platform under KVM, a release booted through kozane-vm
+make test-kzc           # the client against the gateway and upstream Rosenpass
 make check              # every gate: proofs, laws, constant-time, fuzz, repro, tests
 ```
 

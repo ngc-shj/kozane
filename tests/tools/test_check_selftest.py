@@ -274,6 +274,26 @@ def main() -> int:
         and "FAIL selftest-anchor: selftest: injection anchor in x.rs matched 0 times" in out.getvalue()
     failures += not ok
     print(f"{'ok  ' if ok else 'FAIL'} dry_case: a missed anchor fails, nothing is made: got {got}, made {made}")
+    # M9 plan C6 (T3.7): EXTRA_GATES join the gates the cases must cover; an
+    # extra gate with no cases fails, by name.
+    def covered(name, cases_for_gate, cases, needle):
+        nonlocal failures, ran
+        ran += 1
+        got = g["gate_problems"](["a"], ("test-kzc",), cases_for_gate, cases)
+        ok = any(needle in p for p in got) if needle else got == []
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} gate_problems: {name}: {got}")
+
+    covered("an extra gate with cases is covered", {"a": {"x"}, "test-kzc": {"y"}}, {"x": 0, "y": 0}, None)
+    covered("an extra gate with no cases fails", {"a": {"x"}, "test-kzc": set()}, {"x": 0},
+            "check-selftest: no cases for test-kzc")
+    covered("an extra gate missing from CASES_FOR_GATE fails", {"a": {"x"}}, {"x": 0},
+            "check-selftest: no cases for test-kzc")
+    covered("an extra gate's case not in CASES fails", {"a": {"x"}, "test-kzc": {"y"}}, {"x": 0}, "case mismatch ['y']")
+    ran += 1
+    real = g["gate_problems"](g["check_gates"]())
+    failures += bool(real)
+    print(f"{'ok  ' if not real else 'FAIL'} gate_problems: the real gates and cases: {real or 'covered'}")
     print(f"CHECK-SELFTEST-FIXTURES {ran}")
     return 1 if failures else 0
 

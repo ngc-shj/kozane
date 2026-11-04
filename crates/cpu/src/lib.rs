@@ -44,8 +44,10 @@ pub fn now_ns() -> u64 {
 }
 
 /// Microkit maps every PD's stack to end here (tools/laws checks maps
-/// against the same value).
-const STACK_TOP: usize = 0xff_ffff_e000;
+/// against the same value): one page below the IPC buffer at the top of the
+/// board's user vspace. Kozane's EL1 board has a 47-bit user vspace
+/// (`vspace_user_top` 0x7fff_ffff_ffff, M9 deviation D-9).
+const STACK_TOP: usize = 0x7fff_ffff_e000;
 const STACK_PAINT: u8 = 0xa5;
 
 /// The stack high-water mark (M4 plan C8): the free stack is painted once

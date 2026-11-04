@@ -5,6 +5,7 @@ Usage: python3 tests/tools/test_check_pins.py
 Prints "CHECK-PINS-FIXTURES <n>" and exits non-zero on any mismatch.
 """
 
+import os
 import pathlib
 import shutil
 import subprocess
@@ -18,20 +19,26 @@ FILES = ["docker/Dockerfile", "Makefile", "rust-toolchain.toml", "Cargo.toml", "
          # P23: the allowlist and the files it lists that are not *.rs.
          "policy/old-name-allowlist", "tests/integration/run.py", "tests/tools/test_config_build.py",
          "tools/check-pins", "tests/tools/test_check_pins.py",
-         # P24: the firmware's flags and the boot path.
-         "support/tf-a/build-flags", "support/u-boot/boot.cmd", "support/u-boot/kozane.config",
+         # P24, P25: the boot path and the machine's one source.
+         "support/u-boot/boot.cmd", "support/u-boot/kozane.config", "tools/vm.py",
          # P30: the release script that signs release_seq.
          "tools/release.py",
          # P32: the audit map and the self-test cases it cites (the
          # integration cases are run.py's, above; fixtures are copied below).
-         "docs/operations/audit-map.md", "tools/check-selftest"]
+         "docs/operations/audit-map.md", "tools/check-selftest",
+         # P36: the system file; P41: the host unit in host.md.
+         "system/kozane.system", "docs/operations/host.md", "docs/operations/client.md"]
+# P35, P36: the SDK files the rules read, copied into each tree's sdk/.
+SDK = pathlib.Path(os.environ.get("MICROKIT_SDK", "/nonexistent-sdk"))
+SDK_FILES = ["kozane-virt.dtb", "board/kozane_virt_aarch64_el1/release/address_space_constants.json"]
 # P7's cases run on a tree whose crates/ is replaced by a synthetic one.
 # P7 is enforced, so they need no --enforce-pending.
 ENFORCE: list = []
 
 
 def rules_fired(tree: pathlib.Path, args=()) -> set:
-    out = subprocess.run([sys.executable, str(TOOL), "--root", str(tree), *args], capture_output=True, text=True)
+    out = subprocess.run([sys.executable, str(TOOL), "--root", str(tree), "--sdk", str(tree / "sdk"), *args],
+                         capture_output=True, text=True)
     fired = {line.split()[0] for line in out.stdout.splitlines() if line[:1] == "P"}
     if bool(fired) != (out.returncode == 1):
         raise SystemExit(f"exit status {out.returncode} disagrees with output {fired}")
@@ -54,6 +61,21 @@ def copy_tree(dst: pathlib.Path):
     # P32: the tool fixtures the audit map cites.
     for src in (ROOT / "tests/tools").glob("*.py"):
         shutil.copy(src, dst / "tests/tools" / src.name)
+    # P38-P40: the client and launcher workspaces' sources and locks.
+    for top in ("client", "host"):
+        for src in (ROOT / top).rglob("*"):
+            rel = src.relative_to(ROOT)
+            if src.is_file() and "target" not in rel.parts and (src.suffix in (".rs", ".service")
+                                                                 or src.name in ("Cargo.toml", "Cargo.lock")):
+                (dst / rel).parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy(src, dst / rel)
+    for f in SDK_FILES:
+        (dst / "sdk" / f).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(SDK / f, dst / "sdk" / f)
+    # P33, P34: the Rosenpass vectors and the rosenpass-wire seeds.
+    for src in [*(ROOT / RP_VECTORS).glob("*"), *(ROOT / RP_SEEDS).glob("seed-*")]:
+        (dst / src.relative_to(ROOT)).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src, dst / src.relative_to(ROOT))
 
 
 def write(path: pathlib.Path, text: str):
@@ -87,6 +109,9 @@ def lock_cmr_at(lock: pathlib.Path, version: str = "2.0.2"):
 SC23 = '[[waivers]]\nid = "SC23"\nowner = "M4"\nstatus = "closed"\n'
 SECRET = "\npub struct Secret<const N: usize>([u8; N]);\n"
 # P32: the audit map, and a table of its shape with one row to cite from.
+RP_VECTORS = "crates/rosenpass-core/tests/vectors"
+RP_SEEDS = "crates/rosenpass-wire/src/__fuzz__/tests__parsers_never_panic_and_round_trip/corpus"
+RP_STATE = "crates/rosenpass-core/src/initiator_state.rs"
 AUDIT_MAP = "docs/operations/audit-map.md"
 AUDIT_ROW = "\n| Question | Mechanism | Evidence | Test |\n|---|---|---|---|\n| q | m | e | {} |\n"
 
@@ -96,6 +121,35 @@ def edit(path: pathlib.Path, old: str, new: str):
     if old not in text:
         raise SystemExit(f"fixture anchor not found in {path.name}: {old!r}")
     path.write_text(text.replace(old, new, 1))
+
+
+def add_region(t: pathlib.Path, name: str, phys: str):
+    """A device region in the system file (P36 reads only phys_addr)."""
+    edit(t / "system/kozane.system", '    <memory_region name="uart_mmio" ',
+         f'    <memory_region name="{name}" size="0x1000" phys_addr="{phys}" />\n    <memory_region name="uart_mmio" ')
+
+
+def patch_bytes(path: pathlib.Path, old: bytes, new: bytes):
+    data = path.read_bytes()
+    if data.count(old) != 1:
+        raise SystemExit(f"fixture anchor not found once in {path.name}: {old!r}")
+    path.write_bytes(data.replace(old, new))
+
+
+def bump_lock(path: pathlib.Path, name: str, version: str):
+    edit(path, f'name = "{name}"\nversion = "{version}"\n', f'name = "{name}"\nversion = "{version}9"\n')
+
+
+HOST_UNIT = "docs/operations/host.md"
+CPU = "crates/cpu/src/lib.rs"
+LAWS_CHECK = "tools/laws/src/check.rs"
+SDK_CONSTANTS = "sdk/board/kozane_virt_aarch64_el1/release/address_space_constants.json"
+
+
+def move_startup_after_extend(path: pathlib.Path):
+    edit(path, "tpm2 startup TPM2_SU_CLEAR || REFUSE\n", "")
+    edit(path, "tpm2 pcr_extend 8 0x6fb00000 || REFUSE\n",
+         "tpm2 pcr_extend 8 0x6fb00000 || REFUSE\ntpm2 startup TPM2_SU_CLEAR || REFUSE\n")
 
 
 CASES = [
@@ -200,7 +254,7 @@ CASES = [
     # P16 fails closed too: it cannot find what it binds.
     ("P6 Cargo.lock without [[package]] tables", {"P6", "P16"},
      lambda t: (t / "Cargo.lock").write_text("version = 4\n")),
-    ("P6 Cargo.lock not UTF-8", {"P6", "P16"}, lambda t: (t / "Cargo.lock").write_bytes(b"version = 4\n\xff\n")),
+    ("P6 Cargo.lock not UTF-8", {"P6", "P16", "P39"}, lambda t: (t / "Cargo.lock").write_bytes(b"version = 4\n\xff\n")),
     ("P6 Cargo.lock package without a name", {"P6", "P16"},
      lambda t: (t / "Cargo.lock").write_text('version = 4\n[[package]]\nversion = "1"\n')),
     ("P6 waivers.toml missing", {"P6"}, lambda t: (t / "policy/waivers.toml").unlink()),
@@ -589,7 +643,7 @@ CASES = [
      lambda t: append(t / ".cargo/config.toml", "\n[target.aarch64-unknown-linux-gnu]\nrustflags = [\"-C\", \"x\"]\n")),
     ("P16 a workspace member without a Cargo.toml", {"P16"},
      lambda t: (t / "crates/wg-core/Cargo.toml").rename(t / "crates/wg-core/Cargo.toml.gone")),
-    ("P16 a closure package without a checksum", {"P16"},
+    ("P16 a closure package without a checksum", {"P16", "P39"},
      lambda t: edit(t / "Cargo.lock", 'checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"\n', "")),
     ("P16 a [patch] in .cargo/config.toml", {"P16"},
      lambda t: append(t / ".cargo/config.toml", '\n[patch.crates-io]\nsha3 = { path = "x" }\n')),
@@ -609,7 +663,7 @@ CASES = [
                     'checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"\ndependencies = [\n',
                     'name = "keccak"\nversion = "0.1.6"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\n'
                     'checksum = "cb26cec98cce3a3d96cbb7bced3c4b16e3d13f27ec56dbd62cbc8f39cfb9d653"\ndependencies = [\n "memchr",\n')),
-    ("P16 a closure package from another source", {"P16"},
+    ("P16 a closure package from another source", {"P16", "P39"},
      lambda t: edit(t / "Cargo.lock", 'name = "keccak"\nversion = "0.1.6"\nsource = "registry+https://github.com/rust-lang/crates.io-index"',
                     'name = "keccak"\nversion = "0.1.6"\nsource = "git+https://example.invalid/keccak#0"')),
     # P9/P10 (M4 C11): mce460896 joins the secret crates.
@@ -800,26 +854,33 @@ CASES = [
      lambda t: append(t / "policy/old-name-allowlist", "crates/wire/src/lib.rs  # stale\n")),
     ("allow an archive document cited by its file name", set(),
      lambda t: append(t / "crates/wire/src/lib.rs", "// docs/archive/review/secureos-m5-measured-release-plan.md\n")),
-    # P24 (M7 plan C2, C3): the firmware's fixed strings and the boot path.
-    ("P24 the firmware flags without BUILD_STRING", {"P24"},
-     lambda t: edit(t / "support/tf-a/build-flags", "BUILD_STRING=kozane\n", "")),
-    ("P24 the firmware flags with a build-time timestamp", {"P24"},
-     lambda t: edit(t / "support/tf-a/build-flags", 'BUILD_MESSAGE_TIMESTAMP="kozane"', "BUILD_MESSAGE_TIMESTAMP=__TIME__")),
-    ("P24 no firmware flags file", {"P24"},
-     lambda t: (t / "support/tf-a/build-flags").unlink()),
-    ("P24 U-Boot starting the TPM", {"P24"},
-     lambda t: edit(t / "support/u-boot/boot.cmd", "tpm2 init || REFUSE\n",
-                    "tpm2 init || REFUSE\ntpm2 startup TPM2_SU_CLEAR || REFUSE\n")),
+    # P24 (M9 plan C2, C12): U-Boot starts the TPM; -bios only in vm.machine.
+    ("P24 U-Boot not starting the TPM", {"P24"},
+     lambda t: edit(t / "support/u-boot/boot.cmd", "tpm2 startup TPM2_SU_CLEAR || REFUSE\n", "")),
+    ("P24 tpm2 startup only in a comment", {"P24"},
+     lambda t: edit(t / "support/u-boot/boot.cmd", "tpm2 startup TPM2_SU_CLEAR || REFUSE\n",
+                    "# tpm2 startup TPM2_SU_CLEAR || REFUSE\n")),
+    ("P24 tpm2 startup without its refusal", {"P24"},
+     lambda t: edit(t / "support/u-boot/boot.cmd", "tpm2 startup TPM2_SU_CLEAR || REFUSE\n",
+                    "tpm2 startup TPM2_SU_CLEAR\n")),
+    ("P24 tpm2 startup after the first extend", {"P24"},
+     lambda t: move_startup_after_extend(t / "support/u-boot/boot.cmd")),
     ("allow a comment naming tpm2 startup", set(),
-     lambda t: append(t / "support/u-boot/boot.cmd", "# no tpm2 startup here: BL1 starts the TPM\n")),
+     lambda t: append(t / "support/u-boot/boot.cmd", "# tpm2 startup runs once, above\n")),
     ("P24 U-Boot with measured boot on", {"P24"},
      lambda t: append(t / "support/u-boot/kozane.config", "CONFIG_MEASURED_BOOT=y\n")),
     ("P24 U-Boot with the EFI TCG2 protocol on", {"P24"},
      lambda t: append(t / "support/u-boot/kozane.config", "CONFIG_EFI_TCG2_PROTOCOL=y\n")),
     ("allow U-Boot measured boot left off", set(),
      lambda t: append(t / "support/u-boot/kozane.config", "# CONFIG_MEASURED_BOOT is not set\n")),
-    ("P24 a second QEMU command line naming its firmware", {"P24"},
+    ("P24 the harness naming its own firmware", {"P24", "P37"},
      lambda t: append(t / "tests/integration/run.py", 'BYPASS = ["-bios", "u-boot.bin"]\n')),
+    ("P24 a second -bios in tools/vm.py", {"P24"},
+     lambda t: append(t / "tools/vm.py", '\nBYPASS = ["-bios", "u-boot.bin"]\n')),
+    ("P24 tools/vm.py without -bios", {"P24"},
+     lambda t: edit(t / "tools/vm.py", '"-bios", firmware]', '"-kernel", firmware]')),
+    ("allow -bios named in the harness's prose", set(),
+     lambda t: append(t / "tests/integration/run.py", "# vm.machine passes the firmware as -bios\n")),
     # P25 (M7 plan C7, D3): no RNDR.
     ("P25 the RNDR encoding in a crate", {"P25"},
      lambda t: append(t / "crates/cpu/src/lib.rs", '// asm!("mrs {}, s3_3_c2_c4_0")\n')),
@@ -833,6 +894,13 @@ CASES = [
      lambda t: append(t / "tests/integration/run.py", 'CPU = "neoverse-n2"\n')),
     ("allow the RNDR core named in docs", set(),
      lambda t: write(t / "docs/note.md", "M6 ran on neoverse-n2.\n")),
+    ("P25 a TCG CPU with FEAT_RNG", {"P25"},
+     lambda t: edit(t / "tools/vm.py", '"tcg": "cortex-a72"', '"tcg": "max"')),
+    ("P25 a -cpu not from CPU", {"P25"},
+     lambda t: edit(t / "tools/vm.py", '"-cpu", CPU[accel]', '"-cpu", "max"')),
+    ("allow vm.py's CPU table in another order", set(),
+     lambda t: edit(t / "tools/vm.py", 'CPU = {"tcg": "cortex-a72", "kvm": "host"}',
+                    'CPU = {"kvm": "host", "tcg": "cortex-a72"}')),
     # P26 (M7 plan C9): boot-stop in leaves only, init through run_init.
     ("P26 a PPC callee enabling boot-stop", {"P26"},
      lambda t: edit(t / "crates/pds/key/Cargo.toml", 'boot-stage = { path = "../../boot-stage" }',
@@ -1005,6 +1073,105 @@ CASES = [
          "`fixture:test_audit_verify.py:deny: a deleted line`"))),
     ("allow unchecked code spans outside the Test column", set(),
      lambda t: append(t / AUDIT_MAP, "\n| Question | Evidence |\n|---|---|\n| q | `policy: accepted version=<v>` |\n")),
+    # P33 (M9 plan C7, T2.18): the Rosenpass vectors and seeds are pinned.
+    ("P33 v02.txt edited", {"P33"},
+     lambda t: edit(t / RP_VECTORS / "v02.txt", "\nkh.out ", "\nkh.out 00")),
+    ("P33 an unpinned file among the vectors", {"P33"},
+     lambda t: write(t / RP_VECTORS / "v03.txt", "x 00\n")),
+    ("P33 a rosenpass-wire seed removed", {"P33"},
+     lambda t: (t / RP_SEEDS / "seed-init-hello").unlink()),
+    ("allow a generated rosenpass-wire corpus file", set(),
+     lambda t: write(t / RP_SEEDS / "0123abcd", "generated\n")),
+    # P34 (M9 plan C7): the initiator's constants follow upstream's lines.
+    ("P34 a delay constant changed", {"P34"},
+     lambda t: edit(t / RP_STATE, "= 500 * NS_PER_MS;", "= 501 * NS_PER_MS;")),
+    ("P34 the jitter fraction changed", {"P34"},
+     lambda t: edit(t / RP_STATE, "RETRANSMIT_DELAY_JITTER_DEN: u64 = 2;", "RETRANSMIT_DELAY_JITTER_DEN: u64 = 4;")),
+    ("P34 a citation drifted", {"P34"},
+     lambda t: edit(t / RP_STATE, "(`constants.rs:56`)", "(`constants.rs:57`)")),
+    ("P34 the excerpt's upstream value edited", {"P33", "P34"},
+     lambda t: edit(t / RP_VECTORS / "upstream-constants.txt", "RETRANSMIT_DELAY_END: Timing = 10.0;",
+                    "RETRANSMIT_DELAY_END: Timing = 11.0;")),
+    ("P34 the oracle's upstream commit bumped", {"P34"},
+     lambda t: edit(t / "docker/Dockerfile", "ARG RP_MASTER_COMMIT=9e72", "ARG RP_MASTER_COMMIT=9e73")),
+    ("allow a constant spelled as a plain literal", set(),
+     lambda t: edit(t / RP_STATE, "= 10_000 * NS_PER_MS;", "= 10_000_000_000;")),
+    # P35 (M9 deviation D-9): the stack top follows the board.
+    ("P35 cpu's stack top left at the EL2 board's", {"P35"},
+     lambda t: edit(t / CPU, "const STACK_TOP: usize = 0x7fff_ffff_e000;", "const STACK_TOP: usize = 0xff_ffff_e000;")),
+    ("P35 laws' stack top drifted", {"P35"},
+     lambda t: edit(t / LAWS_CHECK, "const STACK_TOP: u64 = 0x7fff_ffff_e000;", "const STACK_TOP: u64 = 0x7fff_ffff_d000;")),
+    ("P35 the board's vspace grew", {"P35"},
+     lambda t: edit(t / SDK_CONSTANTS, '"vspace_user_top": 140737488355327', '"vspace_user_top": 281474976710655')),
+    ("P35 no SDK to compare with", {"P35", "P36"}, lambda t: None, ("--sdk", "/nonexistent-sdk")),
+    ("P35 a second stack top in cpu", {"P35"},
+     lambda t: append(t / CPU, "\nmod again {\n    const STACK_TOP: usize = 0x7fff_ffff_e000;\n}\n")),
+    ("allow both stack tops spelled without separators", set(),
+     lambda t: (edit(t / CPU, "STACK_TOP: usize = 0x7fff_ffff_e000;", "STACK_TOP: usize = 0x7fffffffe000;"),
+                edit(t / LAWS_CHECK, "STACK_TOP: u64 = 0x7fff_ffff_e000;", "STACK_TOP: u64 = 0x7fffffffe000;"))),
+    # P36 (M9 plan C14, I14.1): devices of the stock machine only.
+    ("P36 the sp804 timer_mmio reinstated", {"P36"}, lambda t: add_region(t, "timer_mmio", "0x90d0000")),
+    ("P36 a device region in RAM", {"P36"}, lambda t: add_region(t, "ram_mmio", "0x4000_0000")),
+    ("P36 precondition: a dtb with an arm,sp804 node", {"P36"},
+     lambda t: patch_bytes(t / "sdk/kozane-virt.dtb", b"arm,pl061\0", b"arm,sp804\0")),
+    ("allow a device in the platform bus window", set(), lambda t: add_region(t, "tis2_mmio", "0xc001000")),
+    ("allow a device at another stock node", set(), lambda t: add_region(t, "gpio_mmio", "0x9030000")),
+    # P37 (M9 plan C1): the forbidden patterns, outside vm.py.
+    ('P37 "-bios" in another tool', {"P37"}, lambda t: append(t / "tools/release.py", '\nBIOS = ["-bios", "u-boot.bin"]\n')),
+    ("P37 secure=on in an operations doc", {"P37"},
+     lambda t: append(t / HOST_UNIT, "\nqemu -machine virt,secure=on\n")),
+    ("P37 mon:stdio in the Makefile", {"P37"}, lambda t: append(t / "Makefile", "\n# -serial mon:stdio\n")),
+    ("allow the patterns in an archived document", set(),
+     lambda t: write(t / "docs/archive/old.md", 'qemu "-bios" bl1.bin -machine secure=on -serial mon:stdio\n')),
+    ("allow -bios unquoted in prose", set(), lambda t: append(t / HOST_UNIT, "\nU-Boot runs as -bios.\n")),
+    # P38 (M9 plan D6, deviation D-13): kzc never shells out.
+    ("P38 Command::new in kzc-psk's source", {"P38"},
+     lambda t: append(t / "client/crates/client-cli/src/netlink.rs",
+                      '\n#[allow(dead_code)]\nfn ip() { let _ = std::process::Command::new("ip"); }\n')),
+    ("P38 REPLACE_PEERS in client/", {"P38"},
+     lambda t: append(t / "client/crates/client-cli/tests/netns.rs", "\n// WGDEVICE_F_REPLACE_PEERS\n")),
+    ("allow Command::new in a client test", set(),
+     lambda t: append(t / "client/crates/client-cli/tests/netns.rs",
+                      '\n#[allow(dead_code)]\nfn wg() { let _ = Command::new("wg"); }\n')),
+    # P39 (M9 plan D12): the second locks pinned to the first.
+    ("P39 a shared crate bumped in client/Cargo.lock", {"P39"},
+     lambda t: bump_lock(t / "client/Cargo.lock", "libc", "0.2.191")),
+    ("P39 a shared crate's checksum changed in host/Cargo.lock", {"P39"},
+     lambda t: edit(t / "host/Cargo.lock", 'name = "libc"\nversion = "0.2.191"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "',
+                    'name = "libc"\nversion = "0.2.191"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "0')),
+    ("P39 client/Cargo.lock missing", {"P39"}, lambda t: (t / "client/Cargo.lock").unlink()),
+    ("P39 a shared crate bumped in tools/rp-residue/Cargo.lock", {"P39"},
+     lambda t: bump_lock(t / "tools/rp-residue/Cargo.lock", "libc", "0.2.191")),
+    ("allow a client-only package's version changed", set(),
+     lambda t: bump_lock(t / "client/Cargo.lock", "kozane-client", "0.1.0")),
+    # P42 (deviation D-16): the client's scrub after every initiator call.
+    ("P42 the scrub after start removed", {"P42"},
+     lambda t: edit(t / "client/crates/client/src/lib.rs",
+                    "            let r = ini.start(&keys, now, seams);\n            scrub_stack();\n",
+                    "            let r = ini.start(&keys, now, seams);\n")),
+    ("P42 Initiator named in client-ffi", {"P42"},
+     lambda t: append(t / "client/crates/client-ffi/src/lib.rs", "\nuse rosenpass_core::Initiator as _;\n")),
+    # P40 (M9 plan C4, C10): the seams' two modules.
+    ("P40 a test-seams cfg in the launcher's main", {"P40"},
+     lambda t: append(t / "host/crates/kozane-vm/src/main.rs", '\n#[cfg(feature = "test-seams")]\nfn seam() {}\n')),
+    ("P40 a test-seams cfg in kzc-psk's netlink code", {"P40"},
+     lambda t: append(t / "client/crates/client-cli/src/netlink.rs", '\nconst S: bool = cfg!(feature = "test-seams");\n')),
+    ("allow an integration test gated on the seams", set(),
+     lambda t: write(t / "host/crates/kozane-vm/tests/seamed.rs", '#![cfg(feature = "test-seams")]\n')),
+    # P41 (M9 plan D6's subset): the host unit in host.md.
+    ("P41 a repeated directive in the host unit", {"P41"},
+     lambda t: edit(t / HOST_UNIT, "Restart=always\n", "Restart=always\nRestart=no\n")),
+    ("P41 an inverted list in the host unit", {"P41"},
+     lambda t: edit(t / HOST_UNIT, "Restart=always\n", "Restart=always\nSystemCallFilter=~@mount\n")),
+    ("P41 a repeated section in the host unit", {"P41"},
+     lambda t: edit(t / HOST_UNIT, "LimitCORE=0\n", "LimitCORE=0\n\n[Service]\nUser=root\n")),
+    ("P41 spaces around the equals sign", {"P41"},
+     lambda t: edit(t / HOST_UNIT, "Restart=always\n", "Restart = always\n")),
+    ("allow a repeated key in a block that is no unit", set(),
+     lambda t: edit(t / HOST_UNIT, "qemu=/usr/bin/qemu-system-aarch64\n",
+                    "qemu=/usr/bin/qemu-system-aarch64\nqemu=/usr/bin/qemu-system-aarch64\n")),
+    ("allow a comment and a blank line in the host unit", set(),
+     lambda t: edit(t / HOST_UNIT, "Restart=always\n", "# restarted by systemd\n\nRestart=always\n")),
 ]
 
 

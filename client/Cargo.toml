@@ -1,0 +1,34 @@
+# The client's own workspace and lock (M9 plan D12): the root lock, and so
+# the Kani keys, never change for it. Every crate shared with the root lock
+# resolves to the root's version and checksum.
+[workspace]
+resolver = "3"
+members = ["crates/client", "crates/client-ffi", "crates/client-cli"]
+
+[workspace.package]
+edition = "2024"
+license = "BSD-2-Clause"
+
+# A panic must unwind to the FFI's catch_unwind, which returns
+# KZ_ERR_INTERNAL (M9 plan C9).
+[profile.release]
+panic = "unwind"
+overflow-checks = true
+
+# Copied from the root Cargo.toml: unoptimised mce460896 keygen takes
+# minutes, and libcrux Kyber uses about 270 KB of stack at opt-level 0.
+[profile.dev.package.libcrux-ml-kem]
+opt-level = 3
+
+[profile.dev.package.mce460896]
+opt-level = 3
+
+# rosenpass-wire and wg-wire depend on vstd: built from the vendored sources
+# the root workspace patches in, never from the registry.
+[patch.crates-io]
+vstd = { path = "../third_party/verus/vstd" }
+verus_builtin = { path = "../third_party/verus/verus_builtin" }
+verus_builtin_macros = { path = "../third_party/verus/verus_builtin_macros" }
+verus_state_machines_macros = { path = "../third_party/verus/verus_state_machines_macros" }
+verus_syn = { path = "../third_party/verus/verus_syn" }
+verus_prettyplease = { path = "../third_party/verus/verus_prettyplease" }

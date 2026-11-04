@@ -1,0 +1,16 @@
+# The host launcher's own workspace and lock (M9 plan C4, D12): the root lock,
+# and so the Kani keys, never change for it. Every crate shared with the root
+# lock resolves to the root's version and checksum.
+#
+# The shipped binary: `cargo build --release -p kozane-vm --locked`, no
+# --features (`kozane-vm --build-info` prints SEAMS=0).
+[workspace]
+resolver = "3"
+members = ["crates/kozane-vm"]
+
+[workspace.package]
+edition = "2024"
+license = "BSD-2-Clause"
+
+[profile.release]
+overflow-checks = true

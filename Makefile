@@ -6,7 +6,8 @@ SHELL := bash
 .SHELLFLAGS := -euo pipefail -c
 
 BUILD ?= build
-MICROKIT_BOARD := qemu_virt_aarch64
+# M9 plan C1, C15: Kozane's own board (EL1, GICv3), from the dev image's SDK.
+MICROKIT_BOARD := kozane_virt_aarch64_el1
 # Development images print through the debug kernel too; what ships, and
 # what `make test` boots, is `release` (M5 plan C7: tools/package refuses
 # anything else).
@@ -34,10 +35,10 @@ kani_variants_boot-stage := --features boot-stop
 # The `policy` PD links policy-wire with `verifier` (M8 plan D-2), every
 # other PD without it.
 kani_variants_policy-wire := --features verifier
-kani_crates := wire ring boot-stage drbg rng-core supervisor-core ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire policy-wire audit-event auditkey-core audit-core
+kani_crates := wire ring boot-stage drbg rng-core supervisor-core ingress-core inner-core wg-wire msgs rosenpass-wire tpm2-wire tls-wire http-wire policy-wire audit-event auditkey-core audit-core rosenpass-core
 
 .PHONY: clean-counts
-.PHONY: all image package run test check check-selftest repro mir audit lint lint-pds unit kani verus ct ct-harness ct-shape bolero fuzz-long laws pins manifest kernel-config clean
+.PHONY: all image package run test check check-selftest repro mir audit lint lint-pds unit kani verus ct ct-harness ct-shape rp-residue bolero fuzz-long laws pins manifest kernel-config clean
 all: image
 
 $(counts):
@@ -75,10 +76,13 @@ SEL4_INCLUDE_DIRS=$(abspath $(sdk_config_dir)/include) \
 		-p pd-$(1) $(if $(features_$(1)),--features $(features_$(1)))
 endef
 
-# L11: single core, MCS as shipped by Microkit.
+# L11: single core, MCS. M9 plan C1: EL1 (no hypervisor support), GICv3,
+# SMC calls (the supervisor's PSCI reset), and the physical timer and
+# counter exported to EL0 (C14, D13). tools/kernel-config names the first
+# line that fails.
+kernel_config_file ?= $(sdk_config_dir)/include/kernel/gen_config.h
 kernel-config:
-	grep -q '^#define CONFIG_MAX_NUM_NODES  1$$' $(sdk_config_dir)/include/kernel/gen_config.h
-	grep -q '^#define CONFIG_KERNEL_MCS  1$$' $(sdk_config_dir)/include/kernel/gen_config.h
+	tools/kernel-config $(kernel_config_file)
 
 # Zero blob for the secrets region: `make image` is never deployable (`key`
 # is Unavailable on it); `make package` seals a real one for U-Boot to copy
@@ -110,9 +114,11 @@ $(BUILD)/policy-slot-placeholder.bin: crates/limits/src/lib.rs tools/measure.py
 	mkdir -p $(BUILD)
 	python3 -c 'import sys; sys.path.insert(0, "tools"); import measure; sys.stdout.buffer.write(bytes(measure.BUNDLE_MAX))' > $@
 
-# The laws checker runs on the exact file handed to the Microkit tool.
+# The laws checker runs on the exact file handed to the Microkit tool. Its
+# ELF check (W^X, the timer scan's result) runs in `package`, after the scan
+# (M9 plan D13).
 image: pds kernel-config $(BUILD)/secrets-placeholder.bin $(BUILD)/pq-secrets-placeholder.bin $(BUILD)/tls-secrets-placeholder.bin $(BUILD)/audit-secrets-placeholder.bin $(BUILD)/policy-slot-placeholder.bin
-	cargo run --locked -q -p laws -- check --system $(system) --policy $(policy) --search-path $(BUILD)
+	cargo run --locked -q -p laws -- check --system $(system) --policy $(policy) --search-path $(BUILD) --no-elf-check
 	$(MICROKIT_SDK)/bin/microkit $(system) \
 		--search-path $(BUILD) \
 		--board $(MICROKIT_BOARD) \
@@ -138,8 +144,18 @@ endif
 # have passed. It records the node's NodeConfig digest from the gateway.toml
 # the image was built from (crates/config's build.rs reads the same file)
 # with tools/policy, for `policy verify --fleet --package-node` (M8 plan C2).
+# M9 plan D13: first the timer scan over the ELFs it packages (no timer
+# access outside `timer`, at least one inside), then laws' ELF check, which
+# reads its result ($(BUILD)/timer-scan.txt) and checks W^X. Only the
+# shipped release package of `make test` sets timer_scan_counts, so
+# TIMER-SCAN-PDS reaches the counts once; every other package writes only
+# the file.
 gateway_config := $(or $(KOZANE_CONFIG),config/gateway.toml)
+timer_scan_counts :=
 package: image ct-harness $(firmware) policy-tool
+	tools/timer-scan --system $(system) --search-path $(BUILD) --out $(BUILD)/timer-scan.txt
+	cargo run --locked -q -p laws -- check --system $(system) --policy $(policy) --search-path $(BUILD)
+	$(if $(timer_scan_counts),mkdir -p $(counts) && grep '^TIMER-SCAN-PDS ' $(BUILD)/timer-scan.txt > $(counts)/timer-scan)
 	tools/package --secrets $(SECRETS) --pq-secrets $(PQ_SECRETS) --tls-secrets $(TLS_SECRETS) \
 		--audit-secrets $(AUDIT_SECRETS) --srk-public $(SRK_PUBLIC) --firmware $(firmware) --out $(OUT) \
 		--system $(system) --policy $(policy) \
@@ -160,7 +176,7 @@ fault_inject_timer := features_timer=fault-inject
 fault_inject_policy := features_policy=fault-inject
 package-fault-inject-%: ct-harness $(firmware)
 	$(if $(fault_inject_$*),,$(error no fault-inject variant '$*'))
-	$(MAKE) package BUILD=$(BUILD)/fault-inject-$* $(fault_inject_$*) ct_dir=$(ct_dir) firmware=$(firmware) \
+	$(MAKE) package BUILD=$(BUILD)/fault-inject-$* $(fault_inject_$*) timer_scan_counts= ct_dir=$(ct_dir) firmware=$(firmware) \
 		policy_target=$(policy_target)
 
 # Boots a package interactively, the shipped way (M7 plan I2.1): the
@@ -172,9 +188,11 @@ package-fault-inject-%: ct-harness $(firmware)
 # the package's (M8 plan C4): SLOT_A is the slot `tools/provision nv` wrote
 # when it provisioned TPM_STATE, SLOT_B the inactive one (zeros if unset).
 # Without a signed slot A at TPM_STATE's version every barrier PD halts (C6).
+# TPM_KEY is the file TPM_STATE is encrypted with (`swtpm_setup --keyfile
+# KEY --cipher aes-256-cbc`; M9 plan C1): swtpm never runs on a plaintext state.
 RUN_PORT ?= 51820
 run: $(firmware)
-	python3 tests/integration/run.py --run "$(PKG)" "$(TPM_STATE)" $(RUN_PORT) "$(SLOT_A)" "$(SLOT_B)"
+	python3 tests/integration/run.py --run "$(PKG)" "$(TPM_STATE)" $(RUN_PORT) "$(SLOT_A)" "$(SLOT_B)" "$(TPM_KEY)"
 
 # The crate-level clippy denies (indexing, unwrap, arithmetic) only bite here.
 lint: | $(counts)
@@ -292,10 +310,31 @@ ct-shape: ct-harness | $(counts)
 	cat $(counts)/ct-shape.log
 	grep '^CT-SHAPE-SYMBOLS ' $(counts)/ct-shape.log > $(counts)/ct-shape
 
+# M9 plan C7, I7.2 (deviation D-16): the initiator's residue cases, run
+# natively in their own workspace and lock (tools/rp-residue), with the
+# client's release profile. Not in the ct-harness, whose libcrux features
+# and ct-shape baseline rosenpass-core's would change. Its clippy and unit
+# tests here too: `make lint` and `make unit` do not see it.
+rp_residue_target ?= $(BUILD)/rp-residue/target
+rp-residue: | $(counts)
+	cargo build --locked --release --manifest-path tools/rp-residue/Cargo.toml --target-dir $(rp_residue_target) \
+		> $(counts)/rp-residue-build.log 2>&1 || { cat $(counts)/rp-residue-build.log; exit 1; }
+	$(rp_residue_target)/release/rp-residue --run > $(counts)/rp-residue.log 2>&1 \
+		|| { grep -v '^RP-RESIDUE-DEPTH ' $(counts)/rp-residue.log; exit 1; }
+	tail -n 1 $(counts)/rp-residue.log | grep -q '^RP-RESIDUE-DONE ' || { cat $(counts)/rp-residue.log; exit 1; }
+	cargo clippy --locked --manifest-path tools/rp-residue/Cargo.toml --target-dir $(rp_residue_target) \
+		--all-targets -- -D warnings > $(counts)/rp-residue-lint.log 2>&1 || { cat $(counts)/rp-residue-lint.log; exit 1; }
+	cargo test --locked --manifest-path tools/rp-residue/Cargo.toml --target-dir $(rp_residue_target) \
+		> $(counts)/rp-residue-unit.log 2>&1 || { cat $(counts)/rp-residue-unit.log; exit 1; }
+	{ grep '^RP-RESIDUE-CASES ' $(counts)/rp-residue.log; \
+		awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-RP-RESIDUE", n + 0 }' $(counts)/rp-residue-unit.log; } \
+		> $(counts)/rp-residue
+
 bolero_targets := wire/tests::fuzz_parse_never_panics_and_round_trips \
 	policy-wire/tests::fuzz_render_round_trips_and_parse_never_panics \
 	wg-wire/tests::fuzz_parsers_never_panic_and_round_trip \
 	rosenpass-wire/tests::fuzz_parsers_never_panic_and_round_trip \
+	rosenpass-core/tests_initiator_vectors::fuzz_initiator_input_after_upstreams_prefix \
 	tpm2-wire/tests::fuzz_response_parsers_never_panic_and_stay_in_bounds \
 	tls-wire/tests::fuzz_parsers_never_panic_and_stay_in_bounds \
 	http-wire/tests::fuzz_parse_never_panics_and_rewrite_reparses \
@@ -340,6 +379,9 @@ audit: | $(counts)
 	# The policy tool's own workspace (M8 plan C2): the same libcrux build
 	# chain as tools/release's, so the same exception file applies.
 	tools/audit-gate --lock tools/policy/Cargo.lock --ignore policy/audit-ignore-release.toml > $(counts)/audit-policy.log 2>&1 || { cat $(counts)/audit-policy.log; exit 1; }
+	# M9 plan D12: the client's and the launcher's own workspaces.
+	tools/audit-gate --lock client/Cargo.lock --ignore policy/audit-ignore-release.toml > $(counts)/audit-client.log 2>&1 || { cat $(counts)/audit-client.log; exit 1; }
+	tools/audit-gate --lock host/Cargo.lock --ignore policy/audit-ignore-release.toml > $(counts)/audit-host.log 2>&1 || { cat $(counts)/audit-host.log; exit 1; }
 	grep '^AUDIT-ADVISORIES' $(counts)/audit.log > $(counts)/audit
 
 laws: | $(counts)
@@ -371,6 +413,10 @@ pins: release-tool policy-tool | $(counts)
 	python3 tests/tools/test_verus_pairing.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_mir_gate.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_measure.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	python3 tests/tools/test_vm.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	python3 tests/tools/test_timer_scan.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	python3 tests/tools/test_kernel_config.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
+	python3 tests/tools/test_sdk_repro.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_release.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_provision.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
 	python3 tests/tools/test_mkcert.py >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
@@ -387,7 +433,7 @@ pins: release-tool policy-tool | $(counts)
 		> $(counts)/policy-unit.log 2>&1 || { cat $(counts)/policy-unit.log; exit 1; }
 	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-POLICY-TOOL", n + 0 }' $(counts)/policy-unit.log >> $(counts)/pins.log
 	tools/verus-pairing >> $(counts)/pins.log || { cat $(counts)/pins.log; exit 1; }
-	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES|UNIT-COUNTS-FIXTURES|PROOF-LOCK-FIXTURES|SELFTEST-SPLIT-FIXTURES|KANI-GUARD-FIXTURES|VERUS-PAIRING-FIXTURES|VERUS-PAIRED|MIR-GATE-FIXTURES|MEASURE-FIXTURES|RELEASE-FIXTURES|PROVISION-FIXTURES|MKCERT-FIXTURES|POLICY-FIXTURES|AUDIT-VERIFY-FIXTURES|UNIT-RELEASE-TOOL|UNIT-POLICY-TOOL)' $(counts)/pins.log > $(counts)/pins
+	grep -E '^(CHECK-(PINS-RULES|PINS-FIXTURES|SELFTEST-FIXTURES)|PACKAGE-FIXTURES|SECCOMP-FIXTURES|CONFIG-BUILD-FIXTURES|CHECK-MANIFEST-FIXTURES|HARNESS-SIGNAL-FIXTURES|AUDIT-GATE-FIXTURES|RP-COOKIE-TWIN-FIXTURES|CT-RECORD-FIXTURES|CT-SHAPE-FIXTURES|STACK-HEADROOM-FIXTURES|UNIT-COUNTS-FIXTURES|PROOF-LOCK-FIXTURES|SELFTEST-SPLIT-FIXTURES|KANI-GUARD-FIXTURES|VERUS-PAIRING-FIXTURES|VERUS-PAIRED|MIR-GATE-FIXTURES|MEASURE-FIXTURES|VM-FIXTURES|TIMER-SCAN-FIXTURES|KERNEL-CONFIG-FIXTURES|SDK-REPRO-FIXTURES|RELEASE-FIXTURES|PROVISION-FIXTURES|MKCERT-FIXTURES|POLICY-FIXTURES|AUDIT-VERIFY-FIXTURES|UNIT-RELEASE-TOOL|UNIT-POLICY-TOOL)' $(counts)/pins.log > $(counts)/pins
 
 # Builds its own deployment (fresh keys, generated config, release package);
 # see run.py. Packaging a release kernel needs the C9 pass record, hence
@@ -395,10 +441,39 @@ pins: release-tool policy-tool | $(counts)
 # it_boots (check-selftest only) runs a subset of the boots; such a run
 # prints INTEGRATION-CASES-PARTIAL, which this grep does not take.
 it_boots :=
-test: ct firmware | $(counts)
+test: ct firmware host-launcher | $(counts)
 	KOZANE_IT_BOOTS="$(it_boots)" python3 tests/integration/run.py > $(counts)/test.log 2>&1 \
 		|| { tail -40 $(counts)/test.log; exit 1; }
 	grep '^INTEGRATION-CASES ' $(counts)/test.log > $(counts)/test
+	tools/check-manifest --identity > $(counts)/identity
+
+# M9 plan C6, C11: the gates `make check` does not run, each with its own
+# counts directory and manifest, and the image identity of its run. Both
+# boot the release package as `test` does; their cases are run.py's
+# KOZANE_SUITE (kvm: every boot under KVM, VE21, gx10 only; kzc: kzc on
+# kernel WireGuard under TCG, VE25). Baselines are measured, not gated
+# (baselines.txt, no counts in it).
+counts_kvm := $(BUILD)/counts-kvm
+counts_kzc := $(BUILD)/counts-kzc
+# The KVM device test-kvm requires: without it the gate fails, never skips.
+kvm_dev := /dev/kvm
+.PHONY: test-kvm test-kzc kzc-seams vm-seams
+test-kvm: ct firmware host-launcher vm-seams kzc-seams
+	rm -rf $(counts_kvm) && mkdir -p $(counts_kvm)
+	KOZANE_SUITE=kvm KOZANE_ACCEL=kvm KOZANE_KVM_DEV=$(kvm_dev) KOZANE_IT_BOOTS="$(it_boots)" \
+		KOZANE_BASELINES=$(abspath $(counts_kvm))/baselines.txt python3 tests/integration/run.py \
+		> $(counts_kvm)/test.log 2>&1 || { tail -60 $(counts_kvm)/test.log; exit 1; }
+	grep '^KVM-CASES ' $(counts_kvm)/test.log > $(counts_kvm)/test
+	tools/check-manifest --identity > $(counts_kvm)/identity
+	tools/check-manifest tests/manifest-kvm.txt $(counts_kvm)
+test-kzc: ct firmware host-launcher kzc-seams
+	rm -rf $(counts_kzc) && mkdir -p $(counts_kzc)
+	KOZANE_SUITE=kzc KOZANE_IT_BOOTS="$(it_boots)" \
+		KOZANE_BASELINES=$(abspath $(counts_kzc))/baselines.txt python3 tests/integration/run.py \
+		> $(counts_kzc)/test.log 2>&1 || { tail -60 $(counts_kzc)/test.log; exit 1; }
+	grep -E '^(KZC-CASES|INTEGRATION-ORACLE-CASES) ' $(counts_kzc)/test.log > $(counts_kzc)/test
+	tools/check-manifest --identity > $(counts_kzc)/identity
+	tools/check-manifest tests/manifest-kzc.txt $(counts_kzc)
 
 # M5 plan C8: U-Boot from the image's pinned source, with the repo's config
 # fragment and the boot command of support/u-boot/boot.cmd compiled in. The
@@ -424,37 +499,13 @@ $(BUILD)/u-boot-%/u-boot.bin: support/u-boot/kozane.config support/u-boot/boot.c
 	SOURCE_DATE_EPOCH=0 env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/u-boot-$* -j$$(nproc) LOCALVERSION= >> $(BUILD)/u-boot-$*.log 2>&1 \
 		|| { tail -30 $(BUILD)/u-boot-$*.log; exit 1; }
 
-# M7 plan C2, C3: flash.bin, TF-A's BL1 at 0 and its FIP (BL2, BL31, and
-# the variant's U-Boot as BL33) at the platform's FIP offset. TF-A, Mbed
-# TLS and the vendored libTPM and libEventLog are unpacked fresh and
-# patched (support/tf-a): BL1 and BL2 extend PCR 0 through the MMIO TIS
-# before each image runs.
-tfa_tarball ?= /opt/tf-a/tf-a-2.15.0.tar.gz
-mbedtls_tarball ?= /opt/tf-a/mbedtls-3.6.6.tar.bz2
-tfa_flags := $(shell grep -v '^\#' support/tf-a/build-flags)
-tfa_patches := support/tf-a/tf-a-qemu-discrete-tpm.patch support/tf-a/libtpm-fifo-mmio.patch
-firmware ?= $(BUILD)/firmware-shipped/flash.bin
-firmware_measure := $(BUILD)/firmware-measure/flash.bin
+# M9 plan C2: the firmware is U-Boot alone, run as -bios at EL1 (EL2 under
+# TCG, deviation D-2); TF-A left with M9 (D1). `firmware` is the shipped
+# variant, `firmware_measure` the one that stops after measuring.
+firmware ?= $(uboot)
+firmware_measure := $(uboot_measure)
 .PHONY: firmware
 firmware: $(firmware) $(firmware_measure)
-
-$(BUILD)/firmware-%/flash.bin: $(BUILD)/u-boot-%/u-boot.bin support/tf-a/build-flags $(tfa_patches) \
-		$(shell find third_party/libtpm third_party/libeventlog -type f) $(tfa_tarball) $(mbedtls_tarball)
-	rm -rf $(BUILD)/firmware-$*
-	mkdir -p $(BUILD)/firmware-$*/src/contrib/mbed-tls
-	tar -xzf $(tfa_tarball) -C $(BUILD)/firmware-$*/src --strip-components=1
-	tar -xjf $(mbedtls_tarball) -C $(BUILD)/firmware-$*/src/contrib/mbed-tls --strip-components=1
-	rm -rf $(BUILD)/firmware-$*/src/contrib/libtpm $(BUILD)/firmware-$*/src/contrib/libeventlog
-	cp -r third_party/libtpm $(BUILD)/firmware-$*/src/contrib/libtpm
-	cp -r third_party/libeventlog $(BUILD)/firmware-$*/src/contrib/libeventlog
-	patch -s -p1 -d $(BUILD)/firmware-$*/src < support/tf-a/tf-a-qemu-discrete-tpm.patch
-	patch -s -p1 -d $(BUILD)/firmware-$*/src/contrib/libtpm < support/tf-a/libtpm-fifo-mmio.patch
-	env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/firmware-$*/src -j$$(nproc) $(foreach f,$(tfa_flags),'$(f)') \
-		BUILD_BASE=$(abspath $(BUILD))/firmware-$*/build BL33=$(abspath $<) all fip > $(BUILD)/firmware-$*.log 2>&1 \
-		|| { tail -30 $(BUILD)/firmware-$*.log; exit 1; }
-	cp $(BUILD)/firmware-$*/build/qemu/release/bl1.bin $(BUILD)/firmware-$*/bl1.bin
-	cp $(BUILD)/firmware-$*/build/qemu/release/fip.bin $(BUILD)/firmware-$*/fip.bin
-	python3 tools/flash-image $(BUILD)/firmware-$*/bl1.bin $(BUILD)/firmware-$*/fip.bin $@
 
 # M5 plan C13: hybrid-signed releases with dev keys (residual RM5-1).
 #   make release-keys KEYS=<new dir outside the repo and cache volumes>
@@ -467,7 +518,7 @@ release-tool:
 release-keys: release-tool
 	test -n "$(KEYS)" || { echo "release-keys: set KEYS=<dir>"; exit 1; }
 	$(release_bin) keygen --dir $(KEYS) --forbid $(CURDIR) --forbid $(HOME)/.cargo/registry
-release: release-tool
+release: release-tool host-launcher
 	test -n "$(KEYS)" -a -n "$(PKG)" -a -n "$(OUT)" || { echo "release: set KEYS= PKG= OUT="; exit 1; }
 	python3 tools/release.py make --keys $(KEYS) --pkg $(PKG) --out $(OUT)
 release-verify: release-tool
@@ -480,8 +531,55 @@ release-verify: release-tool
 policy_target := $(BUILD)/policy/target
 policy_bin = $(policy_target)/release/policy
 .PHONY: policy-tool
+# M9 plan C4: the launcher, in its own workspace (host/, D12). The argv it
+# embeds is rendered from tools/vm.py first. Commands run from host/ so its
+# rust-toolchain.toml (1.97.1) applies, not the root nightly.
+host_target := $(abspath $(BUILD))/host/target
+.PHONY: host-launcher host
+host-launcher:
+	python3 -c "import sys; sys.path.insert(0, 'tools'); import vm; vm.render_launcher_args()"
+	cd host && cargo build --locked --release -p kozane-vm --target-dir $(host_target)
+# The gate: lint and unit with and without the test seams, the advisory
+# check on host/Cargo.lock, and the seams marker (SEAMS=1 in the test build,
+# the positive control; SEAMS=0 in the shipped one).
+host: host-launcher | $(counts)
+	cd host && cargo clippy --locked --all-targets --target-dir $(host_target) -- -D warnings \
+		> $(abspath $(counts))/host-lint.log 2>&1 || { cat $(abspath $(counts))/host-lint.log; exit 1; }
+	cd host && cargo clippy --locked --all-targets --features kozane-vm/test-seams --target-dir $(host_target) -- -D warnings \
+		>> $(abspath $(counts))/host-lint.log 2>&1 || { cat $(abspath $(counts))/host-lint.log; exit 1; }
+	cd host && cargo test --locked --features kozane-vm/test-seams --target-dir $(host_target) \
+		> $(abspath $(counts))/host-unit.log 2>&1 || { cat $(abspath $(counts))/host-unit.log; exit 1; }
+	$(host_target)/debug/kozane-vm --build-info | grep -qx 'SEAMS=1' || { echo "host: test build lacks SEAMS=1"; exit 1; }
+	$(host_target)/release/kozane-vm --build-info | grep -qx 'SEAMS=0' || { echo "host: shipped launcher has test seams"; exit 1; }
+	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-HOST", n + 0 }' $(abspath $(counts))/host-unit.log > $(counts)/host
+
+# M9 plan C8-C10, D12: the client workspace. Lint and tests (the C harness
+# under valgrind included, client-ffi's tests/c_harness.rs), and C9's header
+# gate: cbindgen regenerates the header and it must equal the committed one.
+client_target := $(abspath $(BUILD))/client/target
+.PHONY: client
+client: | $(counts)
+	cd client && cargo clippy --locked --workspace --all-targets --target-dir $(client_target) -- -D warnings \
+		> $(abspath $(counts))/client-lint.log 2>&1 || { cat $(abspath $(counts))/client-lint.log; exit 1; }
+	cd client && cargo test --locked --workspace --target-dir $(client_target) \
+		> $(abspath $(counts))/client-unit.log 2>&1 || { cat $(abspath $(counts))/client-unit.log; exit 1; }
+	cd client && cbindgen --quiet --config crates/client-ffi/cbindgen.toml --crate kozane-client-ffi \
+		--output $(abspath $(BUILD))/kozane_client.h crates/client-ffi
+	cmp -s client/include/kozane_client.h $(BUILD)/kozane_client.h \
+		|| { echo "ffi: header differs"; diff -u client/include/kozane_client.h $(BUILD)/kozane_client.h; exit 1; }
+	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-CLIENT", n + 0 }' $(abspath $(counts))/client-unit.log > $(counts)/client
+
 policy-tool:
 	cargo build --locked --release --manifest-path tools/policy/Cargo.toml --target-dir $(policy_target)
+
+# M9 plan C4, C10: kozane-vm, kzc and kzc-psk with the test seams
+# (--root-prefix, --user-map), which the test-kvm and test-kzc harness runs
+# in its single-uid namespace (VE26). Debug builds, never shipped: the
+# shipped launcher is host-launcher's, without --features.
+kzc-seams:
+	cd client && cargo build --locked -p kozane-client-cli --features test-seams --bins --target-dir $(client_target)
+vm-seams: host-launcher
+	cd host && cargo build --locked -p kozane-vm --features test-seams --target-dir $(host_target)
 
 # M5 plan C4: the MIR each PD ships from a verified crate equals the MIR the
 # proof configuration compiles (tools/mir-gate).
@@ -509,7 +607,7 @@ clean-counts:
 
 check:
 	$(MAKE) clean-counts
-	$(MAKE) pins audit lint lint-pds unit kani verus ct ct-shape bolero laws mir repro test
+	$(MAKE) pins audit lint lint-pds unit client host kani verus ct ct-shape rp-residue bolero laws mir repro test
 	$(MAKE) manifest
 
 # Requires a prior `make check` (the manifest case reuses build/counts).

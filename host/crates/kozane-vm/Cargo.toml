@@ -1,0 +1,22 @@
+[package]
+name = "kozane-vm"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+# `--root-prefix` and `--user-map` (M9 plan C4), confined to src/resolve.rs,
+# so the tests run the launcher in a single-uid user namespace (VE26).
+# Never in a shipped build; `--build-info` prints SEAMS=1 when it is on.
+test-seams = []
+
+[dependencies]
+# Every system call: memfd, seals, tun/bridge ioctls, credentials, prctl,
+# pidfd, signalfd.
+libc = "=0.2.191"
+# The firmware digest, from the crate the release verifier already links.
+libcrux-sha2 = "=0.0.9"
+# The release verifier (M9 plan C4): `pin-firmware` accepts exactly what
+# `release verify` accepts.
+release = { path = "../../../tools/release" }

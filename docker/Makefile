@@ -22,6 +22,11 @@ build-amd64:
 		--build-arg GID=$(shell id -g) \
 		-t $(image):amd64 .
 
+# M9 plan D8: KVM where the host has it (gx10), with the device's group so
+# the unprivileged dev user can open it; QEMU's mem-lock needs the memlock
+# limit lifted (P14).
+kvm_flags := $(if $(wildcard /dev/kvm),--device /dev/kvm --group-add $(shell stat -c %g /dev/kvm))
+
 .PHONY: run
 run: build
 	# No NET_ADMIN: integration tests create an unprivileged user + network
@@ -30,6 +35,8 @@ run: build
 	docker run -d --name $(container) \
 		--security-opt seccomp=$(abspath seccomp-userns.json) \
 		--device /dev/net/tun \
+		$(kvm_flags) \
+		--ulimit memlock=-1 \
 		--memory $(memory) --memory-swap $(memory) \
 		--mount type=bind,src=$(repo),dst=/work \
 		--mount type=volume,src=kozane-cargo-registry,dst=/home/dev/.cargo/registry \

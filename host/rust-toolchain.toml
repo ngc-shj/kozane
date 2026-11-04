@@ -1,0 +1,6 @@
+# The launcher runs on the KVM host on a stable toolchain, as the client
+# does (M9 plan C4, D12); the gateway's nightly pin is for rust-sel4 only.
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

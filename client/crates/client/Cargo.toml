@@ -1,0 +1,25 @@
+[package]
+name = "kozane-client"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The initiator (M9 plan C7) and its seams; the client drives it and adds
+# no protocol or crypto of its own.
+rosenpass-core = { path = "../../../crates/rosenpass-core" }
+rosenpass-wire = { path = "../../../crates/rosenpass-wire" }
+# The client's decapsulation under rp.sk, through the `Decaps` seam.
+mce460896 = { path = "../../../crates/mce460896" }
+# `LIBOQS_SK_LEN` and the liboqs-to-round-3 key conversion.
+secret-blob = { path = "../../../crates/secret-blob" }
+# The L8 window, `REJECT_AFTER_TIME_NS`.
+wg-core = { path = "../../../crates/wg-core" }
+# The OS RNG (M9 plan D5), at the root lock's version.
+getrandom = { version = "=0.4.3", default-features = false }
+# mlock and MADV_DONTDUMP on the secret key, at the root lock's version.
+libc = "=0.2.191"
+# The stack scrub's volatile writes (`scrub_stack`), at the root lock's
+# version.
+zeroize = { version = "=1.8.1", default-features = false }

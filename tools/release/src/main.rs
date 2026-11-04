@@ -10,18 +10,14 @@
 //! and the cache volumes, as L6 does for secrets), creates it 0700 and the
 //! private key files 0600. `verify` reads only the public files.
 
-mod manifest;
-mod sig;
-#[cfg(test)]
-mod tests;
-
 use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use libcrux_ml_dsa::ml_dsa_65::{MLDSA65SigningKey, MLDSA65VerificationKey};
+use libcrux_ml_dsa::ml_dsa_65::MLDSA65SigningKey;
+use release::{load_verifying, manifest, read_hex, sig};
 use zeroize::Zeroizing;
 
 fn urandom(buf: &mut [u8]) -> bool {
@@ -31,15 +27,6 @@ fn urandom(buf: &mut [u8]) -> bool {
 fn arg(args: &[String], name: &str) -> Result<String, String> {
     let i = args.iter().position(|a| a == name).ok_or(format!("missing {name}"))?;
     args.get(i + 1).cloned().ok_or(format!("{name} needs a value"))
-}
-
-/// The decoded file. Both the text and the bytes are wiped on drop: the
-/// signing keys pass through here (L12).
-fn read_hex(path: &Path) -> Result<Zeroizing<Vec<u8>>, String> {
-    let text = Zeroizing::new(fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?);
-    sig::unhex(text.trim_end_matches('\n'))
-        .map(Zeroizing::new)
-        .ok_or(format!("{}: not lowercase hex", path.display()))
 }
 
 fn write_new(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
@@ -83,10 +70,6 @@ fn keygen(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn fixed<const N: usize>(bytes: &[u8], what: &str) -> Result<[u8; N], String> {
-    bytes.try_into().map_err(|_| format!("{what}: wrong length"))
-}
-
 /// Filled in place, so no copy of either key outlives this call unwiped:
 /// `SigningKeys` wipes itself on drop, `read_hex`'s buffers wipe themselves.
 fn load_signing(dir: &Path) -> Result<sig::SigningKeys, String> {
@@ -102,17 +85,6 @@ fn load_signing(dir: &Path) -> Result<sig::SigningKeys, String> {
     }
     keys.ml_dsa.as_ref_mut().copy_from_slice(&ml);
     Ok(keys)
-}
-
-fn load_verifying(dir: &Path) -> Result<sig::VerifyingKeys, String> {
-    let ed = fixed::<32>(&read_hex(&dir.join("ed25519.pub"))?, "ed25519.pub")?;
-    let mut ml = MLDSA65VerificationKey::zero();
-    let bytes = read_hex(&dir.join("ml-dsa-65.pub"))?;
-    if bytes.len() != MLDSA65VerificationKey::len() {
-        return Err("ml-dsa-65.pub: wrong length".into());
-    }
-    ml.as_ref_mut().copy_from_slice(&bytes);
-    Ok(sig::VerifyingKeys { ed25519: ed, ml_dsa: ml })
 }
 
 fn run(args: &[String]) -> Result<(), String> {
@@ -136,9 +108,8 @@ fn run(args: &[String]) -> Result<(), String> {
         Some("verify") => {
             let keys = load_verifying(Path::new(&arg(args, "--pub")?))?;
             let m = fs::read(arg(args, "--manifest")?).map_err(|e| e.to_string())?;
-            let fields = manifest::parse(&m).map_err(|e| e.to_string())?;
             let s = fs::read(arg(args, "--sig")?).map_err(|e| e.to_string())?;
-            sig::verify(&keys, &m, &s).map_err(|e| e.to_string())?;
+            let fields = release::verify_release(&keys, &m, &s)?;
             for (k, v) in fields {
                 println!("{k}={v}");
             }

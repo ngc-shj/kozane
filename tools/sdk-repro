@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# VE27 (M9 plan C15, I15.1): Kozane's Microkit SDK is bit-reproducible
+# across hosts. Runs on the host, not in the dev container: `make repro`
+# inside the container shares one SDK and cannot rebuild the image stage.
+#
+#   tools/sdk-repro build <out.sha>     build docker/'s `sdk` stage with no
+#                                       cache, list sha256 of every SDK file
+#   tools/sdk-repro compare <a> <b>     the two lists must be identical and
+#                                       name the kernel, loader and tool
+#
+# `compare` prints SDK-REPRO-ARTIFACTS <n>: how many of the three must-match
+# artifacts it compared (3, or it fails).
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+case "${1:-}" in
+build)
+    out=${2:?usage: tools/sdk-repro build <out.sha>}
+    tag="kozane-sdk-repro:$$"
+    tmp="$out.partial"
+    trap 'docker rmi "$tag" >/dev/null 2>&1 || true; rm -f "$tmp"' EXIT
+    docker build --network host --no-cache --target sdk -t "$tag" docker >&2
+    # pipefail inside the container too: a find that fails part-way must
+    # not leave a truncated list behind a successful sha256sum.
+    if ! docker run --rm "$tag" bash -c \
+        'set -euo pipefail; cd /opt/microkit/sdk; find . -type f -print0 | sort -z | xargs -0 sha256sum' > "$tmp"; then
+        echo "sdk-repro: listing the SDK failed; no list written"
+        exit 1
+    fi
+    mv "$tmp" "$out"
+    echo "sdk-repro: $(wc -l < "$out") files listed in $out"
+    ;;
+compare)
+    a=${2:?usage: tools/sdk-repro compare <a.sha> <b.sha>}
+    b=${3:?usage: tools/sdk-repro compare <a.sha> <b.sha>}
+    if ! diff -u "$a" "$b"; then
+        echo "sdk-repro: differs between $a and $b"
+        exit 1
+    fi
+    n=0
+    for f in ./board/kozane_virt_aarch64_el1/release/elf/sel4.elf \
+             ./board/kozane_virt_aarch64_el1/release/elf/loader.elf \
+             ./bin/microkit; do
+        # The path field exactly (sha256sum's "<hash>  <path>"), not a regex.
+        awk -v f="$f" '$2 == f { found = 1 } END { exit !found }' "$a" && n=$((n + 1))
+    done
+    echo "SDK-REPRO-ARTIFACTS $n"
+    if [ "$n" -lt 3 ]; then
+        echo "sdk-repro: SDK-REPRO-ARTIFACTS $n < 3"
+        exit 1
+    fi
+    ;;
+*)
+    sed -n '2,13p' "$0"
+    exit 2
+    ;;
+esac

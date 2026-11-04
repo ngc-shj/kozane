@@ -1047,3 +1047,23 @@ fn peer_kinds_are_never_coalesced_and_carry_their_value() {
         assert!(ev.slot() < SLOTS, "{ev:?}");
     }
 }
+
+#[test]
+fn no_ring_code_is_named_heartbeat() {
+    for code in 0..=u16::MAX {
+        if let Decoded::Fixed(ev) = decode(code) {
+            assert_ne!(ev.name(), HEARTBEAT, "code {code:#06x}");
+        }
+    }
+    let tables: [&[&str]; 8] = [
+        &TCP_LIMIT_NAMES,
+        &TLS_REFUSED_NAMES,
+        &TLS_CLOSED_NAMES,
+        &HTTP_REFUSED_NAMES,
+        &TLS_TIMEOUT_NAMES,
+        &POLICY_SLOT_NAMES,
+        &POLICY_REASON_NAMES,
+        &INNER_REASON_NAMES,
+    ];
+    assert!(tables.iter().all(|t| !t.contains(&HEARTBEAT)));
+}

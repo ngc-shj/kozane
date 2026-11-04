@@ -145,6 +145,30 @@ pub fn seal_cookie_reply(
     crypto::xaead_seal(&Secret::copy_from(key), nonce, mac, value.expose(), sealed)
 }
 
+/// The session id of a CookieReply: `None` unless `msg` is one, with zero
+/// reserved bytes. The padding is not checked, as upstream does not.
+pub fn reply_sid(msg: &[u8]) -> Option<[u8; 4]> {
+    let reply: &[u8; COOKIE_REPLY_LEN] = msg.try_into().ok()?;
+    let head = reply.first_chunk::<SEALED_AT>()?;
+    let (hdr, sid) = head.split_first_chunk::<SID_AT>()?;
+    (*hdr == [MSG_COOKIE_REPLY, 0, 0, 0]).then_some(())?;
+    sid.try_into().ok()
+}
+
+/// The initiator's side of `seal_cookie_reply` (upstream
+/// `handle_cookie_reply`): opens the cookie value with `mac`, the mac of the
+/// message the reply answers, as associated data.
+pub fn open_cookie_reply(
+    key: &[u8; KEY_LEN],
+    reply: &[u8; COOKIE_REPLY_LEN],
+    mac: &[u8; MAC_LEN],
+) -> Result<Secret<COOKIE_VALUE_LEN>, CryptoError> {
+    let sealed = reply.get(SEALED_AT..SEALED_AT + SEALED_LEN).ok_or(CryptoError::Buffer)?;
+    let mut value = Secret::zero();
+    crypto::xaead_open(&Secret::copy_from(key), mac, sealed, value.expose_mut())?;
+    Ok(value)
+}
+
 /// The CookieReply nonce for the `counter`-th reply under `secret`: never
 /// repeated under one secret, and unpredictable without it. Local to the
 /// responder (upstream draws a random one), so it carries a kozane label.

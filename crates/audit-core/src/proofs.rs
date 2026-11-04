@@ -2,7 +2,8 @@
 
 //! Kani harnesses (M8 plan C10, F32, F42, D-18): the ready input is the
 //! auditkey channel alone, no call precedes it, and each poll moves the due
-//! point past its own seq, with the ready checkpoint taken once. Run with
+//! point past its own seq, with the ready checkpoint taken once; and (M9
+//! plan C3) a heartbeat is due exactly on every `HEARTBEAT_S`-th tick. Run with
 //! `cargo kani -p audit-core`. The chain (libcrux's SHA-256) is out of
 //! reach; its unit tests carry known answers.
 
@@ -100,4 +101,18 @@ fn a_reply_ends_the_call() {
     if label == REFUSED {
         assert!(out == Outcome::Unsigned(REASON_REFUSED));
     }
+}
+
+/// One tick from any count: the count moves by one (saturating), and a
+/// line is due, carrying the new count, exactly when it is a multiple of
+/// `HEARTBEAT_S`.
+#[kani::proof]
+fn a_heartbeat_is_due_exactly_every_heartbeat_s_ticks() {
+    let before: u64 = kani::any();
+    let mut hb = Heartbeat { ticks: before };
+    let due = hb.tick();
+    assert!(hb.ticks == before.saturating_add(1));
+    assert!(due == (hb.ticks % HEARTBEAT_S == 0).then_some(hb.ticks));
+    kani::cover!(due.is_some(), "a heartbeat");
+    kani::cover!(due.is_none(), "no heartbeat");
 }

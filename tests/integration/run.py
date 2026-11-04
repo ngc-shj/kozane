@@ -68,6 +68,13 @@ oracle in the dev image) and its key_out is the PresharedKey. Boots 1, 6 to
 9, 10 and 11 run no Rosenpass.
 
 Missing prerequisites fail the run; nothing is skipped.
+
+KOZANE_SUITE selects M9's gates instead (their own deployment, cases and
+counts): `kvm` for `make test-kvm` (plan C6: a release boot through
+kozane-vm, seal and unseal, a kzc session, HTTPS, a policy update, a
+supervisor reset and the tick rate, every boot under KVM), `kzc` for `make
+test-kzc` (plan C11: kzc on kernel WireGuard against the gateway under TCG,
+and kzc against upstream rosenpass as responder, the D4 oracle).
 """
 
 import array
@@ -101,16 +108,19 @@ import tomllib
 
 import pexpect
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "../../tools"))
+import vm  # noqa: E402  (M9 plan C1: the one source of the QEMU and swtpm argv)
+
 BOOT_TIMEOUT_S = 60
 REPLY_TIMEOUT_S = 5
 LINE_TIMEOUT_S = 10
 
-GW_MAC = bytes.fromhex("525400123456")
+GW_MAC = vm.OUTSIDE_MAC
 GW_IP = bytes([10, 0, 2, 15])
 PEER_MAC = bytes.fromhex("52550a000202")
 PEER_IP = bytes([10, 0, 2, 2])
 WG_PORT = 51820
-INSIDE_MAC = bytes.fromhex("525400123457")
+INSIDE_MAC = vm.INSIDE_MAC
 INSIDE_IP = bytes([10, 99, 0, 1])
 HOST_MAC = bytes.fromhex("0200000099" "02")
 HOST_IP = bytes([10, 99, 0, 2])
@@ -450,39 +460,30 @@ def free_udp_port() -> int:
             return port
 
 
-# The machine every boot runs (M7 plan C2 I2.1): EL3 for TF-A, EL2 for seL4;
-# a core without FEAT_RNG (D3), so a stray RNDR faults.
-QEMU_CPU = "cortex-a72"
-# The rng PD's device (M7 plan C6): virtio-rng on slot 0, fed by the host.
-RNG_DEVICE = ["-object", "rng-random,id=rng0,filename=/dev/urandom",
-              "-device", "virtio-rng-device,rng=rng0,bus=virtio-mmio-bus.0"]
-
-
-# Deny-case firmware (M7 plan C3): `firmware_variant` derives each from
-# FIRMWARE, one byte changed in one FIP entry, and registers it here.
-FIRMWARE_VARIANTS = set()
+# The accelerator every boot runs under (M9 plan C1, C6): `tcg` on every
+# worker, `kvm` for `make test-kvm`; vm.machine refuses anything else.
+ACCEL = os.environ.get("KOZANE_ACCEL", "tcg")
 
 
 def same_bytes(a: str, b: str) -> bool:
-    """A copy of the shipped firmware (a release's flash.bin, M7 plan C11)."""
+    """A copy of the shipped firmware (a release's u-boot.bin, M7 plan C11)."""
     with open(a, "rb") as f, open(b, "rb") as g:
         return f.read() == g.read()
 
 
-def qemu_machine(firmware: str, rng: bool = True) -> list:
-    """The QEMU arguments every boot starts with. The only firmware a boot
-    may run is one of the two images `make firmware` builds, or a deny-case
-    variant firmware_variant derived from the shipped one, so no boot skips
-    TF-A's measurements (I2.1)."""
-    if firmware not in (FIRMWARE, FIRMWARE_MEASURE) and firmware not in FIRMWARE_VARIANTS \
-            and not same_bytes(firmware, FIRMWARE):
+def qemu_machine(firmware: str, tpm: str, netdevs: tuple, rng: bool = True, media=()) -> list:
+    """The QEMU arguments of every boot: vm.machine's, under ACCEL, with
+    `tpm` the socket QEMU's TPM backend connects to and `netdevs` the
+    (outside, inside) backends without an id. The only firmware a boot may
+    run is one of the two U-Boot images `make firmware` builds, or a copy of
+    the shipped one, so no boot skips U-Boot's measurements (I2.1)."""
+    if firmware not in (FIRMWARE, FIRMWARE_MEASURE) and not same_bytes(firmware, FIRMWARE):
         raise Fail(f"qemu_machine: {firmware} is not a firmware image `make firmware` builds")
-    return ["-machine", "virt,secure=on,virtualization=on", "-cpu", QEMU_CPU, "-m", "size=2G",
-            "-serial", "mon:stdio", "-nographic", "-bios", firmware] + (RNG_DEVICE if rng else [])
+    return vm.machine(ACCEL, firmware, tpm, netdevs, rng=rng, media=tuple(media))
 
 
 def boot(pkg: "Package", outside: str, inside: str, monitor: str = "", media=None, flip=None,
-         fail_extend: bool = False, inject_pcr3: bool = False, fail_nth: tuple = None,
+         fail_extend: bool = False, inject_pcr: int = None, fail_nth: tuple = None,
          firmware: str = None, rng: bool = True, shutdown: str = None, resets: tuple = None,
          swallow_pcr9: bool = False) -> tuple:
     """Every boot is the shipped one (M5 plan C14): U-Boot measures and
@@ -492,6 +493,8 @@ def boot(pkg: "Package", outside: str, inside: str, monitor: str = "", media=Non
     PCRs), stopped and removed by kill(). `flip` puts the A7 proxy between
     QEMU and swtpm, flipping a byte of each Unseal response if true;
     `fail_extend` puts it there failing the cap's PCR_Extend (post-M6 P3).
+    `outside` and `inside` are netdev backends without an id (vm.machine
+    names them).
 
     M7 plan C11: QEMU starts paused under `-no-reboot`, with a QMP socket in
     a fresh 0700 directory; the harness negotiates QMP, then continues it.
@@ -504,37 +507,31 @@ def boot(pkg: "Package", outside: str, inside: str, monitor: str = "", media=Non
     tpm = Swtpm(os.path.dirname(pkg.dir), state=pkg.state)
     proxy = None
     try:
-        if flip is not None or fail_extend or inject_pcr3 or fail_nth or swallow_pcr9:
-            proxy = TpmProxy(tpm, bool(flip), fail_extend, inject_pcr3, fail_nth, swallow_pcr9)
-        cmd = qemu_machine(firmware or FIRMWARE, rng)
-        for path, addr in media or pkg.media():
-            cmd += ["-device", f"loader,file={path},addr={addr:#x},force-raw=on"]
-        cmd += (proxy or tpm).qemu_args()
-        cmd += [
-            "-device", f"virtio-net-device,netdev=n0,mac={GW_MAC.hex(':')},bus=virtio-mmio-bus.31",
-            "-netdev", outside,
-            "-device", f"virtio-net-device,netdev=n1,mac={INSIDE_MAC.hex(':')},bus=virtio-mmio-bus.23",
-            "-netdev", inside,
-        ]
-        if monitor:
-            cmd += ["-monitor", f"unix:{monitor},server,nowait"]
+        if flip is not None or fail_extend or inject_pcr is not None or fail_nth or swallow_pcr9:
+            proxy = TpmProxy(tpm, bool(flip), fail_extend, inject_pcr, fail_nth, swallow_pcr9)
+        cmd = qemu_machine(firmware or FIRMWARE, (proxy or tpm).qemu_socket(), (outside, inside), rng,
+                           media or pkg.media())
     except BaseException:
         close_tpm(proxy, tpm)
         raise
-    return spawn_qemu(cmd, shutdown, resets, tpm, proxy)
+    return spawn_qemu(cmd, shutdown, resets, tpm, proxy, monitor)
 
 
-def spawn_qemu(cmd: list, shutdown: str = None, resets: tuple = None, tpm=None, proxy=None) -> tuple:
+def spawn_qemu(cmd: list, shutdown: str = None, resets: tuple = None, tpm=None, proxy=None,
+               monitor: str = "") -> tuple:
     """Every QEMU the suite runs (M7 plan C11): paused (`-S`) under
     `-no-reboot` unless `resets` opts out, with a QMP socket in a fresh
     0700 directory; QMP negotiated, then continued. kill() ends it and
-    the TPM handed here, and judges its QMP events (see boot())."""
+    the TPM handed here, and judges its QMP events (see boot()). These, and
+    `monitor`'s HMP socket (the residue scans, S11's reset), are the only
+    arguments the harness adds to vm.machine's (M9 plan C1)."""
     qmp_dir = None
     try:
         qmp_dir = tempfile.mkdtemp(prefix="kozane-qmp-")
         qmp_path = os.path.join(qmp_dir, "qmp.sock")
         cmd = cmd + ["-S", "-qmp", f"unix:{qmp_path},server=on,wait=off"] + \
-            ([] if resets is not None else ["-no-reboot"])
+            ([] if resets is not None else ["-no-reboot"]) + \
+            (["-monitor", f"unix:{monitor},server,nowait"] if monitor else [])
         # pexpect makes the child a session leader, so kill() takes the group.
         child = pexpect.spawn(DIE_WITH_PARENT[0], DIE_WITH_PARENT[1:] + ["qemu-system-aarch64"] + cmd,
                               encoding="utf-8", timeout=BOOT_TIMEOUT_S)
@@ -548,6 +545,12 @@ def spawn_qemu(cmd: list, shutdown: str = None, resets: tuple = None, tpm=None, 
     try:
         con = Console(child)
         child.qmp = Qmp(qmp_path)
+        if ACCEL == "kvm":
+            # M9 plan C6 (T1.3, T2.1): the boot runs under KVM, as QEMU
+            # itself reports it, not only as the argv asked.
+            kvm = child.qmp.query_kvm()
+            if kvm != {"enabled": True, "present": True}:
+                raise Fail(f"kvm: not enabled: query-kvm returned {kvm} for {cmd[:6]}")
         child.qmp.cont()
     except BaseException:
         kill(child)
@@ -556,7 +559,7 @@ def spawn_qemu(cmd: list, shutdown: str = None, resets: tuple = None, tpm=None, 
 
 
 def run_interactive(pkg_dir: str = "", state: str = "", port: str = "51820", slot_a: str = "",
-                    slot_b: str = "") -> int:
+                    slot_b: str = "", key: str = "") -> int:
     """`make run` (M7 plan I2.1): a package booted interactively the shipped
     way, through qemu_machine's firmware and a per-run copy of the swtpm
     state it was sealed to; both NICs as the suite wires them (outside on
@@ -565,10 +568,13 @@ def run_interactive(pkg_dir: str = "", state: str = "", port: str = "51820", slo
 
     The node's slots (M8 plan C4, C13): `slot_a` is the bundle `tools/
     provision nv` wrote when it provisioned `state`, `slot_b` the inactive
-    slot, zero if not given. The operator brings both, as for the package."""
-    if not pkg_dir or not state or not slot_a:
+    slot, zero if not given. The operator brings both, as for the package.
+    `key` is the file the state is encrypted with (M9 plan C1, H2): the
+    `swtpm_setup --keyfile` that created it, 64 hex digits (AES-256)."""
+    if not pkg_dir or not state or not slot_a or not key:
         print("run: PKG=<a `make package` OUT> TPM_STATE=<the swtpm state it was sealed to> "
-              "SLOT_A=<the slot `tools/provision nv` wrote for it> [SLOT_B=<the inactive slot>]", file=sys.stderr)
+              "SLOT_A=<the slot `tools/provision nv` wrote for it> TPM_KEY=<the state's key file> "
+              "[SLOT_B=<the inactive slot>]", file=sys.stderr)
         return 2
     slots = tempfile.mkdtemp(prefix="kozane-slots-")
     data = []
@@ -579,17 +585,11 @@ def run_interactive(pkg_dir: str = "", state: str = "", port: str = "51820", slo
             shutil.rmtree(slots, ignore_errors=True)
             return 2
     pkg = Package(pkg_dir, state, write_slots(slots, *data))
-    tpm = Swtpm(tempfile.gettempdir(), state=state)
+    tpm = Swtpm(tempfile.gettempdir(), state=state, key=key)
     try:
-        cmd = qemu_machine(FIRMWARE)
-        for path, addr in pkg.media():
-            cmd += ["-device", f"loader,file={path},addr={addr:#x},force-raw=on"]
-        cmd += tpm.qemu_args() + [
-            "-device", f"virtio-net-device,netdev=n0,mac={GW_MAC.hex(':')},bus=virtio-mmio-bus.31",
-            "-netdev", f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{int(port)}-:{WG_PORT}",
-            "-device", f"virtio-net-device,netdev=n1,mac={INSIDE_MAC.hex(':')},bus=virtio-mmio-bus.23",
-            "-netdev", dgram("n1", 45001, 45002),
-        ]
+        cmd = qemu_machine(FIRMWARE, tpm.qemu_socket(),
+                           (f"user,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{int(port)}-:{WG_PORT}",
+                            dgram(45001, 45002)), media=pkg.media())
         return subprocess.run(["qemu-system-aarch64", *cmd]).returncode
     finally:
         tpm.close()
@@ -746,7 +746,12 @@ class Qmp:
             elif "error" in msg:
                 raise Fail(f"QMP {command}: {msg['error']}")
             elif "return" in msg:
-                return
+                return msg["return"]
+
+    def query_kvm(self) -> dict:
+        """`query-kvm`, before `cont` (the reader thread owns the socket
+        after it)."""
+        return self._execute("query-kvm")
 
     def cont(self):
         self._execute("cont")
@@ -817,7 +822,9 @@ class Qmp:
 # is not knowable from the Microkit report, so the whole window is read and
 # a positive control (a session key that data or hs memory must hold) proves
 # it covers PD memory.
-OBJECT_RAM = (0x6000_0000, 0x0200_0000)
+# Kozane's EL1 board puts RAM at 0x4000_0000, and its PD frames fill about
+# 52 MiB from there (build/report.txt; M9 deviation D-14).
+OBJECT_RAM = (0x4000_0000, 0x0400_0000)
 
 
 def wait_absent(mon: Monitor, needle: bytes, control: bytes, scratch: str, timeout: float = 5.0,
@@ -917,8 +924,8 @@ def psk_install_bytes(peer: int, osk: bytes) -> bytes:
     return b
 
 
-def dgram(name: str, local: int, remote: int) -> str:
-    return (f"dgram,id={name},local.type=inet,local.host=127.0.0.1,local.port={local},"
+def dgram(local: int, remote: int) -> str:
+    return (f"dgram,local.type=inet,local.host=127.0.0.1,local.port={local},"
             f"remote.type=inet,remote.host=127.0.0.1,remote.port={remote}")
 
 
@@ -933,8 +940,8 @@ class Wire:
         self.qemu_port = free_udp_port()
         self.sock.settimeout(REPLY_TIMEOUT_S)
 
-    def netdev(self, name: str) -> str:
-        return dgram(name, self.qemu_port, self.port)
+    def netdev(self) -> str:
+        return dgram(self.qemu_port, self.port)
 
     def send(self, frame: bytes):
         self.sock.sendto(frame, ("127.0.0.1", self.qemu_port))
@@ -998,7 +1005,7 @@ FLOOD_BATCH = 32
 
 def test_raw(pkg: "Package"):
     w = Wire()
-    child, con = boot(pkg, w.netdev("n0"), dgram("n1", free_udp_port(), free_udp_port()))
+    child, con = boot(pkg, w.netdev(), dgram(free_udp_port(), free_udp_port()))
     try:
         wait_arp_ready(w, con)
         con.wait_for(r"audit: src=ingress ArpReplied total=1 lost=0")
@@ -1523,10 +1530,11 @@ def peer_handshake(con: Console, peer: int, since: int, index: int = None) -> in
 
 def peer_endpoint(con: Console, peer: int, since: int) -> tuple:
     """M8 plan C12: ingress's PeerEndpoint lines for `peer`, the IP and then
-    the port of one change (a checkpoint line may fall between them);
-    returns (ip, port)."""
+    the port of one change (a checkpoint line may fall between them, and,
+    when the two records drain on separate notifications, a heartbeat line
+    and its checkpoint: M9 plan C3); returns (ip, port)."""
     m = con.wait_for(rf"audit: src=ingress PeerEndpoint peer={peer} ip=(?P<ip>\d+\.\d+\.\d+\.\d+) lost=\d+\r*\n"
-                     rf"(?:audit: checkpoint [^\n]*\n)?"
+                     rf"(?:audit: (?:checkpoint|Heartbeat) [^\n]*\n){{0,2}}"
                      rf"audit: src=ingress PeerEndpoint peer={peer} port=(?P<port>\d+) lost=\d+\r*\n", since=since)
     return m.group("ip"), int(m.group("port"))
 
@@ -1538,8 +1546,8 @@ def test_wireguard(pkg: "Package", deploy: str, passed: list):
     host = InsideHost(inside)
     monitor = os.path.join(deploy, "monitor.sock")
     # S11 resets the machine from the monitor: the one host reset C11 opts out.
-    child, con = boot(pkg, f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT},"
-                              f"hostfwd=udp:127.0.0.1:{rp_fwd}-:{RP_PORT}", inside.netdev("n1"), monitor,
+    child, con = boot(pkg, f"user,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT},"
+                              f"hostfwd=udp:127.0.0.1:{rp_fwd}-:{RP_PORT}", inside.netdev(), monitor,
                       resets=("host-qmp-system-reset",))
     wg = None
     rps = []
@@ -1946,9 +1954,9 @@ def test_peer_binding(pkg: "Package", deploy: str, passed: list):
                 raise Fail(f"peer binding: the bundle does not pair wg{client} with rp{other}")
     hostfwd = free_udp_port()
     rp_fwd = free_udp_port()
-    child, con = boot(pkg, f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT},"
+    child, con = boot(pkg, f"user,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{hostfwd}-:{WG_PORT},"
                               f"hostfwd=udp:127.0.0.1:{rp_fwd}-:{RP_PORT}",
-                      dgram("n1", free_udp_port(), free_udp_port()))
+                      dgram(free_udp_port(), free_udp_port()))
     rp = sock = None
     try:
         cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
@@ -2054,8 +2062,8 @@ def test_mismatched_blob(pkg: "Package"):
     if not any(gateway_private) or not any(pq_plain):
         raise Fail("mismatched blob: a needle is all zero; the scan would prove nothing")
     monitor = os.path.join(deploy, "monitor.sock")
-    child, con = boot(pkg, dgram("n0", free_udp_port(), free_udp_port()),
-                      dgram("n1", free_udp_port(), free_udp_port()), monitor)
+    child, con = boot(pkg, dgram(free_udp_port(), free_udp_port()),
+                      dgram(free_udp_port(), free_udp_port()), monitor)
     try:
         m = con.wait_for(rf"audit: src=hs KeyUnavailable code={code} lost=\d+\r*\n", timeout=BOOT_TIMEOUT_S)
         con.wait_for(rf"audit: src=hs Halted reason={reason} lost=\d+\r*\n", since=m.end(), timeout=LINE_TIMEOUT_S)
@@ -2088,11 +2096,12 @@ ENVELOPE_FILES = ("secrets.env", "pq_secrets.env", "tls_secrets.env", "audit_sec
 sys.path.insert(0, os.path.join(ROOT, "tools"))
 import measure  # noqa: E402  (the host model of support/u-boot/boot.cmd)
 
-# TF-A with the measure variant's U-Boot as BL33 (M7 plan C2).
-FIRMWARE_MEASURE = os.path.join(ROOT, "build/firmware-measure/flash.bin")
-# What every other boot runs (M5 plan C14, M7 plan C2): TF-A measuring the
-# shipped U-Boot, whose boot command ends in the jump to the loader.
-FIRMWARE = os.path.join(ROOT, "build/firmware-shipped/flash.bin")
+# U-Boot's measure variant, which stops after measuring (M9 plan C2: U-Boot
+# alone is the firmware, run as -bios).
+FIRMWARE_MEASURE = os.path.join(ROOT, "build/u-boot-measure/u-boot.bin")
+# What every other boot runs (M5 plan C14): the shipped U-Boot, whose boot
+# command ends in the jump to the loader.
+FIRMWARE = os.path.join(ROOT, "build/u-boot-shipped/u-boot.bin")
 SWTPM_SOCKET_WAIT_S = 10.0
 # How often measure_boot repeats its Ctrl-C until the boot command decides.
 CTRLC_REPEAT_S = 0.25
@@ -2100,15 +2109,40 @@ CTRLC_REPEAT_S = 0.25
 # them); a volatile state file would make U-Boot's TPM2_Startup fail.
 SWTPM_PERMALL = "tpm2-00.permall"
 SWTPM_VOLATILE = "tpm2-00.volatilestate"
+# M9 plan C1 (H2): every swtpm state of a run is encrypted under one
+# per-run AES-256 key, in the run's 0700 directory, never in the tree: the
+# outer harness writes it before provisioning, the netns harness reads it.
+SWTPM_KEY_FILE = "swtpm.key"
+swtpm_key = None
+
+
+def use_swtpm_key(root: str, create: bool = False) -> str:
+    """The run's swtpm key file in `root`, made here (64 hex digits, mode
+    0600, never an existing file) when `create`; every Swtpm and
+    swtpm_setup of the run uses it from then on."""
+    global swtpm_key
+    path = os.path.join(root, SWTPM_KEY_FILE)
+    if create:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as f:
+            f.write(secrets.token_hex(32))
+    elif not os.path.isfile(path):
+        raise Fail(f"{path} is missing: the outer harness writes the run's swtpm key")
+    swtpm_key = path
+    return path
 
 
 class Swtpm:
     """One swtpm per boot, in its own state directory (plan T6): started
     before QEMU, stopped and its directory removed after, and a directory
     that survives the removal fails the case. `state`, a provisioned state
-    directory, is copied in first: the deployment's SRK, fresh PCRs."""
+    directory, is copied in first: the deployment's SRK, fresh PCRs. Its
+    argv is vm.swtpm's, under `key` (the run's swtpm key unless given)."""
 
-    def __init__(self, parent: str, state: str = None):
+    def __init__(self, parent: str, state: str = None, key: str = None):
+        key = key or swtpm_key
+        if key is None:
+            raise Fail("Swtpm: no swtpm key (use_swtpm_key was not called)")
         self.dir = tempfile.mkdtemp(prefix="swtpm-", dir=parent)
         self.sock = os.path.join(self.dir, "ctrl.sock")
         self.proc = None
@@ -2118,9 +2152,7 @@ class Swtpm:
         try:
             if state is not None:
                 shutil.copy2(os.path.join(state, SWTPM_PERMALL), self.dir)
-            self.proc = subprocess.Popen(DIE_WITH_PARENT + ["swtpm", "socket", "--tpm2", "--tpmstate",
-                                                            f"dir={self.dir}", "--ctrl",
-                                                            f"type=unixio,path={self.sock}"],
+            self.proc = subprocess.Popen(DIE_WITH_PARENT + ["swtpm", *vm.swtpm(self.dir, key, self.sock)],
                                          stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
             deadline = time.monotonic() + SWTPM_SOCKET_WAIT_S
             while not os.path.exists(self.sock):
@@ -2131,9 +2163,9 @@ class Swtpm:
             self.close()
             raise
 
-    def qemu_args(self) -> list:
-        return ["-chardev", f"socket,id=chrtpm,path={self.sock}", "-tpmdev", "emulator,id=tpm0,chardev=chrtpm",
-                "-device", "tpm-tis-device,tpmdev=tpm0"]
+    def qemu_socket(self) -> str:
+        """The socket QEMU's TPM backend connects to (vm.machine's `tpm`)."""
+        return self.sock
 
     def close(self):
         if self.proc is not None:
@@ -2329,11 +2361,16 @@ def read_pcr8(tpm: Swtpm) -> bytes:
 CC_UNSEAL = 0x15E
 CC_PCR_EXTEND = 0x182
 CC_POLICY_PCR = 0x17F
-# The proxy's own command (M7 plan C4, TE4): TPM2_PCR_Extend of PCR 3, sha256,
-# under the empty password session, so PCRs 0-8 move before the policy reads
-# them.
-PCR3_EXTEND = (struct.pack(">HII", 0x8002, 10 + 4 + 4 + 9 + 4 + 2 + 32, CC_PCR_EXTEND) + struct.pack(">I", 3)
-               + struct.pack(">IIHBH", 9, 0x40000009, 0, 0, 0) + struct.pack(">IH", 1, 0x000B) + b"\x33" * 32)
+# The proxy's own command (M7 plan C4, TE4; M9 plan C2): TPM2_PCR_Extend of
+# one policy PCR, sha256, under the empty password session, so PCRs 0-8
+# move before the policy reads them. Recorded in the proxy's codes as
+# INJECTED_EXTEND.
+INJECTED_EXTEND = "INJECTED_EXTEND"
+
+
+def pcr_extend_command(pcr: int) -> bytes:
+    return (struct.pack(">HII", 0x8002, 10 + 4 + 4 + 9 + 4 + 2 + 32, CC_PCR_EXTEND) + struct.pack(">I", pcr)
+            + struct.pack(">IIHBH", 9, 0x40000009, 0, 0, 0) + struct.pack(">IH", 1, 0x000B) + b"\x33" * 32)
 # TPM_RC_POLICY_FAIL on the policy session (session 1), the refusal Unseal
 # gives when PolicyPCR folded in values other than the object's; and
 # TPM_RC_PCR_CHANGED, which a PCR moved between PolicyPCR and Unseal gives.
@@ -2357,16 +2394,17 @@ class TpmProxy:
     of slot B) is answered success and never reaches swtpm. Feasibility
     (F6-A): the unmodified relay must pass a sealed boot first."""
 
-    def __init__(self, tpm: Swtpm, flip: bool, fail_extend: bool = False, inject_pcr3: bool = False,
+    def __init__(self, tpm: Swtpm, flip: bool, fail_extend: bool = False, inject_pcr: int = None,
                  fail_nth: tuple = None, swallow_pcr9: bool = False):
-        self.tpm, self.flip, self.fail_extend, self.inject_pcr3 = tpm, flip, fail_extend, inject_pcr3
+        self.tpm, self.flip, self.fail_extend, self.inject_pcr = tpm, flip, fail_extend, inject_pcr
         self.swallow_pcr9, self.pcr9_extends, self.pcr9_swallowed = swallow_pcr9, 0, 0
         # (command code, n): the n-th command with that code is answered
         # TPM_RC_FAILURE and never reaches swtpm (M7 plan C3 I3.2), and
         # `failed` records it once it happened.
         self.fail_nth, self.failed = fail_nth, None
         # (command code, response code) of every command relayed, in order;
-        # the injected extend's under "PCR3_EXTEND".
+        # the injected extend's (`inject_pcr`, before the first PolicyPCR)
+        # under INJECTED_EXTEND.
         self.codes = []
         self.cap = cap_digest()
         self.path = os.path.join(tpm.dir, "proxy.sock")
@@ -2381,9 +2419,8 @@ class TpmProxy:
         self.thread = threading.Thread(target=self._run, daemon=True)
         start_without_stop_signals(self.thread)
 
-    def qemu_args(self) -> list:
-        return ["-chardev", f"socket,id=chrtpm,path={self.path}", "-tpmdev", "emulator,id=tpm0,chardev=chrtpm",
-                "-device", "tpm-tis-device,tpmdev=tpm0"]
+    def qemu_socket(self) -> str:
+        return self.path
 
     def _run(self):
         try:
@@ -2485,16 +2522,17 @@ class TpmProxy:
                     self.codes.append((cc, "failed"))
                     r[0].sendall(EXTEND_FAILED_RSP)
                     continue
-            if self.inject_pcr3 and cc == CC_POLICY_PCR and not any(c == "PCR3_EXTEND" for c, _ in self.codes):
+            if self.inject_pcr is not None and cc == CC_POLICY_PCR \
+                    and not any(c == INJECTED_EXTEND for c, _ in self.codes):
                 if r[4]:
                     raise Fail("proxy: a PolicyPCR while another command awaits its response")
                 # swtpm takes one command at a time: the PolicyPCR waits
                 # until the extend's response, which is swallowed below
                 # (QEMU never sees it).
-                r[4].append("PCR3_EXTEND")
-                self.codes.append(("PCR3_EXTEND", None))
+                r[4].append(INJECTED_EXTEND)
+                self.codes.append((INJECTED_EXTEND, None))
                 self.held = (cc, cmd)
-                r[1].sendall(PCR3_EXTEND)
+                r[1].sendall(pcr_extend_command(self.inject_pcr))
                 continue
             r[4].append(cc)
             r[1].sendall(cmd)
@@ -2506,8 +2544,8 @@ class TpmProxy:
         for rsp in frames:
             cc = r[4].pop(0) if r[4] else None
             rc = struct.unpack(">I", rsp[6:10])[0]
-            if cc == "PCR3_EXTEND":
-                self.codes[self.codes.index(("PCR3_EXTEND", None))] = ("PCR3_EXTEND", rc)
+            if cc == INJECTED_EXTEND:
+                self.codes[self.codes.index((INJECTED_EXTEND, None))] = (INJECTED_EXTEND, rc)
                 held_cc, held = self.held
                 r[4].append(held_cc)
                 r[1].sendall(held)
@@ -2532,12 +2570,11 @@ class TpmProxy:
 
 
 def boot_uboot(firmware: str, files: list, tpm: Swtpm) -> tuple:
-    """QEMU with a firmware image (TF-A and a U-Boot); `files` are (path,
-    address) pairs, the boot media U-Boot reads (measure.LOAD_*)."""
-    cmd = qemu_machine(firmware)
-    for path, addr in files:
-        cmd += ["-device", f"loader,file={path},addr={addr:#x},force-raw=on"]
-    cmd += tpm.qemu_args()
+    """QEMU with a U-Boot image; `files` are (path, address) pairs, the
+    boot media U-Boot reads (measure.LOAD_*). The machine is every boot's,
+    so both NICs exist, each on a dgram socket nothing listens on."""
+    cmd = qemu_machine(firmware, tpm.qemu_socket(), (dgram(free_udp_port(), free_udp_port()),
+                                                     dgram(free_udp_port(), free_udp_port())), media=files)
     # The measure variant always powers off: after its PCR dump, or after
     # a refusal (M7 plan C11).
     return spawn_qemu(cmd, shutdown="guest-shutdown")
@@ -2638,9 +2675,9 @@ def test_measured_boot(pkg: str, slots: tuple, passed: list):
     image, desc = read("published.img"), read("boot.desc")
     envs = [read("secrets.env"), read("pq_secrets.env"), read("tls_secrets.env"), read("audit_secrets.env"), *slots]
     want = measure.expected_pcr8(desc, image)
-    # M7 plan C4: the package's PCRs 0-8 are the twin's for its flash.bin.
+    # M7 plan C4, M9 plan C2: the package's PCRs 0-8 are the twin's.
     pcrs = [bytes.fromhex(l) for l in read("pcrs").decode().split()]
-    if pcrs != measure.expected_pcrs(read("flash.bin"), desc, image):
+    if pcrs != measure.expected_pcrs(desc, image):
         raise Fail("package's pcrs differ from tools/measure.py's")
     scratch = tempfile.mkdtemp(prefix="measure-", dir=pkg)
     try:
@@ -2810,10 +2847,10 @@ def media_with(pkg: Package, scratch: str, image: bytes = None, desc: bytes = No
     return media
 
 
-def sealed_boot(pkg: Package, media=None, flip=None, inject_pcr3: bool = False, fail_nth: tuple = None,
+def sealed_boot(pkg: Package, media=None, flip=None, inject_pcr: int = None, fail_nth: tuple = None,
                 firmware: str = None, rng: bool = True, shutdown: str = None, resets: tuple = None) -> tuple:
-    return boot(pkg, dgram("n0", free_udp_port(), free_udp_port()), dgram("n1", free_udp_port(), free_udp_port()),
-                media=media, flip=flip, inject_pcr3=inject_pcr3, fail_nth=fail_nth, firmware=firmware, rng=rng,
+    return boot(pkg, dgram(free_udp_port(), free_udp_port()), dgram(free_udp_port(), free_udp_port()),
+                media=media, flip=flip, inject_pcr=inject_pcr, fail_nth=fail_nth, firmware=firmware, rng=rng,
                 shutdown=shutdown, resets=resets)
 
 
@@ -2865,26 +2902,39 @@ def test_sealed(good: Package, foreign: Package, passed: list):
             stop(child)
         passed.append("sealed boot: a tampered descriptor is refused")
 
-        # M7 plan C4 (TE4): a PCR in 1-7 extended before the policy session's
-        # PolicyPCR. The TPM folds in the moved value and Unseal refuses with
-        # the policy failure, not because a PCR moved after PolicyPCR.
-        child, con = sealed_boot(good, inject_pcr3=True)
-        try:
-            key_outcomes(con, refused, "PCR 3 extended")
-            codes = list(child.proxy.codes)
-        finally:
-            stop(child)
-        injected = [rc for cc, rc in codes if cc == "PCR3_EXTEND"]
-        if injected != [0]:
-            raise Fail(f"PCR 3 extended: the proxy's extend gave {injected}, want one success")
-        unseals = [rc for cc, rc in codes if cc == CC_UNSEAL]
-        if not unseals or any(rc != RC_POLICY_FAIL_S1 for rc in unseals):
-            raise Fail(f"PCR 3 extended: Unseal answered {[hex(rc) for rc in unseals]}, want TPM_RC_POLICY_FAIL "
-                       f"({RC_POLICY_FAIL_S1:#x}), never TPM_RC_PCR_CHANGED ({RC_PCR_CHANGED:#x})")
-        for cc in (0x176, CC_POLICY_PCR, 0x16B, 0x156, 0x157):
-            if any(c == cc and rc != 0 for c, rc in codes):
-                raise Fail(f"PCR 3 extended: command {cc:#x} failed before Unseal: {codes}")
-        passed.append("sealed boot: a PCR 3 extended before PolicyPCR refuses the unseal (policy failure)")
+        # M7 plan C4 (TE4), M9 plan C2: a policy PCR extended before the
+        # policy session's PolicyPCR. The TPM folds in the moved value and
+        # Unseal refuses with the policy failure, not because a PCR moved
+        # after PolicyPCR. Nothing before U-Boot measures PCR 0 (M9 plan D1):
+        # only the seal policy's zero guards it (the PCR 0 deny case).
+        for pcr in (0, 3):
+            label = f"PCR {pcr} extended"
+            child, con = sealed_boot(good, inject_pcr=pcr)
+            outcome = None
+            try:
+                try:
+                    key_outcomes(con, refused, label)
+                except Fail as e:
+                    outcome = e
+                codes = list(child.proxy.codes)
+            finally:
+                stop(child)
+            unseals = [rc for cc, rc in codes if cc == CC_UNSEAL]
+            if any(rc == 0 for rc in unseals):
+                raise Fail(f"pcr{pcr}-deny: unsealed with PCR {pcr} moved: Unseal answered "
+                           f"{[hex(rc) for rc in unseals]}")
+            if outcome is not None:
+                raise outcome
+            injected = [rc for cc, rc in codes if cc == INJECTED_EXTEND]
+            if injected != [0]:
+                raise Fail(f"{label}: the proxy's extend gave {injected}, want one success")
+            if not unseals or any(rc != RC_POLICY_FAIL_S1 for rc in unseals):
+                raise Fail(f"{label}: Unseal answered {[hex(rc) for rc in unseals]}, want TPM_RC_POLICY_FAIL "
+                           f"({RC_POLICY_FAIL_S1:#x}), never TPM_RC_PCR_CHANGED ({RC_PCR_CHANGED:#x})")
+            for cc in (0x176, CC_POLICY_PCR, 0x16B, 0x156, 0x157):
+                if any(c == cc and rc != 0 for c, rc in codes):
+                    raise Fail(f"{label}: command {cc:#x} failed before Unseal: {codes}")
+            passed.append(f"sealed boot: a PCR {pcr} extended before PolicyPCR refuses the unseal (policy failure)")
 
         # Envelopes sealed to another TPM's SRK, booted on this one (I10.2).
         child, con = sealed_boot(Package(foreign.dir, good.state, good.slots))
@@ -2920,14 +2970,12 @@ def test_sealed(good: Package, foreign: Package, passed: list):
             got = pcrs[8]
         finally:
             stop(child)
-        # M7 plan C3: TF-A extended PCR 0 with BL2, BL31 and BL33 before each
-        # ran, as the twin computes from the shipped flash.bin; 1-7 untouched.
-        with open(FIRMWARE, "rb") as f:
-            firmware_want = measure.expected_pcrs(f.read(), desc, image)[:8]
-        for i, (g, w) in enumerate(zip(pcrs[:8], firmware_want)):
+        # M9 plan C2: nothing runs before U-Boot, and U-Boot extends only
+        # PCRs 8 and 9, so PCRs 0-7 are as the twin gives them: zero.
+        for i, (g, w) in enumerate(zip(pcrs[:8], measure.expected_pcrs(desc, image)[:8])):
             if g != w:
-                raise Fail(f"PCR {i} after the shipped boot is {g.hex()}, the twin of {FIRMWARE} gives {w.hex()}")
-        passed.append("sealed boot: PCRs 0-7 as the firmware twin computes")
+                raise Fail(f"PCR {i} after the shipped boot is {g.hex()}, the twin gives {w.hex()}")
+        passed.append("sealed boot: PCRs 0-7 as the twin computes (zero)")
         # M8 plan C4, D3: U-Boot measured slot A, then slot B, over BUNDLE_MAX.
         slot_want = measure.expected_pcr9(*good.slot_bytes())
         if pcrs[measure.SLOT_PCR] != slot_want:
@@ -2942,80 +2990,36 @@ def test_sealed(good: Package, foreign: Package, passed: list):
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def firmware_variant(scratch: str, entry: str, needle: bytes, offset: int = 0) -> str:
-    """FIRMWARE with one byte changed in FIP entry `entry` (the byte at
-    `offset` in `needle`, a string found once inside that entry, flipped to
-    the other case), every extend intact (M7 plan C3). Registered for
-    qemu_machine."""
-    with open(FIRMWARE, "rb") as f:
-        flash = bytearray(f.read())
-    payload = dict(measure.fip_images(bytes(flash)))[entry]
-    start = bytes(flash).find(payload, measure.FIP_OFFSET)
-    at = payload.find(needle)
-    if start < 0 or payload.count(needle) != 1 or bytes(flash).count(payload) != 1:
-        raise Fail(f"firmware variant: {needle!r} is not one place in {entry}")
-    flash[start + at + offset] ^= 0x20
-    if measure.expected_pcr0(bytes(flash)) == measure.expected_pcr0(open(FIRMWARE, "rb").read()):
-        raise Fail(f"firmware variant: changing {entry} left PCR 0 as it was")
-    path = os.path.join(scratch, f"flash-{entry}.bin")
-    with open(path, "wb") as f:
-        f.write(flash)
-    FIRMWARE_VARIANTS.add(path)
-    return path
-
-
-# The I3.2 cases (M7 plan C3): which TPM command the proxy fails, and the
-# stage token TF-A's refusal line must carry.
 CC_STARTUP = 0x144
-FIRMWARE_REFUSALS = (
-    ((CC_STARTUP, 1), "BL1 startup"),
-    ((CC_PCR_EXTEND, 1), "BL1 extend"),
-    ((CC_PCR_EXTEND, 2), "BL2 extend"),
-)
 
 
-def test_firmware(good: Package, passed: list):
-    """M7 plan C3. Deny: the shipped firmware with one byte changed in BL2,
-    BL31 or BL33 (every extend intact) boots and extends, and the envelopes
-    stay sealed: BL1's extend of BL2 and BL2's extends of the rest put the
-    change into PCR 0 before it runs. I3.2: TPM2_Startup, BL1's extend or
-    BL2's first extend failing stops the boot with TF-A's refusal line and
-    a power-off. The allow side is every other sealed boot."""
-    refused = {"key-core": "UnsealRefused", "pqkey-core": "UnsealRefused", "tlskey-core": "UnsealRefused"}
-    scratch = tempfile.mkdtemp(prefix="firmware-", dir=os.path.dirname(good.dir))
+def test_tpm_startup(good: Package, passed: list):
+    """M9 plan C2: nothing runs before U-Boot, so U-Boot starts the TPM.
+    TPM2_Startup failing (the proxy answers the first TPM_RC_FAILURE) must
+    refuse at once: U-Boot prints its refusal and powers off, the TPM sees
+    no command after the failed Startup, and the loader never starts. The
+    allow side is every other sealed boot."""
+    nth = (CC_STARTUP, 1)
+    child, con = sealed_boot(good, fail_nth=nth, shutdown="guest-shutdown")
     try:
-        # The version string TF-A's stages print, and a U-Boot string.
-        for entry, needle, offset in (("BL2", b"release):kozane", 9), ("BL31", b"release):kozane", 9),
-                                      ("BL33", b"U-Boot 2025.01", 0)):
-            child, con = sealed_boot(good, firmware=firmware_variant(scratch, entry, needle, offset))
-            try:
-                if entry in ("BL2", "BL31"):
-                    # Positive evidence the changed stage ran: its banner.
-                    con.wait_for(rf"{entry}: v2\.15\.0\(release\):Kozane", timeout=BOOT_TIMEOUT_S)
-                key_outcomes(con, refused, f"changed {entry}")
-            finally:
-                stop(child)
-            passed.append(f"firmware: a changed {entry} is refused")
-        for nth, token in FIRMWARE_REFUSALS:
-            child, con = sealed_boot(good, fail_nth=nth, shutdown="guest-shutdown")
-            try:
-                con.wait_for(rf"KOZANE-MBOOT: {token} failed", timeout=BOOT_TIMEOUT_S)
-                deadline = time.monotonic() + LINE_TIMEOUT_S
-                while con.alive and time.monotonic() < deadline:
-                    time.sleep(0.05)
-                if con.alive:
-                    raise Fail(f"{token}: QEMU still runs after TF-A's refusal")
-                if "U-Boot 20" in con.text:
-                    raise Fail(f"{token}: U-Boot ran after TF-A's refusal")
-                failed = child.proxy.failed
-            finally:
-                stop(child)
-            if failed is None or failed[:2] != nth or not failed[2]:
-                raise Fail(f"{token}: the proxy failed {failed}, want {nth} after every earlier one succeeded")
-            passed.append(f"firmware: {token} failing stops the boot")
+        con.wait_for(r"kozane: boot refused", timeout=BOOT_TIMEOUT_S)
+        deadline = time.monotonic() + LINE_TIMEOUT_S
+        while con.alive and time.monotonic() < deadline:
+            time.sleep(0.05)
+        alive, text = con.alive, con.text
+        failed, codes = child.proxy.failed, list(child.proxy.codes)
     finally:
-        shutil.rmtree(scratch, ignore_errors=True)
-        FIRMWARE_VARIANTS.clear()
+        stop(child)
+    if "LDR|" in text or "audit: " in text or "kozane: loader returned" in text:
+        raise Fail("tpm-startup: loader started after the failed TPM2_Startup")
+    if failed is None or failed[:2] != nth or not failed[2]:
+        raise Fail(f"tpm-startup: the proxy failed {failed}, want {nth}")
+    after = codes[codes.index((CC_STARTUP, "failed")) + 1:]
+    if after:
+        raise Fail(f"tpm-startup: a TPM command after the failed startup: {after}")
+    if alive:
+        raise Fail("tpm-startup: QEMU still runs after U-Boot's refusal")
+    passed.append("tpm startup: a failed TPM2_Startup refuses the boot and powers off")
 
 
 # M7 plan C6, C7: the PDs that halt when `rng` gives no seed, and the
@@ -3100,7 +3104,7 @@ def test_tpm_cap_failure(pkg: Package, deploy: str, passed: list):
     tap = Tap()
     inside = Wire()
     try:
-        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"), fail_extend=True)
+        child, con = boot(pkg, tap.netdev(), inside.netdev(), fail_extend=True)
     except BaseException:
         tap.close()
         raise
@@ -3170,7 +3174,7 @@ def fault_boot(pkg: Package, resets: tuple = None, after_checkpoint: bool = True
     waits for the ready checkpoint too; without it the caller's frame lands
     while `audit` may still be signing it, the case D-23's drain covers."""
     w = Wire()
-    child, con = boot(pkg, w.netdev("n0"), dgram("n1", free_udp_port(), free_udp_port()),
+    child, con = boot(pkg, w.netdev(), dgram(free_udp_port(), free_udp_port()),
                       shutdown=None if resets is not None else "guest-reset", resets=resets)
     try:
         wait_arp_ready(w, con)
@@ -3394,7 +3398,7 @@ def test_release_boot(pkg: Package, release: str, deploy: str, fault_inject: dic
     (every FAULT_INJECT_VARIANTS one, M8 plan C13) is the manifest's image."""
     fields = manifest_fields(release)
     pcrs = [bytes.fromhex(p) for p in fields["pcrs"].split(",")]
-    image, desc, firmware = (os.path.join(release, n) for n in ("published.img", "boot.desc", "flash.bin"))
+    image, desc, firmware = (os.path.join(release, n) for n in ("published.img", "boot.desc", "u-boot.bin"))
     media = [(image, measure.LOAD_IMAGE), (desc, measure.LOAD_DESC)] + \
         list(zip(map(pkg.path, ENVELOPE_FILES), measure.LOAD_ENVELOPES, strict=True)) + \
         list(zip(pkg.slots, measure.LOAD_SLOTS, strict=True))
@@ -3413,14 +3417,14 @@ def test_release_boot(pkg: Package, release: str, deploy: str, fault_inject: dic
     try:
         inside = InsideTap()
         backend = Backend()
-        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"), media=media, firmware=firmware)
+        child, con = boot(pkg, tap.netdev(), inside.netdev(), media=media, firmware=firmware)
     except BaseException:
         close_all(backend, inside, tap)
         raise
     rp = py = None
     try:
         # Exactly the verified files, as QEMU was asked to load them.
-        # qemu_machine names the firmware once, as its -bios (P24).
+        # vm.machine names the firmware once, as its -bios (P24).
         loaded = [a for a in child.qemu_cmd if a.startswith("loader,file=")]
         if child.qemu_cmd.count(firmware) != 1 or sorted(a.split(",")[1].removeprefix("file=") for a in loaded) != \
                 sorted(p for p, _ in media):
@@ -3563,8 +3567,8 @@ class PolicyBoot:
         self.inside = Wire()
         slots = write_slots(case.dir, slot_a, slot_b)
         self.child, self.con = boot(Package(pkg.dir, case.dir, slots),
-                                    f"user,id=n0,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{self.hostfwd}-:{WG_PORT},"
-                                    f"hostfwd=udp:127.0.0.1:{self.rp_fwd}-:{RP_PORT}", self.inside.netdev("n1"),
+                                    f"user,net=10.0.2.0/24,hostfwd=udp:127.0.0.1:{self.hostfwd}-:{WG_PORT},"
+                                    f"hostfwd=udp:127.0.0.1:{self.rp_fwd}-:{RP_PORT}", self.inside.netdev(),
                                     flip=False if relay else None, swallow_pcr9=swallow_pcr9)
 
     def unsealed(self, what: str):
@@ -3906,6 +3910,7 @@ STEP2_WARMUP_S = 1.0           #   over capacity this long before the ping start
 PROBE_RATE = 1e6               # unpaced: the injector's own ceiling
 PROBE_S = 2.0
 PROBE_SETTLE_S = 0.3           # audit lines still printing after the drain
+PROBE_STALL_S = 60.0           # a failed drain's second wait: slow, or stalled
 DENY_SETTLE_S = 1.0            # a port-B WgMac2Accepted line must print before the count
 PROBE_SATURATION = 1.5         # the probe must offer at least this x C
 PRECONDITION_S = 4.0           # band flood measuring the below-capacity survival ratio
@@ -3939,7 +3944,7 @@ def rust_const(rel: str, name: str) -> int:
     m = re.search(rf"pub const {name}: u\d+ = ([^;]+);", src)
     if not m:
         raise Fail(f"{name} not found in {rel}")
-    expr = m.group(1).replace("NS_PER_SEC", "1_000_000_000")
+    expr = m.group(1).replace("NS_PER_SEC", "1_000_000_000").replace("NS_PER_MS", "1_000_000")
     if not re.fullmatch(r"[0-9_ *+/]+", expr):
         raise Fail(f"{name} in {rel} is not a plain integer expression: {expr}")
     return int(eval(expr))  # digits and operators only, checked above
@@ -4010,8 +4015,8 @@ class Tap:
             self.close()
             raise
 
-    def netdev(self, name: str) -> str:
-        return f"tap,id={name},ifname={TAP},script=no,downscript=no"
+    def netdev(self) -> str:
+        return f"tap,ifname={TAP},script=no,downscript=no"
 
     def send(self, frame: bytes):
         self.inject.send(frame)
@@ -4243,7 +4248,12 @@ def probe_capacity(con: Console, tap: Tap, flood: Flood, after_rate: float) -> t
     end = flood.set_rate(0)
     drained = arp_round_trip(tap, LINE_TIMEOUT_S)
     if drained is None:
-        raise Fail("capacity probe: no ARP reply after the probe; the queues did not drain")
+        # Still a failure; the second wait only tells a slow drain from a
+        # stalled ingress, which would be a denial of service.
+        late = arp_round_trip(tap, PROBE_STALL_S)
+        after = f"no reply in a further {PROBE_STALL_S:.0f} s either" if late is None else \
+            f"a reply came {late - end[1]:.1f} s after the probe"
+        raise Fail(f"capacity probe: no ARP reply after the probe; the queues did not drain ({after})")
     time.sleep(PROBE_SETTLE_S)
     after, _ = cookie_totals(con)
     flood.set_rate(after_rate)
@@ -5468,7 +5478,7 @@ def test_rp_gate(pkg: "Package", deploy: str, passed: list):
     inside = Wire()
     host = InsideHost(inside)
     try:
-        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"))
+        child, con = boot(pkg, tap.netdev(), inside.netdev())
     except BaseException:
         tap.close()
         raise
@@ -5536,7 +5546,7 @@ def test_cookie_a(pkg: "Package", deploy: str, passed: list):
     inside = Wire()
     host = InsideHost(inside)
     try:
-        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"))
+        child, con = boot(pkg, tap.netdev(), inside.netdev())
     except BaseException:
         tap.close()
         raise
@@ -5802,7 +5812,7 @@ def test_cookie_b(pkg: "Package", deploy: str, passed: list):
     inside = Wire()
     host = InsideHost(inside)
     try:
-        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"))
+        child, con = boot(pkg, tap.netdev(), inside.netdev())
     except BaseException:
         tap.close()
         raise
@@ -6133,8 +6143,8 @@ class InsideTap:
             self.close()
             raise
 
-    def netdev(self, name: str) -> str:
-        return f"tap,id={name},ifname={INSIDE_TAP},script=no,downscript=no"
+    def netdev(self) -> str:
+        return f"tap,ifname={INSIDE_TAP},script=no,downscript=no"
 
     def close(self):
         subprocess.run(["ip", "link", "del", INSIDE_TAP], capture_output=True)
@@ -6709,7 +6719,7 @@ def test_https(pkg: "Package", deploy: str, other_ca: str, passed: list):
     try:
         inside = InsideTap()
         backend = Backend()
-        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"), monitor)
+        child, con = boot(pkg, tap.netdev(), inside.netdev(), monitor)
     except BaseException:
         close_all(backend, inside, tap)
         raise
@@ -7072,7 +7082,7 @@ def test_https_residue(pkg: "Package", deploy: str, passed: list):
     try:
         inside = InsideTap()
         backend = Backend()
-        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"), monitor)
+        child, con = boot(pkg, tap.netdev(), inside.netdev(), monitor)
     except BaseException:
         close_all(backend, inside, tap)
         raise
@@ -7786,7 +7796,7 @@ def test_https_flood(pkg: "Package", deploy: str, passed: list):
         inside = InsideTap()
         route_tunnel_replies()
         backend = Backend()
-        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"))
+        child, con = boot(pkg, tap.netdev(), inside.netdev())
     except BaseException:
         close_all(backend, inside, tap)
         raise
@@ -7842,7 +7852,7 @@ def test_tls_key_failure(pkg: "Package", deploy: str, passed: list):
     inside = Wire()
     monitor = os.path.join(deploy, "monitor.sock")
     try:
-        child, con = boot(pkg, tap.netdev("n0"), inside.netdev("n1"), monitor)
+        child, con = boot(pkg, tap.netdev(), inside.netdev(), monitor)
     except BaseException:
         tap.close()
         raise
@@ -7893,6 +7903,1113 @@ def test_tls_key_failure(pkg: "Package", deploy: str, passed: list):
             kill(child)
             tap.close()
             raise
+
+
+# ---------------------------------------------------------------- M9 suites: test-kvm (C6), test-kzc (C11)
+
+# Which suite this run is: "" for `make test`, "kvm" for `make test-kvm`
+# (every boot under KVM, gx10), "kzc" for `make test-kzc` (kzc on kernel
+# WireGuard under TCG). Each suite builds its own deployment, prints its own
+# count (KVM-CASES, KZC-CASES and INTEGRATION-ORACLE-CASES) and never prints
+# INTEGRATION-CASES.
+SUITE = os.environ.get("KOZANE_SUITE", "")
+SUITES = ("", "kvm", "kzc")
+# The KVM device test-kvm requires (a seam, for the precondition's
+# red-proof): without it the gate fails, never skips.
+KVM_DEV = os.environ.get("KOZANE_KVM_DEV", "/dev/kvm")
+# The test-seams builds `make kzc-seams` and `make vm-seams` make.
+KZC_BIN = os.path.join(ROOT, "build/client/target/debug/kzc")
+KZC_PSK_BIN = os.path.join(ROOT, "build/client/target/debug/kzc-psk")
+VM_SEAMS_BIN = os.path.join(ROOT, "build/host/target/debug/kozane-vm")
+# Every service user is the namespace's one uid (VE26).
+KZC_USERS = "kozane-psk=0,kozane-net=0"
+KZC_IF = "kz0"
+# The kzc client's tunnel address (its bundle allowed_ips) and its ports:
+# Rosenpass from a fixed port, so the gateway sees one endpoint across
+# restarts (the cookie case attributes by it).
+KZC_IP = bytes([10, 200, 0, 10])
+KZC_RP_PORT = 42010
+KZC_WG_PORT = 51830
+# The oracle cases (D4): upstream as responder on loopback, kzc's
+# WireGuard endpoint a port nobody listens on (only the PSK is judged), and
+# allowed_ips apart from every other route.
+ORACLE_RP_PORT = 47001
+ORACLE_WG_PORT = 47002
+ORACLE_ALLOWED = "10.98.0.0/24"
+ORACLE_EXCHANGE_S = 60.0       # host-only: one McEliece exchange on each side
+KZC_READY_S = 20.0             # kzc-psk's READY=1
+KZC_PING_TRIES = 10            # a kernel WireGuard handshake retries every 5 s
+# The tick-rate case (T2.12, T3.11): two Heartbeat lines against the host's
+# monotonic clock. The console is read in chunks as it arrives, so a line's
+# time is late by at most a read; over HEARTBEAT_S that is well inside this.
+TICK_TOLERANCE = 0.02
+HTTPS_RATE_REQUESTS = 20
+# The WireGuard throughput baseline: iperf3 from kz0 to a server on the
+# inside host, which lives in a nested netns on the inside tap.
+IPERF_PORT = 5201
+IPERF_S = 10
+# The release boot through the launcher locks guest RAM (mem-lock=on, the
+# launcher form only): 86 s on gx10 under memory pressure (deviation D-8).
+LAUNCHER_BOOT_S = 300.0
+LAUNCHER_STOP_S = 30.0
+VM_OUTSIDE_BRIDGE, VM_INSIDE_BRIDGE = "kzbr-out", "kzbr-in"
+
+BASELINES = []
+
+
+def baseline(name: str, value: float, unit: str):
+    """A measured value (C6's baselines): printed and written to
+    KOZANE_BASELINES; never gated. Five fields, so check-manifest never
+    reads one as a count."""
+    line = f"baseline {ACCEL} {name} {value:.3f} {unit}"
+    BASELINES.append(line)
+    print(f"\n{line}", flush=True)
+
+
+def write_baselines():
+    path = os.environ.get("KOZANE_BASELINES")
+    if path:
+        with open(path, "w") as f:
+            f.write("".join(f"{line}\n" for line in BASELINES))
+
+
+def check_kvm_device():
+    """C6: test-kvm without /dev/kvm fails here, before anything is built."""
+    try:
+        os.close(os.open(KVM_DEV, os.O_RDWR | os.O_CLOEXEC))
+    except OSError as e:
+        raise Fail(f"test-kvm: no /dev/kvm ({KVM_DEV}: {e.strerror}); KVM runs on gx10 only (VE21)") from None
+
+
+def seams_build(binary: str):
+    r = subprocess.run([binary, "--build-info"], capture_output=True, text=True)
+    if r.returncode != 0 or "SEAMS=1" not in r.stdout.split():
+        raise Fail(f"{binary}: not a test-seams build ({r.stdout.strip()}); `make kzc-seams vm-seams` builds them")
+
+
+def kzc_dir(tmp: str) -> str:
+    return os.path.join(tmp, "kzc")
+
+
+def kzc_keygen(tmp: str) -> dict:
+    """C11 [T2.10, F3.6]: the kzc client's keys from `kzc keygen` itself,
+    under its root prefix, as root of a user namespace (keygen runs as
+    root). Returns its peers.toml entry; the printed digest is checked
+    against an independent blake2s over rp.pub."""
+    root = os.path.join(kzc_dir(tmp), "root")
+    for d in ("etc/kozane", "var/lib", "run/kozane-psk"):
+        os.makedirs(os.path.join(root, d), 0o755)
+    os.chmod(os.path.join(root, "run/kozane-psk"), 0o750)
+    # NEWUSER with NEWNET: the seccomp profile allows exactly that pair.
+    r = subprocess.run(["unshare", "-rn", KZC_BIN, "--root-prefix", root, "--user-map", KZC_USERS, "keygen"],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Fail(f"kzc keygen: {r.stdout}{r.stderr}")
+    wg_pub = re.search(r'^wg_pub = "([A-Za-z0-9+/=]{44})"$', r.stdout, re.M)
+    digest = re.search(r"^# rp_digest = ([0-9a-f]{64})$", r.stdout, re.M)
+    rp_pub = os.path.join(root, "var/lib/kozane-net/rp.pub")
+    if not wg_pub or not digest:
+        raise Fail(f"kzc keygen printed no wg_pub or rp_digest: {r.stdout}")
+    if hashlib.blake2s(open(rp_pub, "rb").read()).hexdigest() != digest.group(1):
+        raise Fail("kzc keygen: the printed rp_digest is not blake2s over rp.pub")
+    # "perf": the iperf3 baseline's TCP port on the inside host (C6).
+    return {"wg_pub": wg_pub.group(1), "rp_pub_path": rp_pub, "allowed_ips": [f"{ip_str(KZC_IP)}/32"],
+            "groups": ["inside", "perf"],
+            "rules": {"perf": [("tcp", f"{ip_str(HOST_IP)}/32", IPERF_PORT, IPERF_PORT)]}}
+
+
+def mksecrets_bin() -> str:
+    r = subprocess.run(["cargo", "build", "--locked", "-q", "-p", "mksecrets", "--message-format=json"], cwd=ROOT,
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise Fail(f"building mksecrets: {r.stderr[-2000:]}")
+    for line in r.stdout.splitlines():
+        msg = json.loads(line)
+        if msg.get("reason") == "compiler-artifact" and msg.get("executable") and msg["target"]["name"] == "mksecrets":
+            return msg["executable"]
+    raise Fail("building mksecrets: cargo named no executable")
+
+
+def kzc_client_confs(tmp: str, deploy: str):
+    """C11: mksecrets writes the client's client.conf, and nothing else of
+    the client: one for the gateway on the tap (10.0.2.15), one for the
+    oracle cases' upstream responder on loopback. The gateway's pinned
+    Rosenpass key, and the oracle's (mksecrets client 0's key pair, which
+    upstream reads), go under the root prefix's /etc/kozane."""
+    d, root = kzc_dir(tmp), os.path.join(kzc_dir(tmp), "root")
+    tool = mksecrets_bin()
+    gw = f"{ip_str(GW_IP)}"
+    for name, wg, rp, allowed, pub in (
+            ("gw", f"{gw}:{WG_PORT}", f"{gw}:{RP_PORT}", None, "gw-rp.pub"),
+            ("oracle", f"127.0.0.1:{ORACLE_WG_PORT}", f"127.0.0.1:{ORACLE_RP_PORT}", ORACLE_ALLOWED, "oracle-rp.pub")):
+        r = subprocess.run([tool, "client-conf", "--gateway", os.path.join(deploy, "gateway.toml"),
+                            "--address", f"{ip_str(KZC_IP)}/32", "--wg-endpoint", wg, "--rp-endpoint", rp,
+                            "--wg-listen-port", str(KZC_WG_PORT), "--rp-listen-port", str(KZC_RP_PORT),
+                            "--gw-rp-pub-path", f"/etc/kozane/{pub}", "--interface", KZC_IF,
+                            *(["--allowed-ips", allowed] if allowed else []),
+                            "--out", os.path.join(d, f"client-{name}.conf")], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise Fail(f"mksecrets client-conf {name}: {r.stdout}{r.stderr}")
+    for src, dst in (("gateway.rp.pk", "gw-rp.pub"), ("peer-0.rp.pk", "oracle-rp.pub")):
+        shutil.copyfile(os.path.join(deploy, src), os.path.join(root, "etc/kozane", dst))
+        os.chmod(os.path.join(root, "etc/kozane", dst), 0o644)
+
+
+def build_suite(tmp: str):
+    """The suites' one deployment, A: one mksecrets client (P, the upstream
+    client every suite's liveness barrier and the oracle's responder key
+    pair) and the `kzc keygen` client K, both in A's v0 bundle; v1 revokes
+    K (signed through tools/policy, M8 plan C13). Its swtpm state is
+    provisioned at v0. The kvm suite also releases the package (the
+    launcher boots the release's files) and packages the net fault-inject
+    variant (the supervisor reset)."""
+    use_swtpm_key(tmp, create=True)
+    deploy = os.path.join(tmp, "a")
+    subprocess.run(["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "--template",
+                    os.path.join(ROOT, "config/gateway.toml"), "--clients", "1", "--out", deploy], check=True, cwd=ROOT)
+    os.mkdir(kzc_dir(tmp), 0o700)
+    kzc_peer = kzc_keygen(tmp)
+    fixtures = PolicyFixtures(os.path.join(tmp, "policy"))
+    fleet = fixtures.fleet(deploy, "a", extra=(kzc_peer,))
+    printed = {}
+    _, srk = provision_tpm(tmp, "a", lambda tcti: printed.update(fixtures.provision(tcti, fleet, deploy, "a")))
+    fixtures.configure(deploy, fleet, printed)
+    revoked = os.path.join(deploy, "peers-kzc-revoked.toml")
+    with open(revoked, "w") as f:
+        f.write(peers_toml(deploy, fleet.fleet_id, False, only=[0]))
+    fixtures.sign_next(fleet, fleet.dir, revoked, os.path.join(kzc_dir(tmp), "v1.bin"))
+    shutil.copy2(fleet.v0, os.path.join(kzc_dir(tmp), "v0.bin"))
+    kzc_client_confs(tmp, deploy)
+    env = {**os.environ, "KOZANE_CONFIG": os.path.join(deploy, "gateway.toml")}
+    secrets_args = [f"SECRETS={deploy}/secrets.bin", f"PQ_SECRETS={deploy}/pqkey-secrets.bin",
+                    f"TLS_SECRETS={deploy}/tls-secrets.bin", f"AUDIT_SECRETS={deploy}/audit-secrets.bin",
+                    f"SRK_PUBLIC={srk}"]
+    make("image", env=env)
+    make("package", *secrets_args, f"OUT={deploy}/pkg", env=env)
+    pkgs = ["a/pkg"]
+    if SUITE == "kvm":
+        make("release-tool")
+        keys = os.path.join(tmp, "release-keys")
+        release_tool("keygen", "--dir", keys, "--forbid", ROOT)
+        release_py("make", "--keys", keys, "--pkg", f"{deploy}/pkg", "--out", f"{deploy}/release", "--allow-dirty")
+        make("package-fault-inject-net", *secrets_args, f"OUT={deploy}/pkg-fi-net", env=env)
+        pkgs.append("a/pkg-fi-net")
+    for pkg in pkgs:
+        if sorted(os.listdir(os.path.join(tmp, pkg))) != sorted(PACKAGE_OUTPUTS):
+            raise Fail(f"{pkg} holds {sorted(os.listdir(os.path.join(tmp, pkg)))}, want {sorted(PACKAGE_OUTPUTS)}")
+        check_oracle_not_in_image(os.path.join(tmp, pkg, "published.img"))
+
+
+class Kzc:
+    """`kzc-psk` and `kzc` (the test-seams builds) under the run's root
+    prefix, one uid for every service user (VE26). `kzc-psk` owns kz0;
+    `kzc up` talks Rosenpass from KZC_RP_PORT. Their stderr goes to the
+    run's logs, appended across starts."""
+
+    def __init__(self, tmp: str):
+        self.dir = kzc_dir(tmp)
+        self.root = os.path.join(self.dir, "root")
+        self.psk = self.kzc = None
+        self.notify = None
+
+    def seams(self) -> list:
+        return ["--root-prefix", self.root, "--user-map", KZC_USERS]
+
+    def configure(self, variant: str):
+        """client.conf for `variant` (mksecrets' gw or oracle file), in
+        place before either binary starts."""
+        dst = os.path.join(self.root, "etc/kozane/client.conf")
+        shutil.copyfile(os.path.join(self.dir, f"client-{variant}.conf"), dst + ".new")
+        os.chmod(dst + ".new", 0o644)
+        os.replace(dst + ".new", dst)
+
+    def log(self, name: str) -> str:
+        try:
+            return open(os.path.join(self.dir, f"{name}.log"), errors="replace").read()
+        except FileNotFoundError:
+            return ""
+
+    def _spawn(self, binary: str, args: list, name: str, env: dict = None) -> subprocess.Popen:
+        log = open(os.path.join(self.dir, f"{name}.log"), "a")
+        try:
+            return subprocess.Popen(DIE_WITH_PARENT + [binary, *self.seams(), *args], stdout=subprocess.DEVNULL,
+                                    stderr=log, env={**os.environ, **(env or {})})
+        finally:
+            log.close()
+
+    def start_psk(self) -> bytes:
+        """kzc-psk, READY: its interface's one peer holds a random PSK,
+        returned."""
+        path = os.path.join(self.root, "notify")
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
+        self.notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.notify.bind(path)
+        self.notify.settimeout(KZC_READY_S)
+        self.psk = self._spawn(KZC_PSK_BIN, [], "kzc-psk", {"NOTIFY_SOCKET": path})
+        try:
+            ready = self.notify.recv(64)
+        except socket.timeout:
+            raise Fail(f"kzc-psk: no READY=1 within {KZC_READY_S:.0f} s: {self.log('kzc-psk')[-2000:]}") from None
+        if ready != b"READY=1":
+            raise Fail(f"kzc-psk: notified {ready!r}")
+        psk = self.psk_now()
+        if psk is None or psk == bytes(32):
+            raise Fail(f"kzc-psk: zero psk installed ({psk!r})")
+        return psk
+
+    def start_kzc(self):
+        self.kzc = self._spawn(KZC_BIN, ["up"], "kzc")
+
+    def psk_now(self):
+        r = subprocess.run(["wg", "show", KZC_IF, "preshared-keys"], capture_output=True, text=True)
+        if r.returncode != 0:
+            return None
+        lines = r.stdout.split("\n")
+        fields = lines[0].split("\t") if lines[0] else []
+        if len([x for x in lines if x]) != 1 or len(fields) != 2:
+            raise Fail(f"kzc-psk: {KZC_IF} has other than one peer: {r.stdout!r}")
+        return None if fields[1] == "(none)" else b64(fields[1])
+
+    def handshake(self) -> int:
+        out = sh("wg", "show", KZC_IF, "latest-handshakes").stdout.split()
+        return int(out[1]) if len(out) >= 2 else 0
+
+    def wait_psk(self, other_than: tuple, timeout: float, what: str) -> bytes:
+        """The PSK once it is none of `other_than` (and not zero)."""
+        deadline = time.monotonic() + timeout
+        while True:
+            for name, p in (("kzc", self.kzc), ("kzc-psk", self.psk)):
+                if p is not None and p.poll() is not None:
+                    raise Fail(f"{what}: {name} exited ({p.returncode}): {self.log(name)[-2000:]}")
+            psk = self.psk_now()
+            if psk is not None and psk not in other_than:
+                if psk == bytes(32):
+                    raise Fail("kzc-psk: zero psk installed")
+                return psk
+            if time.monotonic() > deadline:
+                raise Fail(f"{what} within {timeout:.0f} s; kzc log: {self.log('kzc')[-1500:]}")
+            time.sleep(0.1)
+
+    def stop(self, which: str, sig=signal.SIGTERM) -> int:
+        p = getattr(self, which)
+        setattr(self, which, None)
+        if p is None:
+            return 0
+        if p.poll() is None:
+            p.send_signal(sig)
+        try:
+            return p.wait(timeout=LINE_TIMEOUT_S)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.wait()
+            raise Fail(f"{which} ignored {signal.Signals(sig).name}") from None
+
+    def close(self):
+        """Both stopped (kzc first, so kzc-psk scrubs, then deletes kz0),
+        and a marked leftover removed."""
+        try:
+            self.stop("kzc")
+        finally:
+            try:
+                self.stop("psk")
+            finally:
+                subprocess.run(DIE_WITH_PARENT + [KZC_PSK_BIN, *self.seams(), "cleanup"], capture_output=True)
+                if self.notify is not None:
+                    self.notify.close()
+                    self.notify = None
+        if subprocess.run(["ip", "link", "show", KZC_IF], capture_output=True).returncode == 0:
+            raise Fail("kzc-psk: interface left after exit")
+
+
+class RpBlock:
+    """The gateway's Rosenpass port unreachable from the netns (a policy
+    rule, no iptables in the image): WireGuard stays reachable. A rule after
+    the local table, so loopback is never blocked."""
+
+    RULE = ["pref", "100", "ipproto", "udp", "dport", str(RP_PORT), "blackhole"]
+
+    def __enter__(self):
+        sh("ip", "rule", "add", *self.RULE)
+        return self
+
+    def __exit__(self, *_):
+        subprocess.run(["ip", "rule", "del", *self.RULE], capture_output=True)
+
+
+def kzc_ping(tries: int = KZC_PING_TRIES) -> bool:
+    """A ping from kz0's address to the inside host, through the tunnel."""
+    for _ in range(tries):
+        if subprocess.run(["ping", "-c", "1", "-W", "2", "-I", ip_str(KZC_IP), ip_str(HOST_IP)],
+                          capture_output=True).returncode == 0:
+            return True
+    return False
+
+
+def kzc_session(con: Console, sniffer: Sniffer, kzc: Kzc, scrubbed: bytes, i0: int, what: str) -> bytes:
+    """kzc's exchange with the gateway, its OSK in kz0 (installed only once
+    the gateway exported its PSK: the ping proves the two agree). Records
+    the handshake latency: from the InitHello the gateway answered to its
+    RespHello, and to the install."""
+    osk = kzc.wait_psk((scrubbed,), RP_EXCHANGE_S, f"{what}: kzc: no OSK installed")
+    installed = time.monotonic()
+    hellos = rp_frames(sniffer, i0, outgoing=True, sport=KZC_RP_PORT, dport=RP_PORT, kind=RP_HELLO)
+    resps = rp_frames(sniffer, i0, outgoing=False, sport=RP_PORT, dport=KZC_RP_PORT, kind=RP_RESP_HELLO)
+    if not resps:
+        raise Fail(f"{what}: an OSK installed without a RespHello to kzc's port")
+    rt, resp = resps[-1][0], resps[-1][1]
+    answered = [h for h in hellos if h[0] < rt and h[1][4:8] == resp[8:12]]
+    if answered:
+        baseline("kzc-exchange-inithello-to-resphello", rt - answered[-1][0], "s")
+        baseline("kzc-exchange-inithello-to-install", installed - answered[-1][0], "s")
+    if not kzc_ping():
+        raise Fail(f"{what}: no ping reply through kz0 on the OSK")
+    return osk
+
+
+def tap_boot(pkg: Package, slots: tuple = None):
+    """The outside NIC on the tap (the netns plays the router; kzc and
+    upstream reach the gateway at 10.0.2.15), the inside on a dgram wire
+    the inside host answers pings on: (child, con, tap, host, sniffer)."""
+    tap = Tap()
+    inside = Wire()
+    host = InsideHost(inside)
+    p = pkg if slots is None else Package(pkg.dir, pkg.state, slots)
+    try:
+        child, con = boot(p, tap.netdev(), inside.netdev())
+    except BaseException:
+        tap.close()
+        inside.sock.close()
+        raise
+    try:
+        start_without_stop_signals(host)
+        sniffer = Sniffer(RP_PORT)
+    except BaseException:
+        host.stop = True
+        stop(child)
+        tap.close()
+        raise
+    return child, con, tap, host, sniffer
+
+
+def tap_teardown(child, tap, host, sniffer, *others):
+    try:
+        with signals_held():
+            host.stop = True
+            close_all(*others, sniffer)
+            kill(child)
+            tap.close()
+    except SystemExit:
+        host.stop = True
+        close_all(*others, sniffer)
+        kill(child)
+        tap.close()
+        raise
+
+
+def ready_baseline(con: Console, name: str = "time-to-pq-ready"):
+    """Waits for `pq: ready`; records its time from QEMU's start."""
+    con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+    m = re.search(r"pq: ready\r*\n", con.text)
+    if m:
+        baseline(name, con.time_at(m.end()) - con.started, "s")
+
+
+def test_kzc_boot(pkg: Package, deploy: str, kzc: Kzc, passed: list):
+    """C11's kzc cases on one boot, in order: the startup scrub (kzc's first
+    action, before any InitHello can reach the gateway), the session, a
+    rotation, and expiry (the gateway's Rosenpass port blocked: at the
+    bound kzc-psk re-adds the peer with a random PSK and the session ends)."""
+    child, con, tap, host, sniffer = tap_boot(pkg)
+    try:
+        wait_tap_ready(tap, con)
+        ready_baseline(con)
+        kzc.configure("gw")
+        p0 = kzc.start_psk()
+        with RpBlock():
+            kzc.start_kzc()
+            p1 = kzc.wait_psk((p0,), LINE_TIMEOUT_S, "kzc: send before scrub (no startup scrub)")
+        passed.append("kzc startup scrub")
+        print("\nPASS [kzc startup scrub: kz0's PSK replaced before any exchange]", flush=True)
+
+        osk = kzc_session(con, sniffer, kzc, p1, 0, "kzc session")
+        con.wait_for(r"audit: src=pq RpPskExported total=1 ", timeout=LINE_TIMEOUT_S)
+        passed.append("kzc session")
+        print("\nPASS [kzc session: kz0 holds the exchange's OSK, ping through]", flush=True)
+
+        rekey = rust_const("crates/rosenpass-core/src/initiator_state.rs", "REKEY_AFTER_TIME_INITIATOR_NS") / NS
+        osk2 = kzc.wait_psk((osk,), rekey + RP_EXCHANGE_S, "kzc rotation: wg show preshared-keys did not change")
+        if not kzc_ping():
+            raise Fail("kzc rotation: no ping reply through kz0 after the rekey")
+        passed.append("kzc rotation")
+        print("\nPASS [kzc rotation: the rekey's OSK replaced the PSK, ping through]", flush=True)
+
+        bound = rust_const(WG_CORE, "REJECT_AFTER_TIME_NS") / NS
+        resps = rp_frames(sniffer, 0, outgoing=False, sport=RP_PORT, dport=KZC_RP_PORT, kind=RP_RESP_HELLO)
+        if not resps:
+            raise Fail("kzc expiry: no RespHello to kzc's port was sniffed")
+        last = resps[-1][0]
+        with RpBlock():
+            if not kzc_ping():
+                raise Fail("kzc expiry: WireGuard unreachable with only the Rosenpass port blocked")
+            left = last + bound + EXPIRY_SLACK_S - time.monotonic()
+            scrub = kzc.wait_psk((osk2,), max(left, 0.0), "client: no scrub at bound")
+            at = time.monotonic() - last
+            if at < bound - EXPIRY_SLACK_S:
+                raise Fail(f"client: unexpected scrub {at:.1f} s after the last RespHello, before the bound {bound:.0f} s")
+            if scrub == osk:
+                raise Fail("kzc expiry: the scrub re-installed an earlier OSK")
+            if subprocess.run(["ping", "-c", "1", "-W", "2", "-I", ip_str(KZC_IP), ip_str(HOST_IP)],
+                              capture_output=True).returncode == 0:
+                raise Fail("kzc: session survived scrub")
+            if kzc.handshake() != 0:
+                raise Fail("kzc: session survived scrub (latest-handshakes kept)")
+        baseline("kzc-scrub-after-last-resphello", at, "s")
+        passed.append("kzc expiry")
+        print(f"\nPASS [kzc expiry: scrubbed {at:.1f} s after the last RespHello, the session gone]", flush=True)
+        sniffer.check_drops()
+    finally:
+        try:
+            kzc.close()
+        finally:
+            tap_teardown(child, tap, host, sniffer)
+
+
+def test_kzc_cookie(pkg: Package, deploy: str, kzc: Kzc, passed: list):
+    """C11 [T2.11, T3.5]: kzc under the S-3 load (its own address spoofed
+    once a second with a replay of its own InitHello, so the per-IP token
+    stays at zero): its exchange completes only through the cookie path.
+    Evidence: ingress's RpCookieReplySent and RpCookieAccepted lines (both
+    coalesced: the boot's first of each), and, since this load engaged, on
+    the wire a CookieReply to kzc's endpoint, then kzc's InitHello with
+    that cookie from the same endpoint, answered by a RespHello."""
+    child, con, tap, host, sniffer = tap_boot(pkg)
+    spoof = None
+    try:
+        wait_tap_ready(tap, con)
+        con.wait_for(r"pq: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
+        spkm = open(os.path.join(deploy, cfg["gateway"]["rp_pub_path"]), "rb").read()
+        kzc.configure("gw")
+        p0 = kzc.start_psk()
+        kzc.start_kzc()
+        p1 = kzc.wait_psk((p0,), LINE_TIMEOUT_S, "kzc: send before scrub (no startup scrub)")
+        osk = kzc.wait_psk((p1,), RP_EXCHANGE_S, "kzc cookie prelude: kzc: no OSK installed")
+        hellos = rp_frames(sniffer, 0, outgoing=True, sport=KZC_RP_PORT, dport=RP_PORT, kind=RP_HELLO)
+        if not hellos:
+            raise Fail("kzc cookie prelude: no InitHello from kzc's port was sniffed")
+        hello = hellos[0][1]
+        kzc.stop("kzc")
+        scrubbed = kzc.wait_psk((osk,), LINE_TIMEOUT_S, "kzc: psk survived exit")
+        wait_rp_load_clear(con)
+        mark = con.mark()
+        spoof = RpSpoof(tap, [hello], [(PEER_IP, RP_SPOOF_PORT)], RP_SPOOF_RATE)
+        con.wait_for(r"audit: src=ingress RpUnderLoad total=\d+ ", since=mark, timeout=10 * RP_SPOOF_RATE + LINE_TIMEOUT_S)
+        i0 = len(sniffer.since(0))
+        kzc.start_kzc()
+        rescrubbed = kzc.wait_psk((scrubbed,), LINE_TIMEOUT_S, "kzc: send before scrub (no startup scrub)")
+        try:
+            kzc.wait_psk((rescrubbed,), RP_EXCHANGE_S + RP_BACKOFF_CAP_S, "kzc's exchange under the load")
+            spoof.verify("kzc cookie")
+            rp_attribute_cookie(sniffer, i0, KZC_RP_PORT, spkm, "kzc cookie")
+            # Both lines are coalesced (a boot prints each kind's first
+            # only), so they are judged over the boot; the attribution to
+            # kzc's endpoint, after this load engaged, is the wire's.
+            for line in ("RpCookieReplySent", "RpCookieAccepted"):
+                if not con.count(rf"audit: src=ingress {line} "):
+                    raise Fail(f"no {line} line in the boot")
+        except Fail as e:
+            raise Fail(f"kzc-cookie: no cookie path: {e}") from e
+        if not kzc_ping():
+            raise Fail("kzc cookie: no ping reply through kz0 after the cookied exchange")
+        sniffer.check_drops()
+        passed.append("kzc cookie")
+        print("\nPASS [kzc cookie: under load kzc's exchange took the cookie path from its endpoint]", flush=True)
+    finally:
+        try:
+            if spoof is not None:
+                spoof.close()
+            kzc.close()
+        finally:
+            tap_teardown(child, tap, host, sniffer)
+
+
+def test_kzc_revocation(pkg: Package, deploy: str, tmp: str, kzc: Kzc, passed: list):
+    """C11: a bundle update revokes kzc (M8 plan C13): slot A v0, slot B v1
+    without K, on the provisioned state. `policy` accepts v1; client P's
+    upstream exchange and WireGuard handshake still succeed (the liveness
+    barrier), while kzc's InitHellos are refused by pq (HandshakeOther), no
+    RespHello reaches it, and kz0 keeps its random PSK."""
+    v0, v1 = (open(os.path.join(kzc_dir(tmp), f"v{n}.bin"), "rb").read() for n in (0, 1))
+    what = "kzc revocation"
+    with PolicyCase(tmp, "kzc-revocation", pkg.state, policy_names(deploy), 0) as case:
+        slots = write_slots(case.dir, v0, v1)
+        child, con, tap, host, sniffer = tap_boot(Package(pkg.dir, case.dir, slots))
+        rp = py = None
+        try:
+            policy_outcome(con, what, "accepted version=1 slot=B", set())
+            m = re.search(POLICY_OUTCOME, con.text)
+            if m:
+                baseline("policy-verdict-after-qemu-start", con.time_at(m.end()) - con.started, "s")
+            barrier_serves(con, what)
+            wait_tap_ready(tap, con)
+            cfg = tomllib.load(open(os.path.join(deploy, "gateway.toml"), "rb"))
+            rp = Rosenpass(deploy, 0, f"{ip_str(GW_IP)}:{RP_PORT}")
+            py = py_installed(peer_conf(deploy, 0), b64(cfg["gateway"]["public_key"]), rp,
+                              time.monotonic() + RP_EXCHANGE_S)
+            rp.stop()
+            kzc.configure("gw")
+            p0 = kzc.start_psk()
+            mark, i0 = con.mark(), len(sniffer.since(0))
+            kzc.start_kzc()
+            scrubbed = kzc.wait_psk((p0,), LINE_TIMEOUT_S, "kzc: send before scrub (no startup scrub)")
+            con.wait_for(r"audit: src=pq HandshakeOther ", since=mark, timeout=RP_EXCHANGE_S)
+            if rp_frames(sniffer, i0, outgoing=False, sport=RP_PORT, dport=KZC_RP_PORT, kind=RP_RESP_HELLO):
+                raise Fail(f"{what}: the revoked kzc got a RespHello")
+            if kzc.psk_now() != scrubbed:
+                raise Fail(f"{what}: the revoked kzc's PSK changed after its startup scrub")
+            if not rp_frames(sniffer, i0, outgoing=True, sport=KZC_RP_PORT, dport=RP_PORT, kind=RP_HELLO):
+                raise Fail(f"{what}: kzc sent no InitHello")
+            if kzc_ping(1):
+                raise Fail(f"{what}: a ping crossed kz0 for the revoked kzc")
+            passed.append("kzc revocation")
+            print("\nPASS [kzc revocation: v1 accepted from slot B; P still serves, kzc refused]", flush=True)
+        finally:
+            try:
+                kzc.close()
+            finally:
+                tap_teardown(child, tap, host, sniffer, py, rp)
+
+
+def oracle_case(kzc: Kzc, binary: str, label: str, oracle: list):
+    """D4: kzc against upstream rosenpass as responder (`label`), host-only,
+    upstream with no endpoint for kzc's peer, so it only responds. Upstream
+    holds mksecrets client 0's key pair, which kzc pins. The PSK kzc-psk
+    installs in kz0 must be upstream's key_out; the equality is printed."""
+    d = os.path.join(kzc.dir, f"oracle-{label}")
+    os.mkdir(d, 0o700)
+    deploy = os.path.join(os.path.dirname(kzc.dir), "a")
+    conf = os.path.join(d, "responder.toml")
+    with open(conf, "w") as f:
+        f.write(f'public_key = "{deploy}/peer-0.rp.pk"\nsecret_key = "{deploy}/peer-0.rp.sk"\n'
+                f'listen = ["127.0.0.1:{ORACLE_RP_PORT}"]\nverbosity = "Quiet"\n\n'
+                f'[[peers]]\npublic_key = "{kzc.root}/var/lib/kozane-net/rp.pub"\nkey_out = "{d}/osk"\n'
+                f'protocol_version = "V02"\n')
+    proc = subprocess.Popen(DIE_WITH_PARENT + [binary, "exchange-config", conf], cwd=d, stdout=subprocess.DEVNULL,
+                            stderr=open(os.path.join(d, "responder.log"), "w"))
+    try:
+        kzc.configure("oracle")
+        p0 = kzc.start_psk()
+        kzc.start_kzc()
+        p1 = kzc.wait_psk((p0,), LINE_TIMEOUT_S, "kzc: send before scrub (no startup scrub)")
+        deadline = time.monotonic() + ORACLE_EXCHANGE_S
+        key = None
+        while key is None:
+            with contextlib.suppress(FileNotFoundError, ValueError):
+                k = base64.b64decode(open(os.path.join(d, "osk")).read().strip(), validate=True)
+                key = k if len(k) == 32 else None
+            if proc.poll() is not None:
+                raise Fail(f"oracle {label}: upstream exited ({proc.returncode})")
+            if time.monotonic() > deadline:
+                raise Fail(f"oracle {label}: upstream wrote no key_out within {ORACLE_EXCHANGE_S:.0f} s; "
+                           f"kzc log: {kzc.log('kzc')[-1500:]}")
+            time.sleep(0.1)
+        got = kzc.wait_psk((p0, p1), LINE_TIMEOUT_S, f"oracle {label}: kzc installed no PSK")
+        if got != key:
+            raise Fail(f"oracle {label}: kz0's PSK is not upstream's key_out")
+        print(f"\nORACLE-EQUAL kzc upstream-{label}: kz0's PSK equals upstream's key_out "
+              f"(sha256 {hashlib.sha256(key).hexdigest()[:16]})", flush=True)
+        oracle.append(f"kzc oracle {label}")
+    finally:
+        try:
+            kzc.close()
+        finally:
+            proc.kill()
+            proc.wait()
+
+
+# ---- test-kvm (C6)
+
+class LogConsole(Console):
+    """The launcher's console log (root/var/log/kozane/console.log, written
+    by its serial reader) read as it grows, with Console's waits."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.stopped = False
+        super().__init__(None)
+
+    def _drain(self):
+        f = None
+        try:
+            while not self.stopped:
+                if f is None:
+                    try:
+                        f = open(self.path, encoding="utf-8", errors="replace", newline="")
+                    except FileNotFoundError:
+                        time.sleep(0.05)
+                        continue
+                s = f.read(4096)
+                if not s:
+                    time.sleep(0.05)
+                    continue
+                sys.stdout.write(s)
+                sys.stdout.flush()
+                with self.lock:
+                    self._commit(s)
+                    self.ends.append(len(self.text))
+                    self.times.append(time.monotonic())
+        finally:
+            if f is not None:
+                f.close()
+            with self.lock:
+                self._commit("", final=True)
+            self.alive = False
+
+    def close(self):
+        self.stopped = True
+
+
+def children_of(pid: int) -> list:
+    out = []
+    for p in os.listdir("/proc"):
+        if p.isdigit():
+            with contextlib.suppress(OSError):
+                stat = open(f"/proc/{p}/stat").read()
+                if int(stat.rsplit(")", 1)[1].split()[1]) == pid:
+                    out.append(int(p))
+    return out
+
+
+def kvm_vm_fd(pid: int) -> bool:
+    for fd in os.listdir(f"/proc/{pid}/fd"):
+        with contextlib.suppress(OSError):
+            if os.readlink(f"/proc/{pid}/fd/{fd}") == "anon_inode:kvm-vm":
+                return True
+    return False
+
+
+def launcher_qemu(launcher: subprocess.Popen, qemu: str, what: str) -> int:
+    """The QEMU the launcher started, and C6's proof that it runs under KVM
+    without QMP: its fds hold an anon_inode:kvm-vm."""
+    deadline = time.monotonic() + LAUNCHER_BOOT_S
+    while True:
+        pids = [p for p in children_of(launcher.pid)
+                if os.path.realpath(f"/proc/{p}/exe") == os.path.realpath(qemu)] if launcher.poll() is None else []
+        if pids and kvm_vm_fd(pids[0]):
+            return pids[0]
+        if launcher.poll() is not None:
+            raise Fail(f"{what}: the launcher exited ({launcher.returncode}) before QEMU ran")
+        if time.monotonic() > deadline:
+            raise Fail(f"kvm: not enabled: the launcher's QEMU {pids} holds no anon_inode:kvm-vm fd "
+                       f"within {LAUNCHER_BOOT_S:.0f} s")
+        time.sleep(0.2)
+
+
+def swtpm_state_encrypted(state: str, scratch: str):
+    """C4 [T2.20, T3.15]: the provisioned state is encrypted. On a copy,
+    swtpm without --key fails CMD_INIT (swtpm_ioctl -i) or TPM2_Startup;
+    with the run's key the same sequence succeeds."""
+    results = {}
+    for keyed in (False, True):
+        d = tempfile.mkdtemp(prefix="swtpm-enc-", dir=scratch)
+        shutil.copy2(os.path.join(state, SWTPM_PERMALL), d)
+        ctrl, data = os.path.join(d, "ctrl.sock"), os.path.join(d, "data.sock")
+        argv = ["swtpm", "socket", "--tpm2", "--tpmstate", f"dir={d}", "--ctrl", f"type=unixio,path={ctrl},mode=0600",
+                "--server", f"type=unixio,path={data},mode=0600"]
+        if keyed:
+            argv += ["--key", f"file={swtpm_key},mode=aes-256-cbc"]
+        proc = subprocess.Popen(DIE_WITH_PARENT + argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + SWTPM_SOCKET_WAIT_S
+            while not (os.path.exists(ctrl) and os.path.exists(data)):
+                if proc.poll() is not None or time.monotonic() > deadline:
+                    raise Fail(f"swtpm-state: swtpm ({'with' if keyed else 'without'} key) opened no sockets")
+                time.sleep(0.05)
+            init = subprocess.run(["swtpm_ioctl", "--unix", ctrl, "-i"], capture_output=True, text=True)
+            started = False
+            if init.returncode == 0:
+                s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    s.settimeout(LINE_TIMEOUT_S)
+                    s.connect(data)
+                    tpm_command(s, 0x8001, CC_STARTUP, struct.pack(">H", 0))
+                    started = True
+                except (Fail, OSError):
+                    started = False
+                finally:
+                    s.close()
+            results[keyed] = (init.returncode, started, init.stdout + init.stderr)
+        finally:
+            proc.kill()
+            proc.wait()
+            shutil.rmtree(d, ignore_errors=True)
+    if results[False][0] == 0 and results[False][1]:
+        raise Fail("swtpm-state: plaintext: a copy of the state starts without the key")
+    if results[True][0] != 0 or not results[True][1]:
+        raise Fail(f"swtpm-state: the run's key does not start the state: {results[True]}")
+
+
+def https_rate(ca: str, what: str):
+    """HTTPS_RATE_REQUESTS sequential verified GETs, each a fresh TLS 1.3
+    handshake (X25519MLKEM768): their rate, a baseline."""
+    t0 = time.monotonic()
+    for _ in range(HTTPS_RATE_REQUESTS):
+        body, _ = curl_get(ca)
+        if body != backend_body():
+            raise Fail(f"{what}: HTTPS returned {len(body)} bytes, not the backend's body")
+    baseline("https-sequential-requests", HTTPS_RATE_REQUESTS / (time.monotonic() - t0), "req/s")
+
+
+def test_kvm_launcher(pkg: Package, deploy: str, tmp: str, passed: list):
+    """C6, C4's acceptance: the release boots through `kozane-vm` (the
+    test-seams build, --root-prefix and --user-map), with the real QEMU and
+    swtpm: the release's u-boot.bin pinned, its image and descriptor and
+    the package's envelopes and node slots as the node's media, the
+    provisioned swtpm state with the run's key. Its taps join two bridges
+    the netns plays the router and the backend on. The launcher has no
+    QMP: KVM is proved by QEMU's kvm-vm fd. The console is the launcher's
+    root-only log. First the encrypted-state check on the provisioned
+    state; after the boot, HTTPS end to end, and a clean stop on SIGTERM."""
+    scratch = tempfile.mkdtemp(prefix="swtpm-enc-", dir=tmp)
+    try:
+        swtpm_state_encrypted(pkg.state, scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    passed.append("kvm swtpm state encrypted")
+    print("\nPASS [kvm swtpm state: a copy without the key does not start; with it, it does]", flush=True)
+    release = os.path.join(deploy, "release")
+    fields = manifest_fields(release)
+    root = tempfile.mkdtemp(prefix="kozane-vm-root-", dir=tmp)
+    node = os.path.join(root, "var/lib/kozane/node")
+    for d in ("etc/kozane", "var/lib/kozane/node", "var/lib/kozane/swtpm", "var/log/kozane"):
+        os.makedirs(os.path.join(root, d), 0o700)
+    qemu, swtpm = shutil.which("qemu-system-aarch64"), shutil.which("swtpm")
+
+    def put(rel: str, data: bytes, mode: int):
+        path = os.path.join(root, rel)
+        with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), "wb") as f:
+            f.write(data)
+        os.chmod(path, mode)
+    put("etc/kozane/vm.conf", f"inside_bridge={VM_INSIDE_BRIDGE}\noutside_bridge={VM_OUTSIDE_BRIDGE}\n"
+        f"qemu={qemu}\nswtpm={swtpm}\n".encode(), 0o644)
+    put("etc/kozane/firmware.pin", f"firmware_sha256={fields['firmware_sha256']}\nrelease_seq={fields['release_seq']}\n"
+        .encode(), 0o600)
+    put("etc/kozane/swtpm.key", open(swtpm_key, "rb").read(), 0o600)
+    files = {"u-boot.bin": os.path.join(release, "u-boot.bin"), "published.img": os.path.join(release, "published.img"),
+             "boot.desc": os.path.join(release, "boot.desc"),
+             **{n: pkg.path(n) for n in ENVELOPE_FILES}, "slot-a.bin": pkg.slots[0], "slot-b.bin": pkg.slots[1]}
+    for name, src in files.items():
+        put(f"var/lib/kozane/node/{name}", open(src, "rb").read(), 0o644)
+    for name in ("u-boot.bin", "published.img", "boot.desc"):
+        key = {"u-boot.bin": "firmware_sha256", "published.img": "loader_img_sha256", "boot.desc": "boot_desc_sha256"}
+        if file_sha256(os.path.join(node, name)) != fields[key[name]]:
+            raise Fail(f"kvm release boot: {name} is not the manifest's")
+    shutil.copy2(os.path.join(pkg.state, SWTPM_PERMALL), os.path.join(root, "var/lib/kozane/swtpm"))
+    seams_build(VM_SEAMS_BIN)
+    bridges = []
+    launcher = con = backend = None
+    log = os.path.join(tmp, "kozane-vm.log")
+    try:
+        for br, mac, ip, peer, peer_mac in ((VM_OUTSIDE_BRIDGE, PEER_MAC, PEER_IP, GW_IP, GW_MAC),
+                                            (VM_INSIDE_BRIDGE, HOST_MAC, HOST_IP, INSIDE_IP, INSIDE_MAC)):
+            sh("ip", "link", "add", br, "type", "bridge")
+            bridges.append(br)
+            sh("ip", "link", "set", br, "address", mac.hex(":"))
+            sh("ip", "addr", "add", f"{ip_str(ip)}/24", "dev", br)
+            sh("ip", "link", "set", br, "up")
+            sh("ip", "neigh", "replace", ip_str(peer), "lladdr", peer_mac.hex(":"), "dev", br, "nud", "permanent")
+        backend = Backend()
+        con = LogConsole(os.path.join(root, "var/log/kozane/console.log"))
+        with open(log, "w") as f:
+            launcher = subprocess.Popen(DIE_WITH_PARENT + [VM_SEAMS_BIN, "--root-prefix", root, "--user-map"],
+                                        stdout=f, stderr=subprocess.STDOUT)
+        started = time.monotonic()
+        launcher_qemu(launcher, qemu, "kvm release boot")
+        for pd in ("hs", "pq", "tls"):
+            con.wait_for(rf"{pd}: ready", timeout=LAUNCHER_BOOT_S, strip_ready=True)
+        m = re.search(r"pq: ready\r*\n", con.text)
+        if m:
+            baseline("launcher-time-to-pq-ready", con.time_at(m.end()) - started, "s")
+        no_supervisor_record(con, "kvm release boot")
+        if con.count(r"KeyUnavailable"):
+            raise Fail("kvm release boot: a key PD was Unavailable")
+        ca = os.path.join(deploy, "devca.pem")
+        body, _ = curl_get(ca)
+        if body != backend_body():
+            raise Fail(f"kvm https: HTTPS returned {len(body)} bytes, not the backend's body: {body[:64]!r}")
+        https_rate(ca, "kvm https")
+        passed.append("kvm https")
+        print("\nPASS [kvm https: a verified request through the launcher's node reaches the backend]", flush=True)
+        launcher.send_signal(signal.SIGTERM)
+        try:
+            rc = launcher.wait(timeout=LAUNCHER_STOP_S)
+        except subprocess.TimeoutExpired:
+            raise Fail(f"kvm release boot: kozane-vm did not stop within {LAUNCHER_STOP_S:.0f} s of SIGTERM") from None
+        if rc != 0:
+            raise Fail(f"kvm release boot: kozane-vm exited {rc} on SIGTERM: {open(log).read()[-2000:]}")
+        passed.append("kvm release boot via kozane-vm")
+        print("\nPASS [kvm release boot: the release's files boot through kozane-vm under KVM, stop clean]", flush=True)
+    finally:
+        # A stop signal on the way in must not skip any of it: the launcher,
+        # its children and the bridges would outlive the case (the same
+        # teardown runs on both paths, as in tap_teardown).
+        try:
+            with signals_held():
+                if launcher is not None and launcher.poll() is None:
+                    kids = children_of(launcher.pid)
+                    launcher.kill()
+                    launcher.wait()
+                    for c in kids:
+                        with contextlib.suppress(ProcessLookupError):
+                            os.kill(c, signal.SIGKILL)
+                close_all(backend, con)
+                for br in bridges:
+                    subprocess.run(["ip", "link", "del", br], capture_output=True)
+                shutil.rmtree(root, ignore_errors=True)
+        except SystemExit:
+            if launcher is not None and launcher.poll() is None:
+                kids = children_of(launcher.pid)
+                launcher.kill()
+                launcher.wait()
+                for c in kids:
+                    with contextlib.suppress(ProcessLookupError):
+                        os.kill(c, signal.SIGKILL)
+            close_all(backend, con)
+            for br in bridges:
+                subprocess.run(["ip", "link", "del", br], capture_output=True)
+            shutil.rmtree(root, ignore_errors=True)
+            raise
+        print(f"\nkozane-vm log:\n{open(log).read()[-3000:] if os.path.exists(log) else ''}", flush=True)
+
+
+def test_kvm_sealed(pkg: Package, passed: list):
+    """C6: a seal and an unseal under KVM. The package's envelopes (sealed
+    to the release image's PCRs at packaging) open: the three key PDs'
+    callers become ready, and PCR 8 is the twin's plus the cap."""
+    image, desc = pkg.read("published.img"), pkg.read("boot.desc")
+    want = measure.extend(measure.expected_pcr8(desc, image), cap_digest())
+    child, con = sealed_boot(pkg)
+    try:
+        for pd in ("hs", "pq", "tls"):
+            con.wait_for(rf"{pd}: ready", timeout=BOOT_TIMEOUT_S, strip_ready=True)
+        if con.count(r"KeyUnavailable"):
+            raise Fail("kvm seal and unseal: a key PD was Unavailable")
+        kill_qemu(child)
+        got = read_pcrs(child.tpm)[8]
+    finally:
+        stop(child)
+    if got != want:
+        raise Fail(f"kvm seal and unseal: PCR 8 is {got.hex()}, want the twin plus the cap {want.hex()}")
+    passed.append("kvm seal and unseal")
+    print("\nPASS [kvm seal and unseal: the envelopes open, PCR 8 capped]", flush=True)
+
+
+class InsideNetns:
+    """The inside NIC on a tap that moves, once QEMU holds it, into a nested
+    netns of its own (`unshare -rn`, a child of the run's), whose kernel is
+    the inside host: it answers pings and runs one iperf3 server (C6's
+    WireGuard throughput, between the outside netns and an inside netns on
+    the inside tap). Its route back to kzc's address is the gateway's
+    inside address."""
+
+    def __init__(self):
+        self.proc = None
+        sh("ip", "tuntap", "add", "dev", INSIDE_TAP, "mode", "tap")
+        try:
+            sh("ip", "link", "set", INSIDE_TAP, "address", HOST_MAC.hex(":"))
+        except BaseException:
+            self.close()
+            raise
+
+    def netdev(self) -> str:
+        return f"tap,ifname={INSIDE_TAP},script=no,downscript=no"
+
+    def enter(self):
+        script = (f"echo up; read x; ip link set lo up; ip addr add {ip_str(HOST_IP)}/24 dev {INSIDE_TAP}; "
+                  f"ip link set {INSIDE_TAP} up; ip neigh replace {ip_str(INSIDE_IP)} lladdr {INSIDE_MAC.hex(':')} "
+                  f"dev {INSIDE_TAP} nud permanent; ip route add {ip_str(KZC_IP)}/32 via {ip_str(INSIDE_IP)}; "
+                  f"echo configured; exec iperf3 -s -1 -B {ip_str(HOST_IP)} -p {IPERF_PORT}")
+        self.proc = subprocess.Popen(DIE_WITH_PARENT + ["unshare", "-rn", "sh", "-c", script], stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        if self.proc.stdout.readline().strip() != "up":
+            raise Fail("inside netns: the nested namespace did not start")
+        sh("ip", "link", "set", INSIDE_TAP, "netns", str(self.proc.pid))
+        self.proc.stdin.write("go\n")
+        self.proc.stdin.flush()
+        line = self.proc.stdout.readline().strip()
+        if line != "configured":
+            raise Fail(f"inside netns: configuring {INSIDE_TAP} failed: {line} {self.proc.stdout.read()[-500:]}")
+
+    def close(self):
+        if self.proc is not None:
+            self.proc.kill()
+            self.proc.wait()
+            self.proc = None
+        subprocess.run(["ip", "link", "del", INSIDE_TAP], capture_output=True)
+
+
+def iperf3_baseline(what: str):
+    """C6: WireGuard throughput, kz0 to the inside netns's iperf3 server."""
+    r = subprocess.run(["iperf3", "-c", ip_str(HOST_IP), "-p", str(IPERF_PORT), "-B", ip_str(KZC_IP), "-t",
+                        str(IPERF_S), "-J"], capture_output=True, text=True, timeout=IPERF_S + 30)
+    try:
+        bps = json.loads(r.stdout)["end"]["sum_received"]["bits_per_second"]
+    except (ValueError, KeyError) as e:
+        raise Fail(f"{what}: iperf3 through kz0 failed (rc {r.returncode}): {r.stdout[-500:]}{r.stderr[-500:]}") from e
+    baseline("wireguard-iperf3-tcp", bps / 1e6, "Mbit/s")
+
+
+def test_kvm_kzc(pkg: Package, kzc: Kzc, passed: list):
+    """C6: a kzc session under KVM (the EL1 entry path production runs),
+    the inside host a nested netns; then the WireGuard throughput."""
+    tap = Tap()
+    inside = sniffer = None
+    try:
+        inside = InsideNetns()
+        child, con = boot(pkg, tap.netdev(), inside.netdev())
+    except BaseException:
+        close_all(inside, tap)
+        raise
+    try:
+        inside.enter()
+        sniffer = Sniffer(RP_PORT)
+        wait_tap_ready(tap, con)
+        ready_baseline(con)
+        kzc.configure("gw")
+        p0 = kzc.start_psk()
+        kzc.start_kzc()
+        p1 = kzc.wait_psk((p0,), LINE_TIMEOUT_S, "kzc: send before scrub (no startup scrub)")
+        kzc_session(con, sniffer, kzc, p1, 0, "kvm kzc session")
+        passed.append("kvm kzc session")
+        print("\nPASS [kvm kzc session: the OSK in kz0, ping through]", flush=True)
+        iperf3_baseline("kvm kzc session")
+    finally:
+        try:
+            kzc.close()
+        finally:
+            try:
+                with signals_held():
+                    close_all(sniffer)
+                    kill(child)
+                    close_all(inside, tap)
+            except SystemExit:
+                kill(child)
+                close_all(inside, tap)
+                raise
+
+
+def test_kvm_policy(pkg: Package, deploy: str, tmp: str, passed: list):
+    """C6: a policy-update boot under KVM: v1 advances from slot B."""
+    v0, v1 = (open(os.path.join(kzc_dir(tmp), f"v{n}.bin"), "rb").read() for n in (0, 1))
+    with PolicyCase(tmp, "kvm-policy", pkg.state, policy_names(deploy), 0) as case:
+        child, con = sealed_boot(Package(pkg.dir, case.dir, write_slots(case.dir, v0, v1)))
+        try:
+            policy_outcome(con, "kvm policy update", "accepted version=1 slot=B", set())
+            m = re.search(POLICY_OUTCOME, con.text)
+            if m:
+                baseline("policy-verdict-after-qemu-start", con.time_at(m.end()) - con.started, "s")
+            barrier_serves(con, "kvm policy update")
+        finally:
+            stop(child)
+    passed.append("kvm policy update")
+    print("\nPASS [kvm policy update: v1 accepted from slot B, the barrier PDs serve]", flush=True)
+
+
+def test_kvm_supervisor(fi_net: Package, passed: list):
+    """C6: one supervisor reset under KVM (C3 row 1: PSCI SYSTEM_RESET
+    through KVM): inject A's fault, one record, QMP's SHUTDOWN guest-reset."""
+    child, con, w = fault_boot(fi_net)
+    try:
+        mark = con.mark()
+        w.send(ipv4_udp(PEER_IP, GW_IP, 40000, WG_PORT, FAULT_FRAME_A))
+        r = con.wait_for(SUPERVISOR_RECORD, since=mark)
+        if r.group(1) != "ingress" or r.group(3) != "0":
+            raise Fail(f"kvm supervisor reset: the record is {r.group(0).strip()}, want pd=ingress lost=0")
+        reset_after_one_record(child, con, mark, "kvm supervisor reset")
+    finally:
+        stop(child)
+    passed.append("kvm supervisor reset")
+    print("\nPASS [kvm supervisor reset: the fault is recorded and resets through PSCI]", flush=True)
+
+
+def test_kvm_tick(pkg: Package, passed: list):
+    """C6 [T2.12, T3.11, T4.3]: the tick rate under KVM. The `ticks=` of two
+    consecutive Heartbeat lines against the host's monotonic clock between
+    their arrivals, within TICK_TOLERANCE; the headroom is printed. The
+    waits allow a timer at half the rate to show (the red-proof)."""
+    every = rust_const("crates/layout/src/lib.rs", "HEARTBEAT_S")
+    pattern = r"audit: Heartbeat ticks=(\d+)\r*\n"
+    child, con = sealed_boot(pkg)
+    try:
+        seen = []
+        since = 0
+        for _ in range(2):
+            m = con.wait_for(pattern, since=since, timeout=3 * every + BOOT_TIMEOUT_S)
+            since += m.end()
+            seen.append((int(m.group(1)), con.time_at(since)))
+    finally:
+        stop(child)
+    (t1, a1), (t2, a2) = seen
+    rate = (t2 - t1) / (a2 - a1)
+    err = abs(rate - 1.0)
+    print(f"\nkvm-tick: ticks {t1}..{t2} in {a2 - a1:.3f} s: {rate:.5f} ticks/s; |error| {err:.5f} of "
+          f"tolerance {TICK_TOLERANCE} (headroom {TICK_TOLERANCE - err:.5f})", flush=True)
+    baseline("tick-rate", rate, "ticks/s")
+    if t2 - t1 != every or err > TICK_TOLERANCE:
+        raise Fail(f"kvm-tick: rate outside tolerance: {t2 - t1} ticks in {a2 - a1:.3f} s ({rate:.4f}/s)")
+    passed.append("kvm tick rate")
+    print("\nPASS [kvm tick rate]", flush=True)
+
+
+def in_netns_suite(tmp: str) -> int:
+    """The suite's cases, inside the netns (as in_netns)."""
+    guard_thread_starts()
+    use_swtpm_key(tmp)
+    deploy = os.path.join(tmp, "a")
+    pkg = Package(os.path.join(deploy, "pkg"), os.path.join(tmp, "tpm-a"),
+                  tuple(os.path.join(deploy, f) for f in SLOT_FILES))
+    subprocess.run(["ip", "link", "set", "lo", "up"], check=True)
+    kzc = Kzc(tmp)
+    passed, oracle = [], []
+    if SUITE == "kvm":
+        fi_net = Package(os.path.join(deploy, "pkg-fi-net"), pkg.state, pkg.slots)
+        cases = [("kvm release boot", lambda: test_kvm_launcher(pkg, deploy, tmp, passed)),
+                 ("kvm seal and unseal", lambda: test_kvm_sealed(pkg, passed)),
+                 ("kvm kzc session", lambda: test_kvm_kzc(pkg, kzc, passed)),
+                 ("kvm policy update", lambda: test_kvm_policy(pkg, deploy, tmp, passed)),
+                 ("kvm supervisor reset", lambda: test_kvm_supervisor(fi_net, passed)),
+                 ("kvm tick rate", lambda: test_kvm_tick(pkg, passed))]
+        key = "KVM-CASES"
+    else:
+        cases = [("kzc oracle master", lambda: oracle_case(kzc, RP_MASTER, "master", oracle)),
+                 ("kzc oracle 0.2.3", lambda: oracle_case(kzc, RP_023, "0.2.3", oracle)),
+                 ("kzc boot", lambda: test_kzc_boot(pkg, deploy, kzc, passed)),
+                 ("kzc cookie", lambda: test_kzc_cookie(pkg, deploy, kzc, passed)),
+                 ("kzc revocation", lambda: test_kzc_revocation(pkg, deploy, tmp, kzc, passed))]
+        key = "KZC-CASES"
+    only = [b for b in os.environ.get("KOZANE_IT_BOOTS", "").split(",") if b]
+    if only:
+        unknown = sorted(set(only) - {name for name, _ in cases})
+        if unknown:
+            print(f"\nFAIL [setup]: KOZANE_IT_BOOTS names no boot: {unknown}", file=sys.stderr)
+            return 1
+        cases = [c for c in cases if c[0] in only]
+    try:
+        for name, fn in cases:
+            try:
+                fn()
+            except (Fail, pexpect.TIMEOUT, pexpect.EOF, subprocess.CalledProcessError, OSError) as e:
+                print(f"\nFAIL [{name}]: {type(e).__name__}: {e}", file=sys.stderr)
+                return 1
+            print(f"\nPASS [{name}]")
+    finally:
+        write_baselines()
+    partial = "-PARTIAL" if only else ""
+    print(f"{key}{partial} {len(passed)}")
+    if SUITE == "kzc":
+        print(f"INTEGRATION-ORACLE-CASES{partial} {len(oracle)}")
+    return 0
 
 
 # ---------------------------------------------------------------- driver
@@ -8006,8 +9123,9 @@ def swtpm_server(state: str):
     # tpm2-tss's swtpm TCTI finds the control socket at the data path + ".ctrl".
     data = os.path.join(state, "tpm.sock")
     ctrl = data + ".ctrl"
-    proc = subprocess.Popen(DIE_WITH_PARENT + ["swtpm", "socket", "--tpm2", "--tpmstate", f"dir={state}",
-                                               "--ctrl", f"type=unixio,path={ctrl}", "--server",
+    # vm.swtpm's argv (the run's key, M9 plan C1) plus the data socket only
+    # provisioning has.
+    proc = subprocess.Popen(DIE_WITH_PARENT + ["swtpm", *vm.swtpm(state, swtpm_key, ctrl), "--server",
                                                f"type=unixio,path={data}", "--flags", "not-need-init,startup-clear"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     try:
@@ -8055,8 +9173,11 @@ def provision_tpm(root: str, name: str, nv=None) -> tuple:
     os.mkdir(state, 0o700)
     ca = ek_ca(root)
     # The TPM's manufacture: an EK and its certificate from the run's CA.
+    # Encrypted under the run's key from its first write (M9 plan C1, H2),
+    # with the cipher vm.swtpm names.
     r = subprocess.run(["swtpm_setup", "--tpm2", "--tpmstate", state, "--create-ek-cert", "--overwrite", "--config",
-                        os.path.join(root, "swtpm-setup.conf")], capture_output=True, text=True)
+                        os.path.join(root, "swtpm-setup.conf"), "--keyfile", swtpm_key, "--cipher", "aes-256-cbc"],
+                       capture_output=True, text=True)
     if r.returncode != 0:
         raise Fail(f"swtpm_setup {name}: {r.stdout}{r.stderr}")
     srk = os.path.join(root, f"tpm-{name}.srk.pub")
@@ -8163,10 +9284,11 @@ class PolicyFixtures:
         with open(self.pinned, "w") as f:
             f.write("# this run's fleets\n")
 
-    def fleet(self, deploy: str, name: str, swap_rp: bool = False) -> Fleet:
+    def fleet(self, deploy: str, name: str, swap_rp: bool = False, extra: tuple = ()) -> Fleet:
         """A fleet of the one node `deploy`, and its v0 bundle: the clients
         mksecrets wrote (clients.toml) in the groups peers_toml gives them
-        (C8), rendered, approved by both approvers and signed."""
+        (C8), and `extra`'s peers, rendered, approved by both approvers and
+        signed."""
         fleet = Fleet(os.path.join(self.root, name), secrets.token_hex(16))
         os.mkdir(fleet.dir, 0o700)
         policy_tool(self.bin, "keygen", "--dir", fleet.keys, "--forbid", ROOT)
@@ -8175,7 +9297,7 @@ class PolicyFixtures:
         policy_tool(self.bin, "ledger", "init", "--dir", fleet.ledger, "--genesis-roster", self.roster)
         peers = os.path.join(deploy, "peers.toml")
         with open(peers, "w") as f:
-            f.write(peers_toml(deploy, fleet.fleet_id, swap_rp))
+            f.write(peers_toml(deploy, fleet.fleet_id, swap_rp, extra=extra))
         self.sign_next(fleet, fleet.dir, peers, fleet.v0)
         with open(self.pinned, "a") as f:
             for key in self.record_keys:
@@ -8330,10 +9452,13 @@ class PolicyFixtures:
             f.write(bytes(measure.BUNDLE_MAX))
 
 
-def peers_toml(deploy: str, fleet_id: str, swap_rp: bool, only: list = None, min_release: int = 0) -> str:
+def peers_toml(deploy: str, fleet_id: str, swap_rp: bool, only: list = None, min_release: int = 0,
+               extra: tuple = ()) -> str:
     """tools/policy's peers.toml from mksecrets' clients.toml (in client
     order), with `swap_rp` trading clients 0 and 1's Rosenpass keys; `only`
-    keeps those clients alone (M8 plan C13)."""
+    keeps those clients alone (M8 plan C13). `extra` adds peers of its own,
+    each a dict of peers.toml's fields (M9 plan C11: the `kzc keygen`
+    clients), and `rules` for groups of its own."""
     clients = tomllib.load(open(os.path.join(deploy, "clients.toml"), "rb"))["peers"]
     if swap_rp:
         clients[0]["rp_pub_path"], clients[1]["rp_pub_path"] = clients[1]["rp_pub_path"], clients[0]["rp_pub_path"]
@@ -8353,6 +9478,11 @@ def peers_toml(deploy: str, fleet_id: str, swap_rp: bool, only: list = None, min
         member = ", ".join(f'"{g}"' for g in groups.get(i, ["inside"]))
         out += ["[[peers]]", f'wg_pub = "{c["wg_pub"]}"', f'rp_pub_path = "{c["rp_pub_path"]}"',
                 "allowed_ips = [" + ", ".join(f'"{a}"' for a in c["allowed_ips"]) + "]", f"groups = [{member}]", ""]
+    rules.update({n: r for c in extra for n, r in c.get("rules", {}).items()})
+    for c in extra:
+        out += ["[[peers]]", f'wg_pub = "{c["wg_pub"]}"', f'rp_pub_path = "{c["rp_pub_path"]}"',
+                "allowed_ips = [" + ", ".join(f'"{a}"' for a in c["allowed_ips"]) + "]",
+                "groups = [" + ", ".join(f'"{g}"' for g in c["groups"]) + "]", ""]
     for name, group in rules.items():
         out += ["[[groups]]", f'name = "{name}"']
         for proto, dst, lo, hi in group:
@@ -8419,6 +9549,7 @@ def build(tmp: str):
     two approvers approved and it signed, which `tools/provision nv` wrote
     into slot A over NV state at v0 (slot B empty); the [policy] the image
     compiles in names that fleet, its keys and the NV Names."""
+    use_swtpm_key(tmp, create=True)
     for name, clients, extra in (("a", "3", ["--tls-mismatch-blob"]), ("b", "0", []), ("c", "2", [])):
         subprocess.run(["cargo", "run", "--locked", "-q", "-p", "mksecrets", "--", "--template",
                         os.path.join(ROOT, "config/gateway.toml"), "--clients", clients, "--out",
@@ -8444,7 +9575,9 @@ def build(tmp: str):
     make("image", env=env)
     make("package", f"SECRETS={tmp}/a/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
          f"TLS_SECRETS={tmp}/a/tls-secrets.bin", f"AUDIT_SECRETS={tmp}/a/audit-secrets.bin",
-         f"SRK_PUBLIC={srk_a}", f"OUT={tmp}/a/pkg", env=env)
+         f"SRK_PUBLIC={srk_a}", f"OUT={tmp}/a/pkg",
+         # M9 plan D13: the shipped package alone writes TIMER-SCAN-PDS.
+         "timer_scan_counts=1", env=env)
     # Only `key`'s blob mismatches: pqkey and tlskey keep A's, so only `key` is
     # Unavailable.
     make("package", f"SECRETS={tmp}/b/secrets.bin", f"PQ_SECRETS={tmp}/a/pqkey-secrets.bin",
@@ -8511,7 +9644,7 @@ def release_py(*args):
 
 # What tools/package writes: no image with a secret in it (M5 plan C8 F2),
 # and since M8 (plan C10) the audit key's public half.
-PACKAGE_OUTPUTS = ("published.img", "boot.desc", *ENVELOPE_FILES, "flash.bin", "pcrs", "audit.pub", "node.sha256")
+PACKAGE_OUTPUTS = ("published.img", "boot.desc", *ENVELOPE_FILES, "u-boot.bin", "pcrs", "audit.pub", "node.sha256")
 
 
 def packages(tmp: str) -> dict:
@@ -8568,6 +9701,7 @@ def check_harness_matches_config(deploy: str):
 
 def in_netns(tmp: str) -> int:
     guard_thread_starts()
+    use_swtpm_key(tmp)
     pkgs = packages(tmp)
     good, mismatched, binding, foreign = pkgs["good"], pkgs["mismatched"], pkgs["binding"], pkgs["foreign"]
     tls_mismatch = pkgs["tls_mismatch"]
@@ -8602,7 +9736,7 @@ def in_netns(tmp: str) -> int:
              ("measured boot", lambda: test_measured_boot(good.dir, good.slot_bytes(), passed)),
              ("sealed boot", lambda: test_sealed(good, foreign, passed)),
              ("tpm proxy", lambda: test_tpm_proxy(good, passed)),
-             ("firmware", lambda: test_firmware(good, passed)),
+             ("tpm startup", lambda: test_tpm_startup(good, passed)),
              ("no rng", lambda: test_no_rng(good, passed)),
              ("tpm cap failure", lambda: test_tpm_cap_failure(good, deploy, passed)),
              ("https", lambda: test_https(good, deploy, os.path.join(os.path.dirname(deploy), "b", "devca.pem"),
@@ -8719,7 +9853,10 @@ def main() -> int:
         if str(os.getppid()) != os.environ.get("KOZANE_IT_PARENT"):
             print("\nFAIL [setup]: outer harness already gone", file=sys.stderr)
             return 1
-        return in_netns(sys.argv[2])
+        return in_netns_suite(sys.argv[2]) if SUITE else in_netns(sys.argv[2])
+    if SUITE not in SUITES:
+        print(f"\nFAIL [setup]: KOZANE_SUITE={SUITE!r} is none of {SUITES}", file=sys.stderr)
+        return 1
     # The pre-rename variables (post-M6 plan P7, S7): a stale one must not
     # silently run the defaults (every boot) instead.
     stale = sorted(k for k in os.environ if k.startswith("SECUREOS_")
@@ -8731,8 +9868,15 @@ def main() -> int:
     tmp = tempfile.mkdtemp(prefix="kozane-it-")
     status = 1
     try:
+        if SUITE == "kvm":
+            check_kvm_device()
         preflight()
-        build(tmp)
+        if SUITE:
+            for binary in (KZC_BIN, KZC_PSK_BIN, *([VM_SEAMS_BIN] if SUITE == "kvm" else [])):
+                seams_build(binary)
+            build_suite(tmp)
+        else:
+            build(tmp)
         # `unshare` execs the child, so the Popen pid is the netns harness.
         # The outer harness has no threads, so preexec_fn is safe here.
         child = subprocess.Popen(["unshare", "-rn", sys.executable, os.path.abspath(__file__), "--netns", tmp],

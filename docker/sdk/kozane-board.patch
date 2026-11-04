@@ -1,0 +1,45 @@
+diff -ruN pa/build_sdk.py pb/build_sdk.py
+--- a/build_sdk.py
++++ b/build_sdk.py
+@@ -323,6 +323,25 @@
+             "KernelArmExportPTMRUser": True,
+         },
+     ),
++    # Kozane (M9 plan D9, C15): QEMU virt at EL1 under KVM. The hosts KVM
++    # runs on have no GICv2 emulation, so the kernel is built for GICv3. The
++    # device tree is the one the dev image dumps from stock QEMU 9.0.0 with
++    # the pinned machine (virt-9.0), not one the build extracts itself.
++    BoardInfo(
++        name="kozane_virt_aarch64_el1",
++        arch=KernelArch.AARCH64,
++        gcc_cpu="cortex-a53",
++        loader_link_address=0x70000000,
++        smp_cores=None,
++        kernel_options={
++            "KernelPlatform": "qemu-arm-virt",
++            "KernelArmHypervisorSupport": False,
++            "QEMU_MEMORY": "2048",
++            "QEMU_GIC_VERSION": "3",
++            "QEMU_DTB": Path("kozane-virt.dtb"),
++            "KernelArmExportPTMRUser": True,
++        },
++    ),
+     BoardInfo(
+         name="qemu_virt_riscv64",
+         arch=KernelArch.RISCV64,
+diff -ruN pa/loader/src/aarch64/init.c pb/loader/src/aarch64/init.c
+--- a/loader/src/aarch64/init.c
++++ b/loader/src/aarch64/init.c
+@@ -28,6 +28,12 @@
+     if (current_el() == EL1) {
+         return;
+     }
++#if defined(CONFIG_ARM_GIC_V3_SUPPORT)
++    /* Kozane (M9 deviation D-2): a GICv3 machine has no GICC at GICC_BASE,
++     * and QEMU's virt with no EL3 leaves every interrupt in Group 1 NS
++     * already. The GICv2 setup below would fault on it. */
++    return;
++#endif
+ 
+     /* The ZCU102 start in EL3, and then we drop to EL1(NS).
+      *

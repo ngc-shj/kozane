@@ -1,8 +1,7 @@
 """tools/measure.py: the PCR 8 chain against known values, and the I8.2
-range checks on both sides of each boundary (M5 plan C8); the PCR 0 chain
-over the FIP's closed list and its refusals (M7 plan C3, C4); descriptor v3's
+range checks on both sides of each boundary (M5 plan C8); descriptor v3's
 six ranges and per-kind rooms, PCR 9 over the two bundle slots, and the NV
-index twins (M8 plan C3, C4).
+index twins (M8 plan C3, C4); PCRs 0-7 at zero (M9 plan C2).
 
 Usage: python3 tests/tools/test_measure.py
 Prints "MEASURE-FIXTURES <n>" and exits non-zero on any mismatch.
@@ -17,7 +16,6 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 import measure  # noqa: E402
-import fip_fixture  # noqa: E402
 
 SLOT = measure.BUNDLE_MAX
 # Four envelopes in the first 0x10000 bytes, then the two slots.
@@ -132,13 +130,6 @@ def load_slots_apart() -> bool:
     return all(a + n <= b or b + m <= a for k, (a, n) in enumerate(spans) for b, m in spans[k + 1:])
 
 
-def pcr0_chain() -> bool:
-    pcr = bytes(32)
-    for _, data in fip_fixture.payloads():
-        pcr = hashlib.sha256(pcr + hashlib.sha256(data).digest()).digest()
-    return measure.expected_pcr0(fip_fixture.flash()) == pcr
-
-
 # (name, check returning True on the expected outcome)
 CASES = [
     # The swtpm probe observed sha256(0^32 || 0^32) after extending a zero digest.
@@ -250,7 +241,7 @@ CASES = [
     # measured, never sealed to. Fails if PCR 9 enters the selection.
     ("PCR 9 is outside the seal selection", lambda: measure.POLICY_PCRS == 9
      and measure.SLOT_PCR not in range(measure.POLICY_PCRS)
-     and len(measure.expected_pcrs(fip_fixture.flash(), measure.pack(IMG, GOOD), IMAGE)) == measure.POLICY_PCRS),
+     and len(measure.expected_pcrs(measure.pack(IMG, GOOD), IMAGE)) == measure.POLICY_PCRS),
     ("BUNDLE_MAX is crates/limits' value", lambda: measure.BUNDLE_MAX == int(re.search(
         r"^pub const BUNDLE_MAX: usize = (0x[0-9a-f_]+);$", (ROOT / "crates/limits/src/lib.rs").read_text(),
         re.M).group(1).replace("_", ""), 16)),
@@ -267,29 +258,9 @@ CASES = [
     ("the delete policy binds both key Names, in order, and the policyRef", lambda: len({
         measure.delete_policy([b"a", b"b"]), measure.delete_policy([b"b", b"a"]), measure.delete_policy([b"a"]),
         measure.delete_policy([b"a", b"b"], b"other-ref")}) == 4),
-    # M7 plan C3, C4: PCR 0 is BL2, then BL31, then BL33, each the entry's bytes.
-    ("PCR 0 is BL2 then BL31 then BL33", pcr0_chain),
-    ("PCRs 0-8: PCR 0, seven zeros, PCR 8", lambda: measure.expected_pcrs(
-        fip_fixture.flash(), measure.pack(IMG, GOOD), IMAGE)
-     == [measure.expected_pcr0(fip_fixture.flash())] + [bytes(32)] * 7
-     + [measure.expected_pcr8(measure.pack(IMG, GOOD), IMAGE)]),
-    ("entries out of the ToC's order are measured in TF-A's order", lambda: measure.expected_pcr0(
-        fip_fixture.flash(fip_fixture.payloads()[::-1])) == measure.expected_pcr0(fip_fixture.flash())),
-    ("a changed BL31 byte changes PCR 0", lambda: measure.expected_pcr0(fip_fixture.flash(
-        [(u, d + b"!" if n == 1 else d) for n, (u, d) in enumerate(fip_fixture.payloads())]))
-     != measure.expected_pcr0(fip_fixture.flash())),
-    ("a FIP entry outside the measured list is refused", lambda: "is not on the measured list" in raises(
-        lambda: measure.expected_pcr0(fip_fixture.flash(fip_fixture.payloads() + [(b"\x01" * 16, b"x")])))),
-    ("a FIP entry twice is refused", lambda: "appears twice" in raises(
-        lambda: measure.expected_pcr0(fip_fixture.flash(fip_fixture.payloads() + fip_fixture.payloads()[:1])))),
-    ("a FIP without BL31 is refused", lambda: "has no BL31" in raises(
-        lambda: measure.expected_pcr0(fip_fixture.flash([fip_fixture.payloads()[0], fip_fixture.payloads()[2]])))),
-    ("a FIP entry leaving the FIP is refused", lambda: "leaves the FIP" in raises(
-        lambda: measure.expected_pcr0(fip_fixture.flash()[:-1]))),
-    ("a flash with no FIP at the FIP offset is refused", lambda: "no FIP" in raises(
-        lambda: measure.expected_pcr0(fip_fixture.flash()[:measure.FIP_OFFSET] + bytes(64)))),
-    ("a ToC without its terminator is refused", lambda: "runs off its end" in raises(
-        lambda: measure.expected_pcr0(bytes(measure.FIP_OFFSET) + measure.FIP_HEADER.pack(measure.FIP_TOC_NAME, 0, 0)))),
+    # M9 plan C2: nothing runs before U-Boot, so PCRs 0-7 are zero.
+    ("PCRs 0-8: eight zeros, then PCR 8", lambda: measure.expected_pcrs(measure.pack(IMG, GOOD), IMAGE)
+     == [bytes(32)] * 8 + [measure.expected_pcr8(measure.pack(IMG, GOOD), IMAGE)]),
 ]
 
 

@@ -59,15 +59,19 @@ impl SplitMix {
 }
 
 static STREAM: Mutex<Option<SplitMix>> = Mutex::new(None);
+/// Every `randombytes` call while a stream is installed: its bytes, in
+/// order (the `--initiator` mode records what liboqs drew).
+static DRAWN: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 unsafe extern "C" fn stream_randombytes(buf: *mut u8, len: usize) {
     let mut guard = STREAM.lock().expect("stream lock");
     let s = guard.as_mut().expect("stream installed");
     // SAFETY: liboqs passes a writable buffer of `len` bytes.
     let out = unsafe { std::slice::from_raw_parts_mut(buf, len) };
-    for b in out {
+    for b in out.iter_mut() {
         *b = s.byte();
     }
+    DRAWN.lock().expect("drawn lock").push(out.to_vec());
 }
 
 fn with_stream<T>(seed: u64, f: impl FnOnce() -> T) -> T {
@@ -297,11 +301,108 @@ fn mce_vectors(repo: &Path) -> anyhow::Result<()> {
     )
 }
 
+/// The value assert_tv recorded under `name` (the last one, base64).
+fn recorded_value(path: &Path, name: &str) -> anyhow::Result<Vec<u8>> {
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let entries = json["entries"].as_array().context("entries")?;
+    let e = entries.iter().rev().find(|e| e["name"].as_str() == Some(name)).with_context(|| format!("no {name}"))?;
+    let value = e["value"].as_str().with_context(|| format!("{name} is not a string"))?;
+    Ok(base64::engine::general_purpose::STANDARD.decode(value)?)
+}
+
+/// The initiator's vectors (M9 plan C7): one V02 exchange with upstream's
+/// initiator as the subject. Its two Rust-side draws (the cookie value and
+/// sidi, `rand::rng()`) are recorded by `TestVectorActive` in init mode;
+/// its two liboqs draws (Kyber keygen at IHI3, McEliece encapsulation at
+/// IHI5) come from a SplitMix64 stream and are recorded call by call. The
+/// kozane initiator replays exactly those draws and must emit the same
+/// InitHello and InitConf. Writes only the four `*-initiator*` files; the
+/// keys are fresh, the initiator's secret key in liboqs's layout.
+fn initiator_vectors(vec_dir: &Path) -> anyhow::Result<()> {
+    const STREAM_SEED: u64 = 0x5eed_0000_696e_6974;
+    secret_policy_use_only_malloc_secrets();
+    let mut out = Out(BTreeMap::new());
+
+    let (a_sk, a_pk) = gen_keypair()?;
+    let (b_sk, b_pk) = gen_keypair()?;
+    let (spki, skt, spkr) = (a_pk.to_vec(), a_sk.secret().to_vec(), b_pk.to_vec());
+    let mut a = CryptoServer::new(a_sk, a_pk.clone());
+    let mut b = CryptoServer::new(b_sk, b_pk.clone());
+    a.add_peer(None, b_pk, ProtocolVersion::V02, OskDomainSeparator::default())?;
+    b.add_peer(None, a_pk, ProtocolVersion::V02, OskDomainSeparator::default())?;
+    let (mut abuf, mut bbuf) = (MsgBuf::zero(), MsgBuf::zero());
+
+    let raw = std::env::temp_dir().join(format!("rp-vectors-initiator-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&raw);
+    let guard = initialize_tv_case_from_file(&raw, TestVectorFileFormat::Json, TestMode::Init)?;
+    DRAWN.lock().expect("drawn lock").clear();
+    let n = with_stream(STREAM_SEED, || a.initiate_handshake_with_test_vector::<TestVectorActive>(PeerPtr(0), &mut abuf[..]))?;
+    let drawn = std::mem::take(&mut *DRAWN.lock().expect("drawn lock"));
+    finalize_tv_case()?;
+    drop(guard);
+    let ih = abuf[..n].to_vec();
+    let cookie = recorded_value(&raw, "hs.cookie_value.value")?;
+    let sidi = recorded_value(&raw, "hs.core.sidi")?;
+    std::fs::remove_file(&raw)?;
+    ensure!(cookie.len() == 16 && sidi[..] == ih[4..8], "recorded cookie value or sidi");
+
+    // Kyber-512 round 3 keygen draws d and then z, 32 bytes each, before the
+    // McEliece encapsulation's first draw.
+    let lens: Vec<usize> = drawn.iter().map(Vec::len).collect();
+    ensure!(lens.len() > 2 && lens[..2] == [32, 32], "liboqs draws {lens:?}");
+    out.put("draw.cookie", &cookie)?;
+    out.put("draw.sidi", &sidi)?;
+    out.put("draw.kyber", &drawn[..2].concat())?;
+    out.put("draw.mceliece", &drawn[2..].concat())?;
+    let calls: Vec<u8> = lens[2..].iter().flat_map(|l| (*l as u32).to_le_bytes()).collect();
+    out.put("draw.mceliece_calls", &calls)?;
+
+    let n = b.handle_msg(&ih, &mut bbuf[..])?.resp.context("RespHello")?;
+    let rh = bbuf[..n].to_vec();
+    abuf = MsgBuf::zero();
+    let n = a.handle_msg(&rh, &mut abuf[..])?.resp.context("InitConf")?;
+    let ic = abuf[..n].to_vec();
+    bbuf = MsgBuf::zero();
+    let n = b.handle_msg(&ic, &mut bbuf[..])?.resp.context("EmptyData")?;
+    let ed = bbuf[..n].to_vec();
+    ensure!(a.handle_msg(&ed, &mut abuf[..])?.resp.is_none(), "initiator answered EmptyData");
+
+    let osk_a = a.osk(PeerPtr(0))?;
+    ensure!(osk_a.secret() == b.osk(PeerPtr(0))?.secret(), "OSK mismatch between upstream peers");
+    out.put("osk", osk_a.secret())?;
+    out.put("msg.init_hello", &ih)?;
+    out.put("msg.resp_hello", &rh)?;
+    out.put("msg.init_conf", &ic)?;
+    out.put("msg.empty_data", &ed)?;
+
+    write_vectors(
+        &vec_dir.join("v02-initiator.txt"),
+        &[
+            "Rosenpass V02 initiator vectors for crates/rosenpass-core (M9 plan C7).",
+            &format!("upstream: https://github.com/rosenpass/rosenpass rev {UPSTREAM_REV}"),
+            "subject: upstream initiator (spkt-initiator.bin, skt-initiator.bin) to upstream responder (spkm-initiator.bin)",
+            "draws, in upstream's order: cookie value, sidi (TestVectorActive init mode);",
+            "  Kyber keygen d||z, McEliece encapsulation (liboqs randombytes, SplitMix64 stream)",
+            "mceliece_calls: the length of each liboqs randombytes call of the encapsulation (u32 LE)",
+            "skt-initiator.bin: the initiator's McEliece secret key in liboqs's layout (test key only)",
+            "regenerate: tools/rp-vectors/README.md, with --initiator",
+        ],
+        &out,
+    )?;
+    std::fs::write(vec_dir.join("spkt-initiator.bin"), &spki)?;
+    std::fs::write(vec_dir.join("skt-initiator.bin"), &skt)?;
+    std::fs::write(vec_dir.join("spkm-initiator.bin"), &spkr)?;
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
-    let repo: PathBuf =
-        std::env::args().nth(1).context("usage: rp-vectors <kozane repo root> [--cookie|--mce]")?.into();
+    let repo: PathBuf = std::env::args()
+        .nth(1)
+        .context("usage: rp-vectors <kozane repo root> [--cookie|--mce|--initiator]")?
+        .into();
     match std::env::args().nth(2).as_deref() {
         Some("--mce") => return mce_vectors(&repo),
+        Some("--initiator") => return initiator_vectors(&repo.join("crates/rosenpass-core/tests/vectors")),
         _ => {}
     }
     let vec_dir = repo.join("crates/rosenpass-core/tests/vectors");

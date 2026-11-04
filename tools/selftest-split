@@ -10,20 +10,27 @@ Usage:
 
 Partitions, from each case's make targets and their closure over the
 Makefile (prerequisites and `$(MAKE)` recipe calls), first match wins:
+  kvm     the case runs `make test-kvm` (M9 plan C6)       serial
+  kzc     the case runs `make test-kzc` (M9 plan C11)      serial
   qemu    the case reaches a QEMU boot (`test`)            serial
   solver  the case runs Kani or Verus                      serial
   pds     the case builds PDs into the shared pd_target    serial
   rest    everything else, round-robin over N instances    parallel
 Every instance is one check-selftest run with its own TMPDIR, so its own
 warm tree and lock. qemu and pds hold a host-wide lock while they run:
-both build into $(HOME)/.cache/kozane.
+both build into $(HOME)/.cache/kozane. kvm and kzc take that lock too,
+and refuse to start instead of waiting when another partition holds it
+("kzc beside qemu"). kvm also needs /dev/kvm, and holds the solver
+partition's lock and the proof lock (tools/proof-lock), so no KVM guest
+runs beside Kani or Verus on that host (VE23); solver waits for kvm.
 
 On another host: check out the same commit, `pack` on the `make check` host,
 copy the tar over and `run <partition> --inputs <tar>` (build/counts and the
 proof caches; the cache keys use relative paths, so the copies hold). Then
 `merge` every instance's log on one host at that commit: it requires every
 case run exactly once, every instance exited and printed SELFTEST-LAYERS,
-and one commit throughout. It prints "SELFTEST-LAYERS <n>" like a full run.
+and one commit and one image (check-manifest's IMAGE and QEMU) throughout.
+It prints "SELFTEST-LAYERS <n>" like a full run.
 """
 
 import argparse
@@ -43,15 +50,74 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SELFTEST = ROOT / "tools/check-selftest"
-PARTITIONS = ("qemu", "solver", "pds", "rest")
+PARTITIONS = ("kvm", "kzc", "qemu", "solver", "pds", "rest")
 # A case whose closure holds one of these targets belongs to that partition.
-MARKERS = {"qemu": {"test", "run"}, "solver": {"kani", "verus"}, "pds": {"pds"}}
+MARKERS = {"kvm": {"test-kvm"}, "kzc": {"test-kzc"}, "qemu": {"test", "run"}, "solver": {"kani", "verus"},
+           "pds": {"pds"}}
 INPUTS = ("counts", "kani-cache", "verus-cache")
 # Outside the checkout, like check-selftest's own scratch dir (cargo would
 # merge the checkout's .cargo/config.toml into the copy's), and kept, so
 # each instance's warm tree stays warm across runs.
 WORK = pathlib.Path(tempfile.gettempdir()) / "kozane-selftest-split"
 PD_LOCK = pathlib.Path.home() / ".cache/kozane/selftest-split-pd.lock"
+SOLVER_LOCK = pathlib.Path.home() / ".cache/kozane/selftest-split-solver.lock"
+# tools/proof-lock's lock: one Kani or Verus run at a time in the container.
+PROOF_LOCK = pathlib.Path(os.environ.get("KOZANE_PROOF_LOCK", "/tmp/kozane-proof.lock"))
+# The locks each partition holds while it runs: (lock, wait). A partition
+# that may not wait refuses when the lock is held, naming its holder.
+PARTITION_LOCKS = {
+    "kvm": (("host", False), ("solver", False), ("proof", False)),
+    "kzc": (("host", False),),
+    "qemu": (("host", True),),
+    "pds": (("host", True),),
+    "solver": (("solver", True),),
+    "rest": (),
+}
+
+
+def lock_paths() -> dict:
+    return {"host": PD_LOCK, "solver": SOLVER_LOCK, "proof": PROOF_LOCK}
+
+
+def take_locks(part: str, paths: dict) -> list:
+    """Opens and locks `part`'s locks in PARTITION_LOCKS order, writing the
+    partition's name into each so a refused one can name its holder. The
+    files stay open (locked) for the run."""
+    held = []
+    for name, wait in PARTITION_LOCKS[part]:
+        path = paths[name]
+        path.parent.mkdir(parents=True, exist_ok=True)
+        f = open(path, "a+")
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if not wait:
+                f.seek(0)
+                holder = f.read().strip() or f"another holder of {path}"
+                f.close()
+                for h in held:
+                    h.close()
+                raise SystemExit(f"selftest-split: {part} beside {holder}")
+            print(f"selftest-split: waiting for {path}", flush=True)
+            fcntl.flock(f, fcntl.LOCK_EX)
+        f.seek(0)
+        f.truncate()
+        f.write(f"{part}\n")
+        f.flush()
+        held.append(f)
+    return held
+
+
+def kvm_device() -> str:
+    return os.environ.get("KOZANE_KVM_DEV", "/dev/kvm")
+
+
+def image_record() -> str:
+    """tools/check-manifest's IMAGE and QEMU values, one line."""
+    loader = importlib.machinery.SourceFileLoader("check_manifest", str(ROOT / "tools/check-manifest"))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return f"{module.image_digest()} {module.qemu_build_id()}"
 
 
 def load_selftest():
@@ -174,12 +240,13 @@ def unpack(path: pathlib.Path, commit: str):
                 tar.extract(m, build, filter="data")
 
 
-def launch(part: str, i: int, count: int, names: list, commit: str, log_dir: pathlib.Path) -> tuple:
+def launch(part: str, i: int, count: int, names: list, commit: str, log_dir: pathlib.Path, image: str) -> tuple:
     log = log_dir / f"{part}-{i}-of-{count}.log"
     tmp = WORK / f"{part}-{i}-of-{count}"
     tmp.mkdir(parents=True, exist_ok=True)
     f = open(log, "w")
     f.write(f"SELFTEST-SPLIT-INSTANCE {part} {i}/{count} commit={commit}\n")
+    f.write(f"SELFTEST-SPLIT-IMAGE {image}\n")
     f.write(f"SELFTEST-SPLIT-ASSIGNED {' '.join(names)}\n")
     f.flush()
     proc = subprocess.Popen([sys.executable, str(SELFTEST), *names], stdout=f, stderr=subprocess.STDOUT,
@@ -197,16 +264,12 @@ def cmd_run(args) -> int:
         print(f"selftest-split: no {args.partition} instance {args.instance or ''} at --instances {n}")
         return 1
     args.log_dir.mkdir(parents=True, exist_ok=True)
-    lock = None
-    if args.partition in ("qemu", "pds"):
-        PD_LOCK.parent.mkdir(parents=True, exist_ok=True)
-        lock = open(PD_LOCK, "w")
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            print(f"selftest-split: waiting for {PD_LOCK}", flush=True)
-            fcntl.flock(lock, fcntl.LOCK_EX)
-    running = [launch(*x, commit, args.log_dir) for x in chosen]
+    if args.partition == "kvm" and not os.path.exists(kvm_device()):
+        print(f"selftest-split: kvm needs {kvm_device()} (VE21: gx10 only)")
+        return 1
+    locks = take_locks(args.partition, lock_paths())  # noqa: F841  (held until exit)
+    image = image_record()
+    running = [launch(*x, commit, args.log_dir, image) for x in chosen]
     rc = 0
     for proc, f, log in running:
         code = proc.wait()
@@ -221,13 +284,17 @@ def merge(logs: dict, cases: set, commit: str) -> tuple:
     """(problems, failed cases, passed count) over log name -> text. The
     problems are what makes the logs not one full run; failures are cases
     that ran and failed."""
-    problems, failed, passed, seen, commits = [], [], 0, {}, set()
+    problems, failed, passed, seen, commits, images = [], [], 0, {}, set(), set()
     for name, text in logs.items():
         head = re.search(r"^SELFTEST-SPLIT-INSTANCE (\S+) (\S+) commit=(\S+)$", text, re.M)
         if not head:
             problems.append(f"{name}: not a selftest-split instance log")
             continue
         commits.add(head.group(3))
+        image = re.findall(r"^SELFTEST-SPLIT-IMAGE (\S+ \S+)$", text, re.M)
+        if len(image) != 1:
+            problems.append(f"{name}: no image record")
+        images.update(image)
         if head.group(3) != commit:
             problems.append(f"{name}: ran commit {head.group(3)}, this checkout is {commit}")
         exits = re.findall(r"^SELFTEST-SPLIT-EXIT (-?\d+)$", text, re.M)
@@ -249,6 +316,8 @@ def merge(logs: dict, cases: set, commit: str) -> tuple:
                 failed.append(case)
     if len(commits) > 1:
         problems.append(f"instances ran different commits: {sorted(commits)}")
+    if len(images) > 1:
+        problems.append(f"mixed images: {sorted(images)}")
     for case, where in sorted(seen.items()):
         if len(where) > 1:
             problems.append(f"{case}: ran {len(where)} times ({', '.join(where)})")

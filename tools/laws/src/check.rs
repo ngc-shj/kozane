@@ -1,13 +1,16 @@
 //! Evaluates a parsed [`System`] against a [`Policy`]: L1-L5 and L13 from
 //! docs/archive/review/secureos-pq-vpn-architecture-plan.md.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::law::{Finding, LawId};
 use crate::policy::{MrPolicy, PL011_PAGE, Policy, RNG_PAGE, Role, TIS_PAGE};
 use crate::sdf::{Perms, System};
 
-pub fn check(system: &System, policy: &Policy) -> Vec<Finding> {
+/// `timer_scan` is laws' ELF check's verdict on `timer-scan.txt` (M9 plan
+/// D13), None under `--no-elf-check`; a failed one also fails the timer's
+/// L1 exemption.
+pub fn check(system: &System, policy: &Policy, timer_scan: Option<&Result<(), String>>) -> Vec<Finding> {
     let mut findings = Vec::new();
 
     // Default deny (L4): every pd/mr/channel pair not described by the
@@ -15,7 +18,11 @@ pub fn check(system: &System, policy: &Policy) -> Vec<Finding> {
     // they look up either exist in the policy or have already been flagged.
     check_default_deny(system, policy, &mut findings);
 
-    let tainted = compute_taint(system, policy, &mut findings);
+    if let Some(Err(reason)) = timer_scan {
+        findings.push(Finding::new(LawId::L1, format!("the timer exemption needs a clean timer scan: {reason}")));
+    }
+    let scan_clean = timer_scan.is_none_or(Result::is_ok);
+    let tainted = compute_taint(system, policy, scan_clean, &mut findings);
 
     check_secrets_and_taint(system, policy, &tainted, &mut findings);
     check_device_and_dma(system, policy, &mut findings);
@@ -35,9 +42,10 @@ pub fn check(system: &System, policy: &Policy) -> Vec<Finding> {
 }
 
 /// Top of every pd's stack in Microkit 2.3.1 (`tool/microkit/src/sel4.rs`:
-/// the IPC buffer at 0xfffffff000, one unmapped guard page, then the
-/// stack growing down).
-const STACK_TOP: u64 = 0xff_ffff_e000;
+/// the IPC buffer at the top page of the board's user vspace, one unmapped
+/// guard page, then the stack growing down). Kozane's EL1 board: IPC buffer
+/// at 0x7fff_ffff_f000 (`address_space_constants.json`, M9 deviation D-9).
+const STACK_TOP: u64 = 0x7fff_ffff_e000;
 
 /// L4 (M3 GUARD): Microkit places a guard page above the stack only. The
 /// page below it is unmapped only if no `<map>` reaches it, so every map
@@ -162,20 +170,14 @@ fn check_default_deny(system: &System, policy: &Policy, findings: &mut Vec<Findi
         }
     }
 
-    // Executable permission on any mr mapped into more than one distinct
-    // pd (denied outright regardless of mr kind).
-    let mut mappers: BTreeMap<&str, HashSet<&str>> = BTreeMap::new();
+    // Executable permission on any mr (M9 plan D13; before M9, on a shared
+    // one only): a PD's only code is its ELF, which the timer scan reads.
     for pd in &system.pds {
         for m in mrs_mapped_by(pd) {
-            mappers.entry(m.mr.as_str()).or_default().insert(pd.name.as_str());
-        }
-    }
-    for pd in &system.pds {
-        for m in mrs_mapped_by(pd) {
-            if m.perms.x && mappers.get(m.mr.as_str()).is_some_and(|s| s.len() > 1) {
+            if m.perms.x {
                 findings.push(Finding::new(
                     LawId::L4,
-                    format!("executable permission on shared mr '{}' mapped into pd '{}'", m.mr, pd.name),
+                    format!("laws: executable MR '{}' mapped into pd '{}' (M9 plan D13)", m.mr, pd.name),
                 ));
             }
         }
@@ -208,7 +210,7 @@ fn check_default_deny(system: &System, policy: &Policy, findings: &mut Vec<Findi
 /// (none a NIC) do not seed taint. A `key` pd's call to a `tpm` pd (L1 as
 /// amended by the M5 plan, C9) is no exemption: taint crosses it both ways,
 /// and both ends must stay untainted.
-fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) -> BTreeSet<String> {
+fn compute_taint(system: &System, policy: &Policy, scan_clean: bool, findings: &mut Vec<Finding>) -> BTreeSet<String> {
     let mut adjacency: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
     let mut add_edge = |from: &str, to: &str| {
         adjacency.entry(from.to_string()).or_default().insert(to.to_string());
@@ -247,7 +249,7 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
         let a_exempt = match a_role {
             Some(Role::Key) if a.pp && matches!(b_role, Some(Role::Tpm | Role::Rng)) => false,
             Some(Role::Key) => channel_is_exempt(system, policy, a, b, findings),
-            Some(Role::Timer) => timer_channel_is_exempt(system, policy, a, b, findings),
+            Some(Role::Timer) => timer_channel_is_exempt(system, policy, scan_clean, a, b, findings),
             Some(Role::Rng) => rng_channel_is_exempt(system, policy, a, b, findings),
             Some(Role::Supervisor) => supervisor_channel_is_exempt(a, b, findings),
             Some(Role::Policy) if a.pp && b_role == Some(Role::Tpm) => false,
@@ -257,7 +259,7 @@ fn compute_taint(system: &System, policy: &Policy, findings: &mut Vec<Finding>) 
         let b_exempt = match b_role {
             Some(Role::Key) if b.pp && matches!(a_role, Some(Role::Tpm | Role::Rng)) => false,
             Some(Role::Key) => channel_is_exempt(system, policy, b, a, findings),
-            Some(Role::Timer) => timer_channel_is_exempt(system, policy, b, a, findings),
+            Some(Role::Timer) => timer_channel_is_exempt(system, policy, scan_clean, b, a, findings),
             Some(Role::Rng) => rng_channel_is_exempt(system, policy, b, a, findings),
             Some(Role::Supervisor) => supervisor_channel_is_exempt(b, a, findings),
             Some(Role::Policy) if b.pp && a_role == Some(Role::Tpm) => false,
@@ -361,25 +363,35 @@ fn channel_is_exempt(
 /// satisfies L1's notify-only exemption: `pp == false` on both ends (a
 /// PPC reply would carry data chosen by the callee into the timer),
 /// `peer.notify == false`, and the timer maps only its own device mrs (so
-/// it shares no memory). A failure is reported as L1 directly.
+/// it shares no memory). Since M9 (plan C12, D13) the generic timer has no
+/// device mr, so that clause alone holds vacuously: the timer must also
+/// claim an irq of its own (its PPI) and, under the ELF check, the timer
+/// scan must be clean (no other pd can reach the timer's registers). A
+/// failure is reported as L1 directly.
 fn timer_channel_is_exempt(
     system: &System,
     policy: &Policy,
+    scan_clean: bool,
     timer_end: &crate::sdf::ChannelEnd,
     peer: &crate::sdf::ChannelEnd,
     findings: &mut Vec<Finding>,
 ) -> bool {
-    let maps_only_own_device = pd_by_name(system, &timer_end.pd)
+    let timer = pd_by_name(system, &timer_end.pd);
+    let maps_only_own_device = timer
         .into_iter()
         .flat_map(mrs_mapped_by)
         .all(|m| matches!(policy.mrs.get(m.mr.as_str()), Some(MrPolicy::Device { owner, .. }) if owner == &timer_end.pd));
-    let ok = !peer.pp && !timer_end.pp && !peer.notify && maps_only_own_device;
+    let owns_irq = timer.is_some_and(|pd| {
+        !pd.irqs.is_empty() && policy.irqs(&pd.name).is_some_and(|declared| pd.irqs.iter().all(|i| declared.contains(i)))
+    });
+    let ok = !peer.pp && !timer_end.pp && !peer.notify && maps_only_own_device && owns_irq && scan_clean;
     if !ok {
         findings.push(Finding::new(
             LawId::L1,
             format!(
                 "channel between timer pd '{}' and '{}' does not meet the timer exemption \
-                 (pp=false on both ends, peer notify=false, timer maps only its own device mr)",
+                 (pp=false on both ends, peer notify=false, timer maps only its own device mr, \
+                 claims its policy irq, clean timer scan)",
                 timer_end.pd, peer.pd
             ),
         ));

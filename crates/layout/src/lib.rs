@@ -41,9 +41,10 @@ pub const TLS_STACK_SIZE: usize = 0x30_000;
 /// high-water mark goes to its log page).
 pub const POLICY_STACK_SIZE: usize = 0x40_000;
 
-/// sp804 on QEMU virt (coliasgroup patch): 1 MHz input clock, SPI 11.
-pub const TIMER_IRQ: usize = 43;
-pub const TIMER_FREQ_HZ: u32 = 1_000_000;
+/// The generic timer's EL1 physical timer, PPI 14 (M9 plan C14): the kernel
+/// keeps the virtual timer, and exports this one to EL0. Its rate is the
+/// counter's, read from CNTFRQ_EL0, so no frequency constant lives here.
+pub const TIMER_IRQ: usize = 30;
 
 pub mod eth_out {
     pub const CH_DEVICE: usize = 0;
@@ -87,6 +88,8 @@ pub mod audit {
     /// on it once, at the end of its init (the call site is `audit`'s, in
     /// the export's slice).
     pub const CH_AUDITKEY: usize = 11;
+    /// M9 plan C3: `timer`'s tick, once a second; `audit` never notifies it.
+    pub const CH_TIMER: usize = 12;
     /// A checkpoint every this many printed lines (M8 plan C10): the most
     /// lines a capture holds past its last signed checkpoint, which the
     /// verifier reports as unverified. 64 keeps that tail to a screenful
@@ -95,6 +98,13 @@ pub mod audit {
     /// `AUDIT_RING_SLOTS`, so a full drain of one ring passes a checkpoint.
     pub const CHECKPOINT_EVERY: u64 = 64;
     const _: () = assert!(CHECKPOINT_EVERY > 0 && CHECKPOINT_EVERY <= super::AUDIT_RING_SLOTS as u64);
+    /// A `Heartbeat` line every this many ticks on `CH_TIMER` (M9 plan C3),
+    /// one a second: the node's liveness on the console. 60 is one line a
+    /// minute, so an idle node also signs a checkpoint about once an hour
+    /// (every `CHECKPOINT_EVERY` lines), and a case that counts `audit:`
+    /// lines over a window of seconds sees at most one heartbeat in it.
+    pub const HEARTBEAT_S: u64 = 60;
+    const _: () = assert!(HEARTBEAT_S > 0);
 }
 
 #[cfg(test)]
@@ -107,6 +117,8 @@ pub mod timer {
     pub const CH_INGRESS: usize = 3;
     pub const CH_PQ: usize = 4;
     pub const CH_TLS: usize = 5;
+    /// M9 plan C3: the heartbeat's tick to `audit`.
+    pub const CH_AUDIT: usize = 6;
 }
 
 pub mod key {

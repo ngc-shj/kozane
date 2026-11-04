@@ -2,7 +2,8 @@
 //! (M8 plan C9, C12, F41, F43, F45):
 //! over every slot, reason and value, the encoding stays in its range and
 //! the decoding names exactly what was encoded, or `Unknown` for an
-//! out-of-range input; and the log never writes past its page.
+//! out-of-range input; no code decodes as the heartbeat (M9 plan C3); and
+//! the log never writes past its page.
 
 use super::*;
 
@@ -130,6 +131,20 @@ fn peer_kinds_encode_and_decode_exactly() {
     }
     kani::cover!(peer == PEERS - 1);
     kani::cover!(peer == PEERS);
+}
+
+/// M9 plan C3: no code a ring can carry decodes as an event named
+/// `HEARTBEAT`, the name of `audit`'s own liveness line. The bound covers
+/// both loops: `decode`'s search of `Event::FIXED` (64 entries) and the
+/// memcmp over a name (26 bytes at most), plus the loop exit.
+#[kani::proof]
+#[kani::unwind(66)]
+fn no_code_decodes_as_the_heartbeat() {
+    let code: u16 = kani::any();
+    if let Decoded::Fixed(ev) = decode(code) {
+        assert!(ev.name().as_bytes() != HEARTBEAT.as_bytes());
+    }
+    kani::cover!(matches!(decode(code), Decoded::Fixed(_)));
 }
 
 /// I9.4: the log writer writes only inside its page, and the reader's

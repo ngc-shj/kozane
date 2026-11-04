@@ -1,8 +1,7 @@
 # Development image for kozane. The target is aarch64; the host is
 # aarch64 (the reference) or x86_64, chosen by BuildKit's TARGETARCH (arm64
 # or amd64; post-M6 plan P5). Every downloaded artifact is pinned by sha256
-# per host architecture; the Microkit SDK is also checked against the
-# release key in keys/ (fingerprint pinned below).
+# per host architecture.
 
 # Shared by the oracle stage and the dev image.
 ARG RUSTUP_VERSION=1.29.1
@@ -171,6 +170,125 @@ RUN --network=none set -eux; \
         "$rel"/builtin "$rel"/builtin_macros "$rel"/state_machines_macros "$rel"/vstd /opt/verus/; \
     echo "$VERUS_COMMIT" > /opt/verus/SOURCE
 
+# The Arm GNU toolchain for aarch64-none-elf, shared by the SDK stage and
+# the dev image.
+FROM base AS armgcc
+RUN apt-get update -q && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    xz-utils \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+ARG ARM_GNU_SHA256_ARM64=c4f0daab43f78e0d56ec2bdad76b98a0223ce12ce7fc51a6ce82f9cc6c6dfba0
+ARG ARM_GNU_SHA256_AMD64=eb54c4727440d03199a6af9a6d021e77f45410cad39effce4e5a1c10a88b7f04
+ARG TARGETARCH
+RUN set -eux; \
+    case "$TARGETARCH" in \
+        arm64) host=aarch64 ARM_GNU_SHA256="$ARM_GNU_SHA256_ARM64";; \
+        amd64) host=x86_64 ARM_GNU_SHA256="$ARM_GNU_SHA256_AMD64";; \
+        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1;; \
+    esac; \
+    curl -sSfL -o /tmp/gcc.tar.xz "https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-${host}-aarch64-none-elf.tar.xz"; \
+    echo "$ARM_GNU_SHA256  /tmp/gcc.tar.xz" | sha256sum -c -; \
+    mkdir -p /opt/gcc-aarch64-none-elf; \
+    tar -xJf /tmp/gcc.tar.xz -C /opt/gcc-aarch64-none-elf --strip-components=1; \
+    rm /tmp/gcc.tar.xz
+
+# M9 plan D2: stock QEMU 9.0.0, with no device patch. The image is what a
+# supported host runs (`virt-9.0`), so nothing may depend on a device that
+# stock QEMU lacks (C14 I14.1).
+FROM base AS qemu
+RUN apt-get update -q && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates xz-utils \
+    curl \
+    ninja-build pkg-config python3-venv libglib2.0-dev libpixman-1-dev libslirp-dev flex bison \
+    && rm -rf /var/lib/apt/lists/*
+ARG QEMU_SHA256=32708ac66c30d8c892633ea968c771c1c76d597d70ddead21a0d22ccf386da69
+RUN set -eux; \
+    cd /tmp; \
+    curl -sSfL -o qemu.tar.xz https://download.qemu.org/qemu-9.0.0.tar.xz; \
+    echo "$QEMU_SHA256  qemu.tar.xz" | sha256sum -c -; \
+    tar -xJf qemu.tar.xz; \
+    cd qemu-9.0.0; \
+    ./configure --prefix=/opt/qemu --target-list=aarch64-softmmu \
+        --enable-slirp --disable-docs --disable-werror; \
+    make -j"$(nproc)"; \
+    make install; \
+    cd /tmp; rm -rf qemu-9.0.0 qemu.tar.xz
+
+# M9 plan D9, C15: Kozane's Microkit SDK. The shipped SDK's kernels are
+# GICv2-only, and the KVM hosts have no GICv2 emulation, so the kernel is
+# built here for GICv3 (docker/sdk/kozane-board.patch). Every input is
+# pinned: the sources by sha256, the Python modules and build tools by the
+# apt snapshot, the crates by Microkit's Cargo.lock (--locked), and the
+# device tree by stock QEMU with the pinned machine. tools/sdk-repro builds
+# this stage on two hosts and compares the outputs (VE27).
+FROM base AS sdk
+RUN apt-get update -q && apt-get install -y --no-install-recommends \
+    build-essential ca-certificates xz-utils patch \
+    curl \
+    cmake ninja-build device-tree-compiler libxml2-utils libclang-dev \
+    python3 python3-venv python3-ply python3-jinja2 python3-yaml python3-lxml \
+    python3-setuptools python3-jsonschema \
+    libglib2.0-0t64 libpixman-1-0 libslirp0 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=armgcc /opt/gcc-aarch64-none-elf /opt/gcc-aarch64-none-elf
+COPY --from=qemu /opt/qemu /opt/qemu
+# pyfdt (seL4's hardware_gen) has no Debian package: one sdist, by hash, into
+# a venv that sees the snapshot's modules; no build isolation, no deps.
+ARG PYFDT_SHA256=61601c2005ff394a25a6c84c6da2088bbf888328038400d27e4eeb1b04b9f4f0
+RUN set -eux; \
+    python3 -m venv --system-site-packages /opt/sdkpy; \
+    echo "pyfdt==0.3 --hash=sha256:${PYFDT_SHA256}" > /tmp/req.txt; \
+    /opt/sdkpy/bin/pip install --no-deps --no-build-isolation --require-hashes -r /tmp/req.txt; \
+    rm /tmp/req.txt
+ENV PATH=/opt/sdkpy/bin:/opt/gcc-aarch64-none-elf/bin:/opt/qemu/bin:/root/.cargo/bin:$PATH
+ARG RUSTUP_VERSION
+ARG RUSTUP_SHA256_ARM64
+ARG RUSTUP_SHA256_AMD64
+ARG TARGETARCH
+# Microkit 2.3.1's tool declares rust-version 1.94.0.
+ARG SDK_RUST=1.94.0
+RUN set -eux; \
+    case "$TARGETARCH" in \
+        arm64) host=aarch64-unknown-linux-gnu RUSTUP_SHA256="$RUSTUP_SHA256_ARM64" musl=aarch64-unknown-linux-musl;; \
+        amd64) host=x86_64-unknown-linux-gnu RUSTUP_SHA256="$RUSTUP_SHA256_AMD64" musl=x86_64-unknown-linux-musl;; \
+        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1;; \
+    esac; \
+    curl -sSfL -o /tmp/rustup-init "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/${host}/rustup-init"; \
+    echo "$RUSTUP_SHA256  /tmp/rustup-init" | sha256sum -c -; \
+    chmod +x /tmp/rustup-init; \
+    /tmp/rustup-init -y --no-modify-path --default-toolchain "$SDK_RUST" --profile minimal \
+        --component rust-src --target aarch64-unknown-none --target "$musl"; \
+    rm /tmp/rustup-init
+ARG MICROKIT_VERSION=2.3.1
+ARG MICROKIT_SRC_SHA256=67ae034628465c35169c398dd7d9ea61dbe8bd93c7a9adb05b9bb31bae25c22f
+ARG SEL4_VERSION=16.0.0
+ARG SEL4_SRC_SHA256=d6d2b086e77ba40158dc8460665e4f84a681e8bb682cfb0a1dc344059df48d40
+COPY sdk/kozane-board.patch /src/kozane-board.patch
+RUN set -eux; \
+    cd /src; \
+    curl -sSfL -o microkit.tar.gz "https://github.com/seL4/microkit/archive/refs/tags/${MICROKIT_VERSION}.tar.gz"; \
+    echo "$MICROKIT_SRC_SHA256  microkit.tar.gz" | sha256sum -c -; \
+    curl -sSfL -o sel4.tar.gz "https://github.com/seL4/seL4/archive/refs/tags/${SEL4_VERSION}.tar.gz"; \
+    echo "$SEL4_SRC_SHA256  sel4.tar.gz" | sha256sum -c -; \
+    tar -xzf microkit.tar.gz; tar -xzf sel4.tar.gz; rm microkit.tar.gz sel4.tar.gz; \
+    cd "microkit-${MICROKIT_VERSION}"; \
+    patch -p1 < /src/kozane-board.patch; \
+    # The kernel's device tree: D2's machine, dumped by the stock QEMU above.
+    # dtb-randomness=off: no random kaslr-seed or rng-seed, so the dump is
+    # the same on every build (VE27).
+    qemu-system-aarch64 -machine virt-9.0,secure=off,virtualization=off,gic-version=3,dtb-randomness=off,dumpdtb=kozane-virt.dtb \
+        -cpu cortex-a72 -m 2048 -nographic; \
+    python3 build_sdk.py --sel4 "/src/seL4-${SEL4_VERSION}" \
+        --boards kozane_virt_aarch64_el1 --configs release,debug \
+        --skip-docs --skip-tar; \
+    mkdir -p /opt/microkit; \
+    mv "release/microkit-sdk-${MICROKIT_VERSION}" /opt/microkit/sdk; \
+    # ar records member timestamps: rewrite each archive deterministically.
+    find /opt/microkit/sdk -name "*.a" -exec aarch64-none-elf-objcopy --enable-deterministic-archives {} \; ; \
+    cp kozane-virt.dtb /opt/microkit/sdk/kozane-virt.dtb; \
+    chmod -R a+rX /opt/microkit/sdk
+
 FROM base
 RUN apt-get update -q && apt-get install -y --no-install-recommends \
     build-essential \
@@ -179,7 +297,7 @@ RUN apt-get update -q && apt-get install -y --no-install-recommends \
     git \
     gnupg \
     xz-utils \
-    # qemu build
+    # QEMU runtime libraries (the qemu stage builds it) and U-Boot build tools
     ninja-build \
     pkg-config \
     python3-venv \
@@ -208,6 +326,8 @@ RUN apt-get update -q && apt-get install -y --no-install-recommends \
     swtpm \
     swtpm-tools \
     tpm2-tools \
+    # M9 C6: the WireGuard throughput baseline
+    iperf3 \
     && rm -rf /var/lib/apt/lists/*
 
 # M5 C8: U-Boot source, built by `make uboot` with the repo's config
@@ -215,75 +335,26 @@ RUN apt-get update -q && apt-get install -y --no-install-recommends \
 # image rebuild).
 ARG UBOOT_VERSION=2025.01
 ARG UBOOT_SHA256=cdef7d507c93f1bbd9f015ea9bc21fa074268481405501945abc6f854d5b686f
+# Fedora's lookaside cache holds the same upstream tarball, addressed by its
+# sha512: the fallback when denx.de is unreachable. The sha256 pin decides.
+ARG UBOOT_SHA512=e22202b568f90de15e4e20317e13d68ce106256eadeeae5017241cdd4a1d133cdfd14297b403c7391bf65d022061ad4e1cbe862c480fddbd13f97b756305f188
 RUN set -eux; \
     mkdir -p /opt/u-boot; \
-    curl -sSfL -o /opt/u-boot/u-boot-${UBOOT_VERSION}.tar.bz2 "https://ftp.denx.de/pub/u-boot/u-boot-${UBOOT_VERSION}.tar.bz2"; \
+    curl -sSfL --max-time 300 -o /opt/u-boot/u-boot-${UBOOT_VERSION}.tar.bz2 "https://ftp.denx.de/pub/u-boot/u-boot-${UBOOT_VERSION}.tar.bz2" \
+        || curl -sSfL -o /opt/u-boot/u-boot-${UBOOT_VERSION}.tar.bz2 "https://src.fedoraproject.org/repo/pkgs/uboot-tools/u-boot-${UBOOT_VERSION}.tar.bz2/sha512/${UBOOT_SHA512}/u-boot-${UBOOT_VERSION}.tar.bz2"; \
     echo "$UBOOT_SHA256  /opt/u-boot/u-boot-${UBOOT_VERSION}.tar.bz2" | sha256sum -c -
 
-ARG ARM_GNU_SHA256_ARM64=c4f0daab43f78e0d56ec2bdad76b98a0223ce12ce7fc51a6ce82f9cc6c6dfba0
-ARG ARM_GNU_SHA256_AMD64=eb54c4727440d03199a6af9a6d021e77f45410cad39effce4e5a1c10a88b7f04
 ARG TARGETARCH
-RUN set -eux; \
-    case "$TARGETARCH" in \
-        arm64) host=aarch64 ARM_GNU_SHA256="$ARM_GNU_SHA256_ARM64";; \
-        amd64) host=x86_64 ARM_GNU_SHA256="$ARM_GNU_SHA256_AMD64";; \
-        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1;; \
-    esac; \
-    curl -sSfL -o /tmp/gcc.tar.xz "https://developer.arm.com/-/media/Files/downloads/gnu/14.2.rel1/binrel/arm-gnu-toolchain-14.2.rel1-${host}-aarch64-none-elf.tar.xz"; \
-    echo "$ARM_GNU_SHA256  /tmp/gcc.tar.xz" | sha256sum -c -; \
-    mkdir -p /opt/gcc-aarch64-none-elf; \
-    tar -xJf /tmp/gcc.tar.xz -C /opt/gcc-aarch64-none-elf --strip-components=1; \
-    rm /tmp/gcc.tar.xz
+COPY --from=armgcc /opt/gcc-aarch64-none-elf /opt/gcc-aarch64-none-elf
 ENV PATH=/opt/gcc-aarch64-none-elf/bin:$PATH
 
-# QEMU 9.0.0 + coliasgroup patch adding 2x sp804 timers to arm virt
-# (same pins as seL4/rust-sel4 hacking/nix/scope/qemu).
-ARG QEMU_SHA256=32708ac66c30d8c892633ea968c771c1c76d597d70ddead21a0d22ccf386da69
-ARG SP804_PATCH_URL=https://github.com/coliasgroup/qemu/commit/7994b0d17da7dbf1cf2da3e6555914e23559b23e.patch
-ARG SP804_PATCH_SHA256=a396752d817aa70a811ab3f80183885e685283be70ee6211bb1be3d9908ef876
-RUN set -eux; \
-    cd /tmp; \
-    curl -sSfL -o qemu.tar.xz https://download.qemu.org/qemu-9.0.0.tar.xz; \
-    echo "$QEMU_SHA256  qemu.tar.xz" | sha256sum -c -; \
-    curl -sSfL -o sp804.patch "$SP804_PATCH_URL"; \
-    echo "$SP804_PATCH_SHA256  sp804.patch" | sha256sum -c -; \
-    tar -xJf qemu.tar.xz; \
-    cd qemu-9.0.0; \
-    patch -p1 < ../sp804.patch; \
-    ./configure --prefix=/opt/qemu --target-list=aarch64-softmmu \
-        --enable-slirp --disable-docs --disable-werror; \
-    make -j"$(nproc)"; \
-    make install; \
-    cd /tmp; rm -rf qemu-9.0.0 qemu.tar.xz sp804.patch
+# M9 plan D2: stock QEMU (the qemu stage).
+COPY --from=qemu /opt/qemu /opt/qemu
 ENV PATH=/opt/qemu/bin:$PATH
 
-ARG MICROKIT_VERSION=2.3.1
-ARG MICROKIT_SHA256_ARM64=979553f288e8e2c099dae8fbec86cbe2cfda2ca006ee36de8234649d6d23bbee
-ARG MICROKIT_ASC_SHA256_ARM64=8c64fcd77ded111654e9df493232ae86891e7940918f80f72b7eaa5ea456f5b4
-ARG MICROKIT_SHA256_AMD64=b1b285b8785db7557eba6d0665dd4fbf2f265ea5c0b39d6f91ae3dcc43d2c424
-ARG MICROKIT_ASC_SHA256_AMD64=b28f03edc09f5a4d55c2688a87f626e169fc36e8445c12664c060410b6211756
-ARG MICROKIT_KEY_FPR=FE91486443B0F4EB9ECC36524D868A34EDF3FDCA
+# M9 plan D9, C15: Kozane's own SDK (the sdk stage).
 ENV MICROKIT_SDK=/opt/microkit/sdk
-COPY keys/microkit-release.asc /tmp/microkit-release.asc
-RUN set -eux; \
-    cd /tmp; \
-    case "$TARGETARCH" in \
-        arm64) host=aarch64 MICROKIT_SHA256="$MICROKIT_SHA256_ARM64" MICROKIT_ASC_SHA256="$MICROKIT_ASC_SHA256_ARM64";; \
-        amd64) host=x86-64 MICROKIT_SHA256="$MICROKIT_SHA256_AMD64" MICROKIT_ASC_SHA256="$MICROKIT_ASC_SHA256_AMD64";; \
-        *) echo "unsupported TARGETARCH: $TARGETARCH" >&2; exit 1;; \
-    esac; \
-    base="https://github.com/seL4/microkit/releases/download/${MICROKIT_VERSION}/microkit-sdk-${MICROKIT_VERSION}-linux-${host}.tar.gz"; \
-    curl -sSfL -o sdk.tar.gz "$base"; \
-    curl -sSfL -o sdk.tar.gz.asc "$base.asc"; \
-    echo "$MICROKIT_SHA256  sdk.tar.gz" | sha256sum -c -; \
-    echo "$MICROKIT_ASC_SHA256  sdk.tar.gz.asc" | sha256sum -c -; \
-    export GNUPGHOME="$(mktemp -d)"; \
-    gpg --batch --import microkit-release.asc; \
-    gpg --batch --status-fd 1 --verify sdk.tar.gz.asc sdk.tar.gz | grep -q "VALIDSIG $MICROKIT_KEY_FPR"; \
-    mkdir -p "$MICROKIT_SDK"; \
-    tar -xzf sdk.tar.gz -C "$MICROKIT_SDK" --strip-components=1; \
-    chmod -R a+rX "$MICROKIT_SDK"; \
-    rm -rf "$GNUPGHOME" sdk.tar.gz sdk.tar.gz.asc microkit-release.asc
+COPY --from=sdk /opt/microkit/sdk /opt/microkit/sdk
 
 ARG UID=1000
 ARG GID=1000
@@ -292,30 +363,6 @@ RUN set -eux; \
     useradd --uid "$UID" --gid "$GID" --create-home dev; \
     # wireguard-go's UAPI socket directory, for the unprivileged test netns.
     install -d -o "$UID" -g "$GID" -m 0700 /var/run/wireguard
-
-# M7 C1: TF-A and the Mbed TLS release its measured boot hashes with, built
-# by `make firmware` with the repo's patch (support/tf-a). TF-A's libTPM and
-# libEventLog submodules are vendored under third_party/ instead: their
-# upstream serves no stable release archive.
-ARG TFA_VERSION=2.15.0
-ARG TFA_SHA256=ec4d6779225c5243a05dd190cd25c06ae79bec293afea780f0eb63541341a505
-ARG MBEDTLS_VERSION=3.6.6
-ARG MBEDTLS_SHA256=8fb65fae8dcae5840f793c0a334860a411f884cc537ea290ce1c52bb64ca007a
-# TF-A's build tools, from the same snapshot as the list above (a layer of
-# its own, so adding them did not rebuild every layer after that list):
-# fiptool links OpenSSL, libTPM and libEventLog build with cmake, the fdts
-# need dtc.
-RUN apt-get update -q && apt-get install -y --no-install-recommends \
-    cmake \
-    device-tree-compiler \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-RUN set -eux; \
-    mkdir -p /opt/tf-a; \
-    curl -sSfL -o /opt/tf-a/tf-a-${TFA_VERSION}.tar.gz "https://github.com/ARM-software/arm-trusted-firmware/archive/refs/tags/v${TFA_VERSION}.tar.gz"; \
-    echo "$TFA_SHA256  /opt/tf-a/tf-a-${TFA_VERSION}.tar.gz" | sha256sum -c -; \
-    curl -sSfL -o /opt/tf-a/mbedtls-${MBEDTLS_VERSION}.tar.bz2 "https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-${MBEDTLS_VERSION}/mbedtls-${MBEDTLS_VERSION}.tar.bz2"; \
-    echo "$MBEDTLS_SHA256  /opt/tf-a/mbedtls-${MBEDTLS_VERSION}.tar.bz2" | sha256sum -c -
 
 USER dev
 
@@ -351,6 +398,7 @@ ARG KANI_BUNDLE_SHA256_ARM64=0042d2688bf1550270def4a79c96aaeea138631818cb4ab5480
 ARG KANI_BUNDLE_SHA256_AMD64=32e2b484d73ede0bbf64a2cf0879c4259422497d8aec4ee67d448de9ae7843d3
 ARG CARGO_BOLERO_VERSION=0.13.5
 ARG CARGO_AUDIT_VERSION=0.22.2
+ARG CBINDGEN_VERSION=0.29.4
 # Host tools are built with a pinned stable toolchain (no rust-toolchain.toml at build time).
 ARG TOOLS_RUST=1.97.1
 RUN set -eux; \
@@ -366,7 +414,9 @@ RUN set -eux; \
     cargo +"$TOOLS_RUST" kani setup --use-local-bundle /tmp/kani.tar.gz; \
     rm /tmp/kani.tar.gz; \
     cargo +"$TOOLS_RUST" install --locked cargo-bolero --version "$CARGO_BOLERO_VERSION"; \
-    cargo +"$TOOLS_RUST" install --locked cargo-audit --version "$CARGO_AUDIT_VERSION"
+    cargo +"$TOOLS_RUST" install --locked cargo-audit --version "$CARGO_AUDIT_VERSION"; \
+    # M9 C9: the C header of the client FFI
+    cargo +"$TOOLS_RUST" install --locked cbindgen --version "$CBINDGEN_VERSION"
 
 COPY --from=rosenpass-oracle /opt/rosenpass-master /opt/rosenpass-master
 COPY --from=rosenpass-oracle /opt/rosenpass-023 /opt/rosenpass-023

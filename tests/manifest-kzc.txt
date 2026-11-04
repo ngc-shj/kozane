@@ -1,0 +1,5 @@
+# `make test-kzc` (M9 plan C11): kzc on kernel WireGuard against the
+# gateway under TCG, and the upstream oracle cases (D4). Its own counts
+# (build/counts-kzc), so `make check`'s never depend on the host (VE25).
+KZC-CASES 6
+INTEGRATION-ORACLE-CASES 2

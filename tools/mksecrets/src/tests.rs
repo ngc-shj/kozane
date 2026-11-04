@@ -451,8 +451,9 @@ fn srk_tpm2b() -> Vec<u8> {
     out
 }
 
-/// PCRs 0-8 as `tools/package` writes them: PCR 0 TF-A's, 1-7 untouched,
-/// 8 U-Boot's (with the trailing newline the file has).
+/// PCRs 0-8 in `tools/package`'s format: an arbitrary non-zero PCR 0 (the
+/// policy binds every value given), 1-7 untouched, 8 U-Boot's (with the
+/// trailing newline the file has).
 const PCRS_HEX: &str = "3d4b8c2a9e1f0067a5c3b2d1e0f9a8b7c6d5e4f30112233445566778899aabbc,\
 0000000000000000000000000000000000000000000000000000000000000000,\
 0000000000000000000000000000000000000000000000000000000000000000,\
@@ -750,3 +751,85 @@ fn audit_public_is_the_audit_blob_s_key() {
     assert!(run_audit_public(&args[..2]).is_err(), "no --out");
 }
 
+
+fn kzc_options() -> ClientConfOptions<'static> {
+    ClientConfOptions {
+        interface: "kz0",
+        address: "10.200.0.10/32",
+        wg_endpoint: "10.0.2.15:51820",
+        rp_endpoint: "10.0.2.15:51819",
+        wg_listen_port: 51830,
+        rp_listen_port: 42010,
+        gw_rp_pub_path: "/etc/kozane/gw-rp.pub",
+        allowed_ips: None,
+    }
+}
+
+/// M9 plan C10, C11: `client-conf` renders every client.conf key once, in
+/// the plan's order, with the gateway's public key as `gw_wg_pub` and its
+/// inside prefix as the default `allowed_ips`.
+#[test]
+fn client_conf_names_the_generated_gateway() {
+    let d = &deployment().0;
+    let conf = client_conf(&d.config, &kzc_options()).unwrap_or_else(|e| panic!("{e}"));
+    let public = d.config.lines().find_map(|l| l.strip_prefix("public_key = \"")).and_then(|l| l.strip_suffix('"')).unwrap();
+    let keys: Vec<(&str, &str)> =
+        conf.lines().filter(|l| !l.starts_with('#')).map(|l| l.split_once(" = ").expect("key = value")).collect();
+    assert_eq!(
+        keys,
+        [
+            ("interface", "kz0"),
+            ("address", "10.200.0.10/32"),
+            ("wg_listen_port", "51830"),
+            ("wg_endpoint", "10.0.2.15:51820"),
+            ("rp_listen_port", "42010"),
+            ("rp_endpoint", "10.0.2.15:51819"),
+            ("gw_wg_pub", public),
+            ("gw_rp_pub_path", "/etc/kozane/gw-rp.pub"),
+            ("allowed_ips", "10.99.0.0/24"),
+        ]
+    );
+    let listed = client_conf(&d.config, &ClientConfOptions { allowed_ips: Some("10.99.0.0/24,10.98.0.0/16"), ..kzc_options() });
+    assert!(listed.unwrap().ends_with("allowed_ips = 10.99.0.0/24, 10.98.0.0/16\n"));
+}
+
+#[test]
+fn client_conf_refuses_a_host_name_endpoint_and_a_relative_key_path() {
+    let d = &deployment().0;
+    let e = client_conf(&d.config, &ClientConfOptions { rp_endpoint: "gw.example:51819", ..kzc_options() }).unwrap_err();
+    assert!(e.contains("--rp-endpoint"), "{e}");
+    let e = client_conf(&d.config, &ClientConfOptions { gw_rp_pub_path: "gw-rp.pub", ..kzc_options() }).unwrap_err();
+    assert!(e.contains("not an absolute path"), "{e}");
+    let e = client_conf(&d.config, &ClientConfOptions { address: "10.200.0.10", ..kzc_options() }).unwrap_err();
+    assert!(e.contains("want IP/LEN"), "{e}");
+    let e = client_conf(&d.config, &ClientConfOptions { interface: "kz0;rm", ..kzc_options() }).unwrap_err();
+    assert!(e.contains("not an interface name"), "{e}");
+    assert!(client_conf(TEMPLATE.replace("public_key", "publik_key").as_str(), &kzc_options()).is_err());
+}
+
+/// The file is written once, 0644 (public, kzc reads it as its own user),
+/// and never replaced.
+#[test]
+fn client_conf_writes_a_new_public_file_only() {
+    let d = &deployment().0;
+    let s = Scratch::new("client-conf");
+    let gateway = s.0.join("gateway.toml");
+    std::fs::write(&gateway, &d.config).unwrap();
+    let out = s.0.join("client.conf");
+    let args: Vec<String> = [
+        "--gateway", gateway.to_str().unwrap(), "--address", "10.200.0.10/32", "--wg-endpoint", "10.0.2.15:51820",
+        "--rp-endpoint", "10.0.2.15:51819", "--wg-listen-port", "51830", "--rp-listen-port", "42010",
+        "--gw-rp-pub-path", "/etc/kozane/gw-rp.pub", "--out", out.to_str().unwrap(),
+    ]
+    .iter()
+    .map(|a| a.to_string())
+    .collect();
+    run_client_conf(&args).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(std::fs::read_to_string(&out).unwrap(), client_conf(&d.config, &kzc_options()).unwrap());
+    assert_eq!(std::fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o644);
+    assert!(run_client_conf(&args).is_err(), "the output is never replaced");
+    let mut twice = args.clone();
+    twice.extend(["--address".to_string(), "10.200.0.11/32".to_string()]);
+    assert!(run_client_conf(&twice).unwrap_err().contains("given twice"));
+    assert!(run_client_conf(&args[..4]).is_err(), "a missing option");
+}

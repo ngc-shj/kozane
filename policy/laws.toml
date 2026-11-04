@@ -23,9 +23,14 @@
 #     M5 plan, C6), and never irqs. `timer` may own device
 #     mrs and irqs like a driver, but its device does not seed taint; it
 #     is exempt from taint only while it maps nothing but its own device
-#     mrs and every channel to it has pp=false on both ends and
-#     notify=false on the peer end (L1); a tainted timer is itself an L1
-#     violation. `key` pds hold the static secrets and get the
+#     mrs, claims its own policy irq, and every channel to it has pp=false
+#     on both ends and notify=false on the peer end (L1); a tainted timer
+#     is itself an L1 violation. M9 (plan C14, D13): the generic timer has
+#     no device mr, and since seL4 exports it to every EL0 thread, its
+#     single owner is a code property: under the ELF check (`make
+#     package`) the exemption also needs a clean `tools/timer-scan` result
+#     for the very ELFs checked, and every PD ELF must be W^X (L5). No map
+#     may carry `x` (L4). `key` pds hold the static secrets and get the
 #     taint exemption (L1, L2); there may be several, each mapping
 #     exactly its own secrets mr and nothing else, no pd may hold
 #     pp=true channels to two of them, and none has more than one pp
@@ -177,7 +182,8 @@
 #   `auditkey` from `audit` only and maps only `audit_secrets`; L2 as
 #   amended).
 #   `timer` is exempt as notify-only (L1): it notifies `data`, `hs`,
-#   `ingress`, `pq` and `tls`, none of which can notify it. `audit` (M5) owns the
+#   `ingress`, `pq`, `tls` and (M9, the heartbeat) `audit`, none of which
+#   can notify it. `audit` (M5) owns the
 #   PL011 page as the only console and writes its lines there. `tpm` (M5)
 #   owns the TIS page and is called by the three key pds alone, each over
 #   its one pp channel, to unseal their secrets at boot; it is untainted
@@ -199,7 +205,7 @@ irqs = [71]
 
 [pds.timer]
 role = "timer"
-irqs = [43]
+irqs = [30]
 
 [pds.key]
 role = "key"
@@ -275,12 +281,6 @@ size = 0x1000
 [mrs.eth_in_dma]
 kind = "dma"
 owner = "eth_in"
-
-[mrs.timer_mmio]
-kind = "device"
-owner = "timer"
-phys_addr = 0x90d0000
-size = 0x1000
 
 [mrs.uart_mmio]
 kind = "device"
@@ -755,6 +755,12 @@ notify = { tls = true, inner = true }
 between = ["timer", "tls"]
 pp = { timer = false, tls = false }
 notify = { timer = true, tls = false }
+
+# M9 plan C3: the heartbeat's tick, notify-only like the five above.
+[[channels]]
+between = ["timer", "audit"]
+pp = { timer = false, audit = false }
+notify = { timer = true, audit = false }
 
 [[channels]]
 between = ["tls", "tlskey"]

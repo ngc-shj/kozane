@@ -263,8 +263,22 @@ fn key_channel_meeting_the_exemption_is_allowed() {
 }
 
 #[test]
-fn notify_only_timer_with_own_device_page_is_allowed() {
+fn notify_only_timer_with_its_irq_is_allowed() {
     assert_allow("timer_exemption_allow");
+}
+
+// M9 plan C12: the generic timer maps no device mr, so its exemption also
+// needs its own irq (and, under the ELF check, a clean timer scan below).
+#[test]
+fn timer_without_its_irq_is_l1() {
+    assert_deny_exactly(
+        "timer_no_irq_deny",
+        &[
+            "L1: channel between timer pd 'timer' and 'driver' does not meet the timer exemption (pp=false on both \
+             ends, peer notify=false, timer maps only its own device mr, claims its policy irq, clean timer scan)",
+            "L1: timer pd 'timer' is tainted",
+        ],
+    );
 }
 
 #[test]
@@ -698,6 +712,115 @@ fn shared_mr_within_x_allowance_is_allowed() {
 #[test]
 fn executable_perms_on_shared_mr_is_l4() {
     assert_deny("shared_exec_deny", &["L4"]);
+}
+
+// M9 plan D13: no mr is executable, shared or not.
+#[test]
+fn executable_perms_on_an_unshared_mr_is_l4() {
+    assert_deny_exactly("exec_mr_deny", &["L4: laws: executable MR 'code_mr' mapped into pd 'a' (M9 plan D13)"]);
+}
+
+#[test]
+fn read_only_perms_on_the_same_mr_are_allowed() {
+    assert_allow("exec_mr_allow");
+}
+
+// --- M9 plan D13, C12: the ELF check (W^X, the timer scan's result) ---
+
+const PF_X: u32 = 1;
+const PF_W: u32 = 2;
+const PF_R: u32 = 4;
+
+/// An ELF64 header and `PT_LOAD` (flags, vaddr, memsz) program headers.
+fn elf(segments: &[(u32, u64, u64)]) -> Vec<u8> {
+    let mut b = vec![0u8; 64];
+    b[..6].copy_from_slice(b"\x7fELF\x02\x01");
+    b[0x20..0x28].copy_from_slice(&64u64.to_le_bytes());
+    b[0x36..0x38].copy_from_slice(&56u16.to_le_bytes());
+    b[0x38..0x3a].copy_from_slice(&u16::try_from(segments.len()).unwrap().to_le_bytes());
+    for &(flags, vaddr, memsz) in segments {
+        let mut ph = vec![0u8; 56];
+        ph[..4].copy_from_slice(&1u32.to_le_bytes());
+        ph[4..8].copy_from_slice(&flags.to_le_bytes());
+        ph[16..24].copy_from_slice(&vaddr.to_le_bytes());
+        ph[40..48].copy_from_slice(&memsz.to_le_bytes());
+        b.extend(ph);
+    }
+    b
+}
+
+const CODE: &[(u32, u64, u64)] = &[(PF_R | PF_X, 0x20_0000, 0x1000), (PF_R | PF_W, 0x20_1000, 0x100)];
+
+/// `timer_exemption_allow` under the ELF check: `driver` built from
+/// `driver_segments`, the timer clean, and `scan` (given the two ELFs'
+/// sha256, driver's first) as timer-scan.txt, if any.
+/// timer-scan.txt's text from the driver's and the timer's sha256.
+type Scan<'a> = &'a dyn Fn(&str, &str) -> String;
+
+fn run_elf_check(test: &str, driver_segments: &[(u32, u64, u64)], scan: Option<Scan>) -> Output {
+    let dir = std::env::temp_dir().join(format!("laws-elf-{test}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (driver, timer) = (elf(driver_segments), elf(CODE));
+    std::fs::write(dir.join("driver.elf"), &driver).unwrap();
+    std::fs::write(dir.join("timer.elf"), &timer).unwrap();
+    if let Some(scan) = scan {
+        let text = scan(&laws::sha256::hex_digest(&driver), &laws::sha256::hex_digest(&timer));
+        std::fs::write(dir.join("timer-scan.txt"), text).unwrap();
+    }
+    let fixtures = fixtures_dir();
+    let out = Command::new(env!("CARGO_BIN_EXE_laws"))
+        .arg("check")
+        .arg("--system")
+        .arg(fixtures.join("timer_exemption_allow.system"))
+        .arg("--policy")
+        .arg(fixtures.join("timer_exemption_allow.toml"))
+        .arg("--search-path")
+        .arg(&dir)
+        .output()
+        .expect("failed to run the laws binary");
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
+
+fn clean_scan(driver: &str, timer: &str) -> String {
+    format!("pd driver.elf sha256={driver} clean\npd timer.elf sha256={timer} control=2\nTIMER-SCAN-PDS 1\n")
+}
+
+#[test]
+fn elf_check_with_a_clean_scan_and_wx_segments_is_allowed() {
+    let out = run_elf_check("clean", CODE, Some(&clean_scan));
+    assert!(out.status.success(), "stdout:\n{}\nstderr:\n{}", stdout(&out), stderr(&out));
+}
+
+#[test]
+fn elf_check_without_a_scan_result_fails_the_timer_exemption() {
+    let text = stdout(&run_elf_check("missing", CODE, None));
+    assert!(text.contains("VIOLATIONS: L1\n"), "{text}");
+    assert!(text.contains("L1: the timer exemption needs a clean timer scan: cannot read "), "{text}");
+}
+
+#[test]
+fn elf_check_with_a_stale_scan_result_fails_the_timer_exemption() {
+    let text = stdout(&run_elf_check("stale", CODE, Some(&|_, t| clean_scan(&"0".repeat(64), t))));
+    assert!(text.contains("timer-scan.txt scanned another 'driver.elf' (a stale result)"), "{text}");
+}
+
+#[test]
+fn elf_check_refuses_a_writable_executable_segment() {
+    let text = stdout(&run_elf_check("rwx", &[(PF_R | PF_W | PF_X, 0x20_0000, 0x1000)], Some(&clean_scan)));
+    assert!(text.contains("VIOLATIONS: L5\n"), "{text}");
+    assert!(text.contains("L5: laws: writable executable segment: driver.elf segment 0 at 0x200000 is W and X"), "{text}");
+}
+
+#[test]
+fn elf_check_refuses_a_page_in_an_executable_and_a_writable_segment() {
+    let overlap = [(PF_R | PF_X, 0x20_0000, 0x1800), (PF_R | PF_W, 0x20_1800, 0x100)];
+    let text = stdout(&run_elf_check("overlap", &overlap, Some(&clean_scan)));
+    assert!(
+        text.contains("L5: laws: writable executable segment: driver.elf page 0x201000 is in executable segment 0 and writable segment 1"),
+        "{text}"
+    );
 }
 
 #[test]

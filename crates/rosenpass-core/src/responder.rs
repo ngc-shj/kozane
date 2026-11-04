@@ -48,6 +48,9 @@ pub enum Error {
     Rng,
     Encaps(EncapsError),
     /// The decrypted initiator id, or the biscuit's, names no configured peer.
+    /// At the initiator: the message names no live handshake that awaits it
+    /// (another session id, the wrong state, or a handshake past its
+    /// lifetime), upstream's "non-existent session".
     UnknownPeer,
     /// An AEAD did not open: the peer id, an `auth` field or the biscuit.
     Auth,
@@ -181,12 +184,12 @@ pub fn envelope_mac(mac_key: &[u8; KEY_LEN], msg: &[u8]) -> Result<[u8; MAC_LEN]
     Ok(*mac)
 }
 
-fn mac_field(msg: &mut [u8]) -> Option<&mut [u8; MAC_LEN]> {
+pub(crate) fn mac_field(msg: &mut [u8]) -> Option<&mut [u8; MAC_LEN]> {
     let off = wire::mac_offset(msg.len());
     msg.get_mut(off..)?.first_chunk_mut::<MAC_LEN>()
 }
 
-fn mac_ok(mac_key: &[u8; KEY_LEN], msg: &[u8]) -> Result<bool, Error> {
+pub(crate) fn mac_ok(mac_key: &[u8; KEY_LEN], msg: &[u8]) -> Result<bool, Error> {
     let want = envelope_mac(mac_key, msg)?;
     let got = msg.get(wire::mac_offset(msg.len())..).and_then(|m| m.first_chunk::<MAC_LEN>()).ok_or(Error::Internal)?;
     Ok(crypto::ct_eq(&want, got))

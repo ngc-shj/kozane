@@ -299,3 +299,16 @@ fn a_source_index_past_the_sources_counts_nothing() {
     cps.source_ready(1);
     assert!(matches!(cps.poll(1, [0; 32], 0), Action::Call(_)));
 }
+
+#[test]
+fn a_heartbeat_is_due_every_heartbeat_s_ticks() {
+    let mut hb = Heartbeat::new();
+    let due: Vec<(u64, u64)> = (1..=3 * HEARTBEAT_S).filter_map(|i| hb.tick().map(|n| (i, n))).collect();
+    assert_eq!(due, [(HEARTBEAT_S, HEARTBEAT_S), (2 * HEARTBEAT_S, 2 * HEARTBEAT_S), (3 * HEARTBEAT_S, 3 * HEARTBEAT_S)]);
+}
+
+#[test]
+fn the_timer_channel_is_not_the_ready_input() {
+    assert!(!ready_input([layout::audit::CH_TIMER]));
+    assert!(ready_input([layout::audit::CH_TIMER, CH_AUDITKEY]));
+}

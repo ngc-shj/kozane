@@ -34,13 +34,13 @@ MAKE_ENV = {**os.environ, "LC_ALL": "C", "GIT_DIR": str(ROOT / ".git")}
 SKIP = {"build", "target", ".git", "crashes"}
 
 
-def manifest_count(key: str) -> int:
-    """`key`'s count in tests/manifest.txt, so a needle derived from it
-    follows the manifest instead of going stale when tests are added."""
-    for line in (ROOT / "tests/manifest.txt").read_text().splitlines():
+def manifest_count(key: str, manifest: str = "tests/manifest.txt") -> int:
+    """`key`'s count in `manifest`, so a needle derived from it follows the
+    manifest instead of going stale when tests are added."""
+    for line in (ROOT / manifest).read_text().splitlines():
         if line.split()[:1] == [key]:
             return int(line.split()[1])
-    raise SystemExit(f"selftest: {key} not in tests/manifest.txt")
+    raise SystemExit(f"selftest: {key} not in {manifest}")
 
 
 def doctest_line(rel: str, fence: str) -> int:
@@ -55,6 +55,7 @@ def doctest_line(rel: str, fence: str) -> int:
 
 AUDIT_EVENT_TESTS = manifest_count("UNIT-AUDIT-EVENT")
 INTEGRATION_CASES = manifest_count("INTEGRATION-CASES")
+ORACLE_CASES = manifest_count("INTEGRATION-ORACLE-CASES", "tests/manifest-kzc.txt")
 
 
 def edit(tree: pathlib.Path, rel: str, old: str, new: str):
@@ -126,6 +127,40 @@ def two_key_channel(tree: pathlib.Path, caller: str, caller_id: int, callee: str
            f'pp = {{ {caller} = true, {callee} = false }}\nnotify = {{ {caller} = false, {callee} = true }}\n')
 
 
+# M9 plan D13: `make package` refuses before it reads a secret, so the
+# timer-scan and W^X cases need no real blobs (as package-waiver).
+PACKAGE_RELEASE = ["package", "MICROKIT_CONFIG=release", "SECRETS=/nonexistent/s.bin", "PQ_SECRETS=/nonexistent/pq.bin",
+                   "TLS_SECRETS=/nonexistent/tls.bin", "AUDIT_SECRETS=/nonexistent/audit.bin",
+                   "SRK_PUBLIC=/nonexistent/srk.pub", "OUT=/nonexistent/pkg"]
+INGRESS_NOW = "        let now = cpu::now_ns();\n"
+TIMER_SCAN_DENY = "timer-scan: rejected instruction outside timer: pd=pd-ingress.elf"
+
+
+def ingress_asm(tree: pathlib.Path, insn: str):
+    """`insn` on ingress's frame path, where the timer scan reads it."""
+    edit(tree, "crates/pds/ingress/src/main.rs", INGRESS_NOW,
+         INGRESS_NOW + f"        // SAFETY: selftest only.\n        unsafe {{ core::arch::asm!(\"{insn}\", inout(reg) 0u64 => _) }};\n")
+
+
+def strip_timer_access(tree: pathlib.Path):
+    """The timer PD with no CNTP_* access: its writes and its status read
+    become no-ops (it still builds; it would never tick)."""
+    rel = "crates/pds/timer/src/main.rs"
+    edit(tree, rel, '"mrs {}, cntp_ctl_el0"', '"mov {}, xzr"')
+    edit(tree, rel, '"msr cntp_cval_el0, {}"', '"/* {} */"')
+    edit(tree, rel, '"msr cntp_ctl_el0, {}"', '"/* {} */"')
+
+
+def sp804_dtb(tree: pathlib.Path):
+    """P36's input swapped for the patched QEMU's kind of dtb: the stock one
+    with its pl061 node renamed arm,sp804 (the SDK is outside the copy)."""
+    data = (pathlib.Path(os.environ.get("MICROKIT_SDK", "/nonexistent")) / "kozane-virt.dtb").read_bytes()
+    if data.count(b"arm,pl061\0") != 1:
+        raise SystemExit("selftest: the SDK's dtb has no single arm,pl061 node to rename")
+    (tree / "selftest-sp804.dtb").write_bytes(data.replace(b"arm,pl061\0", b"arm,sp804\0"))
+    edit(tree, "tools/check-pins", 'DTB = "kozane-virt.dtb"\n', f'DTB = "{tree / "selftest-sp804.dtb"}"\n')
+
+
 def share_key_with_tls(tree: pathlib.Path):
     """`tls` back on `key`'s endpoint (M6 slice 2's shape) and `tlskey`
     removed with its region, its PPCs to `tpm` and `rng` and their policy entries, so
@@ -189,7 +224,13 @@ CASES_FOR_GATE = {
     # pins runs the package checker fixtures; package-debug drives the real target.
     "pins": {"pins", "package-debug", "package-waiver", "package-waiver-removed", "mkcert-constraints",
              "l14-constructor", "l14-codepoint", "finished-ct-eq", "c13-pass-due-pin", "cap-barrier-pin",
-             "supervisor-allowlist"},
+             "supervisor-allowlist",
+             # M9 plan C12, C14, D13 (the package cases drive the real target).
+             "timer-scan-deny-write", "timer-scan-deny-read", "timer-scan-allow", "timer-scan-control", "wx-rwx",
+             "i14-1-device", "i14-1-precondition", "stack-top-pin", "client-lock-pin", "seams-confined", "client-scrub-site",
+             "rp-vectors-pin", "rp-constants-pin",
+             # Deviation D-20: tools/vm.py's I1.1 and swtpm key fixtures.
+             "i1-1-drift", "swtpm-key"},
     "lint": {"lint"},
     "audit": {"audit"},
     "lint-pds": {"lint-pds", "tls-audit-names"},
@@ -211,13 +252,17 @@ CASES_FOR_GATE = {
              "c4-inner-src", "c4-inner-port-range", "c4-tln-dst-ip", "c4-tln-dst-port", "c4-tln-src-port-range",
              "proxy-truncation-rst", "proxy-early-client-fin", "proxy-413-no-connect", "proxy-connect-timeout-wipe", "proxy-fin-drain", "rst-inherit",
              "conn-per-source-cap", "c2-tcp-offset", "c2-tls-egress-syn", "s1-inner-tls-tier",
-             "c13-turn-earliest", "c13-pass-due", "c13-hs-cap", "c13-admit-hs-cap"},
+             "c13-turn-earliest", "c13-pass-due", "c13-hs-cap", "c13-admit-hs-cap",
+             "wx-overlap", "initiator-vectors", "initiator-restore"},
     "kani": {"kani", "kani-cache", "kani-chunk-ref"},
     "ct": {"ct-barrier", "ct-c1-barrier", "ct-harness-unit", "ct-harness-lint", "ct-canary", "ct-early-exit", "ct-declassify", "ct-declassify-width",
            "ct-not-valgrind", "residue-under-valgrind", "mce-residue-rand", "mce-residue-scrub", "mce-residue-forms",
            "mce-residue-encaps-scrub", "mce-residue-encaps-depth", "mce-residue-bm", "tpm2-open-residue",
            "tls-exchange-residue", "tls-exchange-scrub-depth", "tls-hello-scrub", "tls-hello-scrub-depth", "residue-secret-drop"},
     "ct-shape": {"ct-shape", "ct-identity", "verus-erasure", "tls-identity", "stage-run-init", "stage-callee-boot-stop"},
+    # M9 plan C7, I7.2 (deviation D-16): the initiator's residue cases.
+    "rp-residue": {"rp-residue-state-wipe", "rp-residue-scrub", "rp-residue-control", "rp-residue-unscrubbed",
+                   "rp-residue-unit", "rp-residue-lint"},
     "verus": {"verus-cache", "verus-trusted", "verus-trusted-item", "verus-no-cheating", "verus-required", "verus-required-site",
               "verus-required-member", "verus-wg-wire-window",
               "verus-wg-wire-roundtrip", "verus-rp-wire-roundtrip",
@@ -225,12 +270,12 @@ CASES_FOR_GATE = {
     "bolero": {"bolero", "bolero-wg-wire", "bolero-rosenpass-wire", "bolero-tls-wire", "bolero-http-wire"},
     "laws": {"laws", "laws-timer-ingress", "laws-pq-key", "laws-hs-pqkey", "laws-pq-secrets-writable",
              "laws-tls-pqkey", "laws-tls-budget", "laws-tls-priority", "laws-tls-hd", "laws-hs-tls-share-key",
-             "laws-supervisor-smc"},
+             "laws-supervisor-smc", "laws-exec-mr"},
     "test": {"measure-twin", "measure-wrap", "measure-pair-01", "measure-pair-02", "measure-pair-12",
              "measure-pair-03", "measure-pair-04", "measure-pair-05", "measure-pair-13", "measure-pair-14",
              "measure-pair-15", "measure-pair-23", "measure-pair-24", "measure-pair-25", "measure-pair-34",
              "measure-pair-35", "measure-pair-45", "measure-pcr9-twin",
-             "measure-range2-wrap", "measure-version", "measure-halt", "measure-poweroff", "measure-ctrlc", "key-wipe", "sealed-pcr-unbound", "sealed-srk-name", "sealed-cap", "tpm-proxy-hmac",
+             "measure-range2-wrap", "measure-version", "tpm-startup-refuse", "measure-halt", "measure-poweroff", "measure-ctrlc", "key-wipe", "sealed-pcr-unbound", "sealed-srk-name", "sealed-cap", "tpm-proxy-hmac",
              "integration", "integration-count", "integration-residue", "integration-cookie",
              "integration-pq-residue", "l8-fallback", "integration-rp-src-meter", "integration-rotation",
              "integration-expiry", "rp-cookie-gate", "rp-rotating-spoof", "integration-expiry-residue",
@@ -240,15 +285,49 @@ CASES_FOR_GATE = {
              "cap-barrier-skipped", "supervisor-resume", "c11-refuse-reason", "c11-no-shutdown",
              "c11-fault-inject-serving", "c7-rndr-fault", "audit-trailer-raw", "policy-pcr9-check",
              "policy-advance-unverified", "policy-ed25519-skipped", "policy-mldsa-skipped", "policy-anchor-floor",
-             "policy-name-skipped", "policy-equivocation-removed", "policy-prev-removed", "policy-hs-barrier"},
-    "repro": {"repro-path-leak", "repro-firmware-timestamp"},
+             "policy-name-skipped", "policy-equivocation-removed", "policy-prev-removed", "policy-hs-barrier",
+             "pcr0-seal"},
+    "repro": {"repro-path-leak", "repro-uboot", "kernel-config-gicv2"},
     "mir": {"mir-target-split", "mir-env-split", "mir-debug-split", "mir-feature-split"},
     "manifest": {"manifest"},
+    # M9 plan C8-C10, C4 (D12): the client and launcher workspaces' gates.
+    "client": {"ffi-header", "client-unit", "client-lint",
+               # Deviation D-20: the plan's I8.1, valgrind, I10.1-I10.4 and
+               # D6 rows (the needles are the client tests' own).
+               "client-scrub-bound", "client-startup-scrub", "client-deadline-reset", "ffi-memcheck",
+               "kzc-symlink", "kzc-loose-mode", "kzc-sigterm-scrub", "kzc-psk-ack", "kzc-psk-zero",
+               "kzc-caps", "units-canonical", "kzc-psk-only-scrub", "kzc-psk-delete-on-exit",
+               "kzc-psk-reclaim", "kzc-psk-peer-uid"},
+    "host": {"vm-launcher-pin", "host-unit", "host-lint",
+             # Deviation D-20: the test-seams build and I4.1-I4.3.
+             "host-seams-shipped", "vm-launcher-argv", "vm-launcher-seals", "pin-firmware-unsigned",
+             "pin-firmware-older"},
+    # M9 plan C6, C11: the gates `make check` does not run, with their own
+    # counts and manifests (EXTRA_GATES).
+    "test-kvm": {"kvm-dev-missing", "kvm-proof", "kvm-tick"},
+    "test-kzc": {"kzc-cookie", "kzc-oracle-count"},
 }
+
+# Gates outside the `check` rule whose cases the selftest still expects
+# (M9 plan C6, T3.7): `make test-kvm` (gx10 only) and `make test-kzc`.
+EXTRA_GATES = ("test-kvm", "test-kzc")
 
 
 class GateParseError(Exception):
     pass
+
+
+def gate_problems(gates: list, extra=EXTRA_GATES, cases_for_gate=None, cases=None) -> list:
+    """Why the cases do not cover the gates: a `check` gate or an extra gate
+    with no case, or cases that are not exactly the gates' cases."""
+    cases_for_gate = CASES_FOR_GATE if cases_for_gate is None else cases_for_gate
+    cases = CASES if cases is None else cases
+    problems = [f"check-selftest: no cases for {g}" for g in extra if not cases_for_gate.get(g)]
+    unknown = [g for g in gates if g not in cases_for_gate]
+    expected = set().union(*(cases_for_gate[g] for g in [*gates, *extra] if cases_for_gate.get(g)))
+    if unknown or set(cases) != expected:
+        problems.append(f"selftest: gates without a case {unknown}; case mismatch {sorted(set(cases) ^ expected)}")
+    return problems
 
 
 def check_gates(text: str = "") -> list:
@@ -288,12 +367,12 @@ CASES = {
     "repro-path-leak": (["repro"], lambda t: append(t, "crates/pds/timer/src/main.rs",
                                                     '\n#[used]\nstatic SELFTEST_PATH: &str = env!("CARGO_MANIFEST_DIR");\n'),
                         "repro: pd-timer.elf differs between"),
-    # M7 plan C2: without its fixed build message TF-A embeds the build
-    # time, so the copy's firmware differs (the regression P24 names, seen
-    # by the gate that adjudicates it).
-    "repro-firmware-timestamp": (["repro"], lambda t: edit(t, "support/tf-a/build-flags",
-                                                           'BUILD_MESSAGE_TIMESTAMP="kozane"\n', ""),
-                                 "repro: firmware-shipped/bl1.bin differs between"),
+    # M9 plan C2: without SOURCE_DATE_EPOCH U-Boot embeds its build time,
+    # so the copy's firmware differs.
+    "repro-uboot": (["repro"], lambda t: edit(t, "Makefile",
+                                              "\tSOURCE_DATE_EPOCH=0 env -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/u-boot-$*",
+                                              "\tenv -u MAKEFLAGS -u MAKELEVEL $(MAKE) -C $(BUILD)/u-boot-$*"),
+                    "repro: u-boot-shipped/u-boot.bin differs between"),
     # M5 plan C4: each split gives the shipped wire a body the proof build
     # does not compile, and only the MIR comparison can see it.
     "mir-target-split": (["mir"], lambda t: append(t, "crates/wire/src/lib.rs", MIR_SPLIT.format(
@@ -849,6 +928,11 @@ CASES = {
     "measure-version": (["test", "it_boots=measured boot"], lambda t: edit(
         t, "support/u-boot/boot.cmd", "setexpr.l ver *0x6ff00008; if test 0x$ver -ne 3; then REFUSE; fi\n", ""),
         "the version-2 descriptor was not refused"),
+    # M9 plan C2: U-Boot going on past a failed TPM2_Startup reaches the TPM
+    # again (its first extend), which the startup case refuses.
+    "tpm-startup-refuse": (["test", "it_boots=tpm startup"], lambda t: edit(
+        t, "support/u-boot/boot.cmd", "tpm2 startup TPM2_SU_CLEAR || REFUSE\n", "tpm2 startup TPM2_SU_CLEAR\n"),
+        "tpm-startup: a TPM command after the failed startup"),
     # M5 plan C14. The PCR binding gone from both sides (the seal policy
     # PolicyAuthValue alone, the client skipping PolicyPCR): another image
     # unseals.
@@ -1635,6 +1719,302 @@ CASES = {
                        lambda t: append(t, "policy/waivers.toml",
                                         '\n[[waivers]]\nid = "SC99"\nowner = "M9"\nstatus = "open"\n'),
                        "waiver SC99 (owner M9) is open"),
+    # M9 plan C7, I7.2 (deviation D-16): a wipe of the state skipped. (A
+    # transient kept past an error path on the stack is no longer a case:
+    # the client's scrub below the call clears it.)
+    "rp-residue-state-wipe": (["rp-residue"], lambda t: edit(
+        t, "crates/rosenpass-core/src/initiator.rs", "        hs.eski.wipe();\n", ""),
+                              "rp-residue: resp-hello.ok left esk in state"),
+    # The client's stack scrub emptied: the initiator's residue stays.
+    "rp-residue-scrub": (["rp-residue"], lambda t: edit(
+        t, "client/crates/client/src/lib.rs",
+        "    let mut area = [0u64; SCRUB_DEPTH / 8];\n    area.zeroize();\n    std::hint::black_box(&area);\n", ""),
+                         "rp-residue: start.ok left esk in stack"),
+    # ... and one call site's scrub removed (the check-pins tripwire).
+    "client-scrub-site": (["pins"], lambda t: edit(
+        t, "client/crates/client/src/lib.rs",
+        "            let r = ini.start(&keys, now, seams);\n            scrub_stack();\n",
+        "            let r = ini.start(&keys, now, seams);\n"),
+                          "initiator call not followed by scrub_stack()"),
+    # The first control: a frame that never held the secret is not found.
+    "rp-residue-control": (["rp-residue"], lambda t: edit(t, "tools/rp-residue/src/main.rs",
+                                                          "    let s = Secret::copy_from(value);\n",
+                                                          "    let s = Secret::<32>::zero();\n"),
+                           "rp-residue: control: kept secret not found in stack"),
+    # The second: unscrubbed runs that scrub too leave nothing, so nothing
+    # shows the scrub is what clears the residue.
+    "rp-residue-unscrubbed": (["rp-residue"], lambda t: edit(t, "tools/rp-residue/src/main.rs",
+                                                             "            black_box(call(ini));\n",
+                                                             "            black_box(call(ini));\n            scrub_stack();\n"),
+                              "rp-residue: unscrubbed: no residue without the scrub"),
+    # Its own unit tests and clippy, run by `make rp-residue` (its own
+    # workspace, so `make unit` and `make lint` never see it).
+    "rp-residue-unit": (["rp-residue"], lambda t: edit(t, "tools/rp-residue/src/scan.rs", "mod tests {\n",
+                                                       "mod tests {\n    #[test]\n    fn selftest_injected_failure() {\n"
+                                                       "        let v = [1u8];\n        assert!(v.is_empty());\n    }\n\n"),
+                        "selftest_injected_failure ... FAILED"),
+    "rp-residue-lint": (["rp-residue"], lambda t: edit(t, "tools/rp-residue/src/scan.rs", "#[cfg(test)]\nmod tests {\n",
+                                                       "pub fn selftest_lint() -> usize {\n    let v = vec![1u8];\n    v.len()\n}\n\n"
+                                                       "#[cfg(test)]\nmod tests {\n"),
+                        "useless use of `vec!`"),
+    # M9 plan C9: the header gate regenerates the C header with cbindgen; a
+    # committed header that names an argument otherwise differs.
+    "ffi-header": (["client"], lambda t: edit(t, "client/include/kozane_client.h",
+                                              "int kz_client_on_timer(struct kz_client *h, uint64_t now);",
+                                              "int kz_client_on_timer(struct kz_client *h, uint64_t now_ns);"),
+                   "ffi: header differs"),
+    # M9 plan I4.2: without the hash compare, a firmware other than the
+    # pinned one boots (the launcher test's stand-ins record it).
+    "vm-launcher-pin": (["host"], lambda t: edit(t, "host/crates/kozane-vm/src/main.rs",
+                                                 "    if found != pin.firmware_sha256 {",
+                                                 "    if found.is_empty() {"),
+                        "vm-launcher: unpinned firmware ran"),
+    # M9 plan C6: without /dev/kvm the gate fails, never skips (the seam
+    # names a missing device).
+    "kvm-dev-missing": (["test-kvm"], lambda t: edit(t, "Makefile", "kvm_dev := /dev/kvm\n",
+                                                     "kvm_dev := /dev/kvm-absent\n"),
+                        "test-kvm: no /dev/kvm"),
+    # M9 plan C6 (T1.3, T2.1): `-accel tcg` in vm.machine's kvm form; every
+    # harness boot's query-kvm, and the launcher boot's kvm-vm fd, must say so.
+    "kvm-proof": (["test-kvm", "it_boots=kvm seal and unseal"], lambda t: edit(
+        t, "tools/vm.py", '"-accel", accel, "-cpu", CPU[accel],', '"-accel", "tcg", "-cpu", CPU["tcg"],'),
+        "kvm: not enabled"),
+    # M9 plan C6 (T2.12): a timer ticking at half the rate, against the
+    # host's monotonic clock between two Heartbeat lines.
+    "kvm-tick": (["test-kvm", "it_boots=kvm tick rate"], lambda t: edit(
+        t, "crates/pds/timer/src/main.rs", "    let period = cntfrq();\n", "    let period = cntfrq() * 2;\n"),
+        "kvm-tick: rate outside tolerance"),
+    # M9 plan C11 (T2.11, T3.5): a kzc that ignores CookieReply never takes
+    # the cookie path under load.
+    "kzc-cookie": (["test-kzc", "it_boots=kzc cookie"], lambda t: edit(
+        t, "client/crates/client/src/lib.rs",
+        "                let r = ini.handle_cookie_reply(msg, now);\n                scrub_stack();\n                r?;\n", ""),
+        "kzc-cookie: no cookie path"),
+    # M9 plan D4: an oracle case counted as a kzc case leaves
+    # INTEGRATION-ORACLE-CASES below manifest-kzc.txt.
+    "kzc-oracle-count": (["test-kzc"], lambda t: edit(
+        t, "tests/integration/run.py", 'oracle_case(kzc, RP_023, "0.2.3", oracle)',
+        'oracle_case(kzc, RP_023, "0.2.3", passed)'),
+        f"INTEGRATION-ORACLE-CASES: {ORACLE_CASES - 1} < manifest {ORACLE_CASES}"),
+    # M9 plan C14 I14.2, D13: the timer scan over the packaged ELFs. A write
+    # and a read of the class in ingress; the counter read refused once the
+    # allowlist loses it (ingress reads it through cpu::now_ns); and a timer
+    # with no timer access fails the positive control.
+    "timer-scan-deny-write": (PACKAGE_RELEASE, lambda t: ingress_asm(t, "msr cntp_cval_el0, {0}"),
+                              f"{TIMER_SCAN_DENY} offset="),
+    # cntvctss_el0 by its encoding: the assembler may not know ECV's names.
+    "timer-scan-deny-read": (PACKAGE_RELEASE, lambda t: ingress_asm(t, "mrs {0}, s3_3_c14_c0_6"),
+                             f"{TIMER_SCAN_DENY} offset="),
+    "timer-scan-allow": (PACKAGE_RELEASE, lambda t: edit(t, "tools/timer-scan", '    (1, 0, 1): "MRS CNTPCT_EL0",\n', ""),
+                         f"{TIMER_SCAN_DENY} offset="),
+    "timer-scan-control": (PACKAGE_RELEASE, strip_timer_access, "timer-scan: no timer access in timer"),
+    # D13's W^X: an RWX section in ingress gives it a writable executable
+    # segment, refused by laws' ELF check after the scan; the overlapping-
+    # page rule removed fails its laws unit test (no build places an X and
+    # a W segment on one page).
+    "wx-rwx": (PACKAGE_RELEASE, lambda t: append(t, "crates/pds/ingress/src/main.rs",
+                                                 '\ncore::arch::global_asm!(".pushsection .selftest_wx,\\"awxR\\",%progbits", '
+                                                 '".word 0", ".popsection");\n'),
+               "laws: writable executable segment: pd-ingress.elf segment"),
+    "wx-overlap": (["unit"], lambda t: edit(t, "tools/laws/src/elf.rs", "            if xa < wb && wa < xb {", "            if false {"),
+                   "---- elf::tests::a_page_shared_by_an_executable_and_a_writable_segment_is_refused stdout ----"),
+    # D13: no MR is executable, shared or not (declared in the policy too).
+    "laws-exec-mr": (["laws"], lambda t: edit(t, "system/kozane.system",
+                                              '<map mr="uart_mmio" vaddr="0x2_000_000" perms="rw" ',
+                                              '<map mr="uart_mmio" vaddr="0x2_000_000" perms="rwx" '),
+                     "laws: executable MR 'uart_mmio' mapped into pd 'audit'"),
+    # I14.1: the sp804's region back, and the dtb of a patched QEMU.
+    "i14-1-device": (["pins"], lambda t: edit(t, "system/kozane.system", '    <memory_region name="uart_mmio" ',
+                                              '    <memory_region name="timer_mmio" size="0x1000" phys_addr="0x90d0000" />\n'
+                                              '    <memory_region name="uart_mmio" '),
+                     "pins: device not in virt-9.0: system/kozane.system mr 'timer_mmio'"),
+    "i14-1-precondition": (["pins"], sp804_dtb, "pins: dtb is not stock virt-9.0"),
+    # Deviation D-9: the probe's stack top left at the EL2 board's.
+    "stack-top-pin": (["pins"], lambda t: edit(t, "crates/cpu/src/lib.rs", "const STACK_TOP: usize = 0x7fff_ffff_e000;",
+                                               "const STACK_TOP: usize = 0xff_ffff_e000;"),
+                      "pins: stack top drift: crates/cpu/src/lib.rs"),
+    # D12: a shared crate bumped in the client's lock only.
+    "client-lock-pin": (["pins"], lambda t: edit(t, "client/Cargo.lock", 'name = "libc"\nversion = "0.2.191"\n',
+                                                 'name = "libc"\nversion = "0.2.192"\n'),
+                        "pins: client lock drift: client/Cargo.lock locks libc 0.2.192"),
+    # C4, C10: a seam outside its module.
+    "seams-confined": (["pins"], lambda t: append(t, "host/crates/kozane-vm/src/main.rs",
+                                                  '\n#[cfg(feature = "test-seams")]\nfn selftest_seam() {}\n'),
+                       "a test-seams cfg outside resolve.rs and seams.rs"),
+    # M9 plan C7: the initiator against upstream's vectors (a recorded draw
+    # flipped), its state kept on an error (committed before the RespHello's
+    # auth check), and the vectors' and the constants' pins.
+    "initiator-vectors": (["unit"], lambda t: edit(t, "crates/rosenpass-core/src/tests_initiator_vectors.rs",
+                                                   'v["draw.sidi"].clone(), v["draw.kyber"].clone()]',
+                                                   '{ let mut d = v["draw.sidi"].clone(); d[0] ^= 1; d }, v["draw.kyber"].clone()]'),
+                          "initiator: vector mismatch"),
+    "initiator-restore": (["unit"], lambda t: edit(t, "crates/rosenpass-core/src/initiator.rs",
+                                                   "        let next = self.state.resp_hello(now, rh.sidi, draw_jitter(s.rng)?)?;\n",
+                                                   "        let next = self.state.resp_hello(now, rh.sidi, draw_jitter(s.rng)?)?;\n"
+                                                   "        self.state = next;\n"),
+                          "initiator: state advanced on error"),
+    "rp-vectors-pin": (["pins"], lambda t: edit(t, "crates/rosenpass-core/tests/vectors/v02.txt", "\nkh.out ", "\nkh.out 00"),
+                       "pins: rp vectors changed: crates/rosenpass-core/tests/vectors/v02.txt sha256"),
+    "rp-constants-pin": (["pins"], lambda t: edit(t, "crates/rosenpass-core/src/initiator_state.rs", "= 500 * NS_PER_MS;",
+                                                  "= 501 * NS_PER_MS;"),
+                         "rp-constants: drift: crates/rosenpass-core/src/initiator_state.rs"),
+    # Deviation D-20 (Phase 2 self-check, testing): the plan's injection
+    # rows that had no case. Each needle is the failure line of the gate's
+    # own test.
+    # I1.1: a KVM-only device in vm.machine.
+    "i1-1-drift": (["pins"], lambda t: edit(
+        t, "tools/vm.py", '                "-device", f"virtio-rng-device,rng=rng0,bus={RNG_BUS}"]\n',
+        '                "-device", f"virtio-rng-device,rng=rng0,bus={RNG_BUS}"]\n'
+        '    if accel == "kvm":\n        cmd += ["-device", "virtio-rng-device,id=selftest"]\n'),
+                   "vm: tcg and kvm argv differ"),
+    # H2: swtpm's state unencrypted (no --key).
+    "swtpm-key": (["pins"], lambda t: edit(t, "tools/vm.py", ', "--ctrl", ctrl_arg, "--key", key_arg]',
+                                           ', "--ctrl", ctrl_arg]'),
+                  "vm: swtpm without key"),
+    # C1: the SDK's kernel built for GICv2; image's kernel-config refuses it
+    # (repro is the gate that builds the image).
+    "kernel-config-gicv2": (["repro"], lambda t: edit(
+        t, "Makefile", "kernel_config_file ?= $(sdk_config_dir)/include/kernel/gen_config.h\n",
+        "kernel_config_file ?= tests/fixtures/kernel-config/gicv2-el1-gen_config.h\n"),
+                            "kernel-config: GIC_V3 missing"),
+    # M9 plan D1: the seal policy without PCR 0 (both sides, so the good
+    # boot still unseals); nothing before U-Boot measures PCR 0, so a PCR 0
+    # extended before PolicyPCR unseals.
+    "pcr0-seal": (["test", "it_boots=sealed boot"], lambda t: (
+        edit(t, "crates/tpm2-wire/src/lib.rs",
+             "pub const POLICY_PCR_SELECTION: [u8; 10] = [0, 0, 0, 1, 0x00, 0x0B, 3, 0xFF, 0x01, 0x00];",
+             "pub const POLICY_PCR_SELECTION: [u8; 10] = [0, 0, 0, 1, 0x00, 0x0B, 3, 0xFE, 0x01, 0x00];"),
+        edit(t, "crates/tpm2-wire/src/lib.rs", "    assert!(p7 == 0xFF && p8 == 0x01", "    assert!(p7 == 0xFE && p8 == 0x01"),
+        edit(t, "crates/tpm2/src/crypto.rs", "&POLICY_PCR_SELECTION, &sha256(&values)])",
+             "&POLICY_PCR_SELECTION, &sha256(&values[1..])])")),
+                  "pcr0-deny: unsealed"),
+    # The test-seams build shipped.
+    "host-seams-shipped": (["host"], lambda t: edit(
+        t, "Makefile", "\tcd host && cargo build --locked --release -p kozane-vm --target-dir $(host_target)\n",
+        "\tcd host && cargo build --locked --release -p kozane-vm --features test-seams --target-dir $(host_target)\n"),
+                           "host: shipped launcher has test seams"),
+    # I4.1: one-device drift between vm.py and what the launcher embeds.
+    "vm-launcher-argv": (["host"], lambda t: edit(
+        t, "tools/vm.py", "                        media=media, launcher=True),\n",
+        '                        media=media, launcher=True) + ["-device", "virtio-rng-device,id=selftest"],\n'),
+                         "vm-launcher: argv differs"),
+    # I4.1 seals: the firmware's memfd (the one copy of FIRMWARE_MAX)
+    # handed over unsealed.
+    "vm-launcher-seals": (["host"], lambda t: (
+        edit(t, "host/crates/kozane-vm/src/files.rs",
+             "    if unsafe { libc::fcntl(mem.as_raw_fd(), libc::F_ADD_SEALS, SEAL_ALL) } == -1 {",
+             "    if max != crate::FIRMWARE_MAX && unsafe { libc::fcntl(mem.as_raw_fd(), libc::F_ADD_SEALS, SEAL_ALL) } == -1 {"),
+        edit(t, "host/crates/kozane-vm/src/files.rs", "    if seals(&mem)? & SEAL_ALL != SEAL_ALL {",
+             "    if max != crate::FIRMWARE_MAX && seals(&mem)? & SEAL_ALL != SEAL_ALL {")),
+                          "vm-launcher: firmware fd not sealed"),
+    # I4.3: pin-firmware without the manifest's signature check, and
+    # without the sequence check.
+    "pin-firmware-unsigned": (["host"], lambda t: edit(
+        t, "host/crates/kozane-vm/src/pin.rs",
+        '    let fields = release::verify_release(&keys, &manifest, &sig).map_err(|e| format!("the release does not verify: {e}"))?;\n',
+        '    let _ = (&keys, &sig);\n'
+        '    let fields = release::manifest::parse(&manifest).map_err(|_| "selftest: manifest".to_string())?;\n'),
+                              "pin-firmware: unsigned release pinned"),
+    "pin-firmware-older": (["host"], lambda t: edit(
+        t, "host/crates/kozane-vm/src/pin.rs",
+        "    if let Some(cur) = current\n        && seq < cur.release_seq\n    {\n"
+        '        return Err(format!("release_seq {seq} is below the pinned {}", cur.release_seq));\n    }\n',
+        "    let _ = current;\n"),
+                           "pin-firmware: older release pinned"),
+    # The host and client workspaces' own unit tests and clippy (as
+    # rp-residue's: `make unit` and `make lint` never see them).
+    "host-unit": (["host"], lambda t: append(t, "host/crates/kozane-vm/src/tests.rs", "\n#[test]\nfn selftest_injected_failure() {\n    let v = [1u8];\n    assert!(v.is_empty());\n}\n"),
+                  "selftest_injected_failure ... FAILED"),
+    "host-lint": (["host"], lambda t: append(t, "host/crates/kozane-vm/src/kv.rs", "\npub fn selftest_lint() -> usize {\n    let v = vec![1u8];\n    v.len()\n}\n"),
+                  "useless use of `vec!`"),
+    "client-unit": (["client"], lambda t: append(t, "client/crates/client/src/tests.rs", "\n#[test]\nfn selftest_injected_failure() {\n    let v = [1u8];\n    assert!(v.is_empty());\n}\n"),
+                    "selftest_injected_failure ... FAILED"),
+    "client-lint": (["client"], lambda t: append(t, "client/crates/client/src/lib.rs", "\npub fn selftest_lint() -> usize {\n    let v = vec![1u8];\n    v.len()\n}\n"),
+                    "useless use of `vec!`"),
+    # I8.1 a: the scrub one tick late; b: no startup scrub; c: a second
+    # RespHello does not push the deadline.
+    "client-scrub-bound": (["client"], lambda t: edit(t, "client/crates/client/src/lib.rs",
+                                                      "self.scrub_at.is_some_and(|t| now >= t)",
+                                                      "self.scrub_at.is_some_and(|t| now > t)"),
+                           "client: no scrub at bound"),
+    "client-startup-scrub": (["client"], lambda t: edit(t, "client/crates/client/src/lib.rs",
+                                                        "        out.push(Action::Scrub)?;\n        Ok((client, out))\n",
+                                                        "        let _ = &mut out;\n        Ok((client, out))\n"),
+                             "client: send before scrub"),
+    "client-deadline-reset": (["client"], lambda t: edit(t, "client/crates/client/src/lib.rs",
+                                                         "                self.scrub_at = Some(scrub_at);\n",
+                                                         "                self.scrub_at = self.scrub_at.or(Some(scrub_at));\n"),
+                              "client: unexpected scrub"),
+    # C9: an uninitialised read in the C harness, under valgrind.
+    "ffi-memcheck": (["client"], lambda t: edit(
+        t, "client/tests/ffi/harness.c", "    fill(rp_sk, KZ_RP_SK_LEN, 3);\n",
+        "    fill(rp_sk, KZ_RP_SK_LEN, 3);\n"
+        '    { uint8_t *u = malloc(1); if (u && *u == 42) printf("selftest\\n"); free(u); }\n'),
+                     "ffi: memcheck errors"),
+    # I10.1 a: a key file opened through a symlink; b: a loose secret key.
+    "kzc-symlink": (["client"], lambda t: edit(
+        t, "client/crates/client-cli/src/files.rs",
+        "            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_NOCTTY,\n",
+        "            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOCTTY,\n"),
+                    "kzc: symlink accepted"),
+    "kzc-loose-mode": (["client"], lambda t: edit(t, "client/crates/client-cli/src/files.rs",
+                                                  '        Kind::SecretKey => (euid, perm == 0o600, "0600"),',
+                                                  '        Kind::SecretKey => (euid, true, "0600"),'),
+                       "kzc: loose mode accepted"),
+    # I10.2: kzc-psk keeps the PSK when kzc's connection closes.
+    "kzc-sigterm-scrub": (["client"], lambda t: edit(
+        t, "client/crates/client-cli/src/psk.rs",
+        "            dev.scrub()?;\n            eprintln!(\"kzc-psk: connection closed; peer scrubbed\");\n",
+        "            eprintln!(\"kzc-psk: connection closed; peer scrubbed\");\n"),
+                          "kzc: psk survived exit"),
+    # I10.3 a: the scrub's netlink acks ignored; b: a failed draw ignored.
+    "kzc-psk-ack": (["client"], lambda t: (
+        edit(t, "client/crates/client-cli/src/device.rs",
+             '        step("scrub: remove peer", self.genl.call(&mut wg::remove_peer(self.family, self.index, &self.gw_wg_pub)))?;\n',
+             '        let _ = step("scrub: remove peer", self.genl.call(&mut wg::remove_peer(self.family, self.index, &self.gw_wg_pub)));\n'),
+        edit(t, "client/crates/client-cli/src/device.rs",
+             '        step("scrub: re-add peer", self.genl.call(&mut m)).map(drop)\n',
+             '        let _ = step("scrub: re-add peer", self.genl.call(&mut m));\n        Ok(())\n')),
+                    "kzc-psk: scrub unconfirmed"),
+    "kzc-psk-zero": (["client"], lambda t: edit(
+        t, "client/crates/client-cli/src/device.rs",
+        "        if (self.fill)(self.psk.expose_mut()).is_err() || self.psk.is_zero() {\n"
+        "            self.psk.wipe();\n"
+        '            return Err("getrandom failed; no PSK installed".into());\n'
+        "        }\n",
+        "        let _ = (self.fill)(self.psk.expose_mut());\n"),
+                     "kzc-psk: zero psk installed"),
+    # I10.4: kozane-net.service with capabilities.
+    "kzc-caps": (["client"], lambda t: edit(t, "client/dist/kozane-net.service", "CapabilityBoundingSet=\nNoNewPrivileges=yes\n",
+                                            "AmbientCapabilities=CAP_NET_ADMIN\nNoNewPrivileges=yes\n"),
+                 "kzc: capabilities held"),
+    # D6's canonical subset: a repeated directive.
+    "units-canonical": (["client"], lambda t: edit(t, "client/dist/kozane-psk.service", "NoNewPrivileges=yes\n",
+                                                   "NoNewPrivileges=yes\nNoNewPrivileges=yes\n"),
+                        "units: non-canonical unit file"),
+    # D6: a scrub that only replaces the PSK (live keypairs survive it).
+    "kzc-psk-only-scrub": (["client"], lambda t: edit(
+        t, "client/crates/client-cli/src/device.rs",
+        '        step("scrub: remove peer", self.genl.call(&mut wg::remove_peer(self.family, self.index, &self.gw_wg_pub)))?;\n'
+        "        let peer = wg::Peer { public: &self.gw_wg_pub, endpoint: &self.endpoint, allowed_ips: &self.allowed_ips };\n"
+        "        let mut m = wg::add_peer(self.family, self.index, &peer, self.psk.expose());\n",
+        "        let mut m = wg::set_psk(self.family, self.index, &self.gw_wg_pub, self.psk.expose());\n"),
+                           "kzc: session survived scrub"),
+    # D6 lifecycle: no delete on drop; a marked leftover refused.
+    "kzc-psk-delete-on-exit": (["client"], lambda t: edit(
+        t, "client/crates/client-cli/src/device.rs",
+        '        if let Err(e) = self.delete() {\n            eprintln!("kzc-psk: {e}");\n        }\n',
+        "        self.alive = false;\n"),
+                               "kzc-psk: interface left after exit"),
+    "kzc-psk-reclaim": (["client"], lambda t: edit(t, "client/crates/client-cli/src/device.rs",
+                                                   "    if link.alias.as_deref() != Some(rtnl::MARK) ",
+                                                   '    if link.alias.as_deref() != Some("selftest") '),
+                        "kzc-psk: restart refused"),
+    # D6: SO_PEERCRED's uid not checked.
+    "kzc-psk-peer-uid": (["client"], lambda t: edit(t, "client/crates/client-cli/src/ipc.rs",
+                                                    "    peer_uid == kozane_net_uid\n",
+                                                    "    let _ = (peer_uid, kozane_net_uid);\n    true\n"),
+                         "kzc-psk: foreign peer accepted"),
     # Deleting a test keeps `unit` green; only the manifest comparison notices.
     "manifest": (["unit", "manifest"], lambda t: edit(t, "crates/audit-event/src/tests.rs",
                                                      "#[test]\nfn first_occurrence_emits()",
@@ -1844,8 +2224,9 @@ def run_case(name: str) -> bool:
     inject(tree)
     out = run_make(tree, *targets)
     text = out.stdout + out.stderr
-    # Gates write their tool output to build/counts/*.log.
-    for log in sorted((tree / "build/counts").glob("*.log")):
+    # Gates write their tool output to build/counts/*.log (test-kvm and
+    # test-kzc to their own counts directories, M9 plan C6).
+    for log in sorted((tree / "build").glob("counts*/*.log")):
         text += log.read_text(errors="replace")
     if name not in RAW_NEEDLE:
         text = strip_trailer(text)
@@ -1915,10 +2296,9 @@ def main() -> int:
     except GateParseError as e:
         print(f"selftest: {e}")
         return 1
-    unknown = [g for g in gates if g not in CASES_FOR_GATE]
-    expected = set().union(*(CASES_FOR_GATE[g] for g in gates if g in CASES_FOR_GATE))
-    if unknown or set(CASES) != expected:
-        print(f"selftest: gates without a case {unknown}; case mismatch {sorted(set(CASES) ^ expected)}")
+    problems = gate_problems(gates)
+    if problems:
+        print("\n".join(problems))
         return 1
     # Stale counts are only harmless if `check` clears them before any gate.
     if gates[:1] != ["clean-counts"]:

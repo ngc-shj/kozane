@@ -1,0 +1,11 @@
+# Upstream rosenpass lines that crates/rosenpass-core's initiator constants follow (M9 plan C7).
+# upstream: rev 9e72f1eb871c4c403e99e9b78262fff8dd8d7357, archive sha256 8e58490971058e778b097147cdbcc4b0c15449ffe01f28e873993c5cd6fc0e5a
+# (docker/Dockerfile's RP_MASTER_COMMIT and RP_MASTER_SHA256; copied from the rosenpass-oracle stage's /src/master)
+# rosenpass/src/protocol/constants.rs sha256 a60eb7b97033745636d0ca2a73ffea89cd55f6ae08b8e4667f955c7f72f5fbc4
+# format: <path>:<line> <the line, verbatim>; tools/check-pins P34 holds initiator_state.rs to these
+rosenpass/src/protocol/constants.rs:19 pub const REKEY_AFTER_TIME_INITIATOR: Timing = 130.0;
+rosenpass/src/protocol/constants.rs:28 pub const REJECT_AFTER_TIME: Timing = 180.0;
+rosenpass/src/protocol/constants.rs:50 pub const RETRANSMIT_DELAY_GROWTH: Timing = 2.0;
+rosenpass/src/protocol/constants.rs:53 pub const RETRANSMIT_DELAY_BEGIN: Timing = 0.5;
+rosenpass/src/protocol/constants.rs:56 pub const RETRANSMIT_DELAY_END: Timing = 10.0;
+rosenpass/src/protocol/constants.rs:60 pub const RETRANSMIT_DELAY_JITTER: Timing = 0.5;

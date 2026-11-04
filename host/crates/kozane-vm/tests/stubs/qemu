@@ -1,0 +1,25 @@
+#!/usr/bin/python3
+"""An argv-recording QEMU stand-in (M9 plan C4, I4.1): records its argv and
+its fds into qemu.json next to itself, makes one round trip with the swtpm
+stand-in over the TPM chardev's fd, prints a console line and an `audit`
+heartbeat line on its stdout (the serial pipe), and exits 0."""
+
+import json
+import os
+import re
+import sys
+
+HERE = os.path.dirname(os.path.abspath(sys.argv[0]))
+sys.path.insert(0, HERE)
+import inventory  # noqa: E402
+
+rec = inventory.inventory(sys.argv[1:])
+tpm = [int(m[1]) for a in sys.argv for m in [re.fullmatch(r"socket,id=chrtpm,fd=(\d+)", a)] if m]
+rec["tpm_roundtrip"] = False
+if len(tpm) == 1:
+    os.write(tpm[0], b"ping")
+    rec["tpm_roundtrip"] = os.read(tpm[0], 4) == b"pong"
+with open(os.path.join(HERE, "qemu.json"), "w") as f:
+    json.dump(rec, f)
+sys.stdout.write("U-Boot stand-in\r\naudit: src=timer Heartbeat ticks=1 lost=0 seq=1\r\n")
+sys.stdout.flush()

@@ -7,3 +7,5 @@
 __pycache__/
 /tools/*/target/
 /.claude/
+/host/target/
+/client/target/

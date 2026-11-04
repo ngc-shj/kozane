@@ -1,0 +1,44 @@
+[package]
+name = "kozane-client-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "kzc"
+path = "src/bin/kzc.rs"
+
+[[bin]]
+name = "kzc-psk"
+path = "src/bin/kzc-psk.rs"
+
+[features]
+# `--root-prefix` and `--user-map` (M9 plan C4's seams, for C10), so the
+# tests run both binaries in a single-uid user namespace (VE26). Never in a
+# shipped build; `--build-info` prints SEAMS=1 when it is on.
+test-seams = []
+
+[dependencies]
+# The sans-IO core `kzc` drives (M9 plan C8).
+kozane-client = { path = "../client" }
+# `blake2s` for the printed Rosenpass digest, and the rp.sk layout.
+secret-blob = { path = "../../../crates/secret-blob" }
+# `kzc keygen`'s McEliece key pair.
+mce460896 = { path = "../../../crates/mce460896" }
+# `kzc keygen`'s X25519 public key, from the gateway's own code.
+wg-core = { path = "../../../crates/wg-core" }
+# The buffer wipe (L12).
+secret = { path = "../../../crates/secret" }
+# The OS RNG for PSKs and keys (D5), at the root lock's version.
+getrandom = { version = "=0.4.3", default-features = false }
+# Every system call: netlink, unix sockets, openat, fstat, prctl, mlock.
+libc = "=0.2.191"
+
+[dev-dependencies]
+# The integration test's gateway: the real responder with real KEMs.
+rosenpass-core = { path = "../../../crates/rosenpass-core" }
+rosenpass-wire = { path = "../../../crates/rosenpass-wire" }
+# The binaries the integration tests run are built with the seams, and only
+# for the tests: a release build has none (`--build-info` says SEAMS=0).
+kozane-client-cli = { path = ".", features = ["test-seams"] }

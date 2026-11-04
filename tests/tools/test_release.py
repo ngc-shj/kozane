@@ -2,6 +2,7 @@
 (M5 plan C13, C12). The envelope check is mksecrets' own test.
 
 Usage: python3 tests/tools/test_release.py   (after `make release-tool`)
+The launcher is a shell stand-in for `kozane-vm --build-info`.
 Prints "RELEASE-FIXTURES <n>" and exits non-zero on any mismatch.
 """
 
@@ -16,13 +17,18 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 import measure  # noqa: E402
-import fip_fixture  # noqa: E402
 
 RELEASE = [sys.executable, str(ROOT / "tools/release.py")]
 SEQ = re.search(r"^pub const RELEASE_SEQ: u32 = (\d+);$", (ROOT / "crates/release-seq/src/lib.rs").read_text(), re.M)[1]
 BIN = str(ROOT / "build/release/target/release/release")
 SLOT = measure.BUNDLE_MAX
 # The four envelopes, then the two bundle slots (descriptor v3).
+# The firmware the release ships (M9 plan C2): U-Boot stand-in bytes.
+FIRMWARE = b"u-boot stand-in " * 64
+# The host launcher (M9 plan C4): stand-ins for its --build-info, a release
+# build and a test-seams build.
+LAUNCHER = b"#!/bin/sh\necho SEAMS=0\n"
+LAUNCHER_SEAMS = b"#!/bin/sh\necho SEAMS=1\n"
 RANGES = [(0x1000, 0x400), (0x2000, 0x800), (0x3000, 0x400), (0x3800, 0x400), (0x4000, SLOT), (0x4000 + SLOT, SLOT)]
 
 
@@ -47,19 +53,21 @@ def setup(d: pathlib.Path) -> None:
     desc = measure.pack(len(image), RANGES)
     (pkg / "published.img").write_bytes(image)
     (pkg / "boot.desc").write_bytes(desc)
-    (pkg / "flash.bin").write_bytes(fip_fixture.flash())
+    (pkg / "u-boot.bin").write_bytes(FIRMWARE)
     write_pcrs(pkg)
+    for name, data in (("kozane-vm", LAUNCHER), ("kozane-vm-seams", LAUNCHER_SEAMS)):
+        (d / name).write_bytes(data)
+        (d / name).chmod(0o755)
 
 
 def write_pcrs(pkg: pathlib.Path):
-    pcrs = measure.expected_pcrs((pkg / "flash.bin").read_bytes(), (pkg / "boot.desc").read_bytes(),
-                                 (pkg / "published.img").read_bytes())
+    pcrs = measure.expected_pcrs((pkg / "boot.desc").read_bytes(), (pkg / "published.img").read_bytes())
     (pkg / "pcrs").write_text("".join(p.hex() + "\n" for p in pcrs))
 
 
-def make(d, out="rel"):
+def make(d, out="rel", launcher="kozane-vm"):
     return run(*RELEASE, "make", "--keys", str(d / "keys"), "--pkg", str(d / "pkg"), "--out", str(d / out),
-               "--allow-dirty")
+               "--kozane-vm", str(d / launcher), "--allow-dirty")
 
 
 def verify(d, pub="keys", rel="rel", *extra):
@@ -95,13 +103,12 @@ def case_desc(d):
 
 
 def case_firmware(d):
-    """M7 plan C4, C11: a firmware byte changed after signing (BL2's, so PCR 0
-    moves too) is refused."""
+    """M7 plan C11, M9 plan C2: a u-boot.bin byte changed after signing is
+    refused (no PCR measures it, so only firmware_sha256 can)."""
     make(d)
-    flash = d / "rel/flash.bin"
-    flip(flash, measure.FIP_OFFSET + measure.FIP_HEADER.size + measure.FIP_ENTRY.size * 4 + 1)
+    flip(d / "rel/u-boot.bin")
     rc, out = verify(d)
-    return rc == 1 and ("firmware_sha256" in out or "pcrs" in out), out
+    return rc == 1 and "firmware_sha256" in out, out
 
 
 def case_manifest(d):
@@ -119,27 +126,54 @@ def case_other_key(d):
 
 
 def case_pkg_pcrs(d):
-    """M7 plan C4: a package whose PCR 0 (TF-A's) disagrees with its flash.bin."""
+    """M9 plan C2: a package whose PCR 0 is not zero."""
     lines = (d / "pkg/pcrs").read_text().split()
-    (d / "pkg/pcrs").write_text("".join(l + "\n" for l in ["00" * 32] + lines[1:]))
+    (d / "pkg/pcrs").write_text("".join(l + "\n" for l in ["11" * 32] + lines[1:]))
     rc, out = make(d)
     return rc == 1 and "pcrs differ" in out and not (d / "rel").exists(), out
 
 
-def case_pkg_firmware_swapped(d):
-    """M7 plan C4: another firmware beside the pcrs computed from the first."""
-    other = [(u, data + b"!") for u, data in fip_fixture.payloads()]
-    (d / "pkg/flash.bin").write_bytes(fip_fixture.flash(other))
+def case_ships_firmware(d):
+    """M9 plan C2: the release ships the package's u-boot.bin, and the signed
+    firmware_sha256 is its digest."""
     rc, out = make(d)
-    return rc == 1 and "pcrs differ" in out and not (d / "rel").exists(), out
+    signed = (d / "rel/manifest").read_text().splitlines() if rc == 0 else []
+    want = hashlib.sha256(FIRMWARE).hexdigest()
+    return rc == 0 and f"firmware_sha256={want}" in signed \
+        and (d / "rel/u-boot.bin").read_bytes() == FIRMWARE, out
 
 
-def case_pkg_firmware_extra_entry(d):
-    """M7 plan C3: a FIP with an entry outside the measured list is refused."""
-    extra = fip_fixture.payloads() + [(bytes.fromhex("9766fd3d89bee849ae5d78a140608213"), b"scp")]
-    (d / "pkg/flash.bin").write_bytes(fip_fixture.flash(extra))
+def case_ships_launcher(d):
+    """M9 plan C4: the release ships the launcher it was given, under the
+    signed kozane_vm_sha256."""
     rc, out = make(d)
-    return rc == 1 and "not on the measured list" in out and not (d / "rel").exists(), out
+    signed = (d / "rel/manifest").read_text().splitlines() if rc == 0 else []
+    want = hashlib.sha256(LAUNCHER).hexdigest()
+    return rc == 0 and f"kozane_vm_sha256={want}" in signed \
+        and (d / "rel/kozane-vm").read_bytes() == LAUNCHER, out
+
+
+def case_make_launcher_seams(d):
+    """M9 plan C4: a launcher built with the test seams is no release."""
+    rc, out = make(d, launcher="kozane-vm-seams")
+    return rc == 1 and "built with test seams" in out and not (d / "rel").exists(), out
+
+
+def case_launcher_changed(d):
+    """A shipped kozane-vm changed after signing is refused, before it runs."""
+    make(d)
+    with open(d / "rel/kozane-vm", "ab") as f:
+        f.write(b"# changed\n")
+    rc, out = verify(d)
+    return rc == 1 and "kozane_vm_sha256: the shipped kozane-vm gives" in out, out
+
+
+def case_verify_launcher_seams(d):
+    """A signed release whose launcher reports SEAMS=1 is refused, though its
+    digest is the signed one."""
+    made = signed_release(d, "0" * 40, launcher=LAUNCHER_SEAMS)
+    rc, out = verify_default(d)
+    return made and rc == 1 and "built with test seams" in out, out
 
 
 def case_existing_out(d):
@@ -160,13 +194,13 @@ def case_sign_fails_leaves_nothing(d):
         (bad / f).write_bytes((d / "keys" / f).read_bytes())
     (bad / "ed25519.key").write_text("00\n")
     rc, out = run(*RELEASE, "make", "--keys", str(bad), "--pkg", str(d / "pkg"), "--out", str(d / "rel"),
-                  "--allow-dirty")
+                  "--kozane-vm", str(d / "kozane-vm"), "--allow-dirty")
     leftovers = [p.name for p in d.iterdir() if p.name.startswith(".rel.")]
     rc2, out2 = make(d)
     return rc == 1 and not leftovers and rc2 == 0 and (d / "rel/manifest.sig").exists(), out + out2
 
 
-def signed_release(d, commit: str, image: bytes = None, seq: str = SEQ) -> bool:
+def signed_release(d, commit: str, image: bytes = None, seq: str = SEQ, launcher: bytes = LAUNCHER) -> bool:
     """A release signed by hand, bypassing `make`'s own refusals, so each of
     verify's checks can be met on its own: OUT is d/rel."""
     rel = d / "rel"
@@ -176,16 +210,19 @@ def signed_release(d, commit: str, image: bytes = None, seq: str = SEQ) -> bool:
     fields = {"version": "m5-dev", "commit": commit, "dev_image": "x",
               "loader_img_sha256": hashlib.sha256(img).hexdigest(),
               "boot_desc_sha256": hashlib.sha256(desc).hexdigest(),
-              "firmware_sha256": hashlib.sha256(fip_fixture.flash()).hexdigest(),
-              "pcrs": ",".join(p.hex() for p in measure.expected_pcrs(fip_fixture.flash(), desc, img)),
-              "cargo_lock_sha256": "x", "release_seq": seq, "verus": "x", "kani": "x"}
+              "firmware_sha256": hashlib.sha256(FIRMWARE).hexdigest(),
+              "pcrs": ",".join(p.hex() for p in measure.expected_pcrs(desc, img)),
+              "cargo_lock_sha256": "x", "release_seq": seq, "verus": "x", "kani": "x",
+              "kozane_vm_sha256": hashlib.sha256(launcher).hexdigest()}
     rc, manifest = run(BIN, "render", *(f"{k}={v}" for k, v in fields.items()))
     (rel / "manifest").write_text(manifest)
     rc2, _ = run(BIN, "sign", "--keys", str(d / "keys"), "--manifest", str(rel / "manifest"),
                  "--out", str(rel / "manifest.sig"))
     (rel / "published.img").write_bytes(img)
     (rel / "boot.desc").write_bytes(desc)
-    (rel / "flash.bin").write_bytes(fip_fixture.flash())
+    (rel / "u-boot.bin").write_bytes(FIRMWARE)
+    (rel / "kozane-vm").write_bytes(launcher)
+    (rel / "kozane-vm").chmod(0o755)
     return rc == 0 and rc2 == 0
 
 
@@ -283,7 +320,8 @@ def case_release_seq_missing(d):
     """A manifest without release_seq does not render, so it cannot be
     signed (the tool's canonical key set)."""
     rc, out = run(BIN, "render", "version=x", "commit=x", "dev_image=x", "loader_img_sha256=x", "boot_desc_sha256=x",
-                  "firmware_sha256=x", "pcrs=x", "cargo_lock_sha256=x", "verus=x", "kani=x")
+                  "firmware_sha256=x", "pcrs=x", "cargo_lock_sha256=x", "verus=x", "kani=x",
+                  "kozane_vm_sha256=x")
     return rc == 1 and "manifest key release_seq is missing" in out, out
 
 
@@ -306,8 +344,11 @@ CASES = [
     ("an edited manifest is refused", case_manifest),
     ("another key's public half refuses the release", case_other_key),
     ("a package whose pcrs disagree with measure.py is refused", case_pkg_pcrs),
-    ("a package whose flash.bin is not the one its pcrs came from is refused", case_pkg_firmware_swapped),
-    ("a package whose FIP has an unmeasured entry is refused", case_pkg_firmware_extra_entry),
+    ("the release ships u-boot.bin under the signed firmware_sha256", case_ships_firmware),
+    ("the release ships kozane-vm under the signed kozane_vm_sha256", case_ships_launcher),
+    ("make refuses a kozane-vm built with test seams", case_make_launcher_seams),
+    ("a kozane-vm changed after signing is refused", case_launcher_changed),
+    ("verify refuses a signed kozane-vm built with test seams", case_verify_launcher_seams),
     ("an existing OUT is refused", case_existing_out),
     ("release keys inside the repo are refused", case_keys_in_repo),
     ("a failed signing leaves no OUT and no staging, and the retry succeeds", case_sign_fails_leaves_nothing),

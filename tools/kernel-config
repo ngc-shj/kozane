@@ -1,0 +1,40 @@
+#!/usr/bin/env python3
+"""The kernel configuration Kozane runs on (M9 plan C1; L11): checks one
+gen_config.h and names every requirement it misses.
+
+Usage: tools/kernel-config <gen_config.h>
+"""
+
+import re
+import sys
+
+# (label, the line gen_config.h must hold)
+REQUIRED = (
+    ("single core", "#define CONFIG_MAX_NUM_NODES  1"),
+    ("MCS", "#define CONFIG_KERNEL_MCS  1"),
+    ("EL1: no hypervisor support", "/* disabled: CONFIG_ARM_HYPERVISOR_SUPPORT */"),
+    ("GIC_V3", "#define CONFIG_ARM_GIC_V3_SUPPORT  1"),
+    ("SMC calls", "#define CONFIG_ALLOW_SMC_CALLS  1"),
+    ("physical timer exported", "#define CONFIG_EXPORT_PTMR_USER  1"),
+    ("physical counter exported", "#define CONFIG_EXPORT_PCNT_USER  1"),
+)
+
+
+def missing(text: str) -> list:
+    lines = set(re.sub(r"[ \t]+$", "", line) for line in text.splitlines())
+    return [label for label, line in REQUIRED if line not in lines]
+
+
+def main(argv: list) -> int:
+    if len(argv) != 2:
+        print(__doc__, file=sys.stderr)
+        return 2
+    with open(argv[1]) as f:
+        absent = missing(f.read())
+    for label in absent:
+        print(f"kernel-config: {label} missing in {argv[1]}")
+    return 1 if absent else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

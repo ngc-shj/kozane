@@ -91,10 +91,8 @@ TLS_END = TLS_AT + len(TLS_BLOB)
 AUDIT_AT = TLS_END + len(PAD)
 AUDIT_END = AUDIT_AT + len(AUDIT_BLOB)
 PLACEHOLDER_IMG = b"\x7fELF" + PAD + bytes(4096) + PAD + bytes(16384) + PAD + bytes(4096) + PAD + bytes(4096) + PAD
-# The firmware the PCRs are computed from (M7 plan C4): a minimal FIP.
-sys.path.insert(0, str(ROOT / "tests/tools"))
-import fip_fixture  # noqa: E402
-FLASH = fip_fixture.flash()
+# The firmware the package ships (M9 plan C2): U-Boot stand-in bytes.
+FIRMWARE = b"u-boot stand-in " * 64
 PACKAGE_IMG = b"\x7fELF" + PAD + BLOB + PAD + PQ_BLOB + PAD + TLS_BLOB + PAD + AUDIT_BLOB + PAD
 SPANS = f"{KEY_AT:#x}..{KEY_AT + len(BLOB):#x}, {PQ_AT:#x}..{PQ_END:#x}, {TLS_AT:#x}..{TLS_END:#x}, " \
     f"{AUDIT_AT:#x}..{AUDIT_END:#x}"
@@ -688,7 +686,7 @@ def _build_case(variant):
         (d / "slot.bin").write_bytes(bytes(SLOT))
         (d / "system.xml").write_text(SYSTEM.replace("slot-placeholder.bin", str(d / "slot.bin")))
         (d / "placeholder.img").write_bytes(BUILD_IMG)
-        (d / "flash.bin").write_bytes(FLASH)
+        (d / "u-boot.bin").write_bytes(FIRMWARE)
         staging = d / "staging"
         staging.mkdir()
 
@@ -740,7 +738,7 @@ def _build_case(variant):
 
         class A:
             system, image, firmware, policy, search_path, board, config, microkit, gateway_config, policy_bin = (
-                str(d / "system.xml"), str(d / "placeholder.img"), str(d / "flash.bin"), "p", "s", "b", "c",
+                str(d / "system.xml"), str(d / "placeholder.img"), str(d / "u-boot.bin"), "p", "s", "b", "c",
                 "microkit", "gw/gateway.toml", "policy")
 
         captured = io.StringIO()
@@ -767,7 +765,7 @@ def _build_case(variant):
         if desc and pkg.measure.parse(desc)[1] != [(KEY_AT, len(BLOB)), (PQ_AT, len(PQ_BLOB)), (TLS_AT, len(TLS_BLOB)),
                                                    (AUDIT_AT, len(AUDIT_BLOB)), (SLOT_A_AT, SLOT), (SLOT_B_AT, SLOT)]:
             errors.append(f"descriptor ranges {pkg.measure.parse(desc)[1]}")
-        want_pcrs = pkg.measure.expected_pcrs(FLASH, desc, BUILD_IMG) if desc else []
+        want_pcrs = pkg.measure.expected_pcrs(desc, BUILD_IMG) if desc else []
         for mr in pkg.SECRETS_MRS:
             path, data, srk, pcrs = sealed.get(mr, ("", b"", b"", ""))
             if not path.startswith(str(staging)) or data != BLOBS[mr]:
@@ -780,9 +778,9 @@ def _build_case(variant):
             errors.append(f"OUT holds {sorted(p.name for p in staging.iterdir())}")
         if (staging / "pcrs").exists() and desc and \
                 (staging / "pcrs").read_text() != "".join(p.hex() + "\n" for p in want_pcrs):
-            errors.append("pcrs are not the firmware's, the descriptor's and the published image's")
-        if (staging / "flash.bin").exists() and (staging / "flash.bin").read_bytes() != FLASH:
-            errors.append("flash.bin is not the firmware the PCRs came from")
+            errors.append("pcrs are not the descriptor's and the published image's")
+        if (staging / "u-boot.bin").exists() and (staging / "u-boot.bin").read_bytes() != FIRMWARE:
+            errors.append("u-boot.bin is not the --firmware given")
         if (staging / "published.img").exists() and (staging / "published.img").read_bytes() != BUILD_IMG:
             errors.append("published.img is not the published image")
         return errors

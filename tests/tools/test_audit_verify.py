@@ -160,6 +160,18 @@ def cases(run: Run) -> list:
     case("allow: --events marks the lines after the last checkpoint unverified", run.verify(capture(rejected), events=True), 0,
          "event boot=0 seq=4 verified=no: audit: src=ingress ArpReplied total=1 lost=0")
 
+    # M9 plan C3: audit's heartbeat is a chained line like any other, so a
+    # checkpoint after it signs it and an edited count breaks the chain.
+    beating = ready_boot(k, boot_id(1), RESET_AT_PROVISION + 1, tail=0)
+    beating.line("audit: Heartbeat ticks=60")
+    beating.checkpoint()
+    case("allow: --events prints a heartbeat, verified", run.verify(capture(beating), events=True), 0,
+         "event boot=0 seq=13 verified=yes: audit: Heartbeat ticks=60")
+    stalled = list(beating.lines)
+    stalled[13] = stalled[13].replace(b"ticks=60", b"ticks=120")
+    case("deny: an edited heartbeat (ticks changed)", run.verify(capture(stalled)), 1,
+         "checkpoint seq=14: the chain does not match the lines before it (a line edited)")
+
     case("allow: a capture cut mid-line skips its unterminated last line",
          run.verify(clean + b"audit: src=ingress ArpReplied total=4 lost=0 seq=1"), 0,
          "note: the capture's unterminated last line was skipped")

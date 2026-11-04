@@ -27,3 +27,8 @@ sha3 = { version = "=0.10.9", default-features = false }
 [dev-dependencies]
 # The ingress PD's cookie adapter is tested here by path (M3b plan C3).
 ingress-core = { path = "../ingress-core" }
+# The initiator's fuzz target after a deterministic prefix (M9 plan C7).
+bolero = "=0.13.4"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

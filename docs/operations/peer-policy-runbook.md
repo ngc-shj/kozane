@@ -124,7 +124,7 @@ be re-made after every provisioning.
    node is checked with `--from-provisioning` (below).
 
 Under QEMU the node is booted with
-`make run PKG=<package> TPM_STATE=<swtpm state> SLOT_A=<slot A> SLOT_B=<slot B>`.
+`make run PKG=<package> TPM_STATE=<swtpm state> TPM_KEY=<its key file> SLOT_A=<slot A> SLOT_B=<slot B>`.
 
 ## Issuing a policy change
 

@@ -1,0 +1,24 @@
+[package]
+name = "kozane-client-ffi"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[features]
+# A panic in `kz_client_on_timer` at `now == UINT64_MAX`, which proves
+# catch_unwind returns KZ_ERR_INTERNAL. Never in a shipped build.
+test-panic = []
+
+[dependencies]
+kozane-client = { path = "../client" }
+
+[dev-dependencies]
+getrandom = { version = "=0.4.3", default-features = false }
+mce460896 = { path = "../../../crates/mce460896" }
+rosenpass-core = { path = "../../../crates/rosenpass-core" }
+rosenpass-wire = { path = "../../../crates/rosenpass-wire" }
+secret-blob = { path = "../../../crates/secret-blob" }

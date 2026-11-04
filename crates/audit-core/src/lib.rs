@@ -1,5 +1,6 @@
 //! `audit`'s export logic (M8 plan C10, D7), host-testable and used only by
-//! `pds/audit`: the line chain and the checkpoint schedule.
+//! `pds/audit`: the line chain, the checkpoint schedule and (M9 plan C3)
+//! the heartbeat.
 //!
 //! **The chain.** Every printed line ends in the trailer ` seq=<n>` before
 //! its CRLF, `n` counting the boot's lines from 0. `audit` keeps
@@ -33,7 +34,7 @@
 )]
 
 use auditkey_core::{CHAIN_LEN, Reply, Request};
-use layout::audit::{CH_AUDITKEY, CHECKPOINT_EVERY};
+use layout::audit::{CH_AUDITKEY, CHECKPOINT_EVERY, HEARTBEAT_S};
 use layout::auditkey::{OK, REFUSED, SIGN_REPLY_LEN, SIGN_REPLY_WORDS, SIGN_REQ_WORDS};
 use libcrux_sha2::{Digest, Sha256};
 
@@ -287,6 +288,28 @@ impl Checkpoints {
             Some(r) => Outcome::Signed(r),
             None => Outcome::Unsigned(REASON_BAD_REPLY),
         }
+    }
+}
+
+/// The heartbeat (M9 plan C3): `timer`'s ticks on `layout::audit::CH_TIMER`,
+/// counted. Every `HEARTBEAT_S`-th tick a `Heartbeat ticks=<n>` line is
+/// due, `n` the ticks handled so far. Notifications that arrive while
+/// `audit` is not scheduled coalesce into one, so `n` can only undercount
+/// the seconds elapsed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Heartbeat {
+    ticks: u64,
+}
+
+impl Heartbeat {
+    pub const fn new() -> Self {
+        Self { ticks: 0 }
+    }
+
+    /// One notification on the timer channel: the count, when a line is due.
+    pub fn tick(&mut self) -> Option<u64> {
+        self.ticks = self.ticks.saturating_add(1);
+        self.ticks.is_multiple_of(HEARTBEAT_S).then_some(self.ticks)
     }
 }
 

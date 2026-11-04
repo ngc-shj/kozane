@@ -88,7 +88,7 @@ fn every_region_is_a_link_an_audit_ring_or_a_named_singleton() {
         .flat_map(|l| ["used", "free", "data"].map(|s| std::format!("{l}_{s}")))
         .chain(AUDITS.iter().map(|a| String::from(*a)))
         .chain(
-            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "timer_mmio", "uart_mmio", "tpm_mmio", "rng_mmio", "rng_dma", "supervisor_record", "secrets", "pq_secrets", "tls_secrets", "audit_secrets", "policy_a", "policy_b", "audit_policy"]
+            ["eth_out_mmio", "eth_out_dma", "eth_in_mmio", "eth_in_dma", "uart_mmio", "tpm_mmio", "rng_mmio", "rng_dma", "supervisor_record", "secrets", "pq_secrets", "tls_secrets", "audit_secrets", "policy_a", "policy_b", "audit_policy"]
                 .map(String::from),
         )
         .collect();
@@ -277,6 +277,7 @@ fn channel_ids_match_layout() {
         (("ingress", ingress::CH_TLS), ("tls", tls::CH_INGRESS)),
         (("tls", tls::CH_INNER), ("inner", inner::CH_TLS)),
         (("timer", timer::CH_TLS), ("tls", tls::CH_TIMER)),
+        (("timer", timer::CH_AUDIT), ("audit", audit::CH_TIMER)),
         (("tls", tls::CH_TLSKEY), ("tlskey", tlskey::CH_TLS)),
         (("tlskey", tlskey::CH_TPM), ("tpm", tpm::CH_TLSKEY)),
         (("tls", tls::CH_AUDIT), ("audit", audit::CH_TLS)),

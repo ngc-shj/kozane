@@ -1,0 +1,6 @@
+# The client ships to Linux hosts on a stable toolchain (M9 plan D12); the
+# gateway's nightly pin (../rust-toolchain.toml) is for rust-sel4 only.
+[toolchain]
+channel = "1.97.1"
+profile = "minimal"
+components = ["rustfmt", "clippy"]

@@ -17,10 +17,10 @@ PCR 9 is extended with sha256(slot A), then sha256(slot B), each over the
 full BUNDLE_MAX at its load address (M8 plan D3); it is measured, not
 sealed to.
 
-PCR 0 is TF-A's (M7 plan C3, C4): BL1 extends it with sha256(BL2), then BL2
-with sha256(BL31) and sha256(BL33), each the FIP entry's bytes, before each
-runs. That is the closed list: a FIP holding any other entry is refused.
-PCRs 1-7 stay at zero. The seal policy names PCRs 0-8.
+Nothing runs before U-Boot (M9 plan D1, C2: no TF-A), so nothing extends
+PCRs 0-7: they stay at zero, and the seal policy names PCRs 0-8 with 0-7 at
+zero. That guards the firmware the operator runs; it does not measure it
+(RM9-1).
 
 The NV anti-rollback indices (M8 plan C3) have twins here too: the delete
 policy their authPolicy holds and the Names the `tpm` PD compares.
@@ -73,20 +73,6 @@ PCR_ZERO = bytes(32)
 # (M8 plan D3, C4).
 POLICY_PCRS = 9
 SLOT_PCR = 9
-
-# flash.bin (tools/flash-image): the FIP at the qemu platform's FIP offset.
-FIP_OFFSET = 0x40000
-FIP_TOC_NAME = 0xAA640001
-FIP_HEADER = struct.Struct("<IIQ")
-FIP_ENTRY = struct.Struct("<16sQQQ")
-# The closed list, in the order TF-A measures it (TF-A's
-# include/tools_share/firmware_image_package.h, uuid_t's bytes in order).
-FIP_MEASURED = (
-    ("BL2", bytes.fromhex("5ff9ec0b4d223e4da544c39d81c73f0a")),
-    ("BL31", bytes.fromhex("47d4086d4cfe98469b952950cbbd5a00")),
-    ("BL33", bytes.fromhex("d6d0eea7fcead54b97829934f234b6e4")),
-)
-
 
 class DescriptorError(ValueError):
     pass
@@ -187,47 +173,9 @@ def expected_pcr9(slot_a: bytes, slot_b: bytes) -> bytes:
     return extend(extend(PCR_ZERO, hashlib.sha256(slot_a).digest()), hashlib.sha256(slot_b).digest())
 
 
-def fip_images(flash: bytes) -> list:
-    """[(name, bytes)] of the FIP in `flash`, in FIP_MEASURED's order,
-    refusing a bad header, an entry outside the closed list, a duplicate,
-    one that leaves the FIP, or a missing one."""
-    fip = flash[FIP_OFFSET:]
-    if len(fip) < FIP_HEADER.size or FIP_HEADER.unpack_from(fip)[0] != FIP_TOC_NAME:
-        raise DescriptorError("measure: no FIP at the flash's FIP offset")
-    names = {uuid: name for name, uuid in FIP_MEASURED}
-    found = {}
-    at = FIP_HEADER.size
-    while True:
-        if at + FIP_ENTRY.size > len(fip):
-            raise DescriptorError("measure: the FIP's table of contents runs off its end")
-        uuid, offset, size, _ = FIP_ENTRY.unpack_from(fip, at)
-        at += FIP_ENTRY.size
-        if uuid == bytes(16):
-            break
-        name = names.get(uuid)
-        if name is None:
-            raise DescriptorError(f"measure: FIP entry {uuid.hex()} is not on the measured list")
-        if name in found:
-            raise DescriptorError(f"measure: FIP entry {name} appears twice")
-        if size == 0 or offset > len(fip) or size > len(fip) - offset:
-            raise DescriptorError(f"measure: FIP entry {name} ({offset:#x}, {size:#x}) leaves the FIP")
-        found[name] = fip[offset:offset + size]
-    missing = [name for name, _ in FIP_MEASURED if name not in found]
-    if missing:
-        raise DescriptorError(f"measure: the FIP has no {', '.join(missing)}")
-    return [(name, found[name]) for name, _ in FIP_MEASURED]
-
-
-def expected_pcr0(flash: bytes) -> bytes:
-    pcr = PCR_ZERO
-    for _, image in fip_images(flash):
-        pcr = extend(pcr, hashlib.sha256(image).digest())
-    return pcr
-
-
-def expected_pcrs(flash: bytes, desc: bytes, image: bytes) -> list:
-    """PCRs 0-8 after the shipped boot of `flash`, before the cap."""
-    return [expected_pcr0(flash)] + [PCR_ZERO] * 7 + [expected_pcr8(desc, image)]
+def expected_pcrs(desc: bytes, image: bytes) -> list:
+    """PCRs 0-8 after the shipped boot, before the cap."""
+    return [PCR_ZERO] * 8 + [expected_pcr8(desc, image)]
 
 
 def assemble(image: bytes, desc: bytes, contents: list) -> bytes:
