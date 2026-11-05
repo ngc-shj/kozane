@@ -6,6 +6,9 @@ Usage: python3 tests/tools/test_check_manifest.py
 Prints "CHECK-MANIFEST-FIXTURES <n>" and exits non-zero on any mismatch.
 """
 
+import importlib.machinery
+import importlib.util
+import os
 import pathlib
 import subprocess
 import sys
@@ -57,6 +60,47 @@ COMPARE_CASES = [
 ]
 
 
+def load_tool():
+    loader = importlib.machinery.SourceFileLoader("check_manifest", str(TOOL))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module
+
+
+def digest_cases() -> list:
+    """IMAGE over a tree (D-27): the same bytes are one image whatever
+    their mtimes; other bytes, even of the same size, another path or a
+    symlink's other target are another image."""
+    tool = load_tool()
+    results = []
+    with tempfile.TemporaryDirectory() as d:
+        d = pathlib.Path(d)
+        db = d / "status"
+        db.write_text("Package: x\n")
+        tree = d / "opt"
+        (tree / "a").mkdir(parents=True)
+        f = tree / "a/file"
+        f.write_text("bytes")
+        (tree / "a/link").symlink_to("file")
+
+        def digest() -> str:
+            return tool.tree_digest(str(db), [str(tree)])
+
+        first = digest()
+        os.utime(f, ns=(1_793_687_763_208_809_344, 1_793_687_763_208_809_344))
+        results.append(("the same bytes with another mtime are the same image", digest() == first))
+        f.write_text("bytez")
+        results.append(("other bytes of the same size are another image", digest() != first))
+        f.write_text("bytes")
+        f.rename(tree / "a/other")
+        results.append(("another path is another image", digest() != first))
+        (tree / "a/other").rename(f)
+        (tree / "a/link").unlink()
+        (tree / "a/link").symlink_to("other")
+        results.append(("a symlink to another target is another image", digest() != first))
+    return results
+
+
 def run(*args) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, str(TOOL), *map(str, args)], capture_output=True, text=True)
 
@@ -101,7 +145,11 @@ def main() -> int:
         ok = r.returncode == 0 and not r.stdout if want is None else r.returncode == 1 and want in r.stdout
         failures += not ok
         print(f"{'ok  ' if ok else 'FAIL'} {name}: exit={r.returncode} {r.stdout.strip()!r}")
-    print(f"CHECK-MANIFEST-FIXTURES {len(CASES) + len(IDENTITY_CASES) + len(COMPARE_CASES)}")
+    digests = digest_cases()
+    for name, ok in digests:
+        failures += not ok
+        print(f"{'ok  ' if ok else 'FAIL'} {name}")
+    print(f"CHECK-MANIFEST-FIXTURES {len(CASES) + len(IDENTITY_CASES) + len(COMPARE_CASES) + len(digests)}")
     return 1 if failures else 0
 
 

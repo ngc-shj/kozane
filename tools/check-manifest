@@ -22,10 +22,10 @@ two different values of one; the same value written twice is one record.
 final check that they ran on one image.
 
 The image has no name for itself inside the container, so IMAGE is a digest
-of what identifies one build of it: the package database, and the path, size
-and mtime of every file under the image's own trees (/opt and the SDK). A
-layer keeps its files' mtimes through `docker save | load`, so two hosts on
-one image agree, and a rebuilt image differs.
+of its toolchain's contents: the package database, and the path and bytes of
+every file under the image's own trees (/opt and the SDK), a symlink by its
+target. Two hosts agree exactly when they run the same tools, whatever their
+filesystems keep of mtimes (M9 deviation D-27); 1.1 GB, about 1.5 s.
 """
 
 import hashlib
@@ -41,19 +41,27 @@ PACKAGE_DB = "/var/lib/dpkg/status"
 
 
 def image_digest() -> str:
-    h = hashlib.sha256()
-    with open(PACKAGE_DB, "rb") as f:
-        h.update(f.read())
     trees = list(IMAGE_TREES)
     if os.environ.get("MICROKIT_SDK"):
         trees.append(os.environ["MICROKIT_SDK"])
+    return tree_digest(PACKAGE_DB, trees)
+
+
+def tree_digest(package_db: str, trees: list) -> str:
+    h = hashlib.sha256()
+    with open(package_db, "rb") as f:
+        h.update(f.read())
     for tree in sorted(set(trees)):
         for top, dirs, files in os.walk(tree):
             dirs.sort()
             for name in sorted(files):
                 p = os.path.join(top, name)
-                st = os.lstat(p)
-                h.update(f"{p}\0{st.st_size}\0{st.st_mtime_ns}\n".encode())
+                if os.path.islink(p):
+                    body = "link:" + os.readlink(p)
+                else:
+                    with open(p, "rb") as f:
+                        body = hashlib.file_digest(f, "sha256").hexdigest()
+                h.update(f"{p}\0{body}\n".encode())
     return h.hexdigest()
 
 

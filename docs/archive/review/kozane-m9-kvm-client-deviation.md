@@ -1187,3 +1187,43 @@ fault in the gateway.
     entry) went red for its own needle on the EL1 board. So no other
     mutation was silently disarmed. The final verdict is the self-test at
     the closing commit.
+
+### D-27 — IMAGE compared mtimes, not the toolchain's contents
+
+- **Seen as** the split self-test merge at 0212d1e.
+  - Every one of the 312 cases passed on gx10 and z1mn.
+  - The merge still refused, with `mixed images`: z1mn's qemu and solver
+    instances recorded another IMAGE than gx10's. QEMU's build ID was the
+    same on both.
+- **What IMAGE is for.**
+  - The milestone's verdict joins `make check`, test-kvm, test-kzc and
+    the self-test partitions of two hosts. IMAGE shows that they all ran
+    on one toolchain: rustc, Kani, Verus, the SDK and QEMU.
+  - z1mn gets its image by a manual `docker save | load`, so a stale image
+    on a worker is a real risk.
+- **The two images were one.**
+  - Same `RootFS.Layers` and the same creation time.
+  - The 6,874 files have the same paths and sizes, and `dpkg` status is
+    the same.
+  - Only the mtimes differed. Docker Desktop's snapshotter on macOS keeps
+    whole seconds, while gx10's Linux one keeps nanoseconds.
+- **The fault.** IMAGE hashed each file's path, size and mtime, as a stand-in
+  for its contents. It assumed that `docker save | load` keeps mtimes
+  exactly, which the snapshotter does not.
+- **The fix, after the owner's review.**
+  - A first fix counted mtimes in whole seconds. The owner asked what
+    such a check proves, and the answer was nothing direct: an mtime is a
+    proxy.
+  - `tree_digest` now hashes contents instead: the package database, and
+    each file's path with the SHA-256 of its bytes (a symlink, with its
+    target).
+    - Two hosts agree exactly when they run the same tool bytes.
+    - It covers 1.1 GB and takes 0.6–1.0 s.
+  - On the live containers the digest is the same on both hosts
+    (`4ea251e6…`).
+- **The tests: four digest fixtures** (CHECK-MANIFEST-FIXTURES 24).
+  - The same bytes with another mtime: one image. On a scratch copy, the
+    old mtime digest fails this one.
+  - Other bytes of the same size: another image.
+  - Another path: another image.
+  - A symlink to another target: another image.
