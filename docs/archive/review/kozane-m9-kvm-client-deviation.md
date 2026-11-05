@@ -1215,15 +1215,24 @@ fault in the gateway.
     such a check proves, and the answer was nothing direct: an mtime is a
     proxy.
   - `tree_digest` now hashes contents instead: the package database, and
-    each file's path with the SHA-256 of its bytes (a symlink, with its
-    target).
+    each file's path with the SHA-256 of its bytes. A symlink is hashed
+    by its target.
+  - Directory symlinks are included too, which a second review asked for.
+    `os.walk` lists a symlink to a directory under `dirs` and does not
+    enter it, so the first content digest skipped such links: switching
+    `current -> v1` to `current -> v2` kept the digest. Links are now
+    taken from both lists. The image has no directory symlinks today, so
+    the value did not change.
     - Two hosts agree exactly when they run the same tool bytes.
     - It covers 1.1 GB and takes 0.6–1.0 s.
   - On the live containers the digest is the same on both hosts
     (`4ea251e6…`).
-- **The tests: four digest fixtures** (CHECK-MANIFEST-FIXTURES 24).
+- **The tests: five digest fixtures.**
   - The same bytes with another mtime: one image. On a scratch copy, the
     old mtime digest fails this one.
   - Other bytes of the same size: another image.
   - Another path: another image.
   - A symlink to another target: another image.
+  - A directory symlink to another target: another image. HEAD's digest
+    fails this one.
+  - CHECK-MANIFEST-FIXTURES 25.

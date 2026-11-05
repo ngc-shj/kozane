@@ -70,7 +70,7 @@ def load_tool():
 def digest_cases() -> list:
     """IMAGE over a tree (D-27): the same bytes are one image whatever
     their mtimes; other bytes, even of the same size, another path or a
-    symlink's other target are another image."""
+    symlink's other target, to a file or a directory, are another image."""
     tool = load_tool()
     results = []
     with tempfile.TemporaryDirectory() as d:
@@ -98,6 +98,15 @@ def digest_cases() -> list:
         (tree / "a/link").unlink()
         (tree / "a/link").symlink_to("other")
         results.append(("a symlink to another target is another image", digest() != first))
+        (tree / "a/link").unlink()
+        (tree / "a/link").symlink_to("file")
+        (tree / "v1").mkdir()
+        (tree / "v2").mkdir()
+        (tree / "current").symlink_to("v1")
+        before = digest()
+        (tree / "current").unlink()
+        (tree / "current").symlink_to("v2")
+        results.append(("a directory symlink to another target is another image", digest() != before))
     return results
 
 
