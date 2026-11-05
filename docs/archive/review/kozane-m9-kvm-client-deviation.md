@@ -1110,3 +1110,80 @@ fault in the gateway.
 - **The commit that closed this.** The self-test ran on the commit that
   corrected these comments and docs. Its `make check` counts are those of
   93d2d07, whose code is the same.
+
+### D-26 — kzc and kzc-psk could lose a stop signal
+
+- **Seen as** the split self-test's `ffi-header` failure at b342ce4.
+  - The mutated header was never compared. Before the comparison,
+    `make client`'s real-kernel netns test failed with
+    `process … did not exit`.
+  - The process was the restarted `kzc`, sent SIGINT with 20 s to exit,
+    under the partition's parallel load.
+- **The cause.** Every loop in `kzc` and `kzc-psk` checks the handler's
+  flag (`sys::terminated()`) and then calls `poll`.
+  - A signal that lands between the two sets the flag, but `poll` has not
+    started, so nothing interrupts it.
+  - The poll then sleeps to its timeout. That is the next Rosenpass
+    deadline for `kzc`, and forever (`-1`) for `kzc-psk`.
+  - A stop request is therefore lost until systemd's SIGKILL. For
+    `kzc-psk` that is the case the client guide warns about: the
+    interface is left with its last PSK, because `Device`'s drop never
+    runs.
+- **The fix: a self-pipe in `sys`.**
+  - `install_signal_handlers` creates a non-blocking, close-on-exec pipe.
+  - The handler sets the flag and writes one byte to the pipe. It saves
+    and restores errno around that write.
+  - `sys::poll` always waits on the pipe as well, and returns `None` once
+    the pipe is readable. The pipe is never drained, so every later poll
+    returns at once too.
+  - `sleep_ms` is a poll on the pipe alone.
+  - No loop changed; they all reach `poll` through `sys`.
+- **The test.** `tests/signal.rs` is its own binary, since the handlers
+  are process-wide.
+  - It raises SIGTERM before `poll` and requires `None` within 1 s from a
+    5 s poll.
+  - With the old `sys.rs` it slept the full 5 s, and failed with
+    `poll: the signal was lost`.
+  - UNIT-CLIENT 89.
+- **The same patterns elsewhere (swept after the fix).**
+  - **A stop flag checked before a blocking wait.**
+    - `kozane-vm` blocks its signals and reads them through a signalfd in
+      the same `poll` as its children, so it cannot lose one.
+    - `mksecrets` only blocks signals around its critical sections; it
+      waits on nothing.
+    - In `kzc` and `kzc-psk`, no other loop checks `terminated()` and then
+      blocks. Their loops reach `poll` through `sys::poll` or
+      `sys::sleep_ms`, both fixed here.
+    - Not every wait goes through them. `netlink::Socket::call` waits for
+      the kernel's reply in `sys::netlink_recv`, a blocking `recvfrom`, and
+      the self-pipe does not wake that.
+      - That wait checks no flag, so it has no window to lose a signal in.
+      - A signal during it still sets the flag, and the next loop check
+        acts on it once the reply arrives. So with a kernel that answers,
+        a stop during setup or a scrub is not lost.
+      - Nothing here guarantees that the self-pipe ends a netlink wait
+        itself.
+  - **Netlink steps that one request could hold.**
+    - `kzc-psk` creates the link and then marks it in a second request,
+      because the kernel ignores `IFLA_IFALIAS` in a creating
+      `RTM_NEWLINK`.
+    - A non-graceful end between the two leaves an unmarked `kz0`, which
+      the next start refuses to touch.
+      - That covers any end that skips `Device`'s drop: SIGKILL, an OOM
+        kill, SIGABRT, SIGSEGV or power loss.
+      - It is fail-closed, but it needs `ip link del kz0` by hand.
+      - A SIGTERM stop is not lost, so the drop runs and the link is
+        reclaimed.
+    - This is a residual, since nothing in the kernel API closes it.
+    - Every later configuration step runs on a marked link, and `Device`
+      deletes the link on any error.
+    - `kozane-vm`'s taps are not persistent, so they vanish with its
+      descriptors, even on SIGKILL.
+  - **Fault replies.** The supervisor is the only PD with a fault handler,
+    and it never answers a fault, so D-25's label rule has no production
+    reader.
+  - **Mutations a platform change could disarm.** In the split self-test
+    at b342ce4 (gx10 and z1mn), every case except `ffi-header` (this
+    entry) went red for its own needle on the EL1 board. So no other
+    mutation was silently disarmed. The final verdict is the self-test at
+    the closing commit.

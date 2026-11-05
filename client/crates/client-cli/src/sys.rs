@@ -10,7 +10,7 @@ use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 
 fn cstr(s: &OsStr) -> io::Result<CString> {
     CString::new(s.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
@@ -139,14 +139,41 @@ pub fn boottime_ns() -> io::Result<u64> {
 }
 
 static TERMINATED: AtomicBool = AtomicBool::new(false);
+/// The self-pipe: the handler writes to `WAKE_W`, and every `poll` also
+/// waits on `WAKE_R`. A flag alone loses a signal that lands between a
+/// loop's `terminated()` check and its `poll`, which then sleeps to its
+/// timeout, or forever.
+static WAKE_R: AtomicI32 = AtomicI32::new(-1);
+static WAKE_W: AtomicI32 = AtomicI32::new(-1);
 
 extern "C" fn on_term(_: libc::c_int) {
+    // SAFETY: errno is this thread's; it is put back for the code the
+    // signal interrupted.
+    let errno = unsafe { *libc::__errno_location() };
     TERMINATED.store(true, Ordering::SeqCst);
+    let fd = WAKE_W.load(Ordering::SeqCst);
+    if fd >= 0 {
+        let b = 1u8;
+        // SAFETY: write(2) is async-signal-safe; the pipe is non-blocking,
+        // and a full one already wakes every poll.
+        unsafe { libc::write(fd, (&raw const b).cast(), 1) };
+    }
+    // SAFETY: as above.
+    unsafe { *libc::__errno_location() = errno };
 }
 
-/// SIGINT, SIGTERM and SIGHUP set a flag and interrupt blocking calls (no
-/// SA_RESTART); SIGPIPE is ignored, so a closed peer is an error return.
+/// SIGINT, SIGTERM and SIGHUP set a flag, wake every `poll` through the
+/// self-pipe (including one entered after the signal), and interrupt
+/// blocking calls (no SA_RESTART); SIGPIPE is ignored, so a closed peer is
+/// an error return.
 pub fn install_signal_handlers() -> io::Result<()> {
+    let mut ends = [-1; 2];
+    // SAFETY: `ends` has room for the two descriptors pipe2 writes.
+    check(unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) })?;
+    let [r, w] = ends;
+    // Held for the process's life; never closed.
+    WAKE_R.store(r, Ordering::SeqCst);
+    WAKE_W.store(w, Ordering::SeqCst);
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         // SAFETY: an all-zero `sigaction` is valid; the handler only stores
         // to an atomic, which is async-signal-safe.
@@ -168,11 +195,13 @@ pub fn terminated() -> bool {
     TERMINATED.load(Ordering::SeqCst)
 }
 
-/// poll(2) over `fds` (fd, events); returns each fd's revents, or `None`
-/// when a signal interrupted it.
+/// poll(2) over `fds` (fd, events) and the self-pipe; returns each fd's
+/// revents, or `None` when a signal arrived, before the call or during it.
 pub fn poll(fds: &[(BorrowedFd<'_>, i16)], timeout_ms: i32) -> io::Result<Option<Vec<i16>>> {
     let mut p: Vec<libc::pollfd> =
         fds.iter().map(|(fd, ev)| libc::pollfd { fd: fd.as_raw_fd(), events: *ev, revents: 0 }).collect();
+    // A negative fd (no handlers installed) is ignored by poll(2).
+    p.push(libc::pollfd { fd: WAKE_R.load(Ordering::SeqCst), events: libc::POLLIN, revents: 0 });
     let n = libc::nfds_t::try_from(p.len()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
     // SAFETY: `p` holds `n` valid pollfd entries.
     let ret = unsafe { libc::poll(p.as_mut_ptr(), n, timeout_ms) };
@@ -180,13 +209,16 @@ pub fn poll(fds: &[(BorrowedFd<'_>, i16)], timeout_ms: i32) -> io::Result<Option
         let e = io::Error::last_os_error();
         return if e.kind() == io::ErrorKind::Interrupted { Ok(None) } else { Err(e) };
     }
+    // The pipe is never drained: once a signal came, every poll returns.
+    if p.pop().is_some_and(|w| w.revents != 0) {
+        return Ok(None);
+    }
     Ok(Some(p.iter().map(|x| x.revents).collect()))
 }
 
-/// Sleeps `ms`, or less when a signal arrives.
+/// Sleeps `ms`, or less when a signal arrives (before the call or during).
 pub fn sleep_ms(ms: i32) {
-    // SAFETY: poll with no fds only sleeps.
-    unsafe { libc::poll(std::ptr::null_mut(), 0, ms) };
+    let _ = poll(&[], ms);
 }
 
 fn sockaddr_un(path: &[u8]) -> io::Result<(libc::sockaddr_un, libc::socklen_t)> {
