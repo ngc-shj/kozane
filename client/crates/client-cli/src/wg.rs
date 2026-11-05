@@ -122,8 +122,11 @@ pub fn set_psk(fam: u16, index: u32, public: &[u8; 32], psk: &[u8; 32]) -> Msg {
 /// Replaces the peer with a fresh one holding `psk`, in one request: the
 /// first entry removes it, and every live keypair with it (S1.11); the
 /// second, the same key, creates it again. The kernel applies a request's
-/// peers in order under the device's lock, so no reader sees the interface
-/// without its peer, and no failure leaves it peerless.
+/// peers in order under the device's update lock, which netlink readers
+/// also take, so none sees the interface between the two. It is not a
+/// transaction: an error in the second entry leaves the removal in place.
+/// The caller treats any error as fatal, and `kzc-psk` then deletes the
+/// interface and exits.
 pub fn replace_peer(fam: u16, index: u32, peer: &Peer<'_>, psk: &[u8; 32]) -> Msg {
     let mut m = genl(fam, WG_CMD_SET_DEVICE, WG_GENL_VERSION);
     m.u32(WGDEVICE_A_IFINDEX, index).nest(WGDEVICE_A_PEERS).nest(0);

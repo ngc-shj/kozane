@@ -27,7 +27,9 @@ Two rules hold from first start:
 - The peer never exists without a PSK. At start it gets a random one.
 - When no exchange has succeeded for 180 seconds (the gateway's L8 window),
   `kzc-psk` replaces the peer with a fresh one holding a random PSK, in
-  one kernel request, so the interface is never without its peer. That ends
+  one kernel request, so no reader of the interface's configuration sees
+  it without its peer. If the request fails, `kzc-psk` deletes the
+  interface and exits, and systemd restarts it. That ends
   any live WireGuard session, so traffic stops instead of running on a
   stale key.
 

@@ -1058,8 +1058,7 @@ fault in the gateway.
     - Between the two, the interface had no peer. The harness's
       `wg show` landed in that window under the partition's parallel load.
     - A failed re-add would also have left the interface without a peer
-      until a restart. That fails closed, but the state is not one the
-      design names.
+      until a restart. That fails closed.
   - The fix: `wg::replace_peer` sends one `WG_CMD_SET_DEVICE` with two
     peer entries.
     - The first is the key with `WGPEER_F_REMOVE_ME`; the removal takes
@@ -1067,9 +1066,18 @@ fault in the gateway.
     - The second is the same key with the fresh PSK, endpoint and allowed
       IPs, so the peer is created again.
     - The kernel applies a request's peers in order under the device's
-      update lock, and `wg show` reads under the same lock. So no reader
-      sees the interface without its peer, and the scrub succeeds or fails
-      as a whole.
+      update lock, and `wg show` reads under the same lock. So no netlink
+      reader sees the interface between the two entries.
+    - It is not a transaction (corrected after review). The kernel stops
+      at the first failing entry, and does not undo the ones before it.
+      So an `ENOMEM` while creating the second entry, or one of its
+      allowed IPs, leaves the peer removed.
+    - Any scrub error is fatal. `kzc-psk` deletes the interface and exits,
+      and `Restart=on-failure` starts it again, so the failure stays
+      closed: no traffic, no stale key.
+    - What the single request removes is the gap that readers saw, and the
+      second request that could fail on its own. Inside the kernel, the
+      remove still comes before the re-add.
   - The tests:
     - Layout: `replace_peer_layout`.
     - Device: one request with the remove entry, then the add entry.
@@ -1099,3 +1107,6 @@ fault in the gateway.
   - The fix: the mutation replies `MessageInfo::new(0, 0)`. That is label
     0 and no message words, so the registers are unchanged and the thread
     restarts at the faulting instruction on either kernel.
+- **The commit that closed this.** The self-test ran on the commit that
+  corrected these comments and docs. Its `make check` counts are those of
+  93d2d07, whose code is the same.
