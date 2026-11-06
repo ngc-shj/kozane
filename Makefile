@@ -547,8 +547,13 @@ host: host-launcher | $(counts)
 		> $(abspath $(counts))/host-lint.log 2>&1 || { cat $(abspath $(counts))/host-lint.log; exit 1; }
 	cd host && cargo clippy --locked --all-targets --features kozane-vm/test-seams --target-dir $(host_target) -- -D warnings \
 		>> $(abspath $(counts))/host-lint.log 2>&1 || { cat $(abspath $(counts))/host-lint.log; exit 1; }
-	cd host && cargo test --locked --features kozane-vm/test-seams --target-dir $(host_target) \
+	# The shipped configuration first: without the seams, the fixed paths,
+	# the root owner and the refused seam options are what the tests see.
+	cd host && cargo test --locked --target-dir $(host_target) \
 		> $(abspath $(counts))/host-unit.log 2>&1 || { cat $(abspath $(counts))/host-unit.log; exit 1; }
+	$(host_target)/debug/kozane-vm --build-info | grep -qx 'SEAMS=0' || { echo "host: the plain test build has SEAMS=1"; exit 1; }
+	cd host && cargo test --locked --features kozane-vm/test-seams --target-dir $(host_target) \
+		>> $(abspath $(counts))/host-unit.log 2>&1 || { cat $(abspath $(counts))/host-unit.log; exit 1; }
 	$(host_target)/debug/kozane-vm --build-info | grep -qx 'SEAMS=1' || { echo "host: test build lacks SEAMS=1"; exit 1; }
 	$(host_target)/release/kozane-vm --build-info | grep -qx 'SEAMS=0' || { echo "host: shipped launcher has test seams"; exit 1; }
 	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-HOST", n + 0 }' $(abspath $(counts))/host-unit.log > $(counts)/host
@@ -561,13 +566,31 @@ client_target := $(abspath $(BUILD))/client/target
 client: | $(counts)
 	cd client && cargo clippy --locked --workspace --all-targets --target-dir $(client_target) -- -D warnings \
 		> $(abspath $(counts))/client-lint.log 2>&1 || { cat $(abspath $(counts))/client-lint.log; exit 1; }
-	cd client && cargo test --locked --workspace --target-dir $(client_target) \
-		> $(abspath $(counts))/client-unit.log 2>&1 || { cat $(abspath $(counts))/client-unit.log; exit 1; }
+	# One run per crate, so each has its own count (plan T2.13): a test moved
+	# from one crate to another is not a net zero.
+	: > $(abspath $(counts))/client-unit.log
+	for p in kozane-client kozane-client-cli kozane-client-ffi; do \
+		(cd client && cargo test --locked -p $$p --target-dir $(client_target)) \
+			> $(abspath $(counts))/client-unit-$$p.log 2>&1 || { cat $(abspath $(counts))/client-unit-$$p.log; exit 1; }; \
+		cat $(abspath $(counts))/client-unit-$$p.log >> $(abspath $(counts))/client-unit.log; \
+	done
+	# The shipped kzc and kzc-psk: built without the seams (the tests'
+	# self dev-dependency always enables them), and they refuse a seam option.
+	cd client && cargo build --locked --release -p kozane-client-cli --bins --target-dir $(client_target)-ship \
+		> $(abspath $(counts))/client-ship.log 2>&1 || { cat $(abspath $(counts))/client-ship.log; exit 1; }
+	for b in kzc kzc-psk; do $(client_target)-ship/release/$$b --build-info | grep -qx 'SEAMS=0' \
+		|| { echo "client: shipped $$b has test seams"; exit 1; }; done
+	! $(client_target)-ship/release/kzc --root-prefix /nonexistent up 2> $(counts)/client-ship-seam.log \
+		|| { echo "client: shipped kzc took --root-prefix"; exit 1; }
+	grep -q '^kzc: usage: kzc ' $(counts)/client-ship-seam.log || { echo "client: shipped kzc took --root-prefix"; cat $(counts)/client-ship-seam.log; exit 1; }
 	cd client && cbindgen --quiet --config crates/client-ffi/cbindgen.toml --crate kozane-client-ffi \
 		--output $(abspath $(BUILD))/kozane_client.h crates/client-ffi
 	cmp -s client/include/kozane_client.h $(BUILD)/kozane_client.h \
 		|| { echo "ffi: header differs"; diff -u client/include/kozane_client.h $(BUILD)/kozane_client.h; exit 1; }
-	awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-CLIENT", n + 0 }' $(abspath $(counts))/client-unit.log > $(counts)/client
+	{ awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-CLIENT", n + 0 }' $(abspath $(counts))/client-unit-kozane-client.log; \
+	  awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-CLIENT-CLI", n + 0 }' $(abspath $(counts))/client-unit-kozane-client-cli.log; \
+	  awk '/^test result: ok\./ { n += $$4 } END { print "UNIT-CLIENT-FFI", n + 0 }' $(abspath $(counts))/client-unit-kozane-client-ffi.log; \
+	} > $(counts)/client
 
 policy-tool:
 	cargo build --locked --release --manifest-path tools/policy/Cargo.toml --target-dir $(policy_target)

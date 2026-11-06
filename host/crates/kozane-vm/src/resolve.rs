@@ -97,6 +97,20 @@ impl Resolver {
         (0, 0)
     }
 
+    /// The uids a program, and each directory on its path, may belong to:
+    /// root's and the input owner's. In the test seams' user namespace, real root shows
+    /// as the kernel's overflow uid, which stands for root there.
+    pub fn dir_owners(&self) -> Vec<u32> {
+        let (owner, _) = self.owner();
+        #[cfg(feature = "test-seams")]
+        if self.user_map
+            && let Some(o) = std::fs::read_to_string("/proc/sys/kernel/overflowuid").ok().and_then(|s| s.trim().parse().ok())
+        {
+            return vec![0, owner, o];
+        }
+        vec![0, owner]
+    }
+
     /// The credentials `service` runs with.
     pub fn creds(&self, service: Service) -> Result<Creds, String> {
         #[cfg(feature = "test-seams")]

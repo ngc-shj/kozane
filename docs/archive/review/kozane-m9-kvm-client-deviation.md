@@ -520,8 +520,13 @@ is the operator's liveness signal.
   only.
 - **For C13:** client.md tells the operator to load the `wireguard` module
   beforehand. Autoloading under `ProtectKernelModules=yes` is unverified.
-- **Not unlocked:** some PSK copies (in `Actions` and the netlink request
-  `Vec`) are wiped but not mlocked.
+- **Not locked, and not all wiped (corrected in code review S5):** the PSK's
+  final copies, the `Actions` entry dropped in `perform`/`queue` and the
+  netlink request `Vec`, are wiped but not mlocked. The bitwise copies the
+  moves leave in the dead frames of `on_datagram`, `step` and `perform`
+  (FFI: `process`, `queue`) were not wiped at all until the review. Each
+  shell now calls `scrub_stack()` once those frames have returned (see the
+  code review's S5).
 
 ### D-14 — the residue scan window moves with the EL1 board's RAM
 
@@ -1236,3 +1241,58 @@ fault in the gateway.
   - A directory symlink to another target: another image. HEAD's digest
     fails this one.
   - CHECK-MANIFEST-FIXTURES 25.
+
+### D-28 — code review round 1: decisions beyond the findings' text
+
+- **S2, the programs vm.conf names, are checked by path, not run by fd.**
+  - The finding proposed running the checked file through `fexecve` or
+    `/proc/self/fd/<n>`. Neither works for every program:
+    - The launcher's stand-ins are scripts. A script cannot run from a
+      close-on-exec descriptor.
+    - Keeping the descriptor open would hand the child an extra fd, which
+      the I4.1 inventory refuses.
+  - So `files::check_program` closes the window by ownership instead. It
+    requires:
+    - a plain absolute path, with no `.` or `..`;
+    - an executable regular file, not a symlink, not group- or
+      world-writable;
+    - the file, and every directory from `/` down, owned by one of
+      `Resolver::dir_owners`, with each directory not writable by group or
+      others unless it is sticky.
+  - With every component checked, only those owners could swap the file
+    between the check and the exec. In the shipped launcher they are root
+    alone (H1's trusted party).
+  - Under the test seams with `--user-map`, the input owner and the
+    kernel's overflow uid count as owners too. In the launcher tests' user
+    namespace real root shows as 65534. An earlier version checked from the
+    root prefix down instead, and failed test-kvm, whose real QEMU sits in
+    /opt, outside the prefix.
+  - The file's own owner check shares that list. With a single uid, no
+    fixture can own a file differently from its directory, so this clause
+    is not red-proved on its own. Its cross-uid cell joins VE26's deferral.
+- **T1, UNIT-HOST counts both runs.** `make host` runs the unit tests
+  twice: once without the seams (the shipped configuration), then with
+  them. UNIT-HOST (111) is the sum, so a library test counts once per
+  configuration.
+- **T7, the plan's manifest keys.**
+  - UNIT-CLIENT, UNIT-CLIENT-CLI and UNIT-CLIENT-FFI are now separate
+    keys, one `cargo test -p` per crate (14, 66, 10). UNIT-CLIENT is
+    `kozane-client` alone, no longer the workspace total.
+  - RP-INITIATOR-VECTORS is not a separate key. The vector replay is
+    `rosenpass-core`'s own unit test (`tests_initiator_vectors`), counted
+    in UNIT-ROSENPASS-CORE. Its inputs are pinned by D-15's
+    `rp-vectors-pin`.
+- **Milestone-close records the testing review asked for.**
+  - **VE27.** `tools/sdk-repro build` ran on gx10 and z1mn on 2026-11-04:
+    201 files each. `tools/sdk-repro compare build/sdk-gx10.sha
+    build/sdk-z1mn.sha` printed `SDK-REPRO-ARTIFACTS 3`, exit 0.
+  - **Cross-gate identity.** `tools/check-manifest --compare-identity
+    build/counts build/counts-kvm build/counts-kzc` has been run after
+    every gate chain since D-24, exit 0 each time. It runs again at the
+    closing commit.
+- **S5, a client-level residue case is not added.** The shells now scrub
+  their stacks after every step. rp-residue drives `Initiator` directly,
+  and measuring the shells' frames would need a whole `Client` with a live
+  responder in the scan harness.
+  - This is a deferral. Its cost justification is in the code review's
+    Resolution Status.

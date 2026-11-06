@@ -149,9 +149,18 @@ head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > /etc/kozane/swtpm.key
 echo >> /etc/kozane/swtpm.key
 ```
 
-Create the TPM state with that key
-(`swtpm_setup --tpm2 --tpmstate /var/lib/kozane/swtpm --keyfile /etc/kozane/swtpm.key --cipher aes-256-cbc`,
-as `kozane-swtpm`), then provision the node as the runbook says. The state
+Create the TPM state with that key, as `kozane-swtpm`. The key stays
+root-owned and 0600, so a root shell opens it and hands the descriptor
+over:
+
+```
+sudo -u kozane-swtpm swtpm_setup --tpm2 --tpmstate /var/lib/kozane/swtpm \
+    --keyfile-fd 3 --cipher aes-256-cbc 3< /etc/kozane/swtpm.key
+```
+
+Never relax the key's owner or mode to let `kozane-swtpm` read it: the
+launcher refuses a key other than root's 0600. Then provision the node as
+the runbook says. The state
 and the pin belong together: a new state needs a new provisioning, and a new
 pin needs envelopes sealed under that release.
 

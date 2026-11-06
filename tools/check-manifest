@@ -41,10 +41,12 @@ PACKAGE_DB = "/var/lib/dpkg/status"
 
 
 def image_digest() -> str:
-    trees = list(IMAGE_TREES)
-    if os.environ.get("MICROKIT_SDK"):
-        trees.append(os.environ["MICROKIT_SDK"])
-    return tree_digest(PACKAGE_DB, trees)
+    # The SDK is part of the image: without it IMAGE would cover less than
+    # the toolchain, and two hosts could agree on that.
+    sdk = os.environ.get("MICROKIT_SDK")
+    if not sdk:
+        raise SystemExit("check-manifest: MICROKIT_SDK unset; IMAGE covers the SDK")
+    return tree_digest(PACKAGE_DB, list(IMAGE_TREES) + [sdk])
 
 
 def tree_digest(package_db: str, trees: list) -> str:
@@ -52,6 +54,9 @@ def tree_digest(package_db: str, trees: list) -> str:
     with open(package_db, "rb") as f:
         h.update(f.read())
     for tree in sorted(set(trees)):
+        # os.walk yields nothing for a missing tree, which would hash as empty.
+        if not os.path.isdir(tree) or os.path.islink(tree):
+            raise SystemExit(f"check-manifest: image tree {tree} missing")
         for top, dirs, files in os.walk(tree):
             dirs.sort()
             # os.walk lists a symlink to a directory under `dirs` and does
@@ -148,7 +153,8 @@ def compare_identity(dirs: list) -> list:
         _, ident, _ = read_counts(d)
         for p in identity_problems(ident):
             bad.append(f"{d}: {p}")
-        seen[d] = tuple(sorted(next(iter(ident[k])) if len(ident[k]) == 1 else "?" for k in IDENTITY_KEYS))
+        # In IDENTITY_KEYS order, so each value keeps its key.
+        seen[d] = tuple(next(iter(ident[k])) if len(ident[k]) == 1 else "?" for k in IDENTITY_KEYS)
     if len(set(seen.values())) > 1:
         bad.append("the counts directories ran on different images: "
                    + "; ".join(f"{d}: {dict(zip(IDENTITY_KEYS, v))}" for d, v in seen.items()))

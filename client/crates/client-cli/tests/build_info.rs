@@ -1,5 +1,6 @@
-//! The test build of both binaries carries the seams; the release build's
-//! `SEAMS=0` is checked where it is built (M9 plan C4's pin).
+//! The test build of both binaries carries the seams. The shipped build's
+//! `SEAMS=0`, and its refusal of `--root-prefix`, are checked by
+//! `make client` on a release build without the feature.
 
 use std::process::Command;
 

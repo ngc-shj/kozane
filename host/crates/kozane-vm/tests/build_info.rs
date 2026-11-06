@@ -16,11 +16,10 @@ fn build_info_reports_the_seams_and_the_embedded_argv() {
     assert_eq!(text, format!("{seams}\nVM_ARGS_SHA256={digest}\n"));
 }
 
+// Run by the plain `cargo test` in `make host`, the shipped configuration.
+#[cfg(not(feature = "test-seams"))]
 #[test]
 fn a_release_build_refuses_the_seam_options() {
-    if cfg!(feature = "test-seams") {
-        return;
-    }
     let out = Command::new(env!("CARGO_BIN_EXE_kozane-vm")).args(["--root-prefix", "/tmp", "--build-info"]).output().unwrap();
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("usage:"));

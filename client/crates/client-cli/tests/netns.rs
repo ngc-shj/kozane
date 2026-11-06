@@ -41,6 +41,18 @@ const INNER: &str = "KZC_NETNS_INNER";
 const KZC: &str = env!("CARGO_BIN_EXE_kzc");
 const KZC_PSK: &str = env!("CARGO_BIN_EXE_kzc-psk");
 const USERS: &str = "kozane-psk=0,kozane-net=0";
+/// The cells `inner` runs, by the line each prints when it passes.
+const CELLS: [&str; 9] = [
+    "keygen ok",
+    "kzc-psk up",
+    "session on the OSK",
+    "scrubbed on kzc exit",
+    "kzc restart ok",
+    "kzc reconnects after a kzc-psk restart",
+    "exits delete the interface",
+    "SIGKILL recovery ok",
+    "peer and record checks ok",
+];
 const WAIT: Duration = Duration::from_secs(20);
 
 #[test]
@@ -59,6 +71,11 @@ fn kernel_wireguard_in_a_user_namespace() {
     print!("{text}");
     assert!(out.status.success(), "the namespace run failed");
     assert!(text.contains("netns: all cases passed"), "the namespace run did not reach the end");
+    // Every cell, by its line: one dropped from inner() reddens this, though
+    // the run still reaches its end (code review T8).
+    for cell in CELLS {
+        assert!(text.contains(&format!("netns: {cell}\n")), "netns: the cell `{cell}` did not run");
+    }
 }
 
 // --- tools ------------------------------------------------------------------
@@ -322,6 +339,19 @@ fn setup() -> (Env, UnixDatagram) {
 fn keygen(env: &Env) -> String {
     let args: Vec<String> = env.seams(USERS).into_iter().chain(["keygen".to_string()]).collect();
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    // A run that cannot create its last file leaves none of the others
+    // (code review T11): rp.pub is there already, so wg.sk, wg.pub and rp.sk,
+    // created before it, are unlinked again.
+    fs::create_dir_all(env.path("var/lib/kozane-net")).unwrap();
+    fs::write(env.path("var/lib/kozane-net/rp.pub"), b"in the way").unwrap();
+    let (made, text) = run(KZC, &args);
+    assert!(!made && text.contains("rp.pub") && text.contains("never overwritten"), "keygen: {text}");
+    for p in ["var/lib/kozane-psk/wg.sk", "var/lib/kozane-psk/wg.pub", "var/lib/kozane-net/rp.sk"] {
+        assert!(fs::symlink_metadata(env.path(p)).is_err(), "keygen: {p} left after a failed run");
+    }
+    assert_eq!(fs::read(env.path("var/lib/kozane-net/rp.pub")).unwrap(), b"in the way");
+    fs::remove_file(env.path("var/lib/kozane-net/rp.pub")).unwrap();
+    // With the way clear, the same run succeeds.
     let out = ok(KZC, &args);
     let wg_pub = out
         .lines()

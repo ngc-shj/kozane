@@ -33,6 +33,15 @@ RNG_BUS = "virtio-mmio-bus.0"
 
 # Every device the guest may have, in order (I1.2's declared list).
 DEVICES = ("virtio-rng-device", "loader", "tpm-tis-device", "virtio-net-device")
+# Each device's keys, exactly, as machine() renders them. A loader with
+# `cpu-num=`, or without `force-raw=on` (an ELF sets its own entry), would
+# start the CPU in boot media instead of the pinned firmware.
+_DEVICE_KEYS = {
+    "loader": {"file", "addr", "force-raw"},
+    "virtio-net-device": {"netdev", "mac", "bus"},
+    "virtio-rng-device": {"rng", "bus"},
+    "tpm-tis-device": {"tpmdev"},
+}
 
 # I1.2 is an allowlist: the options machine() and swtpm() emit and no
 # other (the harness's own -S, -qmp, -no-reboot and HMP monitor are
@@ -133,6 +142,23 @@ def _keys(value: str) -> dict:
     return dict((f.split("=", 1) + [None])[:2] for f in value.split(","))
 
 
+def _device_key_problems(drivers: list, value: str) -> list:
+    """A device value's keys against its driver's exact set: a repeated key,
+    one outside the set, one missing, or a loader not raw."""
+    if len(drivers) != 1:
+        return [f"device {value} (one driver)"]
+    driver = drivers[0]
+    names = [f.split("=", 1)[0] for f in value.split(",") if "=" in f and not f.startswith("driver=")]
+    if len(names) != len(set(names)):
+        return [f"device {value} (a repeated key)"]
+    want = _DEVICE_KEYS[driver]
+    found = [f"device {driver} key {k}" for k in names if k not in want]
+    found += [f"device {driver} without {k}=" for k in sorted(want - set(names))]
+    if driver == "loader" and not found and _keys(value).get("force-raw") != "on":
+        found.append("device loader without force-raw=on")
+    return found
+
+
 def _value_problems(name: str, value: str, launcher: bool) -> list:
     """What is wrong with the value of one allowed QEMU option, `name`
     without its dash."""
@@ -170,8 +196,12 @@ def _value_problems(name: str, value: str, launcher: bool) -> list:
         drivers = ([] if "=" in value.split(",", 1)[0] else [head]) + \
             [v for k, v in (f.split("=", 1) for f in value.split(",") if "=" in f) if k == "driver"]
         found = [f"device {d}" for d in drivers if d not in DEVICES] or ([] if drivers else ["a device without a driver"])
+        if not found:
+            found = _device_key_problems(drivers, value)
     elif name == "object":
         found = [] if head == "rng-random" else [f"object {head}"]
+        if not found and (set(keys) != {"rng-random", "id", "filename"} or keys.get("filename") != "/dev/urandom"):
+            found = [f"object {value} (rng-random,id=,filename=/dev/urandom alone)"]
     elif name == "tpmdev":
         found = [] if head == "emulator" else [f"tpmdev {head}"]
     elif name == "bios":

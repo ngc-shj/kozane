@@ -26,10 +26,10 @@ pub const LOG_MAX: u64 = 1 << 30;
 const MARK_ROOM: u64 = 256;
 const FULL_MARK: &[u8] = b"\nkozane-vm: console log full; dropping console output until it is rotated\n";
 
-/// `audit`'s heartbeat event (C3): a console line `audit: … Heartbeat …`.
+/// `audit`'s heartbeat line (C3), as `audit` prints it:
+/// `audit: Heartbeat ticks=<n> seq=<s>`.
 pub fn is_heartbeat(line: &[u8]) -> bool {
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
-    line.starts_with(b"audit: ") && line.split(|&b| b == b' ').any(|t| t == b"Heartbeat")
+    line.starts_with(b"audit: Heartbeat ticks=")
 }
 
 /// Splits the console stream into lines and counts the heartbeats.
@@ -155,30 +155,31 @@ mod tests {
     #[test]
     fn an_audit_heartbeat_line_counts_once() {
         let mut l = Lines::default();
-        assert_eq!(l.feed(b"audit: src=timer Heartbeat ticks=100 lost=0 seq=9\r\n"), 1);
+        // The bytes `audit` writes, console line ending included.
+        assert_eq!(l.feed(b"audit: Heartbeat ticks=60 seq=9\r\r\n"), 1);
     }
 
     #[test]
     fn a_heartbeat_split_across_chunks_counts_when_its_line_ends() {
         let mut l = Lines::default();
-        assert_eq!(l.feed(b"audit: src=timer Heart"), 0);
-        assert_eq!(l.feed(b"beat ticks=1\n"), 1);
+        assert_eq!(l.feed(b"audit: Heart"), 0);
+        assert_eq!(l.feed(b"beat ticks=60 seq=9\r\n"), 1);
     }
 
     #[test]
     fn other_lines_do_not_count() {
         let mut l = Lines::default();
-        let text = b"pq: ready\nHeartbeat\nnot audit: src=x Heartbeat\naudit: src=hs HandshakeOk total=1\naudit: src=x Heartbeats\n";
+        let text = b"pq: ready\nHeartbeat\nnot audit: Heartbeat ticks=1\naudit: src=hs HandshakeOk total=1\naudit: src=x Heartbeat ticks=1\naudit: Heartbeats ticks=1\n";
         assert_eq!(l.feed(text), 0);
     }
 
     #[test]
     fn an_overlong_line_is_never_counted_and_the_next_one_is() {
         let mut l = Lines::default();
-        let mut long = b"audit: src=timer Heartbeat ".to_vec();
+        let mut long = b"audit: Heartbeat ticks=".to_vec();
         long.resize(MAX_LINE + 10, b'x');
         long.push(b'\n');
         assert_eq!(l.feed(&long), 0);
-        assert_eq!(l.feed(b"audit: src=timer Heartbeat ticks=2\n"), 1);
+        assert_eq!(l.feed(b"audit: Heartbeat ticks=120 seq=10\r\n"), 1);
     }
 }

@@ -3,6 +3,9 @@
 //! not below the pin; every refusal leaves the pin as it was. Runs only in
 //! a `test-seams` build (`--root-prefix`, `--user-map`).
 
+// The stand-ins and the root prefix need the test seams.
+#![cfg(feature = "test-seams")]
+
 #![cfg(feature = "test-seams")]
 
 use std::os::unix::fs::PermissionsExt;
@@ -143,6 +146,21 @@ fn i4_3_deny_a_release_signed_by_another_key() {
     let out = c.pin_firmware(&c.release("rel", 2, &c.other));
     assert!(!out.status.success() && c.pin() == Some(before), "pin-firmware: unsigned release pinned\n{}", text(&out));
     assert!(text(&out).contains("does not verify"), "{}", text(&out));
+}
+
+#[test]
+fn a_release_key_file_past_its_bound_is_refused() {
+    // Read from the checked descriptor, bounded (code review S4): padding
+    // past 8 KiB is refused, though the key itself is intact.
+    let c = case("key-bound");
+    let before = c.set_pin(1);
+    let path = c.root.join("etc/kozane/release-keys/ml-dsa-65.pub");
+    let mut padded = std::fs::read_to_string(&path).unwrap();
+    padded.push_str(&"\n".repeat(8 << 10));
+    std::fs::write(&path, padded).unwrap();
+    let out = c.pin_firmware(&c.release("rel", 2, &c.keys));
+    assert!(!out.status.success() && c.pin() == Some(before), "pin-firmware: pinned with an oversized key file\n{}", text(&out));
+    assert!(text(&out).contains("ml-dsa-65.pub") && text(&out).contains("larger than"), "{}", text(&out));
 }
 
 #[test]

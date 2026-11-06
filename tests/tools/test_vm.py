@@ -9,6 +9,7 @@ Prints "VM-FIXTURES <n>" and exits non-zero on any mismatch.
 
 import pathlib
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
@@ -117,12 +118,50 @@ def main() -> int:
          inject(vm.machine("kvm", **LAUNCHER), at, ["-chardev", "socket,id=x,path=/tmp/x"]), True, "path="),
         ("a file= key in the launcher form", vm.swtpm("/s", 11, 12, launcher=True)[:-1] + ["file=/k,mode=aes-256-cbc"],
          True, "file= other than /dev/fd/<n>"),
+        # S1: a loader that sets the CPU's PC (cpu-num=, or an ELF entry when
+        # not raw) would start the guest in boot media, not the pinned firmware.
+        ("a loader that sets the CPU's PC",
+         inject(kvm, at, ["-device", "loader,file=/m/x,addr=0x70000000,force-raw=on,cpu-num=0"]), False,
+         "device loader key cpu-num"),
+        ("a loader without force-raw", inject(kvm, at, ["-device", "loader,file=/m/x,addr=0x70000000"]), False,
+         "device loader without force-raw="),
+        ("a loader with force-raw=off",
+         inject(kvm, at, ["-device", "loader,file=/m/x,addr=0x70000000,force-raw=off"]), False,
+         "device loader without force-raw=on"),
+        ("a device key outside its driver's set",
+         inject(kvm, at, ["-device", "virtio-net-device,netdev=n0,mac=02:00:00:00:00:01,bus=b,romfile=/x"]), False,
+         "device virtio-net-device key romfile"),
+        ("a repeated device key",
+         inject(kvm, at, ["-device", "tpm-tis-device,tpmdev=tpm0,tpmdev=tpm1"]), False,
+         "device tpm-tis-device,tpmdev=tpm0,tpmdev=tpm1 (a repeated key)"),
+        # S3: the guest's entropy comes from /dev/urandom alone.
+        ("an rng backend other than /dev/urandom",
+         inject(kvm, at, ["-object", "rng-random,id=r1,filename=/dev/zero"]), False,
+         "object rng-random,id=r1,filename=/dev/zero (rng-random,id=,filename=/dev/urandom alone)"),
         ("a bridge helper in the launcher form",
          inject(vm.machine("kvm", **LAUNCHER), at, ["-netdev", "bridge,br=br0,helper=/usr/lib/qemu-bridge-helper"]),
          True, "helper="),
     ]:
         got = vm.violations(argv, launcher)
         check(f"I1.2 {name} is refused", want in got, got)
+
+    # I1.2's chokepoint: render_launcher_args writes nothing for an argv
+    # violations() refuses, and writes the clean one.
+    with tempfile.TemporaryDirectory() as d:
+        clean = pathlib.Path(d) / "clean.json"
+        vm.render_launcher_args(out=clean)
+        check("the clean launcher argv is rendered", clean.is_file())
+        bad = pathlib.Path(d) / "bad.json"
+        real = vm.machine
+        vm.machine = lambda *a, **k: real(*a, **k) + ["-gdb", "tcp::1234"]
+        try:
+            vm.render_launcher_args(out=bad)
+            check("a forbidden launcher argv is not rendered", False, "rendered")
+        except ValueError as e:
+            check("a forbidden launcher argv is not rendered",
+                  "vm: forbidden argument" in str(e) and not bad.exists(), str(e))
+        finally:
+            vm.machine = real
 
     print(f"VM-FIXTURES {cases}")
     return 1 if failures else 0

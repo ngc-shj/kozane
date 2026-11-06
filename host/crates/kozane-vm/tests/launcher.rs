@@ -4,6 +4,9 @@
 //! bridges. Runs only in a `test-seams` build:
 //! `cargo test --locked --features kozane-vm/test-seams`.
 
+// The stand-ins and the root prefix need the test seams.
+#![cfg(feature = "test-seams")]
+
 #![cfg(feature = "test-seams")]
 
 use std::os::unix::fs::PermissionsExt;
@@ -114,7 +117,7 @@ fn i4_1_the_children_get_vm_py_argv_and_exactly_their_checked_fds() {
     // The reader child teed the console and reported the heartbeat; root
     // never parsed it.
     let console = std::fs::read_to_string(root.join("var/log/kozane/console.log")).unwrap();
-    assert!(console.contains("audit: src=timer Heartbeat ticks=1"), "console log: {console:?}");
+    assert!(console.contains("audit: Heartbeat ticks=60 seq=1"), "console log: {console:?}");
     assert!(log.contains("kozane-vm: guest heartbeat"), "vm-launcher: heartbeat not reported\n{log}");
     assert!(!log.contains("U-Boot stand-in"), "vm-launcher: guest console outside the root-only log\n{log}");
     let mode = std::fs::metadata(root.join("var/log/kozane/console.log")).unwrap().permissions().mode() & 0o7777;
@@ -173,6 +176,15 @@ fn a_pin_or_key_readable_by_others_is_refused() {
         assert!(!out.status.success() && !ran(&root), "{file}: {}", text(&out));
         assert!(text(&out).contains("mode 0644, expected 0600"), "{}", text(&out));
     }
+}
+
+#[test]
+fn a_qemu_program_others_can_write_is_refused_before_any_child_starts() {
+    let root = node("deny-program");
+    std::fs::set_permissions(root.join("stubs/qemu"), std::fs::Permissions::from_mode(0o775)).unwrap();
+    let out = boot(&root);
+    assert!(!out.status.success() && !ran(&root), "vm-launcher: a writable qemu ran\n{}", text(&out));
+    assert!(text(&out).contains("stubs/qemu: mode 0775 is writable by others"), "{}", text(&out));
 }
 
 #[test]

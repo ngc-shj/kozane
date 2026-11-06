@@ -121,7 +121,12 @@ fn session(m: &Material, udp: &UdpSocket, conn: &OwnedFd) -> Result<End, String>
             Err(e) => Err(fatal(e)),
         }
     };
-    if let Some(end) = step(Ok(first), &mut rec)? {
+    // After each step, from this frame: the OSK it carried was moved through
+    // `on_*`, `step` and `perform`, whose dead frames still hold copies
+    // (code review S5).
+    let first = step(Ok(first), &mut rec);
+    kozane_client::scrub_stack();
+    if let Some(end) = first? {
         return Ok(end);
     }
     loop {
@@ -131,7 +136,9 @@ fn session(m: &Material, udp: &UdpSocket, conn: &OwnedFd) -> Result<End, String>
         let now = sys::boottime_ns().map_err(|e| format!("clock: {e}"))?;
         let timeout = match client.next_deadline() {
             Some(d) if d <= now => {
-                if let Some(end) = step(client.on_timer(now), &mut rec)? {
+                let r = step(client.on_timer(now), &mut rec);
+                kozane_client::scrub_stack();
+                if let Some(end) = r? {
                     return Ok(end);
                 }
                 continue;
@@ -157,7 +164,9 @@ fn session(m: &Material, udp: &UdpSocket, conn: &OwnedFd) -> Result<End, String>
                     }
                     let now = sys::boottime_ns().map_err(|e| format!("clock: {e}"))?;
                     let msg = buf.get(..n).unwrap_or(&[]);
-                    if let Some(end) = step(client.on_datagram(now, msg), &mut rec)? {
+                    let r = step(client.on_datagram(now, msg), &mut rec);
+                    kozane_client::scrub_stack();
+                    if let Some(end) = r? {
                         return Ok(end);
                     }
                 }

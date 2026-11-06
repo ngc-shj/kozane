@@ -66,14 +66,24 @@ fn kozane_net_holds_nothing_and_follows_kozane_psk() {
     }
 }
 
+/// A scratch directory, removed on drop (a failing test's too).
+struct Scratch(std::path::PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 #[test]
 fn systemd_analyze_verifies_both_units() {
     // The dev image carries systemd-analyze (VE28): without it this gate
     // fails rather than skipping the verify.
     let found = Command::new("systemd-analyze").arg("--version").output();
     assert!(found.is_ok_and(|o| o.status.success()), "units: systemd-analyze missing; the verify cannot run");
-    let dir = std::env::temp_dir().join(format!("kzc-units-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    let scratch = Scratch(std::env::temp_dir().join(format!("kzc-units-{}", std::process::id())));
+    let dir = &scratch.0;
+    std::fs::create_dir_all(dir).unwrap();
     // The units name the installed paths; verify needs them executable.
     for (name, bin) in [("kozane-psk.service", "kzc-psk"), ("kozane-net.service", "kzc")] {
         let built = if bin == "kzc" { env!("CARGO_BIN_EXE_kzc") } else { env!("CARGO_BIN_EXE_kzc-psk") };
@@ -86,7 +96,6 @@ fn systemd_analyze_verifies_both_units() {
         .arg(dir.join("kozane-net.service"))
         .output()
         .unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
     assert!(
         out.status.success() && out.stderr.is_empty(),
         "units: systemd-analyze verify: {}",

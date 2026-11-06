@@ -57,6 +57,12 @@ COMPARE_CASES = [
     ("another image refused", IDENTITY, "IMAGE 2222\nQEMU aaaa\n", "ran on different images"),
     ("another QEMU refused", IDENTITY, "IMAGE 1111\nQEMU bbbb\n", "ran on different images"),
     ("a directory without records refused", IDENTITY, "", "IMAGE missing"),
+    # Each value keeps its key (code review F1): a QEMU-only difference names
+    # QEMU with that directory's build ID, and swapped values are not equal.
+    # (values that sort the other way round, so a sorted tuple mislabels them)
+    ("a QEMU difference is labelled QEMU", "IMAGE ffff\nQEMU 0000\n", "IMAGE ffff\nQEMU 1111\n",
+     "{'IMAGE': 'ffff', 'QEMU': '1111'}"),
+    ("swapped values refused", IDENTITY, "IMAGE aaaa\nQEMU 1111\n", "ran on different images"),
 ]
 
 
@@ -107,6 +113,24 @@ def digest_cases() -> list:
         (tree / "current").unlink()
         (tree / "current").symlink_to("v2")
         results.append(("a directory symlink to another target is another image", digest() != before))
+
+        def refused(f, want: str) -> bool:
+            try:
+                f()
+            except SystemExit as e:
+                return want in str(e)
+            return False
+
+        # Code review T6: examining nothing is a refusal, not an empty digest.
+        results.append(("a missing image tree is refused",
+                        refused(lambda: tool.tree_digest(str(db), [str(d / "absent")]), "image tree")))
+        saved = os.environ.pop("MICROKIT_SDK", None)
+        try:
+            results.append(("IMAGE without MICROKIT_SDK is refused",
+                            refused(tool.image_digest, "MICROKIT_SDK unset")))
+        finally:
+            if saved is not None:
+                os.environ["MICROKIT_SDK"] = saved
     return results
 
 

@@ -32,15 +32,21 @@ pub fn read_pin(path: &Path, owner: u32) -> Result<Option<Pin>, String> {
     Pin::parse(&text).map(Some).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// A release public key file's bound: ML-DSA-65's 1952 bytes in hex, and room.
+const KEY_FILE_MAX: u64 = 8 << 10;
+
 /// The pin a verified `release` gives, checked against `current`.
 pub fn verified_pin(res: &Resolver, release: &Path, current: Option<&Pin>) -> Result<Pin, String> {
     let (owner, _) = res.owner();
     let keys_dir = res.path(RELEASE_KEYS);
     files::check_dir(&keys_dir, owner)?;
-    for name in ["ed25519.pub", "ml-dsa-65.pub"] {
-        files::open_checked(&keys_dir.join(name), owner, Mode::NotShared)?;
-    }
-    let keys = release::load_verifying(&keys_dir)?;
+    // The keys are read from the descriptors checked, never reopened by name.
+    let key_text = |name: &str| -> Result<String, String> {
+        let p = keys_dir.join(name);
+        let bytes = files::read_bounded(&mut files::open_checked(&p, owner, Mode::NotShared)?, KEY_FILE_MAX, &p)?;
+        String::from_utf8(bytes).map_err(|_| format!("{}: not UTF-8", p.display()))
+    };
+    let keys = release::verifying_from_hex(&key_text("ed25519.pub")?, &key_text("ml-dsa-65.pub")?)?;
     let read = |name: &str, max: u64| -> Result<Vec<u8>, String> {
         let p = release.join(name);
         let mut f = std::fs::OpenOptions::new()

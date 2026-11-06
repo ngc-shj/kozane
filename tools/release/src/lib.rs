@@ -29,12 +29,20 @@ fn fixed<const N: usize>(bytes: &[u8], what: &str) -> Result<[u8; N], String> {
 
 /// The public halves `keygen` writes into `dir`.
 pub fn load_verifying(dir: &Path) -> Result<sig::VerifyingKeys, String> {
-    let ed = fixed::<32>(&read_hex(&dir.join("ed25519.pub"))?, "ed25519.pub")?;
-    let mut ml = MLDSA65VerificationKey::zero();
-    let bytes = read_hex(&dir.join("ml-dsa-65.pub"))?;
+    let text = |name: &str| fs::read_to_string(dir.join(name)).map_err(|e| format!("{}: {e}", dir.join(name).display()));
+    verifying_from_hex(&text("ed25519.pub")?, &text("ml-dsa-65.pub")?)
+}
+
+/// The public halves from their files' text (lowercase hex and a newline),
+/// for a caller that read them from descriptors it checked.
+pub fn verifying_from_hex(ed25519: &str, ml_dsa: &str) -> Result<sig::VerifyingKeys, String> {
+    let ed = sig::unhex(ed25519.trim_end_matches('\n')).ok_or("ed25519.pub: not lowercase hex")?;
+    let ed = fixed::<32>(&ed, "ed25519.pub")?;
+    let bytes = sig::unhex(ml_dsa.trim_end_matches('\n')).ok_or("ml-dsa-65.pub: not lowercase hex")?;
     if bytes.len() != MLDSA65VerificationKey::len() {
         return Err("ml-dsa-65.pub: wrong length".into());
     }
+    let mut ml = MLDSA65VerificationKey::zero();
     ml.as_ref_mut().copy_from_slice(&bytes);
     Ok(sig::VerifyingKeys { ed25519: ed, ml_dsa: ml })
 }

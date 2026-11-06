@@ -321,7 +321,11 @@ pub unsafe extern "C" fn kz_client_on_datagram(h: *mut kz_client, now: u64, buf:
         return KZ_ERR_INVALID;
     };
     // SAFETY: the caller's contract.
-    unsafe { with_handle(h, |c| c.process(|client| client.on_datagram(now, msg))) }
+    let code = unsafe { with_handle(h, |c| c.process(|client| client.on_datagram(now, msg))) };
+    // The OSK was moved through `on_datagram`, `process` and `queue`: their
+    // dead frames below this one still hold copies (code review S5).
+    kozane_client::scrub_stack();
+    code
 }
 
 /// Runs the client's timers at `now` (ns on a clock that counts suspend,
@@ -333,7 +337,7 @@ pub unsafe extern "C" fn kz_client_on_datagram(h: *mut kz_client, now: u64, buf:
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn kz_client_on_timer(h: *mut kz_client, now: u64) -> c_int {
     // SAFETY: the caller's contract.
-    unsafe {
+    let code = unsafe {
         with_handle(h, |c| {
             #[cfg(feature = "test-panic")]
             #[allow(clippy::panic)]
@@ -342,7 +346,10 @@ pub unsafe extern "C" fn kz_client_on_timer(h: *mut kz_client, now: u64) -> c_in
             }
             c.process(|client| client.on_timer(now))
         })
-    }
+    };
+    // As in `kz_client_on_datagram`.
+    kozane_client::scrub_stack();
+    code
 }
 
 /// Writes the next deadline to `*out`, or returns `KZ_NONE` when there is

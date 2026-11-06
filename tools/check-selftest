@@ -297,14 +297,18 @@ CASES_FOR_GATE = {
                "client-scrub-bound", "client-startup-scrub", "client-deadline-reset", "ffi-memcheck",
                "kzc-symlink", "kzc-loose-mode", "kzc-sigterm-scrub", "kzc-psk-ack", "kzc-psk-zero",
                "kzc-caps", "units-canonical", "kzc-psk-only-scrub", "kzc-psk-delete-on-exit",
-               "kzc-psk-reclaim", "kzc-psk-peer-uid"},
+               "kzc-psk-reclaim", "kzc-psk-peer-uid",
+               # Code review T2: the shipped binaries' build.
+               "client-ship-seams"},
     "host": {"vm-launcher-pin", "host-unit", "host-lint",
              # Deviation D-20: the test-seams build and I4.1-I4.3.
              "host-seams-shipped", "vm-launcher-argv", "vm-launcher-seals", "pin-firmware-unsigned",
-             "pin-firmware-older"},
+             "pin-firmware-older",
+             # Code review T1: the plain (shipped) configuration's own tests.
+             "host-plain-seam-option", "host-plain-owner"},
     # M9 plan C6, C11: the gates `make check` does not run, with their own
     # counts and manifests (EXTRA_GATES).
-    "test-kvm": {"kvm-dev-missing", "kvm-proof", "kvm-tick"},
+    "test-kvm": {"kvm-dev-missing", "kvm-proof", "kvm-tick", "kvm-swtpm-plaintext"},
     "test-kzc": {"kzc-cookie", "kzc-oracle-count"},
 }
 
@@ -1789,6 +1793,13 @@ CASES = {
         "kvm-tick: rate outside tolerance"),
     # M9 plan C11 (T2.11, T3.5): a kzc that ignores CookieReply never takes
     # the cookie path under load.
+    # Code review T3 (C4, T2.20): the encrypted-state check, given a keyless
+    # copy that starts (its swtpm gets the key too), says the state is plaintext.
+    "kvm-swtpm-plaintext": (["test-kvm", "it_boots=kvm release boot"], lambda t: edit(
+        t, "tests/integration/run.py",
+        "        if keyed:\n            argv += [\"--key\", f\"file={swtpm_key},mode=aes-256-cbc\"]\n",
+        "        argv += [\"--key\", f\"file={swtpm_key},mode=aes-256-cbc\"]\n"),
+        "swtpm-state: plaintext: a copy of the state starts without the key"),
     "kzc-cookie": (["test-kzc", "it_boots=kzc cookie"], lambda t: edit(
         t, "client/crates/client/src/lib.rs",
         "                let r = ini.handle_cookie_reply(msg, now);\n                scrub_stack();\n                r?;\n", ""),
@@ -1926,6 +1937,19 @@ CASES = {
                            "pin-firmware: older release pinned"),
     # The host and client workspaces' own unit tests and clippy (as
     # rp-residue's: `make unit` and `make lint` never see them).
+    # Code review T1: the plain `cargo test` in `make host` runs the shipped
+    # configuration: a seam option taken, or an owner other than root, reddens it.
+    "host-plain-seam-option": (["host"], lambda t: edit(
+        t, "host/crates/kozane-vm/src/resolve.rs",
+        "        #[cfg(not(feature = \"test-seams\"))]\n        {\n            let _ = args;\n",
+        "        #[cfg(not(feature = \"test-seams\"))]\n        {\n"
+        "            if let Some(i) = args.iter().position(|a| a == \"--root-prefix\") {\n"
+        "                args.drain(i..(i + 2).min(args.len())).for_each(drop);\n            }\n"),
+                               "a release build took a seam option"),
+    "host-plain-owner": (["host"], lambda t: edit(t, "host/crates/kozane-vm/src/resolve.rs",
+                                                  "            return unsafe { (libc::geteuid(), libc::getegid()) };\n        }\n        (0, 0)\n",
+                                                  "            return unsafe { (libc::geteuid(), libc::getegid()) };\n        }\n        (1, 1)\n"),
+                         "without_seams_the_paths_are_fixed_and_the_owner_is_root ... FAILED"),
     "host-unit": (["host"], lambda t: append(t, "host/crates/kozane-vm/src/tests.rs", "\n#[test]\nfn selftest_injected_failure() {\n    let v = [1u8];\n    assert!(v.is_empty());\n}\n"),
                   "selftest_injected_failure ... FAILED"),
     "host-lint": (["host"], lambda t: append(t, "host/crates/kozane-vm/src/kv.rs", "\npub fn selftest_lint() -> usize {\n    let v = vec![1u8];\n    v.len()\n}\n"),
@@ -1985,6 +2009,11 @@ CASES = {
         "        let _ = (self.fill)(self.psk.expose_mut());\n"),
                      "kzc-psk: zero psk installed"),
     # I10.4: kozane-net.service with capabilities.
+    # Code review T2: the shipped kzc and kzc-psk are built without the seams.
+    "client-ship-seams": (["client"], lambda t: edit(
+        t, "Makefile", "cargo build --locked --release -p kozane-client-cli --bins --target-dir $(client_target)-ship",
+        "cargo build --locked --release -p kozane-client-cli --bins --features test-seams --target-dir $(client_target)-ship"),
+                          "client: shipped kzc has test seams"),
     "kzc-caps": (["client"], lambda t: edit(t, "client/dist/kozane-net.service", "CapabilityBoundingSet=\nNoNewPrivileges=yes\n",
                                             "AmbientCapabilities=CAP_NET_ADMIN\nNoNewPrivileges=yes\n"),
                  "kzc: capabilities held"),
