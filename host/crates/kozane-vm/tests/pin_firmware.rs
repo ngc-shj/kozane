@@ -54,8 +54,15 @@ fn case(name: &str) -> Case {
     let c = Case { root, keys, other };
     let root = &c.root;
     std::fs::create_dir_all(root.join("etc/kozane/release-keys")).unwrap();
-    std::fs::write(root.join("etc/kozane/release-keys/ed25519.pub"), format!("{}\n", hex(&public.ed25519))).unwrap();
-    std::fs::write(root.join("etc/kozane/release-keys/ml-dsa-65.pub"), format!("{}\n", hex(public.ml_dsa.as_ref()))).unwrap();
+    // Modes set, not left to the umask: the checks refuse shared ones.
+    for d in [root.clone(), root.join("etc"), root.join("etc/kozane"), root.join("etc/kozane/release-keys")] {
+        std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    for (name, text) in [("ed25519.pub", format!("{}\n", hex(&public.ed25519))), ("ml-dsa-65.pub", format!("{}\n", hex(public.ml_dsa.as_ref())))] {
+        let p = root.join("etc/kozane/release-keys").join(name);
+        std::fs::write(&p, text).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
     c
 }
 

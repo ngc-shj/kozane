@@ -1120,6 +1120,24 @@ def conf_value(text: str, key: str) -> str:
     return re.search(rf"^{key} = (\S+)$", text, re.M).group(1)
 
 
+def wait_listening(path: str, proc, deadline: float, what: str):
+    """Until a connect to the Unix socket `path` succeeds: a path that
+    exists may be a dead run's leftover, or bound but not yet listening
+    (code review round 7). `proc` exiting, or `deadline`, is `what`'s Fail."""
+    while True:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            s.connect(path)
+            return
+        except OSError:
+            pass
+        finally:
+            s.close()
+        if proc.poll() is not None or time.monotonic() > deadline:
+            raise Fail(what)
+        time.sleep(0.05)
+
+
 def sh(*args, **kw):
     return subprocess.run(list(args), check=True, capture_output=True, text=True, **kw)
 
@@ -1140,6 +1158,12 @@ class WgGo:
         self.stopped = False
         self.watcher = None
         self.dev = dev = f"wgt{os.getpid() % 100000}"
+        # A socket of this name with no link is a killed run's leftover (pids
+        # repeat after a container restart): remove it, so the readiness
+        # probe below meets this run's wireguard-go and not a dead socket.
+        uapi = f"/var/run/wireguard/{dev}.sock"
+        if os.path.exists(uapi) and subprocess.run(["ip", "link", "show", dev], capture_output=True).returncode:
+            os.unlink(uapi)
         self.proc = subprocess.Popen(DIE_WITH_PARENT + ["wireguard-go", "-f", dev], stdout=subprocess.DEVNULL,
                                      stderr=subprocess.DEVNULL, env={**os.environ, "LOG_LEVEL": "error"})
         try:
@@ -1157,13 +1181,13 @@ class WgGo:
             if time.monotonic() > deadline or self.proc.poll() is not None:
                 raise Fail(f"wireguard-go did not create {dev}")
             time.sleep(0.05)
-        # The link appears before wireguard-go listens on its UAPI socket, and
-        # `wg` needs that socket: wait for it too, and keep wg's reason if the
-        # configuration is refused (one setconf failed under load, no stderr).
-        uapi = f"/var/run/wireguard/{dev}.sock"
-        while not os.path.exists(uapi):
+        # The link appears before wireguard-go accepts on its UAPI socket, and
+        # `wg` needs that socket: wait until `wg show` really talks to it (a
+        # path that exists may be bound but not listening yet), then
+        # configure once, keeping wg's reason if it refuses.
+        while (probe := subprocess.run(["wg", "show", dev], capture_output=True, text=True)).returncode:
             if time.monotonic() > deadline or self.proc.poll() is not None:
-                raise Fail(f"wireguard-go did not open {uapi}")
+                raise Fail(f"wireguard-go's UAPI for {dev} never answered: {(probe.stderr or probe.stdout).strip()}")
             time.sleep(0.05)
         r = subprocess.run(["wg", "setconf", dev, conf], capture_output=True, text=True)
         if r.returncode != 0:
@@ -2164,11 +2188,8 @@ class Swtpm:
                 shutil.copy2(os.path.join(state, SWTPM_PERMALL), self.dir)
             self.proc = subprocess.Popen(DIE_WITH_PARENT + ["swtpm", *vm.swtpm(self.dir, key, self.sock)],
                                          stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
-            deadline = time.monotonic() + SWTPM_SOCKET_WAIT_S
-            while not os.path.exists(self.sock):
-                if self.proc.poll() is not None or time.monotonic() > deadline:
-                    raise Fail("swtpm did not open its control socket")
-                time.sleep(0.05)
+            wait_listening(self.sock, self.proc, time.monotonic() + SWTPM_SOCKET_WAIT_S,
+                           "swtpm did not open its control socket")
         except BaseException:
             self.close()
             raise
@@ -8632,10 +8653,9 @@ def swtpm_state_encrypted(state: str, scratch: str):
         proc = subprocess.Popen(DIE_WITH_PARENT + argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             deadline = time.monotonic() + SWTPM_SOCKET_WAIT_S
-            while not (os.path.exists(ctrl) and os.path.exists(data)):
-                if proc.poll() is not None or time.monotonic() > deadline:
-                    raise Fail(f"swtpm-state: swtpm ({'with' if keyed else 'without'} key) opened no sockets")
-                time.sleep(0.05)
+            for sock in (ctrl, data):
+                wait_listening(sock, proc, deadline,
+                               f"swtpm-state: swtpm ({'with' if keyed else 'without'} key) opened no sockets")
             init = subprocess.run(["swtpm_ioctl", "--unix", ctrl, "-i"], capture_output=True, text=True)
             started = False
             if init.returncode == 0:
@@ -9133,17 +9153,19 @@ def swtpm_server(state: str):
     # tpm2-tss's swtpm TCTI finds the control socket at the data path + ".ctrl".
     data = os.path.join(state, "tpm.sock")
     ctrl = data + ".ctrl"
+    # A killed run leaves its sockets in `state`: never take them for this
+    # swtpm's (the finally below removes them on every other path).
+    for path in (ctrl, data):
+        with contextlib.suppress(FileNotFoundError):
+            os.unlink(path)
     # vm.swtpm's argv (the run's key, M9 plan C1) plus the data socket only
     # provisioning has.
     proc = subprocess.Popen(DIE_WITH_PARENT + ["swtpm", *vm.swtpm(state, swtpm_key, ctrl), "--server",
                                                f"type=unixio,path={data}", "--flags", "not-need-init,startup-clear"],
                             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
     try:
-        deadline = time.monotonic() + SWTPM_SOCKET_WAIT_S
-        while not os.path.exists(data):
-            if proc.poll() is not None or time.monotonic() > deadline:
-                raise Fail("swtpm did not open its data socket for provisioning")
-            time.sleep(0.05)
+        wait_listening(data, proc, time.monotonic() + SWTPM_SOCKET_WAIT_S,
+                       "swtpm did not open its data socket for provisioning")
         yield f"swtpm:path={data}"
     finally:
         proc.kill()

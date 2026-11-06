@@ -1440,3 +1440,42 @@ fault in the gateway.
     the same 10 s, and fails with wg's own stderr.
   - The case is the harness's, not the gateway's: the failure came before
     any WireGuard traffic.
+- **Round 7 (the owner's review of round 6), and the owner's sweep request
+  over rounds 1–7.**
+  - **The finding.** The harness took a UAPI path's existence as
+    readiness. A stale socket, or one bound but not yet listening, passed
+    at once.
+  - **The fix.** `WgGo` now:
+    - removes a same-named socket when no link of that name exists (a
+      killed run's leftover; pids repeat after a container restart);
+    - retries `wg show <dev>` until it really talks to the UAPI, within
+      the same 10 s;
+    - then runs `setconf` once.
+  - **Sweep, by the shapes the reviews found.**
+    - *Readiness taken from a path's existence.* The three swtpm waits did
+      the same: `Swtpm`, `swtpm_state_encrypted` and `swtpm_server`. All
+      now go through `wait_listening`, which needs a successful `connect`.
+      `swtpm_server`, whose sockets sit in a reused state directory,
+      removes any leftover first.
+    - *Tests that depend on the environment.* Both workspaces' tests were
+      run with umask 002 and a foreign TMPDIR. The launcher and
+      pin-firmware integration tests failed: their trees and stand-ins
+      took the umask's (or the checkout's) modes, and the launcher refuses
+      a shared directory or program. Both now set the modes. The host and
+      client suites then pass under that environment.
+    - *Values bound by key or head, not exactly; required parts not
+      counted; a value pinned in one layer only.* The validators M9 added
+      were re-read:
+      - `VmConf` and `Pin`: exact keys in order, all required, values
+        checked.
+      - `VmArgs::parse`: exact keys, fds distinct and in range, plain
+        media names. swtpm_state is now pinned in two layers. The QEMU and
+        swtpm argv rest on vm.py alone. vm.py checked them when it
+        rendered the file into this same build, and a different file
+        needs write access to the build tree.
+      - client `Conf`: a closed key list, all required, each value
+        checked.
+      - The IPC record: exact tags and lengths.
+      - check-manifest's identity: one IMAGE and one QEMU per directory.
+      - The self-test merge: every case exactly once.
+      None had the open shape.

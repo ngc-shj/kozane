@@ -33,6 +33,17 @@ fn write(p: &Path, data: &[u8], mode: u32) {
     std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
+/// Every directory from `root` down, 0755.
+fn set_tree_modes(root: &Path) {
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for e in std::fs::read_dir(root).unwrap() {
+        let p = e.unwrap().path();
+        if p.is_dir() && !p.is_symlink() {
+            set_tree_modes(&p);
+        }
+    }
+}
+
 /// A test's root prefix, removed on drop (a failing test's too).
 struct Node(PathBuf);
 
@@ -58,8 +69,12 @@ fn node(name: &str) -> Node {
     for d in ["etc/kozane", "var/lib/kozane/node", "var/lib/kozane/swtpm", "var/log/kozane", "stubs"] {
         std::fs::create_dir_all(root.join(d)).unwrap();
     }
+    // Modes set, not left to the umask (or the checkout's): the launcher
+    // refuses a shared directory or program before the check a test means.
+    set_tree_modes(&root);
     for stub in ["qemu", "swtpm", "inventory.py"] {
         std::fs::copy(crate_dir().join("tests/stubs").join(stub), root.join("stubs").join(stub)).unwrap();
+        std::fs::set_permissions(root.join("stubs").join(stub), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
     let conf = format!(
         "inside_bridge=kzbr-in\noutside_bridge=kzbr-out\nqemu={}\nswtpm={}\n",
