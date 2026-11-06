@@ -1796,8 +1796,11 @@ CASES = {
                         "test-kvm: no /dev/kvm"),
     # M9 plan C6 (T1.3, T2.1): `-accel tcg` in vm.machine's kvm form; every
     # harness boot's query-kvm, and the launcher boot's kvm-vm fd, must say so.
+    # The whole tcg triple (machine string, accel, cpu), which I1.2 admits, so
+    # the boot runs and the KVM proof is what refuses it (code review round 8).
     "kvm-proof": (["test-kvm", "it_boots=kvm seal and unseal"], lambda t: edit(
-        t, "tools/vm.py", '"-accel", accel, "-cpu", CPU[accel],', '"-accel", "tcg", "-cpu", CPU["tcg"],'),
+        t, "tools/vm.py", '_machine_string(accel), "-accel", accel, "-cpu", CPU[accel],',
+        '_machine_string("tcg"), "-accel", "tcg", "-cpu", CPU["tcg"],'),
         "kvm: not enabled"),
     # M9 plan C6 (T2.12): a timer ticking at half the rate, against the
     # host's monotonic clock between two Heartbeat lines.

@@ -308,6 +308,11 @@ def main() -> int:
     drift = vm.machine("kvm", **LAUNCHER) + ["-device", f"virtio-rng-device,rng=rng0,bus={vm.RNG_BUS}"]
     check("the vm-launcher-argv drift is admissible", vm.violations(drift, True) == [], vm.violations(drift, True))
 
+    # Likewise the kvm-proof case's launcher argv, the tcg triple in the
+    # launcher form: admissible, or a tightening pre-empts its needle.
+    tcg_launcher = vm.machine("tcg", **LAUNCHER)
+    check("the kvm-proof drift is admissible", vm.violations(tcg_launcher, True) == [], vm.violations(tcg_launcher, True))
+
     print(f"VM-FIXTURES {cases}")
     return 1 if failures else 0
 

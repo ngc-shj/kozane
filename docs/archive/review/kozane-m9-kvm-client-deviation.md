@@ -1479,3 +1479,17 @@ fault in the gateway.
       - check-manifest's identity: one IMAGE and one QEMU per directory.
       - The self-test merge: every case exactly once.
       None had the open shape.
+- **Round 8: the split self-test at 44fd42a.** 317 of 318 cases passed.
+  - The failure was `kvm-proof`.
+  - Its mutation set only `-accel` and `-cpu` to tcg, leaving kvm's
+    machine string. Round 4's (machine, accel, cpu) check refused that at
+    render time, before the boot whose KVM proof the needle names: the
+    shape of round 2's N1.
+  - The mutation now sets the whole tcg triple, which I1.2 admits.
+  - test_vm pins that triple's admissibility in the launcher form
+    (VM-FIXTURES 102), as it does for `vm-launcher-argv`'s drift.
+  - The case fires `kvm: not enabled` on gx10.
+  - Only self-test and fixture files changed, so the gates re-run were
+    `make pins` and the manifest check. The rest of `make check`,
+    test-kvm and test-kzc stand from 44fd42a, whose product and harness
+    code is unchanged.
