@@ -228,6 +228,7 @@ CASES_FOR_GATE = {
              # M9 plan C12, C14, D13 (the package cases drive the real target).
              "timer-scan-deny-write", "timer-scan-deny-read", "timer-scan-allow", "timer-scan-control", "wx-rwx",
              "i14-1-device", "i14-1-precondition", "stack-top-pin", "client-lock-pin", "seams-confined", "client-scrub-site",
+             "client-shell-scrub-net", "client-shell-scrub-ffi",
              "rp-vectors-pin", "rp-constants-pin",
              # Deviation D-20: tools/vm.py's I1.1 and swtpm key fixtures.
              "i1-1-drift", "swtpm-key"},
@@ -299,7 +300,7 @@ CASES_FOR_GATE = {
                "kzc-caps", "units-canonical", "kzc-psk-only-scrub", "kzc-psk-delete-on-exit",
                "kzc-psk-reclaim", "kzc-psk-peer-uid",
                # Code review T2: the shipped binaries' build.
-               "client-ship-seams"},
+               "client-ship-seams", "client-ship-root-prefix"},
     "host": {"vm-launcher-pin", "host-unit", "host-lint",
              # Deviation D-20: the test-seams build and I4.1-I4.3.
              "host-seams-shipped", "vm-launcher-argv", "vm-launcher-seals", "pin-firmware-unsigned",
@@ -1738,6 +1739,18 @@ CASES = {
         "    let mut area = [0u64; SCRUB_DEPTH / 8];\n    area.zeroize();\n    std::hint::black_box(&area);\n", ""),
                          "rp-residue: start.ok left esk in stack"),
     # ... and one call site's scrub removed (the check-pins tripwire).
+    # Code review TN3: the shells' scrubs after each client call.
+    "client-shell-scrub-net": (["pins"], lambda t: edit(
+        t, "client/crates/client-cli/src/net.rs",
+        "                    let r = step(|| client.on_datagram(now, msg), udp, to, conn, &mut rec);\n"
+        "                    kozane_client::scrub_stack();\n",
+        "                    let r = step(|| client.on_datagram(now, msg), udp, to, conn, &mut rec);\n"),
+                               "net.rs:178: a step not followed by kozane_client::scrub_stack()"),
+    "client-shell-scrub-ffi": (["pins"], lambda t: edit(
+        t, "client/crates/client-ffi/src/lib.rs",
+        "    // dead frames below this one still hold copies (code review S5).\n    kozane_client::scrub_stack();\n",
+        "    // dead frames below this one still hold copies (code review S5).\n"),
+                               "lib.rs: 1 client calls followed by kozane_client::scrub_stack();, want 2"),
     "client-scrub-site": (["pins"], lambda t: edit(
         t, "client/crates/client/src/lib.rs",
         "            let r = ini.start(&keys, now, seams);\n            scrub_stack();\n",
@@ -1910,7 +1923,9 @@ CASES = {
     # I4.1: one-device drift between vm.py and what the launcher embeds.
     "vm-launcher-argv": (["host"], lambda t: edit(
         t, "tools/vm.py", "                        media=media, launcher=True),\n",
-        '                        media=media, launcher=True) + ["-device", "virtio-rng-device,id=selftest"],\n'),
+        # A drift I1.2 admits (a second rng, rendered form), so the render
+        # passes and the stand-in's comparison is what refuses it.
+        '                        media=media, launcher=True) + ["-device", f"virtio-rng-device,rng=rng0,bus={RNG_BUS}"],\n'),
                          "vm-launcher: argv differs"),
     # I4.1 seals: the firmware's memfd (the one copy of FIRMWARE_MAX)
     # handed over unsealed.
@@ -2014,6 +2029,16 @@ CASES = {
         t, "Makefile", "cargo build --locked --release -p kozane-client-cli --bins --target-dir $(client_target)-ship",
         "cargo build --locked --release -p kozane-client-cli --bins --features test-seams --target-dir $(client_target)-ship"),
                           "client: shipped kzc has test seams"),
+    # Code review TN5: the shipped kzc refuses --root-prefix.
+    "client-ship-root-prefix": (["client"], lambda t: edit(
+        t, "client/crates/client-cli/src/seams.rs",
+        "        #[cfg(not(feature = \"test-seams\"))]\n        Ok((Self::default(), args))\n",
+        "        #[cfg(not(feature = \"test-seams\"))]\n"
+        "        {\n            let mut args = args;\n"
+        "            if let Some(i) = args.iter().position(|a| a == \"--root-prefix\") {\n"
+        "                args.drain(i..(i + 2).min(args.len())).for_each(drop);\n            }\n"
+        "            Ok((Self::default(), args))\n        }\n"),
+                                "client: shipped kzc took --root-prefix"),
     "kzc-caps": (["client"], lambda t: edit(t, "client/dist/kozane-net.service", "CapabilityBoundingSet=\nNoNewPrivileges=yes\n",
                                             "AmbientCapabilities=CAP_NET_ADMIN\nNoNewPrivileges=yes\n"),
                  "kzc: capabilities held"),

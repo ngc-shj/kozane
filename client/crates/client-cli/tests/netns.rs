@@ -42,7 +42,7 @@ const KZC: &str = env!("CARGO_BIN_EXE_kzc");
 const KZC_PSK: &str = env!("CARGO_BIN_EXE_kzc-psk");
 const USERS: &str = "kozane-psk=0,kozane-net=0";
 /// The cells `inner` runs, by the line each prints when it passes.
-const CELLS: [&str; 9] = [
+const CELLS: [&str; 10] = [
     "keygen ok",
     "kzc-psk up",
     "session on the OSK",
@@ -52,6 +52,7 @@ const CELLS: [&str; 9] = [
     "exits delete the interface",
     "SIGKILL recovery ok",
     "peer and record checks ok",
+    "a foreign kz0 is refused",
 ];
 const WAIT: Duration = Duration::from_secs(20);
 
@@ -350,8 +351,12 @@ fn keygen(env: &Env) -> String {
         assert!(fs::symlink_metadata(env.path(p)).is_err(), "keygen: {p} left after a failed run");
     }
     assert_eq!(fs::read(env.path("var/lib/kozane-net/rp.pub")).unwrap(), b"in the way");
-    fs::remove_file(env.path("var/lib/kozane-net/rp.pub")).unwrap();
-    // With the way clear, the same run succeeds.
+    // Back to a fresh install: neither key directory exists, so the run
+    // below creates both (key_dir's mkdir branch, its fchown and fchmod).
+    for d in ["var/lib/kozane-net", "var/lib/kozane-psk"] {
+        fs::remove_dir_all(env.path(d)).unwrap();
+        assert!(fs::symlink_metadata(env.path(d)).is_err(), "{d} left before the fresh keygen");
+    }
     let out = ok(KZC, &args);
     let wg_pub = out
         .lines()
@@ -591,6 +596,7 @@ fn inner() {
     assert!(log.contains("not created by kzc-psk"), "{log}");
     assert!(link_exists("kz0"), "kzc-psk deleted a foreign interface");
     ok("ip", &["link", "del", "kz0"]);
+    eprintln!("netns: a foreign kz0 is refused");
 
     eprintln!("netns: all cases passed");
 }

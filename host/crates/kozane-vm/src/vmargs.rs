@@ -176,6 +176,10 @@ pub struct Medium {
     pub fd: i32,
 }
 
+/// The swtpm state directory the launcher runs on (tools/vm.py's
+/// LAUNCHER_SWTPM_STATE).
+pub const SWTPM_STATE: &str = "/var/lib/kozane/swtpm";
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct VmArgs {
     pub qemu: Vec<String>,
@@ -249,6 +253,11 @@ impl VmArgs {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let Json::Str(swtpm_state) = field(top, "swtpm_state")? else { return Err("`swtpm_state` is not a string".into()) };
+        // The one provisioned state (host.md); a file that moves both it and
+        // the argv is refused here too, not only by vm.py.
+        if swtpm_state != SWTPM_STATE {
+            return Err(format!("`swtpm_state` {swtpm_state} is not {SWTPM_STATE}"));
+        }
         let args = Self {
             qemu: strings(field(top, "qemu")?, "qemu")?,
             qemu_fds,

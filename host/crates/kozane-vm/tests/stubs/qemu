@@ -24,7 +24,7 @@ if len(tpm) == 1:
     rec["tpm_roundtrip"] = os.read(tpm[0], 4) == b"pong"
 with open(os.path.join(HERE, "qemu.json"), "w") as f:
     json.dump(rec, f)
-sys.stdout.write("U-Boot stand-in\r\naudit: Heartbeat ticks=60 seq=1\r\r\n")
+sys.stdout.write("U-Boot stand-in\r\naudit: Heartbeat ticks=60\r\r\n")
 sys.stdout.flush()
 first = os.path.join(HERE, "console-first")
 if os.path.exists(first):

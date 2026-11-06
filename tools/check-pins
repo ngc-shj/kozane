@@ -1900,7 +1900,54 @@ CLIENT_INITIATOR_CALLS = 6
 INITIATOR_CALL = re.compile(r"\bini\.(start|handle_resp_hello|handle_empty_data|handle_cookie_reply|tick)\(")
 
 
+# ... and the shells' scrub after each client call (code review S5, TN3):
+# kzc's `step` sites and the FFI's two client calls.
+CLIENT_NET = "client/crates/client-cli/src/net.rs"
+CLIENT_NET_STEPS = 3
+CLIENT_FFI = "client/crates/client-ffi/src/lib.rs"
+CLIENT_FFI_CALLS = 2
+SHELL_SCRUB = "kozane_client::scrub_stack();"
+
+
+def check_shell_scrub(root: pathlib.Path, out: list):
+    texts = {}
+    for rel in (CLIENT_NET, CLIENT_FFI):
+        try:
+            texts[rel] = (root / rel).read_text().splitlines()
+        except (OSError, UnicodeDecodeError) as e:
+            out.append(f"P42 {rel}: cannot read ({e})")
+    if CLIENT_NET in texts:
+        lines, steps = texts[CLIENT_NET], 0
+        for n, line in enumerate(lines, 1):
+            if not re.search(r"\bstep\(\|\|", line):
+                continue
+            steps += 1
+            rest = [l.strip() for l in lines[n:] if l.strip()]
+            if not re.match(r"\s*let \w+ = step\(\|\| .*\);$", line) or rest[:1] != [SHELL_SCRUB]:
+                out.append(f"P42 {CLIENT_NET}:{n}: a step not followed by {SHELL_SCRUB} (code review S5)")
+        if steps != CLIENT_NET_STEPS:
+            out.append(f"P42 {CLIENT_NET}: {steps} step calls, want {CLIENT_NET_STEPS}, each followed by {SHELL_SCRUB}")
+    # The scrub reaches a call's copies only because the call runs in a frame
+    # of its own (code review round 3): each helper stays out of line.
+    for rel, fn in ((CLIENT_NET, "fn step("), (CLIENT_FFI, "unsafe fn with_handle(")):
+        if rel not in texts:
+            continue
+        lines = texts[rel]
+        at = [n for n, l in enumerate(lines) if l.startswith(fn)]
+        if len(at) != 1:
+            out.append(f"P42 {rel}: {len(at)} definitions of `{fn}`, want 1")
+        elif at[0] == 0 or lines[at[0] - 1].strip() != "#[inline(never)]":
+            out.append(f"P42 {rel}:{at[0] + 1}: `{fn}` without #[inline(never)] right above it (code review S7)")
+    if CLIENT_FFI in texts:
+        lines = [l.strip() for l in texts[CLIENT_FFI]]
+        scrubs = [n for n, l in enumerate(lines) if l == SHELL_SCRUB and lines[n + 1:n + 2] == ["code"]]
+        if len(scrubs) != CLIENT_FFI_CALLS:
+            out.append(f"P42 {CLIENT_FFI}: {len(scrubs)} client calls followed by {SHELL_SCRUB}, "
+                       f"want {CLIENT_FFI_CALLS} (code review S5)")
+
+
 def check_client_scrub(root: pathlib.Path, out: list):
+    check_shell_scrub(root, out)
     try:
         lines = (root / CLIENT_LIB).read_text().splitlines()
     except (OSError, UnicodeDecodeError) as e:

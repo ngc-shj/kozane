@@ -142,15 +142,15 @@ def _keys(value: str) -> dict:
     return dict((f.split("=", 1) + [None])[:2] for f in value.split(","))
 
 
-def _device_key_problems(drivers: list, value: str) -> list:
-    """A device value's keys against its driver's exact set: a repeated key,
-    one outside the set, one missing, or a loader not raw."""
+def _device_key_problems(drivers: list, value: str, launcher: bool) -> list:
+    """A device value's keys against its driver's exact set: one outside the
+    set, one missing, or a loader not raw."""
     if len(drivers) != 1:
         return [f"device {value} (one driver)"]
     driver = drivers[0]
+    # Bare fields and repeated keys are refused for every QemuOpts option
+    # before this (_opts_shape_problems).
     names = [f.split("=", 1)[0] for f in value.split(",") if "=" in f and not f.startswith("driver=")]
-    if len(names) != len(set(names)):
-        return [f"device {value} (a repeated key)"]
     want = _DEVICE_KEYS[driver]
     found = [f"device {driver} key {k}" for k in names if k not in want]
     found += [f"device {driver} without {k}=" for k in sorted(want - set(names))]
@@ -159,12 +159,80 @@ def _device_key_problems(drivers: list, value: str) -> list:
     return found
 
 
+# The values I1.2 admits exactly, written out here rather than taken from
+# machine(), so a bad edit there does not move the reference with it (code
+# review round 4): which netdev a NIC takes, on which bus and MAC, is the
+# PD's outside/inside slot, and an rng, a TPM or a loader is bound the same
+# way.
+def _exact_devices() -> set:
+    return {
+        f"virtio-rng-device,rng=rng0,bus={RNG_BUS}",
+        "tpm-tis-device,tpmdev=tpm0",
+        f"virtio-net-device,netdev=n0,mac={OUTSIDE_MAC.hex(':')},bus={OUTSIDE_BUS}",
+        f"virtio-net-device,netdev=n1,mac={INSIDE_MAC.hex(':')},bus={INSIDE_BUS}",
+    }
+
+
+TPMDEV = "emulator,id=tpm0,chardev=chrtpm"
+
+
+def _launcher_loaders() -> set:
+    """Each launcher medium's loader: its fd (after the fixed ones, in
+    LAUNCHER_MEDIA's order) at its own address."""
+    first = max(LAUNCHER_QEMU_FDS.values()) + 1
+    return {f"loader,file=/dev/fd/{first + i},addr={addr:#x},force-raw=on" for i, addr in enumerate(launcher_addrs())}
+
+
+def _launcher_exact() -> dict:
+    """The launcher form's fd-bearing values, by option."""
+    q = LAUNCHER_QEMU_FDS
+    return {
+        "bios": {f"/dev/fd/{q['firmware']}"},
+        "netdev": {f"tap,fd={q['outside']},id=n0", f"tap,fd={q['inside']},id=n1"},
+        "chardev-socket": {f"socket,id=chrtpm,fd={q['tpm']}"},
+    }
+
+
+# Options machine() renders exactly once.
+_ONCE = ("machine", "accel", "cpu", "m", "bios", "serial", "monitor", "display")
+
+
+# The options whose values QEMU parses as QemuOpts (`head,key=value,...`).
+# There a bare field `x` is `x=on`, `nox` is `x=off`, and a repeated key's
+# last value wins, so either would override a fixed property
+# (`secure`, `mux`, `mem-merge=off`, `signal=off`) without a `key=value`
+# this module could match (code review rounds 2-3).
+_QEMUOPTS = ("machine", "chardev", "netdev", "object", "device", "tpmdev", "overcommit")
+# Keys the harness's user-net renders more than once.
+_REPEATABLE = {"netdev": {"hostfwd"}}
+
+
+def _opts_shape_problems(name: str, value: str) -> list:
+    """A QemuOpts value with a bare field after its head, an empty field, or
+    a repeated key."""
+    fields = value.split(",")
+    head_bare = "=" not in fields[0]
+    bare = [f for i, f in enumerate(fields) if "=" not in f and not (i == 0 and f)]
+    if bare:
+        return [f"{name} {value} (a bare field {bare[0]!r})"]
+    names = [f.split("=", 1)[0] for f in fields[1 if head_bare else 0:]]
+    repeated = sorted({k for k in names if names.count(k) > 1} - _REPEATABLE.get(name, set()))
+    if repeated:
+        return [f"{name} {value} (a repeated key {repeated[0]})"]
+    return []
+
+
 def _value_problems(name: str, value: str, launcher: bool) -> list:
     """What is wrong with the value of one allowed QEMU option, `name`
     without its dash."""
+    if name in _QEMUOPTS and (shape := _opts_shape_problems(name, value)):
+        return shape
     head, keys = value.split(",", 1)[0], _keys(value)
     if name == "machine":
+        # Exactly one of the two strings machine() renders.
         found = [] if head == MACHINE_TYPE else [f"machine {head}"]
+        if not found and value not in (_machine_string("tcg"), _machine_string("kvm")):
+            found = [f"machine {value} (not the rendered machine)"]
     elif name == "accel":
         found = [] if value in ACCELS else [f"accelerator {value}"]
     elif name == "cpu":
@@ -179,16 +247,27 @@ def _value_problems(name: str, value: str, launcher: bool) -> list:
         found = [] if value == "mem-lock=on" else [f"overcommit {value}"]
     elif name == "chardev":
         if head == "stdio":
-            found = []
+            # The console, exactly as rendered; the `signal=off` regex below
+            # names the commonest drift.
+            found = [] if value == "stdio,id=serial0,signal=off" else [f"chardev {value} (not the rendered console)"]
         elif head == "socket":
             want = "fd" if launcher else "path"
-            found = [] if want in keys else [f"a socket chardev without {want}="]
+            if want not in keys:
+                found = [f"a socket chardev without {want}="]
+            elif set(keys) != {"socket", "id", want} or keys.get("id") != "chrtpm":
+                found = [f"chardev {value} (socket,id=chrtpm,{want}= alone)"]
+            elif launcher and value not in _launcher_exact()["chardev-socket"]:
+                found = [f"chardev {value} (not the TPM socket's fd)"]
+            else:
+                found = []
         else:
             found = [f"chardev {head}"]
     elif name == "netdev":
         if launcher:
             ok = head == "tap" and set(keys) == {"tap", "fd", "id"}
             found = [] if ok else [f"netdev {value} (the launcher's are tap,fd= alone)"]
+            if not found and value not in _launcher_exact()["netdev"]:
+                found = [f"netdev {value} (not the outside tap as n0 or the inside tap as n1)"]
         else:
             found = [] if head in _HARNESS_NETDEVS else [f"netdev {head}"]
     elif name == "device":
@@ -197,15 +276,25 @@ def _value_problems(name: str, value: str, launcher: bool) -> list:
             [v for k, v in (f.split("=", 1) for f in value.split(",") if "=" in f) if k == "driver"]
         found = [f"device {d}" for d in drivers if d not in DEVICES] or ([] if drivers else ["a device without a driver"])
         if not found:
-            found = _device_key_problems(drivers, value)
+            found = _device_key_problems(drivers, value, launcher)
+        if not found and drivers[0] != "loader" and value not in _exact_devices():
+            found = [f"device {value} (not a rendered {drivers[0]})"]
+        if not found and drivers[0] == "loader" and launcher and value not in _launcher_loaders():
+            found = [f"device {value} (not a launcher medium's fd at its address)"]
     elif name == "object":
         found = [] if head == "rng-random" else [f"object {head}"]
         if not found and (set(keys) != {"rng-random", "id", "filename"} or keys.get("filename") != "/dev/urandom"):
             found = [f"object {value} (rng-random,id=,filename=/dev/urandom alone)"]
     elif name == "tpmdev":
         found = [] if head == "emulator" else [f"tpmdev {head}"]
+        if not found and value != TPMDEV:
+            found = [f"tpmdev {value} (not {TPMDEV})"]
+    elif name == "m":
+        found = [] if value == MEMORY else [f"-m {value} (not {MEMORY})"]
     elif name == "bios":
         found = [] if not launcher or _INHERITED_FD.fullmatch(value) else ["-bios other than /dev/fd/<n>"]
+        if not found and launcher and value not in _launcher_exact()["bios"]:
+            found = [f"-bios {value} (not the firmware's fd)"]
     else:
         found = []
     return found
@@ -242,6 +331,15 @@ def violations(argv: list, launcher: bool = False) -> list:
                 found.append("a swtpm ctrl other than unixio")
             if name == "key" and _keys(value).get("mode") != "aes-256-cbc":
                 found.append("a swtpm key other than aes-256-cbc")
+            s_fds = LAUNCHER_SWTPM_FDS
+            if launcher and name == "ctrl" and value != f"type=unixio,clientfd={s_fds['ctrl']}":
+                found.append(f"a swtpm ctrl {value} (not the TPM socket's fd)")
+            if launcher and name == "key" and value != f"fd={s_fds['key']},mode=aes-256-cbc":
+                found.append(f"a swtpm key {value} (not the key's fd)")
+            # The launcher runs swtpm on the provisioned state alone: vm-args.json
+            # carries the path too, so a second spelling would move both.
+            if launcher and name == "tpmstate" and value != f"dir={LAUNCHER_SWTPM_STATE}":
+                found.append(f"a swtpm state {value} (not dir={LAUNCHER_SWTPM_STATE})")
         elif value is not None:
             found += _value_problems(name, value, launcher)
             if name == "machine" and "virtualization=on" in value.split(",") \
@@ -254,6 +352,79 @@ def violations(argv: list, launcher: bool = False) -> list:
         i += 2 if value is not None else 1
     if swtpm_argv and not {"--key", "-key"} & set(argv):
         found.append("swtpm without key")
+    found += _count_problems(argv, launcher) if swtpm_argv else _qemu_once_problems(argv, launcher)
+    return found
+
+
+def _option_values(argv: list) -> list:
+    """(name, value) for each option, `--x` as `x`; a valueless option's
+    value is None."""
+    out, i = [], 1 if argv[:1] == ["socket"] else 0
+    while i < len(argv):
+        if not argv[i].startswith("-"):
+            i += 1
+            continue
+        name = argv[i].lstrip("-")
+        value = argv[i + 1] if i + 1 < len(argv) and not argv[i + 1].startswith("-") else None
+        out.append((name, value))
+        i += 2 if value is not None else 1
+    return out
+
+
+def _count_problems(argv: list, launcher: bool) -> list:
+    """swtpm: each of its options exactly once (code review round 5): a
+    missing --tpm2, --tpmstate, --ctrl or --key is no rendered argv."""
+    names = [n for n, _ in _option_values(argv)]
+    return [f"-{n} given {names.count(n)} times" for n in _SWTPM_OPTIONS if names.count(n) != 1]
+
+
+def _qemu_once_problems(argv: list, launcher: bool) -> list:
+    """Every part machine() always renders, exactly once (code review round
+    5: missing counts as much as repeated), and the machine string and CPU
+    those of the one accelerator. A missing -bios drops the pinned firmware,
+    a missing -overcommit (launcher) lets guest RAM swap."""
+    opts = _option_values(argv)
+    names = [n for n, _ in opts]
+    found = [f"-{n} given {names.count(n)} times" for n in _ONCE if names.count(n) != 1]
+    want_overcommit = 1 if launcher else 0
+    if names.count("overcommit") != want_overcommit:
+        found.append(f"-overcommit given {names.count('overcommit')} times, want {want_overcommit}")
+    values = [v for _, v in opts]
+    one_each = [("tpmdev", TPMDEV), ("chardev", "stdio,id=serial0,signal=off"),
+                ("device", "tpm-tis-device,tpmdev=tpm0"),
+                ("device", f"virtio-net-device,netdev=n0,mac={OUTSIDE_MAC.hex(':')},bus={OUTSIDE_BUS}"),
+                ("device", f"virtio-net-device,netdev=n1,mac={INSIDE_MAC.hex(':')},bus={INSIDE_BUS}")]
+    for name, value in one_each:
+        n = opts.count((name, value))
+        if n != 1:
+            found.append(f"-{name} {value} given {n} times")
+    tpm_sockets = [v for n, v in opts if n == "chardev" and v and v.startswith("socket,id=chrtpm,")]
+    if len(tpm_sockets) != 1:
+        found.append(f"the TPM socket chardev given {len(tpm_sockets)} times")
+    for nid in ("n0", "n1"):
+        n = sum(1 for k, v in opts if k == "netdev" and v and _keys(v).get("id") == nid)
+        if n != 1:
+            found.append(f"-netdev id={nid} given {n} times")
+    # The rng: its backend once and a device on it (the launcher renders it
+    # always, the harness may leave both out), never one half alone.
+    backends = sum(1 for n, v in opts if n == "object" and v and v.startswith("rng-random,"))
+    rng_devices = sum(1 for n, v in opts if n == "device" and v and v.startswith("virtio-rng-device,"))
+    if backends > 1 or (launcher and backends != 1):
+        found.append(f"the rng backend given {backends} times")
+    elif bool(backends) != bool(rng_devices):
+        found.append(f"an rng backend without a device, or a device without it ({backends}, {rng_devices})")
+    if launcher:
+        for loader in sorted(_launcher_loaders()):
+            n = values.count(loader)
+            if n != 1:
+                found.append(f"-device {loader} given {n} times")
+    vals = {n: argv[i + 1] for i, a in enumerate(argv[:-1]) if a.startswith("-") and (n := a.lstrip("-")) in _ONCE}
+    accel = vals.get("accel")
+    if accel in ACCELS:
+        if "machine" in vals and vals["machine"] != _machine_string(accel):
+            found.append(f"machine {vals['machine']} (not {accel}'s)")
+        if "cpu" in vals and vals["cpu"] != CPU[accel]:
+            found.append(f"cpu {vals['cpu']} (not {accel}'s)")
     return found
 
 

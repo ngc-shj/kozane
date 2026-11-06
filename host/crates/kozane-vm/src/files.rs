@@ -64,11 +64,13 @@ pub fn check_dir(path: &Path, owner: u32) -> Result<(), String> {
 /// A program the launcher runs (vm.conf's `qemu` and `swtpm`): an absolute
 /// path with no `.` or `..`, an executable regular file, not a symlink, and
 /// it and every directory from `/` down belonging to one of `owners` (root
-/// and the input owner) and changeable by nobody else. A world-writable directory passes only with the sticky bit,
-/// where an entry can be replaced by its owner or root alone. The path is
-/// then run by name: with every component checked, only those uids could
-/// swap it between this check and the exec.
-pub fn check_program(path: &Path, owners: &[u32]) -> Result<(), String> {
+/// and the input owner) and changeable by nobody else. With `sticky_ok`
+/// (the test seams' fixtures live under /tmp), a world-writable directory
+/// passes when it has the sticky bit, where an entry can be replaced by its
+/// owner or root alone; the shipped launcher refuses it, as `check_dir`
+/// does. The path is then run by name: with every component checked, only
+/// those uids could swap it between this check and the exec.
+pub fn check_program(path: &Path, owners: &[u32], sticky_ok: bool) -> Result<(), String> {
     use std::path::Component;
     let comps: Vec<_> = path.components().collect();
     if comps.first() != Some(&Component::RootDir) || !comps.iter().all(|c| matches!(c, Component::RootDir | Component::Normal(_))) {
@@ -76,10 +78,10 @@ pub fn check_program(path: &Path, owners: &[u32]) -> Result<(), String> {
     }
     let mut dir = std::path::PathBuf::from("/");
     for c in comps.iter().skip(1).take(comps.len().saturating_sub(2)) {
-        check_program_dir(&dir, owners)?;
+        check_program_dir(&dir, owners, sticky_ok)?;
         dir.push(c);
     }
-    check_program_dir(&dir, owners)?;
+    check_program_dir(&dir, owners, sticky_ok)?;
     let f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW)
@@ -102,7 +104,7 @@ pub fn check_program(path: &Path, owners: &[u32]) -> Result<(), String> {
     Ok(())
 }
 
-fn check_program_dir(dir: &Path, owners: &[u32]) -> Result<(), String> {
+fn check_program_dir(dir: &Path, owners: &[u32], sticky_ok: bool) -> Result<(), String> {
     let f = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
@@ -113,7 +115,7 @@ fn check_program_dir(dir: &Path, owners: &[u32]) -> Result<(), String> {
         return Err(format!("{}: owned by uid {}, not root", dir.display(), meta.uid()));
     }
     let bits = meta.mode() & 0o7777;
-    if bits & 0o022 != 0 && bits & 0o1000 == 0 {
+    if bits & 0o022 != 0 && !(sticky_ok && bits & 0o1000 != 0) {
         return Err(format!("{}: mode {bits:04o} is writable by others", dir.display()));
     }
     Ok(())
@@ -194,6 +196,7 @@ mod tests {
     impl Drop for Scratch {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+            let _ = std::fs::remove_file(&self.0);
         }
     }
 
@@ -209,6 +212,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         let d = Scratch(d);
         std::fs::create_dir_all(&*d).unwrap();
+        // Whatever the umask: a 0775 scratch would be refused as shared
+        // before the check a test means (code review round 4).
+        std::fs::set_permissions(&*d, std::fs::Permissions::from_mode(0o755)).unwrap();
         d
     }
 
@@ -267,10 +273,36 @@ mod tests {
         assert!(open_checked(&p, me(), Mode::NotShared).unwrap_err().contains("writable by others"));
     }
 
-    /// The directory owners the tests accept: root and us (the temp dir is
-    /// root's, the scratch ours).
+    /// The uids that stand for root here: 0, and in a user namespace the
+    /// kernel's overflow uid, which real root shows as.
+    fn root_like() -> Vec<u32> {
+        let mut v = vec![0];
+        if let Some(o) = std::fs::read_to_string("/proc/sys/kernel/overflowuid").ok().and_then(|s| s.trim().parse().ok()) {
+            v.push(o);
+        }
+        v
+    }
+
+    /// The directory owners the tests accept: root's stand-ins and us (the
+    /// temp dir is root's, the scratch ours).
     fn owners() -> Vec<u32> {
-        vec![0, me()]
+        let mut v = root_like();
+        v.push(me());
+        v
+    }
+
+    /// A path directly under /tmp, whatever TMPDIR says (the self-test sets
+    /// its own): these tests need a root-owned, sticky 1777 parent.
+    fn in_root_tmp(name: &str) -> Scratch {
+        let meta = std::fs::metadata("/tmp").unwrap();
+        assert!(
+            root_like().contains(&meta.uid()) && meta.mode() & 0o7777 == 0o1777 && !root_like().contains(&me()),
+            "precondition: a root-owned 1777 /tmp and a test that is not root"
+        );
+        let d = Scratch(std::path::PathBuf::from("/tmp").join(format!("kz-{name}-{}", std::process::id())));
+        let _ = std::fs::remove_dir_all(&d.0);
+        let _ = std::fs::remove_file(&d.0);
+        d
     }
 
     fn program(d: &Scratch, mode: u32) -> std::path::PathBuf {
@@ -284,13 +316,13 @@ mod tests {
     fn a_checked_program_under_safe_directories_is_accepted() {
         // The scratch sits under the sticky, world-writable temp dir.
         let d = scratch("prog-ok");
-        assert_eq!(check_program(&program(&d, 0o755), &owners()), Ok(()));
+        assert_eq!(check_program(&program(&d, 0o755), &owners(), true), Ok(()));
     }
 
     #[test]
     fn a_program_writable_by_others_is_refused() {
         let d = scratch("prog-shared");
-        assert!(check_program(&program(&d, 0o775), &owners()).unwrap_err().contains("writable by others"));
+        assert!(check_program(&program(&d, 0o775), &owners(), true).unwrap_err().contains("writable by others"));
     }
 
     #[test]
@@ -298,13 +330,15 @@ mod tests {
         let d = scratch("prog-link");
         let p = program(&d, 0o755);
         std::os::unix::fs::symlink(&p, d.join("link")).unwrap();
-        assert!(check_program(&d.join("link"), &owners()).is_err());
+        // O_NOFOLLOW's refusal (ELOOP), not some later check.
+        let err = check_program(&d.join("link"), &owners(), true).unwrap_err();
+        assert!(err.contains("Too many levels of symbolic links"), "{err}");
     }
 
     #[test]
     fn a_program_that_is_not_executable_is_refused() {
         let d = scratch("prog-noexec");
-        assert!(check_program(&program(&d, 0o644), &owners()).unwrap_err().contains("not executable"));
+        assert!(check_program(&program(&d, 0o644), &owners(), true).unwrap_err().contains("not executable"));
     }
 
     #[test]
@@ -316,16 +350,47 @@ mod tests {
         std::fs::write(&p, b"x").unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(check_program(&p, &owners()).unwrap_err().contains("bin: mode 0777 is writable by others"));
+        assert!(check_program(&p, &owners(), true).unwrap_err().contains("bin: mode 0777 is writable by others"));
+    }
+
+    #[test]
+    fn a_program_that_is_a_directory_is_refused() {
+        let d = scratch("prog-isdir");
+        let p = d.join("qemu");
+        std::fs::create_dir(&p).unwrap();
+        assert!(check_program(&p, &owners(), true).unwrap_err().contains("qemu: not a regular file"));
+    }
+
+    #[test]
+    fn a_program_owned_by_another_uid_is_refused_though_its_directories_pass() {
+        // Directly in the root-owned, sticky /tmp: `/` and it pass with
+        // owners [0], so the file's own owner check is the one that refuses.
+        let d = in_root_tmp("prog-owner");
+        std::fs::write(&*d, b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&*d, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = check_program(&d, &root_like(), true).unwrap_err();
+        assert!(err.contains(&format!("kz-prog-owner-{}: owned by uid", std::process::id())), "{err}");
+        assert_eq!(check_program(&d, &owners(), true), Ok(()));
+    }
+
+    #[test]
+    fn the_shipped_check_refuses_a_sticky_shared_directory() {
+        // Without the seams' allowance, /tmp (1777) is a shared directory.
+        let d = scratch("prog-sticky");
+        let err = check_program(&program(&d, 0o755), &owners(), false).unwrap_err();
+        assert!(err.contains("mode 1777 is writable by others"), "{err}");
     }
 
     #[test]
     fn a_program_under_a_directory_of_another_uid_is_refused() {
-        // Only root may own the directories here: the scratch, ours, is not.
-        let d = scratch("prog-dirowner");
+        // Only root may own the directories here: ours, under /tmp, is not.
+        let d = in_root_tmp("prog-dirowner");
+        std::fs::create_dir(&*d).unwrap();
+        std::fs::set_permissions(&*d, std::fs::Permissions::from_mode(0o755)).unwrap();
         let p = program(&d, 0o755);
         // The directory's refusal, before the file's own (same owner list).
-        assert!(check_program(&p, &[0]).unwrap_err().contains("prog-dirowner: owned by uid"));
+        let err = check_program(&p, &root_like(), true).unwrap_err();
+        assert!(err.contains(&format!("kz-prog-dirowner-{}: owned by uid", std::process::id())), "{err}");
     }
 
     #[test]
@@ -333,7 +398,7 @@ mod tests {
         let d = scratch("prog-dots");
         let p = program(&d, 0o755);
         let dotted = d.join("..").join(d.file_name().unwrap()).join("qemu");
-        assert!(p.exists() && check_program(&dotted, &owners()).unwrap_err().contains("not a plain absolute path"));
+        assert!(p.exists() && check_program(&dotted, &owners(), true).unwrap_err().contains("not a plain absolute path"));
     }
 
     #[test]

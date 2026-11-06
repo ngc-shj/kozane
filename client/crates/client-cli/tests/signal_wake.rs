@@ -12,8 +12,14 @@ use std::time::{Duration, Instant};
 
 use kozane_client_cli::sys;
 
-/// ppoll's number on AArch64 (poll(2) is ppoll there).
-const SYS_PPOLL: &str = "73";
+/// The syscalls glibc's poll(3) issues: ppoll on AArch64 (it has no poll),
+/// poll or ppoll on x86_64.
+#[cfg(target_arch = "aarch64")]
+const POLL_SYSCALLS: &[&str] = &["73"];
+#[cfg(target_arch = "x86_64")]
+const POLL_SYSCALLS: &[&str] = &["7", "271"];
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+compile_error!("signal_wake: no poll syscall numbers for this architecture");
 
 #[test]
 fn a_signal_handled_elsewhere_wakes_a_blocked_poll() {
@@ -35,11 +41,11 @@ fn a_signal_handled_elsewhere_wakes_a_blocked_poll() {
         (got, start.elapsed())
     });
     let tid = tid_rx.recv().unwrap();
-    // Until the poller is inside ppoll: the signal must land during the poll.
+    // Until the poller is inside the poll: the signal must land during it.
     let syscall = format!("/proc/self/task/{tid}/syscall");
     let deadline = Instant::now() + Duration::from_secs(5);
-    while !std::fs::read_to_string(&syscall).is_ok_and(|s| s.split(' ').next() == Some(SYS_PPOLL)) {
-        assert!(Instant::now() < deadline, "signal-wake: the poller never entered ppoll");
+    while !std::fs::read_to_string(&syscall).is_ok_and(|s| s.split(' ').next().is_some_and(|n| POLL_SYSCALLS.contains(&n))) {
+        assert!(Instant::now() < deadline, "signal-wake: the poller never entered the poll");
         std::thread::yield_now();
     }
     // SAFETY: raise only signals this (main) thread, which has SIGTERM

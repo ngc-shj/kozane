@@ -1157,7 +1157,17 @@ class WgGo:
             if time.monotonic() > deadline or self.proc.poll() is not None:
                 raise Fail(f"wireguard-go did not create {dev}")
             time.sleep(0.05)
-        sh("wg", "setconf", dev, conf)
+        # The link appears before wireguard-go listens on its UAPI socket, and
+        # `wg` needs that socket: wait for it too, and keep wg's reason if the
+        # configuration is refused (one setconf failed under load, no stderr).
+        uapi = f"/var/run/wireguard/{dev}.sock"
+        while not os.path.exists(uapi):
+            if time.monotonic() > deadline or self.proc.poll() is not None:
+                raise Fail(f"wireguard-go did not open {uapi}")
+            time.sleep(0.05)
+        r = subprocess.run(["wg", "setconf", dev, conf], capture_output=True, text=True)
+        if r.returncode != 0:
+            raise Fail(f"wg setconf {dev}: {(r.stderr or r.stdout).strip()}")
         psk = self.rp.osk()
         if psk is None:
             raise Fail("wireguard-go started before its rosenpass wrote key_out")

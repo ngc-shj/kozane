@@ -99,6 +99,25 @@ fn perform(acts: Actions, udp: &UdpSocket, to: SocketAddr, conn: &OwnedFd, rec: 
     Ok(())
 }
 
+/// One client call and its actions, in a frame of its own: kept out of
+/// `session`, so the `Actions` the call returns (a PSK among them) and every
+/// copy its moves leave lie below the caller's scrub.
+#[inline(never)]
+fn step(
+    call: impl FnOnce() -> Result<Actions, Error>,
+    udp: &UdpSocket,
+    to: SocketAddr,
+    conn: &OwnedFd,
+    rec: &mut [u8; INSTALL_LEN],
+) -> Result<Option<End>, String> {
+    match call() {
+        Ok(acts) => Ok(perform(acts, udp, to, conn, rec).err()),
+        // A refused datagram changes nothing.
+        Err(Error::Protocol(_)) => Ok(None),
+        Err(e) => Err(fatal(e)),
+    }
+}
+
 fn fatal(e: Error) -> String {
     format!("client: {e:?}")
 }
@@ -113,18 +132,10 @@ fn session(m: &Material, udp: &UdpSocket, conn: &OwnedFd) -> Result<End, String>
     lock_memory(&*rec).map_err(|_| "cannot lock PSK memory")?;
     let to = m.rp_endpoint;
     let mut buf = vec![0u8; 2048];
-    let step = |r: Result<Actions, Error>, rec: &mut [u8; INSTALL_LEN]| -> Result<Option<End>, String> {
-        match r {
-            Ok(acts) => Ok(perform(acts, udp, to, conn, rec).err()),
-            // A refused datagram changes nothing.
-            Err(Error::Protocol(_)) => Ok(None),
-            Err(e) => Err(fatal(e)),
-        }
-    };
-    // After each step, from this frame: the OSK it carried was moved through
-    // `on_*`, `step` and `perform`, whose dead frames still hold copies
-    // (code review S5).
-    let first = step(Ok(first), &mut rec);
+    // After each step, from this frame: the OSK a step carries lives, with
+    // its moved-from copies, in `step`'s frame and below, which the scrub
+    // then reaches (code review S5, S7).
+    let first = step(|| Ok(first), udp, to, conn, &mut rec);
     kozane_client::scrub_stack();
     if let Some(end) = first? {
         return Ok(end);
@@ -136,7 +147,7 @@ fn session(m: &Material, udp: &UdpSocket, conn: &OwnedFd) -> Result<End, String>
         let now = sys::boottime_ns().map_err(|e| format!("clock: {e}"))?;
         let timeout = match client.next_deadline() {
             Some(d) if d <= now => {
-                let r = step(client.on_timer(now), &mut rec);
+                let r = step(|| client.on_timer(now), udp, to, conn, &mut rec);
                 kozane_client::scrub_stack();
                 if let Some(end) = r? {
                     return Ok(end);
@@ -164,7 +175,7 @@ fn session(m: &Material, udp: &UdpSocket, conn: &OwnedFd) -> Result<End, String>
                     }
                     let now = sys::boottime_ns().map_err(|e| format!("clock: {e}"))?;
                     let msg = buf.get(..n).unwrap_or(&[]);
-                    let r = step(client.on_datagram(now, msg), &mut rec);
+                    let r = step(|| client.on_datagram(now, msg), udp, to, conn, &mut rec);
                     kozane_client::scrub_stack();
                     if let Some(end) = r? {
                         return Ok(end);

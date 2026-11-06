@@ -174,12 +174,15 @@ fn status(e: Error) -> c_int {
     }
 }
 
-/// Runs `f` on the handle; a panic poisons it.
+/// Runs `f` on the handle; a panic poisons it. Out of line, so what `f`
+/// leaves on the stack (an OSK's moved-from copies) lies below the extern
+/// function's frame, which scrubs after it.
 ///
 /// # Safety
 ///
 /// `h` is null or a live handle from `kz_client_new`, not used elsewhere
 /// for the duration of the call.
+#[inline(never)]
 unsafe fn with_handle(h: *mut kz_client, f: impl FnOnce(&mut kz_client) -> c_int) -> c_int {
     // SAFETY: the caller's contract.
     let Some(handle) = (unsafe { h.as_mut() }) else {

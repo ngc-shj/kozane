@@ -1267,9 +1267,13 @@ fault in the gateway.
     namespace real root shows as 65534. An earlier version checked from the
     root prefix down instead, and failed test-kvm, whose real QEMU sits in
     /opt, outside the prefix.
-  - The file's own owner check shares that list. With a single uid, no
-    fixture can own a file differently from its directory, so this clause
-    is not red-proved on its own. Its cross-uid cell joins VE26's deferral.
+  - The file's own owner check shares that list. Round 1 claimed it could
+    not be red-proved with one uid. Round 2 showed it can: a file of ours
+    directly in the root-owned, sticky /tmp, checked with owners [0], is
+    refused by the file clause alone.
+  - Round 2, S8: the sticky allowance is now the caller's `sticky_ok`,
+    `resolve::SEAMS`. The shipped launcher refuses every group- or
+    world-writable directory, as `check_dir` does.
 - **T1, UNIT-HOST counts both runs.** `make host` runs the unit tests
   twice: once without the seams (the shipped configuration), then with
   them. UNIT-HOST (111) is the sum, so a library test counts once per
@@ -1296,3 +1300,143 @@ fault in the gateway.
   responder in the scan harness.
   - This is a deferral. Its cost justification is in the code review's
     Resolution Status.
+
+### D-29 — code review round 2: decisions beyond the findings' text
+
+- **S6/N2, bare `-device` fields.** In `_device_key_problems`, every field
+  after the leading driver must be `key=value`.
+  - QEMU 9.0's QemuOpts reads a bare `x` as `x=on` and `nox` as `x=off`,
+    and the last value wins. So `force-raw=on,noforce-raw` loads an ELF.
+  - An empty field (`,,`) is refused too, which is stricter than QEMU.
+  - In the launcher form, a loader's `addr=` must also be one of
+    `launcher_addrs()`. S6 asked this as a question; pinning it to the set
+    the launcher renders answers it.
+- **S7/N5 and TN3, the shells' scrubs.**
+  - kzc's per-call closure became `#[inline(never)] fn step`, which makes
+    the client call itself. The FFI's `with_handle` is `#[inline(never)]`.
+  - So the `Actions` a call returns, and the copies its moves leave, lie
+    in a frame that has returned before the caller's `scrub_stack()`.
+  - P42 now pins the call sites:
+    - each of kzc's three `let r = step(|| …)` is followed by
+      `kozane_client::scrub_stack();`;
+    - the FFI has exactly two scrubs, each before `code`.
+  - Self-test cases `client-shell-scrub-net` and `client-shell-scrub-ffi`
+    each remove one call.
+  - A client-level rp-residue measurement is still not added. The call
+    sites are now gated, so deleting one fails `make check`. Whether the
+    scrubbed region holds every copy stays unmeasured at the `Client`
+    level, a residual for M10.
+- **TN6, the two early returns in host src/tests.rs stay.** P40 forbids
+  `feature = "test-seams"` in a crate's `src/` outside resolve.rs. The two
+  tests are real in the plain run, which is the one that matters (T1). In
+  the seams run they return at once, so 2 of UNIT-HOST's 118 are those
+  no-ops.
+- **N3, provisioning.** host.md uses `setpriv`, which keeps the key's
+  descriptor open, where `sudo` closes it (closefrom). That `setpriv`
+  passes fd 3 through was checked in the dev image (util-linux 2.41.5).
+  The service user itself was not available there.
+- **Self-test TMPDIR.** The new owner tests use `/tmp` by name: the
+  self-test sets each instance's TMPDIR to a directory the user owns, so
+  `temp_dir()` is not root's there. A run of `vm-launcher-argv` under that
+  TMPDIR first failed on exactly this.
+- **Round 3 (the owner's review of round 2).**
+  - The QemuOpts shape check now covers every QemuOpts option: `-machine`,
+    `-chardev`, `-netdev`, `-object`, `-device`, `-tpmdev` and
+    `-overcommit`. On all of them a bare field (`x` is `x=on`), an empty
+    field or a repeated key (the last value wins) is refused. Without that,
+    `secure`, `mux`, `mem-merge=on`, `dump-guest-core=on` and `signal=on`
+    went through.
+  - The harness's user-net repeats `hostfwd`, its one allowed repeat.
+  - `-machine` must be one of the two strings machine() renders. The
+    console chardev must be the rendered one exactly. The TPM socket must
+    be `socket,id=chrtpm` with `path=` (harness) or `fd=` (launcher) alone.
+  - P42 also pins `#[inline(never)]` directly above kzc's `fn step` and
+    the FFI's `unsafe fn with_handle`. The scrub's reach depends on both:
+    with either inlined, the call's copies sit in the scrubbing frame.
+  - The host file tests accept the kernel's overflow uid among the owners,
+    so they run in a user namespace where `/` shows as 65534. The two
+    tests that need root's sticky /tmp fail there on their precondition,
+    loudly.
+- **Round 4 (the owner's review of round 3): values bound, not only keys.**
+  - Each non-loader `-device` must be one of the four strings written out
+    in `_exact_devices`:
+    - the rng on bus 0;
+    - the TPM on `tpm0`;
+    - the outside NIC with `n0`, its MAC and its bus;
+    - the inside NIC with `n1`, its MAC and its bus.
+    So swapping the NICs' netdevs (the PD's outside and inside slots) is
+    refused.
+  - A launcher loader must be one of `_launcher_loaders`: medium i on fd
+    `max(LAUNCHER_QEMU_FDS) + 1 + i` at `launcher_addrs()[i]`. Swapping two
+    media's fds or addresses is refused.
+  - Also exact:
+    - `-m` is `MEMORY`, and `-tpmdev` is `TPMDEV`.
+    - The launcher's `-bios`, both taps (outside as n0, inside as n1) and
+      the TPM socket sit on their LAUNCHER_QEMU_FDS numbers.
+    - swtpm's ctrl and key sit on their LAUNCHER_SWTPM_FDS numbers.
+  - `machine`, `accel`, `cpu`, `m`, `bios`, `serial`, `monitor` and
+    `display` are each given once. The machine string and the CPU must be
+    those of the given accelerator.
+  - These references are written out, not taken from machine(), so a bad
+    edit there does not move them.
+  - test_vm's launcher fixtures now use the real fd layout. 16 new deny
+    fixtures bring VM-FIXTURES to 72.
+  - The vm-launcher-argv self-test's second rng is the rendered string, so
+    it stays admissible.
+  - Under the stricter list, the needles of `i1-1-drift` and `swtpm-key`
+    were re-checked.
+  - The host file tests no longer depend on the umask: `scratch()` sets
+    0755.
+  - Root ownership is judged by `root_like()`, which is 0 and the kernel's
+    overflow uid. So the tests pass where `/` and `/tmp` show as 65534 to
+    a non-root user.
+  - Under `unshare -r`, where the test itself is uid 0, the two
+    other-uid tests fail on their precondition. No second uid exists there.
+- **Round 5 (the owner's review of round 4): required parts, not only
+  unrepeated ones.** `_qemu_once_problems` now requires exactly once:
+  - each of `_ONCE`;
+  - `-overcommit mem-lock=on`, in the launcher form (zero in the harness's);
+  - `-tpmdev`, the console chardev and the TPM socket chardev;
+  - the TPM device and both NICs;
+  - netdevs `n0` and `n1`;
+  - in the launcher form, every medium's loader.
+
+  `_count_problems` requires each swtpm option once.
+
+  A dropped `-bios` would have run QEMU's own firmware instead of the
+  pinned one, and a dropped `-overcommit` would let guest RAM swap. 23 new
+  fixtures, one per dropped part, bring VM-FIXTURES to 95.
+- **The vm.py red-proofs were re-run without bytecode.** Every vm.py
+  mutation loop so far wrote mutants of one module in quick succession.
+  Python reuses a cached `.pyc` when the source's mtime (in seconds) and
+  size match, so two equal-size mutants written within one second ran the
+  first one's code. This showed up as four different round-5 mutations
+  reporting the same failures.
+  - All 25 clauses were re-run with `python3 -B` and a cleared
+    `__pycache__`. Each reddens its own fixtures.
+  - Two device-level clauses, bare fields and repeated keys, reddened
+    nothing: round 3's shape check, which runs first for every QemuOpts
+    option, catches both. They were removed as unreachable.
+- **Round 6 (the owner's review of round 5).**
+  - The launcher's swtpm `--tpmstate` must be `dir=/var/lib/kozane/swtpm`
+    exactly. Before, a vm-args.json that moved both the argv and its
+    `swtpm_state` field was accepted end to end.
+  - `VmArgs::parse` now refuses any other `swtpm_state` too
+    (`vmargs::SWTPM_STATE`). So the launcher no longer trusts vm.py alone
+    for it.
+  - The rng halves are paired. The launcher needs exactly one `rng-random`
+    backend and at least one rng device; the self-test's second rendered
+    device stays admissible. The harness has both halves or neither, as
+    `rng=False` renders.
+- **A harness race seen while gating round 6.** `cookie boot b` failed
+  once in `make check` with `wg setconf wgt49801 … returned non-zero exit
+  status 1`, and the harness kept no stderr.
+  - `WgGo._configure` waited only for the link.
+    - wireguard-go creates the link before it listens on its UAPI socket,
+      and `wg` needs that socket.
+    - A stale socket left by a run killed in a container restart, of a
+      reused pid, is the other candidate.
+  - The harness now waits for `/var/run/wireguard/<dev>.sock` too, within
+    the same 10 s, and fails with wg's own stderr.
+  - The case is the harness's, not the gateway's: the failure came before
+    any WireGuard traffic.

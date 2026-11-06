@@ -7,8 +7,6 @@
 // The stand-ins and the root prefix need the test seams.
 #![cfg(feature = "test-seams")]
 
-#![cfg(feature = "test-seams")]
-
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -117,7 +115,7 @@ fn i4_1_the_children_get_vm_py_argv_and_exactly_their_checked_fds() {
     // The reader child teed the console and reported the heartbeat; root
     // never parsed it.
     let console = std::fs::read_to_string(root.join("var/log/kozane/console.log")).unwrap();
-    assert!(console.contains("audit: Heartbeat ticks=60 seq=1"), "console log: {console:?}");
+    assert!(console.contains("audit: Heartbeat ticks=60\r"), "console log: {console:?}");
     assert!(log.contains("kozane-vm: guest heartbeat"), "vm-launcher: heartbeat not reported\n{log}");
     assert!(!log.contains("U-Boot stand-in"), "vm-launcher: guest console outside the root-only log\n{log}");
     let mode = std::fs::metadata(root.join("var/log/kozane/console.log")).unwrap().permissions().mode() & 0o7777;
@@ -185,6 +183,15 @@ fn a_qemu_program_others_can_write_is_refused_before_any_child_starts() {
     let out = boot(&root);
     assert!(!out.status.success() && !ran(&root), "vm-launcher: a writable qemu ran\n{}", text(&out));
     assert!(text(&out).contains("stubs/qemu: mode 0775 is writable by others"), "{}", text(&out));
+}
+
+#[test]
+fn a_swtpm_program_others_can_write_is_refused_before_any_child_starts() {
+    let root = node("deny-swtpm-program");
+    std::fs::set_permissions(root.join("stubs/swtpm"), std::fs::Permissions::from_mode(0o775)).unwrap();
+    let out = boot(&root);
+    assert!(!out.status.success() && !ran(&root), "vm-launcher: a writable swtpm ran\n{}", text(&out));
+    assert!(text(&out).contains("stubs/swtpm: mode 0775 is writable by others"), "{}", text(&out));
 }
 
 #[test]

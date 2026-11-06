@@ -6,8 +6,6 @@
 // The stand-ins and the root prefix need the test seams.
 #![cfg(feature = "test-seams")]
 
-#![cfg(feature = "test-seams")]
-
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

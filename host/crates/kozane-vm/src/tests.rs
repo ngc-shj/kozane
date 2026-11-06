@@ -45,7 +45,11 @@ fn vm_args_with_a_shared_fd_or_a_low_fd_or_a_path_medium_are_refused() {
     assert!(args_with(|t| t.replacen("\"tpm\": 4", "\"tpm\": 3", 1)).unwrap_err().contains("used twice"));
     assert!(args_with(|t| t.replacen("\"tpm\": 4", "\"tpm\": 2", 1)).unwrap_err().contains("not an fd"));
     assert!(args_with(|t| t.replacen("\"published.img\"", "\"../published.img\"", 1)).unwrap_err().contains("plain file name"));
-    assert!(args_with(|t| t.replacen("\"swtpm_state\": \"", "\"swtpm_state\": \"/x", 1)).unwrap_err().contains("state directory"));
+    // The argv's state no longer the field's.
+    assert!(args_with(|t| t.replacen("\"dir=/var/lib/kozane/swtpm\"", "\"dir=/x\"", 1)).unwrap_err().contains("state directory"));
+    // Both moved together: the argv and the field (code review round 6).
+    let moved = args_with(|t| t.replace("/var/lib/kozane/swtpm", "/tmp/attacker"));
+    assert!(moved.unwrap_err().contains("`swtpm_state` /tmp/attacker is not /var/lib/kozane/swtpm"));
 }
 
 #[test]

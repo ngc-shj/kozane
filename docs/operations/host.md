@@ -151,10 +151,12 @@ echo >> /etc/kozane/swtpm.key
 
 Create the TPM state with that key, as `kozane-swtpm`. The key stays
 root-owned and 0600, so a root shell opens it and hands the descriptor
-over:
+over. Use `setpriv`, which keeps it open; `sudo` closes every descriptor
+above stderr:
 
 ```
-sudo -u kozane-swtpm swtpm_setup --tpm2 --tpmstate /var/lib/kozane/swtpm \
+setpriv --reuid=kozane-swtpm --regid=kozane-swtpm --init-groups \
+    swtpm_setup --tpm2 --tpmstate /var/lib/kozane/swtpm \
     --keyfile-fd 3 --cipher aes-256-cbc 3< /etc/kozane/swtpm.key
 ```
 

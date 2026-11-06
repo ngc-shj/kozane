@@ -216,3 +216,237 @@ clause; the mutation and the assertion it reddened are named.
   noroot cell).
 - VE27 verified-local: gx10 + z1mn `SDK-REPRO-ARTIFACTS 3` (D-28).
 - VE28 narrowed by D-13 (systemd-analyze verify runs; runtime deferred).
+
+---
+
+# Review round 2 (fixes a5c7704..968b245)
+
+## Changes from Previous Round
+Round 1's fixes reviewed. F1, S2–S4, T1, T3–T10 resolved; F2, F3, S1, S5, T2, T11 continuing in part. New: three experts converged on bare `-device` fields (N2 = S6), and the S1 tightening pre-empted an existing self-test needle (N1).
+
+## Functionality Findings (round 2)
+- F3 [Minor] continuing: the heartbeat doc, tests, QEMU stand-in and launcher.rs use `seq=`, which audit never prints (crates/pds/audit/src/main.rs:507).
+- N1 [Major] tools/check-selftest `vm-launcher-argv` injects `virtio-rng-device,id=selftest`, which the S1 key set now refuses at render time, so its needle never prints.
+- N2 [Major] tools/vm.py:151 counts only `key=value` fields; a bare field (`noforce-raw`, `data-be`, `packed`) passes.
+- N3 [Minor] (F2 continuing) sudo closes fd 3 (closefrom), so host.md's `--keyfile-fd 3` still fails.
+- N4 [Minor] duplicated `#![cfg(feature = "test-seams")]` in launcher.rs and pin_firmware.rs.
+- N5 [Minor][Adjacent] question: do the scrubs reach OSK copies in `session`'s own frame (inlined `step`)?
+- N6 [Minor][Adjacent] signal_wake.rs hard-codes AArch64's ppoll number.
+- N7 [Minor][Adjacent] test_vm.py's clean render is outside a check; a refusal is a traceback.
+
+## Security Findings (round 2)
+- S6 [Major] = N2, checked against QEMU v9.0.0 (util/qemu-option.c get_opt_name_value: a bare field is `<name>=on`, `no<name>` is `<name>=off`; the last value wins): `force-raw=on,noforce-raw` reaches the loader as `force-raw=off`. Question: pin the loader's `addr=` to the rendered set. escalate: false.
+- S7 [Minor] = N5.
+- S8 [Minor] check_program_dir accepts a sticky 022 directory in the shipped build; check_dir does not (R43).
+
+## Testing Findings (round 2)
+- TN1 [Major] the file-owner clause of check_program is provable with one uid: a file of ours directly in the root-owned sticky temp dir, with owners [0]. D-28's claim is wrong.
+- TN2 [Major] the T11 cell leaves both key directories in place, so the successful keygen no longer runs the fresh-install branch of `key_dir`.
+- TN3 [Major] S5's deferral fails the Anti-Deferral format and R34: deleting any new `scrub_stack()` call leaves every gate green; P42 can pin the call sites cheaply.
+- TN4 [Minor] no launcher-level swtpm program cell; the not-a-regular-file clause and the symlink reason are unpinned.
+- TN5 [Minor] the shipped kzc's `--root-prefix` refusal has no red-proof, and its echo text is literal in the recipe (not failure-only).
+- TN6 [Minor] host src/tests.rs:80, :108 still return early under the seams and count in UNIT-HOST.
+- TN7 [Minor] = N6.
+- TN8 [Minor] the foreign-interface netns cell has no marker.
+- TN9 [Minor] = N4.
+
+## Recurring Issue Check (round 2)
+- Functionality: R43 only narrowing except as noted; write-read: heartbeat bytes (F3); gate red-proof integrity (N1).
+- Security: R3 S2 resolved; R43 S8; R49 S6, S7; R51 S4 resolved; R39 S7; R50 ok.
+- Testing: R34 TN3; R44 ok; R50 TN1 precondition; RT6/RT7 TN1, TN4, TN5; RT8 ok; RT10 stated; RT11 ok.
+
+## Resolution Status (round 2)
+
+- **S6/N2 Major — bare device fields.** Fixed in tools/vm.py:
+  - Every field after the driver must be `key=value`.
+  - A launcher loader's `addr=` must be a launcher media address.
+  - Four deny fixtures: `noforce-raw`, `packed`, an empty field, and a
+    loader at an unrendered address.
+  - Allow side: all 12 renderable argv (tcg/kvm, harness/launcher, rng
+    on/off, media on/off) still give `[]`.
+  - Red-proof: dropping the bare-field clause reddens 3 fixtures; dropping
+    the address pin reddens 1. VM-FIXTURES 49.
+- **N1 Major — `vm-launcher-argv` was pre-empted by S1.**
+  - The drift is now a second rendered rng, which I1.2 admits.
+  - test_vm pins that it stays admissible.
+  - The case fires `vm-launcher: argv differs` on gx10.
+- **TN1 Major — the file-owner clause is provable.**
+  - `a_program_owned_by_another_uid_is_refused_though_its_directories_pass`
+    uses a file directly in root's sticky /tmp with owners [0], paired
+    with the allow side [0, me].
+  - Red-proof: with the clause removed, the test fails. D-28 is corrected.
+- **TN2 Major — fresh-install keygen.**
+  - After the failure cell, both key directories are removed and checked
+    gone, so the successful run creates them.
+  - Red-proof: `mkdirat` at 0755 without the fchmod reddens
+    `var/lib/kozane-psk` 0o40700.
+- **TN3 Major / S7 / N5 — the shells' scrubs.**
+  - kzc's `step` is an `#[inline(never)]` fn that runs the client call.
+    The FFI's `with_handle` is `#[inline(never)]`.
+  - P42 pins the 3 + 2 call sites, with two test_check_pins fixtures
+    (CHECK-PINS-FIXTURES 426).
+  - Self-test cases `client-shell-scrub-net` and `client-shell-scrub-ffi`
+    each fire on gx10.
+  - The Client-level residue measurement stays a residual (D-29).
+    Anti-Deferral: the call sites the fix added are now gated, so its
+    removal fails `make check`. What is left is measuring scrub depth at
+    the Client level. Worst case: a copy below the scrubbed 128 KiB on
+    kozane-net's stack. Likelihood: low (the frames are shallow). Cost: a
+    Client and a responder in rp-residue, about a day. Owner: M10's
+    client work.
+- **S8 Minor — sticky directories in the shipped build.**
+  - `check_program(…, sticky_ok)` with `resolve::SEAMS`.
+  - `the_shipped_check_refuses_a_sticky_shared_directory` covers it.
+  - Red-proof: the always-sticky mutant reddens it.
+- **F3 Minor — heartbeat bytes.** The doc, the tests, the QEMU stand-in and
+  launcher.rs now use `audit: Heartbeat ticks=60` and the line ending; the
+  `seq=` form is gone.
+- **N3 Minor (F2) — provisioning.** host.md uses `setpriv` (D-29).
+- **N4/TN9 Minor.** The duplicate crate attribute is removed.
+- **N6/TN7 Minor.** signal_wake.rs takes the poll syscall numbers per
+  architecture, and `compile_error!` on any other.
+- **N7 Minor.** The clean render is inside its check.
+- **TN4 Minor.**
+  - New tests: `a_swtpm_program_others_can_write_is_refused_before_any_child_starts`
+    and `a_program_that_is_a_directory_is_refused`.
+  - The symlink fixture is pinned to ELOOP.
+  - Each is red-proved by removing its clause.
+- **TN5 Minor.**
+  - The recipe's `--root-prefix` lines are `@`-silent, so their text
+    prints only on failure.
+  - Self-test `client-ship-root-prefix` fires.
+- **TN6 Minor.** Kept, because of P40 (D-29).
+- **TN8 Minor.**
+  - The foreign-interface cell prints `netns: a foreign kz0 is refused`,
+    and CELLS has 10 entries.
+  - Red-proof: dropping that marker reddens the outer test.
+
+Found while fixing: under the self-test's own TMPDIR the two new owner
+tests failed their /tmp precondition. They now use /tmp by name (D-29).
+
+# Review round 3 (the owner's review of round 2)
+
+## Findings
+- R3-1 [Major] The bare-field and repeated-key refusal covered `-device`
+  only. `-machine …,secure`, `-chardev …,mux`, `-machine …,mem-merge=on`,
+  `-machine …,dump-guest-core=on` and `-chardev …,signal=on` all gave
+  `violations() == []`.
+- R3-2 [Medium] The scrub's precondition, `#[inline(never)]` on `step` and
+  `with_handle`, was ungated. P42 stayed green with both removed.
+- Note: host file tests failed where `/` shows as uid 65534.
+
+## Resolution Status (round 3)
+- R3-1:
+  - `_opts_shape_problems` runs on every QemuOpts option. It refuses a
+    bare field after the head, an empty field, and a repeated key
+    (`hostfwd` excepted for netdev).
+  - `-machine` must equal a rendered machine string. The console chardev
+    must be the rendered one exactly. The TPM socket must have its exact
+    key set.
+  - Seven fixtures, the five reported patterns plus an unrendered machine
+    property and an extra TPM socket key. VM-FIXTURES 56.
+  - Every renderable argv, and both swtpm forms, still give `[]`.
+  - Red-proof: disabling the shape check reddens the 5 reported patterns,
+    plus the existing repeated device key. Disabling the exact machine
+    match reddens its fixture, and so does disabling the socket key set.
+- R3-2:
+  - P42 requires `#[inline(never)]` on the line directly above each
+    helper.
+  - Four test_check_pins fixtures, removed and `inline(always)` for each
+    helper. Each fails P42 on a scratch copy (CHECK-PINS-FIXTURES 430).
+- Note: `owners()` in the host file tests includes the overflow uid.
+
+# Review round 4 (the owner's review of round 3)
+
+## Findings
+- R4-1 [Major] Device keys were fixed but not their values. The outside
+  and inside NICs' netdevs could be swapped, and two launcher loaders'
+  fd/address pairs too.
+- R4-2 [Medium] Fixed values went unchecked:
+  - `-m 64G`, `-m size=2G,maxmem=4G`;
+  - `-tpmdev …,chardev=serial0`, `-tpmdev …,x-data=on`;
+  - TCG/KVM machine string or CPU mismatches.
+- R4-3 [Testing] The host file tests depended on the umask and on uid 0
+  owning /tmp.
+
+## Resolution Status (round 4)
+- **R4-1:**
+  - Exact device strings, and the launcher loaders' (fd, address) pairs
+    derived from LAUNCHER_QEMU_FDS and launcher_addrs().
+  - The launcher's bios, taps, TPM socket and swtpm fds are exact too.
+  - Fixtures: NICs swapped, media swapped, rng on another bus, TPM on
+    another backend, launcher taps swapped, firmware, TPM socket and swtpm
+    ctrl and key on other fds.
+- **R4-2:**
+  - `-m` is `MEMORY`, and `-tpmdev` is `TPMDEV`.
+  - The once-only options are given once, and the machine string and CPU
+    match the accelerator.
+  - Fixtures: `-m 64G`, `-m size=2G,maxmem=4G`, the tpmdev on serial0,
+    the tpmdev with `x-data`, kvm's machine under tcg, tcg's CPU under
+    kvm, `-m` given twice.
+- **Red-proof:** each of the 12 clauses was disabled on its own, and each
+  reddened its own fixtures (exact devices 3, launcher loaders 2, tpmdev 2,
+  memory 2, launcher taps 1, swtpm key fd 1, once 1, triple machine 1,
+  triple cpu 1, bios fd 1, TPM socket fd 1, swtpm ctrl fd 1).
+- **Allow side:** all 12 renderable argv, both swtpm forms and
+  render_launcher_args still pass. VM-FIXTURES 72.
+- **R4-3:**
+  - The scratch is 0755 whatever the umask.
+  - `root_like()` is 0 and the overflow uid. The tests pass with umask 002
+    and a foreign TMPDIR.
+  - Under `unshare -r` (test uid 0) the two other-uid tests fail on their
+    precondition, as designed.
+
+# Review round 5 (the owner's review of round 4)
+
+## Findings
+- R5-1 [Major] "Exactly once" refused only repeats. Dropping any of these
+  still gave `[]`:
+  - `-machine`, `-accel`, `-cpu`, `-m`, `-bios`, `-serial`, `-monitor`,
+    `-display`;
+  - the launcher's `-overcommit`;
+  - swtpm's `--tpm2`, `--tpmstate`, `--ctrl`.
+
+## Resolution Status (round 5)
+- R5-1: every always-rendered part is required exactly once. That covers
+  `_ONCE`, the launcher's overcommit (refused in the harness), tpmdev, both
+  chardevs, the TPM device, both NICs, both netdevs and each launcher
+  medium. swtpm's four options are likewise required once.
+- Fixtures: one per dropped part (23), and `-overcommit` in the harness
+  form. VM-FIXTURES 95.
+- Allow side: every renderable argv, both swtpm forms and
+  render_launcher_args still pass.
+- Red-proof: each count clause relaxed to `> 1` reddens exactly its
+  fixtures:
+  - once 8, overcommit 2, one-each 5, TPM socket 1, netdev ids 2,
+    launcher loaders 1, swtpm 4.
+  - All 25 vm.py clauses were re-run under `python3 -B` after a stale
+    `.pyc` was found to have merged equal-size mutants (D-29).
+  - Two device-level clauses were unreachable behind the shape check and
+    were removed.
+
+# Review round 6 (the owner's review of round 5)
+
+## Findings
+- R6-1 [Medium] The launcher's swtpm `--tpmstate` value was unpinned.
+  `dir=/tmp/attacker` gave `[]`, and `VmArgs::parse` accepted a field moved
+  with it.
+- R6-2 [Minor] Either rng half could be dropped alone.
+
+## Resolution Status (round 6)
+- R6-1:
+  - vm.py: the launcher `--tpmstate` must be `dir=` LAUNCHER_SWTPM_STATE.
+    Fixture `dir=/tmp/attacker`; the test's launcher swtpm uses the real
+    state dir.
+  - vmargs.rs: `swtpm_state` must be `SWTPM_STATE`. A unit test moves both
+    the field and the argv. The old argv-only case now edits the argv
+    alone, so it still proves the mismatch check.
+  - Red-proof: dropping each pin reddens its own test.
+- R6-2:
+  - The launcher needs exactly one backend and at least one rng device;
+    the harness needs both or neither.
+  - Four fixtures: each half dropped, in each form. `rng=False` stays
+    admissible.
+  - Red-proof: relaxing the backend count reddens 1 fixture, and removing
+    the pairing reddens 3.
+- VM-FIXTURES 101. All renderable argv and render_launcher_args pass.

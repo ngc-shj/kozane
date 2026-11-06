@@ -580,9 +580,10 @@ client: | $(counts)
 		> $(abspath $(counts))/client-ship.log 2>&1 || { cat $(abspath $(counts))/client-ship.log; exit 1; }
 	for b in kzc kzc-psk; do $(client_target)-ship/release/$$b --build-info | grep -qx 'SEAMS=0' \
 		|| { echo "client: shipped $$b has test seams"; exit 1; }; done
-	! $(client_target)-ship/release/kzc --root-prefix /nonexistent up 2> $(counts)/client-ship-seam.log \
+	@# Not echoed: its refusal text must print only when it fails (a needle).
+	@! $(client_target)-ship/release/kzc --root-prefix /nonexistent up 2> $(counts)/client-ship-seam.log \
 		|| { echo "client: shipped kzc took --root-prefix"; exit 1; }
-	grep -q '^kzc: usage: kzc ' $(counts)/client-ship-seam.log || { echo "client: shipped kzc took --root-prefix"; cat $(counts)/client-ship-seam.log; exit 1; }
+	@grep -q '^kzc: usage: kzc ' $(counts)/client-ship-seam.log || { echo "client: shipped kzc took --root-prefix"; cat $(counts)/client-ship-seam.log; exit 1; }
 	cd client && cbindgen --quiet --config crates/client-ffi/cbindgen.toml --crate kozane-client-ffi \
 		--output $(abspath $(BUILD))/kozane_client.h crates/client-ffi
 	cmp -s client/include/kozane_client.h $(BUILD)/kozane_client.h \

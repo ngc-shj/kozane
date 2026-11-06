@@ -27,7 +27,7 @@ const MARK_ROOM: u64 = 256;
 const FULL_MARK: &[u8] = b"\nkozane-vm: console log full; dropping console output until it is rotated\n";
 
 /// `audit`'s heartbeat line (C3), as `audit` prints it:
-/// `audit: Heartbeat ticks=<n> seq=<s>`.
+/// `audit: Heartbeat ticks=<n>`, then the console's line ending.
 pub fn is_heartbeat(line: &[u8]) -> bool {
     line.starts_with(b"audit: Heartbeat ticks=")
 }
@@ -156,14 +156,14 @@ mod tests {
     fn an_audit_heartbeat_line_counts_once() {
         let mut l = Lines::default();
         // The bytes `audit` writes, console line ending included.
-        assert_eq!(l.feed(b"audit: Heartbeat ticks=60 seq=9\r\r\n"), 1);
+        assert_eq!(l.feed(b"audit: Heartbeat ticks=60\r\r\n"), 1);
     }
 
     #[test]
     fn a_heartbeat_split_across_chunks_counts_when_its_line_ends() {
         let mut l = Lines::default();
         assert_eq!(l.feed(b"audit: Heart"), 0);
-        assert_eq!(l.feed(b"beat ticks=60 seq=9\r\n"), 1);
+        assert_eq!(l.feed(b"beat ticks=60\r\n"), 1);
     }
 
     #[test]
@@ -180,6 +180,6 @@ mod tests {
         long.resize(MAX_LINE + 10, b'x');
         long.push(b'\n');
         assert_eq!(l.feed(&long), 0);
-        assert_eq!(l.feed(b"audit: Heartbeat ticks=120 seq=10\r\n"), 1);
+        assert_eq!(l.feed(b"audit: Heartbeat ticks=120\r\n"), 1);
     }
 }

@@ -166,7 +166,7 @@ fn open_inputs(res: &Resolver, args: &VmArgs) -> Result<Opened, String> {
     // The two programs run with the TPM socket, the taps, the firmware and
     // the swtpm key: checked like the inputs they are given.
     for program in [&conf.qemu, &conf.swtpm] {
-        files::check_program(Path::new(program), &res.dir_owners())?;
+        files::check_program(Path::new(program), &res.dir_owners(), resolve::SEAMS)?;
     }
     let pin_path = res.path(PIN);
     let pin = Pin::parse(&read_text(&pin_path, owner, Mode::Exact(0o600))?).map_err(|e| format!("{}: {e}", pin_path.display()))?;
