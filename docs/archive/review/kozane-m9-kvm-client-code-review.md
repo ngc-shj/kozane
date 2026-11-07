@@ -450,3 +450,28 @@ tests failed their /tmp precondition. They now use /tmp by name (D-29).
   - Red-proof: relaxing the backend count reddens 1 fixture, and removing
     the pairing reddens 3.
 - VM-FIXTURES 101. All renderable argv and render_launcher_args pass.
+
+# Rounds 7-8 and close
+
+- Round 7 (owner): wireguard-go's readiness taken from the socket path.
+  Fixed with a `wg show` probe and stale-socket removal. The sweep the
+  owner asked for found the same shape in three swtpm waits (now
+  `wait_listening`) and umask-dependent launcher and pin tests (now with
+  explicit modes). The product validators showed none of the reviews'
+  shapes (D-29).
+- Round 8 (self-test at 44fd42a): `kvm-proof` was pre-empted by round 4's
+  machine/accel/cpu check. It was re-aimed at the whole tcg triple, and
+  its admissibility is pinned in test_vm.
+- The owner's last review found nothing blocking in the product; its one
+  harness item is round 7.
+
+## Final verification at 33e8b71
+- `make check`, test-kvm and test-kzc green on gx10, on one image
+  (`--compare-identity` exit 0). Gates after round 8, which touched only
+  self-test and fixtures: `make pins` and the manifest check.
+- Split self-test: gx10 ran kvm, kzc, pds and rest×4; z1mn ran qemu and
+  solver. Merged `SELFTEST-LAYERS 319`, rc 0, one image (IMAGE `4ea251e6…`).
+- Residuals, each with its deferral recorded:
+  - S5/S7: the client-level rp-residue measurement (D-29, M10).
+  - VE22, VE24, VE26 and VE28 runtime, as planned.
+  - The unmarked-`kz0` window under a non-graceful exit (D-26).
